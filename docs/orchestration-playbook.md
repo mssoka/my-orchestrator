@@ -3,6 +3,8 @@
 How the pi orchestrator (mayor) dispatches and tracks work across the repos in
 `/Users/moses/code` using Herdr + the BMAD quick-dev workflow.
 
+Setting up a new machine? See `docs/mayor-setup-guide.md`.
+
 Read this at the start of any orchestration session. Sub-agent briefings link
 here for standing orders.
 
