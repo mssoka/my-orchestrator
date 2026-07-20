@@ -37,6 +37,10 @@ here for standing orders.
    the request is clearly multi-goal or large, propose the full flow
    (bmad-prd → bmad-architecture → bmad-create-epics-and-stories) instead of
    quick-dev. Default is always quick-dev.
+5. **Model (optional, never blocking).** If the user names a model for the
+   sub-agent (or for its sub-sub-agents), record it in the ledger as `model`
+   and pass it at launch (Dispatch step 6); put it in the briefing's Model
+   policy. Unset means pi's default model resolution — do not ask about it.
 
 ## Dispatch (exact sequence)
 
@@ -76,9 +80,10 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
      symlinks are never committed.
    - Tell the sub-agent in the briefing which env files were linked.
 5. Record the job in the ledger (status `dispatched`).
-6. Launch pi and hand over:
+6. Launch pi and hand over — append `--model <model>` when the job has one
+   in the ledger, otherwise launch plain:
    ```bash
-   herdr pane run <pane> "pi"
+   herdr pane run <pane> "pi --model <model>"   # or plain "pi" when unset
    herdr wait agent-status <pane> --status idle --timeout 60000
    herdr pane run <pane> "Read /Users/moses/code/docs/orchestration-playbook.md section 'Sub-agent standing orders' and the briefing at <briefing-path>, then begin."
    ```
@@ -97,8 +102,9 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
      destructive operations).
 - Work entirely inside this pane's cwd (the worktree) on branch `<slug>`.
 - You may spawn your own sub-agents with the herdr skill
-  (`herdr pane split --current ...`). You MUST close every pane you create
-  before finishing.
+  (`herdr pane split --current ...`). Launch them per the briefing's Model
+  policy (`pi --model ...` when it names one). You MUST close every pane you
+  create before finishing.
 - Treat env files as read-only. If the task genuinely requires changing
   env values, replace the symlink with a copy first
   (`rm .env && cp <repo_root>/.env .env`), edit the copy, and call the

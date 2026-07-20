@@ -12,6 +12,11 @@
 - <bullet list incl. tests/build passing>
 - PR opened against `<base>` with summary + test plan
 
+## Model policy
+- This pane was launched as `<pi-launch-command>` — stay on that model.
+- Helper panes you spawn: launch them with `<sub-pane-launch-command>`
+  (plain `pi` if no model was specified); close them when done.
+
 ## Standing orders
 Follow /Users/moses/code/docs/orchestration-playbook.md § "Sub-agent standing
 orders": use the bmad-quick-dev skill; clarify questions halt for relay;
