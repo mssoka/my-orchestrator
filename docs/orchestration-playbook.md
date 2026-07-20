@@ -3,7 +3,7 @@
 How the pi orchestrator (mayor) dispatches and tracks work across the repos in
 `/Users/moses/code` using Herdr + the BMAD quick-dev workflow.
 
-Setting up a new machine? See `docs/mayor-setup-guide.md`.
+Setting up a new machine? See `README.md` ("Setting up a new machine").
 
 Read this at the start of any orchestration session. Sub-agent briefings link
 here for standing orders.
@@ -14,13 +14,20 @@ here for standing orders.
   user intent, runs intake, writes briefings, dispatches sub-agents, relays
   clarify Q&A, tracks progress, closes out jobs.
 - **Task sub-agent** — a `pi` agent in a named pane in the `orchestrator`
-  Herdr workspace (`w7`), one per job, working in a git worktree of the
+  Herdr workspace (currently `wA`, label "code" — ids are ephemeral,
+  re-resolve at session start), one per job, working in a git worktree of the
   target repo. May spawn its own throwaway sub-agents via the herdr skill
   and must close them when done.
 
 ## Durable state
 
-- Job ledger: `/Users/moses/code/_bmad-output/orchestrator-jobs.yaml`
+- Job ledger: **SQLite** at `/Users/moses/code/_bmad-output/orchestrator.db`,
+  accessed via the helper `/Users/moses/code/bin/ledger` (python3, stdlib
+  only). `ledger` lists active jobs; `ledger all|show <id>|events|json` for
+  reads; `ledger add <id> k=v ...` and `ledger set <id> <status> [note]` for
+  writes. Every write appends to `job_events` (audit trail). `ledger backup`
+  dumps SQL to `_bmad-output/backups/`. The old `orchestrator-jobs.yaml` is
+  retired (pointer file only).
 - Briefings: `/Users/moses/code/_bmad-output/briefings/<job-id>.md`
 - The ledger is the source of truth across Herdr restarts. Update it on every
   status transition.
@@ -57,12 +64,12 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
    Parse `result.root_pane.pane_id` and `result.worktree.path`
    (`~/.herdr/worktrees/<repo>/<slug>`). Note: this also auto-opens a
    source-repo workspace — leave it, it is handy for main-checkout access.
-3. Move the pane into the orchestrator workspace (`w7`). Panes first, tabs
-   on overflow: if the target tab already has 2 panes (or would go below
-   ~100 cols/pane), use a new tab; otherwise split the current tab:
+3. Move the pane into the orchestrator workspace (currently `wA`). Panes
+   first, tabs on overflow: if the target tab already has 2 panes (or would
+   go below ~100 cols/pane), use a new tab; otherwise split the current tab:
    ```bash
-   herdr pane move <pane> --tab <w7-tab> --split right --no-focus      # panes first
-   herdr pane move <pane> --new-tab --workspace w7 --label <job-id> --no-focus  # overflow
+   herdr pane move <pane> --tab <orch-tab> --split right --no-focus      # panes first
+   herdr pane move <pane> --new-tab --workspace <orch-ws> --label <job-id> --no-focus  # overflow
    ```
    Re-read the new pane id from the JSON response. Rename the pane
    (`herdr pane rename <pane> <job-id>`) and tab (`herdr tab rename`).
@@ -81,7 +88,12 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
      symlink the same way. Gitignore rules apply in the worktree too, so the
      symlinks are never committed.
    - Tell the sub-agent in the briefing which env files were linked.
-5. Record the job in the ledger (status `dispatched`).
+5. Record the job in the ledger (status `dispatched`):
+   ```bash
+   /Users/moses/code/bin/ledger add <job-id> repo=<repo> repo_root=<root> \
+     slug=<slug> base=<base> worktree=<path> pane_id=<pane> tab_id=<tab> \
+     briefing=<briefing-path> github_issue=<n>   # model=<m> if set
+   ```
 6. Launch pi and hand over — append `--model <model>` when the job has one
    in the ledger, otherwise launch plain:
    ```bash
@@ -113,6 +125,11 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
   change out in the PR description. **Never commit env files or secrets.**
 - When blocked or finished, run:
   `herdr notification show "<job-id>" --body "<one-line status>"`
+- **Self-report every status transition** to the ledger as it happens:
+  `/Users/moses/code/bin/ledger set <job-id> <status> "<one-line note>"`
+  (e.g. `clarifying` when you halt with questions, `working` once answers
+  arrive, `in-review` when the PR opens). The orchestrator's watcher reads
+  this; do not skip it.
 - On completion: commit on `<slug>`, `git push -u origin <slug>`, open a PR
   targeting `<base>` (`gh pr create --base <base>`; `glab mr create` for
   GitLab). End your final message with: summary, files changed, PR URL.
@@ -121,16 +138,22 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
 
 ## Tracking (orchestrator)
 
-- Dashboard: `herdr agent list` and `herdr pane list --workspace w7`.
-- Wait/inspect: `herdr wait agent-status <pane> --status done --timeout N`,
-  then `herdr pane read <pane> --source recent-unwrapped --lines 120`.
+- Dashboard: `herdr agent list` and `/Users/moses/code/bin/ledger`.
+- **mayor-watch** (`.pi/extensions/mayor-watch.ts`) polls `herdr agent list`
+  every 30s, diffs ledger-tracked panes, and injects a message into this
+  session when one transitions to `idle`/`done`/`blocked` (or vanishes). On
+  such a message: read the transcript (`herdr pane read <pane> --source
+  recent-unwrapped --lines 120`), classify (clarify halt vs finished vs
+  error), update the ledger, relay to the user.
+- Manual wait/inspect: `herdr wait agent-status <pane> --status done --timeout N`.
   Treat `idle` and `done` as completed; `blocked` needs input.
 - **Clarify relay**: when a sub-agent halts with numbered questions
   (quick-dev step-01), paste them verbatim to the user, then send the reply
   with `herdr agent send <pane> "<answers>"` (or the user answers directly
   in the pane).
 - Ledger statuses: `dispatched → clarifying → working → in-review → done`
-  (`blocked` any time).
+  (`blocked` any time). Sub-agents self-report via `bin/ledger set`; the
+  orchestrator verifies and owns `done`.
 
 ## Close-out (after the user acks the summary)
 
@@ -142,12 +165,18 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
    git -C <repo_root> branch -D <slug>
    ```
    PR still open → keep both, ledger stays `in-review`.
-3. Ledger → `done` with one-line result + PR URL.
+3. Ledger → `done` with one-line result + PR URL:
+   `bin/ledger set <job-id> done "<result>" && bin/ledger clear-pane <job-id>`
+   (record the PR via `bin/ledger note <job-id> "pr: <url>"`).
 4. `herdr notification show "done: <job-id>"`.
 
 Note: `herdr worktree remove` only works while the workspace is rooted at
-the worktree; since panes are moved into `w7`, cleanup is the manual git
-sequence above.
+the worktree; since panes are moved into the orchestrator workspace, cleanup
+is the manual git sequence above.
+
+Note: Herdr workspace/pane ids (`wA`, `w7`, ...) are ephemeral across Herdr
+restarts — re-resolve them with `herdr agent list` at session start and
+update the ledger's `pane_id` fields; never trust ids from an old session.
 
 ## Concurrency
 

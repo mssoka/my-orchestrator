@@ -20,32 +20,39 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const MAYOR_DIR = "/Users/moses/code";
 const PLAYBOOK = "/Users/moses/code/docs/orchestration-playbook.md";
-const LEDGER = "/Users/moses/code/_bmad-output/orchestrator-jobs.yaml";
+const LEDGER_HELPER = "/Users/moses/code/bin/ledger";
+const LEDGER_DB = "/Users/moses/code/_bmad-output/orchestrator.db";
 
 const STANDING_ORDERS = `
 ## Mayor standing orders (enforced by .pi/extensions/mayor.ts)
 
 You are the orchestrator for ${MAYOR_DIR}; you dispatch, you do not implement.
 - Playbook: ${PLAYBOOK}
-- Job ledger: ${LEDGER} — update it on every status transition.
+- Job ledger: SQLite at ${LEDGER_DB} — query via \`${LEDGER_HELPER}\`
+  (active jobs), update on every status transition via
+  \`${LEDGER_HELPER} set <job-id> <status> "<note>"\`.
 - On your first action of a session, and after any compaction: read the
-  playbook and ledger, and reconcile the ledger against live Herdr state
-  (\`herdr agent list\`, \`herdr pane list --workspace w7\`).
+  playbook, run \`${LEDGER_HELPER}\`, and reconcile against live Herdr state
+  (\`herdr agent list\`). Herdr workspace/pane ids are ephemeral across
+  restarts — re-resolve them; never trust ids from an old session.
+- mayor-watch (mayor-watch.ts) injects a message when a ledger-tracked pane
+  transitions to idle/done/blocked — read the transcript, classify, update
+  the ledger, relay to the user.
 - Never implement in a main checkout; dispatch into Herdr worktrees.
 - Never merge PRs. Max 3 concurrent task panes unless the user says otherwise.
 `;
 
 const STARTUP_CHECKLIST =
-  `Mayor startup checklist: read ${PLAYBOOK} and ${LEDGER}, then reconcile ` +
-  "the ledger against live Herdr state (`herdr agent list`, " +
-  "`herdr pane list --workspace w7`). Reply with a short readiness report: " +
-  "active jobs, blocked jobs needing relay, free pane slots. If the ledger " +
-  "is empty and nothing is running, say so in one line.";
+  `Mayor startup checklist: read ${PLAYBOOK} and run \`${LEDGER_HELPER}\`, ` +
+  "then reconcile the ledger against live Herdr state (`herdr agent list`). " +
+  "Reply with a short readiness report: active jobs, blocked jobs needing " +
+  "relay, free pane slots. If the ledger is empty and nothing is running, " +
+  "say so in one line.";
 
 const REGROUND =
   "This session was just compacted — job details from message history may " +
-  `be stale or summarized away. Re-read ${LEDGER} and reconcile against ` +
-  "`herdr agent list` before continuing any orchestration work.";
+  `be stale or summarized away. Run \`${LEDGER_HELPER}\` and reconcile ` +
+  "against `herdr agent list` before continuing any orchestration work.";
 
 export default function mayor(pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {

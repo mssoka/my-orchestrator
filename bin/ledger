@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""ledger — CLI for the orchestrator job ledger (SQLite).
+
+DB: /Users/moses/code/_bmad-output/orchestrator.db (source of truth; the old
+orchestrator-jobs.yaml is retired). Used by the mayor session, sub-agents
+(self-reporting transitions), and the mayor-watch pi extension.
+
+Usage:
+  ledger                     # active jobs (status != done), table view
+  ledger all                 # all jobs, table view
+  ledger show <id>           # one job + its event history
+  ledger events [n]          # last n events across all jobs (default 20)
+  ledger add <id> k=v ...    # insert job (keys: repo repo_root slug base model
+                             #   worktree pane_id tab_id status started_at
+                             #   briefing pr result github_issue parent note)
+  ledger set <id> <status> [note]   # transition status (+ event row)
+  ledger note <id> <text>           # event row without status change
+  ledger clear-pane <id>            # null out pane_id/tab_id (close-out)
+  ledger backup              # .dump to _bmad-output/backups/orchestrator-<ts>.sql
+  ledger json [active|all]   # machine-readable output
+Statuses: dispatched clarifying working in-review blocked done
+"""
+import sqlite3, sys, os, datetime
+
+DB = "/Users/moses/code/_bmad-output/orchestrator.db"
+BACKUPS = "/Users/moses/code/_bmad-output/backups"
+STATUSES = {"dispatched", "clarifying", "working", "in-review", "blocked", "done"}
+COLUMNS = {"repo", "repo_root", "slug", "base", "model", "worktree", "pane_id",
+           "tab_id", "status", "started_at", "briefing", "pr", "result",
+           "github_issue", "parent", "note"}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  repo TEXT, repo_root TEXT, slug TEXT, base TEXT,
+  model TEXT, worktree TEXT, pane_id TEXT, tab_id TEXT,
+  status TEXT NOT NULL DEFAULT 'dispatched'
+    CHECK (status IN ('dispatched','clarifying','working','in-review','blocked','done')),
+  started_at TEXT, briefing TEXT, pr TEXT, result TEXT,
+  github_issue INTEGER, parent TEXT, note TEXT
+);
+CREATE TABLE IF NOT EXISTS job_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  ts TEXT NOT NULL,
+  from_status TEXT,
+  to_status TEXT,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_job ON job_events(job_id);
+"""
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def connect():
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=5000")
+    return c
+
+def init(c):
+    c.executescript(SCHEMA)
+    # WAL persists in the DB file; set it once (harmless to repeat).
+    c.execute("PRAGMA journal_mode=WAL")
+    c.commit()
+
+def event(c, job_id, frm, to, note):
+    c.execute("INSERT INTO job_events (job_id, ts, from_status, to_status, note) VALUES (?,?,?,?,?)",
+              (job_id, now(), frm, to, note))
+
+def table(rows, cols):
+    if not rows:
+        print("(no jobs)")
+        return
+    widths = {k: max(len(str(r[k] or "")), len(k)) for k in cols for r in rows}
+    # cap wide columns
+    for k in widths:
+        widths[k] = min(widths[k], 44 if k in ("worktree", "briefing", "result", "note") else 24)
+    def fmt(v, k):
+        s = str(v if v is not None else "")
+        return s[:widths[k] - 1] + "…" if len(s) > widths[k] else s.ljust(widths[k])
+    print("  ".join(k.ljust(widths[k]) for k in cols))
+    print("  ".join("-" * widths[k] for k in cols))
+    for r in rows:
+        print("  ".join(fmt(r[k], k) for k in cols))
+
+def main():
+    args = sys.argv[1:]
+    c = connect()
+    init(c)
+    cmd = args[0] if args else "active"
+
+    if cmd in ("active", "all", "json"):
+        which = args[1] if cmd == "json" and len(args) > 1 else cmd
+        q = "SELECT * FROM jobs" + ("" if which == "all" else " WHERE status != 'done'") + " ORDER BY started_at"
+        rows = c.execute(q).fetchall()
+        if cmd == "json":
+            import json
+            print(json.dumps([dict(r) for r in rows], indent=1))
+        else:
+            table(rows, ["id", "status", "pane_id", "github_issue", "started_at", "result"])
+
+    elif cmd == "show" and len(args) == 2:
+        r = c.execute("SELECT * FROM jobs WHERE id=?", (args[1],)).fetchone()
+        if not r:
+            sys.exit(f"no such job: {args[1]}")
+        for k in r.keys():
+            print(f"{k:14} {r[k] if r[k] is not None else ''}")
+        print("\nevents:")
+        for e in c.execute("SELECT * FROM job_events WHERE job_id=? ORDER BY id", (args[1],)):
+            print(f"  {e['ts']}  {e['from_status'] or '—'} -> {e['to_status'] or '—'}  {e['note'] or ''}")
+
+    elif cmd == "events":
+        n = int(args[1]) if len(args) > 1 else 20
+        for e in c.execute("SELECT * FROM job_events ORDER BY id DESC LIMIT ?", (n,)):
+            print(f"{e['ts']}  {e['job_id']}  {e['from_status'] or '—'} -> {e['to_status'] or '—'}  {e['note'] or ''}")
+
+    elif cmd == "add" and len(args) >= 2:
+        job_id = args[1]
+        kv = {}
+        for pair in args[2:]:
+            if "=" not in pair:
+                sys.exit(f"bad k=v: {pair}")
+            k, v = pair.split("=", 1)
+            if k not in COLUMNS:
+                sys.exit(f"unknown column: {k} (allowed: {' '.join(sorted(COLUMNS))})")
+            kv[k] = v if v != "null" else None
+        if "status" in kv and kv["status"] not in STATUSES:
+            sys.exit(f"bad status: {kv['status']}")
+        kv.setdefault("status", "dispatched")
+        kv.setdefault("started_at", now())
+        cols = ["id"] + list(kv)
+        c.execute(f"INSERT INTO jobs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                  [job_id] + [kv[k] for k in kv])
+        event(c, job_id, None, kv["status"], "added")
+        c.commit()
+        print(f"added {job_id} ({kv['status']})")
+
+    elif cmd == "set" and len(args) >= 3:
+        job_id, status = args[1], args[2]
+        note = " ".join(args[3:]) or None
+        if status not in STATUSES:
+            sys.exit(f"bad status: {status} (one of {' '.join(sorted(STATUSES))})")
+        r = c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not r:
+            sys.exit(f"no such job: {job_id}")
+        if r["status"] == status:
+            print(f"{job_id} already {status}")
+            return
+        c.execute("UPDATE jobs SET status=? WHERE id=?", (status, job_id))
+        event(c, job_id, r["status"], status, note)
+        c.commit()
+        print(f"{job_id}: {r['status']} -> {status}")
+
+    elif cmd == "pr" and len(args) == 3:
+        r = c.execute("SELECT status FROM jobs WHERE id=?", (args[1],)).fetchone()
+        if not r:
+            sys.exit(f"no such job: {args[1]}")
+        c.execute("UPDATE jobs SET pr=? WHERE id=?", (args[2], args[1]))
+        event(c, args[1], r["status"], r["status"], f"pr: {args[2]}")
+        c.commit()
+        print(f"{args[1]}: pr set")
+
+    elif cmd == "note" and len(args) >= 3:
+        job_id, text = args[1], " ".join(args[2:])
+        r = c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not r:
+            sys.exit(f"no such job: {job_id}")
+        event(c, job_id, r["status"], r["status"], text)
+        c.commit()
+        print(f"{job_id}: noted")
+
+    elif cmd == "clear-pane" and len(args) == 2:
+        c.execute("UPDATE jobs SET pane_id=NULL, tab_id=NULL WHERE id=?", (args[1],))
+        event(c, args[1], None, None, "pane closed")
+        c.commit()
+        print(f"{args[1]}: pane cleared")
+
+    elif cmd == "backup":
+        os.makedirs(BACKUPS, exist_ok=True)
+        ts = now().replace(":", "").replace("-", "")
+        path = os.path.join(BACKUPS, f"orchestrator-{ts}.sql")
+        with open(path, "w") as f:
+            f.write("\n".join(c.iterdump()))
+        print(path)
+
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
