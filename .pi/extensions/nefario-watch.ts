@@ -28,6 +28,13 @@
  * (pull base, remove worktree/branch, close pane, ledger done). On CLOSED
  * unmerged: wakes Gru to ask the user. Terminal states alert once per job;
  * Gru owns every ledger transition — this extension only detects.
+ *
+ * CI sensor (same 5-min tick): for OPEN in-review PRs, inspects
+ * statusCheckRollup and wakes Gru when any check completes with a failing
+ * conclusion (FAILURE/TIMED_OUT/STARTUP_FAILURE/ACTION_REQUIRED; StatusContext
+ * FAILURE/ERROR). Alerts once per head sha — a new push re-arms, and checks
+ * returning green re-arms too. CANCELLED is ignored (superseded runs are
+ * normal when pushing repeatedly).
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -175,6 +182,8 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 	const prStates = new Map<string, string>();
 	/** job_id already alerted for a terminal state — alert once, ever. */
 	const prAlerted = new Set<string>();
+	/** job_id -> head sha already CI-alerted on (deleted when checks recover). */
+	const ciAlerted = new Map<string, string>();
 
 	async function inReviewJobs(): Promise<ReviewJob[]> {
 		const r = await pi.exec(
@@ -194,14 +203,48 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		}
 	}
 
-	async function prState(url: string): Promise<string | null> {
-		const r = await pi.exec("gh", ["pr", "view", url, "--json", "state"], {
-			timeout: 20_000,
-		});
+	interface PrInfo {
+		state: string;
+		headSha: string | null;
+		/** Names of checks that completed with a failing conclusion. */
+		failing: string[];
+	}
+
+	const FAIL_CONCLUSIONS = new Set([
+		"FAILURE",
+		"TIMED_OUT",
+		"STARTUP_FAILURE",
+		"ACTION_REQUIRED",
+	]);
+
+	async function prInfo(url: string): Promise<PrInfo | null> {
+		const r = await pi.exec(
+			"gh",
+			["pr", "view", url, "--json", "state,headRefOid,statusCheckRollup"],
+			{ timeout: 20_000 },
+		);
 		if (r.code !== 0) return null; // gh missing/offline/rate-limited — skip
 		try {
-			const s = JSON.parse(r.stdout)?.state;
-			return typeof s === "string" ? s : null;
+			const j = JSON.parse(r.stdout);
+			const state = j?.state;
+			if (typeof state !== "string") return null;
+			const failing: string[] = [];
+			for (const c of j?.statusCheckRollup ?? []) {
+				// Two shapes: CheckRun {name,status,conclusion} and
+				// StatusContext {context,state}. Skip in-flight CheckRuns.
+				if (c?.status !== undefined && c.status !== "COMPLETED") continue;
+				const bad =
+					(typeof c?.conclusion === "string" &&
+						FAIL_CONCLUSIONS.has(c.conclusion)) ||
+					c?.state === "FAILURE" ||
+					c?.state === "ERROR";
+				if (bad) failing.push(c.name ?? c.context ?? "unknown");
+			}
+			return {
+				state,
+				headSha: typeof j?.headRefOid === "string" ? j.headRefOid : null,
+				failing,
+			};
 		} catch {
 			return null;
 		}
@@ -215,19 +258,39 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			const alerts: string[] = [];
 			for (const job of jobs) {
 				if (!job.pr) continue;
-				const cur = await prState(job.pr);
-				if (cur === null) continue;
-				prStates.set(job.id, cur);
-				const terminal = cur === "MERGED" || cur === "CLOSED";
-				if (!terminal || prAlerted.has(job.id)) continue;
+				const info = await prInfo(job.pr);
+				if (info === null) continue;
+				prStates.set(job.id, info.state);
+				const terminal = info.state === "MERGED" || info.state === "CLOSED";
+				if (!terminal) {
+					// CI sensor: alert once per head sha while checks fail.
+					if (info.failing.length === 0) {
+						ciAlerted.delete(job.id); // recovered/pending — re-arm
+					} else if (ciAlerted.get(job.id) !== (info.headSha ?? "")) {
+						ciAlerted.set(job.id, info.headSha ?? "");
+						alerts.push(
+							`- ${job.id}: CI FAILING — ${job.pr}` +
+								(job.pane_id ? ` (pane ${job.pane_id})` : "") +
+								` — failed check(s): ${info.failing.join(", ")}. ` +
+								"Investigate: `gh run list --repo <repo> --branch <slug>`, " +
+								"`gh run view <run-id> --repo <repo> --log-failed`. Infra " +
+								"flake → `gh run rerun <run-id> --repo <repo> --failed`; " +
+								'real failure → relay to the minion: `herdr pane run <pane> "<failure summary + instruction>"`.',
+						);
+					}
+					continue;
+				}
+				if (prAlerted.has(job.id)) continue;
 				prAlerted.add(job.id);
-				if (cur === "MERGED") {
+				if (info.state === "MERGED") {
 					alerts.push(
 						`- ${job.id}: PR MERGED — ${job.pr}` +
 							(job.pane_id ? ` (pane ${job.pane_id})` : "") +
-							". Run close-out: `git -C <repo> pull --ff-only origin <base>`, " +
-							"remove worktree + branch, close the pane, `" +
-							`${LEDGER_HELPER} set ${job.id} done "<result>"\` + clear-pane.`,
+							". Run close-out (ledger FIRST, pane LAST — playbook " +
+							"'Close-out'): `" +
+							`${LEDGER_HELPER} set ${job.id} done "<result>"\` + clear-pane, ` +
+							"`git -C <repo> pull --ff-only origin <base>`, remove worktree " +
+							"+ branch, close the pane.",
 					);
 				} else {
 					alerts.push(
@@ -241,7 +304,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 				{
 					customType: "nefario-watch",
 					content:
-						"[nefario-watch] PR state change on in-review job(s):\n" +
+						"[nefario-watch] PR/CI alert on in-review job(s):\n" +
 						alerts.join("\n"),
 					display: true,
 				},

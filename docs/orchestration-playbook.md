@@ -177,6 +177,11 @@ older briefings use that name; this is the same section.)
   2. **PR watcher (5 min):** polls `gh pr view` for jobs in `in-review` with
      a recorded PR. On MERGED: run close-out (which now includes pulling the
      base). On CLOSED-unmerged: ask the user (abandon vs reopen/fix).
+  3. **CI sensor (same 5-min tick):** for OPEN in-review PRs, alerts when a
+     check completes failing (once per head sha; a new push or a recovery
+     re-arms). On such a message: pull the failed log (`gh run view <run-id>
+     --log-failed`); infra flake → `gh run rerun <run-id> --failed`; real
+     failure → relay to the minion with `herdr pane run <pane> "..."`.
   nefario-watch only DETECTS — it never writes the ledger. **Transition
   ownership:** merges are performed only by the human on GitHub; every ledger
   transition (including `in-review  done` at close-out) is performed by Gru
@@ -193,8 +198,16 @@ older briefings use that name; this is the same section.)
 
 ## Close-out (after the user acks the summary, or nefario-watch reports the PR merged)
 
-1. `herdr pane close <pane>` for the minion and any leftover mega-minion
-   panes; close the tab if empty.
+Order matters: ledger FIRST, panes LAST. The pane watcher diffs
+ledger-tracked panes every 30s — if a pane dies while the ledger still
+tracks it, Gru gets a false "pane vanished / Herdr restarted" alert.
+`clear-pane` first means the close is invisible to the watcher. Trade-off:
+if cleanup fails after the ledger flip, the ledger says `done` while
+debris remains — acceptable, since failures are reported to the user.
+
+1. Ledger → `done` with one-line result + PR URL:
+   `bin/ledger set <job-id> done "<result>" && bin/ledger clear-pane <job-id>`
+   (record the PR via `bin/ledger pr <job-id> <url>`).
 2. PR merged → sync the local base branch, then remove the worktree and
    branch:
    ```bash
@@ -205,9 +218,8 @@ older briefings use that name; this is the same section.)
    `--ff-only` never mangles a diverged/dirty checkout — if it fails, report
    it to the user instead of forcing. PR still open → keep worktree + branch,
    ledger stays `in-review`.
-3. Ledger → `done` with one-line result + PR URL:
-   `bin/ledger set <job-id> done "<result>" && bin/ledger clear-pane <job-id>`
-   (record the PR via `bin/ledger pr <job-id> <url>`).
+3. `herdr pane close <pane>` for the minion and any leftover mega-minion
+   panes; close the tab if empty.
 4. `herdr notification show "done: <job-id>"`.
 
 Note: `herdr worktree remove` only works while the workspace is rooted at
