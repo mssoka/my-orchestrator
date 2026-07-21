@@ -1,18 +1,17 @@
 /**
- * mayor-watch — idle/blocked detection for orchestrator sub-agents.
+ * nefario-watch (gru-watch.ts) — idle/blocked detection for minions.
  *
- * Project-local (loads only when cwd is /Users/moses/code, i.e. the mayor
+ * Project-local (loads only when cwd is /Users/moses/code, i.e. the Gru
  * session). Polls `herdr agent list` every 30s, diffs the agent_status of
  * every ledger-tracked pane (SQLite ledger, non-done jobs with a pane_id),
  * and injects a message into this session when one transitions to
  * idle/done/blocked or vanishes.
  *
  * Why: a pi agent halted at its prompt (e.g. quick-dev step-01 clarify)
- * reports `idle`, which no human notification reliably reaches the mayor —
- * the sub-agent's `herdr notification show` only toasts the human. This
- * extension is the machine channel: the injected message triggers a turn,
- * and the mayor reads the transcript, classifies, updates the ledger, and
- * relays.
+ * reports `idle`, which no human notification reliably reaches Gru — the
+ * minion's `herdr notification show` only toasts the human. This extension
+ * is the machine channel: the injected message triggers a turn, and Gru
+ * reads the transcript, classifies, updates the ledger, and relays.
  *
  * Alert policy:
  * - Alert only on TRANSITIONS into idle/done/blocked (no repeats while a
@@ -21,13 +20,13 @@
  * - At session_start: silent snapshot, plus a one-time catch-up digest
  *   (deliverAs nextTurn — no turn triggered) for any pane already stopped
  *   while its ledger status says it should be running.
- * - The mayor pane itself and untracked panes are ignored by construction
+ * - The Gru pane itself and untracked panes are ignored by construction
  *   (diff is driven by the ledger's pane_id list).
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const MAYOR_DIR = "/Users/moses/code";
+const GRU_DIR = "/Users/moses/code";
 const DB = "/Users/moses/code/_bmad-output/orchestrator.db";
 const LEDGER_HELPER = "/Users/moses/code/bin/ledger";
 const POLL_MS = 30_000;
@@ -42,7 +41,7 @@ interface TrackedJob {
 	status: string;
 }
 
-export default function mayorWatch(pi: ExtensionAPI) {
+export default function nefarioWatch(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let ticking = false;
 	/** job_id -> last observed agent_status ("gone" when the pane vanished). */
@@ -116,8 +115,8 @@ export default function mayorWatch(pi: ExtensionAPI) {
 					if (initial && STOPPED.has(cur) && !SETTLED.has(job.status)) {
 						alerts.push(
 							`- ${job.id} (${pane}): '${cur}' at session start while ` +
-								`ledger says '${job.status}' — likely stopped while the ` +
-								"mayor session was down.",
+								`ledger says '${job.status}' — likely stopped while ` +
+								"Gru was down.",
 						);
 					}
 					continue;
@@ -137,9 +136,9 @@ export default function mayorWatch(pi: ExtensionAPI) {
 
 			pi.sendMessage(
 				{
-					customType: "mayor-watch",
+					customType: "gru-watch",
 					content:
-						"[mayor-watch] status change on ledger-tracked job(s):\n" +
+						"[gru-watch] status change on ledger-tracked job(s):\n" +
 						alerts.join("\n") +
 						"\nFor each: `herdr pane read <pane> --source recent-unwrapped " +
 						"--lines 120`, classify (clarify halt vs finished vs error), " +
@@ -149,7 +148,7 @@ export default function mayorWatch(pi: ExtensionAPI) {
 				},
 				initial
 					? { deliverAs: "nextTurn" } // digest rides the first prompt; no turn
-					: { deliverAs: "followUp", triggerTurn: true }, // wake the mayor
+					: { deliverAs: "followUp", triggerTurn: true }, // wake Gru
 			);
 		} finally {
 			ticking = false;
@@ -157,7 +156,7 @@ export default function mayorWatch(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (ctx.cwd !== MAYOR_DIR) return;
+		if (ctx.cwd !== GRU_DIR) return;
 		if (timer) return; // idempotent — one watcher per session
 		await tick(true);
 		timer = setInterval(() => {

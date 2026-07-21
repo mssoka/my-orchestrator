@@ -1,9 +1,13 @@
 # Orchestrator root (`~/code`)
 
-Multi-repo workspace run by a single pi **mayor** session. The mayor receives
-intent, dispatches work to sub-agents in Herdr worktrees, relays their
+Multi-repo workspace run by a single pi **Gru** session. Gru receives
+intent, dispatches work to minions in Herdr worktrees, relays their
 questions, tracks them in a SQLite ledger, and never implements or merges
 itself.
+
+Naming theme (Despicable Me): **Gru** = the orchestrator, **minion** = a
+dispatched task agent (one per job), **mega-minion** = a specialist helper a
+minion spawns (e.g. a review swarm), **nefario-watch** = the watcher gadget.
 
 - Operating procedure: [docs/orchestration-playbook.md](docs/orchestration-playbook.md)
 - Interactive explainer (open in a browser):
@@ -12,12 +16,12 @@ itself.
 ## Architecture at a glance
 
 ```
- you ──► mayor pi session (cwd = this root)
-         │  .pi/extensions/mayor.ts        standing orders + startup checklist
-         │  .pi/extensions/mayor-watch.ts  polls Herdr, wakes mayor on changes
+ you ──► Gru pi session (cwd = this root)
+         │  .pi/extensions/gru.ts        standing orders + startup checklist
+         │  .pi/extensions/gru-watch.ts  polls Herdr, wakes Gru on changes
          │
          ├──► Herdr  workspaces/tabs/panes + git worktrees
-         │      └──► sub-agent pi sessions (one per job, in a worktree)
+         │      └──► minion pi sessions (one per job, in a worktree)
          │             ├── BMAD skills (bmad-quick-dev, Paige, …)
          │             ├── bin/ledger set …      self-reports status ──┐
          │             └── gh pr create ──► human reviews & merges   │
@@ -28,31 +32,31 @@ itself.
 
 | Component | Role |
 |---|---|
-| **pi mayor session** | Orchestrator. Runs only in this root; the extensions below are project-local so repo/worktree sessions are unaffected. |
-| **`.pi/extensions/mayor.ts`** | Enforces standing orders: injects them into the system prompt every turn, fires the startup checklist, re-grounds after compaction. |
-| **`.pi/extensions/mayor-watch.ts`** | Watcher. Every 30s diffs `herdr agent list` against ledger-tracked panes; when one stops (idle/done/blocked) or vanishes, injects a message that wakes the mayor. |
+| **Gru pi session** | Orchestrator. Runs only in this root; the extensions below are project-local so repo/worktree sessions are unaffected. |
+| **`.pi/extensions/gru.ts`** | Enforces standing orders: injects them into the system prompt every turn, fires the startup checklist, re-grounds after compaction. |
+| **`.pi/extensions/gru-watch.ts`** | Watcher. Every 30s diffs `herdr agent list` against ledger-tracked panes; when one stops (idle/done/blocked) or vanishes, injects a message that wakes Gru. |
 | **Herdr** | Terminal multiplexer + runtime for agents. Provides workspaces/tabs/panes, agent status detection, `herdr wait`, notifications, and git worktree management. |
-| **BMAD skills** | `bmad-*` skills (installer-managed per repo, symlinked into `~/.pi/agent/skills/`). Sub-agents execute with `bmad-quick-dev`; specialist personas (e.g. Paige the tech writer) handle copy/docs. |
+| **BMAD skills** | `bmad-*` skills (installer-managed per repo, symlinked into `~/.pi/agent/skills/`). Minions execute with `bmad-quick-dev`; specialist personas (e.g. Paige the tech writer) handle copy/docs. |
 | **SQLite ledger** | `_bmad-output/orchestrator.db` — durable job state across Herdr restarts. Two tables: `jobs` (current state) and `job_events` (audit trail of every transition). Accessed via `bin/ledger`. |
-| **`bin/ledger`** | Python3-stdlib CLI used by the mayor, by sub-agents (self-reporting), and by mayor-watch. Concurrency-safe (WAL + busy timeout). |
-| **Briefings** | `_bmad-output/briefings/<job-id>.md` — the job contract a sub-agent reads at launch. |
-| **`gh` / `glab`** | Sub-agents push their branch and open PRs targeting the repo's base branch. The human merges. |
+| **`bin/ledger`** | Python3-stdlib CLI used by Gru, by minions (self-reporting), and by nefario-watch. Concurrency-safe (WAL + busy timeout). |
+| **Briefings** | `_bmad-output/briefings/<job-id>.md` — the job contract a minion reads at launch. |
+| **`gh` / `glab`** | Minions push their branch and open PRs targeting the repo's base branch. The human merges. |
 
 ## How a job flows
 
-1. **Intake** — mayor resolves repo + base branch, asks only blocking questions.
+1. **Intake** — Gru resolves repo + base branch, asks only blocking questions.
 2. **Briefing** — written to `_bmad-output/briefings/<job-id>.md`.
 3. **Dispatch** — `herdr worktree create`, pane moved into the orchestrator
    workspace, worktree bootstrapped (`_bmad` copy, `.env` symlinks),
    `bin/ledger add <job-id> …` (status `dispatched`), pi launched, handover
    message sent.
-4. **Work** — sub-agent runs bmad-quick-dev. On every status change it
+4. **Work** — minion runs bmad-quick-dev. On every status change it
    self-reports: `bin/ledger set <job-id> <status> "<note>"`.
-5. **Clarify relay** — if it halts with numbered questions, mayor-watch sees
-   the pane go idle and wakes the mayor, who pastes the questions to you
+5. **Clarify relay** — if it halts with numbered questions, nefario-watch sees
+   the pane go idle and wakes Gru, who pastes the questions to you
    verbatim and relays your answers back.
-6. **Review** — sub-agent pushes, opens a PR, reports `in-review`, fires
-   `herdr notification show`. You review and merge. **The mayor never merges.**
+6. **Review** — minion pushes, opens a PR, reports `in-review`, fires
+   `herdr notification show`. You review and merge. **The Gru never merges.**
 7. **Close-out** — after your ack: panes closed, PR merged → worktree +
    branch removed, `bin/ledger set <job-id> done "<result>"`.
 
@@ -83,14 +87,14 @@ re-resolve with `herdr agent list`; never trust ids from an old session.
 ## Setting up a new machine
 
 Replicates this setup from scratch. (This section replaced
-`docs/mayor-setup-guide.md`.)
+`docs/gru-setup-guide.md`.)
 
 Target state:
 
 ```
 <root>/                              # e.g. ~/code — contains all repos
-├── .pi/extensions/mayor.ts          # standing orders (enforcement)
-├── .pi/extensions/mayor-watch.ts    # sub-agent watcher
+├── .pi/extensions/gru.ts          # standing orders (enforcement)
+├── .pi/extensions/gru-watch.ts    # minion watcher
 ├── bin/ledger                       # ledger CLI
 ├── .agents/skills/bmad-*            # BMAD skills (fresh install, step 2)
 ├── _bmad/                           # BMAD project config (fresh install)
@@ -146,8 +150,8 @@ rg -l '/Users/moses/code' .pi docs AGENTS.md _bmad-output bin \
   | xargs sed -i '' 's|/Users/moses/code|<root>|g'
 ```
 
-Verify by hand: `MAYOR_DIR`/`PLAYBOOK`/`LEDGER_*` in `.pi/extensions/mayor.ts`
-and `.pi/extensions/mayor-watch.ts`, root refs in
+Verify by hand: `MAYOR_DIR`/`PLAYBOOK`/`LEDGER_*` in `.pi/extensions/gru.ts`
+and `.pi/extensions/gru-watch.ts`, root refs in
 `docs/orchestration-playbook.md`, `_bmad-output/briefings/_template.md`,
 `AGENTS.md`, and the `DB` path at the top of `bin/ledger`.
 
@@ -163,12 +167,12 @@ ln -sfn ~/.agents/skills/herdr ~/.pi/agent/skills/herdr
 
 1. Inside Herdr, `cd <root>` and run `pi`. The workspace you launch in
    becomes the orchestrator workspace — no id is hardcoded anywhere; the
-   mayor re-resolves it via `herdr agent list` each session.
+   Gru re-resolves it via `herdr agent list` each session.
 2. `session_start` fires: the startup checklist arrives as a user message →
-   the mayor reads the playbook, runs `bin/ledger`, reconciles against
+   Gru reads the playbook, runs `bin/ledger`, reconciles against
    `herdr agent list`, and replies with a readiness report.
-3. Confirm the system prompt contains "Mayor standing orders" (injected
-   every turn, survives compaction) and that mayor-watch loaded without
+3. Confirm the system prompt contains "Gru standing orders" (injected
+   every turn, survives compaction) and that nefario-watch loaded without
    errors (it silently snapshots on `session_start`).
 4. Optional: dispatch one tiny job end-to-end to validate worktree creation,
    pane moves, briefing handoff, self-reporting, and watcher alerts.
@@ -177,8 +181,10 @@ ln -sfn ~/.agents/skills/herdr ~/.pi/agent/skills/herdr
 
 - The extensions only fire when `cwd` is exactly the root — sessions in
   repos or worktrees never orchestrate (by design).
-- Mayor never implements in main checkouts and never merges PRs; max 3
-  concurrent task panes unless the user says otherwise.
+- Gru never implements in main checkouts and never merges PRs; max 10
+  Gru-dispatched task panes unless the user says otherwise; minions may
+  fan out max 10 concurrent child panes each (closed before the parent
+  finishes).
 - The old YAML ledger (`orchestrator-jobs.yaml`) is retired; the DB is
   created on first `bin/ledger` run. Back up with `bin/ledger backup`.
 - If the harness ever changes (Claude Code, Codex, …), port the extensions;
