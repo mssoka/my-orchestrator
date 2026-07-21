@@ -63,11 +63,14 @@ here for standing orders.
 Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
 
 1. Write briefing to `_bmad-output/briefings/<job-id>.md` (template below).
-2. Create the worktree:
+2. Fetch the base and create the worktree **from `origin/<base>`**, so a
+   stale local base branch never affects the work:
    ```bash
-   herdr worktree create --cwd <repo_root> --branch <slug> --base <base> \
+   git -C <repo_root> fetch origin <base>     # skip if the repo has no remote
+   herdr worktree create --cwd <repo_root> --branch <slug> --base origin/<base> \
      --label <job-id> --no-focus --json
    ```
+   (No remote → fall back to `--base <base>`.)
    Parse `result.root_pane.pane_id` and `result.worktree.path`
    (`~/.herdr/worktrees/<repo>/<slug>`). Note: this also auto-opens a
    source-repo workspace — leave it, it is handy for main-checkout access.
@@ -151,12 +154,19 @@ older briefings use that name; this is the same section.)
 ## Tracking (Gru)
 
 - Dashboard: `herdr agent list` and `/Users/moses/code/bin/ledger`.
-- **nefario-watch** (`.pi/extensions/nefario-watch.ts`) polls `herdr agent list`
-  every 30s, diffs ledger-tracked panes, and injects a message into this
-  session when one transitions to `idle`/`done`/`blocked` (or vanishes). On
-  such a message: read the transcript (`herdr pane read <pane> --source
-  recent-unwrapped --lines 120`), classify (clarify halt vs finished vs
-  error), update the ledger, relay to the user.
+- **nefario-watch** (`.pi/extensions/nefario-watch.ts`) has two sensors:
+  1. **Pane watcher (30s):** diffs `herdr agent list` against ledger-tracked
+     panes; injects a message when one transitions to `idle`/`done`/`blocked`
+     (or vanishes). On such a message: read the transcript (`herdr pane read
+     <pane> --source recent-unwrapped --lines 120`), classify (clarify halt
+     vs finished vs error), update the ledger, relay to the user.
+  2. **PR watcher (5 min):** polls `gh pr view` for jobs in `in-review` with
+     a recorded PR. On MERGED: run close-out (which now includes pulling the
+     base). On CLOSED-unmerged: ask the user (abandon vs reopen/fix).
+  nefario-watch only DETECTS — it never writes the ledger. **Transition
+  ownership:** merges are performed only by the human on GitHub; every ledger
+  transition (including `in-review  done` at close-out) is performed by Gru
+  after verifying.
 - Manual wait/inspect: `herdr wait agent-status <pane> --status done --timeout N`.
   Treat `idle` and `done` as completed; `blocked` needs input.
 - **Clarify relay**: when a minion halts with numbered questions
@@ -167,16 +177,20 @@ older briefings use that name; this is the same section.)
   (`blocked` any time). Minions self-report via `bin/ledger set`; Gru
   verifies and owns `done`.
 
-## Close-out (after the user acks the summary)
+## Close-out (after the user acks the summary, or nefario-watch reports the PR merged)
 
 1. `herdr pane close <pane>` for the minion and any leftover mega-minion
    panes; close the tab if empty.
-2. PR merged → remove the worktree and branch:
+2. PR merged → sync the local base branch, then remove the worktree and
+   branch:
    ```bash
+   git -C <repo_root> pull --ff-only origin <base>   # main checkout sits on <base>
    git -C <repo_root> worktree remove --force <worktree_path>
    git -C <repo_root> branch -D <slug>
    ```
-   PR still open → keep both, ledger stays `in-review`.
+   `--ff-only` never mangles a diverged/dirty checkout — if it fails, report
+   it to the user instead of forcing. PR still open → keep worktree + branch,
+   ledger stays `in-review`.
 3. Ledger → `done` with one-line result + PR URL:
    `bin/ledger set <job-id> done "<result>" && bin/ledger clear-pane <job-id>`
    (record the PR via `bin/ledger pr <job-id> <url>`).

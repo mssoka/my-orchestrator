@@ -1,5 +1,5 @@
 /**
- * nefario-watch (nefario-watch.ts) — idle/blocked detection for minions.
+ * nefario-watch — idle/blocked detection for minions + PR merge detection.
  *
  * Project-local (loads only when cwd is /Users/moses/code, i.e. the Gru
  * session). Polls `herdr agent list` every 30s, diffs the agent_status of
@@ -13,7 +13,7 @@
  * is the machine channel: the injected message triggers a turn, and Gru
  * reads the transcript, classifies, updates the ledger, and relays.
  *
- * Alert policy:
+ * Alert policy (pane watcher):
  * - Alert only on TRANSITIONS into idle/done/blocked (no repeats while a
  *   pane stays put; a relayed answer flips it back to working → re-arms).
  * - Pane vanishing (Herdr restart, manual close) alerts once.
@@ -22,6 +22,12 @@
  *   while its ledger status says it should be running.
  * - The Gru pane itself and untracked panes are ignored by construction
  *   (diff is driven by the ledger's pane_id list).
+ *
+ * PR watcher (every 5 min): polls `gh pr view` for ledger jobs in
+ * 'in-review' with a recorded PR. On MERGED: wakes Gru to run close-out
+ * (pull base, remove worktree/branch, close pane, ledger done). On CLOSED
+ * unmerged: wakes Gru to ask the user. Terminal states alert once per job;
+ * Gru owns every ledger transition — this extension only detects.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -30,6 +36,7 @@ const GRU_DIR = "/Users/moses/code";
 const DB = "/Users/moses/code/_bmad-output/orchestrator.db";
 const LEDGER_HELPER = "/Users/moses/code/bin/ledger";
 const POLL_MS = 30_000;
+const PR_POLL_MS = 300_000;
 
 const STOPPED = new Set(["idle", "done", "blocked"]);
 /** Ledger statuses where a stopped pane is expected — no catch-up alert. */
@@ -39,6 +46,12 @@ interface TrackedJob {
 	id: string;
 	pane_id: string | null;
 	status: string;
+}
+
+interface ReviewJob {
+	id: string;
+	pr: string | null;
+	pane_id: string | null;
 }
 
 export default function nefarioWatch(pi: ExtensionAPI) {
@@ -155,6 +168,92 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		}
 	}
 
+	// ── PR watcher: detect merges of in-review jobs ─────────────────────
+	let prTimer: ReturnType<typeof setInterval> | null = null;
+	let prTicking = false;
+	/** job_id -> last gh pr state seen (OPEN / MERGED / CLOSED / ...). */
+	const prStates = new Map<string, string>();
+	/** job_id already alerted for a terminal state — alert once, ever. */
+	const prAlerted = new Set<string>();
+
+	async function inReviewJobs(): Promise<ReviewJob[]> {
+		const r = await pi.exec(
+			"sqlite3",
+			[
+				"-json",
+				DB,
+				"SELECT id, pr, pane_id FROM jobs WHERE status = 'in-review' AND pr IS NOT NULL",
+			],
+			{ timeout: 5000 },
+		);
+		if (r.code !== 0 || !r.stdout.trim()) return [];
+		try {
+			return JSON.parse(r.stdout) as ReviewJob[];
+		} catch {
+			return [];
+		}
+	}
+
+	async function prState(url: string): Promise<string | null> {
+		const r = await pi.exec("gh", ["pr", "view", url, "--json", "state"], {
+			timeout: 20_000,
+		});
+		if (r.code !== 0) return null; // gh missing/offline/rate-limited — skip
+		try {
+			const s = JSON.parse(r.stdout)?.state;
+			return typeof s === "string" ? s : null;
+		} catch {
+			return null;
+		}
+	}
+
+	async function prTick(initial: boolean): Promise<void> {
+		if (prTicking) return;
+		prTicking = true;
+		try {
+			const jobs = await inReviewJobs();
+			const alerts: string[] = [];
+			for (const job of jobs) {
+				if (!job.pr) continue;
+				const cur = await prState(job.pr);
+				if (cur === null) continue;
+				prStates.set(job.id, cur);
+				const terminal = cur === "MERGED" || cur === "CLOSED";
+				if (!terminal || prAlerted.has(job.id)) continue;
+				prAlerted.add(job.id);
+				if (cur === "MERGED") {
+					alerts.push(
+						`- ${job.id}: PR MERGED — ${job.pr}` +
+							(job.pane_id ? ` (pane ${job.pane_id})` : "") +
+							". Run close-out: `git -C <repo> pull --ff-only origin <base>`, " +
+							"remove worktree + branch, close the pane, `" +
+							`${LEDGER_HELPER} set ${job.id} done "<result>"\` + clear-pane.`,
+					);
+				} else {
+					alerts.push(
+						`- ${job.id}: PR CLOSED UNMERGED — ${job.pr}. Ask the user: ` +
+							"abandon (close job + clean up) or reopen/fix?",
+					);
+				}
+			}
+			if (alerts.length === 0) return;
+			pi.sendMessage(
+				{
+					customType: "nefario-watch",
+					content:
+						"[nefario-watch] PR state change on in-review job(s):\n" +
+						alerts.join("\n"),
+					display: true,
+				},
+				initial
+					? { deliverAs: "nextTurn" }
+					: { deliverAs: "followUp", triggerTurn: true },
+			);
+		} finally {
+			prTicking = false;
+		}
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.cwd !== GRU_DIR) return;
 		if (timer) return; // idempotent — one watcher per session
@@ -162,12 +261,20 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		timer = setInterval(() => {
 			void tick(false);
 		}, POLL_MS);
+		await prTick(true);
+		prTimer = setInterval(() => {
+			void prTick(false);
+		}, PR_POLL_MS);
 	});
 
 	pi.on("session_shutdown", async () => {
 		if (timer) {
 			clearInterval(timer);
 			timer = null;
+		}
+		if (prTimer) {
+			clearInterval(prTimer);
+			prTimer = null;
 		}
 	});
 }
