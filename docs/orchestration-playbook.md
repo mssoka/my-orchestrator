@@ -57,12 +57,23 @@ here for standing orders.
    minion (or for its mega-minions), record it in the ledger as `model`
    and pass it at launch (Dispatch step 6); put it in the briefing's Model
    policy. Unset means pi's default model resolution — do not ask about it.
+6. **Skills (required, never blocking).** Scan the request against the
+   available `bmad-*` skills and choose deliberately — do not default
+   blindly. Name your choice in the briefing's **Skills policy**: the
+   minion's workflow skill (implementation → `bmad-quick-dev`; review →
+   `bmad-code-review` / `bmad-review-adversarial-general`; spec work →
+   `bmad-spec`; etc.) **and** the skills its mega-minions should use
+   (review swarms → `bmad-review-adversarial-general`,
+   `bmad-review-edge-case-hunter`). The user should never have to name a
+   bmad skill for you — when unsure, `bmad-help` recommends one.
 
 ## Dispatch (exact sequence)
 
 Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
 
 1. Write briefing to `_bmad-output/briefings/<job-id>.md` (template below).
+   Required sections: standing-orders pointer, task + acceptance, repo map,
+   env/bootstrap, verify, Model policy, **Skills policy** (Intake step 6).
 2. Fetch the base and create the worktree **from `origin/<base>`**, so a
    stale local base branch never affects the work:
    ```bash
@@ -117,8 +128,9 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
 (Also pasted into every briefing. Formerly "Sub-agent standing orders" —
 older briefings use that name; this is the same section.)
 
-- Use the **bmad-quick-dev** skill for the work. Follow its step files
-  exactly, with two orchestration overrides:
+- Use the **bmad skill(s) named in your briefing's Skills policy** for the
+  work (`bmad-quick-dev` is the implementation default). Follow the skill's
+  step files exactly, with two orchestration overrides:
   1. **Step-01 clarify**: ask your numbered questions, then HALT. Gru
      relays answers from the user. Do not proceed on guesses.
   2. **Internal approval checkpoints** (e.g. spec approval in step-02):
@@ -128,9 +140,11 @@ older briefings use that name; this is the same section.)
 - Work entirely inside this pane's cwd (the worktree) on branch `<slug>`.
 - You may spawn your own mega-minions with the herdr skill
   (`herdr pane split --current ...`). Launch them per the briefing's Model
-  policy (`pi --model ...` when it names one). **Max 10 concurrent
-  mega-minion panes** (batch larger swarms). You MUST close every pane you
-  create before finishing ("badge out").
+  policy (`pi --model ...` when it names one) and its Skills policy (name
+  each mega-minion's skill explicitly — e.g. review swarms use
+  `bmad-review-adversarial-general` / `bmad-review-edge-case-hunter`).
+  **Max 10 concurrent mega-minion panes** (batch larger swarms). You MUST
+  close every pane you create before finishing ("badge out").
 - Treat env files as read-only. If the task genuinely requires changing
   env values, replace the symlink with a copy first
   (`rm .env && cp <repo_root>/.env .env`), edit the copy, and call the
@@ -219,7 +233,9 @@ unacked for > 3 days (mention it in the readiness report).
 Two tiers, both policy (Herdr itself enforces no limit):
 
 - **Minions (Gru-dispatched task jobs): max 10 panes** by default; ask the
-  user before exceeding.
+  user before exceeding. **2026-07-21: user lifted the cap until further
+  notice** — dispatches may exceed 10 minions; the ~20 total-agent-pane
+  safety valve below still applies.
 - **Mega-minions (minion-spawned helpers): max 10 concurrent child panes
   per minion** (e.g. the 7-perspective code-review swarm fits in one wave).
   Mega-minion panes do NOT count against the 10-job cap — they are bursty
@@ -229,6 +245,12 @@ Two tiers, both policy (Herdr itself enforces no limit):
 
 ## Skills availability
 
-All `bmad-*` skills are symlinked into `~/.pi/agent/skills/`, so pi agents
-see them from any cwd (including worktrees). The herdr skill is already
-global. `_bmad` project config is copied into each worktree at dispatch.
+Canonical home: `/Users/moses/code/.agents/skills/` — every `bmad-*` skill
+there is symlinked into `~/.pi/agent/skills/`, so pi agents see them from
+any cwd (including worktrees). The herdr skill is already global. `_bmad`
+project config is copied into each worktree at dispatch.
+
+Gru lists the available `bmad-*` skills at every session start (startup
+checklist) and names skills explicitly in every briefing (Intake step 6) —
+minions and mega-minions should never have to guess which bmad skill
+applies.

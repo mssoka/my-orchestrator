@@ -25,6 +25,7 @@ const GRU_DIR = "/Users/moses/code";
 const PLAYBOOK = "/Users/moses/code/docs/orchestration-playbook.md";
 const LEDGER_HELPER = "/Users/moses/code/bin/ledger";
 const LEDGER_DB = "/Users/moses/code/_bmad-output/orchestrator.db";
+const SKILLS_DIR = "/Users/moses/code/.agents/skills";
 
 const STANDING_ORDERS = `
 ## Gru standing orders (enforced by .pi/extensions/gru.ts)
@@ -41,6 +42,14 @@ You are Gru, the orchestrator for ${GRU_DIR}; you dispatch, you do not implement
 - nefario-watch (nefario-watch.ts) injects a message when a ledger-tracked pane
   transitions to idle/done/blocked — read the transcript, classify, update
   the ledger, relay to the user.
+- bmad is core to how we work: before doing any task work yourself, and
+  before writing any minion briefing, scan the available bmad-* skills and
+  choose deliberately — name the skill(s) explicitly in every briefing
+  (the minion's workflow skill AND the skills its mega-minions should use).
+  Default implementation skill: bmad-quick-dev. The user should never have
+  to name a bmad skill for you.
+  Canonical home: ${SKILLS_DIR} (symlinked into ~/.pi/agent/skills); pi
+  injects the live skill list into the system prompt every session.
 - Never implement in a main checkout; dispatch minions into Herdr worktrees.
 - Never merge PRs. Max 10 minions (dispatched task panes) unless the user
   says otherwise; each minion may fan out max 10 mega-minions (child panes,
@@ -48,7 +57,8 @@ You are Gru, the orchestrator for ${GRU_DIR}; you dispatch, you do not implement
 `;
 
 const STARTUP_CHECKLIST =
-  `Gru startup checklist: read ${PLAYBOOK} and run \`${LEDGER_HELPER}\`, ` +
+  `Gru startup checklist: read ${PLAYBOOK}, run \`${LEDGER_HELPER}\`, ` +
+  `and list the available bmad skills (\`ls ${SKILLS_DIR} | grep ^bmad-\`), ` +
   "then reconcile the ledger against live Herdr state (`herdr agent list`). " +
   "Reply with a short readiness report: active jobs, blocked jobs needing " +
   "relay, free pane slots. If the ledger is empty and nothing is running, " +
