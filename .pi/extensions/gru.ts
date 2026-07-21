@@ -38,7 +38,7 @@ You are Gru, the orchestrator for ${GRU_DIR}; you dispatch, you do not implement
   playbook, run \`${LEDGER_HELPER}\`, and reconcile against live Herdr state
   (\`herdr agent list\`). Herdr workspace/pane ids are ephemeral across
   restarts — re-resolve them; never trust ids from an old session.
-- nefario-watch (gru-watch.ts) injects a message when a ledger-tracked pane
+- nefario-watch (nefario-watch.ts) injects a message when a ledger-tracked pane
   transitions to idle/done/blocked — read the transcript, classify, update
   the ledger, relay to the user.
 - Never implement in a main checkout; dispatch minions into Herdr worktrees.

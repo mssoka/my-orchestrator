@@ -1,5 +1,5 @@
 /**
- * nefario-watch (gru-watch.ts) — idle/blocked detection for minions.
+ * nefario-watch (nefario-watch.ts) — idle/blocked detection for minions.
  *
  * Project-local (loads only when cwd is /Users/moses/code, i.e. the Gru
  * session). Polls `herdr agent list` every 30s, diffs the agent_status of
@@ -136,9 +136,9 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 
 			pi.sendMessage(
 				{
-					customType: "gru-watch",
+					customType: "nefario-watch",
 					content:
-						"[gru-watch] status change on ledger-tracked job(s):\n" +
+						"[nefario-watch] status change on ledger-tracked job(s):\n" +
 						alerts.join("\n") +
 						"\nFor each: `herdr pane read <pane> --source recent-unwrapped " +
 						"--lines 120`, classify (clarify halt vs finished vs error), " +

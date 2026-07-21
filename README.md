@@ -18,7 +18,7 @@ minion spawns (e.g. a review swarm), **nefario-watch** = the watcher gadget.
 ```
  you ──► Gru pi session (cwd = this root)
          │  .pi/extensions/gru.ts        standing orders + startup checklist
-         │  .pi/extensions/gru-watch.ts  polls Herdr, wakes Gru on changes
+         │  .pi/extensions/nefario-watch.ts  polls Herdr, wakes Gru on changes
          │
          ├──► Herdr  workspaces/tabs/panes + git worktrees
          │      └──► minion pi sessions (one per job, in a worktree)
@@ -34,7 +34,7 @@ minion spawns (e.g. a review swarm), **nefario-watch** = the watcher gadget.
 |---|---|
 | **Gru pi session** | Orchestrator. Runs only in this root; the extensions below are project-local so repo/worktree sessions are unaffected. |
 | **`.pi/extensions/gru.ts`** | Enforces standing orders: injects them into the system prompt every turn, fires the startup checklist, re-grounds after compaction. |
-| **`.pi/extensions/gru-watch.ts`** | Watcher. Every 30s diffs `herdr agent list` against ledger-tracked panes; when one stops (idle/done/blocked) or vanishes, injects a message that wakes Gru. |
+| **`.pi/extensions/nefario-watch.ts`** | Watcher. Every 30s diffs `herdr agent list` against ledger-tracked panes; when one stops (idle/done/blocked) or vanishes, injects a message that wakes Gru. |
 | **Herdr** | Terminal multiplexer + runtime for agents. Provides workspaces/tabs/panes, agent status detection, `herdr wait`, notifications, and git worktree management. |
 | **BMAD skills** | `bmad-*` skills (installer-managed per repo, symlinked into `~/.pi/agent/skills/`). Minions execute with `bmad-quick-dev`; specialist personas (e.g. Paige the tech writer) handle copy/docs. |
 | **SQLite ledger** | `_bmad-output/orchestrator.db` — durable job state across Herdr restarts. Two tables: `jobs` (current state) and `job_events` (audit trail of every transition). Accessed via `bin/ledger`. |
@@ -94,7 +94,7 @@ Target state:
 ```
 <root>/                              # e.g. ~/code — contains all repos
 ├── .pi/extensions/gru.ts          # standing orders (enforcement)
-├── .pi/extensions/gru-watch.ts    # minion watcher
+├── .pi/extensions/nefario-watch.ts    # minion watcher
 ├── bin/ledger                       # ledger CLI
 ├── .agents/skills/bmad-*            # BMAD skills (fresh install, step 2)
 ├── _bmad/                           # BMAD project config (fresh install)
@@ -151,7 +151,7 @@ rg -l '/Users/moses/code' .pi docs AGENTS.md _bmad-output bin \
 ```
 
 Verify by hand: `MAYOR_DIR`/`PLAYBOOK`/`LEDGER_*` in `.pi/extensions/gru.ts`
-and `.pi/extensions/gru-watch.ts`, root refs in
+and `.pi/extensions/nefario-watch.ts`, root refs in
 `docs/orchestration-playbook.md`, `_bmad-output/briefings/_template.md`,
 `AGENTS.md`, and the `DB` path at the top of `bin/ledger`.
 

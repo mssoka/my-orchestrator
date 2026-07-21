@@ -151,7 +151,7 @@ older briefings use that name; this is the same section.)
 ## Tracking (Gru)
 
 - Dashboard: `herdr agent list` and `/Users/moses/code/bin/ledger`.
-- **nefario-watch** (`.pi/extensions/gru-watch.ts`) polls `herdr agent list`
+- **nefario-watch** (`.pi/extensions/nefario-watch.ts`) polls `herdr agent list`
   every 30s, diffs ledger-tracked panes, and injects a message into this
   session when one transitions to `idle`/`done`/`blocked` (or vanishes). On
   such a message: read the transcript (`herdr pane read <pane> --source
