@@ -277,8 +277,10 @@ the human. Full spec: `docs/perkins-pr-review-plan.md`.
      note="sha=<full-sha> round <N>"
    ```
 7. **Round close-out** (on Perkins pane-done, reported by the pane
-   watcher): verify the review actually posted (`gh pr view <pr> --json
-   reviews` — latest by `perkins-review[bot]`); then `bin/ledger set
+   watcher): verify the review actually posted
+   (`gh api repos/<owner>/<repo>/pulls/<n>/reviews --jq '.[-1]'` —
+   `gh pr view --json reviews` has no URL field and returns `url:
+   null`); then `bin/ledger set
    <round-id> done "<verdict + review-url>"` + `clear-pane`; close panes
    (Perkins must have badged out its mega-minions — verify with `herdr
    agent list`); `git worktree remove --force <wt>`.
@@ -311,16 +313,23 @@ the human. Full spec: `docs/perkins-pr-review-plan.md`.
   Every lens reviews these identical bytes. (Absolute path — the round
   worktree is destroyed at close-out, so artifacts live in the
   orchestrator's `_bmad-output`.)
-- Spawn the **7 lenses** as mega-minions in one wave
-  (`herdr pane split --current`, label `mm-<lens>-r<N>`), per the
+- Spawn the **7 lenses** as mega-minions in one wave, per the
   `code-review` skill's reviewer definitions: **blind** (diff only — no
   repo access, no framing), **edge**, **acceptance** (briefing + issue as
-  spec), **security**, **architecture**, **codebase**, **tests**. Each
-  writes one JSON findings array (skill schema:
+  spec), **security**, **architecture**, **codebase**, **tests**.
+  Pane mechanics: do NOT repeatedly `herdr pane split --current` — it
+  subdivides your own pane. Create a dedicated tab once, then split the
+  lens panes off a fresh pane in it (`herdr pane split <pane-id>
+  --direction right|down`), labeling each `mm-<lens>-r<N>`. Each writes
+  one JSON findings array (skill schema:
   source/severity/category/title/location/evidence/detail/recommended_fix,
-  accuracy mandate verbatim) to
-  `/Users/moses/code/_bmad-output/perkins/<job-id>/r<N>/<lens>.json`, then
-  stops. You MUST close every mega-minion pane before finishing.
+  accuracy mandate verbatim) to the ABSOLUTE path
+  `/Users/moses/code/_bmad-output/perkins/<job-id>/r<N>/<lens>.json`
+  (paste the full path into the lens brief — lenses must not derive it),
+  then stops. **Before treating the wave as done, verify all 7 files
+  exist at those exact paths** — a lens that wrote elsewhere (e.g. under
+  `<job-id>-r<N>/`) is recovered by moving its file, not re-running.
+  You MUST close every mega-minion pane before finishing.
 - **Verification pass (mandatory, per the skill's Step 3b):** every
   finding is presumed false-positive until you re-verify it against the
   worktree yourself. Discard rejected findings; demote unverifiable
