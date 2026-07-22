@@ -7,7 +7,9 @@ itself.
 
 Naming theme (Despicable Me): **Gru** = the orchestrator, **minion** = a
 dispatched task agent (one per job), **mega-minion** = a specialist helper a
-minion spawns (e.g. a review swarm), **nefario-watch** = the watcher gadget.
+minion spawns (e.g. a review swarm), **Perkins** = the automated PR-review
+agent (posts verdicts as the `perkins-review` GitHub App),
+**nefario-watch** = the watcher gadget.
 
 - Operating procedure: [docs/orchestration-playbook.md](docs/orchestration-playbook.md)
 - Interactive explainer (open in a browser):
@@ -25,6 +27,9 @@ minion spawns (e.g. a review swarm), **nefario-watch** = the watcher gadget.
          │             ├── BMAD skills (bmad-quick-dev, Paige, …)
          │             ├── bin/ledger set …      self-reports status ──┐
          │             └── gh pr create ──► human reviews & merges   │
+         │                  (opt-in) Perkins reviews the PR first:    │
+         │                  7-lens mega-minion swarm → verdict posted │
+         │                  as perkins-review[bot] → rework / approve │
          │                                                           ▼
          └──► _bmad-output/orchestrator.db ◄────────────────── SQLite ledger
               (jobs + job_events, via bin/ledger)
@@ -34,11 +39,12 @@ minion spawns (e.g. a review swarm), **nefario-watch** = the watcher gadget.
 |---|---|
 | **Gru pi session** | Orchestrator. Runs only in this root; the extensions below are project-local so repo/worktree sessions are unaffected. |
 | **`.pi/extensions/gru.ts`** | Enforces standing orders: injects them into the system prompt every turn, fires the startup checklist, re-grounds after compaction. |
-| **`.pi/extensions/nefario-watch.ts`** | Watcher. Every 30s diffs `herdr agent list` against ledger-tracked panes; every 5 min polls `gh` for in-review PRs (merge detection). Injects a message that wakes Gru. Detects only — Gru owns all ledger transitions. |
+| **`.pi/extensions/nefario-watch.ts`** | Watcher with five sensors. Every 30s diffs `herdr agent list` against ledger-tracked panes; every 5 min polls `gh` for in-review PRs: merge detection, CI failure sensing, review sensing (approve/changes relay), and the Perkins sensor (dispatches review rounds for `pr_review=1` jobs). Injects a message that wakes Gru. Detects only — Gru owns all ledger transitions. |
 | **Herdr** | Terminal multiplexer + runtime for agents. Provides workspaces/tabs/panes, agent status detection, `herdr wait`, notifications, and git worktree management. |
 | **BMAD skills** | `bmad-*` skills (installer-managed per repo, symlinked into `~/.pi/agent/skills/`). Minions execute with `bmad-quick-dev`; specialist personas (e.g. Paige the tech writer) handle copy/docs. |
 | **SQLite ledger** | `_bmad-output/orchestrator.db` — durable job state across Herdr restarts. Two tables: `jobs` (current state) and `job_events` (audit trail of every transition). Accessed via `bin/ledger`. |
 | **`bin/ledger`** | Python3-stdlib CLI used by Gru, by minions (self-reporting), and by nefario-watch. Concurrency-safe (WAL + busy timeout). |
+| **`bin/perkins-token`** | Mints short-lived GitHub App installation tokens for Perkins (RS256 JWT via `openssl`, per-installation 0600 cache). `gh` here authenticates as the human and GitHub rejects formal reviews on your own PRs, so Perkins posts as its own actor: `perkins-review[bot]`. |
 | **Briefings** | `_bmad-output/briefings/<job-id>.md` — the job contract a minion reads at launch. |
 | **`gh` / `glab`** | Minions push their branch and open PRs targeting the repo's base branch. The human merges. |
 
@@ -56,8 +62,16 @@ minion spawns (e.g. a review swarm), **nefario-watch** = the watcher gadget.
    the pane go idle and wakes Gru, who pastes the questions to you
    verbatim and relays your answers back.
 6. **Review** — minion pushes, opens a PR, reports `in-review`, fires
-   `herdr notification show`. You review and merge. **The Gru never merges.**
-7. **Close-out** — after your ack: panes closed, PR merged → worktree +
+   `herdr notification show`. **The Gru never merges.**
+7. **Perkins (opt-in)** — for jobs dispatched with `pr_review=1`, the
+   Perkins sensor wakes Gru, who dispatches a review round: 7 lenses fan
+   out as mega-minions (blind, edge, acceptance, security, architecture,
+   codebase, tests), findings are re-verified against the code and
+   consolidated, and the verdict posts as a `perkins-review[bot]` GitHub
+   review. Request-changes relays to the minion (its push re-triggers
+   Perkins; cap 3 rounds, then you're called in); approve notifies you.
+   You review and merge either way.
+8. **Close-out** — after your ack: panes closed, PR merged → worktree +
    branch removed, `bin/ledger set <job-id> done "<result>"`.
 
 Ledger statuses: `dispatched → clarifying → working → in-review → done`
@@ -73,6 +87,7 @@ bin/ledger events [n]            # recent transitions across all jobs
 bin/ledger set <id> <status> "note"   # transition (also appends job_events)
 bin/ledger pr <id> <url>         # record PR URL
 bin/ledger backup                # SQL dump → _bmad-output/backups/
+bin/perkins-token --check        # validate the Perkins GitHub App identity
 
 herdr agent list                 # live agent statuses across workspaces
 herdr pane read <pane> --source recent-unwrapped --lines 120
@@ -96,6 +111,7 @@ Target state:
 ├── .pi/extensions/gru.ts          # standing orders (enforcement)
 ├── .pi/extensions/nefario-watch.ts    # minion watcher
 ├── bin/ledger                       # ledger CLI
+├── bin/perkins-token                # Perkins' GitHub App token minter
 ├── .agents/skills/bmad-*            # BMAD skills (fresh install, step 2)
 ├── _bmad/                           # BMAD project config (fresh install)
 ├── AGENTS.md / CLAUDE.md            # slim pointers only
@@ -108,11 +124,16 @@ Target state:
 └── <repo1>/ <repo2>/ ...            # repos, each with .git and its own _bmad/
 ```
 
+Plus machine-local secrets **outside** the root: `~/.config/perkins/`
+(GitHub App private key + config — never in git).
+
 ### 1. Prerequisites
 
 - Node 22+ and pi: `npm i -g @earendil-works/pi-coding-agent` (setup used pi 0.80.x)
 - Herdr ≥ 0.7.4
-- `git`, `sqlite3` (macOS built-in), python3 (stdlib only), plus `gh` and/or `glab`
+- `git`, `sqlite3` (macOS built-in), python3 (stdlib only), `openssl` CLI
+  (macOS built-in — `bin/perkins-token` signs JWTs with it), plus `gh`
+  and/or `glab`
 - LLM provider credentials configured for pi
 
 ### 2. Clone the meta repo, install BMAD fresh
@@ -125,8 +146,9 @@ git clone git@github.com:mssoka/my-orchestrator.git <root>
 ```
 
 Tracked: `.gitignore`, `AGENTS.md`, `CLAUDE.md`, `README.md`, `docs/`,
-`bin/ledger`, `.pi/extensions/`, `_bmad-output/` (briefing template only —
-the DB and backups are deliberately untracked machine-local state).
+`bin/` (`ledger`, `perkins-token`), `.pi/extensions/`, `_bmad-output/`
+(briefings, templates, artifacts — only the DB and backups are
+deliberately untracked machine-local state).
 
 Then install BMAD in the root and **once in each repo** (required: dispatch
 does `cp -R <repo_root>/_bmad <worktree>/_bmad`):
@@ -154,8 +176,45 @@ Verify by hand: `MAYOR_DIR`/`PLAYBOOK`/`LEDGER_*` in `.pi/extensions/gru.ts`
 and `.pi/extensions/nefario-watch.ts`, root refs in
 `docs/orchestration-playbook.md`, `_bmad-output/briefings/_template.md`,
 `AGENTS.md`, and the `DB` path at the top of `bin/ledger`.
+(`bin/perkins-token` has no hardcoded root — it reads
+`~/.config/perkins/config`.)
 
-### 4. Make skills visible to pi
+### 4. Perkins: GitHub App identity (optional, ~20 min)
+
+Needed only if you want automated PR review. `gh` on the machine
+authenticates as you, and GitHub rejects formal reviews on your own PRs
+(422) — so Perkins posts as its own actor via a GitHub App.
+
+1. GitHub → (org or user) Settings → Developer settings → GitHub Apps →
+   New. Name e.g. `perkins-review`; homepage any URL; **webhook: Active
+   unchecked** (the watcher polls — nothing POSTs to you); no
+   callback/setup URLs, no OAuth/device flow.
+2. Repository permissions: **Pull requests: read & write**, **Contents:
+   read** (Metadata: read is auto-added). No org/account permissions, no
+   event subscriptions.
+3. Visibility: *Only on this account* covers that account's repos; choose
+   *Any account* if the app must also serve repos under a second account
+   you own — each installation is separate, with its own installation id
+   and config line.
+4. Generate a private key → save as `~/.config/perkins/app-key.pem`,
+   `chmod 600`.
+5. Install the app (selected repositories) and note the **installation
+   id** from the installation URL. Note the **app id** from the app's
+   settings page.
+6. Write `~/.config/perkins/config` (`chmod 600`):
+   ```
+   app_id=<app id>
+   key_path=/Users/<you>/.config/perkins/app-key.pem
+   installation_id_<account-login>=<installation id>
+   ```
+   (one `installation_id_<login>` line per installed account).
+7. Validate: `bin/perkins-token --check` lists the repos each
+   installation can see.
+
+Without this, everything else works — Perkins rounds just can't post
+formal reviews (they fall back to PR comments via your own `gh` auth).
+
+### 5. Make skills visible to pi
 
 ```bash
 mkdir -p ~/.pi/agent/skills
@@ -163,7 +222,7 @@ for d in <root>/.agents/skills/bmad-*; do ln -sfn "$d" ~/.pi/agent/skills/; done
 ln -sfn ~/.agents/skills/herdr ~/.pi/agent/skills/herdr
 ```
 
-### 5. Launch and smoke-test
+### 6. Launch and smoke-test
 
 1. Inside Herdr, `cd <root>` and run `pi`. The workspace you launch in
    becomes the orchestrator workspace — no id is hardcoded anywhere; the
@@ -177,7 +236,7 @@ ln -sfn ~/.agents/skills/herdr ~/.pi/agent/skills/herdr
 4. Optional: dispatch one tiny job end-to-end to validate worktree creation,
    pane moves, briefing handoff, self-reporting, and watcher alerts.
 
-### 6. Notes
+### 7. Notes
 
 - The extensions only fire when `cwd` is exactly the root — sessions in
   repos or worktrees never orchestrate (by design).
@@ -187,5 +246,8 @@ ln -sfn ~/.agents/skills/herdr ~/.pi/agent/skills/herdr
   finishes).
 - The old YAML ledger (`orchestrator-jobs.yaml`) is retired; the DB is
   created on first `bin/ledger` run. Back up with `bin/ledger backup`.
+- Perkins is opt-in per job (`pr_review=1` at dispatch — Intake step 7 in
+  the playbook); cap 3 automated rounds per PR, then the human is called
+  in. Full spec: `docs/perkins-pr-review-plan.md`.
 - If the harness ever changes (Claude Code, Codex, …), port the extensions;
   the trimmed `AGENTS.md`/`CLAUDE.md` stay as-is.
