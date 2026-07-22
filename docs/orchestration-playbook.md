@@ -168,7 +168,7 @@ older briefings use that name; this is the same section.)
 ## Tracking (Gru)
 
 - Dashboard: `herdr agent list` and `/Users/moses/code/bin/ledger`.
-- **nefario-watch** (`.pi/extensions/nefario-watch.ts`) has two sensors:
+- **nefario-watch** (`.pi/extensions/nefario-watch.ts`) has four sensors:
   1. **Pane watcher (30s):** diffs `herdr agent list` against ledger-tracked
      panes; injects a message when one transitions to `idle`/`done`/`blocked`
      (or vanishes). On such a message: read the transcript (`herdr pane read
@@ -182,10 +182,29 @@ older briefings use that name; this is the same section.)
      re-arms). On such a message: pull the failed log (`gh run view <run-id>
      --log-failed`); infra flake → `gh run rerun <run-id> --failed`; real
      failure → relay to the minion with `herdr pane run <pane> "..."`.
+  4. **Review sensor (same 5-min tick):** polls the reviews of every OPEN
+     in-review PR (deduped by review id; silent baseline on first
+     sighting — pre-existing reviews never alert, and PENDING drafts are
+     skipped without being recorded so their later submission still
+     alerts). Convention: **Request changes = work** (relay to the minion
+     pane: address each comment, push, re-request review, then set the
+     ledger back to `in-review`), **Comment = FYI straight to the minion**
+     (no user round-trip — "address or reply, your call"), **Approve =
+     notify the human** ("PR approved — merge when ready"; no minion
+     action). No author/bot filtering — bot reviews are treated exactly
+     like the human's. Standalone PR conversation comments are ignored in
+     v1. Failure modes: review bodies are capped (~1500 chars — full text
+     at the review URL); PRs with >100 reviews can fall back to the bare PR
+     URL; baselines are in-memory, so a Gru restart silently re-baselines
+     (no catch-up — "no alert" ≠ "no reviews while Gru was down").
   nefario-watch only DETECTS — it never writes the ledger. **Transition
   ownership:** merges are performed only by the human on GitHub; every ledger
   transition (including `in-review  done` at close-out) is performed by Gru
   after verifying.
+- **GitLab:** review sensing is GitHub-only for now — GitLab has no native
+  review states, so support is deliberately deferred. Planned mapping when
+  the first GitLab-hosted job lands: unresolved diff threads = work,
+  approvals = approve.
 - Manual wait/inspect: `herdr wait agent-status <pane> --status done --timeout N`.
   Treat `idle` and `done` as completed; `blocked` needs input.
 - **Clarify relay**: when a minion halts with numbered questions
