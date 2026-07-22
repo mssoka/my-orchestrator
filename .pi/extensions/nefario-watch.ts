@@ -1,6 +1,6 @@
 /**
  * nefario-watch — idle/blocked detection for minions + PR merge/CI/review
- * sensing.
+ * sensing + Perkins review-dispatch sensing.
  *
  * Project-local (loads only when cwd is /Users/moses/code, i.e. the Gru
  * session). Polls `herdr agent list` every 30s, diffs the agent_status of
@@ -47,6 +47,23 @@
  * Standalone PR conversation comments are ignored (v1); no author/bot
  * filtering. Detection-only: nefario-watch never writes the ledger and
  * never sends pane input — Gru owns every relay and ledger transition.
+ *
+ * Perkins sensor (same 5-min tick): for jobs opted in via the ledger
+ * `pr_review=1` flag, wakes Gru to dispatch a Perkins automated-review
+ * round when the PR's head sha has not been reviewed yet. Dedup is
+ * DURABLE via ledger round rows (rows with parent = <job-id>, note
+ * carrying sha=<full-sha>): a round in flight (status != done) or a round
+ * whose note contains the current head sha skips silently — this survives
+ * Gru restarts, unlike the in-memory maps. The in-memory perkinsAlerted
+ * map (mirrors ciAlerted) only suppresses per-tick re-alerts while a
+ * dispatch is pending; it re-arms when the sha changes. Round cap: 3
+ * rounds per PR — a further new sha injects a once-per-sha escalation
+ * ("human review needed") instead of a dispatch message. Detection-only,
+ * same contract as above: Gru dispatches per playbook 'Perkins (automated
+ * PR review)'. If the ledger predates the pr_review column (no `ledger`
+ * run since upgrade), the shared jobs query falls back to a legacy shape
+ * (pr_review=0) so merge/CI/review sensing keeps working; Perkins stays
+ * off until `bin/ledger` next runs and migrates.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -58,6 +75,8 @@ const POLL_MS = 30_000;
 const PR_POLL_MS = 300_000;
 /** Review bodies are capped in alerts — Gru only relays; the URL has it. */
 const REVIEW_BODY_CAP = 1500;
+/** Perkins: max automated review rounds per PR before escalating. */
+const PERKINS_ROUND_CAP = 3;
 
 const STOPPED = new Set(["idle", "done", "blocked"]);
 /** Ledger statuses where a stopped pane is expected — no catch-up alert. */
@@ -74,7 +93,9 @@ const REVIEW_ACTIONS: Record<string, string> = {
 	CHANGES_REQUESTED:
 		'relay to the minion pane as WORK NEEDED (`herdr pane run <pane> "...")' +
 		": address each review comment, push, re-request review, then set the " +
-		`ledger back to in-review (\`${LEDGER_HELPER} set <job-id> in-review "<note>"\`)`,
+		`ledger back to in-review (\`${LEDGER_HELPER} set <job-id> in-review "<note>"\`). ` +
+		"If the review is from perkins-review[bot], SKIP the re-request step — " +
+		"the new sha re-triggers Perkins automatically",
 	COMMENTED:
 		'relay STRAIGHT to the minion pane as FYI/judgment (no user round-trip) ' +
 		'(`herdr pane run <pane> "..."): "address or reply, your call"',
@@ -92,6 +113,7 @@ interface ReviewJob {
 	id: string;
 	pr: string | null;
 	pane_id: string | null;
+	pr_review: number;
 }
 
 export default function nefarioWatch(pi: ExtensionAPI) {
@@ -220,17 +242,37 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 	/** job_id -> review node ids already seen (baselined silently on first
 	 * sighting; PENDING ids are never recorded). */
 	const seenReviews = new Map<string, Set<string>>();
+	/** Perkins: job_id -> head sha already dispatch-alerted on (in-memory
+	 * only — durable dedup lives in the ledger round rows). Re-arms when
+	 * the sha changes. */
+	const perkinsAlerted = new Map<string, string>();
+	/** Perkins: job_id -> head sha already cap-escalated on (once per sha). */
+	const perkinsEscalated = new Map<string, string>();
 
 	async function inReviewJobs(): Promise<ReviewJob[]> {
-		const r = await pi.exec(
+		let r = await pi.exec(
 			"sqlite3",
 			[
 				"-json",
 				DB,
-				"SELECT id, pr, pane_id FROM jobs WHERE status = 'in-review' AND pr IS NOT NULL",
+				"SELECT id, pr, pane_id, pr_review FROM jobs WHERE status = 'in-review' AND pr IS NOT NULL",
 			],
 			{ timeout: 5000 },
 		);
+		if (r.code !== 0 && r.stderr.includes("no such column")) {
+			// DB predates the pr_review migration (no `ledger` run since the
+			// upgrade): fall back so merge/CI/review sensing keeps working.
+			// Perkins stays off (pr_review=0) until `bin/ledger` next migrates.
+			r = await pi.exec(
+				"sqlite3",
+				[
+					"-json",
+					DB,
+					"SELECT id, pr, pane_id, 0 AS pr_review FROM jobs WHERE status = 'in-review' AND pr IS NOT NULL",
+				],
+				{ timeout: 5000 },
+			);
+		}
 		if (r.code !== 0 || !r.stdout.trim()) return [];
 		try {
 			return JSON.parse(r.stdout) as ReviewJob[];
@@ -244,6 +286,38 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		state: string;
 		author: string;
 		body: string;
+	}
+
+	interface PerkinsRound {
+		id: string;
+		status: string;
+		note: string | null;
+	}
+
+	/** Perkins sensor: round rows for a job (durable dedup source). Round
+	 * ids follow the playbook's `<job-id>-perkins-r<N>` convention — the
+	 * LIKE keeps any future non-Perkins child rows out of the count.
+	 * Returns null on transient DB error so the caller skips this tick
+	 * instead of mistaking it for "zero rounds". */
+	async function perkinsRounds(jobId: string): Promise<PerkinsRound[] | null> {
+		const esc = jobId.replace(/'/g, "''");
+		const r = await pi.exec(
+			"sqlite3",
+			[
+				"-json",
+				DB,
+				`SELECT id, status, note FROM jobs WHERE parent = '${esc}' AND id LIKE '${esc}-perkins-r%'`,
+			],
+			{ timeout: 5000 },
+		);
+		if (r.code !== 0) return null;
+		if (!r.stdout.trim()) return [];
+		try {
+			const parsed = JSON.parse(r.stdout);
+			return Array.isArray(parsed) ? (parsed as PerkinsRound[]) : null;
+		} catch {
+			return null;
+		}
 	}
 
 	interface PrInfo {
@@ -411,6 +485,42 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 						// m === null → not a GitHub PR URL (GitLab deferred): ids are
 						// already recorded above; skip alerting silently.
 					}
+					// Perkins sensor: opt-in (ledger pr_review=1) automated PR
+					// review. Durable dedup via round rows (parent = job id,
+					// note carries sha=<full-sha>) — survives Gru restarts;
+					// the in-memory maps only suppress per-tick re-alerts.
+					// Detection-only — Gru dispatches; this never writes the
+					// ledger and never touches panes.
+					if (job.pr_review === 1 && info.headSha) {
+						const sha = info.headSha;
+						const rounds = await perkinsRounds(job.id);
+						// rounds === null → transient DB error; skip this tick
+						// rather than mistake it for "zero rounds" and re-alert.
+						if (rounds !== null) {
+							const inFlight = rounds.some((r) => r.status !== "done");
+							const shaReviewed = rounds.some((r) => r.note?.includes(sha));
+							if (!inFlight && !shaReviewed) {
+								if (rounds.length >= PERKINS_ROUND_CAP) {
+									if (perkinsEscalated.get(job.id) !== sha) {
+										perkinsEscalated.set(job.id, sha);
+										alerts.push(
+											`- Perkins round cap (${PERKINS_ROUND_CAP}) reached for ` +
+												`${job.id} — human review needed: ${job.pr}`,
+										);
+									}
+								} else if (perkinsAlerted.get(job.id) !== sha) {
+									perkinsAlerted.set(job.id, sha);
+									alerts.push(
+										`- Perkins review pending: ${job.id}: ${job.pr} — head ` +
+											`${sha.slice(0, 7)} — dispatch Perkins round ` +
+											`${rounds.length + 1} per playbook 'Perkins (automated PR ` +
+											"review)'. Ledger round rows: " +
+											`parent=${job.id}, note must carry sha=${sha}.`,
+									);
+								}
+							}
+						}
+					}
 					continue;
 				}
 				if (prAlerted.has(job.id)) continue;
@@ -437,7 +547,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 				{
 					customType: "nefario-watch",
 					content:
-						"[nefario-watch] PR/CI/review alert on in-review job(s):\n" +
+						"[nefario-watch] PR/CI/review/Perkins alert on in-review job(s):\n" +
 						alerts.join("\n") +
 						"\nDetection only: nefario-watch never writes the ledger or " +
 						"sends pane input — Gru owns every relay and ledger transition.",

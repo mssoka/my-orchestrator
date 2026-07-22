@@ -13,7 +13,8 @@ Usage:
   ledger events [n]          # last n events across all jobs (default 20)
   ledger add <id> k=v ...    # insert job (keys: repo repo_root slug base model
                              #   worktree pane_id tab_id status started_at
-                             #   briefing pr result github_issue parent note)
+                             #   briefing pr result github_issue parent note
+                             #   pr_review)
   ledger set <id> <status> [note]   # transition status (+ event row)
   ledger note <id> <text>           # event row without status change
   ledger clear-pane <id>            # null out pane_id/tab_id (close-out)
@@ -28,7 +29,7 @@ BACKUPS = "/Users/moses/code/_bmad-output/backups"
 STATUSES = {"dispatched", "clarifying", "working", "in-review", "blocked", "done"}
 COLUMNS = {"repo", "repo_root", "slug", "base", "model", "worktree", "pane_id",
            "tab_id", "status", "started_at", "briefing", "pr", "result",
-           "github_issue", "parent", "note"}
+           "github_issue", "parent", "note", "pr_review"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   status TEXT NOT NULL DEFAULT 'dispatched'
     CHECK (status IN ('dispatched','clarifying','working','in-review','blocked','done')),
   started_at TEXT, briefing TEXT, pr TEXT, result TEXT,
-  github_issue INTEGER, parent TEXT, note TEXT
+  github_issue INTEGER, parent TEXT, note TEXT,
+  pr_review INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS job_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +65,12 @@ def connect():
 
 def init(c):
     c.executescript(SCHEMA)
+    # Migration: older DBs predate the pr_review column (Perkins opt-in).
+    if "pr_review" not in {r[1] for r in c.execute("PRAGMA table_info(jobs)")}:
+        try:
+            c.execute("ALTER TABLE jobs ADD COLUMN pr_review INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # lost a concurrent-migration race; the column now exists
     # WAL persists in the DB file; set it once (harmless to repeat).
     c.execute("PRAGMA journal_mode=WAL")
     c.commit()
@@ -130,6 +138,8 @@ def main():
             kv[k] = v if v != "null" else None
         if "status" in kv and kv["status"] not in STATUSES:
             sys.exit(f"bad status: {kv['status']}")
+        if "pr_review" in kv and kv["pr_review"] not in ("0", "1"):
+            sys.exit("pr_review must be 0 or 1")
         kv.setdefault("status", "dispatched")
         kv.setdefault("started_at", now())
         cols = ["id"] + list(kv)

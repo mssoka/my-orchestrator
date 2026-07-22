@@ -14,6 +14,11 @@ here for standing orders.
 - **minion** — a dispatched task agent, one per job (formerly "sub-agent")
 - **mega-minion** — a specialist helper a minion spawns, e.g. a review swarm
   (formerly "sub-sub-agent" / "child pane")
+- **Perkins** — the automated PR-review agent (Mr Perkins, Bank of Evil:
+  Gru pitches a plan, Perkins approves it or sends it back). One Perkins
+  pane per review round, label `perkins-<slug>-r<N>`, ledger id
+  `<job-id>-perkins-r<N>`. Approves or requests changes; the human still
+  merges.
 
 ## Roles
 
@@ -66,6 +71,11 @@ here for standing orders.
    (review swarms → `bmad-review-adversarial-general`,
    `bmad-review-edge-case-hunter`). The user should never have to name a
    bmad skill for you — when unsure, `bmad-help` recommends one.
+7. **Perkins opt-in (optional, never blocking).** For large or risky jobs,
+   opt in to automated PR review: put `pr_review: true` in the briefing
+   and pass `pr_review=1` in `ledger add`. Default stays off — small
+   changes rely on quick-dev's built-in review. See 'Perkins (automated
+   PR review)'.
 
 ## Dispatch (exact sequence)
 
@@ -168,7 +178,7 @@ older briefings use that name; this is the same section.)
 ## Tracking (Gru)
 
 - Dashboard: `herdr agent list` and `/Users/moses/code/bin/ledger`.
-- **nefario-watch** (`.pi/extensions/nefario-watch.ts`) has four sensors:
+- **nefario-watch** (`.pi/extensions/nefario-watch.ts`) has five sensors:
   1. **Pane watcher (30s):** diffs `herdr agent list` against ledger-tracked
      panes; injects a message when one transitions to `idle`/`done`/`blocked`
      (or vanishes). On such a message: read the transcript (`herdr pane read
@@ -188,7 +198,10 @@ older briefings use that name; this is the same section.)
      skipped without being recorded so their later submission still
      alerts). Convention: **Request changes = work** (relay to the minion
      pane: address each comment, push, re-request review, then set the
-     ledger back to `in-review`), **Comment = FYI straight to the minion**
+     ledger back to `in-review` — when the reviewer is
+     `perkins-review[bot]`, skip the re-request step: the new sha
+     re-triggers Perkins automatically, see 'Perkins (automated PR
+     review)'), **Comment = FYI straight to the minion**
      (no user round-trip — "address or reply, your call"), **Approve =
      notify the human** ("PR approved — merge when ready"; no minion
      action). No author/bot filtering — bot reviews are treated exactly
@@ -197,6 +210,15 @@ older briefings use that name; this is the same section.)
      at the review URL); PRs with >100 reviews can fall back to the bare PR
      URL; baselines are in-memory, so a Gru restart silently re-baselines
      (no catch-up — "no alert" ≠ "no reviews while Gru was down").
+  5. **Perkins sensor (same 5-min tick):** for jobs with ledger
+     `pr_review=1`, alerts when an OPEN PR's head sha has no review round
+     yet — durable dedup via ledger round rows (`parent=<job-id>`, note
+     carries `sha=<full-sha>`): a round in flight or an already-reviewed
+     sha skips silently, surviving Gru restarts. An in-memory map
+     suppresses per-tick re-alerts while a dispatch is pending (re-arms on
+     sha change). Cap: 3 automated rounds — a further new sha escalates
+     once per sha ("human review needed"). On the dispatch message: run
+     the sequence in 'Perkins (automated PR review)'.
   nefario-watch only DETECTS — it never writes the ledger. **Transition
   ownership:** merges are performed only by the human on GitHub; every ledger
   transition (including `in-review  done` at close-out) is performed by Gru
@@ -214,6 +236,146 @@ older briefings use that name; this is the same section.)
 - Ledger statuses: `dispatched → clarifying → working → in-review → done`
   (`blocked` any time). Minions self-report via `bin/ledger set`; Gru
   verifies and owns `done`.
+
+## Perkins (automated PR review)
+
+Perkins reviews PRs for jobs opted in via `pr_review=1` (Intake step 7)
+and posts the verdict as the `perkins-review` GitHub App — `gh` here
+authenticates as `mssoka`, and GitHub rejects formal reviews on your own
+PRs (422), so Perkins needs its own actor (`perkins-review[bot]`) with
+short-lived installation tokens (`bin/perkins-token`). Approval policy:
+Perkins may APPROVE and REQUEST_CHANGES; the human remains the only
+merger. GitHub only. Cap: **3 automated rounds per PR**, then escalate to
+the human. Full spec: `docs/perkins-pr-review-plan.md`.
+
+### Gru dispatch sequence (on the Perkins sensor message)
+
+1. Verify: job still `in-review`; PR still OPEN; refresh the head sha
+   (`gh pr view <pr> --json state,headRefOid`) — use the freshest sha,
+   not the alerted one.
+2. Round `N` = existing round rows for the job + 1. If N > 3 → escalate
+   to the user instead of dispatching (belt-and-braces; the sensor
+   already enforces the cap).
+3. `git -C <repo_root> fetch origin <slug>` then
+   `git -C <repo_root> worktree add --detach \
+     ~/.herdr/worktrees/<repo>/perkins-<slug>-r<N> <sha>`
+   — detached at the exact reviewed sha, immune to mid-review pushes.
+   No env/bootstrap (read-only review).
+4. Write briefing `_bmad-output/briefings/perkins-<job-id>-r<N>.md`.
+   Required content: the Perkins standing orders (below, verbatim), PR
+   URL + number, reviewed sha, repo_root, round N, and pointers to the
+   **original job briefing** and **GitHub issue** (Perkins' spec).
+5. Pane into the orchestrator workspace (panes-first rule), label
+   `perkins-<slug>-r<N>`; launch `cd <worktree> && pi` and hand over:
+   "Read the playbook 'Perkins standing orders' and the briefing at
+   `<path>`, then begin."
+6. Record the round:
+   ```bash
+   bin/ledger add <job-id>-perkins-r<N> parent=<job-id> repo=<repo> \
+     repo_root=<root> slug=perkins-<slug>-r<N> worktree=<wt> \
+     pane_id=<p> tab_id=<t> pr=<pr> briefing=<path> \
+     note="sha=<full-sha> round <N>"
+   ```
+7. **Round close-out** (on Perkins pane-done, reported by the pane
+   watcher): verify the review actually posted (`gh pr view <pr> --json
+   reviews` — latest by `perkins-review[bot]`); then `bin/ledger set
+   <round-id> done "<verdict + review-url>"` + `clear-pane`; close panes
+   (Perkins must have badged out its mega-minions — verify with `herdr
+   agent list`); `git worktree remove --force <wt>`.
+   If the review did NOT post (crash/token failure): retry the same round
+   once — remove the stale worktree (`git -C <repo_root> worktree remove
+   --force <wt>`), re-run steps 3–5, and point the SAME round row at the
+   new pane (the ledger CLI has no pane-update command, so):
+   ```bash
+   sqlite3 /Users/moses/code/_bmad-output/orchestrator.db \
+     "UPDATE jobs SET status='dispatched', pane_id='<new-pane>', tab_id='<new-tab>' WHERE id='<round-id>'"
+   ```
+   Second failure → `blocked` + tell the user. **Recovery from `blocked`:**
+   any non-done round mutes new Perkins dispatches for that job, so always
+   resolve blocked rows — the human decides: `bin/ledger set <round-id>
+   done "abandoned"` closes it, or flip to `dispatched` (same SQL) for a
+   fresh retry.
+
+### Perkins standing orders
+
+(Also pasted into every Perkins briefing.)
+
+- You are Perkins. You review; you never fix, push, or merge. You never
+  touch the implementing minion's worktree or pane.
+- Context: PR URL + number, reviewed sha, repo_root, the **original job
+  briefing** and **GitHub issue** (your spec), and your cwd — a detached
+  worktree at exactly the reviewed sha. Trust it, not `origin/<base>`.
+- Save the canonical diff first:
+  `gh pr diff <pr>` →
+  `/Users/moses/code/_bmad-output/perkins/<job-id>/r<N>/diff.patch`.
+  Every lens reviews these identical bytes. (Absolute path — the round
+  worktree is destroyed at close-out, so artifacts live in the
+  orchestrator's `_bmad-output`.)
+- Spawn the **7 lenses** as mega-minions in one wave
+  (`herdr pane split --current`, label `mm-<lens>-r<N>`), per the
+  `code-review` skill's reviewer definitions: **blind** (diff only — no
+  repo access, no framing), **edge**, **acceptance** (briefing + issue as
+  spec), **security**, **architecture**, **codebase**, **tests**. Each
+  writes one JSON findings array (skill schema:
+  source/severity/category/title/location/evidence/detail/recommended_fix,
+  accuracy mandate verbatim) to
+  `/Users/moses/code/_bmad-output/perkins/<job-id>/r<N>/<lens>.json`, then
+  stops. You MUST close every mega-minion pane before finishing.
+- **Verification pass (mandatory, per the skill's Step 3b):** every
+  finding is presumed false-positive until you re-verify it against the
+  worktree yourself. Discard rejected findings; demote unverifiable
+  blockers to `[unverified]` warnings. Record the counts.
+- Consolidate: dedupe on (title, location), merge sources, triage into
+  blocker/warning/note, surface the reviewer-agreement set first.
+- **Verdict → review event:**
+  - 0 blockers → `--approve`
+  - 1–3 blockers → `--request-changes`
+  - 4+ blockers → `--request-changes`, body leads with "MAJOR REWORK"
+  - **Degraded guard:** any lens failed AND zero findings remain → do NOT
+    approve; `--comment` instead and flag Gru ("incomplete review").
+- Post as the app (owner parsed from the PR URL). Mint first, then
+  review — never run gh with an empty GH_TOKEN (a failed command
+  substitution would fall through to the ambient `mssoka` credential and
+  422 on our own PRs):
+  1. `TOKEN=$(/Users/moses/code/bin/perkins-token --owner <owner>)`
+  2. If that failed (non-zero exit): fall back to `gh pr comment <pr>
+     --body-file <body.md>`, note `fallback-comment` in your ledger note,
+     and call it out in your final message.
+  3. Otherwise: `GH_TOKEN=$TOKEN gh pr review <pr> --<event> --body-file
+     <body.md>`
+- Body format:
+  ```
+  ## 🤖 Perkins automated review — round <N> of 3
+  **Job:** <job-id> · **Reviewed sha:** <short> · **Reviewers:** <x>/7 completed
+  **Verification:** <confirmed>/<total> findings confirmed against the code — <rejected> discarded as false-positive[, <u> kept as [unverified]]
+
+  ### Blockers (n) / ### Warnings (n) / ### Notes (n)
+  ### Reviewer agreement
+  **Verdict:** READY TO MERGE | NEEDS CHANGES | MAJOR REWORK NEEDED
+
+  _Address findings and push — I re-review automatically on the new sha.
+  After round 3, the human takes over._
+  ```
+- Before posting, re-fetch `headRefOid`. If it moved mid-review, post
+  anyway but note "reviewed `<old>`, head now `<new>` — a fresh round
+  will follow" in the body.
+- Self-report: `/Users/moses/code/bin/ledger set <round-id> working` at
+  start; final message = verdict + review URL + findings counts.
+- Skip the `code-review` skill's Step 5 (interactive fix flow) entirely —
+  fixing is the implementing minion's job, triggered by the review relay.
+
+### Concurrency
+
+A Perkins round = 8 panes (Perkins + 7 lenses). Two concurrent rounds =
+16 panes + Gru — against the ~20 safety valve, so serialize rounds when
+the workspace is crowded (hold the second dispatch and tell the user).
+
+### Re-review semantics
+
+When the review sensor relays Perkins' CHANGES_REQUESTED, the minion's
+usual "re-request review" step is unnecessary — the new sha is what
+re-triggers Perkins. The minion just fixes, pushes, and sets the ledger
+back to `in-review`.
 
 ## Close-out (after the user acks the summary, or nefario-watch reports the PR merged)
 
