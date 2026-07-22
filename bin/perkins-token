@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""perkins-token — mint a GitHub App installation token for Perkins.
+
+Perkins (the automated PR-review minion) posts reviews as the
+`perkins-review` GitHub App; this helper mints the short-lived (1h)
+installation access token. python3 stdlib + the openssl CLI only.
+
+Usage:
+  perkins-token [--owner <login>] [--refresh]   # print token to stdout
+  perkins-token --check [--refresh]             # validate: list repos each
+                                                #   installation can see
+
+Config: ~/.config/perkins/config (0600, outside any repo), k=v lines:
+  app_id=…
+  key_path=…                         (default ~/.config/perkins/app-key.pem)
+  installation_id_<login>=…          (one per installed account)
+
+`--owner <login>` selects the installation for the repo's owner; it may be
+omitted when exactly one installation is configured. Tokens are cached per
+owner at ~/.config/perkins/token-cache-<owner> (0600) and reused while
+>5 min remain; --refresh bypasses the cache. Any failure: one-line stderr
+reason, exit non-zero (callers map that to their fallback path).
+"""
+import argparse
+import base64
+import datetime
+import json
+import os
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.config/perkins")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
+API = "https://api.github.com"
+# Installation tokens live 1h; reuse the cache while >5 min remain.
+REUSE_THRESHOLD_S = 300
+
+
+def die(msg):
+    sys.stderr.write(f"perkins-token: {msg}\n")
+    sys.exit(1)
+
+
+def ssl_context():
+    """CA roots for urllib. python.org macOS builds ship without roots
+    (their configured cafile lives under /Library/Frameworks and usually
+    doesn't exist); fall back to the macOS LibreSSL bundle, then certifi
+    when it happens to be installed. Stdlib-only either way."""
+    ctx = ssl.create_default_context()
+    if ctx.get_ca_certs():
+        return ctx  # normal case (env SSL_CERT_FILE, Homebrew, Linux)
+    candidates = ["/etc/ssl/cert.pem"]
+    try:
+        import certifi
+        candidates.append(certifi.where())
+    except ImportError:
+        pass
+    for cafile in candidates:
+        if cafile and os.path.isfile(cafile):
+            return ssl.create_default_context(cafile=cafile)
+    return ctx  # no roots found — the request will fail with a clear die()
+
+
+SSL = ssl_context()
+
+
+def load_config():
+    cfg = {"installations": {}}
+    try:
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    die(f"malformed config line: {line!r}")
+                k, v = (s.strip() for s in line.split("=", 1))
+                if k.startswith("installation_id_"):
+                    cfg["installations"][k.removeprefix("installation_id_")] = v
+                else:
+                    cfg[k] = v
+    except FileNotFoundError:
+        die(f"missing config: {CONFIG_PATH}")
+    except OSError as e:
+        die(f"cannot read {CONFIG_PATH}: {e}")
+    if not cfg.get("app_id"):
+        die(f"{CONFIG_PATH}: missing app_id")
+    cfg.setdefault("key_path", os.path.join(CONFIG_DIR, "app-key.pem"))
+    if not cfg["installations"]:
+        die(f"{CONFIG_PATH}: no installation_id_<login> entries")
+    return cfg
+
+
+def resolve_owner(cfg, owner):
+    inst = cfg["installations"]
+    if owner:
+        if owner not in inst:
+            known = ", ".join(sorted(inst))
+            die(f"no installation configured for owner '{owner}' (known: {known})")
+        return owner
+    if len(inst) == 1:
+        return next(iter(inst))
+    die(f"--owner required (configured installations: {', '.join(sorted(inst))})")
+
+
+def b64url(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def mint_jwt(app_id, key_path):
+    now = int(time.time())
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"},
+                               separators=(",", ":")).encode())
+    # exp margin: GitHub's hard limit is +10min; 9min absorbs clock skew.
+    payload = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": app_id},
+                                separators=(",", ":")).encode())
+    try:
+        p = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key_path],
+                           input=f"{header}.{payload}".encode(),
+                           capture_output=True, check=False)
+    except FileNotFoundError:
+        die("openssl not found on PATH")
+    if p.returncode != 0:
+        die(f"openssl failed to sign with {key_path}: {p.stderr.decode(errors='replace').strip()[:120]}")
+    return f"{header}.{payload}.{b64url(p.stdout)}"
+
+
+def api(method, path, bearer):
+    req = urllib.request.Request(
+        API + path,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "perkins-token",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20, context=SSL) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            # GitHub's error body explains the 401/403/422 — keep it.
+            detail = " ".join(e.read().decode(errors="replace").split())[:200]
+        except Exception:
+            detail = ""
+        die(f"github api {method} {path} -> http {e.code}" + (f": {detail}" if detail else ""))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        die(f"github api {method} {path} failed: {e}")
+
+
+def parse_expiry(s):
+    return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ") \
+        .replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def cache_path(owner):
+    return os.path.join(CONFIG_DIR, f"token-cache-{owner}")
+
+
+def read_cache(owner):
+    try:
+        with open(cache_path(owner)) as f:
+            j = json.load(f)
+        if not isinstance(j, dict):
+            return None
+        if j.get("token") and parse_expiry(j["expires_at"]) - time.time() > REUSE_THRESHOLD_S:
+            return j["token"]
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+
+def write_cache(owner, token, expires_at):
+    try:
+        fd = os.open(cache_path(owner), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"token": token, "expires_at": expires_at}) + "\n")
+        os.chmod(cache_path(owner), 0o600)  # a pre-existing wider-mode file is fixed too
+    except OSError as e:
+        # Best-effort: a minted token is still returned without the cache.
+        sys.stderr.write(f"perkins-token: warning: cache write failed ({e})\n")
+
+
+def mint(cfg, owner):
+    key_path = cfg["key_path"]
+    if not os.path.isfile(key_path):
+        die(f"missing private key: {key_path}")
+    jwt = mint_jwt(cfg["app_id"], key_path)
+    resp = api("POST", f"/app/installations/{cfg['installations'][owner]}/access_tokens", jwt)
+    token, expires_at = resp.get("token"), resp.get("expires_at")
+    if not token or not expires_at:
+        die("github returned an access-token response without token/expires_at")
+    write_cache(owner, token, expires_at)
+    return token
+
+
+def token_for(cfg, owner, refresh):
+    if not refresh:
+        cached = read_cache(owner)
+        if cached:
+            return cached
+    return mint(cfg, owner)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="perkins-token",
+                                 description="Mint a Perkins GitHub App installation token.")
+    ap.add_argument("--owner", help="repo owner login selecting the installation")
+    ap.add_argument("--refresh", action="store_true", help="bypass the token cache")
+    ap.add_argument("--check", action="store_true",
+                    help="validate setup: list repos visible to each configured installation")
+    args = ap.parse_args()
+
+    cfg = load_config()
+
+    if args.check:
+        failures = 0
+        for owner in sorted(cfg["installations"]):
+            try:
+                token = token_for(cfg, owner, args.refresh)
+                resp = api("GET", "/installation/repositories?per_page=100", token)
+            except SystemExit:
+                # die() already wrote the one-line reason; report and
+                # continue with the remaining installations.
+                print(f"{owner}: FAILED (see stderr)")
+                failures += 1
+                continue
+            names = sorted(r.get("full_name", "?") for r in resp.get("repositories", []))
+            total = resp.get("total_count", len(names))
+            shown = ", ".join(names) if names else "(none)"
+            more = f" — showing first {len(names)}" if total > len(names) else ""
+            print(f"{owner}: {shown}{more}")
+        if failures:
+            sys.exit(1)
+        return
+
+    owner = resolve_owner(cfg, args.owner)
+    print(token_for(cfg, owner, args.refresh))
+
+
+if __name__ == "__main__":
+    main()
