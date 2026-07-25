@@ -112,7 +112,13 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
      secret copies left behind:
      ```bash
      for f in <repo_root>/.env <repo_root>/.env.*; do
-       [ -f "$f" ] && ln -sf "$f" "<worktree>/$(basename "$f")"
+       [ -f "$f" ] || continue
+       base=$(basename "$f")
+       # skip git-tracked files — the worktree already has real checked-out
+       # copies (2026-07-24: symlinking tracked .env.example/.env.test in
+       # RightTenantry produced `T` typechanges waiting to be committed)
+       git -C <worktree> ls-files --error-unmatch "$base" >/dev/null 2>&1 && continue
+       ln -sf "$f" "<worktree>/$base"
      done
      ```
      Env files in subdirectories: list them explicitly in the briefing and
