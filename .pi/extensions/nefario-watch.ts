@@ -103,6 +103,12 @@ const REVIEW_ACTIONS: Record<string, string> = {
 		'notify the USER only: "PR approved — merge when ready". No minion action',
 };
 
+/** UTC stamp for alert headers — same format as ledger event timestamps
+ * (`2026-07-26T09:53:41Z`) so alerts line up with `ledger show` history. */
+function stamp(): string {
+	return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 interface TrackedJob {
 	id: string;
 	pane_id: string | null;
@@ -213,7 +219,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 				{
 					customType: "nefario-watch",
 					content:
-						"[nefario-watch] status change on ledger-tracked job(s):\n" +
+						`[nefario-watch · ${stamp()}] status change on ledger-tracked job(s):\n` +
 						alerts.join("\n") +
 						"\nFor each: `herdr pane read <pane> --source recent-unwrapped " +
 						"--lines 120`, classify (clarify halt vs finished vs error), " +
@@ -547,7 +553,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 				{
 					customType: "nefario-watch",
 					content:
-						"[nefario-watch] PR/CI/review/Perkins alert on in-review job(s):\n" +
+						`[nefario-watch · ${stamp()}] PR/CI/review/Perkins alert on in-review job(s):\n` +
 						alerts.join("\n") +
 						"\nDetection only: nefario-watch never writes the ledger or " +
 						"sends pane input — Gru owns every relay and ledger transition.",
