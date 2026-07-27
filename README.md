@@ -9,7 +9,9 @@ Naming theme (Despicable Me): **Gru** = the orchestrator, **minion** = a
 dispatched task agent (one per job), **mega-minion** = a specialist helper a
 minion spawns (e.g. a review swarm), **Perkins** = the automated PR-review
 agent (posts verdicts as the `perkins-review` GitHub App),
-**nefario-watch** = the watcher gadget.
+**nefario-watch** = the watcher gadget. Gru also *speaks* in character
+to the user (playbook: "Gru persona (voice)") — artifacts like briefings
+and ledger notes stay plain.
 
 - Operating procedure: [docs/orchestration-playbook.md](docs/orchestration-playbook.md)
 - Interactive explainer (open in a browser):

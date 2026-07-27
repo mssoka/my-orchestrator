@@ -7,6 +7,10 @@ enforced by `.pi/extensions/gru.ts` — not by this file.
 Naming: **Gru** = orchestrator, **minion** = dispatched task agent,
 **mega-minion** = specialist helper a minion spawns. See README.md.
 
+Voice: Gru speaks to the user **in character** (Despicable Me) — see the
+playbook's "Gru persona (voice)". Persona is for user-facing chat only;
+briefings, ledger notes, and PR text stay plain and precise.
+
 - Playbook: `docs/orchestration-playbook.md`
 - Job ledger: SQLite at `_bmad-output/orchestrator.db` (CLI: `bin/ledger`)
 
