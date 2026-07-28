@@ -112,8 +112,10 @@ Nefario built the watcher gadgets; Perkins guards the Bank of Evil.
    `bmad-code-review` / `bmad-review-adversarial-general`; spec work →
    `bmad-spec`; etc.) **and** the skills its mega-minions should use
    (review swarms → `bmad-review-adversarial-general`,
-   `bmad-review-edge-case-hunter`). The user should never have to name a
-   bmad skill for you — when unsure, `bmad-help` recommends one.
+   `bmad-review-edge-case-hunter`). When a deliverable is an HTML artifact
+   for human review (report, plan, mock-design doc), also name `lavish` —
+   see 'HTML artifact review (lavish)'. The user should never have to name
+   a bmad skill for you — when unsure, `bmad-help` recommends one.
 7. **Perkins opt-in (optional, never blocking).** For large or risky jobs,
    opt in to automated PR review: put `pr_review: true` in the briefing
    and pass `pr_review=1` in `ledger add`. Default stays off — small
@@ -208,6 +210,9 @@ older briefings use that name; this is the same section.)
   env values, replace the symlink with a copy first
   (`rm .env && cp <repo_root>/.env .env`), edit the copy, and call the
   change out in the PR description. **Never commit env files or secrets.**
+- **HTML artifacts for human review** (reports, plans, mock-design docs):
+  serve them via the `lavish` skill and foreground-poll for the user's
+  in-page annotations — see 'HTML artifact review (lavish)'.
 - When blocked or finished, run:
   `herdr notification show "<job-id>" --body "<one-line status>"`
 - **Self-report every status transition** to the ledger as it happens:
@@ -285,6 +290,38 @@ older briefings use that name; this is the same section.)
 - Ledger statuses: `dispatched → clarifying → working → in-review → done`
   (`blocked` any time). Minions self-report via `bin/ledger set`; Gru
   verifies and owns `done`.
+
+## HTML artifact review (lavish)
+
+The `lavish` skill (canonical home `/Users/moses/code/.agents/skills/lavish`,
+symlinked into `~/.pi/agent/skills` like the bmad skills, so every minion
+sees it) turns any HTML artifact — reports, plans, comparisons,
+mock-design docs — into an in-page review surface: the user highlights
+elements/text and comments in the browser; feedback routes to whichever
+agent polls. Local-first. Never run `lavish-axi share` (third-party
+hosting on ht-ml.app) unless the user explicitly asks.
+
+- **Minions:** when a deliverable is an HTML artifact for human review,
+  build it per the skill (open the matching playbooks first:
+  `npx -y lavish-axi playbook <id>`), open the session
+  (`npx -y lavish-axi <path>`), then foreground-poll
+  (`npx -y lavish-axi poll <path>`, first poll with
+  `--agent-reply "<what to review first>"`). Apply feedback, re-poll,
+  until the user Send & Ends. Artifacts stay at their task-conventional
+  paths (e.g. `_bmad-output/...`) — lavish is file-path-keyed, no `.lavish/`
+  relocation needed. Never kill the poll; if it dies, re-run — queued
+  feedback is never lost. `npx -y` is the invoke path; if it exits
+  opaquely, the skill documents installed-copy fallbacks. One shared local
+  server (default port 4387, `LAVISH_AXI_PORT` to override) multiplexes
+  all sessions by file path — end YOUR session with
+  `npx -y lavish-axi end <path>`; NEVER `lavish-axi stop` (it kills the
+  shared server for every minion's session).
+- **Gru:** feedback goes straight to the polling minion — no relay, no
+  ledger transition (the job stays `working`). Fallback: if the producing
+  minion is gone (reclaimed pane), Gru polls himself
+  (`npx -y lavish-axi poll <path>`) and relays, or dispatches a fresh
+  minion with the artifact path. Watcher note: a polling minion shows
+  `working` — that is waiting, not stuck.
 
 ## Perkins (automated PR review)
 
@@ -498,8 +535,10 @@ Two tiers, both policy (Herdr itself enforces no limit):
 
 Canonical home: `/Users/moses/code/.agents/skills/` — every `bmad-*` skill
 there is symlinked into `~/.pi/agent/skills/`, so pi agents see them from
-any cwd (including worktrees). The herdr skill is already global. `_bmad`
-project config is copied into each worktree at dispatch.
+any cwd (including worktrees). The `lavish` skill (HTML artifact review
+loop, see its section above) is installed the same way. The herdr skill is
+already global. `_bmad` project config is copied into each worktree at
+dispatch.
 
 Gru lists the available `bmad-*` skills at every session start (startup
 checklist) and names skills explicitly in every briefing (Intake step 6) —
