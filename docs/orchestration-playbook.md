@@ -19,6 +19,10 @@ here for standing orders.
   pane per review round, label `perkins-<slug>-r<N>`, ledger id
   `<job-id>-perkins-r<N>`. Approves or requests changes; the human still
   merges.
+- **Bob** — the dreamer minion: periodic memory consolidation (see
+  'Dreaming (periodic memory consolidation)'). One dream pane per pass,
+  ledger id `dream-<yyyy-mm-dd>`; his per-source readers are **sheep**
+  (Bob counts sheep). Sleeps with his teddy; wakes wiser.
 
 ## Gru persona (voice)
 
@@ -163,6 +167,60 @@ with a session, a compaction, or a worktree.
    each — atomic on local APFS for small writes. Multi-line shared writes
    would need a `mkdir` mutex (portable; macOS has no `flock`). Prefer
    rules 1–3.
+
+### Dreaming (periodic memory consolidation)
+
+Every couple of days, **Bob** dreams: a batch pass that turns the raw
+layers (shards, journal, ledger events) into an updated memory state —
+new insights + reorganized structure — so the next days' sessions start
+smarter. (Pattern credit: Anthropic's "dreaming" deck — cloned memory
+store, one reader per source, proposals with reasoning.)
+
+- **Trigger:** nefario-watch's dream sensor (5-min tick). Durable record:
+  `_bmad-output/memory/last-dream` — the timestamp of the last COMPLETED
+  dream, written only at completion (never at dispatch, so material
+  arriving mid-dream is not falsely marked dreamed). Due = marker older
+  than 2 days AND ≥1 undreamed file in `field-notes/` or `gru-journal/`.
+  Manual: the user can ask Gru to dream anytime. Only ONE dream pass at a
+  time — check `bin/ledger json` for a non-done `dream-*` row before
+  dispatching.
+- **Dispatch:** ledger id `dream-<yyyy-mm-dd>`, pane label the same,
+  briefing from `_bmad-output/briefings/_template-dream.md`. No repo, no
+  worktree — Bob works in `/Users/moses/code` (read-only on everything
+  except the dream dir). One pane; his readers (**sheep**) are
+  mega-minions under the usual cap, closed before Bob finishes.
+- **The pass** (maps the Anthropic diagram):
+  1. **Clone ($MEM → $MEM_OUT):** snapshot the mutable memory —
+     `docs/minion-field-notes.md`, the `AGENTS.md` gotchas section — into
+     `_bmad-output/memory/dream-<yyyy-mm-dd>/store/`. Bob and the sheep
+     NEVER edit the live store.
+  2. **Sheep, one per source:** (a) field-note shards newer than the
+     marker, (b) journal entries newer than the marker, (c) ledger events
+     since the marker (`bin/ledger events 200`, `bin/ledger show` on jobs
+     with activity), (d) optional: pane transcripts of jobs that churned
+     (repeated clarify loops, errors). Each sheep writes findings to its
+     OWN shard in the dream dir — shard-by-writer, same as the live
+     memory.
+  3. **Bob consolidates:** reads the sheep findings, hunts patterns —
+     recurring tooling traps, recurring review findings, conventions that
+     saved time, user-interaction patterns, stale entries to prune — and
+     writes the **dream report** + the proposed updated memory state
+     (edited copies under `store/`). Evidence bar: a pattern needs ≥2
+     independent sightings (job ids + dates); a pattern of one is an
+     anecdote and goes in the report as a *watch item*, not a proposal.
+  4. **Proposals, never silent mutation.** Every proposal carries: target
+     file, the change, **evidence** (examples, job ids, dates),
+     **reasoning**, and a risk class — **auto** (Gru applies immediately:
+     shard promotions, duplicate pruning) vs **user-ack** (structural:
+     new sections, playbook edits, policy/persona changes). Pattern
+     verification pass: challenge each candidate against the evidence
+     (**bmad-review-adversarial-general**) before proposing it.
+  5. **Gru closes the pass:** reviews the report, applies auto-class
+     edits, relays the user-ack list, writes the `last-dream` marker
+     (ISO timestamp), sets the ledger job `done`. Commit doc changes as
+     `dream <date>: <one-liner>`.
+- **Concurrency:** the dream works on a cloned store plus per-sheep
+  shards — the same avoidance rules as the live memory; zero locks.
 
 ## Intake (Gru)
 

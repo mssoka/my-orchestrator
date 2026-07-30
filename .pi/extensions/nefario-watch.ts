@@ -64,6 +64,16 @@
  * run since upgrade), the shared jobs query falls back to a legacy shape
  * (pr_review=0) so merge/CI/review sensing keeps working; Perkins stays
  * off until `bin/ledger` next runs and migrates.
+ *
+ * Dream sensor (same 5-min tick): every DREAM_INTERVAL (default 2 days),
+ * when undreamed memory material exists (field-note shards or Gru journal
+ * entries newer than the last-dream marker), wakes Gru to dispatch the
+ * dream pass ("Bob") per playbook 'Dreaming (periodic memory
+ * consolidation)'. Durable record: `_bmad-output/memory/last-dream`
+ * (written on dream COMPLETION, never at dispatch). Marker missing →
+ * silently baselined to now. An in-memory copy of the marker mtime
+ * suppresses per-tick re-alerts while a dispatch is pending; it re-arms
+ * when the marker changes. Detection-only, same contract as above.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -77,6 +87,11 @@ const PR_POLL_MS = 300_000;
 const REVIEW_BODY_CAP = 1500;
 /** Perkins: max automated review rounds per PR before escalating. */
 const PERKINS_ROUND_CAP = 3;
+
+// ── Dream sensor ─────────────────────────────────────────────────────
+const MEMORY_DIR = `${GRU_DIR}/_bmad-output/memory`;
+const DREAM_MARKER = `${MEMORY_DIR}/last-dream`;
+const DREAM_INTERVAL_MS = 2 * 24 * 60 * 60 * 1000;
 
 const STOPPED = new Set(["idle", "done", "blocked"]);
 /** Ledger statuses where a stopped pane is expected — no catch-up alert. */
@@ -254,6 +269,47 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 	const perkinsAlerted = new Map<string, string>();
 	/** Perkins: job_id -> head sha already cap-escalated on (once per sha). */
 	const perkinsEscalated = new Map<string, string>();
+	/** Dream: marker mtime (epoch secs, string) already alerted for.
+	 * Re-arms when the marker changes or the pass is no longer due. */
+	let dreamAlertedMarker: string | null = null;
+
+	/** Dream sensor: returns an alert string when a dream pass is due,
+	 * null otherwise. Silently baselines the marker on first sighting. */
+	async function dreamCheck(): Promise<string | null> {
+		const script =
+			`mkdir -p "${MEMORY_DIR}"; ` +
+			`if [ ! -f "${DREAM_MARKER}" ]; then date -u +%Y-%m-%dT%H:%M:%SZ > "${DREAM_MARKER}"; echo BASELINE; exit 0; fi; ` +
+			`mm=$(stat -f %m "${DREAM_MARKER}"); now=$(date +%s); age=$((now-mm)); ` +
+			`nc=$(find "${GRU_DIR}/_bmad-output/field-notes" "${GRU_DIR}/_bmad-output/gru-journal" -type f -newer "${DREAM_MARKER}" 2>/dev/null | wc -l | tr -d ' '); ` +
+			`echo "$mm $age $nc $(date -u -r $mm +%Y-%m-%dT%H:%M:%SZ)"`;
+		const r = await pi.exec("bash", ["-c", script], { timeout: 5000 });
+		if (r.code !== 0) return null;
+		const out = r.stdout.trim();
+		if (out === "BASELINE") return null;
+		const parts = out.split(" ");
+		if (parts.length < 4) return null;
+		const [mm, age, count, iso] = parts;
+		if (
+			Number(age) * 1000 < DREAM_INTERVAL_MS ||
+			!Number(count) ||
+			Number(count) === 0
+		) {
+			dreamAlertedMarker = null; // not due (or nothing new) — re-arm
+			return null;
+		}
+		if (dreamAlertedMarker === mm) return null; // alerted already
+		dreamAlertedMarker = mm;
+		const days = Math.floor(Number(age) / 86400);
+		return (
+			`- Bob is sleepy: ${days} day(s) since the last dream (${iso}), ` +
+			`${count} undreamed memory file(s) (field-notes shards + Gru journal). ` +
+			"Dispatch the dream pass per playbook 'Dreaming (periodic memory " +
+			"consolidation)': ledger id `dream-<yyyy-mm-dd>`, briefing from " +
+			"`_bmad-output/briefings/_template-dream.md`. The marker " +
+			"(`_bmad-output/memory/last-dream`) is written on dream COMPLETION, " +
+			"never at dispatch."
+		);
+	}
 
 	async function inReviewJobs(): Promise<ReviewJob[]> {
 		let r = await pi.exec(
@@ -548,12 +604,14 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 					);
 				}
 			}
+			const dream = await dreamCheck();
+			if (dream) alerts.push(dream);
 			if (alerts.length === 0) return;
 			pi.sendMessage(
 				{
 					customType: "nefario-watch",
 					content:
-						`[nefario-watch · ${stamp()}] PR/CI/review/Perkins alert on in-review job(s):\n` +
+						`[nefario-watch · ${stamp()}] PR/CI/review/Perkins/dream alert on in-review job(s):\n` +
 						alerts.join("\n") +
 						"\nDetection only: nefario-watch never writes the ledger or " +
 						"sends pane input — Gru owns every relay and ledger transition.",

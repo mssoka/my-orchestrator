@@ -8,7 +8,9 @@ itself.
 Naming theme (Despicable Me): **Gru** = the orchestrator, **minion** = a
 dispatched task agent (one per job), **mega-minion** = a specialist helper a
 minion spawns (e.g. a review swarm), **Perkins** = the automated PR-review
-agent (posts verdicts as the `perkins-review` GitHub App),
+agent (posts verdicts as the `perkins-review` GitHub App), **Bob** = the
+dreamer minion (periodic memory consolidation; his per-source readers are
+**sheep**),
 **nefario-watch** = the watcher gadget. Gru also *speaks* in character
 to the user (playbook: "Gru persona (voice)") — artifacts like briefings
 and ledger notes stay plain.
@@ -163,6 +165,26 @@ startup, journal at wind-down — injected into the agent's system prompt
 so they survive compaction. No vector stores, no daemons: files you can
 read, diff, and trust.
 
+### Dreaming (periodic consolidation)
+
+Every couple of days the **dream sensor** (in `nefario-watch.ts`, 5-min
+tick) notices undreamed material — field-note shards or journal entries
+newer than `_bmad-output/memory/last-dream` — and wakes Gru, who
+dispatches **Bob**, the dreamer minion (one pane, no repo, ledger id
+`dream-<yyyy-mm-dd>`; briefing: `_bmad-output/briefings/_template-dream.md`).
+Bob clones the mutable memory into
+`_bmad-output/memory/dream-<yyyy-mm-dd>/store/` (never edits the live
+store), fans out one **sheep** per input source (shards / journal /
+ledger events / churned transcripts), then consolidates: patterns with
+≥2 independent sightings become **proposals** — each with target file,
+the change, evidence (job ids + dates), reasoning, and a risk class
+(**auto** = Gru applies; **user-ack** = the human decides). Anecdotes
+become *watch items*, not edits. Gru applies auto-class edits, relays
+the rest, writes the `last-dream` marker (completion, never dispatch),
+and commits as `dream <date>: …`. Same concurrency rules as the live
+memory: cloned store + per-sheep shards, zero locks. Full procedure:
+playbook 'Dreaming (periodic memory consolidation)'.
+
 ---
 
 ## Setting up a new machine
@@ -188,6 +210,7 @@ Target state:
 │   ├── backups/                     # SQL dumps — NOT tracked
 │   ├── field-notes/<job-id>.md      # minion lesson shards (see § Memory)
 │   ├── gru-journal/<yyyy-mm-dd>.md  # Gru episodic journal (see § Memory)
+│   ├── memory/last-dream + dream-*/ # Bob's marker + dream passes (§ Memory)
 │   └── briefings/_template.md       # briefing template
 └── <repo1>/ <repo2>/ ...            # repos, each with .git and its own _bmad/
 ```

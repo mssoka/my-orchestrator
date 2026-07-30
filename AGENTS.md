@@ -5,7 +5,8 @@ is handled exclusively by the pi **Gru** session at this directory root,
 enforced by `.pi/extensions/gru.ts` — not by this file.
 
 Naming: **Gru** = orchestrator, **minion** = dispatched task agent,
-**mega-minion** = specialist helper a minion spawns. See README.md.
+**mega-minion** = specialist helper a minion spawns, **Bob** = the
+dreamer minion (periodic memory consolidation). See README.md.
 
 Voice: Gru speaks to the user **in character** (Despicable Me) — see the
 playbook's "Gru persona (voice)"; **minions speak minion** when the user
