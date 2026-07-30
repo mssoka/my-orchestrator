@@ -107,8 +107,62 @@ first.
   dumps SQL to `_bmad-output/backups/`. The old `orchestrator-jobs.yaml` is
   retired (pointer file only).
 - Briefings: `/Users/moses/code/_bmad-output/briefings/<job-id>.md`
+- Minion field notes: `_bmad-output/field-notes/<job-id>.md` — per-job
+  shards, minion-written; curated lessons: `docs/minion-field-notes.md`
+  (Gru-only writer). See 'Memory system'.
+- Gru journal: `_bmad-output/gru-journal/<yyyy-mm-dd>.md` — episodic
+  memory, Gru-only writer. See 'Memory system'.
 - The ledger is the source of truth across Herdr restarts. Update it on every
   status transition.
+
+## Memory system
+
+Gru has **state** (the ledger) and **procedure** (this playbook); the
+layers below add **lessons** and **episodes** so nothing learned dies
+with a session, a compaction, or a worktree.
+
+| Layer | Path | Writer | What it remembers |
+|---|---|---|---|
+| Ledger | `_bmad-output/orchestrator.db` | Gru + minions (via `bin/ledger`) | job state + event audit trail |
+| Curated field notes | `docs/minion-field-notes.md` | **Gru only** | durable minion lessons, promoted from shards |
+| Field-note shards | `_bmad-output/field-notes/<job-id>.md` | the job's minion | what bit THIS job, ≤3 one-liners at badge-out |
+| Gru journal | `_bmad-output/gru-journal/<yyyy-mm-dd>.md` | **Gru only** | episodes: what happened, decisions, open loops |
+| Gotchas | `AGENTS.md` | **Gru only** | Gru's own curated traps |
+| Minion memlog | `<worktree>/_bmad/scripts/memlog.py` | the minion | in-job scratchpad — commits with the branch, travels into the PR |
+| Briefings + PR "Decisions & rationale" | `_bmad-output/briefings/`, GitHub | Gru / minions | handoff memory — a fresh minion can take over cold |
+
+**Rituals:**
+
+- **Startup (Gru):** after the playbook + ledger + herdr reconcile, read
+  the last few journal entries (`ls -t _bmad-output/gru-journal | head -3`)
+  — this is the rehydration layer.
+- **Wind-down / after significant arcs (Gru):** append to today's journal
+  file — what happened, decisions, open loops. Five lines beats zero.
+- **Gotcha discipline (Gru):** every fumble ends in `AGENTS.md` gotchas or
+  a field note, same session — never "I'll remember it".
+- **Badge-out (minion):** write your shard
+  (`_bmad-output/field-notes/<job-id>.md`, ≤3 one-liners) before
+  finishing. Mega-minion lessons roll up through you.
+- **Consolidation (Gru):** periodically read shards and promote durable
+  lessons into `docs/minion-field-notes.md`; prune stale entries.
+
+**Concurrency — by avoidance, not locks (rules in force):**
+
+1. **Shard by writer.** Minions write only their own
+   `field-notes/<job-id>.md`; no two writers ever share a file, so
+   contention is impossible by construction. Even a 10-mega-minion swarm
+   has ONE writer: the parent minion.
+2. **Single-writer curated files.** Only Gru edits the curated notes,
+   AGENTS.md, this playbook, and the journal. Minions never touch shared
+   docs. Minions READ the curated notes at start (read-only = free).
+3. **Shared mutable state lives in SQLite, not files.** The ledger
+   serializes writers (WAL + `PRAGMA busy_timeout=5000`); that is why
+   statuses never go in markdown.
+4. **Atomic-append discipline (fallback).** If a shared append-only file
+   is ever introduced: single-line entries, one `>>` (O_APPEND) write
+   each — atomic on local APFS for small writes. Multi-line shared writes
+   would need a `mkdir` mutex (portable; macOS has no `flock`). Prefer
+   rules 1–3.
 
 ## Intake (Gru)
 
@@ -216,6 +270,12 @@ older briefings use that name; this is the same section.)
   your pane (see 'Minion persona (voice)') — eager, loyal, playful,
   readable. Artifacts (code, docs, PR text, commits, ledger notes)
   stay plain and precise.
+- **Memory:** at start, read `/Users/moses/code/docs/minion-field-notes.md`
+  (lessons from previous minions). At badge-out, append ≤3 one-liners to
+  `/Users/moses/code/_bmad-output/field-notes/<your-job-id>.md` — YOUR
+  file only, never another minion's shard, never the curated doc
+  (shard-by-writer; no locks). What bit you, what future minions must
+  know. Mega-minion lessons roll up through you, not their own files.
 - Use the **bmad skill(s) named in your briefing's Skills policy** for the
   work (`bmad-quick-dev` is the implementation default). Follow the skill's
   step files exactly, with two orchestration overrides:

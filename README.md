@@ -101,6 +101,70 @@ re-resolve with `herdr agent list`; never trust ids from an old session.
 
 ---
 
+## Memory
+
+Gru has **state** (the ledger) and **procedure** (the playbook); the
+memory system adds **lessons** and **episodes** so nothing learned dies
+with a session, a compaction, or a worktree. Pi sessions themselves
+remember nothing across restarts — these files are the brain.
+
+| Layer | Path | Writer | Remembers |
+|---|---|---|---|
+| **Ledger** | `_bmad-output/orchestrator.db` | Gru + minions via `bin/ledger` | job state + full event audit trail |
+| **Curated field notes** | `docs/minion-field-notes.md` | **Gru only** | durable minion lessons, promoted from shards |
+| **Field-note shards** | `_bmad-output/field-notes/<job-id>.md` | the job's minion | what bit THIS job — ≤3 one-liners at badge-out |
+| **Gru journal** | `_bmad-output/gru-journal/<yyyy-mm-dd>.md` | **Gru only** | episodes: what happened, decisions, open loops |
+| **Gotchas** | `AGENTS.md` | **Gru only** | Gru's own curated traps |
+| **Minion memlog** | `<worktree>/_bmad/scripts/memlog.py` | the minion | in-job scratchpad — commits with the branch, travels into the PR |
+| **Briefings + PR "Decisions & rationale"** | `_bmad-output/briefings/`, GitHub | Gru / minions | handoff memory — a fresh minion takes over cold |
+
+**Rituals:**
+
+- **Startup rehydration (Gru):** playbook + `bin/ledger` + `herdr agent
+  list` reconcile + the last few journal entries
+  (`ls -t _bmad-output/gru-journal | head -3`). Enforced by
+  `.pi/extensions/gru.ts`.
+- **Wind-down (Gru):** append to today's journal — what happened,
+  decisions, open loops.
+- **Gotcha discipline (Gru):** every fumble becomes an AGENTS.md gotcha
+  or a field note, same session.
+- **Badge-out (minion):** write your shard
+  (`_bmad-output/field-notes/<job-id>.md`). Minions also READ the curated
+  notes at job start (standing orders) — born fresh, but briefed.
+- **Consolidation (Gru):** promote durable shard lessons into
+  `docs/minion-field-notes.md`; prune stale entries.
+
+### Concurrency — by avoidance, not locks
+
+Many agents write at once (10+ minions, each with up to 10 mega-minions).
+The design makes contention impossible rather than managing it:
+
+1. **Shard by writer.** Each minion writes only its own
+   `field-notes/<job-id>.md` — no two writers ever share a file. Even a
+   10-mega-minion swarm has ONE writer: the parent (helpers report
+   in-pane; the parent rolls their lessons into its shard).
+2. **Single-writer curated files.** Only Gru edits the curated notes,
+   AGENTS.md, the playbook, and the journal. Minions never touch shared
+   docs; they read the curated notes at start (read-only is free).
+3. **Shared mutable state lives in SQLite, not files.** The ledger
+   serializes writers (WAL + `PRAGMA busy_timeout=5000`) — that is why
+   statuses are rows, not markdown.
+4. **Atomic-append discipline (fallback).** If a shared append-only file
+   is ever introduced: single-line entries, one `>>` (O_APPEND) write
+   each — atomic on local APFS for small writes. Multi-line shared writes
+   would need a `mkdir` mutex (portable; macOS has no `flock`). Prefer
+   rules 1–3.
+
+**Replicating this elsewhere:** the durable pieces are (a) one SQLite
+store with a tiny CLI that everything reports through, (b) a per-job
+shard directory writers can't collide in, (c) one curated lessons file
+with a single owner, (d) a daily journal, (e) two rituals — rehydrate at
+startup, journal at wind-down — injected into the agent's system prompt
+so they survive compaction. No vector stores, no daemons: files you can
+read, diff, and trust.
+
+---
+
 ## Setting up a new machine
 
 Replicates this setup from scratch. (This section replaced
@@ -122,6 +186,8 @@ Target state:
 ├── _bmad-output/
 │   ├── orchestrator.db              # ledger DB — NOT tracked, machine-local
 │   ├── backups/                     # SQL dumps — NOT tracked
+│   ├── field-notes/<job-id>.md      # minion lesson shards (see § Memory)
+│   ├── gru-journal/<yyyy-mm-dd>.md  # Gru episodic journal (see § Memory)
 │   └── briefings/_template.md       # briefing template
 └── <repo1>/ <repo2>/ ...            # repos, each with .git and its own _bmad/
 ```

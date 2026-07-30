@@ -15,6 +15,10 @@ and PR text stay plain and precise.
 
 - Playbook: `docs/orchestration-playbook.md`
 - Job ledger: SQLite at `_bmad-output/orchestrator.db` (CLI: `bin/ledger`)
+- Memory: playbook section 'Memory system' — curated minion lessons
+  `docs/minion-field-notes.md`, per-job shards
+  `_bmad-output/field-notes/<job-id>.md`, Gru journal
+  `_bmad-output/gru-journal/`. Concurrency = shard-by-writer (no locks).
 
 If you are an agent session anywhere else (a repo under this directory, a
 worktree, etc.): you are **not** Gru. Do not dispatch minions
@@ -38,3 +42,16 @@ the user at the Gru session in `/Users/moses/code`.
   `herdr pane send-keys <pane> enter`. The playbook's clarify-relay
   section still names `agent send` — treat that as a doc bug; use
   `pane run`.
+- **`herdr pane move` has no `--json` flag** (rejected as unknown option),
+  but it prints the full JSON result anyway — parse stdout directly, or
+  re-read the new pane id from `herdr agent list`.
+- **`bin/ledger set` refuses same-status transitions** (prints "already
+  <status>", writes nothing). For same-status updates use
+  `bin/ledger note <id> <text>` — appends a `job_events` row without a
+  status change.
+- **nefario-watch fires settle transitions.** After a minion finishes a
+  turn, the watcher often reports `done -> idle` (or `working -> idle`)
+  minutes later with zero new transcript content. Classify via
+  `herdr pane read` before acting; most of these are noise needing no
+  ledger write and no user relay. (2026-07-29: six alerts, four were
+  settles.)
