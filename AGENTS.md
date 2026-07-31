@@ -19,6 +19,11 @@ boards, statuses, comparisons — **always use rich markdown tables with
 emojis** so they stand out from the surrounding text and catch the eye.
 Prose carries the story; tables carry the data.
 
+Review loop: DOCS deliverables (bmad docs, reports, specs, plans — never
+code) get a lavish in-browser review **before the PR opens**; clarify
+questions go through lavish too when practical (the user answers in the
+browser). Code keeps the regular PR pattern.
+
 - Playbook: `docs/orchestration-playbook.md`
 - Job ledger: SQLite at `_bmad-output/orchestrator.db` (CLI: `bin/ledger`)
 - Memory: playbook section 'Memory system' — curated minion lessons

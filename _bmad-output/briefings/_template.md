@@ -20,9 +20,15 @@
 
 ## Standing orders
 Follow /Users/moses/code/docs/orchestration-playbook.md § "Minion standing
-orders": use the bmad-quick-dev skill; clarify questions halt for relay;
-internal checkpoints are pre-approved; close any panes you spawn; self-report
+orders": use the bmad-quick-dev skill; clarify questions halt for relay
+(lavish session when practical); internal checkpoints are pre-approved;
+close any panes you spawn; self-report
 transitions via `/Users/moses/code/bin/ledger set <job-id> <status> "<note>"`;
 notify via `herdr notification show "<job-id>"` when blocked or done; commit,
 push, open PR (never merge); PR description includes a "Decisions &
 rationale" section.
+
+## Review loop (docs only)
+This is a DOCS deliverable: run a lavish review loop BEFORE opening the PR
+(build → serve → poll → apply annotations → then PR). Code keeps the
+regular PR pattern.

@@ -340,8 +340,10 @@ older briefings use that name; this is the same section.)
 - Use the **bmad skill(s) named in your briefing's Skills policy** for the
   work (`bmad-quick-dev` is the implementation default). Follow the skill's
   step files exactly, with two orchestration overrides:
-  1. **Step-01 clarify**: ask your numbered questions, then HALT. Gru
-     relays answers from the user. Do not proceed on guesses.
+  1. **Step-01 clarify**: ask your numbered questions, then HALT. Present
+     them in a **lavish session** when practical (annotatable questions
+     page — the user answers in the browser); Gru chat-relay is the
+     fallback. Do not proceed on guesses.
   2. **Internal approval checkpoints** (e.g. spec approval in step-02):
      pre-approved by the user — proceed without halting. Only halt for
      genuine blockers (missing access, contradictory requirements,
@@ -358,9 +360,11 @@ older briefings use that name; this is the same section.)
   env values, replace the symlink with a copy first
   (`rm .env && cp <repo_root>/.env .env`), edit the copy, and call the
   change out in the PR description. **Never commit env files or secrets.**
-- **HTML artifacts for human review** (reports, plans, mock-design docs):
-  serve them via the `lavish` skill and foreground-poll for the user's
-  in-page annotations — see 'HTML artifact review (lavish)'.
+- **Docs deliverables (bmad docs, reports, specs, plans — never code):
+  lavish review BEFORE the PR opens.** Build the artifact, serve it via
+  the `lavish` skill, foreground-poll for the user's in-page annotations,
+  apply them, and only then open the PR — see 'HTML artifact review
+  (lavish)'. Code keeps the regular PR pattern.
 - When blocked or finished, run:
   `herdr notification show "<job-id>" --body "<one-line status>"`
 - **Self-report every status transition** to the ledger as it happens:
@@ -448,6 +452,12 @@ mock-design docs — into an in-page review surface: the user highlights
 elements/text and comments in the browser; feedback routes to whichever
 agent polls. Local-first. Never run `lavish-axi share` (third-party
 hosting on ht-ml.app) unless the user explicitly asks.
+
+**Standing policy (2026-07-31):** every DOCS deliverable (bmad docs,
+reports, specs, plans — never code) gets a lavish review loop **before
+its PR opens**; clarify questions go through lavish too when practical
+(the user prefers answering in the browser). Code keeps the regular PR
+pattern.
 
 - **Minions:** when a deliverable is an HTML artifact for human review,
   build it per the skill (open the matching playbooks first:
