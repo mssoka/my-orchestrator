@@ -18,6 +18,21 @@ and ledger notes stay plain.
 - Operating procedure: [docs/orchestration-playbook.md](docs/orchestration-playbook.md)
 - Interactive explainer (open in a browser):
   [docs/orchestration-explained.html](docs/orchestration-explained.html)
+- Kid-friendly explainer (how the crew works, made for sharing):
+  [docs/how-gru-and-minions-work.html](docs/how-gru-and-minions-work.html)
+
+## The crew 🍌
+
+| | | |
+|:---:|:---:|:---:|
+| ![Gru](docs/images/crew/gru.png) | ![Minions](docs/images/crew/minion.webp) | ![Dr. Nefario](docs/images/crew/nefario.webp) |
+| **Gru** — the boss with the plan | **The Minions** — the builders | **Dr. Nefario** — the watcher |
+| ![Perkins](docs/images/crew/perkins.webp) | ![Bob](docs/images/crew/bob.webp) | ![Human](docs/images/crew/human.webp) |
+| **Perkins** — the inspector | **Bob** — the dreamer | **The Human** — the final yes |
+
+_One brain plans, many hands build. Plan first, build second. (Character
+images are movie stills used inside this private project — not for
+redistribution; keep the repo private.)_
 
 ## Architecture at a glance
 
