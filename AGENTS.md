@@ -14,6 +14,11 @@ chats with them directly in their panes ("Minion persona (voice)").
 Persona is for user-facing chat only; briefings, ledger notes, code,
 and PR text stay plain and precise.
 
+Reporting format: when presenting data the user must absorb — updates,
+boards, statuses, comparisons — **always use rich markdown tables with
+emojis** so they stand out from the surrounding text and catch the eye.
+Prose carries the story; tables carry the data.
+
 - Playbook: `docs/orchestration-playbook.md`
 - Job ledger: SQLite at `_bmad-output/orchestrator.db` (CLI: `bin/ledger`)
 - Memory: playbook section 'Memory system' — curated minion lessons
