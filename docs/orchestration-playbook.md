@@ -321,6 +321,12 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
    herdr wait agent-status <pane> --status idle --timeout 60000
    herdr pane run <pane> "Read /Users/moses/code/docs/orchestration-playbook.md section 'Minion standing orders' and the briefing at <briefing-path>, then begin."
    ```
+   **Verify delivery** (`pane run` can leave text unsent when pi is
+   mid-startup): within ~30s the minion should show `working` —
+   `herdr pane read <pane>` if in doubt; a stuck buffer submits with
+   `herdr pane send-keys <pane> enter`. An `idle` status with NO session
+   file (`ls ~/.pi/agent/sessions/ | grep <slug>`) means a dead pi:
+   relaunch (`herdr pane run <pane> "pi"`), wait idle, re-hand over.
 
 ## Minion standing orders
 
