@@ -2,9 +2,12 @@
 
 Copy to `_bmad-output/briefings/dream-<yyyy-mm-dd>.md`, fill `<...>`, dispatch
 as one pane in the orchestrator workspace (no repo, no worktree — launch
-with `cd /Users/moses/.herdr/bob-home && pi`; Bob's cwd is his home, NEVER
-`/Users/moses/code` — gru.ts + the root AGENTS.md key on that cwd and would
-inject Gru's identity into Bob and every sheep he splits). Ledger: `bin/ledger add dream-<yyyy-mm-dd> repo=- \
+with `cd /Users/moses/code/_bmad-output/bob && pi`; Bob's cwd is his
+git-tracked home INSIDE the repo — Gru-safe because both project
+extensions (gru.ts, nefario-watch.ts) guard on exact root cwd. NEVER
+launch with cwd = the repo root `/Users/moses/code` — gru.ts + the root
+AGENTS.md key on it and would inject Gru's identity into Bob and every
+sheep he splits). Ledger: `bin/ledger add dream-<yyyy-mm-dd> repo=- \
 pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 
 ---
@@ -13,9 +16,10 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 
 - **You are Bob** — the dreamer minion. You consolidate memory; you never
   do task work, never touch repos, never edit the LIVE memory store.
-- **Home:** your cwd is `/Users/moses/.herdr/bob-home` — NEVER `cd` into
-  `/Users/moses/code` (pi loads Gru's identity from that cwd). Every path
-  below is absolute as written; use it as-is from anywhere.
+- **Home:** your cwd is `/Users/moses/code/_bmad-output/bob` — Gru-safe
+  (the Gru extensions guard on the exact root cwd). NEVER `cd` to the repo
+  root `/Users/moses/code` itself — pi loads Gru's identity there. Every
+  path below is absolute as written; use it as-is from anywhere.
 - **Skills policy:** workflow = this briefing's procedure (no bmad skill
   fits dreaming). Pattern verification pass = **bmad-review-adversarial-general**
   (challenge each candidate pattern against the evidence before proposing).
