@@ -1,0 +1,5 @@
+# Field notes — finlit-bugfix-event-messages (2026-07-31)
+
+- GDScript type trap that caused the whole bug: `var x := 60` (int) then `x -= delta` silently TRUNCATES each frame (−1/frame) — no error, no warning; any var receiving frame deltas must be explicitly float-typed (`var x: float = ...`). Int var = float literal also truncates silently.
+- Godot capture rig on macOS: `--headless` = dummy renderer (`viewport.get_texture().get_image()` returns NULL) — captures must run WINDOWED; `await process_frame` inside `SceneTree._initialize()` deadlocks — drive frames from `_process`; `_ready` is DEFERRED to the first iteration when add_child happens in `_initialize` (freeze test state in the first `_process` frame, and a failed edit in a multi-edit `edit` call fails the WHOLE call atomically — re-check the file).
+- Rebasing onto a theme/palette restyle: `.tres`/`.tscn` colors store 6-decimal truncations vs exact /255 from `Color("#hex")` — assert with `is_equal_approx`, never `==`; theme propagation is tree-scoped, so scene-instantiating color tests must add dynamically built cards INTO the tree (or hand the node the theme like `_open_popup` does) before asserting.

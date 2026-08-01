@@ -1,0 +1,1282 @@
+diff --git a/_bmad-output/implementation-artifacts/deferred-work.md b/_bmad-output/implementation-artifacts/deferred-work.md
+index 52698ad4..a41425bc 100644
+--- a/_bmad-output/implementation-artifacts/deferred-work.md
++++ b/_bmad-output/implementation-artifacts/deferred-work.md
+@@ -526,3 +526,6 @@ Items that are real but will not be fixed: blocked by a project policy, by V1 sc
+ - source_spec: `_bmad-output/implementation-artifacts/spec-bmad-post-strip-hardening.md`
+   summary: Put the pi-global canonical skill dir (`/Users/moses/code/.agents/skills/`) under version control or document git history as the recovery path.
+   evidence: The rescued `bmad-review-verification-gap` skill's only versioned copy was removed from this repo; the canonical dir is unversioned and single-machine. Recovery path today: git history pre-0a82344 (`.claude/skills/bmad-review-verification-gap`).
++- source_spec: `_bmad-output/implementation-artifacts/spec-rc1-1-attestation-capture-schema-submission-write-path.md`
++  summary: request_helpers.client_ip/client_user_agent slice by graphemes (Gleam string.slice) while the DB CHECK bounds count characters (Postgres length()) — a multi-codepoint header can exceed the bound post-slice and 500 the write path.
++  evidence: edge-case review of RC1.1; the helpers feed cookie_consent_log, payment_terms_acceptance, and now application.submitted_* — all share the same 64/512 CHECK idiom, so the fix (codepoint-bounded slicing) belongs in one focused change across all three callers.
+diff --git a/_bmad-output/implementation-artifacts/spec-rc1-1-attestation-capture-schema-submission-write-path.md b/_bmad-output/implementation-artifacts/spec-rc1-1-attestation-capture-schema-submission-write-path.md
+new file mode 100644
+index 00000000..693c02d3
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-rc1-1-attestation-capture-schema-submission-write-path.md
+@@ -0,0 +1,168 @@
++---
++title: 'RC1.1: Attestation & capture schema + submission write path'
++type: 'feature'
++created: '2026-07-31'
++status: 'done'
++baseline_commit: '80ed48f08241d3653b77938ef7b592a8c8b9fb47'
++review_loop_iteration: 0
++context: []
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** AI reference-checking v1 (issue #548, story RC1.1) has no schema or write path for its evidence foundation: the applicant's explicit referee-contact choice is not recorded, and the applicant-submission IP/UA comparator that later fraud signals (RC3.7) are computed against is not captured.
++
++**Approach:** Two expand-only migrations (`reference_contact_attestation` enum value; `application.submitted_ip_text`/`submitted_user_agent`/`reference_contact_choice` columns), then wire the submission path: `validate_form` requires an explicit attested/declined choice, the transaction writes IP/UA + choice onto the application row, and `insert_acknowledgement_records` gains its fourth write (`reference_contact_attestation`, current `policy_version`) only when attested.
++
++## Boundaries & Constraints
++
++**Always:**
++- Attestation/acknowledgement vocabulary only — the word "consent" never appears in relation to this record in code, copy, or comments (AD-2 §3.2). (The pre-existing enum type name `consent_type` stays as-is; it is the type name, not the record's vocabulary.)
++- Enum migration follows the `20260420000003` precedent exactly: `ALTER TYPE consent_type ADD VALUE IF NOT EXISTS 'reference_contact_attestation';`
++- Capture columns follow the `cookie_consent_log` precedent: `TEXT NOT NULL DEFAULT '' CHECK (length(...) <= 64)` / `<= 512`. `reference_contact_choice TEXT` nullable, `CHECK (reference_contact_choice IN ('attested','declined'))` (A4 — pre-v1 rows stay NULL).
++- IP via `request_helpers.client_ip(req)`, UA via `request_helpers.client_user_agent(req)` — both already bounded; extraction happens in `process_form_submission`, values threaded down to the insert.
++- Attestation row writes inside the existing `pog.transaction` via `insert_acknowledgement_records` (AD-2), stamped with `compliance.policy_version`, only when choice = attested. Declined writes NO row and submits normally.
++- Choice is written to `reference_contact_choice` on every successful submission ('attested' or 'declined'), matching the explicit choice.
++- Missing, empty, or tampered choice fails `validate_form` (explicit choice required — no silent skip, no default). Error copy: "Choose one option to continue." (UX §5.3 verbatim — RC1.2's scroll target).
++- Squirrel workflow is mandatory: edit `.sql` files, then `bash run_squirrel.sh` — never hand-edit generated `sql.gleam`.
++- Migrations expand-only, idempotent (`IF NOT EXISTS`).
++
++**Ask First:**
++- Any change outside the Code Map files (e.g. if a shared-file collision with the parallel RC2.1 minion appears — `shared/src/shared/reference_call.gleam` is theirs).
++
++**Never:**
++- No UI/card/copy/framing work — that is story RC1.2 (`form_sections/`, `form_pages.gleam`, `form_copy.gleam`, `form_fields.gleam` stay untouched).
++- Never expose `submitted_ip_text` / `submitted_user_agent` on any API payload, log line, or landlord-visible surface (AD-11: internal-only). Only `reference_contact_choice` joins the shared type/payload (A4).
++- No `reference_call`/`reference_objection_log` schema (RC2.1, parallel minion), no fraud-signal computation (RC3.7), no auto-reject.
++- No backfill of attestation rows for pre-v1 applications.
++- Never merge the PR; never commit env files/secrets.
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| Attested submission | `reference_contact_choice=attested` | App row: choice='attested', IP/UA stored; 3rd ack row type `reference_contact_attestation` with `policy_version` (2→3 rows no-guarantor) | N/A |
++| Declined submission | `reference_contact_choice=declined` | App row: choice='declined', IP/UA stored; NO attestation row; submission succeeds normally | N/A |
++| Missing choice | field absent/empty | `validate_form` error on `reference_contact_choice`; form re-renders; zero app/ack rows persisted | Validation error "Choose one option to continue." |
++| Tampered choice | value not in {attested, declined} | Same as missing (validation rejects); if it ever reached the insert layer, tx aborts loudly (`HandlerLogicError`) | 500 + log, never a coerced value |
++| No IP/UA headers | headers absent | `''` stored in both capture columns; submission unaffected | N/A |
++| Over-long IP/UA | adversarial headers | Helpers slice to 64/512 before write; CHECK constraints never trip | N/A |
++| Pre-v1 rows | existing applications | `reference_contact_choice` stays NULL; capture columns `''` via DEFAULT | N/A |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `supabase/migrations/20260731220000_add_reference_contact_attestation_enum.sql` -- NEW: enum value (precedent `20260420000003`)
++- `supabase/migrations/20260731220100_add_application_capture_columns.sql` -- NEW: three columns (precedent `20260523224800` bounds idiom)
++- `server/src/application/sql/create_application.sql` -- add 3 columns + params ($44–$46); then `bash run_squirrel.sh` regenerates `sql.gleam`
++- `server/src/application/application_handler.gleam` -- `validate_form` choice check (~L261); `process_form_submission` extracts IP/UA (~L188); thread through `prepare_and_insert_application` → `insert_application` → `insert_application_row`; `insert_acknowledgement_records` fourth write (~L1779)
++- `server/src/application/sql/get_application_detail.sql` -- SELECT gains `reference_contact_choice` (squirrel regen)
++- `server/src/application/application_detail_handler.gleam` -- `detail_row_to_application` maps the new field (~L930)
++- `server/src/application/error_summary.gleam` -- `label_for("reference_contact_choice")` → "Contacting your referees" (UX §5.3 card heading)
++- `shared/src/shared/application.gleam` -- `reference_contact_choice: Option(String)` on type + encoder + decoder (`decode.optional_field` default `None`, guarantor-fields pattern)
++- `server/test/test_helpers.gleam` -- `valid_application_form_values()` gains the choice
++- `server/test/application/application_handler_test.gleam` -- unit tests: attested/declined/missing/tampered
++- `server/test/application/application_detail_handler_test.gleam` -- `sample_detail_row` + mapping assertion
++- `server/test/integration/gdpr_integration_test.gleam` -- `apply_form_fixture_values` gains choice; update 3 ack-count tests; new attested/declined/missing-path tests
++- `server/test/integration/application_integration_test.gleam` -- two inline submission fixtures gain the choice
++- `shared/test/shared/application_test.gleam` (or existing codec test home) -- codec round-trip incl. absent-field default
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `supabase/migrations/20260731220000_add_reference_contact_attestation_enum.sql` -- create -- AD-2 enum value, replay-safe
++- [x] `supabase/migrations/20260731220100_add_application_capture_columns.sql` -- create -- AD-10 capture columns + A4 choice column, expand-only
++- [x] `server/src/application/sql/create_application.sql` + `bash run_squirrel.sh` -- add columns/params -- write path for choice + capture
++- [x] `server/src/application/application_handler.gleam` -- validation + threading + fourth ack write -- the story's core behavior
++- [x] `server/src/application/sql/get_application_detail.sql` + `application_detail_handler.gleam` -- expose choice on detail payload -- A4 panel contract
++- [x] `shared/src/shared/application.gleam` -- field + codecs -- A4 payload type; IP/UA deliberately absent (AD-11)
++- [x] `server/src/application/error_summary.gleam` -- label for new field key -- error banner renders a human label
++- [ ] Tests (all files in Code Map) -- fixtures + new attested/declined/missing/tampered/codec coverage -- story Verify contract
++
++**Acceptance Criteria:**
++- Given the migrations run from a reset DB, when they apply, then the enum value exists and the three columns exist with their bounds/CHECK, all idempotent.
++- Given an attested submission, when the transaction commits, then the app row carries choice='attested' + IP/UA, and exactly one `reference_contact_attestation` ack row exists with the current `policy_version`.
++- Given a declined submission, when the transaction commits, then choice='declined', NO attestation row exists, and the application submits normally (confirmation path).
++- Given a missing/empty/tampered choice, when validation runs, then submission fails with the choice error and zero application/ack rows persist.
++- Given the detail payload, when an application with a choice is fetched, then `reference_contact_choice` is present ('attested'/'declined'/null); IP/UA appear nowhere in the payload.
++- Given any code/copy/comment naming this record, when reviewed, then attestation/acknowledgement vocabulary is used — "consent" never appears in relation to it.
++
++## Spec Change Log
++
++## Design Notes
++
++- Insert-layer guard: `validate_form` is the gate, but `insert_application_row` matches the choice exhaustively — anything other than the two literals aborts the tx via `HandlerLogicError`. A silently coerced 'declined' would fabricate a choice the applicant never made (A4's whole point is honest declined-vs-NULL distinction).
++- Shared type carries only `reference_contact_choice`: AD-11's boundary rule ("never leak raw IPs to the landlord payload") keeps the capture columns server-side; RC3.7 reads them via SQL directly.
++- Existing ack-count tests (no_guarantor 2, with_guarantor 3, co_applicant 3) keep their counts by giving `apply_form_fixture_values` a `choice` parameter defaulting to declined; the attested path gets its own dedicated tests.
++
++## Verification
++
++**Commands:**
++- `make test-db-up && make test-db-reset` -- full migration chain replays cleanly from reset
++- `bash run_squirrel.sh` -- generated query code in sync, no diff after regen
++- `make test-shared` -- green (codec tests)
++- `make test-server` -- green (unit tests)
++- `make test-integration` -- green (attested/declined/missing-choice + updated ack-count tests)
++- `cd server && gleam format --check src test` (and `shared`) -- formatting clean
++
++**Manual checks (if no CLI):**
++- `git grep -in "consent" -- server/src/application shared/src/shared | grep -i reference` returns nothing attestation-related (vocabulary sweep, excluding the pre-existing `consent_type` type name and unrelated GDPR consent code).
++
++## Suggested Review Order
++
++**Schema (the contract's foundation)**
++
++- Enum value follows the `20260420000003` one-addition precedent exactly, replay-safe.
++  [`20260731220000_add_reference_contact_attestation_enum.sql`](../../supabase/migrations/20260731220000_add_reference_contact_attestation_enum.sql)
++
++- Three columns: bounded capture pair (NOT NULL DEFAULT '') + nullable honest choice; XFF trust note inline.
++  [`20260731220100_add_application_capture_columns.sql`](../../supabase/migrations/20260731220100_add_application_capture_columns.sql)
++
++**Submission write path (the story's core)**
++
++- Entry point: IP/UA extracted from the request on the validated success path only, threaded to the transaction.
++  [`application_handler.gleam:194`](../../server/src/application/application_handler.gleam#L194)
++
++- Explicit-choice validation: attested|declined required, no silent skip, UX-verbatim error copy.
++  [`application_handler.gleam:514`](../../server/src/application/application_handler.gleam#L514)
++
++- Insert-layer exhaustiveness guard: coercion would fabricate a choice, so the tx aborts loudly instead.
++  [`application_handler.gleam:1664`](../../server/src/application/application_handler.gleam#L1664)
++
++- Fourth acknowledgement write: attestation row with current policy_version, same transaction, only when attested.
++  [`application_handler.gleam:1870`](../../server/src/application/application_handler.gleam#L1870)
++
++- INSERT gains the three columns ($44–$46); squirrel regenerated, never hand-edited.
++  [`create_application.sql:47`](../../server/src/application/sql/create_application.sql#L47)
++
++**Boundary exposure (A4 vs AD-11)**
++
++- Shared type carries ONLY the choice (Option); IP/UA deliberately absent — raw capture never crosses the API boundary.
++  [`application.gleam:86`](../../shared/src/shared/application.gleam#L86)
++
++- Decoder defaults absent keys to None so pre-v1 cached payloads still decode.
++  [`application.gleam:362`](../../shared/src/shared/application.gleam#L362)
++
++- Detail payload maps the choice through (the panel's declined-vs-pre-v1 distinction).
++  [`application_detail_handler.gleam`](../../server/src/application/application_detail_handler.gleam)
++
++- Art. 15: the subject's own choice + capture join the DSAR export (review-pass finding, closed here).
++  [`find_application_by_id.sql:56`](../../server/src/dsar/sql/find_application_by_id.sql#L56)
++  [`dsar_handler.gleam:380`](../../server/src/dsar/dsar_handler.gleam#L380)
++
++- Error banner label matches the RC1.2 card heading ("Contacting your referees").
++  [`error_summary.gleam:172`](../../server/src/application/error_summary.gleam#L172)
++
++**Tests**
++
++- Unit: missing/tampered/declined choice validation paths.
++  [`application_handler_test.gleam`](../../server/test/application/application_handler_test.gleam)
++
++- Integration: attested (row + choice + IP/UA), declined (no row), missing (validation, zero rows), overlong-header truncation.
++  [`gdpr_integration_test.gleam`](../../server/test/integration/gdpr_integration_test.gleam)
++
++- Codec round-trips + absent-key default; detail-row mapping assertion; fixtures updated across server/client.
++  [`shared_test.gleam`](../../shared/test/shared_test.gleam)
+diff --git a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+index 38eccf12..e18590d9 100644
+--- a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
++++ b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+@@ -57,8 +57,8 @@ github_issue: 548
+ 
+ development_status:
+   # Epic RC1: Applicant Attestation & Reference Capture
+-  epic-rc1: backlog
+-  rc1-1-attestation-capture-schema-submission-write-path: backlog
++  epic-rc1: in-progress
++  rc1-1-attestation-capture-schema-submission-write-path: review
+   rc1-2-attestation-ui-the-references-section-choice: backlog
+   epic-rc1-retrospective: optional
+ 
+diff --git a/client/test/client_test.gleam b/client/test/client_test.gleam
+index 3dc7322a..3fd17c99 100644
+--- a/client/test/client_test.gleam
++++ b/client/test/client_test.gleam
+@@ -2207,6 +2207,7 @@ fn test_application() -> application.Application {
+     guarantor_email: None,
+     guarantor_monthly_income_cents: None,
+     guarantor_employer: None,
++    reference_contact_choice: None,
+     household_monthly_income_cents: 350_000,
+     co_applicant_count: 0,
+   )
+@@ -2235,6 +2236,7 @@ pub fn primary_guarantor_block_renders_only_when_declared_test() {
+       guarantor_email: option.Some("mary@example.com"),
+       guarantor_monthly_income_cents: option.Some(450_000),
+       guarantor_employer: option.Some("Acme Ltd"),
++      reference_contact_choice: None,
+     )
+   let html =
+     application_detail_guarantor.view_primary_guarantor_block(with_guarantor)
+@@ -3732,6 +3734,7 @@ fn make_comparison_detail(
+       guarantor_email: None,
+       guarantor_monthly_income_cents: None,
+       guarantor_employer: None,
++      reference_contact_choice: None,
+       household_monthly_income_cents: 350_000,
+       co_applicant_count: 0,
+     ),
+@@ -3865,6 +3868,7 @@ pub fn download_report_disabled_when_no_analysis_test() {
+         guarantor_email: None,
+         guarantor_monthly_income_cents: None,
+         guarantor_employer: None,
++        reference_contact_choice: None,
+         household_monthly_income_cents: 200_000,
+         co_applicant_count: 0,
+       ),
+@@ -5465,6 +5469,7 @@ fn helpers_fixture_detail(
+       guarantor_email: None,
+       guarantor_monthly_income_cents: None,
+       guarantor_employer: None,
++      reference_contact_choice: None,
+       household_monthly_income_cents: 300_000,
+       co_applicant_count: 0,
+     ),
+diff --git a/client/test/components/sweep_nudge_banner_test.gleam b/client/test/components/sweep_nudge_banner_test.gleam
+index 2cfbf0d6..435d01d3 100644
+--- a/client/test/components/sweep_nudge_banner_test.gleam
++++ b/client/test/components/sweep_nudge_banner_test.gleam
+@@ -69,6 +69,7 @@ fn sample_application(
+     guarantor_email: None,
+     guarantor_monthly_income_cents: None,
+     guarantor_employer: None,
++    reference_contact_choice: None,
+     household_monthly_income_cents: 250_000,
+     co_applicant_count: 0,
+   )
+diff --git a/server/src/application/application_detail_handler.gleam b/server/src/application/application_detail_handler.gleam
+index 8f6916d4..4b72c511 100644
+--- a/server/src/application/application_detail_handler.gleam
++++ b/server/src/application/application_detail_handler.gleam
+@@ -991,6 +991,7 @@ pub fn detail_row_to_application(
+     guarantor_email:,
+     guarantor_monthly_income_cents:,
+     guarantor_employer:,
++    reference_contact_choice: row.reference_contact_choice,
+     status: shared_application.status_from_string(row.status),
+     created_at: row.created_at,
+     household_monthly_income_cents: row.household_monthly_income_cents,
+diff --git a/server/src/application/application_handler.gleam b/server/src/application/application_handler.gleam
+index e8aff23c..2bf2d173 100644
+--- a/server/src/application/application_handler.gleam
++++ b/server/src/application/application_handler.gleam
+@@ -26,6 +26,7 @@ import middleware
+ import notification/email_client
+ import pog
+ import posthog/posthog_client.{type PostHog}
++import request_helpers
+ import sentry/sentry_client.{type Sentry}
+ import shared/co_applicant.{type CoApplicant, CoApplicant}
+ import shared/email
+@@ -190,6 +191,8 @@ fn process_form_submission(
+                 vacancy,
+                 values,
+                 form_data.files,
++                request_helpers.client_ip(req),
++                request_helpers.client_user_agent(req),
+                 supabase_url,
+                 supabase_service_role_key,
+                 resend_api_key,
+@@ -504,6 +507,18 @@ pub fn validate_form(
+     ]
+   }
+ 
++  // Reference-contact choice (AD-2 / amendment A4): an explicit attested or
++  // declined answer is required — no silent skip, no default. The radio card
++  // UI lands in story RC1.2; the server-side contract is fixed here so the
++  // write path always records a deliberate choice.
++  let errors = case get_form_value(values, "reference_contact_choice") {
++    "attested" | "declined" -> errors
++    _ -> [
++      #("reference_contact_choice", "Choose one option to continue."),
++      ..errors
++    ]
++  }
++
+   // Household extras — additional income sources (primary) and co-applicants.
+   // Validated here so the form can re-render inline errors next to the
+   // relevant field. Caps are enforced even though the UI hides the add
+@@ -1352,6 +1367,8 @@ fn prepare_and_insert_application(
+   vacancy: sql.GetVacancyForFormRow,
+   values: List(#(String, String)),
+   files: List(#(String, wisp.UploadedFile)),
++  submitted_ip: String,
++  submitted_user_agent: String,
+   supabase_url: String,
+   supabase_service_role_key: String,
+   resend_api_key: String,
+@@ -1370,6 +1387,8 @@ fn prepare_and_insert_application(
+         vacancy,
+         values,
+         [],
++        submitted_ip,
++        submitted_user_agent,
+         supabase_url,
+         supabase_service_role_key,
+         resend_api_key,
+@@ -1382,6 +1401,8 @@ fn prepare_and_insert_application(
+         vacancy,
+         values,
+         prepared,
++        submitted_ip,
++        submitted_user_agent,
+         supabase_url,
+         supabase_service_role_key,
+         resend_api_key,
+@@ -1458,6 +1479,8 @@ fn insert_application(
+   vacancy: sql.GetVacancyForFormRow,
+   values: List(#(String, String)),
+   prepared: List(document_upload.PreparedFile),
++  submitted_ip: String,
++  submitted_user_agent: String,
+   supabase_url: String,
+   supabase_service_role_key: String,
+   resend_api_key: String,
+@@ -1494,6 +1517,8 @@ fn insert_application(
+             monthly_income_cents,
+             num_occupants,
+             personal_statement,
++            submitted_ip,
++            submitted_user_agent,
+           ))
+           use app_uuid <- result.try(
+             uuid.from_string(create_row.id)
+@@ -1503,6 +1528,7 @@ fn insert_application(
+             tx,
+             app_uuid,
+             any_guarantor_present(values, co_applicants),
++            get_form_value(values, "reference_contact_choice") == "attested",
+           ))
+           use _ <- result.try(insert_income_sources(
+             tx,
+@@ -1627,7 +1653,20 @@ fn insert_application_row(
+   monthly_income_cents: Int,
+   num_occupants: Int,
+   personal_statement: String,
++  submitted_ip: String,
++  submitted_user_agent: String,
+ ) -> Result(sql.CreateApplicationRow, InsertFailure) {
++  // Reference-contact choice: validate_form gates submissions on an explicit
++  // attested/declined literal, so anything else here means a bypass or a bug.
++  // Fail loudly rather than coerce — a coerced value would record a choice
++  // the applicant never made (amendment A4 exists to keep declined-vs-NULL
++  // honest).
++  let reference_contact_choice =
++    get_form_value(values, "reference_contact_choice")
++  use Nil <- result.try(case reference_contact_choice {
++    "attested" | "declined" -> Ok(Nil)
++    _ -> Error(HandlerLogicError("invalid_reference_contact_choice"))
++  })
+   // Resolve guarantor fields respecting the null-out rule (plan W5): when
+   // `has_guarantor` is False, all six guarantor inputs are blanked so the
+   // SQL NULLIF clauses drop them to NULL. Trusting the client checkbox
+@@ -1725,6 +1764,9 @@ fn insert_application_row(
+       g_email,
+       g_income_cents,
+       g_employer,
++      submitted_ip,
++      submitted_user_agent,
++      reference_contact_choice,
+     )
+   {
+     Ok(pog.Returned(0, [])) -> Error(VacancyClosed)
+@@ -1780,6 +1822,7 @@ fn insert_acknowledgement_records(
+   tx: pog.Connection,
+   app_uuid: uuid.Uuid,
+   has_guarantor: Bool,
++  reference_attested: Bool,
+ ) -> Result(Nil, InsertFailure) {
+   // acknowledgement_record captures Art. 13 transparency evidence (data
+   // processing + AI analysis notices) and — for guarantor_attestation — real
+@@ -1811,7 +1854,7 @@ fn insert_acknowledgement_records(
+   // The form-level checkbox label confirms the applicant has third-party
+   // consent for every guarantor named on the application — DPC guidance
+   // treats the disclosure as cumulative third-party PII.
+-  case has_guarantor {
++  use _ <- result.try(case has_guarantor {
+     False -> Ok(Nil)
+     True ->
+       sql.create_acknowledgement_record(
+@@ -1828,6 +1871,28 @@ fn insert_acknowledgement_records(
+         QueryFailed(string_inspect_query_error(err))
+       })
+       |> result.map(fn(_) { Nil })
++  })
++  // Referee-contact attestation (AD-2): written only when the applicant
++  // explicitly attested that their referees expect contact. A declined
++  // choice writes NO row — the choice itself lives on the application
++  // row's reference_contact_choice column (amendment A4).
++  case reference_attested {
++    False -> Ok(Nil)
++    True ->
++      sql.create_acknowledgement_record(
++        tx,
++        app_uuid,
++        "reference_contact_attestation",
++        version,
++      )
++      |> result.map_error(fn(err) {
++        wisp.log_error(
++          "Failed to create reference_contact_attestation acknowledgement: "
++          <> string_inspect_query_error(err),
++        )
++        QueryFailed(string_inspect_query_error(err))
++      })
++      |> result.map(fn(_) { Nil })
+   }
+ }
+ 
+diff --git a/server/src/application/error_summary.gleam b/server/src/application/error_summary.gleam
+index 24962c26..217b093b 100644
+--- a/server/src/application/error_summary.gleam
++++ b/server/src/application/error_summary.gleam
+@@ -167,6 +167,9 @@ fn base_label(key: String) -> String {
+     "has_eviction_history" -> "Eviction history"
+     "eviction_details" -> "Eviction details"
+     "has_ccjs" -> "CCJs or judgements"
++    // UX §5.3 card heading — RC1.2 renders the card under this title, so
++    // the error banner's label matches what the applicant sees.
++    "reference_contact_choice" -> "Contacting your referees"
+ 
+     // Guarantor
+     "has_guarantor" -> "Guarantor"
+diff --git a/server/src/application/sql.gleam b/server/src/application/sql.gleam
+index 0af60ca8..b5f02d92 100644
+--- a/server/src/application/sql.gleam
++++ b/server/src/application/sql.gleam
+@@ -344,6 +344,9 @@ pub fn create_application(
+   arg_41: String,
+   arg_42: Int,
+   arg_43: String,
++  arg_44: String,
++  arg_45: String,
++  arg_46: String,
+ ) -> Result(pog.Returned(CreateApplicationRow), pog.QueryError) {
+   let decoder = {
+     use id <- decode.field(0, decode.string)
+@@ -394,7 +397,10 @@ pub fn create_application(
+   guarantor_phone,
+   guarantor_email,
+   guarantor_monthly_income_cents,
+-  guarantor_employer
++  guarantor_employer,
++  submitted_ip_text,
++  submitted_user_agent,
++  reference_contact_choice
+ )
+ SELECT
+   $1::uuid,
+@@ -439,7 +445,10 @@ SELECT
+   NULLIF($40, ''),
+   NULLIF($41, ''),
+   CASE WHEN $42::int = 0 THEN NULL ELSE $42::int END,
+-  NULLIF($43, '')
++  NULLIF($43, ''),
++  $44,
++  $45,
++  NULLIF($46, '')
+ WHERE (
+   SELECT count(*) FROM application WHERE vacancy_id = $1::uuid
+ ) < (
+@@ -491,6 +500,9 @@ RETURNING id::text, created_at::text;
+   |> pog.parameter(pog.text(arg_41))
+   |> pog.parameter(pog.int(arg_42))
+   |> pog.parameter(pog.text(arg_43))
++  |> pog.parameter(pog.text(arg_44))
++  |> pog.parameter(pog.text(arg_45))
++  |> pog.parameter(pog.text(arg_46))
+   |> pog.returning(decoder)
+   |> pog.execute(db)
+ }
+@@ -782,6 +794,7 @@ pub type GetApplicationDetailRow {
+     guarantor_email: Option(String),
+     guarantor_monthly_income_cents: Option(Int),
+     guarantor_employer: Option(String),
++    reference_contact_choice: Option(String),
+     status: String,
+     created_at: String,
+     household_monthly_income_cents: Int,
+@@ -857,12 +870,16 @@ pub fn get_application_detail(
+       decode.optional(decode.int),
+     )
+     use guarantor_employer <- decode.field(43, decode.optional(decode.string))
+-    use status <- decode.field(44, decode.string)
+-    use created_at <- decode.field(45, decode.string)
+-    use household_monthly_income_cents <- decode.field(46, decode.int)
+-    use co_applicant_count <- decode.field(47, decode.int)
+-    use vacancy_name <- decode.field(48, decode.string)
+-    use vacancy_total_applicants <- decode.field(49, decode.int)
++    use reference_contact_choice <- decode.field(
++      44,
++      decode.optional(decode.string),
++    )
++    use status <- decode.field(45, decode.string)
++    use created_at <- decode.field(46, decode.string)
++    use household_monthly_income_cents <- decode.field(47, decode.int)
++    use co_applicant_count <- decode.field(48, decode.int)
++    use vacancy_name <- decode.field(49, decode.string)
++    use vacancy_total_applicants <- decode.field(50, decode.int)
+     decode.success(GetApplicationDetailRow(
+       id:,
+       vacancy_id:,
+@@ -908,6 +925,7 @@ pub fn get_application_detail(
+       guarantor_email:,
+       guarantor_monthly_income_cents:,
+       guarantor_employer:,
++      reference_contact_choice:,
+       status:,
+       created_at:,
+       household_monthly_income_cents:,
+@@ -962,6 +980,7 @@ pub fn get_application_detail(
+   a.guarantor_email,
+   a.guarantor_monthly_income_cents,
+   a.guarantor_employer,
++  a.reference_contact_choice,
+   a.status::text,
+   a.created_at::text,
+   (
+diff --git a/server/src/application/sql/create_application.sql b/server/src/application/sql/create_application.sql
+index a2162fb2..f7f32825 100644
+--- a/server/src/application/sql/create_application.sql
++++ b/server/src/application/sql/create_application.sql
+@@ -41,7 +41,10 @@ INSERT INTO application (
+   guarantor_phone,
+   guarantor_email,
+   guarantor_monthly_income_cents,
+-  guarantor_employer
++  guarantor_employer,
++  submitted_ip_text,
++  submitted_user_agent,
++  reference_contact_choice
+ )
+ SELECT
+   $1::uuid,
+@@ -86,7 +89,10 @@ SELECT
+   NULLIF($40, ''),
+   NULLIF($41, ''),
+   CASE WHEN $42::int = 0 THEN NULL ELSE $42::int END,
+-  NULLIF($43, '')
++  NULLIF($43, ''),
++  $44,
++  $45,
++  NULLIF($46, '')
+ WHERE (
+   SELECT count(*) FROM application WHERE vacancy_id = $1::uuid
+ ) < (
+diff --git a/server/src/application/sql/get_application_detail.sql b/server/src/application/sql/get_application_detail.sql
+index 08197730..938cd04e 100644
+--- a/server/src/application/sql/get_application_detail.sql
++++ b/server/src/application/sql/get_application_detail.sql
+@@ -43,6 +43,7 @@ SELECT
+   a.guarantor_email,
+   a.guarantor_monthly_income_cents,
+   a.guarantor_employer,
++  a.reference_contact_choice,
+   a.status::text,
+   a.created_at::text,
+   (
+diff --git a/server/src/dsar/dsar_handler.gleam b/server/src/dsar/dsar_handler.gleam
+index a8a1c1e9..afdaaa0c 100644
+--- a/server/src/dsar/dsar_handler.gleam
++++ b/server/src/dsar/dsar_handler.gleam
+@@ -375,6 +375,9 @@ fn serialize_application(app: dsar_sql.FindApplicationByIdRow) -> Json {
+         None -> json.null()
+       },
+     ),
++    #("submitted_ip_text", json.string(app.submitted_ip_text)),
++    #("submitted_user_agent", json.string(app.submitted_user_agent)),
++    #("reference_contact_choice", nullable_string(app.reference_contact_choice)),
+     #("status", json.string(app.status)),
+     #("created_at", json.string(app.created_at)),
+     #("rejected_at", empty_to_null(app.rejected_at)),
+diff --git a/server/src/dsar/sql.gleam b/server/src/dsar/sql.gleam
+index 82bcb047..bc547a9a 100644
+--- a/server/src/dsar/sql.gleam
++++ b/server/src/dsar/sql.gleam
+@@ -369,6 +369,9 @@ pub type FindApplicationByIdRow {
+     guarantor_email: Option(String),
+     guarantor_employer: Option(String),
+     guarantor_monthly_income_cents: Option(Int),
++    submitted_ip_text: String,
++    submitted_user_agent: String,
++    reference_contact_choice: Option(String),
+     status: String,
+     created_at: String,
+     rejected_at: String,
+@@ -442,9 +445,15 @@ pub fn find_application_by_id(
+       44,
+       decode.optional(decode.int),
+     )
+-    use status <- decode.field(45, decode.string)
+-    use created_at <- decode.field(46, decode.string)
+-    use rejected_at <- decode.field(47, decode.string)
++    use submitted_ip_text <- decode.field(45, decode.string)
++    use submitted_user_agent <- decode.field(46, decode.string)
++    use reference_contact_choice <- decode.field(
++      47,
++      decode.optional(decode.string),
++    )
++    use status <- decode.field(48, decode.string)
++    use created_at <- decode.field(49, decode.string)
++    use rejected_at <- decode.field(50, decode.string)
+     decode.success(FindApplicationByIdRow(
+       id:,
+       vacancy_id:,
+@@ -491,6 +500,9 @@ pub fn find_application_by_id(
+       guarantor_email:,
+       guarantor_employer:,
+       guarantor_monthly_income_cents:,
++      submitted_ip_text:,
++      submitted_user_agent:,
++      reference_contact_choice:,
+       status:,
+       created_at:,
+       rejected_at:,
+@@ -547,6 +559,12 @@ SELECT
+   a.guarantor_email,
+   a.guarantor_employer,
+   a.guarantor_monthly_income_cents,
++  -- Art. 15: the subject's own attestation choice and the submission-time
++  -- capture (IP/UA) are their personal data and belong in the export even
++  -- though they are never shown to the landlord (AD-11).
++  a.submitted_ip_text,
++  a.submitted_user_agent,
++  a.reference_contact_choice,
+   a.status::text,
+   a.created_at::text,
+   coalesce(a.rejected_at::text, '') AS rejected_at
+diff --git a/server/src/dsar/sql/find_application_by_id.sql b/server/src/dsar/sql/find_application_by_id.sql
+index 94c8d3c0..78999c1b 100644
+--- a/server/src/dsar/sql/find_application_by_id.sql
++++ b/server/src/dsar/sql/find_application_by_id.sql
+@@ -48,6 +48,12 @@ SELECT
+   a.guarantor_email,
+   a.guarantor_employer,
+   a.guarantor_monthly_income_cents,
++  -- Art. 15: the subject's own attestation choice and the submission-time
++  -- capture (IP/UA) are their personal data and belong in the export even
++  -- though they are never shown to the landlord (AD-11).
++  a.submitted_ip_text,
++  a.submitted_user_agent,
++  a.reference_contact_choice,
+   a.status::text,
+   a.created_at::text,
+   coalesce(a.rejected_at::text, '') AS rejected_at
+diff --git a/server/test/ai/audit_report_test.gleam b/server/test/ai/audit_report_test.gleam
+index 79d9db9f..35e29a82 100644
+--- a/server/test/ai/audit_report_test.gleam
++++ b/server/test/ai/audit_report_test.gleam
+@@ -90,6 +90,7 @@ fn empty_application() -> app_sql.GetApplicationDetailRow {
+     guarantor_email: None,
+     guarantor_monthly_income_cents: None,
+     guarantor_employer: None,
++    reference_contact_choice: None,
+     status: "submitted",
+     created_at: "2026-04-01T10:00:00Z",
+     household_monthly_income_cents: 300_000,
+diff --git a/server/test/application/application_detail_handler_test.gleam b/server/test/application/application_detail_handler_test.gleam
+index 0ed108ce..0a089d73 100644
+--- a/server/test/application/application_detail_handler_test.gleam
++++ b/server/test/application/application_detail_handler_test.gleam
+@@ -113,6 +113,7 @@ fn sample_detail_row(
+     guarantor_email: Some("guarantor-email-sentinel"),
+     guarantor_monthly_income_cents: Some(333),
+     guarantor_employer: Some("guarantor-employer-sentinel"),
++    reference_contact_choice: Some("attested"),
+     status: status,
+     created_at: "created-at-sentinel",
+     household_monthly_income_cents: 444,
+@@ -193,6 +194,19 @@ pub fn detail_row_to_application_status_auto_closed_test() {
+   app.status |> should.equal(shared_application.AutoClosed)
+ }
+ 
++/// Amendment A4: the explicit referee-contact choice rides the detail
++/// payload so the panel can distinguish "declined" (Some) from a pre-v1
++/// application that never saw the choice (None). The sentinel fixture
++/// carries Some("attested"); the None path is the codec's default.
++pub fn detail_row_to_application_maps_reference_contact_choice_test() {
++  let app =
++    application_detail_handler.detail_row_to_application(sample_detail_row(
++      has_guarantor: True,
++      status: "submitted",
++    ))
++  app.reference_contact_choice |> should.equal(Some("attested"))
++}
++
+ /// Defence-in-depth: with has_guarantor = False, every guarantor field must be
+ /// suppressed to `None` even though the row still carries guarantor PII.
+ pub fn detail_row_to_application_suppresses_guarantor_when_flag_false_test() {
+diff --git a/server/test/application/application_handler_test.gleam b/server/test/application/application_handler_test.gleam
+index a16b2222..a5d3a205 100644
+--- a/server/test/application/application_handler_test.gleam
++++ b/server/test/application/application_handler_test.gleam
+@@ -168,6 +168,52 @@ pub fn validate_form_missing_consent_test() {
+   |> should.be_true
+ }
+ 
++// Reference-contact choice (RC1.1 / AD-2 / A4): an explicit attested or
++// declined answer is required — no silent skip, no default, no coercion of
++// tampered values.
++
++pub fn validate_form_missing_reference_contact_choice_test() {
++  let values =
++    test_helpers.valid_application_form_values()
++    |> list.filter(fn(pair) { pair.0 != "reference_contact_choice" })
++  let errors =
++    application_handler.validate_form(values, test_helpers.test_today())
++  errors
++  |> list.any(fn(e) {
++    e.0 == "reference_contact_choice" && e.1 == "Choose one option to continue."
++  })
++  |> should.be_true
++}
++
++pub fn validate_form_tampered_reference_contact_choice_test() {
++  let values =
++    test_helpers.valid_application_form_values()
++    |> list.map(fn(pair) {
++      case pair.0 == "reference_contact_choice" {
++        True -> #("reference_contact_choice", "yes-i-guess")
++        False -> pair
++      }
++    })
++  let errors =
++    application_handler.validate_form(values, test_helpers.test_today())
++  errors
++  |> list.any(fn(e) { e.0 == "reference_contact_choice" })
++  |> should.be_true
++}
++
++pub fn validate_form_declined_reference_contact_choice_valid_test() {
++  let values =
++    test_helpers.valid_application_form_values()
++    |> list.map(fn(pair) {
++      case pair.0 == "reference_contact_choice" {
++        True -> #("reference_contact_choice", "declined")
++        False -> pair
++      }
++    })
++  application_handler.validate_form(values, test_helpers.test_today())
++  |> should.equal([])
++}
++
+ pub fn validate_form_invalid_income_test() {
+   let values = [
+     #("first_name", "Jane"),
+diff --git a/server/test/integration/application_integration_test.gleam b/server/test/integration/application_integration_test.gleam
+index 58cb725d..6d280e9b 100644
+--- a/server/test/integration/application_integration_test.gleam
++++ b/server/test/integration/application_integration_test.gleam
+@@ -1833,6 +1833,7 @@ pub fn aggregate_too_large_rejects_with_no_db_rows_test() {
+     #("guarantor_monthly_income_cents", "500000"),
+     #("guarantor_employer", "Employer Co"),
+     #("gdpr_consent", "on"),
++    #("reference_contact_choice", "attested"),
+     #("_form_loaded_at", int.to_string(loaded_at)),
+   ]
+ 
+@@ -1928,6 +1929,7 @@ pub fn co_applicant_empty_first_name_skips_only_guarantor_errors_test() {
+     #("co_applicant[0][guarantor_monthly_income_cents]", ""),
+     #("co_applicant[0][guarantor_employer]", ""),
+     #("_form_loaded_at", int.to_string(loaded_at)),
++    #("reference_contact_choice", "declined"),
+   ]
+ 
+   let req =
+diff --git a/server/test/integration/gdpr_integration_test.gleam b/server/test/integration/gdpr_integration_test.gleam
+index 9549d3a2..69b2b072 100644
+--- a/server/test/integration/gdpr_integration_test.gleam
++++ b/server/test/integration/gdpr_integration_test.gleam
+@@ -1553,6 +1553,13 @@ pub fn dsar_post_returns_json_and_pins_exclusions_test() {
+   body |> string.contains("proof.pdf") |> should.be_true
+   body |> string.contains("72") |> should.be_true
+ 
++  // RC1.1: the attestation choice and the submission-time IP/UA capture
++  // are the subject's own personal data (Art. 15) — keys present even
++  // though these columns are never shown to the landlord (AD-11).
++  body |> string.contains("\"submitted_ip_text\"") |> should.be_true
++  body |> string.contains("\"submitted_user_agent\"") |> should.be_true
++  body |> string.contains("\"reference_contact_choice\"") |> should.be_true
++
+   // AI reasoning — every per-applicant field surfaces both as a JSON
+   // key AND with its sentinel value, so a future change can't silently
+   // drop a field while keeping its name visible elsewhere.
+@@ -2189,6 +2196,10 @@ fn apply_form_fixture_values(
+     #("landlord_ref_email", "landlord@example.com"),
+     #("personal_statement", "I'm a quiet student looking for a long-term let."),
+     #("gdpr_consent", "on"),
++    // Declined by default so the three acknowledgement-count tests below
++    // keep their focus on the guarantor conditional; the attested and
++    // missing-choice paths get their own dedicated tests.
++    #("reference_contact_choice", "declined"),
+     #("_website", ""),
+     #("_form_loaded_at", int.to_string(recent_form_loaded_ms())),
+   ]
+@@ -2413,6 +2424,7 @@ pub fn apply_submission_persists_acknowledgement_records_co_applicant_guarantor_
+     #("landlord_ref_email", "landlord@example.com"),
+     #("personal_statement", "I'm a quiet student looking for a long-term let."),
+     #("gdpr_consent", "on"),
++    #("reference_contact_choice", "declined"),
+     #("_website", ""),
+     #("_form_loaded_at", int.to_string(recent_form_loaded_ms())),
+     #("has_guarantor", "false"),
+@@ -2463,6 +2475,222 @@ pub fn apply_submission_persists_acknowledgement_records_co_applicant_guarantor_
+   versioned_count |> should.equal(3)
+ }
+ 
++// ============================================================================
++// RC1.1 — reference-contact attestation choice + submission capture (AD-2,
++// AD-10, amendment A4)
++// ============================================================================
++
++/// Attested path: the fourth acknowledgement_record write lands in the same
++/// submission transaction with the current policy_version, the choice is
++/// recorded on the application row, and the request's IP / User-Agent are
++/// captured (bounded) as the later fraud-signal comparator.
++pub fn apply_submission_attested_writes_reference_attestation_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let short_code = fetch_vacancy_short_code(db, vacancy_id)
++  let email = "apply-ack-attested@example.com"
++
++  let values =
++    apply_form_fixture_values(email: email, has_guarantor: False)
++    |> list.map(fn(pair) {
++      case pair.0 == "reference_contact_choice" {
++        True -> #("reference_contact_choice", "attested")
++        False -> pair
++      }
++    })
++  let file =
++    simulate.FileUpload(
++      file_name: "reference.pdf",
++      content_type: "application/pdf",
++      content: <<"%PDF-1.4 fake reference body":utf8>>,
++    )
++  let resp =
++    simulate.request(http.Post, "/apply/" <> short_code)
++    |> simulate.multipart_body(values, [#("landlord_ref_primary", file)])
++    |> simulate.header("x-forwarded-for", "203.0.113.99, 10.0.0.1")
++    |> simulate.header("user-agent", "RC11-Test-Agent/1.0")
++    |> application_handler.handle_post_form(test_server_config(db), short_code)
++  resp.status |> should.equal(200)
++
++  let app_id = fetch_application_id_by_email(db, email)
++
++  // data_processing + ai_analysis + reference_contact_attestation = 3 rows.
++  let assert Ok(row_count) =
++    test_db.query_int(
++      db,
++      "SELECT count(*)::int FROM acknowledgement_record WHERE application_id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  row_count |> should.equal(3)
++
++  // The attestation row exists, stamped with the current policy_version.
++  let assert Ok(rc_count) =
++    test_db.query_int(db, "SELECT count(*)::int FROM acknowledgement_record
++       WHERE application_id = '" <> app_id <> "'::uuid
++         AND record_type = 'reference_contact_attestation'::consent_type
++         AND policy_version = '" <> compliance.policy_version <> "'")
++  rc_count |> should.equal(1)
++
++  // Choice recorded on the application row (A4).
++  let assert Ok(choice) =
++    test_db.query_text(
++      db,
++      "SELECT reference_contact_choice FROM application WHERE id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  choice |> should.equal("attested")
++
++  // Capture columns carry the request's client IP (first XFF hop) and UA.
++  let assert Ok(ip) =
++    test_db.query_text(
++      db,
++      "SELECT submitted_ip_text FROM application WHERE id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  ip |> should.equal("203.0.113.99")
++  let assert Ok(ua) =
++    test_db.query_text(
++      db,
++      "SELECT submitted_user_agent FROM application WHERE id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  ua |> should.equal("RC11-Test-Agent/1.0")
++}
++
++/// Declined path: NO attestation row writes, the choice column records
++/// 'declined', and the application submits normally.
++pub fn apply_submission_declined_writes_no_attestation_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let short_code = fetch_vacancy_short_code(db, vacancy_id)
++  let email = "apply-ack-declined@example.com"
++
++  // The shared fixture already carries reference_contact_choice=declined.
++  let values = apply_form_fixture_values(email: email, has_guarantor: False)
++  let resp = submit_apply_form(db, short_code, values)
++  resp.status |> should.equal(200)
++
++  let app_id = fetch_application_id_by_email(db, email)
++
++  // Only the two always-on records — no attestation row.
++  let assert Ok(row_count) =
++    test_db.query_int(
++      db,
++      "SELECT count(*)::int FROM acknowledgement_record WHERE application_id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  row_count |> should.equal(2)
++  let assert Ok(rc_count) =
++    test_db.query_int(db, "SELECT count(*)::int FROM acknowledgement_record
++       WHERE application_id = '" <> app_id <> "'::uuid
++         AND record_type = 'reference_contact_attestation'::consent_type")
++  rc_count |> should.equal(0)
++
++  let assert Ok(choice) =
++    test_db.query_text(
++      db,
++      "SELECT reference_contact_choice FROM application WHERE id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  choice |> should.equal("declined")
++
++  // The simulated request carries no IP/UA headers — capture columns get
++  // the helpers' empty-string fallback, never NULL.
++  let assert Ok(ip) =
++    test_db.query_text(
++      db,
++      "SELECT submitted_ip_text FROM application WHERE id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  ip |> should.equal("")
++}
++
++/// Missing choice: validation rejects the submission with the choice error
++/// and zero rows persist — an explicit choice is required, no silent skip.
++pub fn apply_submission_missing_choice_fails_validation_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let short_code = fetch_vacancy_short_code(db, vacancy_id)
++  let email = "apply-ack-missing@example.com"
++
++  let values =
++    apply_form_fixture_values(email: email, has_guarantor: False)
++    |> list.filter(fn(pair) { pair.0 != "reference_contact_choice" })
++  let resp = submit_apply_form(db, short_code, values)
++  resp.status |> should.equal(200)
++
++  let body = simulate.read_body(resp)
++  body
++  |> string.contains("Choose one option to continue.")
++  |> should.be_true
++
++  // No application row, no acknowledgement rows — validation stopped it.
++  let assert Ok(app_count) =
++    test_db.query_int(
++      db,
++      "SELECT count(*)::int FROM application WHERE email = '" <> email <> "'",
++    )
++  app_count |> should.equal(0)
++}
++
++/// Over-long headers: the helpers slice to the CHECK bounds (64 / 512)
++/// before write, so an adversarial header can never trip the constraint
++/// and 500 the submission path.
++pub fn apply_submission_overlong_headers_truncated_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let short_code = fetch_vacancy_short_code(db, vacancy_id)
++  let email = "apply-ack-overlong@example.com"
++
++  let values = apply_form_fixture_values(email: email, has_guarantor: False)
++  let file =
++    simulate.FileUpload(
++      file_name: "reference.pdf",
++      content_type: "application/pdf",
++      content: <<"%PDF-1.4 fake reference body":utf8>>,
++    )
++  let resp =
++    simulate.request(http.Post, "/apply/" <> short_code)
++    |> simulate.multipart_body(values, [#("landlord_ref_primary", file)])
++    |> simulate.header("x-forwarded-for", string.repeat("9", 500))
++    |> simulate.header("user-agent", string.repeat("U", 600))
++    |> application_handler.handle_post_form(test_server_config(db), short_code)
++  resp.status |> should.equal(200)
++
++  let app_id = fetch_application_id_by_email(db, email)
++  let assert Ok(ip_len) =
++    test_db.query_int(
++      db,
++      "SELECT length(submitted_ip_text)::int FROM application WHERE id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  ip_len |> should.equal(64)
++  let assert Ok(ua_len) =
++    test_db.query_int(
++      db,
++      "SELECT length(submitted_user_agent)::int FROM application WHERE id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  ua_len |> should.equal(512)
++}
++
+ /// Retention sweep against a stub Supabase (empty url / key) enqueues
+ /// every document storage_path for later retry rather than silently
+ /// dropping them. Pins the storage_purge creds-missing fallback — a
+diff --git a/server/test/test_helpers.gleam b/server/test/test_helpers.gleam
+index de4fcf74..920ab0d8 100644
+--- a/server/test/test_helpers.gleam
++++ b/server/test/test_helpers.gleam
+@@ -150,6 +150,7 @@ pub fn valid_application_form_values() -> List(#(String, String)) {
+     #("has_eviction_history", "no"),
+     #("has_ccjs", "no"),
+     #("gdpr_consent", "on"),
++    #("reference_contact_choice", "attested"),
+     #("_website", ""),
+     #("_form_loaded_at", "0"),
+   ]
+diff --git a/shared/src/shared/application.gleam b/shared/src/shared/application.gleam
+index 00ff1925..a1f1c8f5 100644
+--- a/shared/src/shared/application.gleam
++++ b/shared/src/shared/application.gleam
+@@ -76,6 +76,14 @@ pub type Application {
+     guarantor_email: Option(String),
+     guarantor_monthly_income_cents: Option(Int),
+     guarantor_employer: Option(String),
++    /// The applicant's explicit referee-contact attestation choice at
++    /// submission: Some("attested") / Some("declined") for v1 applications,
++    /// None for pre-v1 rows (the panel distinguishes "declined" from
++    /// "never saw the choice" — amendment A4). The matching
++    /// acknowledgement_record row exists only on the attested path (AD-2).
++    /// The submission IP/UA capture columns are internal-only (AD-11) and
++    /// deliberately NOT part of this type.
++    reference_contact_choice: Option(String),
+     status: ApplicationStatus,
+     created_at: String,
+     /// Computed in SQL as monthly_income_cents + Σ income_sources +
+@@ -160,6 +168,10 @@ pub fn encode(app: Application) -> json.Json {
+       json.nullable(app.guarantor_monthly_income_cents, json.int),
+     ),
+     #("guarantor_employer", json.nullable(app.guarantor_employer, json.string)),
++    #(
++      "reference_contact_choice",
++      json.nullable(app.reference_contact_choice, json.string),
++    ),
+     #("status", json.string(encode_status(app.status))),
+     #("created_at", json.string(app.created_at)),
+     #(
+@@ -345,6 +357,13 @@ pub fn decoder() -> decode.Decoder(Application) {
+     None,
+     decode.optional(decode.string),
+   )
++  // Absent in older payloads (cached client state) — defaults to None so
++  // decoding pre-v1 payloads still succeeds.
++  use reference_contact_choice <- decode.optional_field(
++    "reference_contact_choice",
++    None,
++    decode.optional(decode.string),
++  )
+   use status <- decode.field("status", status_decoder())
+   use created_at <- decode.field("created_at", decode.string)
+   // Household fields default to primary income / 0 when absent so decoding
+@@ -404,6 +423,7 @@ pub fn decoder() -> decode.Decoder(Application) {
+     guarantor_email:,
+     guarantor_monthly_income_cents:,
+     guarantor_employer:,
++    reference_contact_choice:,
+     status:,
+     created_at:,
+     household_monthly_income_cents:,
+diff --git a/shared/test/shared_test.gleam b/shared/test/shared_test.gleam
+index bc402d3b..043fae78 100644
+--- a/shared/test/shared_test.gleam
++++ b/shared/test/shared_test.gleam
+@@ -231,6 +231,7 @@ pub fn application_codec_test() {
+       guarantor_email: None,
+       guarantor_monthly_income_cents: None,
+       guarantor_employer: None,
++      reference_contact_choice: option.Some("attested"),
+       household_monthly_income_cents: 350_000,
+       co_applicant_count: 0,
+     ),
+@@ -288,6 +289,7 @@ pub fn application_codec_none_fields_test() {
+       guarantor_email: None,
+       guarantor_monthly_income_cents: None,
+       guarantor_employer: None,
++      reference_contact_choice: option.None,
+       household_monthly_income_cents: 0,
+       co_applicant_count: 0,
+     ),
+@@ -296,6 +298,74 @@ pub fn application_codec_none_fields_test() {
+   )
+ }
+ 
++/// Pre-v1 payloads (e.g. cached client state) lack the
++/// `reference_contact_choice` key entirely — decoding must still succeed
++/// with None, the amendment-A4 "never saw the choice" state. Builds the
++/// payload by stripping the key from a real encoding so the fixture can't
++/// drift from the codec's field set.
++pub fn application_decoder_absent_reference_contact_choice_test() {
++  let encoded =
++    application.encode(application.Application(
++      id: "uuid-3c",
++      vacancy_id: "uuid-2",
++      first_name: "Pat",
++      last_name: "PreV1",
++      email: "pat@example.com",
++      phone: option.None,
++      current_address: option.None,
++      current_city: option.None,
++      current_county: option.None,
++      eircode: option.None,
++      current_living_situation: option.None,
++      reason_for_moving: option.None,
++      employment_status: "employed",
++      employer_name: option.None,
++      job_title: option.None,
++      employment_duration: option.None,
++      monthly_income_cents: 0,
++      landlord_ref_name: option.None,
++      landlord_ref_phone: option.None,
++      landlord_ref_email: option.None,
++      employer_ref_name: option.None,
++      employer_ref_phone: option.None,
++      employer_ref_email: option.None,
++      num_occupants: option.None,
++      has_pets: "no",
++      pet_details: option.None,
++      is_smoker: False,
++      has_eviction_history: False,
++      eviction_details: option.None,
++      has_ccjs: False,
++      desired_move_in_date: option.None,
++      listing_source: option.None,
++      personal_statement: option.None,
++      status: application.Submitted,
++      created_at: "2026-03-29T00:00:00Z",
++      never_rented_before: False,
++      character_ref_name: None,
++      character_ref_phone: None,
++      character_ref_email: None,
++      has_guarantor: False,
++      guarantor_name: None,
++      guarantor_relationship: None,
++      guarantor_phone: None,
++      guarantor_email: None,
++      guarantor_monthly_income_cents: None,
++      guarantor_employer: None,
++      reference_contact_choice: option.None,
++      household_monthly_income_cents: 0,
++      co_applicant_count: 0,
++    ))
++    |> json.to_string
++  // json.to_string is compact (no spaces), so the exact segment is stable.
++  let stripped =
++    string.replace(encoded, "\"reference_contact_choice\":null,", "")
++  string.contains(stripped, "reference_contact_choice") |> should.be_false
++  let assert Ok(decoded) = json.parse(stripped, application.decoder())
++  decoded.id |> should.equal("uuid-3c")
++  decoded.reference_contact_choice |> should.equal(option.None)
++}
++
+ pub fn ai_analysis_codec_test() {
+   roundtrip(
+     ai_analysis.AiAnalysis(
+@@ -692,6 +762,7 @@ pub fn application_detail_codec_test() {
+         guarantor_email: None,
+         guarantor_monthly_income_cents: None,
+         guarantor_employer: None,
++        reference_contact_choice: option.Some("declined"),
+         household_monthly_income_cents: 350_000,
+         co_applicant_count: 0,
+       ),
+@@ -804,6 +875,7 @@ pub fn application_detail_codec_no_ai_test() {
+         guarantor_email: None,
+         guarantor_monthly_income_cents: None,
+         guarantor_employer: None,
++        reference_contact_choice: option.None,
+         household_monthly_income_cents: 0,
+         co_applicant_count: 0,
+       ),
+diff --git a/supabase/migrations/20260731220000_add_reference_contact_attestation_enum.sql b/supabase/migrations/20260731220000_add_reference_contact_attestation_enum.sql
+new file mode 100644
+index 00000000..9557d58f
+--- /dev/null
++++ b/supabase/migrations/20260731220000_add_reference_contact_attestation_enum.sql
+@@ -0,0 +1,11 @@
++-- Add the 'reference_contact_attestation' consent_type enum value so an
++-- applicant's explicit attestation that their referees expect to be
++-- contacted can be recorded on acknowledgement_record (AD-2; the
++-- 20260420000003 guarantor_attestation precedent). Wording is
++-- attestation/acknowledgement framing — lawful basis is Art 6(1)(f)
++-- legitimate interest; the row evidences transparency.
++--
++-- PostgreSQL enum value additions run outside transactions, so IF NOT EXISTS
++-- is used to make the migration replay-safe.
++
++ALTER TYPE consent_type ADD VALUE IF NOT EXISTS 'reference_contact_attestation';
+diff --git a/supabase/migrations/20260731220100_add_application_capture_columns.sql b/supabase/migrations/20260731220100_add_application_capture_columns.sql
+new file mode 100644
+index 00000000..1fa3892b
+--- /dev/null
++++ b/supabase/migrations/20260731220100_add_application_capture_columns.sql
+@@ -0,0 +1,29 @@
++-- Add the reference-checking v1 capture columns to application (AD-10 +
++-- amendment A4):
++--
++--   submitted_ip_text / submitted_user_agent — the applicant-submission
++--   fraud comparator, written at submission time from the request headers
++--   (request_helpers.client_ip / client_user_agent, both bounded). These
++--   are internal-only evidentiary columns: never exposed on the landlord
++--   payload (AD-11). Empty string means "no capture" (header absent or
++--   pre-v1 row). Bounds match the cookie_consent_log /
++--   payment_terms_acceptance precedent (64 / 512).
++--   Trust note: client_ip reads the first x-forwarded-for hop, which is
++--   only trustworthy because production ingress is Cloudflare-only —
++--   direct origin hits could spoof it. The comparator feeds display-only,
++--   honestly-labelled-weak signals (AD-10); it never auto-rejects.
++--
++--   reference_contact_choice — the applicant's explicit attestation choice
++--   at submission ('attested' = referees expect contact, 'declined' = do
++--   not contact automatically). Nullable so pre-v1 applications stay NULL
++--   and the panel can distinguish "declined" from "never saw the choice"
++--   (A4). No default: a fabricated value would misrecord a choice the
++--   applicant never made.
++--
++-- Expand-only and idempotent; existing rows are untouched (DEFAULT ''
++-- applies to new writes, NULL choice untouched).
++
++ALTER TABLE application
++  ADD COLUMN IF NOT EXISTS submitted_ip_text TEXT NOT NULL DEFAULT '' CHECK (length(submitted_ip_text) <= 64),
++  ADD COLUMN IF NOT EXISTS submitted_user_agent TEXT NOT NULL DEFAULT '' CHECK (length(submitted_user_agent) <= 512),
++  ADD COLUMN IF NOT EXISTS reference_contact_choice TEXT CHECK (reference_contact_choice IN ('attested','declined'));

@@ -1,0 +1,5 @@
+# Field notes: righttenantry-refcheck-rc1-1
+
+- Squirrel regen needs the LOCAL test DB (`DATABASE_URL=postgresql://test:test@localhost:<port>/righttenantry_test gleam run -m squirrel` from `server/`) — `run_squirrel.sh` points at staging, which doesn't have unmerged migrations; and every regen re-emits a whitespace-only change to `server/src/ai/sql.gleam` (`}///` doc-comment join) — revert that file after each run.
+- Test-DB port 54321 is contended across worktrees: run your own container (`docker run -d --name rt-<job>-test-db -p 5432X:5432 postgres:16-alpine`) and pass `TEST_DB_PORT` to `scripts/reset-test-db.sh` + `TEST_DATABASE_URL` to `gleam test -- --tag integration` (sibling rc2-1 used 54322, I used 54323).
+- Extending `shared/application.Application` ripples into full-literal fixtures in `shared/test/shared_test.gleam`, `client/test/client_test.gleam`, `client/test/components/`, and two server row fixtures (`application_detail_handler_test`, `ai/audit_report_test`) — grep `application.Application(` and `GetApplicationDetailRow(` before claiming done.

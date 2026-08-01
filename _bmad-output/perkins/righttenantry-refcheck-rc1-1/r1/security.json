@@ -1,0 +1,22 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "spoofing",
+    "title": "client_ip trusts the first X-Forwarded-For hop, which is client-spoofable even behind Cloudflare; the code comment and new migration trust note assert the opposite",
+    "location": "server/src/request_helpers.gleam:17-33",
+    "evidence": "/// Best-effort client IP from the `x-forwarded-for` header.\n///\n/// Cloudflare appends the originating IP first; subsequent entries are\n/// trusted intermediaries. We take only the first value, trim it, and\n...\npub fn client_ip(req: Request) -> String {\n  case request.get_header(req, \"x-forwarded-for\") {\n    Ok(value) ->\n      case string.split_once(value, \",\") {\n        Ok(#(first, _)) -> string.trim(first) |> string.slice(0, 64)\n\n(supabase/migrations/20260731220100_add_application_capture_columns.sql:10-13)\n--   Trust note: client_ip reads the first x-forwarded-for hop, which is\n--   only trustworthy because production ingress is Cloudflare-only —\n--   direct origin hits could spoof it. The comparator feeds display-only,\n--   honestly-labelled-weak signals (AD-10); it never auto-rejects.\n\n(diff, gdpr_integration_test.gleam) |> simulate.header(\"x-forwarded-for\", \"203.0.113.99, 10.0.0.1\") ... ip |> should.equal(\"203.0.113.99\")",
+    "detail": "Cloudflare appends the true connecting IP to the END of any client-supplied XFF header, preserving attacker-controlled leading entries, so the captured first hop is forgeable via Cloudflare too. The comment/trust note codify a wrong assumption; the captured IP becomes fabricated evidence feeding RC3.7 fraud comparators.",
+    "recommended_fix": "Read CF-Connecting-IP (or the last XFF entry) in client_ip; correct the comment and migration trust note to state the first XFF hop is client-controlled."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "validation",
+    "title": "Grapheme-based string.slice can leave multi-codepoint headers over the 64/512 CHECK bounds, tripping the constraint and 500-ing the submission transaction",
+    "location": "server/src/request_helpers.gleam:31-43",
+    "evidence": "        Ok(#(first, _)) -> string.trim(first) |> string.slice(0, 64)\n        Error(_) -> string.trim(value) |> string.slice(0, 64)\n...\npub fn client_user_agent(req: Request) -> String {\n  case request.get_header(req, \"user-agent\") {\n    Ok(value) -> string.slice(value, 0, 512)\n\n(supabase/migrations/20260731220100_add_application_capture_columns.sql:27-28)\n  ADD COLUMN IF NOT EXISTS submitted_ip_text TEXT NOT NULL DEFAULT '' CHECK (length(submitted_ip_text) <= 64),\n  ADD COLUMN IF NOT EXISTS submitted_user_agent TEXT NOT NULL DEFAULT '' CHECK (length(submitted_user_agent) <= 512),\n\n(diff, deferred-work.md) summary: request_helpers.client_ip/client_user_agent slice by graphemes (Gleam string.slice) while the DB CHECK bounds count characters (Postgres length()) — a multi-codepoint header can exceed the bound post-slice and 500 the write path.",
+    "detail": "Gleam string.slice counts graphemes; Postgres length() counts codepoints. A header of 64 multi-codepoint grapheme clusters stays 64 graphemes post-slice but exceeds 64 codepoints, violating the CHECK and aborting the submission. Contradicts the spec matrix's 'CHECK constraints never trip'; already deferred.",
+    "recommended_fix": "Truncate by codepoints (matching Postgres length()) before write in request_helpers, applied across cookie_consent_log, payment_terms_acceptance, and application capture callers."
+  }
+]

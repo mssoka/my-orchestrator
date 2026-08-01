@@ -1,0 +1,12 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "error-path",
+    "title": "Self-heal stamp-clear silently no-ops once the batched send queue runs longer than the new 10-minute freshness window",
+    "location": "server/src/inbound_email/sql/clear_followup_for_sender.sql:11",
+    "evidence": "UPDATE inbound_email\nSET second_reminder_sent_at = NULL\nWHERE vacancy_id = $1\n  AND lower(sender_email) = lower($2)\n  AND second_reminder_sent_at > now() - interval '10 minutes'\n--- and clear_reminder_for_sender.sql: \"  AND reminder_sent_at > now() - interval '10 minutes'\"\n--- and inbound_handler.gleam send_batched: \"let batches = list.sized_chunk(emails, 5)\" / \"True -> process.sleep(1100)\" / \"case process.receive(subject, 12_000)\"\n--- and email_client.gleam: \"let config = httpc.configure() |> httpc.timeout(10_000)\"\n--- and send_reminders_background runs stage 2 only after stage 1 fully drains: \"send_batched(stage1_recipients, ...) |> list.each(...)\" then \"send_batched(stage2_recipients, ...)\"",
+    "detail": "The window's premise (stamps are seconds old at clear time) breaks at scale: ~11s/batch of 5 means the combined stage-1+stage-2 queue exceeds 600s at ≈270 recipients (Daft inbound is uncapped). A send failing past that point clears nothing (stamps older than 10 min, `let _ =` swallows it), leaving the enquirer stamped-but-never-sent: stage-1 victims lose remindability and become stage-2 eligible in 2 days; stage-2 victims are permanently blocked (`last_stage2_at > last_stage1_at`).",
+    "recommended_fix": "Widen the clear window past worst-case queue runtime (e.g. 1 hour) or scope it to the attempt (stamp a batch/attempt id and clear on that), and log when the clear updates zero rows."
+  }
+]

@@ -1,0 +1,142 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "correctness / soft-lock",
+    "title": "Stale one-shot dim-click connection can dismiss a non-dismissible first-launch popup after NEW GAME reset, freezing the game with empty state",
+    "location": "game/scripts/street.gd — _open_popup / _on_dim_input / _show_leaderboard reset lambda / _ask_age_bracket",
+    "evidence": "_open_popup: \"if dismissible:\\n    if not _dim.gui_input.is_connected(_on_dim_input):\\n        _dim.gui_input.connect(_on_dim_input, CONNECT_ONE_SHOT)\" ... _on_dim_input: \"if event is InputEventMouseButton and event.pressed:\\n    _close_popup()\" ... reset button: \"_backend.clear_save()\\n_close_popup()\\n_state = {} # Freeze timers/saves until the new-game flow lands.\\n_wage_timer = 0.0\\n_run_first_launch_flow()\" ... _ask_age_bracket: \"_open_popup(card[\\\"panel\\\"], false)\" and \"var picked: String = await _age_picked\"",
+    "detail": "When any dismissible popup (job picker, buy sheet, asset popup, leaderboard, tutor panel) is closed via its in-card button instead of a dim tap, the CONNECT_ONE_SHOT _dim.gui_input connection stays armed (closing via button never fires or disconnects it). After the player presses 🔄 NEW GAME in the leaderboard, _state is set to {} and the first-launch flow opens NON-dismissible popups (_open_popup(card[\"panel\"], false)) — the connect block is skipped for these, so the stale armed connection survives. One tap on the full-screen Dim (mouse_filter = 0) fires _on_dim_input -> _close_popup(), freeing the age/name/lottery card. The awaiting coroutine (await _age_picked / await _street_name_picked / await _lottery_accepted) never resumes, _start_new_game never runs, _state stays {} so _process and _refresh_dominant_button early-return forever: a blank, frozen screen recoverable only by restarting the app. The reset feature exists specifically for playtests, making this sequence likely in front of the target kid.",
+    "recommended_fix": "In _close_popup(), explicitly disconnect the dim handler if connected (if _dim.gui_input.is_connected(_on_dim_input): _dim.gui_input.disconnect(_on_dim_input)), or gate _on_dim_input on a _popup_dismissible flag set by _open_popup, so non-dismissible popups can never be closed by the dim."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "logic / economy",
+    "title": "Burst pipe charges the full repair cost twice: once at event time and again to un-damage the asset",
+    "location": "game/scripts/economy.gd — _event_burst_pipe + repair_asset; game/scripts/street.gd — _run_market_tick",
+    "evidence": "_event_burst_pipe: \"state[\\\"balance\\\"] -= cost # May go negative -> debt indicator, never game-over.\\nstate[\\\"total_spent\\\"] += cost\\nasset[\\\"damaged\\\"] = true\" ... repair_asset: \"state[\\\"balance\\\"] -= cost\\nstate[\\\"total_spent\\\"] += cost\\nasset[\\\"damaged\\\"] = false\" ... street.gd event narration: \"_show_tutor_beat(\\\"%s at %s! Repairs cost $%d.\\\\n%s\\\" % [event[\\\"title\\\"], event.get(\\\"asset_name\\\", \\\"your building\\\"), event[\\\"cost\\\"], FinLitTutor.teach(\\\"burst_pipe\\\", _state)])\" and damaged card button: \"open.text = \\\"🔧 FIX\\\" if asset[\\\"damaged\\\"] else \\\"👀 OPEN\\\"\"",
+    "detail": "The event deducts REPAIR_COST_PER_LEVEL * level immediately and tells the kid \"Repairs cost $N\" — then the asset sits damaged (\"🔧 broken — no pay\") until the kid pays the SAME REPAIR_COST_PER_LEVEL * level again via FIX. One disaster therefore costs 2x the advertised repair price ($16 total for a level-1 building that the UI said cost $8 to repair). The const is literally documented as \"Burst-pipe repair cost per building level.\" and is used for both charges, which reads as an accidental double-charge rather than two distinct, narrated costs. For a teaching game whose acceptance criterion is \"kid can say what the burst pipe cost THEIR building,\" the answer being silently double the stated number undermines the lesson.",
+    "recommended_fix": "Pick one model: either the event charges the cost and clears/auto-schedules the repair, or the event only marks the asset damaged (cost 0 at event time) and the FIX button charges repair_cost. If two charges are intended (emergency patch + real repair), narrate them as two distinct line items."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "logic / dead flag",
+    "title": "Tough Boots discount is dead code in repair_cost: checks asset.tough_owner, which nothing ever sets",
+    "location": "game/scripts/economy.gd — repair_cost vs _event_burst_pipe",
+    "evidence": "repair_cost: \"var cost: int = REPAIR_COST_PER_LEVEL * asset[\\\"level\\\"]\\nif asset.get(\\\"tough_owner\\\", false):\\n    cost = maxi(1, cost - 3)\" ... _event_burst_pipe: \"var cost: int = REPAIR_COST_PER_LEVEL * asset[\\\"level\\\"]\\nif state[\\\"lottery\\\"].get(\\\"traits\\\", []).has(\\\"tough\\\"):\\n    cost = maxi(1, cost - 3)\" ... buy_asset creates the asset as \"{\\\"id\\\": ..., \\\"type\\\": ..., \\\"name\\\": ..., \\\"level\\\": 1, \\\"damaged\\\": false, \\\"ticks_since_payout\\\": 0}\" — no tough_owner key, and no line in the diff ever writes asset[\"tough_owner\"].",
+    "detail": "Two different mechanisms implement the same Tough Boots discount (life_lottery.gd: \"blurb\\\": \\\"Repairs cost you less.\\\"). The event-time charge consults the lottery traits and works; the FIX charge consults a per-asset tough_owner flag that is never written anywhere in the diff, so it always evaluates false and the kid with Tough Boots pays full price on the second (FIX) charge. The promised trait benefit silently half-applies.",
+    "recommended_fix": "Make repair_cost take the state (or a has_tough bool) and check state[\"lottery\"].traits like _event_burst_pipe does, or stamp asset[\"tough_owner\"] = true at buy time when the trait is present. Unify both charges on one source of truth."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "logic / dead code",
+    "title": "era_changed can never be true: era is computed inside market_tick, which never mutates assets — the NEW ERA teach beats are unreachable",
+    "location": "game/scripts/economy.gd — market_tick + current_era; game/scripts/street.gd — _run_market_tick, _do_buy, _do_upgrade",
+    "evidence": "market_tick: \"\\\"era_changed\\\": false,\\n\\\"era\\\": current_era(state),\" then after income/event: \"var new_era := current_era(state)\\nresult[\\\"era_changed\\\"] = new_era != result[\\\"era\\\"]\" ... current_era derives only from assets: \"for asset in state[\\\"assets\\\"]:\\n    if asset[\\\"level\\\"] >= 2:\\n        return \\\"GROWING\\\"\\nif not state[\\\"assets\\\"].is_empty():\\n    return \\\"OWNING\\\"\\nreturn \\\"EARNING\\\"\" ... street.gd: \"if result[\\\"era_changed\\\"]:\\n    var era_line := FinLitTutor.teach(\\\"era_owning\\\" if result[\\\"era\\\"] == \\\"OWNING\\\" else \\\"era_growing\\\", _state)\" — while _do_buy and _do_upgrade (the only functions that change assets/levels) contain no era transition check at all.",
+    "detail": "current_era depends exclusively on the assets array and asset levels. market_tick mutates balance, tick counters, and damage flags — none of which affect current_era. Assets are only added (buy_asset) or leveled (upgrade_asset) from _do_buy/_do_upgrade, which never evaluate the era. Therefore new_era == result[\"era\"] on every tick, era_changed is permanently false, and the era_owning / era_growing teach lines in tutor.gd (\"NEW ERA: Owning!...\") — the money-history-eras feature called out in the spec change log — are dead code that can never display. The banner text updates, but the scripted teaching moment does not.",
+    "recommended_fix": "Move era-transition detection into the mutation points: capture FinLitEconomy.current_era(_state) before and after _do_buy/_do_upgrade and fire the era teach beat there (or compare-and-fire in _refresh_ui). Add a test asserting the beat triggers on first purchase and on reaching level 2."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "concurrency / race",
+    "title": "Stale timeout timer from a completed request can cancel a subsequent in-flight LLM request and force a spurious fallback",
+    "location": "game/scripts/llm_tutor.gd — explain / _on_timeout / _on_request_completed",
+    "evidence": "explain: \"get_tree().create_timer(TIMEOUT_SECONDS).timeout.connect(_on_timeout, CONNECT_ONE_SHOT)\" ... _on_timeout: \"if not _busy:\\n    return # Response already arrived.\\n_http.cancel_request()\\n_finish(FinLitTutor.explain_options(_state_snapshot), \\\"scripted_fallback\\\", _started_ms, \\\"timeout\\\", _last_messages, \\\"\\\")\" ... _on_request_completed: \"if not _busy:\\n    return\"",
+    "detail": "Every explain() arms a fresh 10s SceneTree timer keyed only by the shared _busy flag, with no request-generation token. Timeline: request A completes at t=9.9s (_busy=false); the kid reopens the ? panel and request B starts at t=10.1s (_busy=true, new snapshot/messages); at t=10.1s+ the timer armed by request A fires, sees _busy==true (for B), calls _http.cancel_request() — cancelling B's live HTTP request — and _finish() emits a scripted_fallback for B at ~1 second of real latency. B's genuine response then arrives and is discarded by the 'if not _busy: return' guard. The debug-compare rig would log a fake timeout, corrupting the very integrate-vs-drop latency evidence this rig exists to collect.",
+    "recommended_fix": "Track a monotonically increasing _request_id per explain(); capture the id in the timeout lambda and bail unless it still matches the current in-flight id. Alternatively store the SceneTreeTimer reference and is_queued_for_deletion/time_left-check it, or disconnect/kill the timer in _finish."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "signal ordering / hang",
+    "title": "Synchronous explanation_ready emit on the request-error path hangs the awaiting tutor panel (missed signal)",
+    "location": "game/scripts/llm_tutor.gd — explain error path vs deferred paths; game/scripts/street.gd — _show_tutor_panel",
+    "evidence": "llm_tutor.gd: the not-available and busy paths use \"explanation_ready.emit.call_deferred(fallback, ...)\" with the comment \"# Deferred so the caller's `await` is already in place.\" — but the request-error path calls _finish synchronously: \"var err := _http.request(API_URL, headers, HTTPClient.METHOD_POST, body)\\nif err != OK:\\n    _finish(fallback, \\\"scripted_fallback\\\", _started_ms, \\\"request_error_%d\\\" % err, messages, \\\"\\\")\\n    return\" and _finish ends with \"explanation_ready.emit(text, source)\". Caller in street.gd: \"_llm_tutor.explain(_state)\\nvar result: Array = await _llm_tutor.explanation_ready\".",
+    "detail": "The author explicitly knew the emit must be deferred so the caller's await is in place (their own comment says so), yet the err != OK branch emits synchronously inside explain(), before street.gd reaches the await. The await then parks waiting for a signal that already fired; the panel is stuck on \"Mrs. K is thinking…\" until closed. Rare in practice (HTTPRequest.request mainly fails fast on ERR_BUSY, which is guarded by _busy — but any other immediate error, e.g. TLS/URL/init failure, hits it), and it directly contradicts the documented invariant 'the game never breaks because a network call did.'",
+    "recommended_fix": "In _finish (or at this call site), always emit via explanation_ready.emit.call_deferred(text, source) so every path honors the await-ordering invariant; add a unit test that forces request() to return non-OK and asserts the signal is still received after await."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "consistency",
+    "title": "Tutor options (and the LLM payload) keep offering BUY after all 4 plots are full — the plot cap exists only in the UI",
+    "location": "game/scripts/street.gd — _refresh_dominant_button; game/scripts/tutor.gd — available_options; game/scripts/economy.gd — buy_asset",
+    "evidence": "street.gd: \"elif _state[\\\"assets\\\"].size() < PLOT_COUNT and _state[\\\"balance\\\"] >= FinLitEconomy.cheapest_asset_price():\\n    text = \\\"🛒 BUY\\\"\" ... tutor.gd available_options: \"for type_key in FinLitEconomy.ASSET_ORDER:\\n    var spec: Dictionary = FinLitEconomy.ASSET_TYPES[type_key]\\n    var price: int = spec[\\\"levels\\\"][0][\\\"price\\\"]\\n    if balance >= price:\\n        options.append(\\\"BUY %s %s — costs $%d, then pays you each market tick\\\" % ...)\" — no PLOT_COUNT check anywhere in tutor.gd or in economy.buy_asset.",
+    "detail": "With 4 assets owned the dominant button correctly stops offering BUY, but explain_options() and the pseudonymous LLM payload (childs_options_right_now) still list up to four BUY options the kid cannot execute. The Mrs. K explanation will tell an 8-year-old to do something the game refuses — exactly the confusion the playtest gate is meant to catch, baked into the teacher's mouth. buy_asset also enforces no cap itself, so the rule lives in exactly one UI branch.",
+    "recommended_fix": "Add the plot cap to available_options (skip BUY entries when state[\"assets\"].size() >= 4) and ideally enforce the cap inside FinLitEconomy.buy_asset so the rule is in the pure logic layer, covered by a unit test."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "robustness / save schema",
+    "title": "Save validation only checks for 'street_name'; missing schema keys crash later, and the version field is never used for migration",
+    "location": "game/scripts/local_json_backend.gd — load_game; game/scripts/economy.gd — sanitize_state, new_state; game/scripts/street.gd — _refresh_ui",
+    "evidence": "load_game: \"if json.parse(raw) != OK or typeof(json.data) != TYPE_DICTIONARY or not json.data.has(\\\"street_name\\\"):\\n    return {\\\"ok\\\": false, ...}\" ... new_state writes \"\\\"version\\\": 1\" but no code ever reads state[\"version\"] ... sanitize_state patches only \"balance, total_earned, total_spent, next_asset_id, tick_count\" and per-asset fields via state.get(\\\"assets\\\", []) ... street.gd indexes unconditionally: \"if _state[\\\"job\\\"] == \\\"\\\":\" and economy.job_wage: \"if state[\\\"lottery\\\"].get(\\\"traits\\\", []).has(\\\"charming\\\")\".",
+    "detail": "Any well-formed JSON dictionary containing a 'street_name' key — a hand-edited save, a save from a different build, a truncated-but-parseable file — passes load_game's gate. sanitize_state fills five int keys but not 'job', 'lottery', 'assets' (missing 'assets' is only tolerated because of .get), 'events_seen', or 'age_bracket'. The very next _refresh_ui evaluates _state[\"job\"] and job_wage touches state[\"lottery\"], both hard-indexing keys that may not exist -> runtime error on load, the exact 'never crash on save weirdness' property the corrupt-save matrix row claims to guarantee. The unused 'version' field suggests migration was planned and dropped.",
+    "recommended_fix": "Validate the full required key set (job, lottery, assets, balance, ...) in load_game before returning ok=true, or have sanitize_state default-fill every required key. Use the version field to gate migrations or reject unknown versions as corrupted."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "test quality",
+    "title": "test_farm_lumpy_and_stocks_volatile does not suppress event draws; a seeded burst pipe on the farm flips the asserted payouts",
+    "location": "game/tests/test_economy.gd — test_farm_lumpy_and_stocks_volatile",
+    "evidence": "\"# No events this run: use a seeded rng and tolerate event draws by\\n# checking only the farm payout rhythm directly.\\nvar farm: Dictionary = state[\\\"assets\\\"][0]\\nvar payouts: Array = []\\nfor i in range(3):\\n    var tick := FinLitEconomy.market_tick(state, make_rng(1000 + i))\\n    payouts.append(tick[\\\"per_asset\\\"][0][\\\"payout\\\"])\\ncheck(payouts[2] == 12, \\\"farm pays on the 3rd tick (lumpy)\\\")\\ncheck(payouts[0] == 0 and payouts[1] == 0, \\\"farm is quiet between harvests\\\")\" — while market_tick unconditionally calls \"result[\\\"event\\\"] = _draw_event(state, rng)\" with EVENT_CHANCE 0.35 and _event_burst_pipe can set \"asset[\\\"damaged\\\"] = true\", after which the payout path yields \"{\\\"id\\\": ..., \\\"payout\\\": 0, \\\"note\\\": \\\"damaged\\\"}\".",
+    "detail": "The comment claims the test 'tolerates event draws,' but the assertions are exact payout equalities. If any of the three seeded draws produces a burst pipe that picks the farm (50% card pick, then 50% target pick among 2 assets), the farm is damaged and payouts[2] becomes 0, failing 'farm pays on the 3rd tick' for reasons unrelated to lumpy logic. The test currently passes only because seeds 1000–1002 happen not to roll that combination; any refactor that changes rng consumption order (e.g., adding a third event card, reordering draws) silently breaks it. A unit test of payout rhythm should be deterministic by construction, not by lucky seeds.",
+    "recommended_fix": "Isolate the rhythm: set EVENT_CHANCE aside (e.g., temporarily pass an rng pre-exhausted so randf() >= 0.35, or refactor market_tick to accept a draw_events := true flag) and assert payouts with events disabled; add a separate explicit test for burst-pipe targeting."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "UI accuracy",
+    "title": "Volatile-income labels understate the max payout for kids with the Lucky trait (2x base + 1 possible, UI shows 2x base)",
+    "location": "game/scripts/street.gd — _make_asset_card and _show_buy_sheet; game/scripts/economy.gd — market_tick volatile branch",
+    "evidence": "economy.gd: \"payout = rng.randi_range(0, base * 2)\\nif state[\\\"lottery\\\"].get(\\\"traits\\\", []).has(\\\"lucky\\\") and payout > 0:\\n    payout += 1\" ... street.gd card: \"income_label.text = \\\"$0–$%d / tick\\\" % (spec[\\\"levels\\\"][asset[\\\"level\\\"] - 1][\\\"income\\\"] * 2)\" ... buy sheet: \"income_text = \\\"pays $0–$%d a tick (jumpy!)\\\" % (income * 2)\".",
+    "detail": "A Lucky Penny kid can receive base*2+1 on a stock tick, but every UI surface caps the displayed range at base*2. The moment a payout of $7 lands on a tower labeled '$0–$6 / tick', the one kid paying close attention sees the game contradict itself. The test suite even encodes the true max (\"stocks pay 0..2x avg (+lucky trait)\" asserting <= 7), so the UI is provably out of sync with the engine.",
+    "recommended_fix": "Compute the label max through a single helper (e.g., FinLitEconomy.volatile_max(state, asset)) that accounts for the lucky trait, and use it in both the card and the buy sheet."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "flow / persistence",
+    "title": "Corrupt-save recovery path skips the age-bracket question (silently defaults to 8-10) and never persists the fresh state",
+    "location": "game/scripts/street.gd — _load_or_new_game vs _run_first_launch_flow and _start_new_game",
+    "evidence": "\"if loaded[\\\"corrupted\\\"]:\\n    ...\\n    _start_new_game(kept_name)\\n    _show_tutor_beat(\\\"Oops — your save got scrambled, so we're starting fresh. Your street kept its name: %s. Sorry!\\\" % kept_name)\\n    return\" — with no _save_game() call, versus the first-launch path: \"_start_new_game(street_name, bracket, lottery)\\n_save_game()\". And _start_new_game's signature: \"func _start_new_game(street_name: String, bracket := \\\"8-10\\\", lottery := {}) -> void:\".",
+    "detail": "Two asymmetries with the fresh-install path: (1) a returning 13-year-old whose save corrupts is silently re-bracketed as 8-10, so all tutor depth and the leaderboard league are wrong for them with no chance to correct it; (2) the recovered state is not saved until the first wage drop or market tick, so an app close inside the first seconds replays the 'save got scrambled' apology a second time and (because clear_save was never called on the corrupt file — load_game's corrupt branch leaves the file in place) the loop can repeat. Minor, but the corrupt-save matrix row is the one place the flow is exercised.",
+    "recommended_fix": "In the corrupted branch, call _save_game() immediately after _start_new_game (or have _start_new_game always save), run the age-bracket prompt for the recovered game too, and consider clear_save()/overwriting the corrupt file at detection time."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "robustness",
+    "title": "trim_to_word_cap splits only on spaces — newline-separated responses can exceed the 80-word cap",
+    "location": "game/scripts/llm_tutor.gd — trim_to_word_cap",
+    "evidence": "\"static func trim_to_word_cap(text: String) -> String:\\n    var words := text.strip_edges().split(\\\" \\\", false)\\n    if words.size() <= WORD_CAP:\\n        return text.strip_edges()\\n    return \\\" \\\".join(words.slice(0, WORD_CAP)) + \\\"…\\\"\"",
+    "detail": "The 'hard 80-word output cap' guardrail counts tokens separated by a literal space only. An LLM answer formatted as short lines (\"Save first.\\nBuy later.\\n...\") packs multiple words per space-delimited token, so a 120-word response with newlines can pass through untrimmed — the exact cheap-model behavior (bulleted lines for kids) this cap exists to stop. The unit test only exercises space-separated input (\"word0 word1 ...\"), so it cannot catch this.",
+    "recommended_fix": "Split on any whitespace, e.g. text.split RegEx \"\\\\s+\" or normalize newlines to spaces before the space-split; add a test with newline-separated words exceeding the cap."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "state reset",
+    "title": "NEW GAME reset does not reset _tick_remaining or _last_shift_ms; first market tick of the new game can fire seconds in",
+    "location": "game/scripts/street.gd — _show_leaderboard reset lambda vs _load_or_new_game",
+    "evidence": "reset lambda: \"_backend.clear_save()\\n_close_popup()\\n_state = {} # Freeze timers/saves until the new-game flow lands.\\n_wage_timer = 0.0\\n_run_first_launch_flow()\" — versus the load path which does \"_tick_remaining = FinLitEconomy.TICK_SECONDS\". WORK_SHIFT cooldown uses \"Time.get_ticks_msec() - _last_shift_ms >= int(FinLitEconomy.WORK_SHIFT_COOLDOWN * 1000.0)\" with _last_shift_ms also untouched on reset.",
+    "detail": "_wage_timer is carefully zeroed on reset but _tick_remaining is not: if the old game was 59.5s into its 60s tick when the kid hit NEW GAME, the brand-new street gets a market tick (with event draw chance) ~0.5s after the lottery is accepted, before the kid has even found work. Harmless numerically with no assets, but a '🔧 Burst Pipe — no target / 📈 Rate Hike' tutor beat in the first 60 seconds contradicts the scripted minute-one flow the playtest is timing. The stale _last_shift_ms similarly lets the first WORK SHIFT be cooldown-blocked for up to 5s.",
+    "recommended_fix": "Reset _tick_remaining = FinLitEconomy.TICK_SECONDS and _last_shift_ms = -100000 inside _start_new_game so every entry path (first launch, corrupt recovery, manual reset) starts timers identically."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "ops / unverifiable assumption",
+    "title": "Hardcoded model 'deepseek-v4-flash' and 'thinking: disabled' body ship green without any automated verification of the live path",
+    "location": "game/scripts/llm_tutor.gd; game/tests/test_llm_live.gd; game/tests/test_economy.gd",
+    "evidence": "\"const API_URL := \\\"https://api.deepseek.com/chat/completions\\\"\\nconst MODEL := \\\"deepseek-v4-flash\\\"\" and \"const THINKING := {\\\"type\\\": \\\"disabled\\\"}\" ... test_llm_live.gd: \"if not FinLitLlmTutor.is_available():\\n    print(\\\"SKIP: DEEPSEEK_API_KEY not set — offline path is the default.\\\")\\n    quit(0)\" ... the offline suite asserts only \"FinLitLlmTutor.is_available() == (OS.get_environment(\\\"DEEPSEEK_API_KEY\\\").strip_edges() != \\\"\\\")\".",
+    "detail": "The entire LLM feature rests on an unverified vendor model identifier and an OpenAI-incompatible extension field ('thinking') whose API acceptance is assumed. If the model name is wrong or the field rejected, every call returns non-200 and the game silently falls back to scripted lines — by design, so nothing ever alarms — and the only test that would catch it (test_llm_live.gd) self-skips green whenever the key is absent, which includes all CI/headless runs. The integrate-vs-drop decision this rig feeds could be made on a rig that never actually reached the model.",
+    "recommended_fix": "Treat the live test as a required pre-playtest gate and record its output; make a model/endpoint failure loudly visible in the debug compare view (surface fallback_reason in the UI, not just the jsonl log) so a permanently-falling-back rig cannot masquerade as 'LLM working'."
+  }
+]

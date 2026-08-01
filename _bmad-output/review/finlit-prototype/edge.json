@@ -1,0 +1,202 @@
+[
+  {
+    "source": "edge",
+    "severity": "blocker",
+    "category": "popup-lifecycle",
+    "title": "Stale one-shot dim connection dismisses non-dismissible first-launch popups, soft-locking the game",
+    "location": "game/scripts/street.gd:384-386",
+    "evidence": "_open_popup() connects _dim.gui_input to _on_dim_input with CONNECT_ONE_SHOT only when dismissible; _close_popup() (street.gd:394-398) frees the card but never disconnects the signal. Closing a dismissible popup via its ✖️ CLOSE button (e.g. leaderboard, street.gd:602-603) leaves the one-shot connection armed. After 🔄 NEW GAME (street.gd:609-615) the flow opens non-dismissible popups (_ask_age_bracket street.gd:443, _ask_street_name street.gd:470, _show_lottery_card street.gd:499) with the Dim visible and mouse_filter=0; PopupRoot is a CenterContainer (mouse_filter PASS, verified on Godot 4.7.1), so a tap outside the card reaches the Dim, fires the stale _on_dim_input, and closes the popup.",
+    "detail": "Once the popup is closed, nothing ever emits _age_picked/_street_name_picked/_lottery_accepted, so the awaiting _run_first_launch_flow (street.gd:78-83) never resumes, _state stays {}, _process early-returns (street.gd:99), and the dominant button stays disabled — a dead street requiring an app restart, on the exact reset path playtesters are told to use.",
+    "recommended_fix": "Disconnect the dim handler in _close_popup() (if _dim.gui_input.is_connected(_on_dim_input): _dim.gui_input.disconnect(_on_dim_input)), or track a _popup_dismissible flag and ignore _on_dim_input when the current popup is non-dismissible."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "reset-flow",
+    "title": "NEW GAME reset leaves the old game's HUD and buildings rendered until the next job pick",
+    "location": "game/scripts/street.gd:78-83",
+    "evidence": "_run_first_launch_flow() ends with _start_new_game(...) + _save_game() but never calls _refresh_ui(). _balance_label, _era_banner and the plot cards are only written by _refresh_ui (street.gd:159-178); _process only updates _tick_chip and the dominant button (street.gd:110-112). The reset lambda (street.gd:609-615) clears _state and re-runs the flow, so after the kid accepts the new lottery the screen still shows the previous game's balance, era banner and owned buildings until _on_job_picked finally refreshes (street.gd:528) or a market tick fires.",
+    "detail": "A fresh 'everyone starts with $0' street can display the old save's 💰 balance and fully-grown buildings for the entire window between lottery accept and first job pick, contradicting the new-game state and the minute-one script.",
+    "recommended_fix": "Call _refresh_ui() at the end of _run_first_launch_flow() (or inside _start_new_game) so HUD and plots re-render from the new state immediately."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "save-load",
+    "title": "Load validation only checks 'street_name' — partially corrupt or older-version saves crash at boot or mid-tick",
+    "location": "game/scripts/local_json_backend.gd:28",
+    "evidence": "load_game() accepts any JSON Dictionary containing 'street_name'. Everything downstream then uses unchecked direct indexing: sanitize_state does asset[\"id\"]/asset[\"level\"] (economy.gd:96-97), _process reads _state[\"job\"] (street.gd:101), job_wage reads JOBS[state[\"job\"]] and state[\"lottery\"] (economy.gd:122-123), market_tick reads state[\"assets\"] and state[\"events_seen\"] (economy.gd:246, 292), income reads spec[\"levels\"][asset[\"level\"] - 1] (economy.gd:252 — a corrupt level 0 silently wraps to levels[-1] and pays max-level income), and _make_asset_card indexes ASSET_COLORS[asset[\"type\"]] (street.gd:217). The 'version': 1 field written by new_state (economy.gd:104) is never checked.",
+    "detail": "A save that is valid JSON with a street name but missing/renamed keys, an unknown job or asset type, a malformed asset entry, or an out-of-range level passes the corruption gate and produces a hard runtime error instead of the designed 'keep the name, start fresh' recovery. The corrupt-save matrix row only handles syntactically broken JSON.",
+    "recommended_fix": "Validate required keys/types in load_game (or a validate_state step): job ∈ JOBS∪{\"\"}, each asset has id/level 1..3/type ∈ ASSET_TYPES, events_seen/lottery present; check version and route failures through the existing corrupted=true path."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "economy",
+    "title": "Burst pipe charges the repair cost twice; 'tough' discount branch in repair_cost is dead",
+    "location": "game/scripts/economy.gd:316",
+    "evidence": "_event_burst_pipe deducts the full repair cost immediately (state[\"balance\"] -= cost, economy.gd:316) AND marks the asset damaged; clearing the damage via repair_asset charges repair_cost again (economy.gd:224-228), so one pipe costs 2× the advertised amount while the tutor beat says 'Repairs cost $%d' once (street.gd:138). Additionally the event charge honors the tough trait (economy.gd:314-315) but repair_cost discounts via asset.get(\"tough_owner\", false) (economy.gd:213) — a flag nothing ever sets — so the FIX price is never discounted.",
+    "detail": "The playtest's key teach question ('what did it cost YOUR building?') has a doubled real answer vs the single number the UI shows, and the Tough Boots lottery trait works on the event but not on the repair button. If the double charge is intentional (emergency fee + repair), nothing communicates that to the kid.",
+    "recommended_fix": "Pick one: either the event only damages (drop the immediate balance deduction) or it pre-pays the repair (repair_asset costs $0 for event-damaged assets). Apply the tough discount from state.lottery traits inside repair_cost, or set tough_owner on the asset when damaged."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "tutor",
+    "title": "Concurrent tutor beats overwrite each other — the burst-pipe teach is lost exactly when it causes debt",
+    "location": "game/scripts/street.gd:145",
+    "evidence": "_run_market_tick shows the event beat (street.gd:134-138), then the era beat overwrites it (street.gd:141-144), then _check_debt_beat overwrites it again with the debt line (street.gd:150-154). _show_tutor_beat simply assigns _tutor_label.text (street.gd:370-373), so on a tick where a burst pipe pushes the balance negative — the slice's central teach-through-consequence moment — the pipe explanation is replaced by the generic debt line in the same frame.",
+    "detail": "The playtest gate asks whether the kid can state what the burst pipe cost their building; in the debt case (the most instructive one) that beat is never visible. Era-change beats similarly erase event beats on the same tick.",
+    "recommended_fix": "Queue beats (append with a short display timer or concatenate with a blank line) instead of last-write-wins assignment, or give event beats priority and delay the debt/era beat to the next tick."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "llm-robustness",
+    "title": "_extract_text crashes on non-dict choices[0] (busy-locks the LLM and hangs the '?' panel) and renders null content as '<null>'",
+    "location": "game/scripts/llm_tutor.gd:204",
+    "evidence": "choices[0].get(\"message\", {}) is called without verifying choices[0] is a Dictionary (llm_tutor.gd:204) — verified on Godot 4.7.1 that 'string'.get raises a runtime error. The error aborts _on_request_completed (llm_tutor.gd:177-195) before _finish runs: _busy stays true forever (every later explain() takes the _busy fallback at llm_tutor.gd:71-73) and explanation_ready is never emitted, so the panel's await (street.gd:648/659) hangs on 'Mrs. K is thinking…' until closed. Separately, message.get(\"content\", \"\") returns null when the API sends explicit null content (OpenAI-compatible shape), and str(null) produces the literal text '<null>' (llm_tutor.gd:207), which passes the is_empty check and is shown to the child as the answer.",
+    "detail": "The spec's guardrail is 'scripted fallback on ANY error'; a 200 response with an unexpected-but-legal body shape (proxy, gateway, or null content) both defeats the fallback and wedges the feature for the whole session.",
+    "recommended_fix": "In _extract_text, guard typeof(choices[0]) == TYPE_DICTIONARY and typeof(message.get('content')) == TYPE_STRING (return '' otherwise); wrap extraction so any failure still routes to _finish(..., 'scripted_fallback', ...)."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "resource-loading",
+    "title": "Leaderboard JSON parse result is used unchecked — null/wrong-shaped data errors on 🏆 press",
+    "location": "game/scripts/street.gd:588",
+    "evidence": "var data: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(LEADERBOARD_PATH)) assigns the parse result directly to a typed Dictionary. If the file is missing (export presets exclude non-resource files such as *.json unless filtered) or its content is invalid JSON or a valid non-object (array/number), parse_string returns null or a non-Dictionary and the typed assignment raises a runtime error, aborting _show_leaderboard; data.get(\"brackets\", {}) / data.get(\"rows\", []) (street.gd:590-593) make the same shape assumption.",
+    "detail": "One missing or malformed data file turns the leaderboard button into a silent error with no popup — and the fake_leaderboard.json file is exactly the kind of non-resource asset Godot export templates drop by default.",
+    "recommended_fix": "Guard the parse: var parsed = JSON.parse_string(raw); if typeof(parsed) != TYPE_DICTIONARY: show a fallback card or return early; add *.json to export filters when packaging."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "test-isolation",
+    "title": "Unit tests mutate the real production user:// files — running the suite deletes the actual save, street name, and parent-review LLM log",
+    "location": "game/tests/test_economy.gd:197-207",
+    "evidence": "test_corrupt_save_keeps_street_name calls backend.clear_save() (line 197), writes garbage to the real user://finlit_save.json (line 199), then deletes the save and user://finlit_street_name.txt (lines 206-207). test_save_roundtrip writes and clears the same real save path (lines ~213-226). test_llm_payload_is_pseudonymous_and_capped deletes the real user://tutor_llm_log.jsonl before and after itself (lines 299-305).",
+    "detail": "Tests and the game share one user:// dir for this project, so running 'godot --headless --script res://tests/test_economy.gd' on the playtest machine wipes the kid's actual save/street name and the parent-reviewable tutor log the spec requires for the integrate-vs-drop evaluation.",
+    "recommended_fix": "Point the backend/log at test-only paths in tests (e.g. subclass LocalJsonBackend overriding SAVE_PATH/STREET_NAME_PATH, and a LOG_PATH override on FinLitLlmTutor), or back up and restore the real files around the suite."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "save-load",
+    "title": "Corrupt-save recovery never re-saves or clears the corrupt file — quitting before the first wage loops the apology",
+    "location": "game/scripts/street.gd:67-74",
+    "evidence": "The corrupted branch calls _start_new_game(kept_name) and shows the apology but no _save_game() and no clear_save(). The next save only happens at the first wage drop (_pay_wage → _save_game, street.gd:123) or first action. If the kid closes the game before taking a job, load_game hits the same corrupt file on the next boot and the 'save got scrambled' flow (and a fresh lottery roll) repeats.",
+    "detail": "The designed recovery works only if a save lands before exit; the corrupt file also remains on disk indefinitely, so has_save() keeps returning true for a file that can never load.",
+    "recommended_fix": "In the corrupted branch, call clear_save() before _start_new_game and _save_game() immediately after, so recovery is durable from the first frame."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "save-load",
+    "title": "Corrupt-save recovery keeps the street name but silently resets the age bracket to 8-10",
+    "location": "game/scripts/street.gd:72",
+    "evidence": "_start_new_game(kept_name) uses the default bracket := \"8-10\" (street.gd:86) and rolls a fresh lottery; only the street name is persisted separately (local_json_backend.gd:42-54), so the previously chosen bracket is unrecoverable.",
+    "detail": "A 13–15 player whose save corrupts gets 8–10 tutor depth and is shown in the Fireflies league afterwards, with no signal that anything changed — an inconsistency in the 'keep what we can' recovery design.",
+    "recommended_fix": "Persist age_bracket alongside the street name (or note the reset in the apology copy), and pass the kept bracket into _start_new_game."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "timers",
+    "title": "_start_new_game doesn't reset _tick_remaining or _last_shift_ms — a market tick can fire seconds into a reset game",
+    "location": "game/scripts/street.gd:86-93",
+    "evidence": "The reset lambda (street.gd:609-615) zeroes _wage_timer only; _tick_remaining keeps whatever remained in the old game's countdown and _start_new_game never resets it. _process decrements it as soon as _state is non-empty (street.gd:106-109), so after a mid-game reset a market tick (and possibly a rate-hike/burst-pipe card) can land within the first second of the new game, before the kid has a job. _last_shift_ms also carries over, briefly disabling WORK SHIFT.",
+    "detail": "A brand-new street can immediately show a 'no effect' rate-hike beat or thud with zero context on minute one; the load path resets _tick_remaining (street.gd:64) but the new-game paths don't.",
+    "recommended_fix": "Reset _tick_remaining = FinLitEconomy.TICK_SECONDS (and _last_shift_ms) inside _start_new_game so all new-game entry points start the clock fresh."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "persistence",
+    "title": "Teach-beat flags (_seen_first_wage, _savings_nudged) are session-only and re-fire after every load",
+    "location": "game/scripts/street.gd:25-26",
+    "evidence": "_seen_first_wage and _savings_nudged are plain member variables reset in _start_new_game (street.gd:91-92) but never written into _state, so the save/load round-trip (street.gd:61-66) doesn't restore them. A returning player sees the 'first wage' teach beat again on their next wage (street.gd:120-122) and the savings nudge again whenever the conditions hold (street.gd:175-178).",
+    "detail": "Repeated 'first time' beats for a returning kid slightly undermines the tutor's credibility; the beats are keyed as one-time but are really once-per-session.",
+    "recommended_fix": "Persist the two flags in the state dictionary (with sanitize_state defaults) so one-time beats survive reloads."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "events",
+    "title": "Unhandled 'no_target' event effect: thud plays with no explanation and the income coin is suppressed",
+    "location": "game/scripts/street.gd:130-140",
+    "evidence": "_event_burst_pipe returns effect \"no_target\" when every building is already damaged or only stocks exist (economy.gd:309-311). In _run_market_tick the event is non-empty so _sfx.thud() plays (street.gd:131), but the match on event[\"effect\"] (street.gd:132-138) has no \"no_target\" case — nothing is shown — and the elif result[\"income\"] > 0 branch (street.gd:139) is skipped, so the wage/rent coin doesn't play on that tick either.",
+    "detail": "The kid hears the bad-news thud with zero feedback and loses the income blip for that tick, on a tick where money actually arrived — the opposite of the juice doctrine. The 'no_debt' teach-beat precedent shows the intent was to narrate these null outcomes.",
+    "recommended_fix": "Add a \"no_target\" case that shows a light beat (e.g. 'A pipe burst somewhere else — your street is fine!') and decouple the income coin from the event branch."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "ui-state",
+    "title": "Popup buttons' disabled state is computed once at open; economy rejections fail silently with no feedback",
+    "location": "game/scripts/street.gd:539",
+    "evidence": "Buy-sheet and asset-popup buttons set disabled from the balance at popup-open time (street.gd:539, 563, 573), but wages and market ticks keep mutating the balance while a popup is open (street.gd:101-109). If the balance drops (burst-pipe charge) a still-enabled button routes to _do_buy/_do_upgrade/_do_repair, which return silently on result[\"ok\"] == false (street.gd:328-329, 341-342, 355-356) — the buy sheet even closes first (street.gd:540-543). Symmetrically, a burst pipe can damage the very asset whose popup is open, leaving an UPGRADE button that does nothing when tapped.",
+    "detail": "The kid taps a button, the popup closes, and nothing happens — no error, no beat — which reads as a broken game even though the economy guard worked correctly.",
+    "recommended_fix": "On a failed economy result, show a one-line tutor beat (e.g. 'Not enough money right now!') and keep/refresh the popup; refresh button disabled state on _refresh_ui while a popup is open."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "economy",
+    "title": "buy_asset has no plot cap — saves with >4 assets render invisible assets that still earn and attract events",
+    "location": "game/scripts/economy.gd:158-176",
+    "evidence": "buy_asset never checks PLOT_COUNT; the cap exists only in the UI (street.gd:271, 309). _render_plots shows only the first PLOT_COUNT assets (street.gd:184-188), while market_tick pays all assets (economy.gd:246), _event_burst_pipe can target any non-stocks asset (economy.gd:305-308), and _first_affordable_repair/_first_affordable_upgrade iterate the full list (street.gd:281-294).",
+    "detail": "With a hand-edited or future-migrated save containing 5+ assets, the extra assets are invisible and unopenable, yet they pay income, can be named in a burst-pipe beat the kid can't locate, and can make the dominant button FIX/UPGRADE something with no visible card.",
+    "recommended_fix": "Enforce the plot cap inside buy_asset (return {ok:false, reason:\"no_plots\"} when assets.size() >= 4) and clamp/skip out-of-range assets in _render_plots and the affordable-scan helpers."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "tutor",
+    "title": "FIX option in available_options ignores affordability while UPGRADE checks it",
+    "location": "game/scripts/tutor.gd:113-118",
+    "evidence": "For a damaged asset the FIX line is appended unconditionally ('FIX %s — $%d, then it earns again', tutor.gd:113-114), whereas the UPGRADE branch requires balance >= cost (tutor.gd:117). Both the scripted '?' answer and the LLM payload ('childs_options_right_now', llm_tutor.gd:138) are built from this list.",
+    "detail": "A kid in debt with a broken building is told fixing it is one of their options right now when they can't afford it — the LLM will faithfully explain an unavailable action, undercutting the 'explain your options' design.",
+    "recommended_fix": "Gate the FIX option on balance >= repair_cost (or append an unaffordable variant such as 'SAVE $X to FIX ...'), matching the UPGRADE branch."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "llm-robustness",
+    "title": "API key availability check strips whitespace but the Authorization header uses the raw env value",
+    "location": "game/scripts/llm_tutor.gd:91",
+    "evidence": "is_available() tests OS.get_environment(\"DEEPSEEK_API_KEY\").strip_edges() != \"\" (llm_tutor.gd:59), but the header is built as \"Authorization: Bearer %s\" % OS.get_environment(\"DEEPSEEK_API_KEY\") (llm_tutor.gd:91) without strip_edges().",
+    "detail": "A key exported with a trailing newline/space (common when sourcing .env files) passes is_available, then every call returns HTTP 401 and falls back forever — the 🐞 compare shows scripted_fallback with no hint that the key formatting is the cause.",
+    "recommended_fix": "Use the stripped value in the header: \"Authorization: Bearer %s\" % OS.get_environment(\"DEEPSEEK_API_KEY\").strip_edges()."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "stub-contract",
+    "title": "reroll() stub returns {} — a shape that crashes _show_lottery_card if wired up later",
+    "location": "game/scripts/life_lottery.gd:70-72",
+    "evidence": "The stub returns an empty Dictionary after push_warning. The only producer-consumer contract that tolerates {} is _start_new_game, which re-rolls on lottery.is_empty() (street.gd:87-88); the display consumer _show_lottery_card indexes lottery[\"title\"], lottery[\"blurb\"], lottery[\"traits\"] directly (street.gd:483-490) and would hard-error on the stub's return value. The disabled reroll button (street.gd:492-494) has no pressed handler, so this is unreachable today.",
+    "detail": "When the OPEN reroll policy lands, the natural wiring (reroll.pressed → FinLitLifeLottery.reroll → show result) crashes, and the two plausible call sites would behave differently (silent fresh roll vs error) — the stub's contract is a trap rather than a seam.",
+    "recommended_fix": "Have reroll() return a fully-formed roll (equivalent to roll(rng)) or return {ok:false} and make the card handle that explicitly; document the intended contract at the stub."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "reset-flow",
+    "title": "Reset ignores clear_save() failure — a failed delete resurrects the old save next launch",
+    "location": "game/scripts/street.gd:610",
+    "evidence": "The reset lambda calls _backend.clear_save(), which silently swallows DirAccess.remove_absolute's return value (local_json_backend.gd:37-39). If removal fails (permissions, locked file), the new game's next autosave overwrites it — but if the kid quits before the first wage/action save, the old save loads on the next boot as if NEW GAME never happened.",
+    "detail": "The playtest reset convenience can silently fail to reset, with no signal to the operator that the old save survived.",
+    "recommended_fix": "Make clear_save() return the removal result and surface a failure (tutor beat or push_error + abort the new-game flow) instead of proceeding silently."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "ui-state",
+    "title": "Every autosave spawns a new tween on the same modulate:a property",
+    "location": "game/scripts/street.gd:363-367",
+    "evidence": "_save_game() calls create_tween() and animates _save_chip modulate:a over 1.6s on every save; saves can land closer together than 1.6s (wage drop + buy/upgrade in the same moment, street.gd:123/335/349/359), leaving multiple live tweens interpolating the same property concurrently.",
+    "detail": "Overlapping tweens fight over the SaveChip alpha — cosmetic flicker of the 'saved ✓' indicator at worst, but an unguarded accumulation path on a per-5-second cadence.",
+    "recommended_fix": "Keep a single _save_tween reference: kill_tween() (or tween.kill()) the previous one before creating the next."
+  }
+]

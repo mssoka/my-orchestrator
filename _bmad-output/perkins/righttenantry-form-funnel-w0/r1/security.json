@@ -1,0 +1,22 @@
+[
+  {
+    "source": "security",
+    "severity": "blocker",
+    "category": "data-exposure",
+    "title": "New security-definer view inbound_email_sender_state bypasses RLS and exposes enquirer emails to the public anon key",
+    "location": "supabase/migrations/20260731213000_add_inbound_email_sender_state_view.sql:22",
+    "evidence": "CREATE OR REPLACE VIEW inbound_email_sender_state AS\nSELECT\n  vacancy_id,\n  lower(sender_email) AS sender_email_lc,\n  bool_or(reminder_sent_at IS NULL) AS has_unreminded,\n  max(reminder_sent_at) AS last_stage1_at,\n  max(second_reminder_sent_at) AS last_stage2_at\nFROM inbound_email",
+    "detail": "Postgres views run as their owner (security definer) by default, so this migration-owned view bypasses the RLS the project auto-enables on every public table precisely to stop anon/authenticated-key reads (20260512175704_canonical_rls_auto_enable.sql). Supabase auto-exposes public-schema views via PostgREST with default SELECT grants to anon, so the shipped public anon key can read per-vacancy enquirer email addresses (PII) and reminder state unauthenticated. The migration comment \"No RLS surface change\" is wrong for views.",
+    "recommended_fix": "Recreate the view WITH (security_invoker = on) so base-table RLS applies to non-service roles, and/or add REVOKE SELECT ON inbound_email_sender_state FROM anon, authenticated; the server role keeps full access either way."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "pii-in-logs",
+    "title": "New reminder code paths log full enquirer email addresses to server logs",
+    "location": "server/src/inbound_email/inbound_handler.gleam:690",
+    "evidence": "    wisp.log_warning(\n      \"reminder stamp cleared for invalid legacy sender: \" <> addr,\n    )\n...\n        wisp.log_error(\"Follow-up send failed for \" <> email <> \": \" <> err)",
+    "detail": "The diff adds two new log sites emitting raw applicant/enquirer email addresses (PII) into Cloud Run logs. This extends a pre-existing stage-1 pattern, but logs outlive the retention job's DB purge of enquirer PII (30 days post-close), widening the PII footprint.",
+    "recommended_fix": "Redact or hash the address in these two new log lines (e.g. log a masked local part or the vacancy-scoped row id); keep the full email only in the DB clear call."
+  }
+]

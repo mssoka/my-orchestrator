@@ -1,0 +1,2586 @@
+diff --git a/_bmad-output/implementation-artifacts/deferred-work.md b/_bmad-output/implementation-artifacts/deferred-work.md
+index 52698ad4..172e1e05 100644
+--- a/_bmad-output/implementation-artifacts/deferred-work.md
++++ b/_bmad-output/implementation-artifacts/deferred-work.md
+@@ -526,3 +526,7 @@ Items that are real but will not be fixed: blocked by a project policy, by V1 sc
+ - source_spec: `_bmad-output/implementation-artifacts/spec-bmad-post-strip-hardening.md`
+   summary: Put the pi-global canonical skill dir (`/Users/moses/code/.agents/skills/`) under version control or document git history as the recovery path.
+   evidence: The rescued `bmad-review-verification-gap` skill's only versioned copy was removed from this repo; the canonical dir is unversioned and single-machine. Recovery path today: git history pre-0a82344 (`.claude/skills/bmad-review-verification-gap`).
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-rc2-1-reference-call-reference-objection-log-schema.md`
++  summary: Extend `shared/src/shared/notification.gleam` with the four `reference_*` NotificationType variants (+ codec arms and client dropdown mapping) in the story that first emits those notifications (RC4.4/RC3.5).
++  evidence: RC2.1's migration added the four enum values to `notification_type`; the shared `type_decoder()` fails closed on unknown strings and `client/src/components/notification_dropdown.gleam` pattern-matches the type exhaustively — any emitted `reference_*` notification is undecodable until the codec lands. Not done in RC2.1 because the dropdown mapping is RC4.4's UX call (edge-case review finding, verified against the client code).
+diff --git a/_bmad-output/implementation-artifacts/epic-RC2-context.md b/_bmad-output/implementation-artifacts/epic-RC2-context.md
+new file mode 100644
+index 00000000..a9b47856
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/epic-RC2-context.md
+@@ -0,0 +1,40 @@
++# Epic RC2 Context: Reference-Check Foundation & Viewing Trigger
++
++<!-- Compiled from planning artifacts. Edit freely. Regenerate with compile-epic-context if planning docs change. -->
++
++## Goal
++
++Establish the system of record for reference checking: the `reference_call` lifecycle table, the Art 21 objection evidence log, the application `viewed` status, and the trigger that auto-creates checks when a viewing is marked done. After this epic the platform knows who to chase and when to start — but sends nothing yet (the sweep in RC3 owns all sends).
++
++## Stories
++
++- Story RC2.1: `reference_call` + `reference_objection_log` schema, enums, indexes, shared types/codecs
++- Story RC2.2: `viewed` application status end to end (enum, codecs, stepper UI)
++- Story RC2.3: trigger on `viewed` + manual start / skip APIs, creation audit
++
++## Requirements & Constraints
++
++- One migration creates both tables, both enums, and all indexes; companion migrations follow the repo's one-purpose-per-migration precedent. New `notification_type` values (`reference_completed`, `reference_unreachable`, `reference_objected`, `reference_declined`) ship with RC2.1 so later emitting stories have their types.
++- Amendments binding this epic (from the epics doc's A-register): no `correction_token` column or applicant correction route (landlord-driven correction, A1); `draft_answers` JSONB for referee autosave (A2); form-link TTL is 10 days (A3); attestation choice recorded per application (A4, RC1's column — RC2 only consumes it); trigger is `viewed`, not shortlist (A5); `'skipped'` status exists, occupies its live slot, and re-enables to `queued` (A6); takeover modelled as `taken_over_at` (A7); form decline = `refused` terminal with `reference_declined` notification (A8).
++- `reference_call` rows are created `queued` with `next_attempt_at = now()` and the immutable `contact_*` snapshot; **nothing is sent at creation**. Auto-create is suppressed when `reference_contact_choice = 'declined'`; pre-v1 (NULL) applications DO trigger. Double-trigger must not duplicate rows (guarded INSERT against the live-slot partial unique index).
++- Objection is a sticky short-circuit: `reference_objection_log` is written at objection time by a single writer, has NO foreign keys, and must survive deletion of both parents (Art 21 evidence).
++- Retention integrates with the application schedule via `retention_class` + `purge_after` on both new tables; application-level CASCADE is the v1 enforcement path.
++- Lifecycle events write `audit_log` rows (entity_type `reference_call`).
++
++## Technical Decisions
++
++- `status`/`outcome` are PG enums (`reference_call_status` incl. `'skipped'` and v2-reserved values; `reference_call_outcome` incl. the §6.4 additions `unreachable`, `form_completed`, `manual_recorded`). `ref_slot`, `owner_label`, `channel`, `retention_class` are TEXT+CHECK — an owned deviation keeping DDL in lockstep with the cross-repo JSON contract.
++- Live-row uniqueness: partial unique index on `(application_id, ref_slot, owner_label)` excluding every terminal status but NOT `'skipped'`. Unique partial index on `form_token`. Plus sweep (`next_attempt_at`), application, contact-phone (cross-application fraud check), and purge indexes.
++- `updated_at` via the repo's existing generic trigger-function pattern. RLS auto-enables via event trigger; zero policies are written (deliberate repo posture, service-role-only access).
++- Squirrel codegen needs a DB carrying the new migration — use the local Docker test DB (`make test-db-up` runs migrations), never staging, and point `DATABASE_URL` at it for `gleam run -m squirrel`.
++- Squirrel limitations (canonical): no timestamptz params (pass TEXT, cast in SQL), lowercase `::text` casts only.
++- `reference_call` FK to `application` is ON DELETE CASCADE; the immutable `contact_*` snapshot records who was actually contacted (corrections land in `corrected_email`/`corrected_phone`, snapshot never overwritten).
++- Shared package owns the types + JSON codecs for status/outcome (compilation-boundary convention); enum variant tests use the enumerate-all-variants round-trip pattern. Internal-only fields (`form_token`, `objection_detail.payload_ref`) never leave the server.
++- Terminal-no-content rows still get a `result` JSONB (outcome + attempts, null verification) so v2 re-score reads uniformly; `fraud_signals` is denormalised to its own column.
++- Migration header comments follow house style (intent + rationale prose); enum additions use `ALTER TYPE ... ADD VALUE IF NOT EXISTS` in their own tiny migration (a newly added enum value can't be referenced in the same transaction).
++
++## Cross-Story Dependencies
++
++- RC2.1 is the schema foundation: RC2.3 creates rows against it, RC4.1's payload contract may start as soon as RC2.1 lands, and RC3's sweep/token work builds on its columns.
++- RC2.3 depends on RC2.2's `viewed` status and on RC1.1's `reference_contact_choice` column (sibling epic RC1 runs in parallel on a different branch — `shared/src/shared/application.gleam` and the `consent_type` enum are THEIRS; RC2 stories must not touch them).
++- RC2.1 must NOT create the `consent_type` value or application capture columns (RC1.1's migrations) and must NOT add `'viewed'` to `application_status` (RC2.2's migration).
+diff --git a/_bmad-output/implementation-artifacts/spec-rc2-1-reference-call-reference-objection-log-schema.md b/_bmad-output/implementation-artifacts/spec-rc2-1-reference-call-reference-objection-log-schema.md
+new file mode 100644
+index 00000000..6a598192
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-rc2-1-reference-call-reference-objection-log-schema.md
+@@ -0,0 +1,154 @@
++---
++title: 'RC2.1: reference_call + reference_objection_log schema'
++type: 'feature'
++created: '2026-07-31'
++status: 'done'
++baseline_commit: '80ed48f08241d3653b77938ef7b592a8c8b9fb47'
++review_loop_iteration: 0
++context: []
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** AI reference-checking v1 has no system of record. Every later story (trigger, sweep, form, panel) needs the `reference_call` lifecycle table, the Art 21 objection evidence log, their enums/indexes, and typed Gleam access — built exactly on the agreed contract.
++
++**Approach:** One schema migration per architecture §4.1 *as amended by the epics doc's A-register*, one tiny notification-type enum migration, Squirrel SQL + generated CRUD primitives in a new `server/src/reference_checks/` module, and shared enum types + JSON codecs with round-trip tests.
++
++## Boundaries & Constraints
++
++**Always:**
++- Migration SQL follows architecture §4.1 *as amended*: status enum gains `'skipped'` (A6); outcome enum gains `'unreachable'`, `'form_completed'`, `'manual_recorded'` (§6.4); add `draft_answers` JSONB (A2) and `taken_over_at TIMESTAMPTZ` (A7); **no `correction_token` column or index** (A1).
++- Live-row partial unique index on `(application_id, ref_slot, owner_label)` excludes every terminal status (`form_completed`,`unreachable`,`refused`,`objected`,`manual_recorded`,`failed`,`completed`,`partial`) but NOT `'skipped'` (A6 — a skipped row occupies its slot).
++- `ref_slot`/`owner_label`/`channel`/`retention_class` = TEXT+CHECK (owned deviation); `status`/`outcome` = PG enums; `updated_at` via the existing generic `update_updated_at_column()` trigger (ai_analysis pattern); retention_class CHECK set = `('referee_submission','objection_evidence','attempt_metadata')` (§9.3), defaults `'referee_submission'` / `'objection_evidence'`.
++- `reference_objection_log` has **no foreign keys** (survives both parent deletions); purge partial index on both tables; unique partial index on `form_token`; sweep (`next_attempt_at`), `application_id`, `contact_phone` indexes.
++- Four `notification_type` values via `ALTER TYPE ... ADD VALUE IF NOT EXISTS` in their own tiny migration (20260423100001 precedent): `reference_completed`, `reference_unreachable`, `reference_objected`, `reference_declined`.
++- House migration header-comment style (intent + rationale prose); RLS auto-enables via existing event trigger — write zero policy content.
++- Shared codecs follow the `application.gleam`/`error_code` pattern (encode/from_string, total inverse); tests enumerate ALL variants for round-trip.
++- Squirrel limitations: timestamptz params passed as TEXT + `::timestamptz` cast; enum params as TEXT + `::enum` cast; JSONB params `::jsonb`.
++
++**Ask First:** any deviation from architecture §4.1-as-amended (column rename, dropped index, extra column); touching RC1.1's files.
++
++**Never:** no `correction_token`; no applicant-facing correction routes; no RLS policies; no edits to `shared/src/shared/application.gleam`, `consent_type`, or `application_status` (sibling minion owns RC1.1; RC2.2 owns `'viewed'`); no sends/sweep logic; no migrations against staging or production — local Docker test DB only.
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| Fresh reset | `scripts/reset-test-db.sh` over all migrations | Both enums, both tables, all indexes, trigger exist; 4 notification values added | Migration error aborts with ON_ERROR_STOP |
++| Live-slot uniqueness | Two non-terminal rows, same (application_id, ref_slot, owner_label) | Second insert rejected by partial unique index | DB unique violation |
++| Skipped occupies slot | One row `status='skipped'`, insert same slot trio | Rejected (skipped NOT in terminal exclusion) | DB unique violation |
++| Terminal frees slot | Prior row terminal (e.g. `unreachable`), insert same slot trio | Insert succeeds (substitution path) | N/A |
++| Objection log orphan | Row with reference_call_id/application_id set, parents deleted | Log row survives (no FKs) | N/A |
++| Codec round-trip | Every status/outcome variant | `from_string(encode(v)) == v` for all 14 + 15 variants | Test fails on missing arm |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `supabase/migrations/20260423100001_auto_closed_enum_values.sql` — enum-addition precedent (header style, IF NOT EXISTS)
++- `supabase/migrations/20260409000001_add_ai_analysis_updated_at.sql` — generic `update_updated_at_column()` trigger function to reuse
++- `supabase/migrations/20260523224800_add_cookie_consent_log.sql` — house header-comment + CREATE TABLE style
++- `server/src/notification/sql.gleam` + `server/src/notification/sql/` — Squirrel module layout to mirror
++- `shared/src/shared/application.gleam` (encode_status/status_from_string), `shared/src/shared/error_code.gleam` + `shared/test/error_code_test.gleam` — codec + all-variants round-trip test pattern
++- `run_squirrel.sh` — codegen flow; override `DATABASE_URL` to the local test DB (`postgresql://test:test@localhost:54321/righttenantry_test`) instead of staging
++- `_bmad-output/planning-artifacts/architecture-reference-checking-v1-2026-07-29.md` §4.1/§4.3/§4.4/§6.4 + epics doc A-register — the contract
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `supabase/migrations/20260731222000_create_reference_call.sql` — create both enums, `reference_call`, its 6 indexes (live-slot, form_token, sweep, application, contact_phone, purge), `reference_objection_log` (no FKs) + its purge index, `updated_at` trigger reusing `update_updated_at_column()` — house header comments noting the A-register amendments
++- [x] `supabase/migrations/20260731222001_add_reference_notification_types.sql` — four `ALTER TYPE notification_type ADD VALUE IF NOT EXISTS` statements
++- [x] `server/src/reference_checks/sql/*.sql` — Squirrel queries: `insert_reference_call` (snapshot trio + now() next_attempt_at, RETURNING id), `get_reference_call_by_id`, `get_reference_call_by_form_token`, `list_reference_calls_for_application`, `update_reference_call_status` (guarded `WHERE id AND status = expected`, sets status/outcome/terminal_reason), `append_reference_call_attempt` (atomic `attempts || $::jsonb`, attempt_count+1, next_attempt_at, guarded on status), `insert_reference_objection_log`
++- [x] `server/src/reference_checks/sql.gleam` — regenerate via `make test-db-up` then `cd server && DATABASE_URL=postgresql://test:test@localhost:54321/righttenantry_test gleam run -m squirrel` (never staging)
++- [x] `shared/src/shared/reference_call.gleam` — `ReferenceCallStatus` (14), `ReferenceCallOutcome` (15), plus contract-mirrored `RefSlot`/`OwnerLabel`/`Channel` types; encode/from_string + JSON codec helpers for each
++- [x] `shared/test/reference_call_test.gleam` — all-variants round-trip tests (status + outcome explicit AC; slot/owner/channel same pattern)
++- [x] `server/test/reference_checks/schema_migration_test.gleam` — unit test reading the migration via simplifile, pinning: no `correction_token`, `'skipped'` in status enum + absent from live-index exclusion list, no FOREIGN KEY/REFERENCES in objection_log block, 4 notification values present
++
++**Acceptance Criteria:**
++- Given a fresh test DB, when `make test-db-up` runs, then all migrations apply cleanly and `\d reference_call` shows the amended contract (verify evidence: psql inspection output)
++- Given the schema on the local test DB, when Squirrel codegen runs against it, then `server/src/reference_checks/sql.gleam` generates and `make test-server` compiles green
++- Given the shared codecs, when `make test-shared` runs, then all status/outcome round-trip tests pass (14 + 15 variants enumerated)
++- Given the schema, when two live rows share a slot trio (or a skipped row exists and a duplicate is inserted), then the unique index rejects it; when the prior row is terminal, then the insert succeeds
++
++## Spec Change Log
++
++## Design Notes
++
++- Enum value order: `'skipped'` placed directly after `'queued'` in `reference_call_status` (lifecycle adjacency; PG enum order has no v1 consumer).
++- `insert_reference_call` deliberately takes no `next_attempt_at` param — creation always stamps `now()` (FR-RC3); re-enable after skip is a later story's guarded update.
++- The objection-log schema test greps the migration *file* (audit_log_schema_test precedent) so DB-free CI pins the no-FK / no-correction_token invariants.
++- `form_token_expires_at` is a bare column — the 10-day TTL (A3) is a runtime policy of the token-issuing story (RC3.x), noted in the column comment.
++- **Squirrel nullability (learned during implementation):** squirrel types cast expressions as non-`Option` (and cannot codegen timestamptz results at all), so nullable non-text columns are selected as `COALESCE(x::text, '')` — '' is the absent marker, mirroring the house `NULLIF($n,'')` input convention. Plain nullable TEXT columns stay `Option(String)`. The existing `ai/sql.gleam` `completed_at::text` non-Option typing is a latent instance of this trap — do not copy it.
++- **Test-DB port deviation:** a sibling minion's container already bound 54321, so the local DB ran on 54322 (`docker run postgres:16-alpine` + `TEST_DB_PORT=54322 scripts/reset-test-db.sh`); Squirrel and integration tests pointed at 54322. Same migrations-from-reset semantics as `make test-db-up`.
++- **Outcome constructors are `Outcome`-prefixed** in the shared module (Gleam constructor names are module-global; 7 collide with status variants). `from_string` helpers are total with documented fallbacks (application.gleam precedent); `*_decoder()` fails on unknown strings (ai_analysis.gleam precedent).
++
++## Verification
++
++**Commands:**
++- `make test-db-down; make test-db-up` — expected: all migrations incl. the two new ones apply with ON_ERROR_STOP, no errors (if a sibling minion's container already binds 54321, run your own: `docker run -d --name rt-rc2-1-test-db -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=righttenantry_test -p 54322:5432 postgres:16-alpine` then `TEST_DB_PORT=54322 bash scripts/reset-test-db.sh` — as actually executed)
++- `psql postgresql://test:test@localhost:54322/righttenantry_test -c '\d reference_call'` — expected: amended columns present, no `correction_token`
++- `cd server && DATABASE_URL=postgresql://test:test@localhost:54322/righttenantry_test gleam run -m squirrel` — expected: codegen succeeds
++- `make test-shared` — expected: round-trip tests green
++- `make test-server` — expected: green incl. schema_migration_test
++- `TEST_DATABASE_URL=postgresql://test:test@localhost:54322/righttenantry_test gleam test -- --tag integration` (from `server/`) — expected: green incl. reference_checks_integration_test (durable form of the DB-level ACs)
++- Tear down the container afterwards (`docker rm -f rt-rc2-1-test-db`) — leave nothing running
++
++**Manual checks (if no CLI):**
++- Confirm via psql that `reference_objection_log` has zero FK constraints and RLS is enabled on both new tables (`relrowsecurity = true`, zero policies)
++
++## Suggested Review Order
++
++**Schema contract (the story's core)**
++
++- The whole amended contract, with A-register rationale in the header comments
++  [`20260731222000_create_reference_call.sql:1`](../../supabase/migrations/20260731222000_create_reference_call.sql#L1)
++
++- Live-slot index: terminal exclusions, `'skipped'` deliberately absent (A6)
++  [`20260731222000_create_reference_call.sql:138`](../../supabase/migrations/20260731222000_create_reference_call.sql#L138)
++
++- Objection evidence table: no foreign keys by design (Art 21)
++  [`20260731222000_create_reference_call.sql:164`](../../supabase/migrations/20260731222000_create_reference_call.sql#L164)
++
++- Four notification types for every later emitting story (A8)
++  [`20260731222001_add_reference_notification_types.sql:1`](../../supabase/migrations/20260731222001_add_reference_notification_types.sql#L1)
++
++**Data-access primitives**
++
++- Guarded transition: COALESCE-preserve outcome, terminal/skipped clears the sweep clock
++  [`update_reference_call_status.sql:1`](../../server/src/reference_checks/sql/update_reference_call_status.sql#L1)
++
++- NULLIF insert discipline — absent contacts store NULL, never `''`
++  [`insert_reference_call.sql:1`](../../server/src/reference_checks/sql/insert_reference_call.sql#L1)
++
++- COALESCE-as-absent-marker read row (squirrel nullability trap workaround)
++  [`get_reference_call_by_id.sql:1`](../../server/src/reference_checks/sql/get_reference_call_by_id.sql#L1)
++
++- Atomic attempt append, guarded on expected status (AD-14)
++  [`append_reference_call_attempt.sql:1`](../../server/src/reference_checks/sql/append_reference_call_attempt.sql#L1)
++
++**Shared contract types**
++
++- Both enums + fail-safe fallbacks (`Failed`/`OutcomeUnreachable`, never success-shaped)
++  [`reference_call.gleam:1`](../../shared/src/shared/reference_call.gleam#L1)
++
++- Two channel domains: `Channel` (result) vs `ObjectionChannel` (arrival)
++  [`reference_call.gleam:77`](../../shared/src/shared/reference_call.gleam#L77)
++
++**Peripherals — tests and tracking**
++
++- Durable DB-level ACs: slot uniqueness, skipped-occupies, orphan survival, sticky terminals
++  [`reference_checks_integration_test.gleam:1`](../../server/test/integration/reference_checks_integration_test.gleam#L1)
++
++- Migration-invariant pins on comment-stripped DDL (no `correction_token`, no FKs)
++  [`schema_migration_test.gleam:1`](../../server/test/reference_checks/schema_migration_test.gleam#L1)
++
++- Round-trip + contract-count + fallback suites
++  [`reference_call_test.gleam:1`](../../shared/test/reference_call_test.gleam#L1)
++
++- Truncate list extended so integration isolation covers the new tables
++  [`test_db.gleam:80`](../../server/test/integration/test_db.gleam#L80)
++
++- Squirrel-regenerated `NotificationType` variants (mechanical, from the enum migration)
++  [`sql.gleam:472`](../../server/src/notification/sql.gleam#L472)
+diff --git a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+index 38eccf12..881fe66e 100644
+--- a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
++++ b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+@@ -63,8 +63,8 @@ development_status:
+   epic-rc1-retrospective: optional
+ 
+   # Epic RC2: Reference-Check Foundation & Viewing Trigger
+-  epic-rc2: backlog
+-  rc2-1-reference-call-reference-objection-log-schema: backlog
++  epic-rc2: in-progress
++  rc2-1-reference-call-reference-objection-log-schema: review
+   rc2-2-viewed-application-status-end-to-end: backlog
+   rc2-3-trigger-on-viewed-manual-start-skip-apis: backlog
+   epic-rc2-retrospective: optional
+diff --git a/server/src/ai/sql.gleam b/server/src/ai/sql.gleam
+index 70511e54..e6112016 100644
+--- a/server/src/ai/sql.gleam
++++ b/server/src/ai/sql.gleam
+@@ -1817,6 +1817,10 @@ WHERE a.id = $1 AND v.user_id = $2;
+ /// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+ ///
+ pub type NotificationType {
++  ReferenceDeclined
++  ReferenceObjected
++  ReferenceUnreachable
++  ReferenceCompleted
+   VacancyExtended
+   RetentionUpcoming
+   PaymentConfirmed
+@@ -1829,6 +1833,10 @@ pub type NotificationType {
+ 
+ fn notification_type_encoder(notification_type) -> pog.Value {
+   case notification_type {
++    ReferenceDeclined -> "reference_declined"
++    ReferenceObjected -> "reference_objected"
++    ReferenceUnreachable -> "reference_unreachable"
++    ReferenceCompleted -> "reference_completed"
+     VacancyExtended -> "vacancy_extended"
+     RetentionUpcoming -> "retention_upcoming"
+     PaymentConfirmed -> "payment_confirmed"
+diff --git a/server/src/notification/sql.gleam b/server/src/notification/sql.gleam
+index 44d52f4c..67b1871a 100644
+--- a/server/src/notification/sql.gleam
++++ b/server/src/notification/sql.gleam
+@@ -470,6 +470,10 @@ WHERE id = $1;
+ /// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+ ///
+ pub type NotificationType {
++  ReferenceDeclined
++  ReferenceObjected
++  ReferenceUnreachable
++  ReferenceCompleted
+   VacancyExtended
+   RetentionUpcoming
+   PaymentConfirmed
+@@ -482,6 +486,10 @@ pub type NotificationType {
+ 
+ fn notification_type_encoder(notification_type) -> pog.Value {
+   case notification_type {
++    ReferenceDeclined -> "reference_declined"
++    ReferenceObjected -> "reference_objected"
++    ReferenceUnreachable -> "reference_unreachable"
++    ReferenceCompleted -> "reference_completed"
+     VacancyExtended -> "vacancy_extended"
+     RetentionUpcoming -> "retention_upcoming"
+     PaymentConfirmed -> "payment_confirmed"
+diff --git a/server/src/reference_checks/sql.gleam b/server/src/reference_checks/sql.gleam
+new file mode 100644
+index 00000000..a2923ca9
+--- /dev/null
++++ b/server/src/reference_checks/sql.gleam
+@@ -0,0 +1,765 @@
++//// This module contains the code to run the sql queries defined in
++//// `./src/reference_checks/sql`.
++//// > 🐿️ This module was generated automatically using v4.6.0 of
++//// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++////
++
++import gleam/dynamic/decode
++import gleam/json.{type Json}
++import gleam/option.{type Option}
++import pog
++import youid/uuid.{type Uuid}
++
++/// A row you get from running the `append_reference_call_attempt` query
++/// defined in `./src/reference_checks/sql/append_reference_call_attempt.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type AppendReferenceCallAttemptRow {
++  AppendReferenceCallAttemptRow(id: String)
++}
++
++/// Atomic attempt append (AD-14): one guarded statement applies the
++/// attempts || append, the attempt_count bump, and the next cadence step.
++/// Pass '' for next_attempt_at to NULL it (terminal / objected rows).
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn append_reference_call_attempt(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Json,
++  arg_3: String,
++  arg_4: ReferenceCallStatus,
++) -> Result(pog.Returned(AppendReferenceCallAttemptRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(AppendReferenceCallAttemptRow(id:))
++  }
++
++  "-- Atomic attempt append (AD-14): one guarded statement applies the
++-- attempts || append, the attempt_count bump, and the next cadence step.
++-- Pass '' for next_attempt_at to NULL it (terminal / objected rows).
++UPDATE reference_call
++SET attempts = attempts || $2::jsonb,
++    attempt_count = attempt_count + 1,
++    next_attempt_at = NULLIF($3, '')::timestamptz
++WHERE id = $1
++  AND status = $4::reference_call_status
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(json.to_string(arg_2)))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(reference_call_status_encoder(arg_4))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `get_reference_call_by_form_token` query
++/// defined in `./src/reference_checks/sql/get_reference_call_by_form_token.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type GetReferenceCallByFormTokenRow {
++  GetReferenceCallByFormTokenRow(
++    id: String,
++    application_id: String,
++    ref_slot: String,
++    owner_label: String,
++    status: String,
++    outcome: String,
++    terminal_reason: Option(String),
++    contact_name: String,
++    contact_email: Option(String),
++    contact_phone: Option(String),
++    corrected_email: Option(String),
++    corrected_phone: Option(String),
++    attempt_count: Int,
++    next_attempt_at: String,
++    attempts: String,
++    correction_cycles: Int,
++    form_token: Option(String),
++    form_token_expires_at: String,
++    form_opened_at: String,
++    submitted_at: String,
++    draft_answers: String,
++    taken_over_at: String,
++    channel: Option(String),
++    result: String,
++    fraud_signals: String,
++    objected_at: String,
++    objection_detail: String,
++    retention_class: String,
++    purge_after: String,
++    created_at: String,
++    updated_at: String,
++  )
++}
++
++/// Nullable non-text columns use COALESCE(x::text, '') — squirrel types cast
++/// expressions as non-optional (and cannot codegen timestamptz results at
++/// all), so '' is the absent marker, mirroring the NULLIF($n,'') input
++/// convention. Plain nullable TEXT columns stay Option(String).
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn get_reference_call_by_form_token(
++  db: pog.Connection,
++  arg_1: String,
++) -> Result(pog.Returned(GetReferenceCallByFormTokenRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    use application_id <- decode.field(1, decode.string)
++    use ref_slot <- decode.field(2, decode.string)
++    use owner_label <- decode.field(3, decode.string)
++    use status <- decode.field(4, decode.string)
++    use outcome <- decode.field(5, decode.string)
++    use terminal_reason <- decode.field(6, decode.optional(decode.string))
++    use contact_name <- decode.field(7, decode.string)
++    use contact_email <- decode.field(8, decode.optional(decode.string))
++    use contact_phone <- decode.field(9, decode.optional(decode.string))
++    use corrected_email <- decode.field(10, decode.optional(decode.string))
++    use corrected_phone <- decode.field(11, decode.optional(decode.string))
++    use attempt_count <- decode.field(12, decode.int)
++    use next_attempt_at <- decode.field(13, decode.string)
++    use attempts <- decode.field(14, decode.string)
++    use correction_cycles <- decode.field(15, decode.int)
++    use form_token <- decode.field(16, decode.optional(decode.string))
++    use form_token_expires_at <- decode.field(17, decode.string)
++    use form_opened_at <- decode.field(18, decode.string)
++    use submitted_at <- decode.field(19, decode.string)
++    use draft_answers <- decode.field(20, decode.string)
++    use taken_over_at <- decode.field(21, decode.string)
++    use channel <- decode.field(22, decode.optional(decode.string))
++    use result <- decode.field(23, decode.string)
++    use fraud_signals <- decode.field(24, decode.string)
++    use objected_at <- decode.field(25, decode.string)
++    use objection_detail <- decode.field(26, decode.string)
++    use retention_class <- decode.field(27, decode.string)
++    use purge_after <- decode.field(28, decode.string)
++    use created_at <- decode.field(29, decode.string)
++    use updated_at <- decode.field(30, decode.string)
++    decode.success(GetReferenceCallByFormTokenRow(
++      id:,
++      application_id:,
++      ref_slot:,
++      owner_label:,
++      status:,
++      outcome:,
++      terminal_reason:,
++      contact_name:,
++      contact_email:,
++      contact_phone:,
++      corrected_email:,
++      corrected_phone:,
++      attempt_count:,
++      next_attempt_at:,
++      attempts:,
++      correction_cycles:,
++      form_token:,
++      form_token_expires_at:,
++      form_opened_at:,
++      submitted_at:,
++      draft_answers:,
++      taken_over_at:,
++      channel:,
++      result:,
++      fraud_signals:,
++      objected_at:,
++      objection_detail:,
++      retention_class:,
++      purge_after:,
++      created_at:,
++      updated_at:,
++    ))
++  }
++
++  "-- Nullable non-text columns use COALESCE(x::text, '') — squirrel types cast
++-- expressions as non-optional (and cannot codegen timestamptz results at
++-- all), so '' is the absent marker, mirroring the NULLIF($n,'') input
++-- convention. Plain nullable TEXT columns stay Option(String).
++SELECT id::text,
++       application_id::text,
++       ref_slot,
++       owner_label,
++       status::text            AS status,
++       COALESCE(outcome::text, '') AS outcome,
++       terminal_reason,
++       contact_name,
++       contact_email,
++       contact_phone,
++       corrected_email,
++       corrected_phone,
++       attempt_count,
++       COALESCE(next_attempt_at::text, '') AS next_attempt_at,
++       attempts::text          AS attempts,
++       correction_cycles,
++       form_token,
++       COALESCE(form_token_expires_at::text, '') AS form_token_expires_at,
++       COALESCE(form_opened_at::text, '') AS form_opened_at,
++       COALESCE(submitted_at::text, '') AS submitted_at,
++       COALESCE(draft_answers::text, '') AS draft_answers,
++       COALESCE(taken_over_at::text, '') AS taken_over_at,
++       channel,
++       COALESCE(result::text, '') AS result,
++       COALESCE(fraud_signals::text, '') AS fraud_signals,
++       COALESCE(objected_at::text, '') AS objected_at,
++       COALESCE(objection_detail::text, '') AS objection_detail,
++       retention_class,
++       COALESCE(purge_after::text, '') AS purge_after,
++       created_at::text        AS created_at,
++       updated_at::text        AS updated_at
++FROM reference_call
++WHERE form_token = $1;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(arg_1))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `get_reference_call_by_id` query
++/// defined in `./src/reference_checks/sql/get_reference_call_by_id.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type GetReferenceCallByIdRow {
++  GetReferenceCallByIdRow(
++    id: String,
++    application_id: String,
++    ref_slot: String,
++    owner_label: String,
++    status: String,
++    outcome: String,
++    terminal_reason: Option(String),
++    contact_name: String,
++    contact_email: Option(String),
++    contact_phone: Option(String),
++    corrected_email: Option(String),
++    corrected_phone: Option(String),
++    attempt_count: Int,
++    next_attempt_at: String,
++    attempts: String,
++    correction_cycles: Int,
++    form_token: Option(String),
++    form_token_expires_at: String,
++    form_opened_at: String,
++    submitted_at: String,
++    draft_answers: String,
++    taken_over_at: String,
++    channel: Option(String),
++    result: String,
++    fraud_signals: String,
++    objected_at: String,
++    objection_detail: String,
++    retention_class: String,
++    purge_after: String,
++    created_at: String,
++    updated_at: String,
++  )
++}
++
++/// Nullable non-text columns use COALESCE(x::text, '') — squirrel types cast
++/// expressions as non-optional (and cannot codegen timestamptz results at
++/// all), so '' is the absent marker, mirroring the NULLIF($n,'') input
++/// convention. Plain nullable TEXT columns stay Option(String).
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn get_reference_call_by_id(
++  db: pog.Connection,
++  arg_1: Uuid,
++) -> Result(pog.Returned(GetReferenceCallByIdRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    use application_id <- decode.field(1, decode.string)
++    use ref_slot <- decode.field(2, decode.string)
++    use owner_label <- decode.field(3, decode.string)
++    use status <- decode.field(4, decode.string)
++    use outcome <- decode.field(5, decode.string)
++    use terminal_reason <- decode.field(6, decode.optional(decode.string))
++    use contact_name <- decode.field(7, decode.string)
++    use contact_email <- decode.field(8, decode.optional(decode.string))
++    use contact_phone <- decode.field(9, decode.optional(decode.string))
++    use corrected_email <- decode.field(10, decode.optional(decode.string))
++    use corrected_phone <- decode.field(11, decode.optional(decode.string))
++    use attempt_count <- decode.field(12, decode.int)
++    use next_attempt_at <- decode.field(13, decode.string)
++    use attempts <- decode.field(14, decode.string)
++    use correction_cycles <- decode.field(15, decode.int)
++    use form_token <- decode.field(16, decode.optional(decode.string))
++    use form_token_expires_at <- decode.field(17, decode.string)
++    use form_opened_at <- decode.field(18, decode.string)
++    use submitted_at <- decode.field(19, decode.string)
++    use draft_answers <- decode.field(20, decode.string)
++    use taken_over_at <- decode.field(21, decode.string)
++    use channel <- decode.field(22, decode.optional(decode.string))
++    use result <- decode.field(23, decode.string)
++    use fraud_signals <- decode.field(24, decode.string)
++    use objected_at <- decode.field(25, decode.string)
++    use objection_detail <- decode.field(26, decode.string)
++    use retention_class <- decode.field(27, decode.string)
++    use purge_after <- decode.field(28, decode.string)
++    use created_at <- decode.field(29, decode.string)
++    use updated_at <- decode.field(30, decode.string)
++    decode.success(GetReferenceCallByIdRow(
++      id:,
++      application_id:,
++      ref_slot:,
++      owner_label:,
++      status:,
++      outcome:,
++      terminal_reason:,
++      contact_name:,
++      contact_email:,
++      contact_phone:,
++      corrected_email:,
++      corrected_phone:,
++      attempt_count:,
++      next_attempt_at:,
++      attempts:,
++      correction_cycles:,
++      form_token:,
++      form_token_expires_at:,
++      form_opened_at:,
++      submitted_at:,
++      draft_answers:,
++      taken_over_at:,
++      channel:,
++      result:,
++      fraud_signals:,
++      objected_at:,
++      objection_detail:,
++      retention_class:,
++      purge_after:,
++      created_at:,
++      updated_at:,
++    ))
++  }
++
++  "-- Nullable non-text columns use COALESCE(x::text, '') — squirrel types cast
++-- expressions as non-optional (and cannot codegen timestamptz results at
++-- all), so '' is the absent marker, mirroring the NULLIF($n,'') input
++-- convention. Plain nullable TEXT columns stay Option(String).
++SELECT id::text,
++       application_id::text,
++       ref_slot,
++       owner_label,
++       status::text            AS status,
++       COALESCE(outcome::text, '') AS outcome,
++       terminal_reason,
++       contact_name,
++       contact_email,
++       contact_phone,
++       corrected_email,
++       corrected_phone,
++       attempt_count,
++       COALESCE(next_attempt_at::text, '') AS next_attempt_at,
++       attempts::text          AS attempts,
++       correction_cycles,
++       form_token,
++       COALESCE(form_token_expires_at::text, '') AS form_token_expires_at,
++       COALESCE(form_opened_at::text, '') AS form_opened_at,
++       COALESCE(submitted_at::text, '') AS submitted_at,
++       COALESCE(draft_answers::text, '') AS draft_answers,
++       COALESCE(taken_over_at::text, '') AS taken_over_at,
++       channel,
++       COALESCE(result::text, '') AS result,
++       COALESCE(fraud_signals::text, '') AS fraud_signals,
++       COALESCE(objected_at::text, '') AS objected_at,
++       COALESCE(objection_detail::text, '') AS objection_detail,
++       retention_class,
++       COALESCE(purge_after::text, '') AS purge_after,
++       created_at::text        AS created_at,
++       updated_at::text        AS updated_at
++FROM reference_call
++WHERE id = $1;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `insert_reference_call` query
++/// defined in `./src/reference_checks/sql/insert_reference_call.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type InsertReferenceCallRow {
++  InsertReferenceCallRow(id: String)
++}
++
++/// NULLIF on the nullable contacts: absent means NULL, never '' — the read
++/// side types them Option(String) and the fraud-check phone index must not
++/// index empty strings.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn insert_reference_call(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: String,
++  arg_3: String,
++  arg_4: String,
++  arg_5: String,
++  arg_6: String,
++) -> Result(pog.Returned(InsertReferenceCallRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(InsertReferenceCallRow(id:))
++  }
++
++  "-- NULLIF on the nullable contacts: absent means NULL, never '' — the read
++-- side types them Option(String) and the fraud-check phone index must not
++-- index empty strings.
++INSERT INTO reference_call (
++  application_id, ref_slot, owner_label,
++  contact_name, contact_email, contact_phone,
++  next_attempt_at
++)
++VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), now())
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(arg_2))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.parameter(pog.text(arg_5))
++  |> pog.parameter(pog.text(arg_6))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `insert_reference_objection_log` query
++/// defined in `./src/reference_checks/sql/insert_reference_objection_log.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type InsertReferenceObjectionLogRow {
++  InsertReferenceObjectionLogRow(id: String)
++}
++
++/// payload_ref is nullable: absent means NULL, never ''.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn insert_reference_objection_log(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Uuid,
++  arg_3: String,
++  arg_4: String,
++  arg_5: String,
++) -> Result(pog.Returned(InsertReferenceObjectionLogRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(InsertReferenceObjectionLogRow(id:))
++  }
++
++  "-- payload_ref is nullable: absent means NULL, never ''.
++INSERT INTO reference_objection_log (
++  reference_call_id, application_id, ref_slot,
++  objected_at, channel, payload_ref
++)
++VALUES ($1, $2, $3, now(), $4, NULLIF($5, ''))
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.parameter(pog.text(arg_5))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `list_reference_calls_for_application` query
++/// defined in `./src/reference_checks/sql/list_reference_calls_for_application.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type ListReferenceCallsForApplicationRow {
++  ListReferenceCallsForApplicationRow(
++    id: String,
++    application_id: String,
++    ref_slot: String,
++    owner_label: String,
++    status: String,
++    outcome: String,
++    terminal_reason: Option(String),
++    contact_name: String,
++    contact_email: Option(String),
++    contact_phone: Option(String),
++    corrected_email: Option(String),
++    corrected_phone: Option(String),
++    attempt_count: Int,
++    next_attempt_at: String,
++    attempts: String,
++    correction_cycles: Int,
++    form_token: Option(String),
++    form_token_expires_at: String,
++    form_opened_at: String,
++    submitted_at: String,
++    draft_answers: String,
++    taken_over_at: String,
++    channel: Option(String),
++    result: String,
++    fraud_signals: String,
++    objected_at: String,
++    objection_detail: String,
++    retention_class: String,
++    purge_after: String,
++    created_at: String,
++    updated_at: String,
++  )
++}
++
++/// Nullable non-text columns use COALESCE(x::text, '') — squirrel types cast
++/// expressions as non-optional (and cannot codegen timestamptz results at
++/// all), so '' is the absent marker, mirroring the NULLIF($n,'') input
++/// convention. Plain nullable TEXT columns stay Option(String).
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn list_reference_calls_for_application(
++  db: pog.Connection,
++  arg_1: Uuid,
++) -> Result(pog.Returned(ListReferenceCallsForApplicationRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    use application_id <- decode.field(1, decode.string)
++    use ref_slot <- decode.field(2, decode.string)
++    use owner_label <- decode.field(3, decode.string)
++    use status <- decode.field(4, decode.string)
++    use outcome <- decode.field(5, decode.string)
++    use terminal_reason <- decode.field(6, decode.optional(decode.string))
++    use contact_name <- decode.field(7, decode.string)
++    use contact_email <- decode.field(8, decode.optional(decode.string))
++    use contact_phone <- decode.field(9, decode.optional(decode.string))
++    use corrected_email <- decode.field(10, decode.optional(decode.string))
++    use corrected_phone <- decode.field(11, decode.optional(decode.string))
++    use attempt_count <- decode.field(12, decode.int)
++    use next_attempt_at <- decode.field(13, decode.string)
++    use attempts <- decode.field(14, decode.string)
++    use correction_cycles <- decode.field(15, decode.int)
++    use form_token <- decode.field(16, decode.optional(decode.string))
++    use form_token_expires_at <- decode.field(17, decode.string)
++    use form_opened_at <- decode.field(18, decode.string)
++    use submitted_at <- decode.field(19, decode.string)
++    use draft_answers <- decode.field(20, decode.string)
++    use taken_over_at <- decode.field(21, decode.string)
++    use channel <- decode.field(22, decode.optional(decode.string))
++    use result <- decode.field(23, decode.string)
++    use fraud_signals <- decode.field(24, decode.string)
++    use objected_at <- decode.field(25, decode.string)
++    use objection_detail <- decode.field(26, decode.string)
++    use retention_class <- decode.field(27, decode.string)
++    use purge_after <- decode.field(28, decode.string)
++    use created_at <- decode.field(29, decode.string)
++    use updated_at <- decode.field(30, decode.string)
++    decode.success(ListReferenceCallsForApplicationRow(
++      id:,
++      application_id:,
++      ref_slot:,
++      owner_label:,
++      status:,
++      outcome:,
++      terminal_reason:,
++      contact_name:,
++      contact_email:,
++      contact_phone:,
++      corrected_email:,
++      corrected_phone:,
++      attempt_count:,
++      next_attempt_at:,
++      attempts:,
++      correction_cycles:,
++      form_token:,
++      form_token_expires_at:,
++      form_opened_at:,
++      submitted_at:,
++      draft_answers:,
++      taken_over_at:,
++      channel:,
++      result:,
++      fraud_signals:,
++      objected_at:,
++      objection_detail:,
++      retention_class:,
++      purge_after:,
++      created_at:,
++      updated_at:,
++    ))
++  }
++
++  "-- Nullable non-text columns use COALESCE(x::text, '') — squirrel types cast
++-- expressions as non-optional (and cannot codegen timestamptz results at
++-- all), so '' is the absent marker, mirroring the NULLIF($n,'') input
++-- convention. Plain nullable TEXT columns stay Option(String).
++SELECT id::text,
++       application_id::text,
++       ref_slot,
++       owner_label,
++       status::text            AS status,
++       COALESCE(outcome::text, '') AS outcome,
++       terminal_reason,
++       contact_name,
++       contact_email,
++       contact_phone,
++       corrected_email,
++       corrected_phone,
++       attempt_count,
++       COALESCE(next_attempt_at::text, '') AS next_attempt_at,
++       attempts::text          AS attempts,
++       correction_cycles,
++       form_token,
++       COALESCE(form_token_expires_at::text, '') AS form_token_expires_at,
++       COALESCE(form_opened_at::text, '') AS form_opened_at,
++       COALESCE(submitted_at::text, '') AS submitted_at,
++       COALESCE(draft_answers::text, '') AS draft_answers,
++       COALESCE(taken_over_at::text, '') AS taken_over_at,
++       channel,
++       COALESCE(result::text, '') AS result,
++       COALESCE(fraud_signals::text, '') AS fraud_signals,
++       COALESCE(objected_at::text, '') AS objected_at,
++       COALESCE(objection_detail::text, '') AS objection_detail,
++       retention_class,
++       COALESCE(purge_after::text, '') AS purge_after,
++       created_at::text        AS created_at,
++       updated_at::text        AS updated_at
++FROM reference_call
++WHERE application_id = $1
++ORDER BY created_at, id;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `update_reference_call_status` query
++/// defined in `./src/reference_checks/sql/update_reference_call_status.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type UpdateReferenceCallStatusRow {
++  UpdateReferenceCallStatusRow(id: String)
++}
++
++/// Guarded transition (AD-14): only fires when the row is in the expected
++/// status; sticky terminals survive out-of-order events because the guard
++/// names the state the writer believes it is leaving.
++/// '' for outcome/terminal_reason means "leave unchanged" (COALESCE), so a
++/// status-only transition (skip, re-enable) never wipes a recorded outcome.
++/// Entering any terminal status — or 'skipped', which must leave the cadence
++/// — clears next_attempt_at so the sweep never touches the row again.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn update_reference_call_status(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: ReferenceCallStatus,
++  arg_3: String,
++  arg_4: String,
++  arg_5: ReferenceCallStatus,
++) -> Result(pog.Returned(UpdateReferenceCallStatusRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(UpdateReferenceCallStatusRow(id:))
++  }
++
++  "-- Guarded transition (AD-14): only fires when the row is in the expected
++-- status; sticky terminals survive out-of-order events because the guard
++-- names the state the writer believes it is leaving.
++-- '' for outcome/terminal_reason means \"leave unchanged\" (COALESCE), so a
++-- status-only transition (skip, re-enable) never wipes a recorded outcome.
++-- Entering any terminal status — or 'skipped', which must leave the cadence
++-- — clears next_attempt_at so the sweep never touches the row again.
++UPDATE reference_call
++SET status = $2::reference_call_status,
++    outcome = COALESCE(NULLIF($3, '')::reference_call_outcome, outcome),
++    terminal_reason = COALESCE(NULLIF($4, ''), terminal_reason),
++    next_attempt_at = CASE
++      WHEN $2::reference_call_status IN (
++        'skipped', 'partial', 'form_completed', 'unreachable', 'refused',
++        'objected', 'manual_recorded', 'failed', 'completed'
++      ) THEN NULL
++      ELSE next_attempt_at
++    END
++WHERE id = $1
++  AND status = $5::reference_call_status
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(reference_call_status_encoder(arg_2))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.parameter(reference_call_status_encoder(arg_5))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++// --- Enums -------------------------------------------------------------------
++
++/// Corresponds to the Postgres `reference_call_status` enum.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type ReferenceCallStatus {
++  Failed
++  ManualRecorded
++  Objected
++  Refused
++  Unreachable
++  FormCompleted
++  Partial
++  Completed
++  Calling
++  Scheduled
++  AwaitingCorrection
++  ContactInitiated
++  Skipped
++  Queued
++}
++
++fn reference_call_status_encoder(reference_call_status) -> pog.Value {
++  case reference_call_status {
++    Failed -> "failed"
++    ManualRecorded -> "manual_recorded"
++    Objected -> "objected"
++    Refused -> "refused"
++    Unreachable -> "unreachable"
++    FormCompleted -> "form_completed"
++    Partial -> "partial"
++    Completed -> "completed"
++    Calling -> "calling"
++    Scheduled -> "scheduled"
++    AwaitingCorrection -> "awaiting_correction"
++    ContactInitiated -> "contact_initiated"
++    Skipped -> "skipped"
++    Queued -> "queued"
++  }
++  |> pog.text
++}
+diff --git a/server/src/reference_checks/sql/append_reference_call_attempt.sql b/server/src/reference_checks/sql/append_reference_call_attempt.sql
+new file mode 100644
+index 00000000..3058eec7
+--- /dev/null
++++ b/server/src/reference_checks/sql/append_reference_call_attempt.sql
+@@ -0,0 +1,10 @@
++-- Atomic attempt append (AD-14): one guarded statement applies the
++-- attempts || append, the attempt_count bump, and the next cadence step.
++-- Pass '' for next_attempt_at to NULL it (terminal / objected rows).
++UPDATE reference_call
++SET attempts = attempts || $2::jsonb,
++    attempt_count = attempt_count + 1,
++    next_attempt_at = NULLIF($3, '')::timestamptz
++WHERE id = $1
++  AND status = $4::reference_call_status
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/get_reference_call_by_form_token.sql b/server/src/reference_checks/sql/get_reference_call_by_form_token.sql
+new file mode 100644
+index 00000000..866bfb63
+--- /dev/null
++++ b/server/src/reference_checks/sql/get_reference_call_by_form_token.sql
+@@ -0,0 +1,37 @@
++-- Nullable non-text columns use COALESCE(x::text, '') — squirrel types cast
++-- expressions as non-optional (and cannot codegen timestamptz results at
++-- all), so '' is the absent marker, mirroring the NULLIF($n,'') input
++-- convention. Plain nullable TEXT columns stay Option(String).
++SELECT id::text,
++       application_id::text,
++       ref_slot,
++       owner_label,
++       status::text            AS status,
++       COALESCE(outcome::text, '') AS outcome,
++       terminal_reason,
++       contact_name,
++       contact_email,
++       contact_phone,
++       corrected_email,
++       corrected_phone,
++       attempt_count,
++       COALESCE(next_attempt_at::text, '') AS next_attempt_at,
++       attempts::text          AS attempts,
++       correction_cycles,
++       form_token,
++       COALESCE(form_token_expires_at::text, '') AS form_token_expires_at,
++       COALESCE(form_opened_at::text, '') AS form_opened_at,
++       COALESCE(submitted_at::text, '') AS submitted_at,
++       COALESCE(draft_answers::text, '') AS draft_answers,
++       COALESCE(taken_over_at::text, '') AS taken_over_at,
++       channel,
++       COALESCE(result::text, '') AS result,
++       COALESCE(fraud_signals::text, '') AS fraud_signals,
++       COALESCE(objected_at::text, '') AS objected_at,
++       COALESCE(objection_detail::text, '') AS objection_detail,
++       retention_class,
++       COALESCE(purge_after::text, '') AS purge_after,
++       created_at::text        AS created_at,
++       updated_at::text        AS updated_at
++FROM reference_call
++WHERE form_token = $1;
+diff --git a/server/src/reference_checks/sql/get_reference_call_by_id.sql b/server/src/reference_checks/sql/get_reference_call_by_id.sql
+new file mode 100644
+index 00000000..5363cea1
+--- /dev/null
++++ b/server/src/reference_checks/sql/get_reference_call_by_id.sql
+@@ -0,0 +1,37 @@
++-- Nullable non-text columns use COALESCE(x::text, '') — squirrel types cast
++-- expressions as non-optional (and cannot codegen timestamptz results at
++-- all), so '' is the absent marker, mirroring the NULLIF($n,'') input
++-- convention. Plain nullable TEXT columns stay Option(String).
++SELECT id::text,
++       application_id::text,
++       ref_slot,
++       owner_label,
++       status::text            AS status,
++       COALESCE(outcome::text, '') AS outcome,
++       terminal_reason,
++       contact_name,
++       contact_email,
++       contact_phone,
++       corrected_email,
++       corrected_phone,
++       attempt_count,
++       COALESCE(next_attempt_at::text, '') AS next_attempt_at,
++       attempts::text          AS attempts,
++       correction_cycles,
++       form_token,
++       COALESCE(form_token_expires_at::text, '') AS form_token_expires_at,
++       COALESCE(form_opened_at::text, '') AS form_opened_at,
++       COALESCE(submitted_at::text, '') AS submitted_at,
++       COALESCE(draft_answers::text, '') AS draft_answers,
++       COALESCE(taken_over_at::text, '') AS taken_over_at,
++       channel,
++       COALESCE(result::text, '') AS result,
++       COALESCE(fraud_signals::text, '') AS fraud_signals,
++       COALESCE(objected_at::text, '') AS objected_at,
++       COALESCE(objection_detail::text, '') AS objection_detail,
++       retention_class,
++       COALESCE(purge_after::text, '') AS purge_after,
++       created_at::text        AS created_at,
++       updated_at::text        AS updated_at
++FROM reference_call
++WHERE id = $1;
+diff --git a/server/src/reference_checks/sql/insert_reference_call.sql b/server/src/reference_checks/sql/insert_reference_call.sql
+new file mode 100644
+index 00000000..66e1e48c
+--- /dev/null
++++ b/server/src/reference_checks/sql/insert_reference_call.sql
+@@ -0,0 +1,10 @@
++-- NULLIF on the nullable contacts: absent means NULL, never '' — the read
++-- side types them Option(String) and the fraud-check phone index must not
++-- index empty strings.
++INSERT INTO reference_call (
++  application_id, ref_slot, owner_label,
++  contact_name, contact_email, contact_phone,
++  next_attempt_at
++)
++VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), now())
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/insert_reference_objection_log.sql b/server/src/reference_checks/sql/insert_reference_objection_log.sql
+new file mode 100644
+index 00000000..f02748db
+--- /dev/null
++++ b/server/src/reference_checks/sql/insert_reference_objection_log.sql
+@@ -0,0 +1,7 @@
++-- payload_ref is nullable: absent means NULL, never ''.
++INSERT INTO reference_objection_log (
++  reference_call_id, application_id, ref_slot,
++  objected_at, channel, payload_ref
++)
++VALUES ($1, $2, $3, now(), $4, NULLIF($5, ''))
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/list_reference_calls_for_application.sql b/server/src/reference_checks/sql/list_reference_calls_for_application.sql
+new file mode 100644
+index 00000000..2548777d
+--- /dev/null
++++ b/server/src/reference_checks/sql/list_reference_calls_for_application.sql
+@@ -0,0 +1,38 @@
++-- Nullable non-text columns use COALESCE(x::text, '') — squirrel types cast
++-- expressions as non-optional (and cannot codegen timestamptz results at
++-- all), so '' is the absent marker, mirroring the NULLIF($n,'') input
++-- convention. Plain nullable TEXT columns stay Option(String).
++SELECT id::text,
++       application_id::text,
++       ref_slot,
++       owner_label,
++       status::text            AS status,
++       COALESCE(outcome::text, '') AS outcome,
++       terminal_reason,
++       contact_name,
++       contact_email,
++       contact_phone,
++       corrected_email,
++       corrected_phone,
++       attempt_count,
++       COALESCE(next_attempt_at::text, '') AS next_attempt_at,
++       attempts::text          AS attempts,
++       correction_cycles,
++       form_token,
++       COALESCE(form_token_expires_at::text, '') AS form_token_expires_at,
++       COALESCE(form_opened_at::text, '') AS form_opened_at,
++       COALESCE(submitted_at::text, '') AS submitted_at,
++       COALESCE(draft_answers::text, '') AS draft_answers,
++       COALESCE(taken_over_at::text, '') AS taken_over_at,
++       channel,
++       COALESCE(result::text, '') AS result,
++       COALESCE(fraud_signals::text, '') AS fraud_signals,
++       COALESCE(objected_at::text, '') AS objected_at,
++       COALESCE(objection_detail::text, '') AS objection_detail,
++       retention_class,
++       COALESCE(purge_after::text, '') AS purge_after,
++       created_at::text        AS created_at,
++       updated_at::text        AS updated_at
++FROM reference_call
++WHERE application_id = $1
++ORDER BY created_at, id;
+diff --git a/server/src/reference_checks/sql/update_reference_call_status.sql b/server/src/reference_checks/sql/update_reference_call_status.sql
+new file mode 100644
+index 00000000..abc9f3b7
+--- /dev/null
++++ b/server/src/reference_checks/sql/update_reference_call_status.sql
+@@ -0,0 +1,21 @@
++-- Guarded transition (AD-14): only fires when the row is in the expected
++-- status; sticky terminals survive out-of-order events because the guard
++-- names the state the writer believes it is leaving.
++-- '' for outcome/terminal_reason means "leave unchanged" (COALESCE), so a
++-- status-only transition (skip, re-enable) never wipes a recorded outcome.
++-- Entering any terminal status — or 'skipped', which must leave the cadence
++-- — clears next_attempt_at so the sweep never touches the row again.
++UPDATE reference_call
++SET status = $2::reference_call_status,
++    outcome = COALESCE(NULLIF($3, '')::reference_call_outcome, outcome),
++    terminal_reason = COALESCE(NULLIF($4, ''), terminal_reason),
++    next_attempt_at = CASE
++      WHEN $2::reference_call_status IN (
++        'skipped', 'partial', 'form_completed', 'unreachable', 'refused',
++        'objected', 'manual_recorded', 'failed', 'completed'
++      ) THEN NULL
++      ELSE next_attempt_at
++    END
++WHERE id = $1
++  AND status = $5::reference_call_status
++RETURNING id::text;
+diff --git a/server/test/integration/reference_checks_integration_test.gleam b/server/test/integration/reference_checks_integration_test.gleam
+new file mode 100644
+index 00000000..60a5b255
+--- /dev/null
++++ b/server/test/integration/reference_checks_integration_test.gleam
+@@ -0,0 +1,306 @@
++//// Integration tests for the reference_call schema contract (RC2.1) —
++//// durable versions of the story's DB-level acceptance criteria:
++//// live-slot uniqueness, skipped-occupies-slot (A6), terminal-frees-slot,
++//// objection-log orphan survival (Art 21, no FKs), NULL-vs-'' insert
++//// discipline, guarded status transitions that preserve outcome and clear
++//// next_attempt_at, and the atomic attempt append (AD-14).
++
++import gleam/dynamic/decode
++import gleam/json
++import gleam/option
++import gleam/result
++import gleam/string
++import gleeunit/should
++import integration/helpers.{setup}
++import integration/test_db
++import pog
++import reference_checks/sql as rc_sql
++import unitest
++import youid/uuid
++
++fn seed_app(db: pog.Connection) -> String {
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 0)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let assert Ok(application_id) =
++    test_db.seed_application(db, vacancy_id, "rc-app@example.com")
++  application_id
++}
++
++fn insert_call(db: pog.Connection, application_id: String) -> String {
++  let assert Ok(app_uuid) = uuid.from_string(application_id)
++  let assert Ok(returned) =
++    rc_sql.insert_reference_call(
++      db,
++      app_uuid,
++      "landlord_ref",
++      "primary",
++      "Colm Ref",
++      "colm@example.com",
++      "+353861111111",
++    )
++  case returned.rows {
++    [row, ..] -> row.id
++    _ -> panic as "insert_reference_call returned no id"
++  }
++}
++
++fn count_rows(db: pog.Connection, table: String) -> Int {
++  let assert Ok(returned) =
++    pog.query("SELECT COUNT(*)::int FROM " <> table)
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  case returned.rows {
++    [n, ..] -> n
++    _ -> -1
++  }
++}
++
++pub fn live_slot_unique_index_rejects_duplicate_live_row_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_id = seed_app(db)
++  let _ = insert_call(db, app_id)
++
++  // Second live row for the same (application, slot, owner) must be rejected.
++  let assert Ok(app_uuid) = uuid.from_string(app_id)
++  rc_sql.insert_reference_call(
++    db,
++    app_uuid,
++    "landlord_ref",
++    "primary",
++    "Duplicate",
++    "",
++    "",
++  )
++  |> result.is_error
++  |> should.be_true
++}
++
++pub fn skipped_row_still_occupies_its_slot_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_id = seed_app(db)
++  let call_id = insert_call(db, app_id)
++
++  // queued → skipped via the guarded transition.
++  let assert Ok(call_uuid) = uuid.from_string(call_id)
++  let assert Ok(_) =
++    rc_sql.update_reference_call_status(
++      db,
++      call_uuid,
++      rc_sql.Skipped,
++      "",
++      "",
++      rc_sql.Queued,
++    )
++
++  // A6: skipped is NOT a terminal status for the live-slot index — the
++  // slot is still occupied.
++  let assert Ok(app_uuid) = uuid.from_string(app_id)
++  rc_sql.insert_reference_call(
++    db,
++    app_uuid,
++    "landlord_ref",
++    "primary",
++    "Duplicate",
++    "",
++    "",
++  )
++  |> result.is_error
++  |> should.be_true
++
++  // …and skipping cleared next_attempt_at so the sweep never sees the row.
++  let assert Ok(returned) = rc_sql.get_reference_call_by_id(db, call_uuid)
++  case returned.rows {
++    [row, ..] -> {
++      row.status |> should.equal("skipped")
++      row.next_attempt_at |> should.equal("")
++    }
++    _ -> panic as "row not found"
++  }
++}
++
++pub fn terminal_row_frees_the_slot_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_id = seed_app(db)
++  let call_id = insert_call(db, app_id)
++
++  let assert Ok(call_uuid) = uuid.from_string(call_id)
++  let assert Ok(_) =
++    rc_sql.update_reference_call_status(
++      db,
++      call_uuid,
++      rc_sql.Unreachable,
++      "unreachable",
++      "sequence_exhausted",
++      rc_sql.Queued,
++    )
++
++  // Substitution path: a new live row for the same slot now succeeds.
++  let assert Ok(app_uuid) = uuid.from_string(app_id)
++  rc_sql.insert_reference_call(
++    db,
++    app_uuid,
++    "landlord_ref",
++    "primary",
++    "Substitute",
++    "",
++    "",
++  )
++  |> result.is_ok
++  |> should.be_true
++}
++
++pub fn objection_log_survives_parent_deletion_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_id = seed_app(db)
++  let call_id = insert_call(db, app_id)
++
++  let assert Ok(call_uuid) = uuid.from_string(call_id)
++  let assert Ok(app_uuid) = uuid.from_string(app_id)
++  let assert Ok(_) =
++    rc_sql.insert_reference_objection_log(
++      db,
++      call_uuid,
++      app_uuid,
++      "landlord_ref",
++      "sms",
++      "",
++    )
++
++  // Deleting the application cascades to reference_call…
++  let assert Ok(_) =
++    pog.query("DELETE FROM application WHERE id = $1::uuid")
++    |> pog.parameter(pog.text(app_id))
++    |> pog.execute(db)
++  count_rows(db, "reference_call") |> should.equal(0)
++  // …but the Art 21 evidence survives (no foreign keys by design).
++  count_rows(db, "reference_objection_log") |> should.equal(1)
++}
++
++pub fn insert_stores_null_not_empty_string_for_absent_contacts_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_id = seed_app(db)
++  let assert Ok(app_uuid) = uuid.from_string(app_id)
++  let assert Ok(returned) =
++    rc_sql.insert_reference_call(
++      db,
++      app_uuid,
++      "employer_ref",
++      "primary",
++      "No Contacts",
++      "",
++      "",
++    )
++  let assert [row, ..] = returned.rows
++  let assert Ok(call_uuid) = uuid.from_string(row.id)
++  let assert Ok(read) = rc_sql.get_reference_call_by_id(db, call_uuid)
++  case read.rows {
++    [r, ..] -> {
++      r.contact_email |> should.equal(option.None)
++      r.contact_phone |> should.equal(option.None)
++    }
++    _ -> panic as "row not found"
++  }
++}
++
++pub fn status_only_transition_preserves_outcome_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_id = seed_app(db)
++  let call_id = insert_call(db, app_id)
++  let assert Ok(call_uuid) = uuid.from_string(call_id)
++
++  // Drive to a terminal with an outcome…
++  let assert Ok(_) =
++    rc_sql.update_reference_call_status(
++      db,
++      call_uuid,
++      rc_sql.ContactInitiated,
++      "",
++      "",
++      rc_sql.Queued,
++    )
++  let assert Ok(_) =
++    rc_sql.update_reference_call_status(
++      db,
++      call_uuid,
++      rc_sql.FormCompleted,
++      "form_completed",
++      "",
++      rc_sql.ContactInitiated,
++    )
++
++  let assert Ok(read) = rc_sql.get_reference_call_by_id(db, call_uuid)
++  case read.rows {
++    [r, ..] -> {
++      r.status |> should.equal("form_completed")
++      r.outcome |> should.equal("form_completed")
++      // Terminal clears the sweep clock.
++      r.next_attempt_at |> should.equal("")
++    }
++    _ -> panic as "row not found"
++  }
++}
++
++pub fn guarded_transition_wrong_source_status_is_noop_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_id = seed_app(db)
++  let call_id = insert_call(db, app_id)
++  let assert Ok(call_uuid) = uuid.from_string(call_id)
++
++  // Guard names the wrong expected status: zero rows updated (sticky).
++  let assert Ok(returned) =
++    rc_sql.update_reference_call_status(
++      db,
++      call_uuid,
++      rc_sql.Objected,
++      "objected",
++      "stop_received",
++      rc_sql.ContactInitiated,
++    )
++  returned.rows |> should.equal([])
++
++  let assert Ok(read) = rc_sql.get_reference_call_by_id(db, call_uuid)
++  case read.rows {
++    [r, ..] -> r.status |> should.equal("queued")
++    _ -> panic as "row not found"
++  }
++}
++
++pub fn append_attempt_is_atomic_and_guarded_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_id = seed_app(db)
++  let call_id = insert_call(db, app_id)
++  let assert Ok(call_uuid) = uuid.from_string(call_id)
++
++  let attempt =
++    json.object([
++      #("at", json.string("2026-07-31T22:00:00Z")),
++      #("channel", json.string("email")),
++      #("outcome", json.string("sent")),
++    ])
++  let assert Ok(_) =
++    rc_sql.append_reference_call_attempt(
++      db,
++      call_uuid,
++      attempt,
++      "2026-08-01 10:00:00+00",
++      rc_sql.Queued,
++    )
++
++  let assert Ok(read) = rc_sql.get_reference_call_by_id(db, call_uuid)
++  case read.rows {
++    [r, ..] -> {
++      r.attempt_count |> should.equal(1)
++      r.attempts |> string.contains("\"channel\": \"email\"") |> should.be_true
++      r.next_attempt_at |> should.equal("2026-08-01 10:00:00+00")
++    }
++    _ -> panic as "row not found"
++  }
++}
+diff --git a/server/test/integration/test_db.gleam b/server/test/integration/test_db.gleam
+index 0fcdcac7..26d43bf9 100644
+--- a/server/test/integration/test_db.gleam
++++ b/server/test/integration/test_db.gleam
+@@ -77,7 +77,7 @@ pub fn should_run() -> Bool {
+ pub fn truncate_all(db: pog.Connection) -> Nil {
+   let _ =
+     pog.query(
+-      "TRUNCATE audit_log, acknowledgement_record, notification, inbound_email, document, ai_analysis, payment_terms_acceptance, payment, application_co_applicant, application_income_source, application, vacancy_view, vacancy, landlord, storage_deletion_queue, processed_stripe_event CASCADE",
++      "TRUNCATE audit_log, acknowledgement_record, notification, inbound_email, document, ai_analysis, payment_terms_acceptance, payment, application_co_applicant, application_income_source, application, vacancy_view, vacancy, landlord, storage_deletion_queue, processed_stripe_event, reference_call, reference_objection_log CASCADE",
+     )
+     |> pog.execute(db)
+   Nil
+diff --git a/server/test/reference_checks/schema_migration_test.gleam b/server/test/reference_checks/schema_migration_test.gleam
+new file mode 100644
+index 00000000..2fbdce03
+--- /dev/null
++++ b/server/test/reference_checks/schema_migration_test.gleam
+@@ -0,0 +1,157 @@
++//// Pins the reference_call schema migration's load-bearing invariants by
++//// reading the migration FILE (audit_log_schema_test precedent) — DB-free
++//// CI catches a future edit that quietly reintroduces a correction_token,
++//// drops 'skipped' from the live-slot semantics, or couples the objection
++//// log to its parents with a foreign key.
++
++import gleam/list
++import gleam/string
++import gleeunit/should
++import simplifile
++
++const migration_path = "../supabase/migrations/20260731222000_create_reference_call.sql"
++
++const notification_migration_path = "../supabase/migrations/20260731222001_add_reference_notification_types.sql"
++
++fn read_migration() -> String {
++  let assert Ok(contents) = simplifile.read(migration_path)
++  contents
++}
++
++/// The migration with `--` comment lines stripped — invariant checks run
++/// against the DDL only, so prose explaining an absence (e.g. "NO
++/// correction_token") can't trip the check that enforces the absence.
++fn read_ddl() -> String {
++  strip_comments(read_migration())
++}
++
++fn strip_comments(contents: String) -> String {
++  contents
++  |> string.split("\n")
++  |> list.filter(fn(line) { !string.starts_with(string.trim_start(line), "--") })
++  |> string.join("\n")
++}
++
++/// Everything from `CREATE TABLE reference_objection_log` onwards — the
++/// block that must stay FK-free.
++fn objection_log_block() -> String {
++  let contents = read_ddl()
++  let assert Ok(#(_, block)) =
++    string.split_once(contents, "CREATE TABLE reference_objection_log")
++  block
++}
++
++pub fn no_correction_token_anywhere_test() {
++  // A1: correction/substitution is landlord-driven — no token column,
++  // no index, not even a mention in the DDL.
++  read_ddl()
++  |> string.contains("correction_token")
++  |> should.be_false
++}
++
++pub fn skipped_in_status_enum_test() {
++  read_ddl()
++  |> string.contains("'skipped'")
++  |> should.be_true
++}
++
++pub fn skipped_not_in_live_index_exclusion_test() {
++  // A6: a skipped row still occupies its slot. The live index's NOT IN
++  // list must name every terminal status but never 'skipped'.
++  let contents = read_ddl()
++  let assert Ok(#(_, index_block)) =
++    string.split_once(contents, "CREATE UNIQUE INDEX idx_reference_call_live")
++  let assert Ok(#(exclusion, _)) = string.split_once(index_block, ";")
++  exclusion |> string.contains("'skipped'") |> should.be_false
++  // …and the eight terminal values must all be there.
++  let terminals = [
++    "'form_completed'", "'unreachable'", "'refused'", "'objected'",
++    "'manual_recorded'", "'failed'", "'completed'", "'partial'",
++  ]
++  list_each_true(terminals, fn(t) { string.contains(exclusion, t) })
++}
++
++pub fn amended_columns_present_test() {
++  let contents = read_ddl()
++  list_each_true(
++    ["draft_answers", "taken_over_at", "corrected_email", "corrected_phone"],
++    fn(c) { string.contains(contents, c) },
++  )
++}
++
++pub fn outcome_enum_has_v1_amendments_test() {
++  let contents = read_ddl()
++  let assert Ok(#(_, outcome_block)) =
++    string.split_once(contents, "CREATE TYPE reference_call_outcome")
++  let assert Ok(#(outcomes, _)) = string.split_once(outcome_block, ";")
++  list_each_true(
++    ["'unreachable'", "'form_completed'", "'manual_recorded'"],
++    fn(v) { string.contains(outcomes, v) },
++  )
++}
++
++pub fn objection_log_has_no_foreign_keys_test() {
++  let block = objection_log_block()
++  block |> string.contains("REFERENCES") |> should.be_false
++  block |> string.contains("FOREIGN KEY") |> should.be_false
++}
++
++pub fn objection_log_retention_default_test() {
++  objection_log_block()
++  |> string.contains("DEFAULT 'objection_evidence'")
++  |> should.be_true
++}
++
++pub fn objection_log_purge_index_test() {
++  objection_log_block()
++  |> string.contains("idx_reference_objection_log_purge")
++  |> should.be_true
++}
++
++pub fn updated_at_uses_existing_trigger_function_test() {
++  let contents = read_ddl()
++  contents
++  |> string.contains("EXECUTE FUNCTION update_updated_at_column()")
++  |> should.be_true
++  // The generic function already exists (20260409000001) — this migration
++  // must not redefine it.
++  contents
++  |> string.contains("CREATE OR REPLACE FUNCTION update_updated_at_column")
++  |> should.be_false
++}
++
++pub fn required_indexes_present_test() {
++  let contents = read_ddl()
++  list_each_true(
++    [
++      "idx_reference_call_live", "idx_reference_call_form_token",
++      "idx_reference_call_sweep", "idx_reference_call_application",
++      "idx_reference_call_contact_phone", "idx_reference_call_purge",
++    ],
++    fn(i) { string.contains(contents, i) },
++  )
++}
++
++pub fn notification_types_migration_test() {
++  let assert Ok(contents) = simplifile.read(notification_migration_path)
++  // Strip comments here too — the ALTER TYPE statements must carry the
++  // values, not the header prose.
++  let ddl = strip_comments(contents)
++  list_each_true(
++    [
++      "'reference_completed'", "'reference_unreachable'", "'reference_objected'",
++      "'reference_declined'",
++    ],
++    fn(v) { string.contains(ddl, v) },
++  )
++}
++
++fn list_each_true(xs: List(String), f: fn(String) -> Bool) -> Nil {
++  case xs {
++    [] -> Nil
++    [x, ..rest] -> {
++      f(x) |> should.be_true
++      list_each_true(rest, f)
++    }
++  }
++}
+diff --git a/shared/src/shared/reference_call.gleam b/shared/src/shared/reference_call.gleam
+new file mode 100644
+index 00000000..49ac642f
+--- /dev/null
++++ b/shared/src/shared/reference_call.gleam
+@@ -0,0 +1,381 @@
++//// Reference-call lifecycle types and JSON codecs — the shared contract for
++//// the `reference_call` table (architecture-reference-checking-v1 §4.1 as
++//// amended by the epics doc's A-register). Wire strings are snake_case and
++//// match the Postgres enums / TEXT+CHECK values exactly.
++////
++//// v2-reserved variants (voice lifecycle) are part of the contract now so a
++//// stored row from any future version still decodes; v1 code paths never
++//// construct them.
++
++import gleam/dynamic/decode
++import gleam/json
++
++/// Mirrors the `reference_call_status` PG enum (14 values).
++/// `partial` is v1-active (A2: abandoned-with-draft-answers terminal);
++/// `skipped` is v1-active (A6) and occupies its live slot.
++pub type ReferenceCallStatus {
++  Queued
++  Skipped
++  ContactInitiated
++  AwaitingCorrection
++  /// v2-reserved (voice)
++  Scheduled
++  /// v2-reserved (voice)
++  Calling
++  /// v2-reserved (voice)
++  Completed
++  Partial
++  FormCompleted
++  Unreachable
++  Refused
++  Objected
++  ManualRecorded
++  Failed
++}
++
++/// Mirrors the `reference_call_outcome` PG enum (15 values, incl. the §6.4
++/// additions `unreachable`, `form_completed`, `manual_recorded`).
++/// Constructors are `Outcome`-prefixed: Gleam constructor names are
++/// module-global and would otherwise collide with the status variants.
++pub type ReferenceCallOutcome {
++  OutcomeCompleted
++  OutcomePartial
++  OutcomeVoicemail
++  OutcomeNoAnswer
++  OutcomeBusy
++  OutcomeRefused
++  OutcomeWrongNumber
++  OutcomeInvalidNumber
++  OutcomeDeclinedAi
++  OutcomeLanguageBarrier
++  OutcomeGatekeeperBlocked
++  OutcomeObjected
++  OutcomeUnreachable
++  OutcomeFormCompleted
++  OutcomeManualRecorded
++}
++
++/// Mirrors the `ref_slot` TEXT+CHECK set.
++pub type RefSlot {
++  LandlordRef
++  CharacterRef
++  EmployerRef
++}
++
++/// Mirrors the `owner_label` TEXT+CHECK set.
++pub type OwnerLabel {
++  Primary
++  CoApplicant0
++  CoApplicant1
++  CoApplicant2
++}
++
++/// Mirrors the `channel` TEXT+CHECK set on `reference_call` (the result
++/// channel). `Manual` is the v1 WoZ channel (AD-8); `Voice` is v2-reserved.
++/// NOTE: `reference_objection_log.channel` is a DIFFERENT domain — the
++/// channel the objection ARRIVED on — use `ObjectionChannel` for that table.
++pub type Channel {
++  Form
++  Manual
++  Voice
++}
++
++/// Mirrors the `reference_objection_log.channel` TEXT+CHECK set — how the
++/// Art 21 objection arrived, not how the reference was collected.
++pub type ObjectionChannel {
++  ObjectionForm
++  ObjectionSms
++  ObjectionEmail
++}
++
++// -- Status codecs ------------------------------------------------------------
++
++pub fn encode_status(status: ReferenceCallStatus) -> String {
++  case status {
++    Queued -> "queued"
++    Skipped -> "skipped"
++    ContactInitiated -> "contact_initiated"
++    AwaitingCorrection -> "awaiting_correction"
++    Scheduled -> "scheduled"
++    Calling -> "calling"
++    Completed -> "completed"
++    Partial -> "partial"
++    FormCompleted -> "form_completed"
++    Unreachable -> "unreachable"
++    Refused -> "refused"
++    Objected -> "objected"
++    ManualRecorded -> "manual_recorded"
++    Failed -> "failed"
++  }
++}
++
++pub fn encode_status_json(status: ReferenceCallStatus) -> json.Json {
++  json.string(encode_status(status))
++}
++
++/// Total inverse of `encode_status` for trusted DB strings (the
++/// `reference_call_status` enum is NOT NULL and constrained to these values).
++/// Unknown input falls back to `Failed` — deliberately the most INERT value
++/// (terminal, never sweep-actionable): forward compatibility must never
++/// silently reinterpret an unrecognised value as live work. Callers reading
++/// COALESCE'd query results must branch on '' BEFORE calling this.
++pub fn status_from_string(value: String) -> ReferenceCallStatus {
++  case value {
++    "queued" -> Queued
++    "skipped" -> Skipped
++    "contact_initiated" -> ContactInitiated
++    "awaiting_correction" -> AwaitingCorrection
++    "scheduled" -> Scheduled
++    "calling" -> Calling
++    "completed" -> Completed
++    "partial" -> Partial
++    "form_completed" -> FormCompleted
++    "unreachable" -> Unreachable
++    "refused" -> Refused
++    "objected" -> Objected
++    "manual_recorded" -> ManualRecorded
++    "failed" -> Failed
++    _ -> Failed
++  }
++}
++
++/// Dynamic decoder — unknown strings FAIL (unlike `status_from_string`), so
++/// malformed API payloads surface as decode errors rather than silent
++/// coercions (ai_analysis.gleam precedent).
++pub fn status_decoder() -> decode.Decoder(ReferenceCallStatus) {
++  use value <- decode.then(decode.string)
++  case value {
++    "queued" -> decode.success(Queued)
++    "skipped" -> decode.success(Skipped)
++    "contact_initiated" -> decode.success(ContactInitiated)
++    "awaiting_correction" -> decode.success(AwaitingCorrection)
++    "scheduled" -> decode.success(Scheduled)
++    "calling" -> decode.success(Calling)
++    "completed" -> decode.success(Completed)
++    "partial" -> decode.success(Partial)
++    "form_completed" -> decode.success(FormCompleted)
++    "unreachable" -> decode.success(Unreachable)
++    "refused" -> decode.success(Refused)
++    "objected" -> decode.success(Objected)
++    "manual_recorded" -> decode.success(ManualRecorded)
++    "failed" -> decode.success(Failed)
++    _ -> decode.failure(Queued, "ReferenceCallStatus")
++  }
++}
++
++// -- Outcome codecs -----------------------------------------------------------
++
++pub fn encode_outcome(outcome: ReferenceCallOutcome) -> String {
++  case outcome {
++    OutcomeCompleted -> "completed"
++    OutcomePartial -> "partial"
++    OutcomeVoicemail -> "voicemail"
++    OutcomeNoAnswer -> "no_answer"
++    OutcomeBusy -> "busy"
++    OutcomeRefused -> "refused"
++    OutcomeWrongNumber -> "wrong_number"
++    OutcomeInvalidNumber -> "invalid_number"
++    OutcomeDeclinedAi -> "declined_ai"
++    OutcomeLanguageBarrier -> "language_barrier"
++    OutcomeGatekeeperBlocked -> "gatekeeper_blocked"
++    OutcomeObjected -> "objected"
++    OutcomeUnreachable -> "unreachable"
++    OutcomeFormCompleted -> "form_completed"
++    OutcomeManualRecorded -> "manual_recorded"
++  }
++}
++
++pub fn encode_outcome_json(outcome: ReferenceCallOutcome) -> json.Json {
++  json.string(encode_outcome(outcome))
++}
++
++/// Total inverse of `encode_outcome` for trusted DB strings. Unknown input
++/// falls back to `OutcomeUnreachable` — deliberately NOT a success value:
++/// §10 frames unreachability as neutral-absence, so an unrecognised value
++/// can never be silently reinterpreted as a completed reference. Callers
++/// reading COALESCE'd query results must branch on '' BEFORE calling this.
++pub fn outcome_from_string(value: String) -> ReferenceCallOutcome {
++  case value {
++    "completed" -> OutcomeCompleted
++    "partial" -> OutcomePartial
++    "voicemail" -> OutcomeVoicemail
++    "no_answer" -> OutcomeNoAnswer
++    "busy" -> OutcomeBusy
++    "refused" -> OutcomeRefused
++    "wrong_number" -> OutcomeWrongNumber
++    "invalid_number" -> OutcomeInvalidNumber
++    "declined_ai" -> OutcomeDeclinedAi
++    "language_barrier" -> OutcomeLanguageBarrier
++    "gatekeeper_blocked" -> OutcomeGatekeeperBlocked
++    "objected" -> OutcomeObjected
++    "unreachable" -> OutcomeUnreachable
++    "form_completed" -> OutcomeFormCompleted
++    "manual_recorded" -> OutcomeManualRecorded
++    _ -> OutcomeUnreachable
++  }
++}
++
++pub fn outcome_decoder() -> decode.Decoder(ReferenceCallOutcome) {
++  use value <- decode.then(decode.string)
++  case value {
++    "completed" -> decode.success(OutcomeCompleted)
++    "partial" -> decode.success(OutcomePartial)
++    "voicemail" -> decode.success(OutcomeVoicemail)
++    "no_answer" -> decode.success(OutcomeNoAnswer)
++    "busy" -> decode.success(OutcomeBusy)
++    "refused" -> decode.success(OutcomeRefused)
++    "wrong_number" -> decode.success(OutcomeWrongNumber)
++    "invalid_number" -> decode.success(OutcomeInvalidNumber)
++    "declined_ai" -> decode.success(OutcomeDeclinedAi)
++    "language_barrier" -> decode.success(OutcomeLanguageBarrier)
++    "gatekeeper_blocked" -> decode.success(OutcomeGatekeeperBlocked)
++    "objected" -> decode.success(OutcomeObjected)
++    "unreachable" -> decode.success(OutcomeUnreachable)
++    "form_completed" -> decode.success(OutcomeFormCompleted)
++    "manual_recorded" -> decode.success(OutcomeManualRecorded)
++    _ -> decode.failure(OutcomeCompleted, "ReferenceCallOutcome")
++  }
++}
++
++// -- RefSlot codecs -----------------------------------------------------------
++
++pub fn encode_ref_slot(slot: RefSlot) -> String {
++  case slot {
++    LandlordRef -> "landlord_ref"
++    CharacterRef -> "character_ref"
++    EmployerRef -> "employer_ref"
++  }
++}
++
++pub fn encode_ref_slot_json(slot: RefSlot) -> json.Json {
++  json.string(encode_ref_slot(slot))
++}
++
++/// Total inverse of `encode_ref_slot`; unknown input falls back to
++/// `LandlordRef` (unreachable given the CHECK constraint).
++pub fn ref_slot_from_string(value: String) -> RefSlot {
++  case value {
++    "landlord_ref" -> LandlordRef
++    "character_ref" -> CharacterRef
++    "employer_ref" -> EmployerRef
++    _ -> LandlordRef
++  }
++}
++
++pub fn ref_slot_decoder() -> decode.Decoder(RefSlot) {
++  use value <- decode.then(decode.string)
++  case value {
++    "landlord_ref" -> decode.success(LandlordRef)
++    "character_ref" -> decode.success(CharacterRef)
++    "employer_ref" -> decode.success(EmployerRef)
++    _ -> decode.failure(LandlordRef, "RefSlot")
++  }
++}
++
++// -- OwnerLabel codecs --------------------------------------------------------
++
++pub fn encode_owner_label(owner: OwnerLabel) -> String {
++  case owner {
++    Primary -> "primary"
++    CoApplicant0 -> "co_applicant_0"
++    CoApplicant1 -> "co_applicant_1"
++    CoApplicant2 -> "co_applicant_2"
++  }
++}
++
++pub fn encode_owner_label_json(owner: OwnerLabel) -> json.Json {
++  json.string(encode_owner_label(owner))
++}
++
++/// Total inverse of `encode_owner_label`; unknown input falls back to
++/// `Primary` (unreachable given the CHECK constraint).
++pub fn owner_label_from_string(value: String) -> OwnerLabel {
++  case value {
++    "primary" -> Primary
++    "co_applicant_0" -> CoApplicant0
++    "co_applicant_1" -> CoApplicant1
++    "co_applicant_2" -> CoApplicant2
++    _ -> Primary
++  }
++}
++
++pub fn owner_label_decoder() -> decode.Decoder(OwnerLabel) {
++  use value <- decode.then(decode.string)
++  case value {
++    "primary" -> decode.success(Primary)
++    "co_applicant_0" -> decode.success(CoApplicant0)
++    "co_applicant_1" -> decode.success(CoApplicant1)
++    "co_applicant_2" -> decode.success(CoApplicant2)
++    _ -> decode.failure(Primary, "OwnerLabel")
++  }
++}
++
++// -- Channel codecs -----------------------------------------------------------
++
++pub fn encode_channel(channel: Channel) -> String {
++  case channel {
++    Form -> "form"
++    Manual -> "manual"
++    Voice -> "voice"
++  }
++}
++
++pub fn encode_channel_json(channel: Channel) -> json.Json {
++  json.string(encode_channel(channel))
++}
++
++/// Total inverse of `encode_channel`; unknown input falls back to `Form`
++/// (unreachable given the CHECK constraint).
++pub fn channel_from_string(value: String) -> Channel {
++  case value {
++    "form" -> Form
++    "manual" -> Manual
++    "voice" -> Voice
++    _ -> Form
++  }
++}
++
++pub fn channel_decoder() -> decode.Decoder(Channel) {
++  use value <- decode.then(decode.string)
++  case value {
++    "form" -> decode.success(Form)
++    "manual" -> decode.success(Manual)
++    "voice" -> decode.success(Voice)
++    _ -> decode.failure(Form, "Channel")
++  }
++}
++
++// -- ObjectionChannel codecs --------------------------------------------------
++
++pub fn encode_objection_channel(channel: ObjectionChannel) -> String {
++  case channel {
++    ObjectionForm -> "form"
++    ObjectionSms -> "sms"
++    ObjectionEmail -> "email"
++  }
++}
++
++pub fn encode_objection_channel_json(channel: ObjectionChannel) -> json.Json {
++  json.string(encode_objection_channel(channel))
++}
++
++/// Total inverse of `encode_objection_channel`; unknown input falls back to
++/// `ObjectionForm` (unreachable given the CHECK constraint).
++pub fn objection_channel_from_string(value: String) -> ObjectionChannel {
++  case value {
++    "form" -> ObjectionForm
++    "sms" -> ObjectionSms
++    "email" -> ObjectionEmail
++    _ -> ObjectionForm
++  }
++}
++
++pub fn objection_channel_decoder() -> decode.Decoder(ObjectionChannel) {
++  use value <- decode.then(decode.string)
++  case value {
++    "form" -> decode.success(ObjectionForm)
++    "sms" -> decode.success(ObjectionSms)
++    "email" -> decode.success(ObjectionEmail)
++    _ -> decode.failure(ObjectionForm, "ObjectionChannel")
++  }
++}
+diff --git a/shared/test/reference_call_test.gleam b/shared/test/reference_call_test.gleam
+new file mode 100644
+index 00000000..8a732b9e
+--- /dev/null
++++ b/shared/test/reference_call_test.gleam
+@@ -0,0 +1,241 @@
++//// Round-trip tests for the reference_call shared codecs. The
++//// `every_variant_*` tests enumerate ALL variants explicitly — adding a new
++//// variant without a matching encode/from_string arm fails here, the same
++//// net as error_code_test.
++
++import gleam/json
++import gleam/list
++import gleeunit/should
++import shared/reference_call.{
++  type Channel, type ObjectionChannel, type OwnerLabel, type RefSlot,
++  type ReferenceCallOutcome, type ReferenceCallStatus, AwaitingCorrection,
++  Calling, CharacterRef, CoApplicant0, CoApplicant1, CoApplicant2, Completed,
++  ContactInitiated, EmployerRef, Failed, Form, FormCompleted, LandlordRef,
++  Manual, ManualRecorded, Objected, ObjectionEmail, ObjectionForm, ObjectionSms,
++  OutcomeBusy, OutcomeCompleted, OutcomeDeclinedAi, OutcomeFormCompleted,
++  OutcomeGatekeeperBlocked, OutcomeInvalidNumber, OutcomeLanguageBarrier,
++  OutcomeManualRecorded, OutcomeNoAnswer, OutcomeObjected, OutcomePartial,
++  OutcomeRefused, OutcomeUnreachable, OutcomeVoicemail, OutcomeWrongNumber,
++  Partial, Primary, Queued, Refused, Scheduled, Skipped, Unreachable, Voice,
++}
++
++fn all_statuses() -> List(ReferenceCallStatus) {
++  [
++    Queued,
++    Skipped,
++    ContactInitiated,
++    AwaitingCorrection,
++    Scheduled,
++    Calling,
++    Completed,
++    Partial,
++    FormCompleted,
++    Unreachable,
++    Refused,
++    Objected,
++    ManualRecorded,
++    Failed,
++  ]
++}
++
++fn all_outcomes() -> List(ReferenceCallOutcome) {
++  [
++    OutcomeCompleted,
++    OutcomePartial,
++    OutcomeVoicemail,
++    OutcomeNoAnswer,
++    OutcomeBusy,
++    OutcomeRefused,
++    OutcomeWrongNumber,
++    OutcomeInvalidNumber,
++    OutcomeDeclinedAi,
++    OutcomeLanguageBarrier,
++    OutcomeGatekeeperBlocked,
++    OutcomeObjected,
++    OutcomeUnreachable,
++    OutcomeFormCompleted,
++    OutcomeManualRecorded,
++  ]
++}
++
++fn all_slots() -> List(RefSlot) {
++  [LandlordRef, CharacterRef, EmployerRef]
++}
++
++fn all_owners() -> List(OwnerLabel) {
++  [Primary, CoApplicant0, CoApplicant1, CoApplicant2]
++}
++
++fn all_channels() -> List(Channel) {
++  [Form, Manual, Voice]
++}
++
++fn all_objection_channels() -> List(ObjectionChannel) {
++  [ObjectionForm, ObjectionSms, ObjectionEmail]
++}
++
++pub fn every_status_round_trips_test() {
++  list.each(all_statuses(), fn(status) {
++    status
++    |> reference_call.encode_status
++    |> reference_call.status_from_string
++    |> should.equal(status)
++  })
++}
++
++pub fn every_outcome_round_trips_test() {
++  list.each(all_outcomes(), fn(outcome) {
++    outcome
++    |> reference_call.encode_outcome
++    |> reference_call.outcome_from_string
++    |> should.equal(outcome)
++  })
++}
++
++pub fn every_ref_slot_round_trips_test() {
++  list.each(all_slots(), fn(slot) {
++    slot
++    |> reference_call.encode_ref_slot
++    |> reference_call.ref_slot_from_string
++    |> should.equal(slot)
++  })
++}
++
++pub fn every_owner_label_round_trips_test() {
++  list.each(all_owners(), fn(owner) {
++    owner
++    |> reference_call.encode_owner_label
++    |> reference_call.owner_label_from_string
++    |> should.equal(owner)
++  })
++}
++
++pub fn every_channel_round_trips_test() {
++  list.each(all_channels(), fn(channel) {
++    channel
++    |> reference_call.encode_channel
++    |> reference_call.channel_from_string
++    |> should.equal(channel)
++  })
++}
++
++pub fn every_objection_channel_round_trips_test() {
++  list.each(all_objection_channels(), fn(channel) {
++    channel
++    |> reference_call.encode_objection_channel
++    |> reference_call.objection_channel_from_string
++    |> should.equal(channel)
++  })
++}
++
++pub fn status_json_round_trips_test() {
++  list.each(all_statuses(), fn(status) {
++    let encoded =
++      status
++      |> reference_call.encode_status_json
++      |> json.to_string
++    let assert Ok(decoded) =
++      json.parse(encoded, reference_call.status_decoder())
++    decoded |> should.equal(status)
++  })
++}
++
++pub fn outcome_json_round_trips_test() {
++  list.each(all_outcomes(), fn(outcome) {
++    let encoded =
++      outcome
++      |> reference_call.encode_outcome_json
++      |> json.to_string
++    let assert Ok(decoded) =
++      json.parse(encoded, reference_call.outcome_decoder())
++    decoded |> should.equal(outcome)
++  })
++}
++
++pub fn ref_slot_json_round_trips_test() {
++  list.each(all_slots(), fn(slot) {
++    let encoded =
++      slot
++      |> reference_call.encode_ref_slot_json
++      |> json.to_string
++    let assert Ok(decoded) =
++      json.parse(encoded, reference_call.ref_slot_decoder())
++    decoded |> should.equal(slot)
++  })
++}
++
++pub fn owner_label_json_round_trips_test() {
++  list.each(all_owners(), fn(owner) {
++    let encoded =
++      owner
++      |> reference_call.encode_owner_label_json
++      |> json.to_string
++    let assert Ok(decoded) =
++      json.parse(encoded, reference_call.owner_label_decoder())
++    decoded |> should.equal(owner)
++  })
++}
++
++pub fn channel_json_round_trips_test() {
++  list.each(all_channels(), fn(channel) {
++    let encoded =
++      channel
++      |> reference_call.encode_channel_json
++      |> json.to_string
++    let assert Ok(decoded) =
++      json.parse(encoded, reference_call.channel_decoder())
++    decoded |> should.equal(channel)
++  })
++}
++
++pub fn objection_channel_json_round_trips_test() {
++  list.each(all_objection_channels(), fn(channel) {
++    let encoded =
++      channel
++      |> reference_call.encode_objection_channel_json
++      |> json.to_string
++    let assert Ok(decoded) =
++      json.parse(encoded, reference_call.objection_channel_decoder())
++    decoded |> should.equal(channel)
++  })
++}
++
++pub fn status_decoder_rejects_unknown_test() {
++  json.parse("\"nonsense\"", reference_call.status_decoder())
++  |> should.be_error
++}
++
++pub fn outcome_decoder_rejects_unknown_test() {
++  json.parse("\"nonsense\"", reference_call.outcome_decoder())
++  |> should.be_error
++}
++
++/// Guards the v1 contract counts: 14 status values (incl. `skipped`, A6)
++/// and 15 outcome values (incl. the §6.4 additions).
++pub fn contract_counts_test() {
++  list.length(all_statuses()) |> should.equal(14)
++  list.length(all_outcomes()) |> should.equal(15)
++}
++
++/// Pins the amended-contract wire strings that later stories depend on.
++pub fn amended_wire_strings_test() {
++  reference_call.encode_status(Skipped) |> should.equal("skipped")
++  reference_call.encode_outcome(OutcomeUnreachable)
++  |> should.equal("unreachable")
++  reference_call.encode_outcome(OutcomeFormCompleted)
++  |> should.equal("form_completed")
++  reference_call.encode_outcome(OutcomeManualRecorded)
++  |> should.equal("manual_recorded")
++}
++
++/// Fail-safe fallbacks: unknown input must never coerce to a live or
++/// success-shaped value (audit-trail discipline — review finding).
++pub fn unknown_status_falls_back_to_inert_failed_test() {
++  reference_call.status_from_string("some_future_value")
++  |> should.equal(Failed)
++}
++
++pub fn unknown_outcome_never_falls_back_to_success_test() {
++  reference_call.outcome_from_string("some_future_value")
++  |> should.equal(OutcomeUnreachable)
++}
+diff --git a/supabase/migrations/20260731222000_create_reference_call.sql b/supabase/migrations/20260731222000_create_reference_call.sql
+new file mode 100644
+index 00000000..8a9d3464
+--- /dev/null
++++ b/supabase/migrations/20260731222000_create_reference_call.sql
+@@ -0,0 +1,180 @@
++-- reference_call + reference_objection_log: the AI reference-checking v1
++-- system of record (architecture-reference-checking-v1 §4.1, as amended by
++-- the epics doc's 2026-07-30 A-register).
++--
++-- reference_call is the lifecycle table every later story builds on: the
++-- RC2.3 trigger inserts `queued` rows with an immutable `contact_*` snapshot
++-- of who was actually contacted; the RC3 sweep owns ALL sends against
++-- `next_attempt_at`; terminal rows carry the ReferenceCallResult v1 payload
++-- in `result` (fraud_signals denormalised alongside for query access).
++--
++-- Amendments applied on top of §4.1 (the A-register binds this migration):
++--   A1  NO `correction_token` column (and no token index) — correction and
++--       substitution are landlord-driven in v1; `corrected_email`/
++--       `corrected_phone` record the effective contact while the snapshot
++--       stays immutable.
++--   A2  `draft_answers` JSONB — referee form server-side autosave; an
++--       abandoned form with answers terminates as `partial` (v1-active).
++--   A3  `form_token_expires_at` carries a 10-day TTL — enforced by the
++--       token-issuing story (RC3.x), the column is policy-free.
++--   A6  `reference_call_status` gains `'skipped'` (landlord excludes a
++--       reference at/before trigger; re-enable returns to `queued`). A
++--       skipped row still OCCUPIES its slot: it is deliberately absent
++--       from the live-row index's terminal exclusion list.
++--   A7  `taken_over_at` — warm-handoff takeover marker; the sweep skips
++--       taken-over rows while the form link stays live.
++--   §6.4 outcome enum gains 'unreachable', 'form_completed',
++--       'manual_recorded' (v1 collection terminals).
++--
++-- Type-system note (owned deviation, §4.1): `ref_slot`, `owner_label`,
++-- `channel`, `retention_class` are TEXT+CHECK — they mirror values inside
++-- the cross-repo JSON contract, and TEXT+CHECK keeps the DDL in lockstep
++-- with that contract without a second enum-migration path. True state
++-- fields (`status`, `outcome`) are PG enums as canonical requires.
++-- retention_class values per §9.3: referee submissions follow the
++-- application's retention schedule; objection evidence may outlive it.
++--
++-- reference_objection_log is Art 21 evidence (§9.2): written AT OBJECTION
++-- TIME by the objection handler — its only writer. It has NO foreign keys
++-- BY DESIGN: the DPC can ask for the objection trail after the application
++-- (and the reference_call row) is gone, so both parent ids are plain UUIDs.
++--
++-- RLS: no migration content needed — the `ensure_rls` event trigger
++-- (20260512175704) auto-enables RLS on every new public table and the app
++-- talks via service_role; per repo convention zero policies are written.
++
++CREATE TYPE reference_call_status AS ENUM (
++  'queued',              -- created, not yet contacted            [v1]
++  'skipped',             -- landlord excluded this reference      [v1, A6 — re-enables to queued]
++  'contact_initiated',   -- invite sent, awaiting form            [v1]
++  'awaiting_correction', -- bad contact; landlord correcting      [v1]
++  'scheduled',           -- referee booked a call                 [v2-reserved]
++  'calling',             -- voice attempt in flight               [v2-reserved]
++  'completed',           -- voice call completed                  [v2-reserved]
++  'partial',             -- abandoned with draft answers          [v1, terminal, A2]
++  'form_completed',      -- structured form submitted             [v1, terminal]
++  'unreachable',         -- sequence exhausted                    [v1, terminal]
++  'refused',             -- referee declined (non-objection)      [v1, terminal, A8]
++  'objected',            -- Art 21 objection / STOP               [v1, terminal]
++  'manual_recorded',     -- WoZ/landlord manual outcome recorded  [v1, terminal]
++  'failed'               -- system failure, no referee contact    [v1, terminal]
++);
++
++CREATE TYPE reference_call_outcome AS ENUM (
++  -- ReferenceCallResult outcome values (heist-535) + three v1 amendments (§6.4).
++  -- v1 emits: form_completed, unreachable, objected, manual_recorded
++  -- (and leaves outcome NULL for status 'failed' — system failure, no referee contact).
++  'completed', 'partial', 'voicemail', 'no_answer', 'busy',
++  'refused', 'wrong_number', 'invalid_number', 'declined_ai',
++  'language_barrier', 'gatekeeper_blocked', 'objected',
++  'unreachable', 'form_completed', 'manual_recorded'
++);
++
++CREATE TABLE reference_call (
++  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
++  application_id  UUID NOT NULL REFERENCES application(id) ON DELETE CASCADE,
++  ref_slot        TEXT NOT NULL
++                  CHECK (ref_slot IN ('landlord_ref', 'character_ref', 'employer_ref')),
++  owner_label     TEXT NOT NULL DEFAULT 'primary'
++                  CHECK (owner_label IN ('primary','co_applicant_0','co_applicant_1','co_applicant_2')),
++
++  status          reference_call_status NOT NULL DEFAULT 'queued',
++  outcome         reference_call_outcome,              -- set at terminal (and mid-flight for voice later)
++  terminal_reason TEXT,                                -- short machine slug, e.g. 'sequence_exhausted', 'stop_received', 'correction_failed'
++
++  -- Contact snapshot (immutable copy of the trio at creation; survives
++  -- later EDITS of the application row — note the row itself dies with the
++  -- application via CASCADE, so "survives erasure" is not its job)
++  contact_name    TEXT NOT NULL,
++  contact_email   TEXT,
++  contact_phone   TEXT,
++  -- Landlord-correction loop (AD-7 as amended, A1): the corrected contact
++  -- lives here; the snapshot above is NEVER overwritten. Sends and fraud
++  -- joins use the EFFECTIVE contact (corrected value when present, else
++  -- snapshot).
++  corrected_email TEXT,
++  corrected_phone TEXT,
++
++  -- Attempt accounting (AD-4)
++  attempt_count   INT NOT NULL DEFAULT 0,
++  next_attempt_at TIMESTAMPTZ,                         -- set to now() at creation; sweep owns ALL sends (AD-14)
++  attempts        JSONB NOT NULL DEFAULT '[]',         -- [{at, channel, outcome, detail}] append-only, atomic || (AD-14)
++  correction_cycles INT NOT NULL DEFAULT 0,            -- AD-7: max 1
++
++  -- Capability token (AD-3) + form session
++  form_token        TEXT,                              -- referee form link (~288-bit; internal-only, §4.2)
++  form_token_expires_at TIMESTAMPTZ,                   -- 10-day TTL (A3) stamped by the token-issuing story
++  form_opened_at    TIMESTAMPTZ,                       -- first GET of the form; completion_seconds input (AD-10)
++  submitted_at      TIMESTAMPTZ,
++  draft_answers     JSONB,                             -- A2: server-side autosave, per-answer PUT, resume support
++
++  -- Warm-handoff takeover (A7): set when the landlord takes over manually;
++  -- the sweep skips taken-over rows, the form link stays live, and a late
++  -- completion still guarded-transitions to form_completed.
++  taken_over_at   TIMESTAMPTZ,
++
++  -- The handoff payload (AD-9)
++  channel         TEXT CHECK (channel IN ('form','manual','voice')),
++  result          JSONB,                               -- ReferenceCallResult v1, schema_version embedded
++  fraud_signals   JSONB,                               -- denormalised copy of result.fraud_signals for querying
++
++  -- Objection evidence (AD-6)
++  objected_at     TIMESTAMPTZ,
++  objection_detail JSONB,                              -- {channel, received_at, payload_ref}
++
++  -- Retention (§9.3)
++  retention_class TEXT NOT NULL DEFAULT 'referee_submission'
++                  CHECK (retention_class IN ('referee_submission','objection_evidence','attempt_metadata')),
++  purge_after     TIMESTAMPTZ,                         -- stamped at terminal: follows the application's retention schedule
++
++  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
++  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++
++-- One live row per (application, slot, owner): a substituted referee creates a
++-- new row only after the prior row is terminal. 'skipped' is NOT in the
++-- exclusion list (A6) — a skipped row still occupies its slot until re-enabled
++-- or terminal.
++CREATE UNIQUE INDEX idx_reference_call_live
++  ON reference_call(application_id, ref_slot, owner_label)
++  WHERE status NOT IN ('form_completed','unreachable','refused','objected','manual_recorded','failed','completed','partial');
++
++CREATE UNIQUE INDEX idx_reference_call_form_token
++  ON reference_call(form_token) WHERE form_token IS NOT NULL;
++CREATE INDEX idx_reference_call_sweep
++  ON reference_call(next_attempt_at) WHERE next_attempt_at IS NOT NULL;
++CREATE INDEX idx_reference_call_application
++  ON reference_call(application_id);
++CREATE INDEX idx_reference_call_contact_phone
++  ON reference_call(contact_phone);   -- cross-application reuse fraud check
++CREATE INDEX idx_reference_call_purge
++  ON reference_call(purge_after) WHERE purge_after IS NOT NULL;
++
++-- updated_at maintained by the repo's existing generic trigger function
++-- (20260409000001, ai_analysis pattern) — bump on any row modification.
++DROP TRIGGER IF EXISTS update_reference_call_updated_at ON reference_call;
++CREATE TRIGGER update_reference_call_updated_at
++  BEFORE UPDATE ON reference_call
++  FOR EACH ROW
++  EXECUTE FUNCTION update_updated_at_column();
++
++-- Art 21 objection evidence (AD-6): written AT OBJECTION TIME by the objection
++-- handler — its only writer. Deliberately NOT CASCADE-coupled (no foreign
++-- keys): the DPC can ask for the objection trail after the application is gone.
++CREATE TABLE reference_objection_log (
++  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
++  reference_call_id UUID,                              -- plain UUID, no FK: must survive both parent deletions
++  application_id    UUID,                              -- same
++  ref_slot          TEXT NOT NULL
++                    CHECK (ref_slot IN ('landlord_ref', 'character_ref', 'employer_ref')),
++  objected_at       TIMESTAMPTZ NOT NULL,
++  channel           TEXT NOT NULL
++                    CHECK (channel IN ('form','sms','email')),
++  payload_ref       TEXT,                              -- pointer to raw evidence (internal-only, §4.2)
++  retention_class   TEXT NOT NULL DEFAULT 'objection_evidence'
++                    CHECK (retention_class IN ('referee_submission','objection_evidence','attempt_metadata')),
++  purge_after       TIMESTAMPTZ,
++  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++CREATE INDEX idx_reference_objection_log_purge
++  ON reference_objection_log(purge_after) WHERE purge_after IS NOT NULL;
+diff --git a/supabase/migrations/20260731222001_add_reference_notification_types.sql b/supabase/migrations/20260731222001_add_reference_notification_types.sql
+new file mode 100644
+index 00000000..c56d123e
+--- /dev/null
++++ b/supabase/migrations/20260731222001_add_reference_notification_types.sql
+@@ -0,0 +1,14 @@
++-- Reference-check notification types (FR-RC15, A8): every later emitting
++-- story (sweep terminals, form completion/decline, late completion after
++-- warm-handoff takeover) needs these values to exist up front.
++--   reference_completed   — form submitted or manual outcome recorded
++--   reference_unreachable — correction cycle exhausted (T+144h silent
++--                           exhaustion is covered by the warm handoff)
++--   reference_objected    — Art 21 objection / STOP on any channel
++--   reference_declined    — form decline route (A8: distinct from objected)
++-- One enum-addition migration per the 20260423100001 precedent; no code
++-- references the new values in this migration's transaction.
++ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'reference_completed';
++ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'reference_unreachable';
++ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'reference_objected';
++ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'reference_declined';
