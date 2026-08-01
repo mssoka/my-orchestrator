@@ -601,6 +601,23 @@ pattern.
   (`npx -y lavish-axi poll <path>`) and relays, or dispatches a fresh
   minion with the artifact path. Watcher note: a polling minion shows
   `working` — that is waiting, not stuck.
+- **Gru/Silas-originated clarify sessions (herdr-wake poll, 2026-08-01):**
+  when Gru (or Silas) builds the artifact himself (ruling pages,
+  escalation clarifies), the skill's foreground-poll rule BLOCKS the
+  orchestrator's chat turn — unacceptable. The skill permits a background
+  poll when a verified wake callback exists in the surrounding supervisor;
+  herdr IS that supervisor. Pattern: open the session, present the
+  questions in chat too (user may answer either way), and run the poll in
+  a scratch pane with a wake wrapper:
+  ```bash
+  herdr pane run <scratch-pane> \
+    "npx -y lavish-axi poll <path> && herdr pane run <gru-pane> '[LAVISH] feedback on <path>'"
+  ```
+  Poll returns → wake message lands → Gru relays/applies. Chat answers
+  short-circuit the loop: kill the scratch poll and `lavish-axi end
+  <path>`. If the poll dies unwatched, re-run — queued feedback is never
+  lost. (Learned 2026-08-01: a 25-min foreground poll held Gru's turn
+  hostage mid-clarify.)
 
 ## Perkins (automated PR review)
 
