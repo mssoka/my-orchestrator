@@ -2,17 +2,19 @@
  * nefario-watch — idle/blocked detection for minions + PR merge/CI/review
  * sensing + Perkins review-dispatch sensing.
  *
- * Project-local (loads only when cwd is /Users/moses/code, i.e. the Gru
- * session). Polls `herdr agent list` every 30s, diffs the agent_status of
+ * Project-local: acts only when cwd is /Users/moses/code AND the session
+ * was launched `PI_SILAS=1` (the Silas/COO session — sensors alert Silas,
+ * never Gru). Polls `herdr agent list` every 30s, diffs the agent_status of
  * every ledger-tracked pane (SQLite ledger, non-done jobs with a pane_id),
  * and injects a message into this session when one transitions to
  * idle/done/blocked or vanishes.
  *
  * Why: a pi agent halted at its prompt (e.g. quick-dev step-01 clarify)
- * reports `idle`, which no human notification reliably reaches Gru — the
- * minion's `herdr notification show` only toasts the human. This extension
- * is the machine channel: the injected message triggers a turn, and Gru
- * reads the transcript, classifies, updates the ledger, and relays.
+ * reports `idle`, which no human notification reliably reaches Silas —
+ * the minion's `herdr notification show` only toasts the human. This
+ * extension is the machine channel: the injected message triggers a turn,
+ * and Silas reads the transcript, classifies, updates the ledger, and
+ * relays.
  *
  * Alert policy (pane watcher):
  * - Alert only on TRANSITIONS into idle/done/blocked (no repeats while a
@@ -21,17 +23,17 @@
  * - At session_start: silent snapshot, plus a one-time catch-up digest
  *   (deliverAs nextTurn — no turn triggered) for any pane already stopped
  *   while its ledger status says it should be running.
- * - The Gru pane itself and untracked panes are ignored by construction
- *   (diff is driven by the ledger's pane_id list).
+ * - The orchestrator panes (Gru, Silas) and untracked panes are ignored
+ *   by construction (diff is driven by the ledger's pane_id list).
  *
  * PR watcher (every 5 min): polls `gh pr view` for ledger jobs in
- * 'in-review' with a recorded PR. On MERGED: wakes Gru to run close-out
+ * 'in-review' with a recorded PR. On MERGED: wakes Silas to run close-out
  * (pull base, remove worktree/branch, close pane, ledger done). On CLOSED
- * unmerged: wakes Gru to ask the user. Terminal states alert once per job;
- * Gru owns every ledger transition — this extension only detects.
+ * unmerged: wakes Silas to escalate to Gru. Terminal states alert once per
+ * job; Silas owns every ledger transition — this extension only detects.
  *
  * CI sensor (same 5-min tick): for OPEN in-review PRs, inspects
- * statusCheckRollup and wakes Gru when any check completes with a failing
+ * statusCheckRollup and wakes Silas when any check completes with a failing
  * conclusion (FAILURE/TIMED_OUT/STARTUP_FAILURE/ACTION_REQUIRED; StatusContext
  * FAILURE/ERROR). Alerts once per head sha — a new push re-arms, and checks
  * returning green re-arms too. CANCELLED is ignored (superseded runs are
@@ -46,20 +48,20 @@
  * resolved lazily via `gh api` (gh's `--json reviews` has no URL field).
  * Standalone PR conversation comments are ignored (v1); no author/bot
  * filtering. Detection-only: nefario-watch never writes the ledger and
- * never sends pane input — Gru owns every relay and ledger transition.
+ * never sends pane input — Silas owns every relay and ledger transition.
  *
  * Perkins sensor (same 5-min tick): for jobs opted in via the ledger
- * `pr_review=1` flag, wakes Gru to dispatch a Perkins automated-review
+ * `pr_review=1` flag, wakes Silas to dispatch a Perkins automated-review
  * round when the PR's head sha has not been reviewed yet. Dedup is
  * DURABLE via ledger round rows (rows with parent = <job-id>, note
  * carrying sha=<full-sha>): a round in flight (status != done) or a round
  * whose note contains the current head sha skips silently — this survives
- * Gru restarts, unlike the in-memory maps. The in-memory perkinsAlerted
+ * Silas restarts, unlike the in-memory maps. The in-memory perkinsAlerted
  * map (mirrors ciAlerted) only suppresses per-tick re-alerts while a
  * dispatch is pending; it re-arms when the sha changes. Round cap: 3
  * rounds per PR — a further new sha injects a once-per-sha escalation
  * ("human review needed") instead of a dispatch message. Detection-only,
- * same contract as above: Gru dispatches per playbook 'Perkins (automated
+ * same contract as above: Silas dispatches per playbook 'Perkins (automated
  * PR review)'. If the ledger predates the pr_review column (no `ledger`
  * run since upgrade), the shared jobs query falls back to a legacy shape
  * (pr_review=0) so merge/CI/review sensing keeps working; Perkins stays
@@ -67,7 +69,7 @@
  *
  * Dream sensor (same 5-min tick): every DREAM_INTERVAL (default 2 days),
  * when undreamed memory material exists (field-note shards or Gru journal
- * entries newer than the last-dream marker), wakes Gru to dispatch the
+ * entries newer than the last-dream marker), wakes Silas to dispatch the
  * dream pass ("Bob") per playbook 'Dreaming (periodic memory
  * consolidation)'. Durable record: `_bmad-output/memory/last-dream`
  * (written on dream COMPLETION, never at dispatch). Marker missing →
@@ -83,7 +85,7 @@ const DB = "/Users/moses/code/_bmad-output/orchestrator.db";
 const LEDGER_HELPER = "/Users/moses/code/bin/ledger";
 const POLL_MS = 30_000;
 const PR_POLL_MS = 300_000;
-/** Review bodies are capped in alerts — Gru only relays; the URL has it. */
+/** Review bodies are capped in alerts — Silas only relays; the URL has it. */
 const REVIEW_BODY_CAP = 1500;
 /** Perkins: max automated review rounds per PR before escalating. */
 const PERKINS_ROUND_CAP = 3;
@@ -102,20 +104,23 @@ const SETTLED = new Set(["clarifying", "in-review", "blocked", "done"]);
  * them silently (GitLab support deferred, v1). */
 const PR_URL = /^https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)/i;
 
-/** Expected Gru action per review state — injected verbatim so a cold Gru
- * session knows what to do. States not present here never alert. */
+/** Expected Silas action per review state — injected verbatim so a cold
+ * Silas session knows what to do. States not present here never alert. */
 const REVIEW_ACTIONS: Record<string, string> = {
 	CHANGES_REQUESTED:
 		'relay to the minion pane as WORK NEEDED (`herdr pane run <pane> "...")' +
-		": address each review comment, push, re-request review, then set the " +
-		`ledger back to in-review (\`${LEDGER_HELPER} set <job-id> in-review "<note>"\`). ` +
+		": address each review comment, push, re-request review, then record " +
+		`the rework with \`${LEDGER_HELPER} note <job-id> "<note>"\` — the job ` +
+		"is already in-review and a same-status `set` is a silent no-op that " +
+		"DROPS the note. " +
 		"If the review is from perkins-review[bot], SKIP the re-request step — " +
 		"the new sha re-triggers Perkins automatically",
 	COMMENTED:
 		'relay STRAIGHT to the minion pane as FYI/judgment (no user round-trip) ' +
 		'(`herdr pane run <pane> "..."): "address or reply, your call"',
 	APPROVED:
-		'notify the USER only: "PR approved — merge when ready". No minion action',
+		'escalate one line to Gru (`herdr pane run` the pane labeled `gru`): ' +
+		'"PR approved — merge when ready". No minion action',
 };
 
 /** UTC stamp for alert headers — same format as ledger event timestamps
@@ -212,7 +217,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 						alerts.push(
 							`- ${job.id} (${pane}): '${cur}' at session start while ` +
 								`ledger says '${job.status}' — likely stopped while ` +
-								"Gru was down.",
+								"Silas was down.",
 						);
 					}
 					continue;
@@ -237,14 +242,15 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 						`[nefario-watch · ${stamp()}] status change on ledger-tracked job(s):\n` +
 						alerts.join("\n") +
 						"\nFor each: `herdr pane read <pane> --source recent-unwrapped " +
-						"--lines 120`, classify (clarify halt vs finished vs error), " +
-						`update the ledger (\`${LEDGER_HELPER} set <job-id> <status> ` +
-						'"<note>"`), and relay to the user anything needing an answer.',
+						"--lines 120`, classify (clarify halt vs finished vs error vs " +
+						`settle-noise), update the ledger (\`${LEDGER_HELPER} set <job-id> ` +
+						'<status> "<note>"`), and escalate to Gru (`herdr pane run` the ' +
+						"pane labeled `gru`) anything needing the user.",
 					display: true,
 				},
 				initial
 					? { deliverAs: "nextTurn" } // digest rides the first prompt; no turn
-					: { deliverAs: "followUp", triggerTurn: true }, // wake Gru
+					: { deliverAs: "followUp", triggerTurn: true }, // wake Silas
 			);
 		} finally {
 			ticking = false;
@@ -614,7 +620,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 						`[nefario-watch · ${stamp()}] PR/CI/review/Perkins/dream alert on in-review job(s):\n` +
 						alerts.join("\n") +
 						"\nDetection only: nefario-watch never writes the ledger or " +
-						"sends pane input — Gru owns every relay and ledger transition.",
+						"sends pane input — Silas owns every relay and ledger transition.",
 					display: true,
 				},
 				initial
@@ -628,6 +634,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.cwd !== GRU_DIR) return;
+		if (process.env.PI_SILAS !== "1") return; // sensors belong to Silas (COO)
 		if (timer) return; // idempotent — one watcher per session
 		await tick(true);
 		timer = setInterval(() => {

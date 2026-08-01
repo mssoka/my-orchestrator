@@ -10,7 +10,12 @@ here for standing orders.
 
 **Naming theme (Despicable Me):**
 
-- **Gru** — the orchestrator pi session (formerly "mayor")
+- **Gru** — the CEO pi session (formerly "mayor"): the user interface —
+  intake, briefings, dispatch decisions, escalations. Launched `PI_GRU=1 pi`.
+- **Silas (Ramsbottom)** — the COO pi session (pane label `silas`, launched
+  `PI_SILAS=1 pi`): runs ALL operations — watcher alerts, ledger
+  transitions, close-outs, relays, Perkins rounds, dream dispatches, pane
+  hygiene. Escalates to Gru only what needs the user.
 - **minion** — a dispatched task agent, one per job (formerly "sub-agent")
 - **mega-minion** — a specialist helper a minion spawns, e.g. a review swarm
   (formerly "sub-sub-agent" / "child pane")
@@ -48,6 +53,9 @@ Nefario built the watcher gadgets; Perkins guards the Bank of Evil.
 - Orchestration as villainy: jobs are heists, the workspace is the lair,
   dispatching is "assemble the minions", close-out is the getaway, the
   ledger is the big book of crimes.
+- Gru no longer narrates operations — Silas runs them off-stage. Gru
+  relays escalations, decisions, and results; the user's channel stays
+  clean of watcher noise, settle transitions, and close-out mechanics.
 - Triumph: "It's so fluffy!" / "The heist is complete!" Bumbling:
   affectionate groaning, never cruelty — Gru loves his minions.
 - "Light bulb!" for insights. "Back to work!" to close a dispatch burst.
@@ -95,14 +103,73 @@ first.
 
 ## Roles
 
-- **Gru (orchestrator)** — the pi session in the orchestrator Herdr workspace
-  (currently `wA`, label "code" — ids are ephemeral, re-resolve at session
-  start). Receives user intent, runs intake, writes briefings, dispatches
-  minions, relays clarify Q&A, tracks progress, closes out jobs.
+- **Gru (CEO)** — the pi session in the orchestrator Herdr workspace
+  (pane label `gru`, launched `PI_GRU=1 pi`; ids are ephemeral, re-resolve
+  at session start). The USER INTERFACE: receives user intent, runs intake,
+  writes briefings, makes dispatch decisions, relays escalations to the
+  user. Never touches operations.
+- **Silas (COO)** — the second long-lived pi session in the orchestrator
+  workspace (pane label `silas`, launched `PI_SILAS=1 pi`). Runs ALL
+  operations: watcher alerts, ledger transitions, dispatch mechanics,
+  close-outs, relays, Perkins rounds, dream dispatches, pane hygiene.
+  Escalates to Gru only what needs the user — see 'Silas (COO)'.
 - **Minion (task agent)** — a `pi` agent in a named pane in the orchestrator
   workspace, one per job, working in a git worktree of the target repo. May
   spawn its own mega-minions via the herdr skill and must close them when
   done.
+
+## Silas (COO)
+
+Silas Ramsbottom — Gru's chief operating officer. A long-lived pi session
+(pane label `silas`) launched `PI_SILAS=1 pi` with cwd
+`/Users/moses/code`. His extension (`.pi/extensions/silas.ts`) injects his
+standing orders + startup checklist; nefario-watch is gated to
+`PI_SILAS=1`, so ALL sensors alert Silas — Gru's context stays clean.
+
+**Silas owns (Gru never touches):**
+
+- Every nefario-watch alert: classify via transcript, act, ledger.
+- Every ledger transition (`bin/ledger set|note|clear-pane|pr`). Gru
+  reads the ledger for boards only.
+- Dispatch mechanics on Gru's handoff ('Dispatch' steps 2–6).
+- Close-outs (merge → pull base → torch worktree/branch → close pane).
+- CI-failure triage: infra flake → rerun; real failure → relay to the
+  minion.
+- Review relays: CHANGES_REQUESTED / COMMENTED → minion pane (ledger
+  `note`, never same-status `set`); APPROVED → one-line escalation.
+- Perkins round dispatch + round close-out ('Perkins (automated PR
+  review)').
+- Dream dispatch (Bob) + dream close-out (applies auto proposals;
+  escalates the user-ack list).
+- Pane hygiene: dead-pi relaunches, in-review pane reclamation.
+
+**Escalation protocol:** `herdr pane run <gru-pane> "[SILAS] <one-liner +
+the decision needed>"` (resolve the Gru pane by label `gru` via
+`herdr agent list`). Gru relays decision items to the user verbatim;
+answers flow back Gru → Silas → minion.
+
+| Event | Silas does |
+|---|---|
+| Clarify halt (numbered questions) | escalate verbatim to Gru |
+| Blocked (access, contradictions) | escalate |
+| PR MERGED | close-out, then one-line FYI escalation |
+| PR CLOSED-unmerged | escalate (abandon vs reopen/fix) |
+| Review APPROVED | one-line FYI escalation |
+| Review CHANGES_REQUESTED / COMMENTED | relay to minion himself |
+| CI failing | triage himself; escalate only if stuck |
+| Perkins round done | close out himself; verdict FYI escalation |
+| Dream done | apply autos; escalate user-ack list |
+| Settle transitions / stale echoes | noise — no action, no escalation |
+| Cap / safety-valve breach | pause + escalate |
+
+**Launch/relaunch:** Gru spawns him at session start when missing (new
+tab, label `silas`, `PI_SILAS=1 pi`, handover: "Read the playbook section
+'Silas (COO)' and run your startup checklist"). His extension re-sends
+the checklist on `startup`/`new` anyway.
+
+**Ledger discipline:** Silas owns transitions; same-status updates use
+`bin/ledger note` (never `set` — a same-status set is a silent no-op that
+drops the note).
 
 ## Durable state
 
@@ -140,13 +207,15 @@ with a session, a compaction, or a worktree.
 
 **Rituals:**
 
-- **Startup (Gru):** after the playbook + ledger + herdr reconcile, read
-  the last few journal entries (`ls -t _bmad-output/gru-journal | head -3`)
-  — this is the rehydration layer.
+- **Startup (Gru and Silas):** Gru reads the playbook roles/intake +
+  ledger (read-only) + last journal entries; Silas runs his own checklist
+  (playbook ops sections + ledger + herdr reconcile + catch-up). The
+  journal is Gru's rehydration layer; the ledger is Silas'.
 - **Wind-down / after significant arcs (Gru):** append to today's journal
   file — what happened, decisions, open loops. Five lines beats zero.
-- **Gotcha discipline (Gru):** every fumble ends in `AGENTS.md` gotchas or
-  a field note, same session — never "I'll remember it".
+- **Gotcha discipline (Gru and Silas):** every fumble ends in `AGENTS.md`
+  gotchas or a field note, same session — never "I'll remember it". Gru
+  writes Gru-session gotchas; Silas writes operational ones.
 - **Badge-out (minion):** write your shard
   (`_bmad-output/field-notes/<job-id>.md`, ≤3 one-liners) before
   finishing. Mega-minion lessons roll up through you.
@@ -159,9 +228,10 @@ with a session, a compaction, or a worktree.
    `field-notes/<job-id>.md`; no two writers ever share a file, so
    contention is impossible by construction. Even a 10-mega-minion swarm
    has ONE writer: the parent minion.
-2. **Single-writer curated files.** Only Gru edits the curated notes,
-   AGENTS.md, this playbook, and the journal. Minions never touch shared
-   docs. Minions READ the curated notes at start (read-only = free).
+2. **Single-writer curated files.** Silas edits the curated notes,
+   AGENTS.md ops gotchas, and this playbook; Gru edits only his journal.
+   Minions never touch shared docs. Minions READ the curated notes at
+   start (read-only = free).
 3. **Shared mutable state lives in SQLite, not files.** The ledger
    serializes writers (WAL + `PRAGMA busy_timeout=5000`); that is why
    statuses never go in markdown.
@@ -184,9 +254,9 @@ store, one reader per source, proposals with reasoning.)
   dream, written only at completion (never at dispatch, so material
   arriving mid-dream is not falsely marked dreamed). Due = marker older
   than 2 days AND ≥1 undreamed file in `field-notes/` or `gru-journal/`.
-  Manual: the user can ask Gru to dream anytime. Only ONE dream pass at a
-  time — check `bin/ledger json` for a non-done `dream-*` row before
-  dispatching.
+  Manual: the user can ask Gru, who tells Silas to dream anytime. Only
+  ONE dream pass at a time — check `bin/ledger json` for a non-done
+  `dream-*` row before dispatching.
 - **Dispatch:** ledger id `dream-<yyyy-mm-dd>`, pane label the same,
   briefing from `_bmad-output/briefings/_template-dream.md`. No repo, no
   worktree — launch Bob with `cd /Users/moses/code/_bmad-output/bob && pi`:
@@ -223,10 +293,10 @@ store, one reader per source, proposals with reasoning.)
      new sections, playbook edits, policy/persona changes). Pattern
      verification pass: challenge each candidate against the evidence
      (**bmad-review-adversarial-general**) before proposing it.
-  5. **Gru closes the pass:** reviews the report, applies auto-class
-     edits, relays the user-ack list, writes the `last-dream` marker
-     (ISO timestamp), sets the ledger job `done`. Commit doc changes as
-     `dream <date>: <one-liner>`.
+  5. **Silas closes the pass:** reviews the report, applies auto-class
+     edits, escalates the user-ack list to Gru (who relays to the user),
+     writes the `last-dream` marker (ISO timestamp), sets the ledger job
+     `done`. Commit doc changes as `dream <date>: <one-liner>`.
 - **Concurrency:** the dream works on a cloned store plus per-sheep
   shards — the same avoidance rules as the live memory; zero locks.
 
@@ -268,8 +338,15 @@ store, one reader per source, proposals with reasoning.)
    and pass `pr_review=1` in `ledger add`. Default stays off — small
    changes rely on quick-dev's built-in review. See 'Perkins (automated
    PR review)'.
+8. **Handoff (Silas).** End the briefing with a **Dispatch parameters**
+   block (repo, repo_root, slug, base, model?, github_issue?). Gru hands
+   the path to Silas (`herdr pane run <silas-pane> "dispatch: <briefing
+   path>"`); Silas runs 'Dispatch' steps 2–6 and reports the pane id.
 
 ## Dispatch (exact sequence)
+
+Ownership: Gru writes the briefing (step 1) and makes the decision; Silas
+executes steps 2–6 on Gru's handoff and reports the pane id back.
 
 Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
 
@@ -396,15 +473,18 @@ older briefings use that name; this is the same section.)
   load-bearing choices, rejected alternatives, anything flagged for legal
   review — so a fresh minion can take over review rounds cold.
 
-## Tracking (Gru)
+## Tracking (Silas)
 
-- Dashboard: `herdr agent list` and `/Users/moses/code/bin/ledger`.
+- Dashboard: `herdr agent list` and `/Users/moses/code/bin/ledger`. Gru
+  reads these for boards on user request; Silas acts on them.
 - **nefario-watch** (`.pi/extensions/nefario-watch.ts`) has five sensors:
   1. **Pane watcher (30s):** diffs `herdr agent list` against ledger-tracked
-     panes; injects a message when one transitions to `idle`/`done`/`blocked`
-     (or vanishes). On such a message: read the transcript (`herdr pane read
-     <pane> --source recent-unwrapped --lines 120`), classify (clarify halt
-     vs finished vs error), update the ledger, relay to the user.
+     panes; injects a message into SILAS' session when one transitions to
+     `idle`/`done`/`blocked` (or vanishes). On such a message: read the
+     transcript (`herdr pane read <pane> --source recent-unwrapped
+     --lines 120`), classify (clarify halt vs finished vs error vs
+     settle-noise), update the ledger, and escalate to Gru anything
+     needing the user.
   2. **PR watcher (5 min):** polls `gh pr view` for jobs in `in-review` with
      a recorded PR. On MERGED: run close-out (which now includes pulling the
      base). On CLOSED-unmerged: ask the user (abandon vs reopen/fix).
@@ -417,16 +497,18 @@ older briefings use that name; this is the same section.)
      in-review PR (deduped by review id; silent baseline on first
      sighting — pre-existing reviews never alert, and PENDING drafts are
      skipped without being recorded so their later submission still
-     alerts). Convention: **Request changes = work** (relay to the minion
-     pane: address each comment, push, re-request review, then set the
-     ledger back to `in-review` — when the reviewer is
+     alerts). Convention: **Request changes = work** (Silas relays to the
+     minion pane: address each comment, push, re-request review, then
+     record the rework with `bin/ledger note <job-id> "<note>"` — the job
+     is already `in-review` and a same-status `set` is a silent no-op
+     that DROPS the note; when the reviewer is
      `perkins-review[bot]`, skip the re-request step: the new sha
      re-triggers Perkins automatically, see 'Perkins (automated PR
      review)'), **Comment = FYI straight to the minion**
      (no user round-trip — "address or reply, your call"), **Approve =
-     notify the human** ("PR approved — merge when ready"; no minion
-     action). No author/bot filtering — bot reviews are treated exactly
-     like the human's. Standalone PR conversation comments are ignored in
+     escalate one line to Gru** (he tells the human "PR approved — merge
+     when ready"; no minion action). No author/bot filtering — bot
+     reviews are treated exactly like the human's. Standalone PR conversation comments are ignored in
      v1. Failure modes: review bodies are capped (~1500 chars — full text
      at the review URL); PRs with >100 reviews can fall back to the bare PR
      URL; baselines are in-memory, so a Gru restart silently re-baselines
@@ -442,7 +524,7 @@ older briefings use that name; this is the same section.)
      the sequence in 'Perkins (automated PR review)'.
   nefario-watch only DETECTS — it never writes the ledger. **Transition
   ownership:** merges are performed only by the human on GitHub; every ledger
-  transition (including `in-review  done` at close-out) is performed by Gru
+  transition (including `in-review  done` at close-out) is performed by Silas
   after verifying.
 - **GitLab:** review sensing is GitHub-only for now — GitLab has no native
   review states, so support is deliberately deferred. Planned mapping when
@@ -451,9 +533,11 @@ older briefings use that name; this is the same section.)
 - Manual wait/inspect: `herdr wait agent-status <pane> --status done --timeout N`.
   Treat `idle` and `done` as completed; `blocked` needs input.
 - **Clarify relay**: when a minion halts with numbered questions
-  (quick-dev step-01), paste them verbatim to the user, then send the reply
-  with `herdr agent send <pane> "<answers>"` (or the user answers directly
-  in the pane).
+  (quick-dev step-01), Silas escalates them verbatim to Gru (`herdr pane
+  run <gru-pane> "[SILAS] clarify: <job-id> — <questions>"`); Gru asks
+  the user, then hands the answers back to Silas, who relays with
+  `herdr pane run <pane> "<answers>"` (or the user answers directly in
+  the pane).
 - Ledger statuses: `dispatched → clarifying → working → in-review → done`
   (`blocked` any time). Minions self-report via `bin/ledger set`; Gru
   verifies and owns `done`.
@@ -507,7 +591,7 @@ Perkins may APPROVE and REQUEST_CHANGES; the human remains the only
 merger. GitHub only. Cap: **3 automated rounds per PR**, then escalate to
 the human. Full spec: `docs/perkins-pr-review-plan.md`.
 
-### Gru dispatch sequence (on the Perkins sensor message)
+### Silas dispatch sequence (on the Perkins sensor message)
 
 1. Verify: job still `in-review`; PR still OPEN; refresh the head sha
    (`gh pr view <pr> --json state,headRefOid`) — use the freshest sha,
@@ -635,11 +719,11 @@ usual "re-request review" step is unnecessary — the new sha is what
 re-triggers Perkins. The minion just fixes, pushes, and sets the ledger
 back to `in-review`.
 
-## Close-out (after the user acks the summary, or nefario-watch reports the PR merged)
+## Close-out (Silas — on the merge alert, or after the user acks via Gru)
 
 Order matters: ledger FIRST, panes LAST. The pane watcher diffs
 ledger-tracked panes every 30s — if a pane dies while the ledger still
-tracks it, Gru gets a false "pane vanished / Herdr restarted" alert.
+tracks it, Silas gets a false "pane vanished / Herdr restarted" alert.
 `clear-pane` first means the close is invisible to the watcher. Trade-off:
 if cleanup fails after the ledger flip, the ledger says `done` while
 debris remains — acceptable, since failures are reported to the user.
@@ -660,6 +744,8 @@ debris remains — acceptable, since failures are reported to the user.
 3. `herdr pane close <pane>` for the minion and any leftover mega-minion
    panes; close the tab if empty.
 4. `herdr notification show "done: <job-id>"`.
+5. Escalate one line to Gru (`herdr pane run <gru-pane> "[SILAS] done:
+   <job-id> — <result>"`) — victories reach the user.
 
 Note: `herdr worktree remove` only works while the workspace is rooted at
 the worktree; since panes are moved into the orchestrator workspace, cleanup
@@ -672,27 +758,27 @@ update the ledger's `pane_id` fields; never trust ids from an old session.
 ### In-review panes and slot contention
 
 Keep in-review panes open by default — the same minion can take review
-feedback with full context. **Reclaim on contention**: when Gru needs a
+feedback with full context. **Reclaim on contention**: when Silas needs a
 slot for a new dispatch and none is free, close the oldest in-review panes
 first (worktrees/branches stay; review rounds go to a fresh minion with the
 PR + branch + briefing as context — the PR's "Decisions & rationale"
 section is what makes this safe). Also close in-review panes that have sat
-unacked for > 3 days (mention it in the readiness report).
+unacked for > 3 days (escalate to Gru for the readiness report).
 
 ## Concurrency
 
 Two tiers, both policy (Herdr itself enforces no limit):
 
-- **Minions (Gru-dispatched task jobs): max 10 panes** by default; ask the
-  user before exceeding. **2026-07-21: user lifted the cap until further
-  notice** — dispatches may exceed 10 minions; the ~20 total-agent-pane
-  safety valve below still applies.
+- **Minions (dispatched task jobs): max 10 panes** by default; Silas
+  escalates to Gru before exceeding. **2026-07-21: user lifted the cap
+  until further notice** — dispatches may exceed 10 minions; the ~20
+  total-agent-pane safety valve below still applies.
 - **Mega-minions (minion-spawned helpers): max 10 concurrent child panes
   per minion** (e.g. the 7-perspective code-review swarm fits in one wave).
   Mega-minion panes do NOT count against the 10-job cap — they are bursty
   and short-lived — but every one must be closed before its minion finishes.
 - **Safety valve:** if total agent panes in the orchestrator workspace
-  exceed ~20, pause new dispatches and check with the user.
+  exceed ~20, Silas pauses new dispatches and escalates to Gru.
 
 ## Skills availability
 

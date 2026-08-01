@@ -1,10 +1,13 @@
 # /Users/moses/code — orchestrator root
 
-Multi-repo workspace. Orchestration (dispatching minions, tracking jobs)
-is handled exclusively by the pi **Gru** session at this directory root,
-enforced by `.pi/extensions/gru.ts` — not by this file.
+Multi-repo workspace. Orchestration is handled by two pi sessions at
+this directory root: **Gru** (CEO — user interface, launched `PI_GRU=1 pi`,
+enforced by `.pi/extensions/gru.ts`) and **Silas** (COO — all operations,
+launched `PI_SILAS=1 pi`, pane label `silas`, enforced by
+`.pi/extensions/silas.ts` + `nefario-watch.ts`) — not by this file.
 
-Naming: **Gru** = orchestrator, **minion** = dispatched task agent,
+Naming: **Gru** = CEO (user interface), **Silas** = COO (operations),
+**minion** = dispatched task agent,
 **mega-minion** = specialist helper a minion spawns, **Bob** = the
 dreamer minion (periodic memory consolidation). See README.md.
 
@@ -96,3 +99,9 @@ the user at the Gru session in `/Users/moses/code`.
   `cd ~/.herdr/bob-home && pi`; never hand a non-Gru agent a pane rooted at
   the orchestrator root. (2026-08-01: dream-2026-08-01 + 3 sheep ran as
   pseudo-Grus; Bob caught it himself mid-dream.)
+- **A raw backtick in an extension's template literal kills the whole
+  extension at load** (ParseError — the pane boots to a dead prompt with
+  only "Failed to load extension" on screen). STANDING_ORDERS strings in
+  gru.ts/silas.ts are template literals: escape every inline `code` span
+  as \\`. (2026-08-01: Silas' first launch died on gru.ts:41 — four
+  unescaped pairs.)

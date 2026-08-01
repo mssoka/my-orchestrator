@@ -94,10 +94,11 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 
 ---
 
-## Gru close-out (not part of the briefing)
+## Silas close-out (not part of the briefing)
 
-1. Read the report; apply **auto** proposals to the live files; relay the
-   **user-ack** list to the user with the report path.
+1. Read the report; apply **auto** proposals to the live files; escalate
+   the **user-ack** list to Gru (`herdr pane run` the pane labeled `gru`)
+   with the report path — Gru relays to the user.
 2. Write the marker: `date -u +%Y-%m-%dT%H:%M:%SZ > _bmad-output/memory/last-dream`.
 3. `bin/ledger set dream-<yyyy-mm-dd> done "<counts>"` + clear-pane; close
    Bob's pane (sheep must already be badged out — verify `herdr agent list`).

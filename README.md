@@ -1,19 +1,21 @@
 # Orchestrator root (`~/code`)
 
-Multi-repo workspace run by a single pi **Gru** session. Gru receives
-intent, dispatches work to minions in Herdr worktrees, relays their
-questions, tracks them in a SQLite ledger, and never implements or merges
-itself.
+Multi-repo workspace run by two pi sessions: **Gru** (CEO — the user
+interface: intake, briefings, dispatch decisions, escalations) and **Silas**
+(COO — runs all operations: watcher alerts, ledger transitions, close-outs,
+relays, Perkins rounds, dream dispatches). Minions do the work in Herdr
+worktrees; Gru never implements or merges.
 
-Naming theme (Despicable Me): **Gru** = the orchestrator, **minion** = a
+Naming theme (Despicable Me): **Gru** = the CEO (user interface),
+**Silas (Ramsbottom)** = the COO (all operations), **minion** = a
 dispatched task agent (one per job), **mega-minion** = a specialist helper a
 minion spawns (e.g. a review swarm), **Perkins** = the automated PR-review
 agent (posts verdicts as the `perkins-review` GitHub App), **Bob** = the
 dreamer minion (periodic memory consolidation; his per-source readers are
 **sheep**),
-**nefario-watch** = the watcher gadget. Gru also *speaks* in character
-to the user (playbook: "Gru persona (voice)") — artifacts like briefings
-and ledger notes stay plain.
+**nefario-watch** = the watcher gadget (alerts Silas, never Gru). Gru also
+*speaks* in character to the user (playbook: "Gru persona (voice)") —
+artifacts like briefings and ledger notes stay plain.
 
 - Operating procedure: [docs/orchestration-playbook.md](docs/orchestration-playbook.md)
 - Interactive explainer (open in a browser):
@@ -337,22 +339,28 @@ use but orchestration doesn't — adk-*, sentry-*, etc. — stay in
 
 ### 6. Launch and smoke-test
 
-1. Inside Herdr, `cd <root>` and run `pi`. The workspace you launch in
-   becomes the orchestrator workspace — no id is hardcoded anywhere; the
-   Gru re-resolves it via `herdr agent list` each session.
-2. `session_start` fires: the startup checklist arrives as a user message →
-   Gru reads the playbook, runs `bin/ledger`, reconciles against
-   `herdr agent list`, and replies with a readiness report.
-3. Confirm the system prompt contains "Gru standing orders" (injected
-   every turn, survives compaction) and that nefario-watch loaded without
-   errors (it silently snapshots on `session_start`).
+1. Inside Herdr, `cd <root>` and run `PI_GRU=1 pi`. The workspace you
+   launch in becomes the orchestrator workspace — no id is hardcoded
+   anywhere; Gru re-resolves it via `herdr agent list` each session.
+   Rename the pane `gru` (`herdr pane rename <pane> gru`).
+2. `session_start` fires (gru.ts hooks are gated on `PI_GRU=1`): the
+   startup checklist arrives as a user message → Gru reads the playbook,
+   runs `bin/ledger` (read-only), checks for the `silas` pane — and
+   spawns him if missing: new tab, label `silas`, `PI_SILAS=1 pi` (the
+   silas.ts hooks + nefario-watch sensors are gated on `PI_SILAS=1`).
+3. Confirm both system prompts ("Gru standing orders" in the `gru` pane,
+   "Silas standing orders" in the `silas` pane) and that nefario-watch
+   loaded in Silas' session without errors (it silently snapshots on
+   `session_start`).
 4. Optional: dispatch one tiny job end-to-end to validate worktree creation,
    pane moves, briefing handoff, self-reporting, and watcher alerts.
 
 ### 7. Notes
 
-- The extensions only fire when `cwd` is exactly the root — sessions in
-  repos or worktrees never orchestrate (by design).
+- The extensions fire only when `cwd` is exactly the root AND the
+  session's env opts in (`PI_GRU=1` for gru.ts, `PI_SILAS=1` for silas.ts
+  + nefario-watch) — sessions in repos, worktrees, or Bob's subdir home
+  never orchestrate (by design).
 - Gru never implements in main checkouts and never merges PRs; max 10
   Gru-dispatched task panes unless the user says otherwise; minions may
   fan out max 10 concurrent child panes each (closed before the parent
