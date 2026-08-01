@@ -232,9 +232,13 @@ store, one reader per source, proposals with reasoning.)
 
 ## Intake (Gru)
 
-1. **Resolve repo.** Auto-detect: any directory under `/Users/moses/code`
-   containing `.git`. Match the user's name case-insensitively; if ambiguous,
-   list candidates and ask. No allow-list — the user owns all repos.
+1. **Resolve repo.** The allow-list is `managed-repos.txt` (repo root,
+   Gru-managed on the user's instruction): one directory name per line,
+   `#` comments. Only listed repos are under Gru's management — match the
+   user's name case-insensitively against LISTED entries; if ambiguous,
+   list candidates and ask. If the requested repo is NOT listed, stop and
+   ask the user: adopt it into the allow-list (their call) or stay out.
+   Never intake an unlisted repo on your own initiative.
 2. **Resolve base branch.** `develop` if it exists (RightTenantry repos),
    else the remote HEAD default (`main`/`master`).
 3. **Ask only blocking questions** (usually 0–3). Detailed requirements
