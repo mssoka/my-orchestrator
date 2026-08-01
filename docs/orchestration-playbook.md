@@ -611,8 +611,11 @@ pattern.
   a scratch pane with a wake wrapper:
   ```bash
   herdr pane run <scratch-pane> \
-    "npx -y lavish-axi poll <path> && herdr pane run <gru-pane> '[LAVISH] feedback on <path>'"
+    "npx -y lavish-axi poll <path> ; herdr pane run <gru-pane> '[LAVISH] feedback on <path>'"
   ```
+  Separator MUST be `;` not `&&` — the poll exits NONZERO when the user
+  Send & Ends the session (2026-08-01: the `&&` wake never fired; Silas
+  relayed by hand).
   Poll returns → wake message lands → Gru relays/applies. Chat answers
   short-circuit the loop: kill the scratch poll and `lavish-axi end
   <path>`. If the poll dies unwatched, re-run — queued feedback is never
