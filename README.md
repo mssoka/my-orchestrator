@@ -323,10 +323,17 @@ formal reviews (they fall back to PR comments via your own `gh` auth).
 ### 5. Make skills visible to pi
 
 ```bash
-mkdir -p ~/.pi/agent/skills
-for d in <root>/.agents/skills/bmad-*; do ln -sfn "$d" ~/.pi/agent/skills/; done
-ln -sfn ~/.agents/skills/herdr ~/.pi/agent/skills/herdr
+mkdir -p ~/.pi/agent/skills ~/.claude/skills
+for d in <root>/.agents/skills/*; do ln -sfn "$d" ~/.pi/agent/skills/; done
+# code-review / review-plan / herdr also live in the repo — link them for Claude Code too:
+for s in code-review review-plan herdr; do ln -sfn <root>/.agents/skills/$s ~/.claude/skills/$s; done
+ln -sfn <root>/.agents/skills/herdr ~/.agents/skills/herdr
 ```
+
+(The repo's `.agents/skills/` is git-tracked and self-contained: bmad-*,
+gds-*, lavish, code-review, review-plan, herdr. Skills your other projects
+use but orchestration doesn't — adk-*, sentry-*, etc. — stay in
+`~/.agents/skills` / `~/.claude/skills` untouched.)
 
 ### 6. Launch and smoke-test
 

@@ -568,29 +568,19 @@ the human. Full spec: `docs/perkins-pr-review-plan.md`.
   Every lens reviews these identical bytes. (Absolute path — the round
   worktree is destroyed at close-out, so artifacts live in the
   orchestrator's `_bmad-output`.)
-- Spawn the **7 lenses** as mega-minions in one wave, per the
-  `code-review` skill's reviewer definitions: **blind** (diff only — no
-  repo access, no framing), **edge**, **acceptance** (briefing + issue as
-  spec), **security**, **architecture**, **codebase**, **tests**.
-  Pane mechanics: do NOT repeatedly `herdr pane split --current` — it
-  subdivides your own pane. Create a dedicated tab once, then split the
-  lens panes off a fresh pane in it (`herdr pane split <pane-id>
-  --direction right|down`), labeling each `mm-<lens>-r<N>`. Each writes
-  one JSON findings array (skill schema:
-  source/severity/category/title/location/evidence/detail/recommended_fix,
-  accuracy mandate verbatim) to the ABSOLUTE path
-  `/Users/moses/code/_bmad-output/perkins/<job-id>/r<N>/<lens>.json`
-  (paste the full path into the lens brief — lenses must not derive it),
-  then stops. **Before treating the wave as done, verify all 7 files
-  exist at those exact paths** — a lens that wrote elsewhere (e.g. under
-  `<job-id>-r<N>/`) is recovered by moving its file, not re-running.
-  You MUST close every mega-minion pane before finishing.
-- **Verification pass (mandatory, per the skill's Step 3b):** every
-  finding is presumed false-positive until you re-verify it against the
-  worktree yourself. Discard rejected findings; demote unverifiable
-  blockers to `[unverified]` warnings. Record the counts.
-- Consolidate: dedupe on (title, location), merge sources, triage into
-  blocker/warning/note, surface the reviewer-agreement set first.
+- Run the lenses per the `code-review` skill's **Headless / Automated
+  Mode** with: `diff_file` = the canonical diff just saved, `worktree` =
+  your cwd (the detached round worktree), `spec_files` = the original job
+  briefing + the GitHub issue (dump it with `gh issue view <n> --json
+  title,body,comments` into the round dir first), `out_dir` =
+  `/Users/moses/code/_bmad-output/perkins/<job-id>/r<N>`, and
+  `prior_findings` = the previous round's `consolidated.json` when N > 1
+  (re-review: fix audit first, carry-forward markers). The headless mode
+  owns: pane mechanics (dedicated tab, `mm-<lens>-r<N>` labels), the
+  `<lens>.json` output contract + existence check, one retry per failed
+  lens, big-diff chunking, the mandatory verification pass, consolidation,
+  and writing `consolidated.json`. Its verdict thresholds are yours below.
+  You MUST close every lens pane before finishing.
 - **Verdict → review event:**
   - 0 blockers → `--approve`
   - 1–3 blockers → `--request-changes`
@@ -702,16 +692,21 @@ Two tiers, both policy (Herdr itself enforces no limit):
 
 ## Skills availability
 
-Canonical home: `/Users/moses/code/.agents/skills/` — every `bmad-*` skill
-there is symlinked into `~/.pi/agent/skills/`, so pi agents see them from
-any cwd (including worktrees). The `gds-*` suite (BMad Game Dev Studio)
-is wired the same way; the `_bmad/gds` module config lives per game
-project — ANY repo can become one: install BMGD into that repo's `_bmad`,
-then propagate `_bmad/gds` + `config.toml` + `_config/` into its existing
-worktrees (fresh dispatches get it via the bootstrap copy; check with
-`[ -d <repo>/_bmad/gds ]`). Skill-listing greps must use `^bma[dg]-|^gds-`,
-not `^bmad-`. The `lavish` skill (HTML artifact review loop, see its
-section above) is installed the same way. The herdr skill is already global. `_bmad`
+Canonical home: `/Users/moses/code/.agents/skills/` — **git-tracked since
+2026-08-01 (self-containment)**: the repo carries its whole skill set —
+`bmad-*`, `gds-*`, `lavish`, `code-review` + `review-plan` (Perkins'
+review skills, imported from `~/.claude/skills`), and `herdr` (deduped
+from identical copies in `~/.agents/skills` and `~/.claude/skills`).
+Everything is symlinked into `~/.pi/agent/skills/` (and the three imports
+also into `~/.claude/skills/`, herdr also into `~/.agents/skills/`), so pi
+agents see them from any cwd (including worktrees). User-general skills
+(adk-*, cadquery, sentry-*, etc.) stay outside — not orchestration needs.
+The `gds-*` suite (BMad Game Dev Studio) is wired the same way; the
+`_bmad/gds` module config lives per game project — ANY repo can become
+one: install BMGD into that repo's `_bmad`, then propagate `_bmad/gds` +
+`config.toml` + `_config/` into its existing worktrees (fresh dispatches
+get it via the bootstrap copy; check with `[ -d <repo>/_bmad/gds ]`).
+Skill-listing greps must use `^bma[dg]-|^gds-`, not `^bmad-`. `_bmad`
 project config is copied into each worktree at dispatch.
 
 Gru lists the available `bmad-*` skills at every session start (startup
