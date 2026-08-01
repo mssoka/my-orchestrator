@@ -189,8 +189,13 @@ store, one reader per source, proposals with reasoning.)
   dispatching.
 - **Dispatch:** ledger id `dream-<yyyy-mm-dd>`, pane label the same,
   briefing from `_bmad-output/briefings/_template-dream.md`. No repo, no
-  worktree — Bob works in `/Users/moses/code` (read-only on everything
-  except the dream dir). One pane; his readers (**sheep**) are
+  worktree — launch Bob with `cd /Users/moses/.herdr/bob-home && pi` so his
+  cwd is his own home, NEVER `/Users/moses/code` (gru.ts + the root
+  AGENTS.md key on that cwd: a pi launched there gets the Gru checklist as
+  a user message and Gru standing orders every turn — 2026-08-01:
+  dream-2026-08-01 and 3 sheep ran contaminated). Everything under
+  `/Users/moses/code` is read-only to him except the dream dir; the
+  briefing uses absolute paths. One pane; his readers (**sheep**) are
   mega-minions under the usual cap, closed before Bob finishes.
 - **The pass** (maps the Anthropic diagram):
   1. **Clone ($MEM → $MEM_OUT):** snapshot the mutable memory —

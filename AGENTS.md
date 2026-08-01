@@ -79,3 +79,10 @@ the user at the Gru session in `/Users/moses/code`.
   `herdr pane read` before acting; most of these are noise needing no
   ledger write and no user relay. (2026-07-29: six alerts, four were
   settles.)
+- **A pi launched with cwd=`/Users/moses/code` IS Gru** — gru.ts guards on
+  `ctx.cwd` alone, so the session gets the startup checklist as a user
+  message + Gru standing orders every turn, and its session file lands in
+  Gru's own session dir. Dream passes launch Bob with
+  `cd ~/.herdr/bob-home && pi`; never hand a non-Gru agent a pane rooted at
+  the orchestrator root. (2026-08-01: dream-2026-08-01 + 3 sheep ran as
+  pseudo-Grus; Bob caught it himself mid-dream.)

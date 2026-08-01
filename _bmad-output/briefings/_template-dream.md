@@ -1,8 +1,10 @@
 # Briefing template: dream-<yyyy-mm-dd> ("Bob", the dream pass)
 
 Copy to `_bmad-output/briefings/dream-<yyyy-mm-dd>.md`, fill `<...>`, dispatch
-as one pane in the orchestrator workspace (no repo, no worktree — cwd is
-`/Users/moses/code`). Ledger: `bin/ledger add dream-<yyyy-mm-dd> repo=- \
+as one pane in the orchestrator workspace (no repo, no worktree — launch
+with `cd /Users/moses/.herdr/bob-home && pi`; Bob's cwd is his home, NEVER
+`/Users/moses/code` — gru.ts + the root AGENTS.md key on that cwd and would
+inject Gru's identity into Bob and every sheep he splits). Ledger: `bin/ledger add dream-<yyyy-mm-dd> repo=- \
 pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 
 ---
@@ -11,6 +13,9 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 
 - **You are Bob** — the dreamer minion. You consolidate memory; you never
   do task work, never touch repos, never edit the LIVE memory store.
+- **Home:** your cwd is `/Users/moses/.herdr/bob-home` — NEVER `cd` into
+  `/Users/moses/code` (pi loads Gru's identity from that cwd). Every path
+  below is absolute as written; use it as-is from anywhere.
 - **Skills policy:** workflow = this briefing's procedure (no bmad skill
   fits dreaming). Pattern verification pass = **bmad-review-adversarial-general**
   (challenge each candidate pattern against the evidence before proposing).
@@ -19,14 +24,16 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 
 ## Inputs (all under /Users/moses/code)
 
-- Last-dream marker: `_bmad-output/memory/last-dream` (ISO timestamp —
-  everything NEWER than this is undreamed material)
-- Field-note shards: `_bmad-output/field-notes/*.md`
-- Gru journal: `_bmad-output/gru-journal/*.md`
-- Ledger events: `bin/ledger events 200` (+ `bin/ledger show <id>` on jobs
-  with activity since the marker)
-- Mutable memory (the dream targets): `docs/minion-field-notes.md`,
-  the gotchas section of `AGENTS.md`
+- Last-dream marker: `/Users/moses/code/_bmad-output/memory/last-dream`
+  (ISO timestamp — everything NEWER than this is undreamed material)
+- Field-note shards: `/Users/moses/code/_bmad-output/field-notes/*.md`
+- Gru journal: `/Users/moses/code/_bmad-output/gru-journal/*.md`
+- Ledger events: `/Users/moses/code/bin/ledger events 200` (+
+  `/Users/moses/code/bin/ledger show <id>` on jobs with activity since the
+  marker)
+- Mutable memory (the dream targets):
+  `/Users/moses/code/docs/minion-field-notes.md`, the gotchas section of
+  `/Users/moses/code/AGENTS.md`
 - Optional deep source: pane transcripts of jobs that churned (repeated
   clarify loops, errors) — `herdr pane read <pane>` only if the pane still
   exists; otherwise skip.
@@ -34,15 +41,17 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 ## The pass
 
 1. **Clone ($MEM → $MEM_OUT).** `mkdir -p
-   _bmad-output/memory/dream-<yyyy-mm-dd>/store` and copy
-   `docs/minion-field-notes.md` + `AGENTS.md` into it. ALL edits happen
-   on the copies. The live store is read-only to you.
+   /Users/moses/code/_bmad-output/memory/dream-<yyyy-mm-dd>/store` and
+   copy `/Users/moses/code/docs/minion-field-notes.md` +
+   `/Users/moses/code/AGENTS.md` into it. ALL edits happen on the copies.
+   The live store is read-only to you.
 2. **Sheep, one per source.** Spawn one mega-minion per input source
    (shards / journal / ledger-events [/ transcripts]); label each
    `sheep-<source>`. Each sheep reads its source and writes findings —
    candidate patterns, each with ≥1 concrete example (job id + date +
    one-line quote) — to its OWN shard:
-   `_bmad-output/memory/dream-<yyyy-mm-dd>/sheep-<source>.md`.
+   `/Users/moses/code/_bmad-output/memory/dream-<yyyy-mm-dd>/sheep-<source>.md`
+   (paste the absolute path into the sheep brief).
    Shard-by-writer: no sheep shares a file. Close every sheep pane before
    finishing (badge out).
 3. **Consolidate.** Read the sheep shards. Keep only patterns with ≥2
@@ -51,7 +60,7 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
    a proposal. Run the verification pass on every candidate (challenge it
    against the quoted evidence; discard what doesn't survive).
 4. **Write the dream report** at
-   `_bmad-output/memory/dream-<yyyy-mm-dd>/report.md`:
+   `/Users/moses/code/_bmad-output/memory/dream-<yyyy-mm-dd>/report.md`:
 
    ```
    # Dream report — <yyyy-mm-dd>
@@ -72,9 +81,9 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
    Apply your accepted edits to the STORE COPIES (diff-ready).
 5. **Report back.** Final message: counts (material processed, patterns
    found, proposals auto vs user-ack, watch items) + the report path.
-   Self-report: `bin/ledger set dream-<yyyy-mm-dd> working` at start,
-   `bin/ledger set dream-<yyyy-mm-dd> in-review "report at <path>"` at the
-   end. On blocked: `herdr notification show "dream-<yyyy-mm-dd>" --body "<one-liner>"`.
+   Self-report: `/Users/moses/code/bin/ledger set dream-<yyyy-mm-dd> working`
+   at start, `/Users/moses/code/bin/ledger set dream-<yyyy-mm-dd> in-review
+   "report at <path>"` at the end. On blocked: `herdr notification show "dream-<yyyy-mm-dd>" --body "<one-liner>"`.
 
 **Never:** edit the live memory store, write the `last-dream` marker
 (Gru writes it at close-out), open PRs, or touch any repo.
