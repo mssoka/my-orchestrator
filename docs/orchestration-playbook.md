@@ -811,3 +811,23 @@ Gru lists the available `bmad-*` skills at every session start (startup
 checklist) and names skills explicitly in every briefing (Intake step 6) —
 minions and mega-minions should never have to guess which bmad skill
 applies.
+
+### bmad updates
+
+Skill files are **disposable by design** — every bmad skill ships a
+`customize.toml` stamped "DO NOT EDIT — overwritten on every update".
+Our customizations live OUTSIDE the skills in `_bmad/custom/<skill>.toml`
+(untracked, per-machine — the updater never touches them). So updates are
+safe; the flow is manual:
+
+1. Run the bmad installer/update (writes fresh vanilla `bmad-*`/`gds-*`
+   skill files).
+2. Check where it wrote: `~/.pi/agent/skills/bmad-*` are symlinks INTO
+   the repo — if the installer wrote through them, the update already
+   landed in `/Users/moses/code/.agents/skills`; if it REPLACED the
+   symlinks with real dirs, copy the new skill dirs into
+   `.agents/skills/` and re-create the symlinks.
+3. `git diff .agents/skills` — review what bmad changed, commit, push.
+
+Never hand-edit skill files (clobbered on the next update) — overrides go
+in `_bmad/custom/`.
