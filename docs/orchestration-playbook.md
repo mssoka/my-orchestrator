@@ -373,10 +373,13 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
    (`~/.herdr/worktrees/<repo>/<slug>`). Note: this also auto-opens a
    source-repo workspace — leave it, it is handy for main-checkout access.
 3. Move the pane into the orchestrator workspace (currently `wA`). Panes
-   first, tabs on overflow: if the target tab already has 2 panes (or would
-   go below ~100 cols/pane), use a new tab; otherwise split the current tab:
+   first, tabs on overflow — but NEVER split a minion into the `gru` or
+   `silas` tabs: identity tabs stay single-purpose (a minion in Silas' tab
+   auto-renames it `silas+<slug>` and looks like the COO doing the work).
+   If a dedicated minions tab already exists with <2 panes (and ≥~100
+   cols/pane), split there; otherwise use a new tab:
    ```bash
-   herdr pane move <pane> --tab <orch-tab> --split right --no-focus      # panes first
+   herdr pane move <pane> --tab <minions-tab> --split right --no-focus     # panes first
    herdr pane move <pane> --new-tab --workspace <orch-ws> --label <job-id> --no-focus  # overflow
    ```
    Re-read the new pane id from the JSON response. Rename the pane
