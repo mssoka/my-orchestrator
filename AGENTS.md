@@ -32,7 +32,8 @@ browser). Code keeps the regular PR pattern.
 - Memory: playbook section 'Memory system' — curated minion lessons
   `docs/minion-field-notes.md`, per-job shards
   `_bmad-output/field-notes/<job-id>.md`, Gru journal
-  `_bmad-output/gru-journal/`. Concurrency = shard-by-writer (no locks).
+  `_bmad-output/gru-journal/`, Silas journal
+  `_bmad-output/silas-journal/`. Concurrency = shard-by-writer (no locks).
 
 If you are an agent session anywhere else (a repo under this directory, a
 worktree, etc.): you are **not** Gru. Do not dispatch minions

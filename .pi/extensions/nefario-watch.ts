@@ -286,7 +286,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			`mkdir -p "${MEMORY_DIR}"; ` +
 			`if [ ! -f "${DREAM_MARKER}" ]; then date -u +%Y-%m-%dT%H:%M:%SZ > "${DREAM_MARKER}"; echo BASELINE; exit 0; fi; ` +
 			`mm=$(stat -f %m "${DREAM_MARKER}"); now=$(date +%s); age=$((now-mm)); ` +
-			`nc=$(find "${GRU_DIR}/_bmad-output/field-notes" "${GRU_DIR}/_bmad-output/gru-journal" -type f -newer "${DREAM_MARKER}" 2>/dev/null | wc -l | tr -d ' '); ` +
+			`nc=$(find "${GRU_DIR}/_bmad-output/field-notes" "${GRU_DIR}/_bmad-output/gru-journal" "${GRU_DIR}/_bmad-output/silas-journal" -type f -newer "${DREAM_MARKER}" 2>/dev/null | wc -l | tr -d ' '); ` +
 			`echo "$mm $age $nc $(date -u -r $mm +%Y-%m-%dT%H:%M:%SZ)"`;
 		const r = await pi.exec("bash", ["-c", script], { timeout: 5000 });
 		if (r.code !== 0) return null;
@@ -308,7 +308,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		const days = Math.floor(Number(age) / 86400);
 		return (
 			`- Bob is sleepy: ${days} day(s) since the last dream (${iso}), ` +
-			`${count} undreamed memory file(s) (field-notes shards + Gru journal). ` +
+			`${count} undreamed memory file(s) (field-notes shards + Gru/Silas journals). ` +
 			"Dispatch the dream pass per playbook 'Dreaming (periodic memory " +
 			"consolidation)': ledger id `dream-<yyyy-mm-dd>`, briefing from " +
 			"`_bmad-output/briefings/_template-dream.md`. The marker " +

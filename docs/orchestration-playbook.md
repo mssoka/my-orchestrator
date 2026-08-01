@@ -201,6 +201,7 @@ with a session, a compaction, or a worktree.
 | Curated field notes | `docs/minion-field-notes.md` | **Gru only** | durable minion lessons, promoted from shards |
 | Field-note shards | `_bmad-output/field-notes/<job-id>.md` | the job's minion | what bit THIS job, ≤3 one-liners at badge-out |
 | Gru journal | `_bmad-output/gru-journal/<yyyy-mm-dd>.md` | **Gru only** | episodes: what happened, decisions, open loops |
+| Silas journal | `_bmad-output/silas-journal/<yyyy-mm-dd>.md` | **Silas only** | ops episodes: alerts handled, transitions, close-outs, escalations |
 | Gotchas | `AGENTS.md` | **Gru only** | Gru's own curated traps |
 | Minion memlog | `<worktree>/_bmad/scripts/memlog.py` | the minion | in-job scratchpad — commits with the branch, travels into the PR |
 | Briefings + PR "Decisions & rationale" | `_bmad-output/briefings/`, GitHub | Gru / minions | handoff memory — a fresh minion can take over cold |
@@ -209,10 +210,15 @@ with a session, a compaction, or a worktree.
 
 - **Startup (Gru and Silas):** Gru reads the playbook roles/intake +
   ledger (read-only) + last journal entries; Silas runs his own checklist
-  (playbook ops sections + ledger + herdr reconcile + catch-up). The
-  journal is Gru's rehydration layer; the ledger is Silas'.
+  (playbook ops sections + ledger + herdr reconcile + catch-up + his last
+  journal entries). Each journal is its owner's rehydration layer —
+  Gru's for decisions and user arcs, Silas' for operations; the ledger
+  backs Silas'.
 - **Wind-down / after significant arcs (Gru):** append to today's journal
   file — what happened, decisions, open loops. Five lines beats zero.
+- **Wind-down / after significant arcs (Silas):** append to today's
+  silas-journal file — alerts handled, ledger transitions, close-outs,
+  escalations, dead-pi relaunches. Five lines beats zero.
 - **Gotcha discipline (Gru and Silas):** every fumble ends in `AGENTS.md`
   gotchas or a field note, same session — never "I'll remember it". Gru
   writes Gru-session gotchas; Silas writes operational ones.
@@ -228,9 +234,9 @@ with a session, a compaction, or a worktree.
    `field-notes/<job-id>.md`; no two writers ever share a file, so
    contention is impossible by construction. Even a 10-mega-minion swarm
    has ONE writer: the parent minion.
-2. **Single-writer curated files.** Silas edits the curated notes,
-   AGENTS.md ops gotchas, and this playbook; Gru edits only his journal.
-   Minions never touch shared docs. Minions READ the curated notes at
+2. **Single-writer curated files.** Silas edits his journal, the curated
+   notes, AGENTS.md ops gotchas, and this playbook; Gru edits only his
+   journal. Minions never touch shared docs. Minions READ the curated notes at
    start (read-only = free).
 3. **Shared mutable state lives in SQLite, not files.** The ledger
    serializes writers (WAL + `PRAGMA busy_timeout=5000`); that is why
@@ -253,7 +259,8 @@ store, one reader per source, proposals with reasoning.)
   `_bmad-output/memory/last-dream` — the timestamp of the last COMPLETED
   dream, written only at completion (never at dispatch, so material
   arriving mid-dream is not falsely marked dreamed). Due = marker older
-  than 2 days AND ≥1 undreamed file in `field-notes/` or `gru-journal/`.
+  than 2 days AND ≥1 undreamed file in `field-notes/`, `gru-journal/`,
+  or `silas-journal/`.
   Manual: the user can ask Gru, who tells Silas to dream anytime. Only
   ONE dream pass at a time — check `bin/ledger json` for a non-done
   `dream-*` row before dispatching.
@@ -273,7 +280,8 @@ store, one reader per source, proposals with reasoning.)
      `_bmad-output/memory/dream-<yyyy-mm-dd>/store/`. Bob and the sheep
      NEVER edit the live store.
   2. **Sheep, one per source:** (a) field-note shards newer than the
-     marker, (b) journal entries newer than the marker, (c) ledger events
+     marker, (b) journal entries (Gru + Silas journals, one sheep reads
+     both) newer than the marker, (c) ledger events
      since the marker (`bin/ledger events 200`, `bin/ledger show` on jobs
      with activity), (d) optional: pane transcripts of jobs that churned
      (repeated clarify loops, errors). Each sheep writes findings to its

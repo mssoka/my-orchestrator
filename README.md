@@ -133,6 +133,7 @@ remember nothing across restarts — these files are the brain.
 | **Curated field notes** | `docs/minion-field-notes.md` | **Gru only** | durable minion lessons, promoted from shards |
 | **Field-note shards** | `_bmad-output/field-notes/<job-id>.md` | the job's minion | what bit THIS job — ≤3 one-liners at badge-out |
 | **Gru journal** | `_bmad-output/gru-journal/<yyyy-mm-dd>.md` | **Gru only** | episodes: what happened, decisions, open loops |
+| **Silas journal** | `_bmad-output/silas-journal/<yyyy-mm-dd>.md` | **Silas only** | ops episodes: alerts, transitions, close-outs, escalations |
 | **Gotchas** | `AGENTS.md` | **Gru only** | Gru's own curated traps |
 | **Minion memlog** | `<worktree>/_bmad/scripts/memlog.py` | the minion | in-job scratchpad — commits with the branch, travels into the PR |
 | **Briefings + PR "Decisions & rationale"** | `_bmad-output/briefings/`, GitHub | Gru / minions | handoff memory — a fresh minion takes over cold |
@@ -143,8 +144,14 @@ remember nothing across restarts — these files are the brain.
   list` reconcile + the last few journal entries
   (`ls -t _bmad-output/gru-journal | head -3`). Enforced by
   `.pi/extensions/gru.ts`.
+- **Startup rehydration (Silas):** ops playbook sections + `bin/ledger` +
+  `herdr agent list` reconcile/catch-up + the last few entries of HIS
+  journal (`ls -t _bmad-output/silas-journal | head -3`). Enforced by
+  `.pi/extensions/silas.ts`.
 - **Wind-down (Gru):** append to today's journal — what happened,
   decisions, open loops.
+- **Wind-down (Silas):** append to today's silas-journal — alerts
+  handled, transitions, close-outs, escalations.
 - **Gotcha discipline (Gru):** every fumble becomes an AGENTS.md gotcha
   or a field note, same session.
 - **Badge-out (minion):** write your shard
@@ -227,6 +234,7 @@ Target state:
 │   ├── backups/                     # SQL dumps — NOT tracked
 │   ├── field-notes/<job-id>.md      # minion lesson shards (see § Memory)
 │   ├── gru-journal/<yyyy-mm-dd>.md  # Gru episodic journal (see § Memory)
+│   ├── silas-journal/<yyyy-mm-dd>.md # Silas ops journal (see § Memory)
 │   ├── memory/last-dream + dream-*/ # Bob's marker + dream passes (§ Memory)
 │   └── briefings/_template.md       # briefing template
 └── <repo1>/ <repo2>/ ...            # repos, each with .git and its own _bmad/

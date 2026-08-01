@@ -32,6 +32,7 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
   (ISO timestamp — everything NEWER than this is undreamed material)
 - Field-note shards: `/Users/moses/code/_bmad-output/field-notes/*.md`
 - Gru journal: `/Users/moses/code/_bmad-output/gru-journal/*.md`
+- Silas journal: `/Users/moses/code/_bmad-output/silas-journal/*.md`
 - Ledger events: `/Users/moses/code/bin/ledger events 200` (+
   `/Users/moses/code/bin/ledger show <id>` on jobs with activity since the
   marker)
@@ -50,7 +51,8 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
    `/Users/moses/code/AGENTS.md` into it. ALL edits happen on the copies.
    The live store is read-only to you.
 2. **Sheep, one per source.** Spawn one mega-minion per input source
-   (shards / journal / ledger-events [/ transcripts]); label each
+   (shards / journals / ledger-events [/ transcripts] — the journals
+   sheep reads BOTH gru-journal and silas-journal); label each
    `sheep-<source>`. Each sheep reads its source and writes findings —
    candidate patterns, each with ≥1 concrete example (job id + date +
    one-line quote) — to its OWN shard:
