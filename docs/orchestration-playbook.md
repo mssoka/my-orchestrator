@@ -523,7 +523,12 @@ older briefings use that name; this is the same section.)
      v1. Failure modes: review bodies are capped (~1500 chars — full text
      at the review URL); PRs with >100 reviews can fall back to the bare PR
      URL; baselines are in-memory, so a Gru restart silently re-baselines
-     (no catch-up — "no alert" ≠ "no reviews while Gru was down").
+     (no catch-up — "no alert" ≠ "no reviews while Gru was down"). The
+     cover is the startup ritual's catch-up step: a fresh Silas runs a
+     direct `gh pr view` sweep on every in-review PR (reviews, CI, merge
+     state) and re-escalates anything unacked — a fresh session cannot
+     verify an earlier escalation reached the user, and the escalation
+     matrix prices a duplicate reminder at one line.
   5. **Perkins sensor (same 5-min tick):** for jobs with ledger
      `pr_review=1`, alerts when an OPEN PR's head sha has no review round
      yet — durable dedup via ledger round rows (`parent=<job-id>`, note
@@ -760,6 +765,34 @@ When the review sensor relays Perkins' CHANGES_REQUESTED, the minion's
 usual "re-request review" step is unnecessary — the new sha is what
 re-triggers Perkins. The minion just fixes, pushes, and sets the ledger
 back to `in-review`.
+
+### Round-budget ops (dream-2026-08-03, P13 — user-approved)
+
+Three practices codified from the field; all preserve the 3-round cap
+for shas that are true merge candidates.
+
+- **Skip-row policy.** A docs-only/noise head or a known-broken sha (a
+  pending review's blockers apply to it equally) is NOT a merge
+  candidate — don't burn a round on it. Instead record
+  `bin/ledger add <job-id>-perkins-skip-<short-sha> parent=<job-id>
+  status=done note="sha=<full-40> round SKIPPED: <reason>"` — the sha in
+  the note dedups the sensor durably (a done row never mutes future
+  dispatches). **Always `gh pr view <pr> --json headRefOid` for the full
+  40-char sha first — a short-sha note silently fails dedup.** The fix
+  push then gets the real round. (Payoff sighted: stepper-f1's r3
+  APPROVED 0B because two skips kept the final round for the merge
+  candidate.)
+- **Proactive next-round dispatch.** When the minion's fix push lands,
+  dispatch the next round immediately (verify the PR head sha matches
+  the push first) with `prior_findings` handed over — don't wait for the
+  5-min sensor tick. Precondition: write the round row + full-sha note
+  in the SAME minute; that durable write is what makes later sensor
+  ticks dedup silently (a same-minute race produces one stale echo —
+  note-only it).
+- **Sensor echoes are expected.** Relay/escalate/dispatch happens at
+  round close-out; the sensor re-fires the same event seconds-to-minutes
+  later. Answer every echo with a same-status `ledger note` ("already
+  relayed — no double X"), never a second action.
 
 ## Close-out (Silas — on the merge alert, or after the user acks via Gru)
 
