@@ -162,3 +162,19 @@ findings that keep recurring. One line per entry, dated, with the job id.
   a regression pin per fix.
 - Supabase security-definer views bypassing RLS (Perkins r1 blocker on PR
   #556, 2026-08-01) — single sighting, still watching.
+pproved p13
+- 2026-08-03 (righttenantry-refcheck-privacy-draft; lavish): a lavish
+  session-end can STRAND queued-but-undelivered prompts — the user's
+  verdict ('Approve — open the PR') sat in ~/.lavish-axi/state.json
+  (session prompts, by uid) while the poll exited on session-end having
+  delivered only the earlier rulings. Before declaring "no verdict was
+  given", check state.json's session prompts as ground truth. Wake-poll
+  corollary: a poll that exits on session-end may miss the final queue —
+  drain-then-exit, or check state.json after exit.
+- 2026-08-03 (finlit-architecture-v1 gate-drill): a typed message in a
+  minion pane CAN be the user talking directly (they do that — e.g. a
+  bare 'approved' at a lavish gate). Provenance still matters: an
+  out-of-band verdict gets VERIFIED via Gru before acting on it (Silas'
+  halt was correct protocol; the confirmation came back within the
+  hour). If the user answers you directly in your pane, note it in your
+  ledger self-report so the orchestrator doesn't chase a phantom.

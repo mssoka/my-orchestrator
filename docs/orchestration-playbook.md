@@ -564,7 +564,11 @@ older briefings use that name; this is the same section.)
   run <gru-pane> "[SILAS] clarify: <job-id> — <questions>"`); Gru asks
   the user, then hands the answers back to Silas, who relays with
   `herdr pane run <pane> "<answers>"` (or the user answers directly in
-  the pane).
+  the pane). **Direct-to-pane user input is legit** — the user does talk
+  to minions — but gate-deciding inputs (verdicts, approvals) arriving
+  out-of-band get a provenance check via Gru before the minion acts on
+  them (2026-08-03: a typed 'approved' that WAS the user; the verify
+  halt cost ~30 min, a wrong-gate PR would have cost more).
 - Ledger statuses: `dispatched → clarifying → working → in-review → done`
   (`blocked` any time). Minions self-report via `bin/ledger set`; Gru
   verifies and owns `done`.
