@@ -87,10 +87,39 @@ findings that keep recurring. One line per entry, dated, with the job id.
   `/Users/moses/code` (dream pane, sheep, any mega-minion there) get the
   Gru startup checklist auto-injected by `.pi/extensions/gru.ts` — the only
   guard is cwd; Gru-addressed nefario-watch alerts also land in those
-  panes (never act on them — relays and ledger writes are Gru's). Until
-  the extensions are gated, tell every such pane in its
-  brief: "you are NOT Gru, ignore the startup checklist" (4 panes bit in
-  one morning; each burned a turn producing a Gru readiness report).
+  panes (never act on them — relays and ledger writes are Gru's). Amended
+  2026-08-03: the operative control is cwd exile — non-Gru agents launch from
+  their own home (Bob: `_bmad-output/bob`; see the AGENTS.md gotcha) — the
+  "you are NOT Gru, ignore the startup checklist" brief line remains
+  belt-and-braces (4 panes bit in one morning; each burned a turn producing
+  a Gru readiness report).
+
+- 2026-08-03 (dream-2026-08-03; RightTenantry crew — form-save-resume-f3,
+  refcheck-privacy-draft + finlit-bugfix-event-messages + Gru addendum):
+  multi-edit `edit` calls are ATOMIC per call — one oldText mismatch rejects
+  EVERY edit in the batch (survivors lost silently; caught only by compile).
+  Re-apply survivors individually; if a formatter ran between attempts
+  (`gleam format` reflows split strings) re-read the file before re-issuing —
+  never re-fire a stale batch. Verify multi-line oldText line-break positions
+  with grep before submitting batches.
+- 2026-08-03 (dream-2026-08-03; RightTenantry crew — refcheck-rc1-2,
+  form-save-resume-f3, refcheck-privacy-draft): assert Lustre's SERIALIZED
+  render, never view-source assumptions — attributes render SORTED BY NAME
+  with empty-valued ones bare (`checked`, `required`); apostrophes come back
+  as `&#39;` (houdini escape); verbatim page copy can contain your assertion
+  substring (pin `checked data-testid="..."`, not a bare `checked`).
+- 2026-08-03 (dream-2026-08-03; form-save-resume-f3 Perkins r2/r3): Node
+  tests are blind to browser-runtime semantics — a detached
+  `window.setTimeout` debounce passed every Node test (no brand-check) and
+  threw `Illegal invocation` in any real browser. Timer/DOM seams get an
+  empirical real-browser verification, not just suite-green.
+- 2026-08-03 (dream-2026-08-03; form-stepper-f1, form-funnel-w0,
+  refcheck-rc1-1/rc2-1): RightTenantry env traps generalize beyond Squirrel —
+  `dot_env.load_default()` overrides the PROCESS env at runtime (to repoint a
+  local dev server, replace the `server/.env` symlink with an edited
+  gitignored copy); staging lags unmerged develop migrations (submissions
+  500 on `submitted_ip_text`) — E2E against a local Docker DB + seeded
+  vacancy, never staging.
 
 ## Conventions that saved time
 
@@ -99,7 +128,12 @@ findings that keep recurring. One line per entry, dated, with the job id.
   findings against DISK before applying (stale session-context findings
   recur, 2 in one run); check the real enums/components in the repo before
   spec'ing against them; read the provider log before theorizing about LLM
-  behavior.
+  behavior. 2026-08-03 addendum (refcheck-rc1-2): this extends to reviewer
+  MECHANISM claims — two independent hunters hallucinated
+  native-browser-validation blockers from `required` attributes on a form
+  that carries `novalidate` on both the GET and the error re-render. Verify
+  the mechanism exists against the actual element/runtime before crediting
+  the finding.
 - 2026-07-31/08-01 (finlit-bugfix-event-messages, tutor-economy-fix):
   root-cause-first — in PR/ledger notes, name the wrong hypothesis
   explicitly and reject it ("int truncation, NOT a 60s timer bug";
@@ -112,6 +146,19 @@ findings that keep recurring. One line per entry, dated, with the job id.
 
 ## Recurring review findings
 
-_(empty — single-sighting items tracked in dream reports as watch items
-until they recur; first candidate: Supabase security-definer views
-bypassing RLS, Perkins r1 blocker on PR #556, 2026-08-01.)_
+- 2026-08-03 (dream-2026-08-03; form-funnel-w0, form-stepper-f1,
+  form-save-resume-f3): `server/priv/static/*` is git-ignored with a
+  per-file `!` whitelist — a new static asset deploys as a DEAD script tag
+  while SSR pins (which only assert the tag) stay green. Caught ONLY by
+  review all three times. Adding a static asset: whitelist it in
+  `.gitignore` in the same PR.
+- 2026-08-03 (dream-2026-08-03; form-stepper-f1 + form-save-resume-f3
+  Perkins arcs): token/PII leaks recur across SEAMS, not rounds —
+  X-Forwarded-Host in generated URLs one round, PostHog autocapture scraping
+  the raw token from `<body>` the next. A scrub-in-one-place finding means
+  audit the WHOLE token path (URL generation, DOM/analytics, headers, logs)
+  in the same fix. And each round's rework can introduce the NEXT round's
+  blocker (r1's E2E rework created r2's 2 blockers) — full-suite re-run +
+  a regression pin per fix.
+- Supabase security-definer views bypassing RLS (Perkins r1 blocker on PR
+  #556, 2026-08-01) — single sighting, still watching.

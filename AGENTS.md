@@ -93,6 +93,19 @@ the user at the Gru session in `/Users/moses/code`.
   `herdr pane read` before acting; most of these are noise needing no
   ledger write and no user relay. (2026-07-29: six alerts, four were
   settles.)
+- **Silas: a deliverable is not reported until it reaches Gru's input.**
+  Text in Silas' own pane output is thinking-out-loud — Gru only sees
+  what arrives via `herdr pane run <gru-pane> "[SILAS] ..."`. Every
+  completed ops task (PRs opened, close-outs, dispatches) ends with that
+  one-line message carrying the deliverables (URLs, pane ids). (2026-08-01:
+  research PRs #559/#560 went unreported; Gru relayed the URLs himself.)
+- **Silas: minions never split into identity tabs.** Dispatch step 3:
+  the `gru` and `silas` tabs carry their owner only — minion panes go to
+  a dedicated minions tab or a new tab labeled `<job-id>`; after any
+  accidental split, move the minion out AND relabel the identity tab
+  back to its bare owner name. (2026-08-01: form-stepper-f1 launched as
+  a split of the silas tab; t2 kept 'silas+form-stepper-f1' after the
+  move until relabeled.)
 - **A pi launched with cwd=`/Users/moses/code` IS Gru** — gru.ts guards on
   `ctx.cwd` alone, so the session gets the startup checklist as a user
   message + Gru standing orders every turn, and its session file lands in
@@ -106,3 +119,40 @@ the user at the Gru session in `/Users/moses/code`.
   gru.ts/silas.ts are template literals: escape every inline `code` span
   as \\`. (2026-08-01: Silas' first launch died on gru.ts:41 — four
   unescaped pairs.)
+- **Provider incidents come in 3 classes with different recoveries
+  (2026-08-02/03).** Transient stalls, mid-turn refusals, and
+  connection-error waves all leave a LIVE pi with `stopReason:"error"` in
+  the session jsonl — `herdr pane run <pane> "continue"` revives them (one
+  continue per pane, no loops; a fleet wave = one continue per pane, then
+  verify any reviewed sha is unchanged). An account-wide quota 403 is
+  different: panes are DEAD and `continue` does nothing — sweep the dead
+  panes, re-add the worktree at the same sha, re-dispatch the SAME round
+  row with a regenerate-everything amendment (stale partial lens JSONs
+  contaminate the verdict), and take another job's activity as evidence
+  the quota lifted. Second failure -> `blocked` + escalate. (2026-08-02:
+  quota 403 killed Perkins r2 mid-round — retry run clean, 21/21 lens
+  verdicts regenerated; same day a connection wave blocked 9 panes, all
+  revived with continue x9.)
+- **Review/Perkins/cap sensors re-fire already-acted events — expect one
+  stale echo per action (2026-08-01/02).** Silas relays/escalates/
+  dispatches at round close-out; the sensor tick lands seconds-to-minutes
+  later and re-alerts the same review/sha/cap. Distinct from settle
+  transitions: answer every echo with a same-status `ledger note`
+  ("already relayed — no double X"), never a second action. Durable dedup
+  (round row + full-sha note written the SAME minute as the dispatch) is
+  what silences per-tick re-alerts; when two sensors race (review-sensor
+  vs pane-watcher), relay on whichever arrives FIRST and note-only the
+  twin. (2026-08-02: three races in one day on PR #563 alone.)
+- **Perkins can self-close its round row (2026-08-02).** Closing the
+  Perkins pane writes `working -> done` before Silas' close-out
+  `set done`, which then no-ops (same-status) and eats the verdict
+  detail. Write the verdict as a pre-emptive `ledger note` at close-out
+  instead of discovering the loss later.
+- **Ground truth for pane forensics is the session jsonl, not env
+  scraping (2026-08-01/03).** The bash tool's env is NOT a proxy for a
+  pane's pi process env (PI_GRU/PI_SILAS are invisible to it). Which
+  extensions are armed = the jsonl's entry types (`custom_message` =
+  extension-injected; `message` role=user = typed). A worktree's session
+  dir holds the minion's AND its mega-minions' sessions (shared cwd) —
+  identify the live pane's file via `herdr pane get <pane>` agent_session,
+  never by newest mtime.
