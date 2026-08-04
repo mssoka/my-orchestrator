@@ -99,63 +99,52 @@ redistribution; keep the repo private.)_
 Ledger statuses: `dispatched → clarifying → working → in-review → done`
 (`blocked` any time).
 
-## Dynamic orchestration — the system that never stops
+## Dynamic orchestration — models and workflows chosen at runtime
 
-The orchestrator never hardcodes a model, a review strategy, or a dispatch
-sequence. Every decision is made **dynamically** at dispatch time, based
-on what the task needs and what the providers offer. This is what makes
-the system resilient to outages, budgets, and capability gaps — and what
-makes it dramatically cheaper than pinning everything to one expensive
-model.
+No model, review strategy, or dispatch sequence is hardcoded. Every
+decision is made at dispatch time, based on what the task needs and what
+the providers offer. This makes the system resilient to provider outages
+and quota limits — and dramatically cheaper than pinning everything to one
+expensive model.
 
-### Each minion gets the right tool
+### Model autonomy
 
-Gru and Silas choose the model per-minion at dispatch — carried in the
-briefing's **Model policy**, passed at launch (`pi --model <model>`). No
-code changes, no redeploy. Change the briefing, change the model.
+Each minion gets the right model for its job, chosen by Gru or Silas at
+dispatch and carried in the briefing's **Model policy**. No code changes,
+no redeploy — change the briefing, change the model.
 
 | Task type | Model choice | Why |
 |---|---|---|
 | Complex implementation | Strongest available | Hard reasoning, multi-file edits |
-| Perkins review rounds | Cheaper / faster | Pattern-matching review work |
+| Automated review rounds | Cheaper / faster | Pattern-matching review work |
 | Docs / copy / specs | Any model that resolves | Text generation is commoditized |
 | Visual verification | Vision-capable model | Needs to evaluate screenshots |
-| Routine ops | Whatever's healthy | No capability requirement |
 
-**Self-healing fleet:** when a provider hits a quota wall, an outage, or
-degraded quality, the orchestrator adapts in real-time. Running minions
-stay on their model (zero context loss); new dispatches launch on
-whatever's healthy. The user is never blocked — the CEO desk (merges,
-decisions, deploys) doesn't depend on any single provider's availability.
+### Self-healing fleet
 
-A weekly usage limit on one provider doesn't stop the machine — it
-redirects the fleet to alternatives and keeps building until the quota
-resets. Multi-model concurrency means one pane can write code on a
-flagship model while another runs review on a budget model and a third
-drafts docs on a third provider — all tracked by job, not by model.
+When a provider hits a quota wall or an outage, the orchestrator adapts in
+real-time: running minions stay on their model (zero context loss); new
+dispatches launch on whatever's healthy. The user is never blocked — the
+CEO desk (merges, decisions, deploys) doesn't depend on any single
+provider. A usage limit on one provider redirects the fleet to alternatives
+and keeps building until the quota resets.
 
-**Provider-qualification rule:** always use the full provider-qualified
-path (`provider/model`, not bare `model`) — bare labels can resolve to the
-wrong provider. If a model fails to resolve at launch, Silas escalates —
-he never improvises auth.
+### Multi-model concurrency
+
+Multiple minions run concurrently on different models — one pane writes
+code on a flagship model while another runs review on a budget model and a
+third drafts docs on a third provider. The orchestrator tracks each by job,
+not by model — the fleet is provider-agnostic.
 
 ### Beyond models — the workflow itself is dynamic
 
-The same principle extends to HOW work gets done:
-
-- **Review strategy** — Perkins is opt-in per job; the briefing decides
-  whether a PR gets automated review. Perkins itself chooses lens
-  allocation and round count based on the PR's diff.
+- **Review strategy** — automated PR review is opt-in per job; the system
+  chooses lens allocation and round count based on the diff.
 - **Dispatch sequencing** — jobs that touch the same files run in series;
-  independent jobs run in parallel. Gru decides the order from the codebase
-  graph, not from a config file.
-- **Memory cadence** — the dream sensor triggers consolidation based on
-  undreamed material volume, not a fixed schedule.
-- **Resource allocation** — pane caps, Perkins serialization, and the
+  independent jobs run in parallel. The order comes from the codebase
+  graph, not a config file.
+- **Resource allocation** — pane caps, review serialization, and the
   safety valve all respond to live fleet state, not static limits.
-
-No config file decides any of this. The agents read the situation and
-adapt — the way a real ops team would.
 
 ## Daily ops
 
