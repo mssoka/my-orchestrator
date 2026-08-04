@@ -99,31 +99,63 @@ redistribution; keep the repo private.)_
 Ledger statuses: `dispatched → clarifying → working → in-review → done`
 (`blocked` any time).
 
-## Model autonomy
+## Dynamic orchestration — the system that never stops
 
-Gru and Silas choose the model for each minion at dispatch time — it is
-never hardcoded. The briefing's **Model policy** names the model (or
-`unset` for pi's default resolution), and Silas passes it at launch:
-`pi --model <model>`. This lets the orchestrator adapt without code
-changes:
+The orchestrator never hardcodes a model, a review strategy, or a dispatch
+sequence. Every decision is made **dynamically** at dispatch time, based
+on what the task needs and what the providers offer. This is what makes
+the system resilient to outages, budgets, and capability gaps — and what
+makes it dramatically cheaper than pinning everything to one expensive
+model.
 
-- **Provider incidents** — a quota wall or outage on one provider?
-  Redirect the next dispatch to another. Running minions stay on their
-  model; new ones launch on whatever's healthy. (2026-08-04: a kimi
-  weekly-limit wall sent the fleet to `deepseek-v4-flash` and
-  `zai-coding-cn/glm-5.2` mid-session — zero downtime, zero code changes.)
-- **Cost / capability tuning** — Perkins rounds can run on a cheaper model
-  than the primary build; vision-heavy stories wait for a vision-capable
-  model; docs-only jobs run on anything that resolves.
-- **Multi-model fleet** — multiple minions run concurrently on different
-  models. The orchestrator doesn't care which provider a pane uses — only
-  that it's working.
+### Each minion gets the right tool
 
-**Model-qualification rule:** always use the full provider-qualified path
-(`zai-coding-cn/glm-5.2`, not bare `glm-5.2`) — bare labels can resolve to
-the wrong provider (2026-08-04: bare `glm-5.2` routed to `opencode`, which
-had no key). If a model fails to resolve at launch, Silas escalates — he
-never improvises auth.
+Gru and Silas choose the model per-minion at dispatch — carried in the
+briefing's **Model policy**, passed at launch (`pi --model <model>`). No
+code changes, no redeploy. Change the briefing, change the model.
+
+| Task type | Model choice | Why |
+|---|---|---|
+| Complex implementation | Strongest available | Hard reasoning, multi-file edits |
+| Perkins review rounds | Cheaper / faster | Pattern-matching review work |
+| Docs / copy / specs | Any model that resolves | Text generation is commoditized |
+| Visual verification | Vision-capable model | Needs to evaluate screenshots |
+| Routine ops | Whatever's healthy | No capability requirement |
+
+**Self-healing fleet:** when a provider hits a quota wall, an outage, or
+degraded quality, the orchestrator adapts in real-time. Running minions
+stay on their model (zero context loss); new dispatches launch on
+whatever's healthy. The user is never blocked — the CEO desk (merges,
+decisions, deploys) doesn't depend on any single provider's availability.
+
+A weekly usage limit on one provider doesn't stop the machine — it
+redirects the fleet to alternatives and keeps building until the quota
+resets. Multi-model concurrency means one pane can write code on a
+flagship model while another runs review on a budget model and a third
+drafts docs on a third provider — all tracked by job, not by model.
+
+**Provider-qualification rule:** always use the full provider-qualified
+path (`provider/model`, not bare `model`) — bare labels can resolve to the
+wrong provider. If a model fails to resolve at launch, Silas escalates —
+he never improvises auth.
+
+### Beyond models — the workflow itself is dynamic
+
+The same principle extends to HOW work gets done:
+
+- **Review strategy** — Perkins is opt-in per job; the briefing decides
+  whether a PR gets automated review. Perkins itself chooses lens
+  allocation and round count based on the PR's diff.
+- **Dispatch sequencing** — jobs that touch the same files run in series;
+  independent jobs run in parallel. Gru decides the order from the codebase
+  graph, not from a config file.
+- **Memory cadence** — the dream sensor triggers consolidation based on
+  undreamed material volume, not a fixed schedule.
+- **Resource allocation** — pane caps, Perkins serialization, and the
+  safety valve all respond to live fleet state, not static limits.
+
+No config file decides any of this. The agents read the situation and
+adapt — the way a real ops team would.
 
 ## Daily ops
 
@@ -285,7 +317,7 @@ The root is itself a git repo with a whitelist `.gitignore` tracking only
 the orchestrator system files:
 
 ```bash
-git clone git@github.com:mssoka/my-orchestrator.git <root>
+git clone <your-orchestrator-repo-url> <root>
 ```
 
 Tracked: `.gitignore`, `AGENTS.md`, `CLAUDE.md`, `README.md`, `docs/`,
@@ -311,8 +343,8 @@ need env can't run until they exist.
 
 ```bash
 cd <root>
-rg -l '/Users/moses/code' .pi docs AGENTS.md _bmad-output bin \
-  | xargs sed -i '' 's|/Users/moses/code|<root>|g'
+rg -l '<root-abs-path>' .pi docs AGENTS.md _bmad-output bin \
+  | xargs sed -i '' 's|<root-abs-path>|<root>|g'
 ```
 
 Verify by hand: `MAYOR_DIR`/`PLAYBOOK`/`LEDGER_*` in `.pi/extensions/gru.ts`
