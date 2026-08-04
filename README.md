@@ -75,8 +75,9 @@ redistribution; keep the repo private.)_
 2. **Briefing** — written to `_bmad-output/briefings/<job-id>.md`.
 3. **Dispatch** — `herdr worktree create`, pane moved into the orchestrator
    workspace, worktree bootstrapped (`_bmad` copy, `.env` symlinks),
-   `bin/ledger add <job-id> …` (status `dispatched`), pi launched, handover
-   message sent.
+   `bin/ledger add <job-id> …` (status `dispatched`), pi launched with the
+   briefing's **Model policy** (see [Model autonomy](#model-autonomy)
+   below), handover message sent.
 4. **Work** — minion runs bmad-quick-dev. On every status change it
    self-reports: `bin/ledger set <job-id> <status> "<note>"`.
 5. **Clarify relay** — if it halts with numbered questions, nefario-watch sees
@@ -97,6 +98,32 @@ redistribution; keep the repo private.)_
 
 Ledger statuses: `dispatched → clarifying → working → in-review → done`
 (`blocked` any time).
+
+## Model autonomy
+
+Gru and Silas choose the model for each minion at dispatch time — it is
+never hardcoded. The briefing's **Model policy** names the model (or
+`unset` for pi's default resolution), and Silas passes it at launch:
+`pi --model <model>`. This lets the orchestrator adapt without code
+changes:
+
+- **Provider incidents** — a quota wall or outage on one provider?
+  Redirect the next dispatch to another. Running minions stay on their
+  model; new ones launch on whatever's healthy. (2026-08-04: a kimi
+  weekly-limit wall sent the fleet to `deepseek-v4-flash` and
+  `zai-coding-cn/glm-5.2` mid-session — zero downtime, zero code changes.)
+- **Cost / capability tuning** — Perkins rounds can run on a cheaper model
+  than the primary build; vision-heavy stories wait for a vision-capable
+  model; docs-only jobs run on anything that resolves.
+- **Multi-model fleet** — multiple minions run concurrently on different
+  models. The orchestrator doesn't care which provider a pane uses — only
+  that it's working.
+
+**Model-qualification rule:** always use the full provider-qualified path
+(`zai-coding-cn/glm-5.2`, not bare `glm-5.2`) — bare labels can resolve to
+the wrong provider (2026-08-04: bare `glm-5.2` routed to `opencode`, which
+had no key). If a model fails to resolve at launch, Silas escalates — he
+never improvises auth.
 
 ## Daily ops
 
