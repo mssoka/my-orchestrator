@@ -1,5 +1,5 @@
 /**
- * nefario-watch — idle/blocked detection for minions + PR merge/CI/review
+ * nefario-watch — idle/blocked detection for minions + PR merge/conflict/CI/review
  * sensing + Perkins review-dispatch sensing.
  *
  * Project-local: acts only when cwd is /Users/moses/code AND the session
@@ -49,6 +49,15 @@
  * Standalone PR conversation comments are ignored (v1); no author/bot
  * filtering. Detection-only: nefario-watch never writes the ledger and
  * never sends pane input — Silas owns every relay and ledger transition.
+ *
+ * Conflict sensor (same 5-min tick): a tracked in-review PR became
+ * unmergeable — mergeable=CONFLICTING / mergeStateStatus=DIRTY (the base
+ * moved since the branch diverged, e.g. a sibling PR merged to it first;
+ * 2026-08-04 PR #577 incident). Alerts once per state TRANSITION
+ * (CONFLICTING → clean → CONFLICTING = two alerts); same-state re-polls
+ * never re-alert. The message tells Silas to relay the rebase instruction
+ * to the minion pane. BLOCKED/BEHIND/UNKNOWN are deliberately NOT
+ * conflict signals (branch protection, review gates, async computation).
  *
  * Perkins sensor (same 5-min tick): for jobs opted in via the ledger
  * `pr_review=1` flag, wakes Silas to dispatch a Perkins automated-review
@@ -264,6 +273,9 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 	const prStates = new Map<string, string>();
 	/** job_id already alerted for a terminal state — alert once, ever. */
 	const prAlerted = new Set<string>();
+	/** Conflict sensor: job_id -> last merge-conflict state observed
+	 * ("CONFLICTING" | "CLEAN") — alerts on transitions only. */
+	const conflictState = new Map<string, string>();
 	/** job_id -> head sha already CI-alerted on (deleted when checks recover). */
 	const ciAlerted = new Map<string, string>();
 	/** job_id -> review node ids already seen (baselined silently on first
@@ -394,6 +406,12 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		/** Names of checks that completed with a failing conclusion. */
 		failing: string[];
 		reviews: PrReview[];
+		/** GitHub mergeability ("MERGEABLE" | "CONFLICTING" | "UNKNOWN" | ...). */
+		mergeable: string | null;
+		/** GitHub merge-state status ("DIRTY" = conflicts; "BLOCKED" etc.). */
+		mergeStateStatus: string | null;
+		/** Base branch the PR targets — used in the rebase relay. */
+		baseRef: string | null;
 	}
 
 	const FAIL_CONCLUSIONS = new Set([
@@ -406,7 +424,13 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 	async function prInfo(url: string): Promise<PrInfo | null> {
 		const r = await pi.exec(
 			"gh",
-			["pr", "view", url, "--json", "state,headRefOid,statusCheckRollup,reviews"],
+			[
+				"pr",
+				"view",
+				url,
+				"--json",
+				"state,headRefOid,statusCheckRollup,reviews,mergeable,mergeStateStatus,baseRefName",
+			],
 			{ timeout: 20_000 },
 		);
 		if (r.code !== 0) return null; // gh missing/offline/rate-limited — skip
@@ -445,6 +469,10 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 				headSha: typeof j?.headRefOid === "string" ? j.headRefOid : null,
 				failing,
 				reviews,
+				mergeable: typeof j?.mergeable === "string" ? j.mergeable : null,
+				mergeStateStatus:
+					typeof j?.mergeStateStatus === "string" ? j.mergeStateStatus : null,
+				baseRef: typeof j?.baseRefName === "string" ? j.baseRefName : null,
 			};
 		} catch {
 			return null;
@@ -495,6 +523,41 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 				prStates.set(job.id, info.state);
 				const terminal = info.state === "MERGED" || info.state === "CLOSED";
 				if (!terminal) {
+					// Conflict sensor: a tracked in-review PR became unmergeable
+					// (mergeable=CONFLICTING / mergeStateStatus=DIRTY — e.g. a
+					// sibling PR merged to the base first, 2026-08-04 PR #577).
+					// Alert once per state TRANSITION; clean re-arms, same-state
+					// re-polls never re-alert. BLOCKED/BEHIND/UNKNOWN are not
+					// conflict signals (protection, review gates, computation).
+					const conflicted =
+						info.mergeable === "CONFLICTING" ||
+						info.mergeStateStatus === "DIRTY";
+					if (conflicted && conflictState.get(job.id) !== "CONFLICTING") {
+						conflictState.set(job.id, "CONFLICTING");
+						const pm = PR_URL.exec(job.pr.trim());
+						const prNum = pm ? "#" + pm[4] : job.pr;
+						const base = info.baseRef ?? "<base>";
+						const relay =
+							'`herdr pane run <pane> "' +
+							prNum +
+							" CONFLICTING — rebase onto " +
+							base +
+							', force-push"`';
+						alerts.push(
+							`- ${job.id}: MERGE CONFLICT — ${job.pr}` +
+								(job.pane_id ? ` (pane ${job.pane_id})` : "") +
+								` — ${prNum} is CONFLICTING (mergeStateStatus ` +
+								`${info.mergeStateStatus ?? "?"}); the base moved since ` +
+								"this branch diverged. " +
+								"Relay to the minion pane: " +
+								relay +
+								" (git rebase origin/" +
+								base +
+								", then `git push --force-with-lease`).",
+						);
+					} else if (!conflicted) {
+						conflictState.set(job.id, "CLEAN");
+					}
 					// CI sensor: alert once per head sha while checks fail.
 					if (info.failing.length === 0) {
 						ciAlerted.delete(job.id); // recovered/pending — re-arm
@@ -617,7 +680,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 				{
 					customType: "nefario-watch",
 					content:
-						`[nefario-watch · ${stamp()}] PR/CI/review/Perkins/dream alert on in-review job(s):\n` +
+						`[nefario-watch · ${stamp()}] PR/CI/conflict/review/Perkins/dream alert on in-review job(s):\n` +
 						alerts.join("\n") +
 						"\nDetection only: nefario-watch never writes the ledger or " +
 						"sends pane input — Silas owns every relay and ledger transition.",
