@@ -610,26 +610,29 @@ pattern.
   (`npx -y lavish-axi poll <path>`) and relays, or dispatches a fresh
   minion with the artifact path. Watcher note: a polling minion shows
   `working` — that is waiting, not stuck.
-- **Gru/Silas-originated clarify sessions (herdr-wake poll, 2026-08-01):**
-  when Gru (or Silas) builds the artifact himself (ruling pages,
-  escalation clarifies), the skill's foreground-poll rule BLOCKS the
-  orchestrator's chat turn — unacceptable. The skill permits a background
-  poll when a verified wake callback exists in the surrounding supervisor;
-  herdr IS that supervisor. Pattern: open the session, present the
-  questions in chat too (user may answer either way), and run the poll in
-  a scratch pane with a wake wrapper:
+- **Gru/Silas-originated lavish sessions — MINION STEWARD (2026-08-05,
+  replaces herdr-wake as the primary pattern):** when Gru or Silas needs
+  a lavish artifact (ruling pages, capsule concepts, escalation
+  clarifies), **dispatch a small minion to own the session end-to-end**
+  rather than running the poll in Gru/Silas's own pane. The minion builds
+  (or receives) the artifact, opens the session, foreground-polls per the
+  skill's default — its pane blocks on the poll, which is NORMAL for a
+  minion (it's working, not stuck). User annotates in the browser →
+  minion receives feedback → applies → relays results to Gru/Silas via
+  `herdr notification show` or pane message. Gru/Silas stay free for chat
+  and ops. This mirrors how producing minions already handle lavish
+  successfully; the orchestrators just shouldn't own the session
+  themselves.
+  **Fallback (herdr-wake poll):** if spawning a minion is too heavy for a
+  tiny one-off artifact, the earlier herdr-wake wrapper still works — run
+  the poll in a scratch pane with a `;`-separated wake:
   ```bash
   herdr pane run <scratch-pane> \
     "npx -y lavish-axi poll <path> ; herdr pane run <gru-pane> '[LAVISH] feedback on <path>'"
   ```
-  Separator MUST be `;` not `&&` — the poll exits NONZERO when the user
-  Send & Ends the session (2026-08-01: the `&&` wake never fired; Silas
-  relayed by hand).
-  Poll returns → wake message lands → Gru relays/applies. Chat answers
-  short-circuit the loop: kill the scratch poll and `lavish-axi end
-  <path>`. If the poll dies unwatched, re-run — queued feedback is never
-  lost. (Learned 2026-08-01: a 25-min foreground poll held Gru's turn
-  hostage mid-clarify.)
+  Separator MUST be `;` not `&&` — the poll exits NONZERO on user Send &
+  End. But prefer the minion-steward pattern; it's cleaner and the
+  minion can apply feedback + iterate without round-trips through Gru.
 
 ## Perkins (automated PR review)
 
