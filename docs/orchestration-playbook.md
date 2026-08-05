@@ -488,7 +488,7 @@ older briefings use that name; this is the same section.)
 
 - Dashboard: `herdr agent list` and `/Users/moses/code/bin/ledger`. Gru
   reads these for boards on user request; Silas acts on them.
-- **nefario-watch** (`.pi/extensions/nefario-watch.ts`) has five sensors:
+- **nefario-watch** (`.pi/extensions/nefario-watch.ts`) has six sensors:
   1. **Pane watcher (30s):** diffs `herdr agent list` against ledger-tracked
      panes; injects a message into SILAS' session when one transitions to
      `idle`/`done`/`blocked` (or vanishes). On such a message: read the
@@ -533,6 +533,17 @@ older briefings use that name; this is the same section.)
      sha change). Cap: 3 automated rounds — a further new sha escalates
      once per sha ("human review needed"). On the dispatch message: run
      the sequence in 'Perkins (automated PR review)'.
+  6. **Conflict sensor (same 5-min tick):** alerts when an OPEN in-review
+     PR becomes unmergeable — `mergeable: CONFLICTING` / `mergeStateStatus:
+     DIRTY` (the base moved since the branch diverged; e.g. a sibling PR
+     merged to it first — 2026-08-04 PR #577 went undetected). Alerts once
+     per conflict-state TRANSITION (conflict → clean → conflict = two
+     alerts); same-state re-polls never re-alert. `BLOCKED`/`BEHIND`/
+     `UNKNOWN` are deliberately NOT conflict signals (branch protection,
+     review gates, async computation). On the alert: relay to the minion
+     pane — "PR #<n> CONFLICTING — rebase onto <base>, force-push"
+     (`git rebase origin/<base>` then `git push --force-with-lease`); the
+     CI/review/Perkins sensors pick up the new sha.
   nefario-watch only DETECTS — it never writes the ledger. **Transition
   ownership:** merges are performed only by the human on GitHub; every ledger
   transition (including `in-review  done` at close-out) is performed by Silas
