@@ -211,7 +211,8 @@ with a session, a compaction, or a worktree.
 - **Startup (Gru and Silas):** Gru reads the playbook roles/intake +
   ledger (read-only) + last journal entries; Silas runs his own checklist
   (playbook ops sections + ledger + herdr reconcile + catch-up + his last
-  journal entries). Each journal is its owner's rehydration layer —
+  journal entries — Silas' catch-up is the fresh-session board-check in
+  'Tracking (Silas)'). Each journal is its owner's rehydration layer —
   Gru's for decisions and user arcs, Silas' for operations; the ledger
   backs Silas'.
 - **Wind-down / after significant arcs (Gru):** append to today's journal
@@ -501,6 +502,25 @@ older briefings use that name; this is the same section.)
 
 - Dashboard: `herdr agent list` and `/Users/moses/code/bin/ledger`. Gru
   reads these for boards on user request; Silas acts on them.
+
+**Fresh-session board-check (before the first sensor tick).** On launch
+Silas re-orients (playbook + ledger + `herdr agent list`) during a window
+that opens *before* nefario-watch's first 30s/5min poll. An in-flight
+minion can transition `done`/`idle` in that gap with no relay — so a
+fresh Silas does NOT just wait for the first tick. Before settling into
+the watch loop, sweep **all non-done jobs** (`ledger all`) and **every
+idle pane** (`herdr agent list`): read each idle pane's transcript, close
+out any that finished, re-check every in-review PR directly with
+`gh pr view` (the review-sensor catch-up below names this sweep), and
+re-escalate anything unacked. **No-PR jobs need the closest look** —
+their completion falls through *both* watchers (the pane watcher drops
+done jobs; the PR watcher has no PR), so a finish that lands during the
+catch-up window is invisible unless Silas boards it manually. The
+righttenantry-gcp-cost-analysis no-PR finish slipped through exactly
+this gap on 2026-08-07 (deeper cause: a notification-compliance gap —
+see the AGENTS.md no-PR-done-mid-turn gotcha). This board-check is the
+"catch-up" the startup ritual names.
+
 - **nefario-watch** (`.pi/extensions/nefario-watch.ts`) has six sensors:
   1. **Pane watcher (30s):** diffs `herdr agent list` against ledger-tracked
      panes; injects a message into SILAS' session when one transitions to
@@ -658,6 +678,28 @@ Perkins may APPROVE and REQUEST_CHANGES; the human remains the only
 merger. GitHub only. Cap: **3 automated rounds per PR**, then escalate to
 the human. Full spec: `docs/perkins-pr-review-plan.md`.
 
+### When Perkins fires (default-armed)
+
+Within a job opted in via `pr_review=1`, Perkins fires on **every** head
+sha by default — every push is a merge candidate until proven otherwise,
+so it earns a round (up to the 3-round cap). Skipping is the exception,
+not the rule, and happens in exactly two ways:
+
+1. **Briefing Perkins-OFF** — Intake step 7 sets `pr_review=0` for a whole
+   job (docs/lavish/script-only deliverables, in-repo commits with no
+   merge intent). That job never fires Perkins, full stop.
+2. **Gru/Silas skip-row** — a *specific sha* may be skipped on judgment
+   (known-broken build, a fix push already inbound) and recorded as a
+   skip-row (mechanism in 'Round-budget ops'). This is per-sha, never
+   per-job.
+
+A docs-only / no-op head is **not** an automatic skip. RightTenantry
+PR #585 (a CSP doc PR whose directives were byte-identical to `develop`)
+still earned a useful r1 — Perkins APPROVED *READY TO MERGE*, i.e. it
+confirmed the no-op, which is itself the verdict. The default is armed
+even for trivial diffs; only an explicit waiver (briefing-OFF or a
+skip-row) mutes a round. (dream-2026-08-07 UA3.)
+
 ### Silas dispatch sequence (on the Perkins sensor message)
 
 1. Verify: job still `in-review`; PR still OPEN; refresh the head sha
@@ -788,12 +830,13 @@ back to `in-review`.
 
 ### Round-budget ops (dream-2026-08-03, P13 — user-approved)
 
-Three practices codified from the field; all preserve the 3-round cap
+Four practices codified from the field; all preserve the 3-round cap
 for shas that are true merge candidates.
 
-- **Skip-row policy.** A docs-only/noise head or a known-broken sha (a
-  pending review's blockers apply to it equally) is NOT a merge
-  candidate — don't burn a round on it. Instead record
+- **Skip-row policy.** The per-sha skip mechanism for 'When Perkins fires
+  (default-armed)' above: a known-broken sha (a pending review's blockers
+  apply to it equally), or — by explicit Gru/Silas waiver — a pure no-op
+  head, is not worth a round. Record it instead of dispatching:
   `bin/ledger add <job-id>-perkins-skip-<short-sha> parent=<job-id>
   status=done note="sha=<full-40> round SKIPPED: <reason>"` — the sha in
   the note dedups the sensor durably (a done row never mutes future
@@ -809,6 +852,19 @@ for shas that are true merge candidates.
   in the SAME minute; that durable write is what makes later sensor
   ticks dedup silently (a same-minute race produces one stale echo —
   note-only it).
+- **Proactive r2 on a fold-in (advisory notes).** A named trigger for the
+  proactive dispatch above: when a minion folds in Perkins' advisory
+  Notes/Warnings (N1/N2/...) pre-merge — not its blockers — the push is a
+  semantic delta, not a blocker fix. Silas dispatches r2 on the updated
+  sha immediately, briefed as a delta/fix-audit review with
+  `prior_findings=r1/consolidated.json`, instead of waiting for the
+  sensor tick to fire the round cold. The sensor re-ticks on the new sha
+  anyway, but the proactive r2 lands sooner and frames the verdict as
+  "delta since r1" rather than a fresh full pass. (Evidence:
+  RightTenantry #585 — r1 APPROVED with N1 "no test asserts
+  eu.posthog.com stays absent"; the user asked for N1 folded in
+  pre-merge; r2 ran fix-audit with `prior_findings=r1/consolidated.json`.
+  dream-2026-08-07 UA3.)
 - **Sensor echoes are expected.** Relay/escalate/dispatch happens at
   round close-out; the sensor re-fires the same event seconds-to-minutes
   later. Answer every echo with a same-status `ledger note` ("already
