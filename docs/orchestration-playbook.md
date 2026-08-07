@@ -404,7 +404,20 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
      Env files in subdirectories: list them explicitly in the briefing and
      symlink the same way. Gitignore rules apply in the worktree too, so the
      symlinks are never committed.
-   - Tell the minion in the briefing which env files were linked.
+   - **JS repos — `node_modules`** (gitignored, so absent from the worktree):
+     a fresh worktree ships no `node_modules`, so `make build` (and any
+     tooling that needs `tailwindcss`/`vite`/etc.) fails on
+     `command not found` before a single test runs. **Symlink** it from
+     the main checkout — the base branch shares the same deps so this is
+     safe, and it's gitignored so it's never committed:
+     ```bash
+     [ -d <repo_root>/node_modules ] && [ ! -e <worktree>/node_modules ] \
+       && ln -s <repo_root>/node_modules <worktree>/node_modules
+     ```
+     (If a minion changes deps, it runs its own `npm ci` / `npm install` in
+     the worktree.)
+   - Tell the minion in the briefing which env files (and `node_modules`, if
+     linked) were bootstrapped.
 5. Record the job in the ledger (status `dispatched`):
    ```bash
    /Users/moses/code/bin/ledger add <job-id> repo=<repo> repo_root=<root> \
