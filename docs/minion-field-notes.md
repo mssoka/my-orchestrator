@@ -120,6 +120,41 @@ findings that keep recurring. One line per entry, dated, with the job id.
   gitignored copy); staging lags unmerged develop migrations (submissions
   500 on `submitted_ip_text`) — E2E against a local Docker DB + seeded
   vacancy, never staging.
+- 2026-08-07 (dream-2026-08-07; righttenantry form-e2e-pass, form-resume-
+  progress-fix, form-nojs-submit-fix, self-employed-copy-fix/-sweep — 5
+  jobs, one notes "4/5 mega-minions hit the same three traps independently"):
+  agent-browser's `click` silently no-ops on JS-driven controls (below-fold
+  elements, emulated-mobile sticky-bar overlap, `type=button`+JS-validated
+  stepper buttons) and the re-snapshot then reads STALE state. Reliable
+  recipe across all sightings: `eval scrollIntoView({behavior:'instant'})` →
+  `eval el.click()` (or click the `label[for=]`), then read state from the
+  DOM; `fill` can't set `input[type=date]` (set `.value` + dispatch
+  `input`/`change`); radios/checkboxes need `checked=true` + dispatched
+  events. Also: the DEFAULT agent-browser session is SHARED machine-wide —
+  a sibling minion's drive hijacks mid-scenario; always `--session <job-id>`.
+- 2026-08-07 (dream-2026-08-07; righttenantry csp-posthog-allowlist,
+  csp-enforce-allowlist, form-resume-progress-fix, draft-grace-period — 4
+  jobs): fresh RT worktrees ship NO `node_modules` (worktree bootstrap
+  copies only git-tracked files), so `make build` fails on `tailwindcss:
+  command not found` — and `make test` never surfaces it (js-tests run on
+  bare node). Fix by scope: `ln -s <repo_root>/node_modules node_modules`
+  (gitignored, never committed), or `npm ci`, or skip with `make build-
+  server` + `make test-server` for server-only work.
+- 2026-08-07 (dream-2026-08-07; orchestrator-nefario-conflict-sensor — 2nd
+  sighting of the parse-test-strip-types watch item): Node 22
+  `--experimental-strip-types` REJECTS TS constructor parameter properties
+  (`private x: T` in a ctor signature — "not supported in strip-only mode";
+  declare the field explicitly + assign in the body) and can't run a file
+  with non-erasable runtime enums / `const enum` (use plain `const` Sets).
+  Parse-test any `.ts` extension with this flag before commit — the
+  preventive practice for the in-store backtick-kills-extension gotcha.
+- 2026-08-07 (dream-2026-08-07; finlit-e2-7, orchestrator-nefario-conflict-
+  sensor): relative paths surprise in worktrees — relative-path edit/write
+  tools + `git` resolved to the MAIN checkout, not the worktree (one `git
+  commit` landed on local `main`; recovered via stash + branch move); ESM
+  relative imports resolve against the SCRIPT's directory, not `cwd`.
+  ALWAYS use absolute worktree paths for file tools and git, and keep
+  scratch importers INSIDE the worktree.
 
 ## Conventions that saved time
 
@@ -133,7 +168,15 @@ findings that keep recurring. One line per entry, dated, with the job id.
   native-browser-validation blockers from `required` attributes on a form
   that carries `novalidate` on both the GET and the error re-render. Verify
   the mechanism exists against the actual element/runtime before crediting
-  the finding.
+  the finding. 2026-08-07 addendum (dream-2026-08-07; righttenantryagents-
+  model-flash, packet-plumber-setup-brief, righttenantry-csp-posthog-allowlist,
+  righttenantry-agent-model-flash): this extends to the BRIEFING itself — a
+  briefing's stated "current state", file paths, and rationales can be STALE
+  (forensics pre-date a merged PR — PR #164 had already moved the model tier)
+  or just WRONG (a security-control mechanism that disk + vendor docs
+  disprove). Before trusting a briefing's premise, `grep`/`find` disk for the
+  real current state and verify any stated mechanism against disk + vendor
+  docs — escalate rather than improvise on a stale/wrong instruction.
 - 2026-07-31/08-01 (finlit-bugfix-event-messages, tutor-economy-fix):
   root-cause-first — in PR/ledger notes, name the wrong hypothesis
   explicitly and reject it ("int truncation, NOT a 60s timer bug";
@@ -143,6 +186,16 @@ findings that keep recurring. One line per entry, dated, with the job id.
   pin acceptance criteria as durable TESTS at the lowest layer (8 DB-level
   AC pins; LOAN_MODEL OPM contract pinned) — they survive review rounds,
   Perkins lenses, and refactors.
+- 2026-08-07 (dream-2026-08-07; packet-plumber-architecture-v1,
+  finlit-architecture-v1, finlit-gdd-amendments): on a high-stakes doc every
+  downstream agent reads, a 2-hunter review swarm (adversarial-general +
+  edge-case-hunter) EARNS its ~2-pane cost — it catches real contradictions
+  the author is blind to (spine data-flow direction, locked-pillar
+  violations, unbuildable seams, superseded-citation overclaims). Verify
+  every finding against disk before applying. Budget an R2 / self-review
+  pass after applying R1 — R1 fixes introduce their OWN bugs (a defective
+  rounding formula written to fix R1; the GDD's own example was the
+  disproof).
 
 ## Recurring review findings
 
@@ -162,7 +215,6 @@ findings that keep recurring. One line per entry, dated, with the job id.
   a regression pin per fix.
 - Supabase security-definer views bypassing RLS (Perkins r1 blocker on PR
   #556, 2026-08-01) — single sighting, still watching.
-pproved p13
 - 2026-08-03 (righttenantry-refcheck-privacy-draft; lavish): a lavish
   session-end can STRAND queued-but-undelivered prompts — the user's
   verdict ('Approve — open the PR') sat in ~/.lavish-axi/state.json
@@ -178,3 +230,31 @@ pproved p13
   halt was correct protocol; the confirmation came back within the
   hour). If the user answers you directly in your pane, note it in your
   ledger self-report so the orchestrator doesn't chase a phantom.
+- 2026-08-04 (finlit e2-1/e2-7 dispatch): the bare model label 'glm-5.2'
+  resolves to the 'opencode' provider (no API key configured) and errors
+  at launch; the FULL path 'zai-coding-cn/glm-5.2' is what worked for the
+  sprint-plan minion. Use the full provider-qualified path for glm
+  dispatches, or fix the routing. The error is silent on the agent_status
+  (pane shows idle with the pi UI up) — read the pane's visible content
+  for the 'No API key found for opencode' red text; the session jsonl
+  won't exist (pi never processed a turn).
+- 2026-08-07 (dream-2026-08-07; righttenantryagents-model-flash Perkins r1
+  N3, righttenantry-oauth-posthog-fix Perkins r1 W1): two flavors of an
+  under-locked change recur as Perkins findings — (a) COVERAGE-GAP: a
+  changed component lacks the per-component assertion test its siblings
+  have (3 of 5 Pro agents had no `model==X` test → the switch wasn't
+  pinned); (b) GUARD-PIN NOT UNIQUE: a substring-pin guard isn't unique to
+  its target adjacency → a regression isn't pinned (reset-arm guard). When
+  adding/changing a component, mirror the siblings' assertion tests and
+  make every guard/pin uniquely identify its target.
+
+## glm-5.2 bare-label routing bug (2026-08-04, 2 independent sightings)
+
+The bare model label `glm-5.2` resolves to the `opencode` provider in pi,
+which has NO API key configured — panes error at launch: "No API key found
+for opencode." The sprint-plan minion and the e2-1 review swarm both hit
+this independently. The full provider-qualified path `zai-coding-cn/glm-5.2`
+resolves correctly (sprint-plan ran fine on it). **Always use the full
+`provider/model` path in briefings and dispatch commands, never the bare
+label.** If a minion falls back to another model on its own (e.g. deepseek),
+that's the symptom — check the pane for the opencode error.
