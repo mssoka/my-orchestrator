@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "verification-gap",
+    "title": "Standalone replay gate cannot detect a cross-wired log: boot.log.bin and error404.log.bin are byte-identical and the manifest's demo identity is parsed then discarded",
+    "location": "harness/replay.odin:read_manifest (case \"demo\":) / harness/main.odin:run_replay",
+    "evidence": "replay.odin: `case \"demo\":` then `case:` `v, okv := strconv.parse_uint(fields[1], 16); if okv { append(&m.hashes, u64(v)) }` — the demo header is dropped; the log header (serialize.odin log_write) records only seed/era/catalog_hash/logic_hz, no demo name. Empirically: `./bin/harness replay boot goldens/error404.log.bin` → \"harness replay: 50 ticks verified against the manifest — bit-for-bit (ODN-11)\" exit=0, and `md5 -q goldens/boot.log.bin goldens/error404.log.bin` → 97f32c1a3c5c15b43fed0c9dffbbabc8 twice.",
+    "detail": "Both demos have zero scripted commands, so their logs are identical; the gate verifies hashes only, and both share ticks 1..50 (same seed/map). A wrong log wired to the wrong manifest passes green.",
+    "recommended_fix": "Store the demo name from the manifest header and bind log to manifest via a demo/run identity field in the log header; fail the replay when they disagree."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "`expect hash stable` is declared by all 7 demos but the harness never evaluates it; the frozen post-end states rendered into T2 goldens have no T1 assertion",
+    "location": "harness/main.odin:299-300 / goldens/error404.t1 (ticks 250) + goldens/error404/40000ms.png / goldens/surge_basics.t1 (ticks 3000) + goldens/surge_basics/305000ms.png",
+    "evidence": "main.odin: `case .Hash_Stable:` `// the manifest compare below is the substance` — empty case. demos/error404.dem: `run 40000ms` `capture at 8000ms, 40000ms` `expect hash stable`; error404.t1 last lines `ticks 250` / `250 b4849833ddbc0454` while `goldens/error404/40000ms.png` = virtual tick 400. demos/surge_basics.dem: `run 310000ms` `capture at ... 305000ms`; surge_basics.t1 `ticks 3000` while 305000ms.png = tick 3050.",
+    "detail": "Captures beyond the manifest range render the ended-state snapshot (step loop is guarded by `!rc.ended`), whose equality with the last hashed tick is asserted only by the never-run hash-stable expectation.",
+    "recommended_fix": "Implement .Hash_Stable: after the run loop, hash the final snapshot state and compare to the manifest's last recorded hash; fail on any mismatch."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "error-path",
+    "title": "`harness save` blesses goldens and exits 0 even when the demo's own expectations/intents failed during the bless run",
+    "location": "harness/main.odin:333-336",
+    "evidence": "main.odin: `ok := len(fail_msgs) == 0` ... `return ok || save` — and main: `if verb == \"save\" { if failures > 0 { ... os.exit(1) } ... os.exit(0) }`. In save mode the expectation checks still append to fail_msgs (`case .Terminal:` `if exp.terminal == \"lost\" && !rc.state.health.lost { append(&fail_msgs, \"expect terminal lost — run was not lost\") }`), but `ok || save` is always true, so the bless exits 0 and writes the manifest/PNGs/log.",
+    "detail": "A golden set can be blessed and committed from a run that violated its own `expect event`/`expect terminal`/intent contract; only a later `harness run` would surface it.",
+    "recommended_fix": "Return ok from run_demo in save mode too (drop `|| save`), and make main's save branch exit 1 when any demo failed its checks."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "A manifest truncated to header-only (`ticks 0`, no hash lines) passes the standalone replay gate vacuously: \"0 ticks verified — bit-for-bit\"",
+    "location": "harness/replay.odin:run_replay / replay_hashes",
+    "evidence": "replay.odin: `if man.ticks != i64(len(man.hashes)) { fmt.eprintfln(\"harness replay: manifest corrupt ...\") }` — 0 == 0 passes; then `for tick in u64(1) ..= ticks` iterates zero times. Empirically with a crafted `ticks 0` manifest: `harness replay zz goldens/zz.log.bin` → \"harness replay: 0 ticks verified against the manifest — bit-for-bit (ODN-11)\" exit=0.",
+    "detail": "A corrupted/truncated manifest with zero hash lines is accepted as a green verification by the standalone gate; only the in-run length check would catch it.",
+    "recommended_fix": "Require man.ticks > 0 (and at least one hash line) in run_replay; treat an empty manifest as corrupt."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "chunk-5 omits goldens/surge_basics.t1 — the 3000-tick T1 manifest for the longest demo is present in diff.patch but in no lens chunk",
+    "location": "chunk-5-goldens.patch (hunk list) / diff.patch:18034",
+    "evidence": "chunk-5-goldens.patch contains `diff --git a/goldens/surge_basics.log.bin ...` and 6 `goldens/surge_basics/*.png` hunks but no `diff --git a/goldens/surge_basics.t1` hunk (grep: 0 matches in every chunk-*.patch); diff.patch has `diff --git a/goldens/surge_basics.t1 b/goldens/surge_basics.t1` at line 18034.",
+    "detail": "The surge demo's T1 determinism chain — the longest state-hash evidence in the PR — is outside every lens's reviewed bytes, so no chunk reviewer can verify it.",
+    "recommended_fix": "Re-run the lens round with surge_basics.t1 included in chunk-5 (or a chunk-5b) so the surge T1 manifest is covered by the canonical review."
+  }
+]

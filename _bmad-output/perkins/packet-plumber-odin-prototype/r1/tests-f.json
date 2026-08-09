@@ -1,0 +1,62 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "hygiene",
+    "title": "Committed app.bin (2 MB built binary) at the repo root — build artifact ships in the PR",
+    "location": "app.bin (repo root; chunk-6-misc.patch)",
+    "evidence": "diff --git a/app.bin b/app.bin\nnew file mode 100755\nindex 0000000..4aaf130\nBinary files /dev/null and b/app.bin differ\n\nworktree: -rwxr-xr-x@ 1 moses  staff  2057480  9 Aug 15:47 app.bin\ngit ls-files | grep -c app.bin -> 1\n\n.gitignore hunk adds only: +tools/raylib-sw/\n+bin/\n+goldens/_reports/",
+    "detail": "A 2 MB platform-specific binary is tracked at the root; .gitignore covers bin/ but not app.bin. Bloat + rot risk: the artifact can silently drift from source (CI builds app fresh).",
+    "recommended_fix": "git rm app.bin, add /app.bin to .gitignore. The CI step 'odin build app' already proves the game compiles; no committed binary is needed."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "draw_and_reject.dem claims ports + budget rejection classes but the script never triggers them",
+    "location": "demos/draw_and_reject.dem:1-3",
+    "evidence": "# draw_and_reject.dem — the edit contract, exercised through the real bus:\n# valid draws land; every rejection class returns its typed error (E3/E26 +\n# span + ports + budget). Terminal-terminal is the 'play the internet' rule.\n\nintents: at 300ms draw_pipe house_c house_d standard -> terminal_to_terminal\nat 400ms draw_pipe house_a house_a standard -> self_loop\nat 500ms draw_pipe host router narrow -> span_exceeds_tier\n\ndata/node_types.json: { \"id\": \"router_mid\", ... \"port_capacity\": 8 }\ndata/balance.json: \"default_budget\": 5200\ncore/run.odin:58-64 fixture spawns the MID router; the script ends with 6 pipes on it (house_a, house_b, host, house_c, house_d, host) and ~$1450 of $5200 spent.",
+    "detail": "Ports (8-cap router, 6 pipes) and budget ($5200, ~$1450 spend) rejections never fire, so the golden corpus pins only E26/E3/span classes at integration level; the comment misstates coverage.",
+    "recommended_fix": "Correct the comment to list the exercised classes, or add intents that actually hit the 8-port cap and exhaust $5200 (they validate with expect_err -> ports_full / over_budget)."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Node-health 🟡/🔴 warning surface (Ev_Warning_Raised/Cleared) has zero direct tests; goldens cover it only transitively",
+    "location": "core/crisis.odin:46-58",
+    "evidence": "if pct >= bal.health_critical_threshold_pct {\n...\n} else if pct >= bal.health_strain_threshold_pct {\n...\nemit(state, tick, Ev_Warning_Cleared{node = t.node_id[i]})\nemit(state, tick, Ev_Warning_Raised{node = t.node_id[i], level = level})\n\ngrep Ev_Warning core/*_test.odin app/run/*_test.odin -> 0 hits; no core/crisis_test.odin; no demo expects a warning event.\n\nprobe (replicating demos/surge_basics.dem, seed 42, 3000 ticks): raised=392 cleared=383 crisis_triggered=1 won=true lost=false levels=map[Strained=312, Critical=80]",
+    "detail": "Warnings fire inside the goldened surge run (392 raised/383 cleared) and are hashed into T1, so the surface is transitively pinned; thresholds, levels, and clear-on-recovery have no assertion. A broken warning surface ships green.",
+    "recommended_fix": "Add a crisis unit test (strain/critical thresholds, level values, cleared-on-recovery) and/or a surge demo expect for Ev_Warning_Raised within the surge window."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "E9 drop-ladder order (Best → Standard → Express) unpinned — Queue_Overflow appears in zero tests",
+    "location": "core/flow.odin:451-455",
+    "evidence": "if idx_in_lane > int(bal.queue_drop_depth) {\n// per-lane queue bound: beyond the depth, packets shed\n// newest-first (the Godot prototype's actual behavior —\n// its comment claimed oldest-first; the comment lied)\ndrop_packet(f, idx, .Queue_Overflow, &arrived)\n\ngrep queue_drop_depth|Queue_Overflow core/*_test.odin -> 0 hits. Only QoS assertion: core/flow_test.odin:95 '// no-starvation (E7): Best-effort still slips through the gaps'",
+    "detail": "The spec'd shed order across lanes and the newest-first depth bound are asserted nowhere; the flood test checks only direction of harm at one configuration, so the ladder can reorder or drop Express-first with every gate green.",
+    "recommended_fix": "Flood a dialed pipe past queue_drop_depth and assert drop reasons/order per lane (Best shed before Standard before Express), plus the newest-first convention at the depth boundary."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Committed review docs (verification-gap.md, edge-case-hunter.md) grade pre-fix states as current blockers — the verification surface is misstated",
+    "location": "_bmad-output/reviews/odin-prototype-r1/verification-gap.md:28-100; edge-case-hunter.md:8",
+    "evidence": "verification-gap.md: '### T2 pixel compare silently passes when the golden is undecodable or the wrong size' / '- **Grade: blocker**' and '### `harness replay` verifies only a prefix of the manifest, prints \"OK\", and nothing runs it' / '- **Grade: blocker**' and 'Ran the full verification surface twice — `odin test core` (30/30 green) and `tools/harness.sh run` (6/6 demos green, stable across runs). `odin build app` succeeds (verified — CI never builds it).'\n\ncurrent tree (same sha): harness/goldens.odin 'if mismatch < 0 { // undecodable or dimension-drifted golden — the pixel tier must fail loudly, never pass on nothing (review r1 blocker)'; harness/replay.odin 'replayed, ok := replay_hashes(log_path, catalogs, u64(man.ticks), false, &fails)'; ci.yml has 'Game builds (the shipped artifact compiles)' -> 'odin build app -out:\"$RUNNER_TEMP/packet-plumber\"'\n\nempirical at 0118cc0: 'harness replay: 3000 ticks verified against the manifest — bit-for-bit (ODN-11)', 'harness replay: 250 ticks verified against the manifest — bit-for-bit (ODN-11)', 'Finished 40 tests in 198.393ms. All tests were successful.', 'harness: 7 demo(s) green'",
+    "detail": "Both committed docs present as open the very blockers this tree already fixes (T2 -1 guard, full-manifest replay, E1/QoS tests, CI app build) and undercount the surface (30 vs 40 tests, 6 vs 7 demos, 13 vs 18 captures).",
+    "recommended_fix": "Mark the docs superseded with the fixing commit (0df9135/0118cc0) or move them under a history dir; re-verify counts against `odin test core` and `tools/harness.sh run` before any future commit."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: CONCERNS",
+    "location": "N/A",
+    "evidence": "P0 = determinism spine + NetworkHealth win/lose/drain: FULL — 40/40 core tests green, 7/7 goldens green, `harness replay` bit-for-bit on all manifests (3000/3000 surge, 250/250 error404), T1 canonical field-wise serialization (core/serialize.odin state_writer). P1 areas: QoS promote/demote+E7+E8 FULL, E9 drop ladder 0%, warning surface ~50% (transitive only), port limits ~50% (unit only), upgrade FULL, E26 FULL, log round-trip FULL, demos-exercise-claims ~85% (ports/budget claim false).",
+    "detail": "P0 100%; P1 ≈80% (E9 drop-ladder order untested, 🟡/🔴 warning surface transitive-only, ports/budget rejections absent from goldens); overall ≈86%. Hard blocker (determinism) verified intact; remaining gaps are P1/P2 corners.",
+    "recommended_fix": "Add the E9 drop-order test, a crisis warning-surface test, and demo intents that actually hit Router_Ports_Full and Over_Budget; that raises P1 to ~95% and the gate to PASS."
+  }
+]
