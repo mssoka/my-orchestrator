@@ -187,10 +187,14 @@ Two tiers, chosen by the NATURE of the task — NOT by which project it is.
 We work on multiple projects (the game, RightTenantry, FinLit, etc.); the
 tier follows the thinking the task demands.
 
-- **Frontier — `kimi-coding/k3`** (the default for coding minions): any
-  task requiring frontier reasoning — architecture, design, complex/novel
-  coding, anything where correctness + judgment under ambiguity matter.
-  This spans ALL projects, not just game code.
+- **Frontier — `kimi-coding/k3`** (the default for coding minions AND for
+  Perkins code review): any task requiring frontier reasoning — architecture,
+  design, complex/novel coding, AND **code review**. Production code with
+  paying users demands the BEST reviewer: the review is the last line of
+  defense before code ships, so correctness + judgment under ambiguity
+  matter most here. This spans ALL projects, not just game code. (The kimi
+  quota is the constraint — review + the game build both draw on it; if it
+  hard-limits, glm-5.2 is the review fallback.)
 - **Mid — `zai-coding-cn/glm-5.2`** (the COO, Silas): the COO's ops/relay/
   coordination — a step up from deepseek (smarter triage/recovery judgment)
   and it rides the existing zai subscription.
@@ -772,7 +776,11 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
    applied); what to flag for verification (e.g. committed binaries, CI
    pins).
 5. Pane into the orchestrator workspace (panes-first rule), label
-   `perkins-<slug>-r<N>`; launch `cd <worktree> && pi` and hand over:
+   `perkins-<slug>-r<N>`; launch `cd <worktree> && pi` **on `kimi-coding/k3`**
+   (the frontier reviewer — production code with paying users demands the
+   BEST review, so Perkins runs kimi, NOT a cheaper model for quota; user
+   ruling 2026-08-09. Pass `--model kimi-coding/k3` at launch or set it in
+   the briefing's Model policy) and hand over:
    "Read the playbook 'Perkins standing orders' and the briefing at
    `<path>`, then begin."
 6. Record the round:
