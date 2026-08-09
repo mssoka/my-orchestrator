@@ -183,7 +183,7 @@ drops the note).
 
 ## Model policy
 
-Two tiers, chosen by the NATURE of the task — NOT by which project it is.
+Three tiers, chosen by the NATURE of the task — NOT by which project it is.
 We work on multiple projects (the game, RightTenantry, FinLit, etc.); the
 tier follows the thinking the task demands.
 
@@ -195,9 +195,13 @@ tier follows the thinking the task demands.
   matter most here. This spans ALL projects, not just game code. (The kimi
   quota is the constraint — review + the game build both draw on it; if it
   hard-limits, glm-5.2 is the review fallback.)
-- **Mid — `zai-coding-cn/glm-5.2`** (the COO, Silas): the COO's ops/relay/
-  coordination — a step up from deepseek (smarter triage/recovery judgment)
-  and it rides the existing zai subscription.
+- **Capable — `zai-coding-cn/glm-5.2`** (the COO, Silas, AND mega-minion
+  workers): tasks needing more than mechanical execution but not the
+  frontier reasoning — the COO's ops/relay/coordination, AND a minion's
+  spawned helpers (mega-minions) executing well-specified sub-tasks. A step
+  up from deepseek (smarter triage/execution) and it rides the existing zai
+  subscription, keeping kimi reserved for the frontier work. (Mega-minions
+  on glm-5.2: user ruling 2026-08-09.)
 - **Mechanical — `deepseek/deepseek-v4-flash`**: tasks that DON'T require
   frontier thinking — text editing, text changes, mechanical/simple edits,
   straightforward documentation. NOT architecture, NOT design, NOT complex
