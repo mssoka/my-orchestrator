@@ -92,6 +92,17 @@ export default function silas(pi: ExtensionAPI) {
 		if (ctx.cwd !== GRU_DIR) return;
 		if (process.env.PI_SILAS !== "1") return;
 		if (event.reason === "startup" || event.reason === "new") {
+			// Silas runs on deepseek/deepseek-v4-flash (user ruling 2026-08-09):
+			// the COO's work is relay + documented ops execution, not frontier
+			// reasoning, so a mid-tier model frees kimi quota for the game-coding
+			// minions. Set it automatically so no manual /model step is needed.
+			const model = ctx.modelRegistry.find("deepseek", "deepseek-v4-flash");
+			if (model) {
+				const ok = await pi.setModel(model);
+				if (!ok) ctx.ui.notify("Silas: no API key for deepseek/deepseek-v4-flash — staying on the default model", "error");
+			} else {
+				ctx.ui.notify("Silas: deepseek/deepseek-v4-flash not in the model registry — staying on the default model", "error");
+			}
 			await pi.sendUserMessage(STARTUP_CHECKLIST);
 		}
 	});
