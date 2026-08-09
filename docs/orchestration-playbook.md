@@ -181,6 +181,29 @@ the checklist on `startup`/`new` anyway.
 `bin/ledger note` (never `set` — a same-status set is a silent no-op that
 drops the note).
 
+## Model policy
+
+Two tiers, chosen by the NATURE of the task — NOT by which project it is.
+We work on multiple projects (the game, RightTenantry, FinLit, etc.); the
+tier follows the thinking the task demands.
+
+- **Frontier — `kimi-coding/k3`** (the default for coding minions): any
+  task requiring frontier reasoning — architecture, design, complex/novel
+  coding, anything where correctness + judgment under ambiguity matter.
+  This spans ALL projects, not just game code.
+- **Mid — `deepseek/deepseek-v4-flash`**: tasks that DON'T require frontier
+  thinking — the COO (Silas) ops/relay, text editing, text changes,
+  mechanical/simple edits, straightforward documentation. NOT architecture,
+  NOT design, NOT complex coding — anything needing real design or
+  reasoning goes to kimi.
+
+The kimi default is the provider default (settings.json `defaultProvider`),
+so unset-model dispatches resolve to kimi; a briefing's 'Model policy'
+field overrides per-job. Silas is pinned to deepseek-flash by
+`.pi/extensions/silas.ts` (see 'Silas (COO)'). The kimi account has a usage
+quota — spending the frontier model only where it earns it keeps quota for
+the work that needs it. (User ruling 2026-08-09.)
+
 ## Durable state
 
 - Job ledger: **SQLite** at `/Users/moses/code/_bmad-output/orchestrator.db`,
