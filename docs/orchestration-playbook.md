@@ -126,15 +126,15 @@ Silas Ramsbottom — Gru's chief operating officer. A long-lived pi session
 standing orders + startup checklist; nefario-watch is gated to
 `PI_SILAS=1`, so ALL sensors alert Silas — Gru's context stays clean.
 
-**Model:** Silas runs on **`deepseek/deepseek-v4-flash`** — set
+**Model:** Silas runs on **`zai-coding-cn/glm-5.2`** — set
 AUTOMATICALLY by `.pi/extensions/silas.ts` at launch (`session_start` ->
 `pi.setModel`), so no manual `/model` step; it notifies if the model is
 missing from the registry or has no API key (a failed auto-set is visible,
 not silent). NOT the kimi default:
-Silas's work is relay + documented ops execution (instruction-following +
-pattern-matching against this playbook), not frontier reasoning, so a
-mid-tier model serves it well AND frees kimi quota for the game-coding
-minions that genuinely need the frontier model. (User ruling 2026-08-09.)
+the COO's ops/coordination judgment benefits from a model smarter than
+deepseek, and glm-5.2 rides the existing zai subscription — while still
+freeing kimi quota for the frontier coding minions. (User ruling
+2026-08-09, revised same day: deepseek -> glm-5.2.)
 
 **Silas owns (Gru never touches):**
 
@@ -191,15 +191,17 @@ tier follows the thinking the task demands.
   task requiring frontier reasoning — architecture, design, complex/novel
   coding, anything where correctness + judgment under ambiguity matter.
   This spans ALL projects, not just game code.
-- **Mid — `deepseek/deepseek-v4-flash`**: tasks that DON'T require frontier
-  thinking — the COO (Silas) ops/relay, text editing, text changes,
-  mechanical/simple edits, straightforward documentation. NOT architecture,
-  NOT design, NOT complex coding — anything needing real design or
-  reasoning goes to kimi.
+- **Mid — `zai-coding-cn/glm-5.2`** (the COO, Silas): the COO's ops/relay/
+  coordination — a step up from deepseek (smarter triage/recovery judgment)
+  and it rides the existing zai subscription.
+- **Mechanical — `deepseek/deepseek-v4-flash`**: tasks that DON'T require
+  frontier thinking — text editing, text changes, mechanical/simple edits,
+  straightforward documentation. NOT architecture, NOT design, NOT complex
+  coding — anything needing real design or reasoning goes to kimi.
 
 The kimi default is the provider default (settings.json `defaultProvider`),
 so unset-model dispatches resolve to kimi; a briefing's 'Model policy'
-field overrides per-job. Silas is pinned to deepseek-flash by
+field overrides per-job. Silas is pinned to glm-5.2 by
 `.pi/extensions/silas.ts` (see 'Silas (COO)'). The kimi account has a usage
 quota — spending the frontier model only where it earns it keeps quota for
 the work that needs it. (User ruling 2026-08-09.)
