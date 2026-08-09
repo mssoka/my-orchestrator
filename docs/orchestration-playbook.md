@@ -352,6 +352,19 @@ store, one reader per source, proposals with reasoning.)
    the path to Silas (`herdr pane run <silas-pane> "dispatch: <briefing
    path>"`); Silas runs 'Dispatch' steps 2–6 and reports the pane id.
 
+## Sprint execution (the standing pattern)
+
+**Fresh minion per story; Gru orchestrates; NOT bmad-dev-auto.** (User
+ruling 2026-08-08: "don't use dev-auto going forward. you take over. and we
+learn that way. and also ensure each story gets a fresh minion.") Each story
+in a sprint gets its OWN fresh minion (bmad-create-story -> bmad-dev-story),
+with Gru dispatching one story at a time as the prior one merges. The
+learning/memory loop depends on per-story granularity: each minion badges
+out its own field-note shard, which the dream pass consolidates.
+bmad-dev-auto churns through stories unattended WITHOUT that per-story
+learning, so it is reserved for mechanical/prototype work where the learning
+loop doesn't matter.
+
 ## Dispatch (exact sequence)
 
 Ownership: Gru writes the briefing (step 1) and makes the decision; Silas
@@ -716,7 +729,13 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
 4. Write briefing `_bmad-output/briefings/perkins-<job-id>-r<N>.md`.
    Required content: the Perkins standing orders (below, verbatim), PR
    URL + number, reviewed sha, repo_root, round N, and pointers to the
-   **original job briefing** and **GitHub issue** (Perkins' spec).
+   **original job briefing** and **GitHub issue** (Perkins' spec). Plus the
+   **lens-guards** (standard since 2026-08-08, validated ~6 rounds holding
+   their guards): name the ONE hard blocker (e.g. the determinism spine for
+   the Odin core) vs what is prototype-rigor (NOT a defect); what NOT to
+   re-litigate (user rulings already made, prior-round findings already
+   applied); what to flag for verification (e.g. committed binaries, CI
+   pins).
 5. Pane into the orchestrator workspace (panes-first rule), label
    `perkins-<slug>-r<N>`; launch `cd <worktree> && pi` and hand over:
    "Read the playbook 'Perkins standing orders' and the briefing at
@@ -788,11 +807,17 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
   review — never run gh with an empty GH_TOKEN (a failed command
   substitution would fall through to the ambient `mssoka` credential and
   422 on our own PRs):
-  1. `TOKEN=$(/Users/moses/code/bin/perkins-token --owner <owner>)`
-  2. If that failed (non-zero exit): fall back to `gh pr comment <pr>
+  1. `TOKEN=$(/Users/moses/code/bin/perkins-token --owner <owner>)` —
+     capture STDOUT ONLY. NEVER append `2>&1`: the script writes cache
+     warnings to stderr, which would corrupt the token and make a good
+     mint look like a failure.
+  2. Check for an EMPTY token, NOT `$?` (an intervening command can clobber
+     `$?`, and a `2>&1` capture makes it lie — the 2026-08-09 rc3-2 round
+     posted a fallback-comment instead of a formal approve on exactly this):
+     `if [ -z "$TOKEN" ]` -> the mint failed; fall back to `gh pr comment <pr>
      --body-file <body.md>`, note `fallback-comment` in your ledger note,
      and call it out in your final message.
-  3. Otherwise: `GH_TOKEN=$TOKEN gh pr review <pr> --<event> --body-file
+  3. Otherwise (token non-empty): `GH_TOKEN=$TOKEN gh pr review <pr> --<event> --body-file
      <body.md>`
 - Body format:
   ```

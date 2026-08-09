@@ -25,7 +25,11 @@ Prose carries the story; tables carry the data.
 Review loop: DOCS deliverables (bmad docs, reports, specs, plans — never
 code) get a lavish in-browser review **before the PR opens**; clarify
 questions go through lavish too when practical (the user answers in the
-browser). Code keeps the regular PR pattern.
+browser). Code keeps the regular PR pattern. **Exemption:** small/targeted
+doc edits (a focused amendment, a one-section fix, a canon touch-up) skip
+lavish and open the PR directly — when that's the intent, the briefing says
+so explicitly ("lavish not needed, PR directly"), NEVER the ambiguous
+"lavish optional" (which parked a minion ~7h on 2026-08-08).
 
 - Playbook: `docs/orchestration-playbook.md`
 - Job ledger: SQLite at `_bmad-output/orchestrator.db` (CLI: `bin/ledger`)
