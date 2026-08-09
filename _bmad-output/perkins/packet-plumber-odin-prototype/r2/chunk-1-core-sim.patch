@@ -1,0 +1,3389 @@
+diff --git a/core/catalog.odin b/core/catalog.odin
+new file mode 100644
+index 0000000..fa7b1b8
+--- /dev/null
++++ b/core/catalog.odin
+@@ -0,0 +1,564 @@
++package core
++
++// catalog.odin — data-driven content catalogs (ODN-5). JSON single source,
++// loaded once, fail-fast validated (unknown fields, out-of-range values,
++// cross-reference errors abort with a named error), read-only after load.
++// Sim-relevant values are integers only. The core parses from BYTES — the
++// app/harness own file IO (#load-embedded or disk in dev), so the core never
++// touches core:os.
++
++import "core:encoding/json"
++import "core:fmt"
++
++Packet_Type :: struct {
++	id:               string,
++	display:          string,
++	color:            [4]u8,  // cosmetic
++	shape:            string, // cosmetic — "circle" | "triangle" | ...
++	latency_tol_ms:   i32,
++	max_loss_pct:     i32,
++	bandwidth_demand: i32,
++	default_lane:     Lane,
++	era_introduced:   i32,
++	sla_fail_effect:  string,
++	demand_weight:    i32,
++}
++
++Pipe_Tier :: struct {
++	id:             string,
++	display:        string,
++	capacity_units: i32,
++	clean_span:     i32,
++	max_span:       i32,
++	cost_per_tile:  i32,
++	era_introduced: i32,
++}
++
++Node_Type :: struct {
++	id:               string,
++	display:          string,
++	kind:             Node_Kind,
++	terminal_role:    Terminal_Role,
++	throughput_units: i32,
++	lb_mode_capable:  bool,
++	era_introduced:   i32,
++	port_capacity:    i32, // 0 = unlimited (terminals); 4/8/16 for router tiers
++}
++
++// A per-source-class demand entry: WHAT traffic flows and WHERE it wants to
++// go; the player's topology decides HOW it routes.
++Demand_Entry :: struct {
++	class:         u16, // packet_types index (resolved at load)
++	source_role:   Terminal_Role,
++	sink_role:     Terminal_Role,
++	volume:        i32, // packets per tick (base)
++	default_lane:  Lane,
++	demand_weight: i32,
++}
++
++Set_Piece :: struct {
++	id:                 string,
++	class:              u16,
++	multiplier:         i32,
++	start_tick:         u64,
++	duration_ticks:     u64,
++	forecast_lead_ticks: u64,
++}
++
++set_piece_active :: proc(sp: ^Set_Piece, tick: u64) -> bool {
++	return tick >= sp.start_tick && tick < sp.start_tick + sp.duration_ticks
++}
++
++set_piece_forecasted :: proc(sp: ^Set_Piece, tick: u64) -> bool {
++	return sp.forecast_lead_ticks <= sp.start_tick &&
++	       tick >= sp.start_tick - sp.forecast_lead_ticks && tick < sp.start_tick
++}
++
++Demand_Catalog :: struct {
++	entries:    [dynamic]Demand_Entry, // era-3 base entries (PROTO runs era 3)
++	set_pieces: [dynamic]Set_Piece,
++}
++
++Balance :: struct {
++	logic_hz:                     i32,
++	snap_radius:                  i32,
++	win_uptime_pct:               i32,
++	breach_exit_pct:              i32, // E30 hysteresis: recovery threshold (> enter)
++	grace_window_ticks:           i32,
++	grace_refill_per_tick:        i32, // gradual refill — no instant re-arm
++	grace_refill_streak_ticks:    i32, // recovery-streak gate before refill starts
++	meter_drain_per_tick_max:     i32,
++	meter_recharge_per_tick:      i32,
++	meter_start_pct:              i32,
++	health_strain_threshold_pct:  i32,
++	health_critical_threshold_pct: i32,
++	queue_drop_depth:             i32,
++	default_lane_weights:         [3]i32,
++	emphasis_preset:              [3]i32,
++	starting_links:               [dynamic]i32, // per pipe-tier index
++	starting_routers:             [dynamic]i32, // per node-type index (routers)
++	grants:                       [dynamic]Grant, // hardware deliveries, tick-ordered
++	packet_pool_cap:              i32,
++	rolling_window_ticks:         i32,
++	growth_first_tick:            i32,
++	growth_interval_ticks:        i32,
++	growth_interval_short_ticks:  i32,
++	growth_min_dist_tiles:        i32,
++	growth_spawn_near_junction:   i32,
++	growth_pool_size:             i32,
++	growth_box:                   [4]i32, // x0, x1, y0, y1 (inclusive)
++	growth_roles:                 [dynamic]string, // node_type ids, in spawn order
++	map_w_tiles:                  i32,
++	map_h_tiles:                  i32,
++	tile_px:                      i32,
++}
++
++Grant_Item :: struct { idx: u16, n: i32 }
++Grant :: struct {
++	at_tick: u64,
++	links:   [dynamic]Grant_Item, // resolved pipe-tier refs
++	routers: [dynamic]Grant_Item, // resolved node-type refs (routers only)
++}
++
++Crisis_Def :: struct {
++	archetype:           string,
++	display:             string,
++	root_cause_pattern:  string,
++	preventive_redesign: string,
++	lead_time_ticks:     i32,
++	failure_effect:      string,
++}
++
++Catalogs :: struct {
++	packet_types: [dynamic]Packet_Type,
++	pipe_tiers:   [dynamic]Pipe_Tier,
++	node_types:   [dynamic]Node_Type,
++	demand:       Demand_Catalog,
++	crises:       [dynamic]Crisis_Def,
++	balance:      Balance,
++	hash:         u64, // FNV-1a-64 over the exact source bytes, fixed order
++}
++
++Catalog_Sources :: struct {
++	packet_types: []byte,
++	pipe_tiers:   []byte,
++	node_types:   []byte,
++	demand:       []byte,
++	crises:       []byte,
++	balance:      []byte,
++}
++
++catalogs_hash_sources :: proc(src: ^Catalog_Sources) -> u64 {
++	h: u64 = 14695981039346656037
++	mix := proc(h: ^u64, bytes: []byte) {
++		for b in bytes {
++			h^ = (h^ ~ u64(b)) * 1099511628211
++		}
++	}
++	mix(&h, src.packet_types)
++	mix(&h, src.pipe_tiers)
++	mix(&h, src.node_types)
++	mix(&h, src.demand)
++	mix(&h, src.crises)
++	mix(&h, src.balance)
++	return h
++}
++
++fnv1a64 :: proc(bytes: []byte) -> u64 {
++	h: u64 = 14695981039346656037
++	for b in bytes {
++		h = (h ~ u64(b)) * 1099511628211
++	}
++	return h
++}
++
++// --- load-time validation helpers --------------------------------------------
++// Fail-fast with a named error (ODN-5): which file, which field, what rule.
++
++Catalog_Error :: struct {
++	file:  string,
++	field: string,
++	rule:  string,
++}
++
++catalogs_load :: proc(src: ^Catalog_Sources, allocator := context.allocator) -> (cat: ^Catalogs, err: Catalog_Error) {
++	context.allocator = allocator
++	cat = new(Catalogs)
++	cat.hash = catalogs_hash_sources(src)
++
++	root: json.Value
++
++	// packet_types
++	{
++		v, e := json.parse(src.packet_types, parse_integers = true)
++		if e != nil { return cat, {"packet_types.json", "$", "invalid JSON"} }
++		root = v
++		obj, ok := root.(json.Object)
++		if !ok { return cat, {"packet_types.json", "$", "root must be an object"} }
++		entries, ok2 := obj["entries"].(json.Array)
++		if !ok2 { return cat, {"packet_types.json", "entries", "missing array"} }
++		for ev in entries {
++			eo := ev.(json.Object) or_continue
++			pt: Packet_Type
++			pt.id = jstr(eo, "id")
++			pt.display = jstr(eo, "display_name")
++			c := jarr_i(eo, "color_rgba")
++			if len(c) == 4 { pt.color = {u8(c[0]), u8(c[1]), u8(c[2]), u8(c[3])} }
++			pt.shape = jstr(eo, "shape")
++			pt.latency_tol_ms = jint(eo, "latency_tol_ms", 500)
++			pt.max_loss_pct = jint(eo, "max_loss_pct", 30)
++			pt.bandwidth_demand = jint(eo, "bandwidth_demand", 1)
++			pt.default_lane = Lane(clamp(jint(eo, "default_lane", 1), 0, 2))
++			pt.era_introduced = jint(eo, "era_introduced", 1)
++			pt.sla_fail_effect = jstr(eo, "sla_fail_effect")
++			pt.demand_weight = jint(eo, "demand_weight", 1)
++			if pt.id == "" { return cat, {"packet_types.json", "id", "empty id"} }
++			if pt.bandwidth_demand < 1 { return cat, {"packet_types.json", pt.id, "bandwidth_demand must be >= 1"} }
++			append(&cat.packet_types, pt)
++		}
++		if len(cat.packet_types) == 0 { return cat, {"packet_types.json", "entries", "empty"} }
++		if len(cat.packet_types) > MAX_CLASSES { return cat, {"packet_types.json", "entries", "too many classes"} }
++	}
++
++	// pipe_tiers
++	{
++		v, e := json.parse(src.pipe_tiers, parse_integers = true)
++		if e != nil { return cat, {"pipe_tiers.json", "$", "invalid JSON"} }
++		obj, okp := v.(json.Object)
++		if !okp { return cat, {"pipe_tiers.json", "$", "root must be an object"} }
++		entries, oke := obj["entries"].(json.Array)
++		if !oke { return cat, {"pipe_tiers.json", "entries", "missing array"} }
++		for ev in entries {
++			eo := ev.(json.Object) or_continue
++			t: Pipe_Tier
++			t.id = jstr(eo, "id")
++			t.display = jstr(eo, "display_name")
++			t.capacity_units = jint(eo, "capacity_units", 0)
++			t.clean_span = jint(eo, "clean_span", 0)
++			t.max_span = jint(eo, "max_span", 0)
++			t.cost_per_tile = jint(eo, "cost_per_tile", 0)
++			t.era_introduced = jint(eo, "era_introduced", 1)
++			if t.id == "" || t.capacity_units <= 0 || t.max_span <= 0 {
++				return cat, {"pipe_tiers.json", t.id, "id/capacity/max_span invalid"}
++			}
++			append(&cat.pipe_tiers, t)
++		}
++		if len(cat.pipe_tiers) == 0 { return cat, {"pipe_tiers.json", "entries", "empty"} }
++	}
++
++	// node_types
++	{
++		v, e := json.parse(src.node_types, parse_integers = true)
++		if e != nil { return cat, {"node_types.json", "$", "invalid JSON"} }
++		obj, okn := v.(json.Object)
++		if !okn { return cat, {"node_types.json", "$", "root must be an object"} }
++		entries, okn2 := obj["entries"].(json.Array)
++		if !okn2 { return cat, {"node_types.json", "entries", "missing array"} }
++		for ev in entries {
++			eo := ev.(json.Object) or_continue
++			nt: Node_Type
++			nt.id = jstr(eo, "id")
++			nt.display = jstr(eo, "display_name")
++			kind := jstr(eo, "kind")
++			switch kind {
++			case "terminal": nt.kind = .Terminal
++			case "junction": nt.kind = .Junction
++			case: return cat, {"node_types.json", nt.id, "kind must be terminal|junction"}
++			}
++			nt.terminal_role = role_from_name(jstr(eo, "terminal_role"))
++			nt.throughput_units = jint(eo, "throughput_units", 0)
++			nt.lb_mode_capable = jbool(eo, "lb_mode_capable")
++			nt.era_introduced = jint(eo, "era_introduced", 1)
++			nt.port_capacity = jint(eo, "port_capacity", 0)
++			if nt.id == "" { return cat, {"node_types.json", "id", "empty id"} }
++			if nt.kind == .Terminal && nt.terminal_role == .None {
++				return cat, {"node_types.json", nt.id, "terminal without a role"}
++			}
++			append(&cat.node_types, nt)
++		}
++		if len(cat.node_types) == 0 { return cat, {"node_types.json", "entries", "empty"} }
++	}
++
++	// demand (PROTO reads era "3" — the surge slice)
++	{
++		v, e := json.parse(src.demand, parse_integers = true)
++		if e != nil { return cat, {"demand.json", "$", "invalid JSON"} }
++		obj, okd := v.(json.Object)
++		if !okd { return cat, {"demand.json", "$", "root must be an object"} }
++		eras, oker := obj["eras"].(json.Object)
++		if !oker { return cat, {"demand.json", "eras", "missing"} }
++		era3, oke3 := eras["3"].(json.Object)
++		if !oke3 { return cat, {"demand.json", "eras.3", "PROTO requires the era-3 demand set"} }
++		entries, oke4 := era3["entries"].(json.Array)
++		if !oke4 { return cat, {"demand.json", "eras.3.entries", "missing array"} }
++		for ev in entries {
++			eo := ev.(json.Object) or_continue
++			de: Demand_Entry
++			cls, okc := class_index(cat, jstr(eo, "class_id"))
++			if !okc { return cat, {"demand.json", jstr(eo, "class_id"), "unknown class"} }
++			de.class = cls
++			de.source_role = role_from_name(jstr(eo, "source_role"))
++			de.sink_role = role_from_name(jstr(eo, "sink_role"))
++			de.volume = jint(eo, "volume", 0)
++			de.default_lane = Lane(clamp(jint(eo, "default_lane", 1), 0, 2))
++			de.demand_weight = jint(eo, "demand_weight", 1)
++			append(&cat.demand.entries, de)
++		}
++		if sps, oks := era3["set_pieces"].(json.Array); oks {
++			for sv in sps {
++				so := sv.(json.Object) or_continue
++				sp: Set_Piece
++				sp.id = jstr(so, "id")
++				cls, okc := class_index(cat, jstr(so, "class_id"))
++				if !okc { return cat, {"demand.json", sp.id, "set-piece unknown class"} }
++				sp.class = cls
++				sp.multiplier = jint(so, "multiplier", 1)
++				sp.start_tick = u64(jint(so, "start_tick", 0))
++				sp.duration_ticks = u64(jint(so, "duration_ticks", 0))
++				sp.forecast_lead_ticks = u64(jint(so, "forecast_lead_ticks", 0))
++				append(&cat.demand.set_pieces, sp)
++			}
++		}
++	}
++
++	// crises (PROTO ships Surge only; the frame takes the rest as content)
++	{
++		v, e := json.parse(src.crises, parse_integers = true)
++		if e != nil { return cat, {"crises.json", "$", "invalid JSON"} }
++		obj, okc := v.(json.Object)
++		if !okc { return cat, {"crises.json", "$", "root must be an object"} }
++		entries, oke := obj["entries"].(json.Array)
++		if !oke { return cat, {"crises.json", "entries", "missing array"} }
++		for ev in entries {
++			eo := ev.(json.Object) or_continue
++			cd: Crisis_Def
++			cd.archetype = jstr(eo, "archetype")
++			cd.display = jstr(eo, "display_name")
++			cd.root_cause_pattern = jstr(eo, "root_cause_pattern")
++			cd.preventive_redesign = jstr(eo, "preventive_redesign")
++			cd.lead_time_ticks = jint(eo, "lead_time_ticks", 0)
++			cd.failure_effect = jstr(eo, "failure_effect")
++			if cd.archetype == "" { return cat, {"crises.json", "archetype", "empty"} }
++			append(&cat.crises, cd)
++		}
++	}
++
++	// balance
++	{
++		v, e := json.parse(src.balance, parse_integers = true)
++		if e != nil { return cat, {"balance.json", "$", "invalid JSON"} }
++		obj, okb := v.(json.Object)
++		if !okb { return cat, {"balance.json", "$", "root must be an object"} }
++		b: Balance
++		b.logic_hz = jint(obj, "logic_hz", 0)
++		if b.logic_hz <= 0 || 1000 % b.logic_hz != 0 {
++			return cat, {"balance.json", "logic_hz", "must be > 0 and divide 1000 (single source of tick timing — Perkins r1)"}
++		}
++		b.snap_radius = jint(obj, "snap_radius", 36)
++		b.win_uptime_pct = jint(obj, "win_uptime_pct", 90)
++		b.breach_exit_pct = jint(obj, "breach_exit_pct", 93)
++		b.grace_window_ticks = jint(obj, "grace_window_ticks", 200)
++		b.grace_refill_per_tick = jint(obj, "grace_refill_per_tick", 5)
++		b.grace_refill_streak_ticks = jint(obj, "grace_refill_streak_ticks", 50)
++		b.meter_drain_per_tick_max = jint(obj, "meter_drain_per_tick_max", 2)
++		b.meter_recharge_per_tick = jint(obj, "meter_recharge_per_tick", 1)
++		b.meter_start_pct = jint(obj, "meter_start_pct", 100)
++		b.health_strain_threshold_pct = jint(obj, "health_strain_threshold_pct", 70)
++		b.health_critical_threshold_pct = jint(obj, "health_critical_threshold_pct", 90)
++		b.queue_drop_depth = jint(obj, "queue_drop_depth", 60)
++		b.default_lane_weights = jw3(obj, "default_lane_weights", {1, 4, 1})
++		b.emphasis_preset = jw3(obj, "emphasis_preset", {4, 1, 1})
++		// hardware inventory (the Mini-Motorways-style tray): named refs
++		// resolved against the pipe/router catalogs (unknown name = fail)
++		b.starting_links = make([dynamic]i32, len(cat.pipe_tiers))
++		b.starting_routers = make([dynamic]i32, len(cat.node_types))
++		if si, oks := obj["starting_inventory"].(json.Object); oks {
++			if lm, okl := si["links"].(json.Object); okl {
++				for name, v in lm {
++					n, okn := jcount(v); if !okn { continue }
++					ti, okti := tier_index(cat, name)
++					if !okti { return cat, {"balance.json", name, "starting_inventory.links names an unknown pipe tier"} }
++					b.starting_links[ti] = i32(n)
++				}
++			}
++			if rm, okr := si["routers"].(json.Object); okr {
++				for name, v in rm {
++					n, okn := jcount(v); if !okn { continue }
++					ni, okni := node_type_index(cat, name)
++					if !okni { return cat, {"balance.json", name, "starting_inventory.routers names an unknown node type"} }
++					if cat.node_types[ni].kind != .Junction { return cat, {"balance.json", name, "starting_inventory.routers names a non-router type"} }
++					b.starting_routers[ni] = i32(n)
++				}
++			}
++		}
++		prev_tick: u64 = 0
++		if gs, okg2 := obj["grants"].(json.Array); okg2 {
++			for gv in gs {
++				go, okgo := gv.(json.Object); if !okgo { continue }
++				g: Grant
++				g.at_tick = u64(jint(go, "at_tick", 0))
++				if len(b.grants) > 0 && g.at_tick <= prev_tick {
++					return cat, {"balance.json", "grants", "grants must be in strictly ascending at_tick order"}
++				}
++				prev_tick = g.at_tick
++				if lm, okl := go["links"].(json.Object); okl {
++					for name, v in lm {
++						n, okn := jcount(v); if !okn { continue }
++						ti, okti := tier_index(cat, name)
++						if !okti { return cat, {"balance.json", name, "grant links names an unknown pipe tier"} }
++						append(&g.links, Grant_Item{idx = ti, n = i32(n)})
++					}
++				}
++				if rm, okr := go["routers"].(json.Object); okr {
++					for name, v in rm {
++						n, okn := jcount(v); if !okn { continue }
++						ni, okni := node_type_index(cat, name)
++						if !okni { return cat, {"balance.json", name, "grant routers names an unknown node type"} }
++						if cat.node_types[ni].kind != .Junction { return cat, {"balance.json", name, "grant routers names a non-router type"} }
++						append(&g.routers, Grant_Item{idx = ni, n = i32(n)})
++					}
++				}
++				append(&b.grants, g)
++			}
++		}
++		b.packet_pool_cap = jint(obj, "packet_pool_cap", 6000)
++		b.rolling_window_ticks = jint(obj, "rolling_window_ticks", 100)
++		b.growth_first_tick = jint(obj, "growth_first_tick", 400)
++		b.growth_interval_ticks = jint(obj, "growth_interval_ticks", 400)
++		b.growth_interval_short_ticks = jint(obj, "growth_interval_short_ticks", 260)
++		b.growth_min_dist_tiles = jint(obj, "growth_min_dist_tiles", 7)
++		b.growth_spawn_near_junction = jint(obj, "growth_spawn_near_junction", 12)
++		b.growth_pool_size = jint(obj, "growth_pool_size", 24)
++		if gb, okg := obj["growth_box"].(json.Object); okg {
++			b.growth_box = {jint(gb, "x0", 6), jint(gb, "x1", 34), jint(gb, "y0", 4), jint(gb, "y1", 26)}
++		}
++		if gr, okg := obj["growth_roles"].(json.Array); okg {
++			for rv in gr {
++				role := rv.(json.String) or_continue
++				if _, okn := node_type_index(cat, role); !okn {
++					return cat, {"balance.json", role, "growth role names an unknown node type"}
++				}
++				append(&b.growth_roles, role)
++			}
++		}
++		if mp, okg := obj["map"].(json.Object); okg {
++			b.map_w_tiles = jint(mp, "w_tiles", 40)
++			b.map_h_tiles = jint(mp, "h_tiles", 30)
++			b.tile_px = jint(mp, "tile_px", 26)
++		}
++		if b.rolling_window_ticks <= 0 || b.rolling_window_ticks > ROLLING_MAX {
++			return cat, {"balance.json", "rolling_window_ticks", "must be 1..ROLLING_MAX"}
++		}
++		if b.breach_exit_pct < b.win_uptime_pct || b.breach_exit_pct > 100 {
++			return cat, {"balance.json", "breach_exit_pct", "must be >= win_uptime_pct and <= 100 (E30 hysteresis)"}
++		}
++		if b.health_critical_threshold_pct <= b.health_strain_threshold_pct {
++			return cat, {"balance.json", "health_critical_threshold_pct", "must exceed the strain threshold"}
++		}
++		if b.map_w_tiles <= 0 || b.map_h_tiles <= 0 || b.tile_px <= 0 {
++			return cat, {"balance.json", "map", "map dims/tile_px must be > 0"}
++		}
++		cat.balance = b
++	}
++
++	// cross-reference + required-content checks (ODN-5 fail-fast)
++	if _, ok := node_type_index(cat, "content_host"); !ok {
++		return cat, {"node_types.json", "content_host", "PROTO requires the content_host type"}
++	}
++	if _, ok := node_type_index(cat, "residential"); !ok {
++		return cat, {"node_types.json", "residential", "PROTO requires the residential type"}
++	}
++	if _, ok := node_type_index(cat, "router_mid"); !ok {
++		return cat, {"node_types.json", "router_mid", "PROTO requires the router_mid type"}
++	}
++	if _, ok := class_index(cat, "email"); !ok {
++		return cat, {"packet_types.json", "email", "PROTO requires the email class"}
++	}
++	if _, ok := class_index(cat, "streaming"); !ok {
++		return cat, {"packet_types.json", "streaming", "PROTO requires the streaming class"}
++	}
++	return cat, {}
++}
++
++MAX_CLASSES :: 12
++
++class_index :: proc(cat: ^Catalogs, id: string) -> (u16, bool) {
++	for pt, i in cat.packet_types {
++		if pt.id == id { return u16(i), true }
++	}
++	return 0, false
++}
++
++tier_index :: proc(cat: ^Catalogs, id: string) -> (u16, bool) {
++	for t, i in cat.pipe_tiers {
++		if t.id == id { return u16(i), true }
++	}
++	return 0, false
++}
++
++node_type_index :: proc(cat: ^Catalogs, id: string) -> (u16, bool) {
++	for nt, i in cat.node_types {
++		if nt.id == id { return u16(i), true }
++	}
++	return 0, false
++}
++
++role_from_name :: proc(name: string) -> Terminal_Role {
++	switch name {
++	case "residential":  return .Residential
++	case "content_host": return .Content_Host
++	}
++	return .None
++}
++
++// --- tiny JSON accessors (parse_integers = true => numbers are json.Integer) --
++
++jstr :: proc(o: json.Object, key: string) -> string {
++	if v, ok := o[key].(json.String); ok { return v }
++	return ""
++}
++
++jcount :: proc(v: json.Value) -> (i32, bool) {
++	#partial switch x in v {
++	case json.Integer: return i32(x), true
++	case json.Float:   return i32(x), true
++	}
++	return 0, false
++}
++
++jint :: proc(o: json.Object, key: string, def: i32) -> i32 {
++	if v, ok := o[key]; ok {
++		#partial switch x in v {
++		case json.Integer: return i32(x)
++		case json.Float:   return i32(x)
++		}
++	}
++	return def
++}
++
++jbool :: proc(o: json.Object, key: string) -> bool {
++	if v, ok := o[key].(json.Boolean); ok { return bool(v) }
++	return false
++}
++
++jarr_i :: proc(o: json.Object, key: string) -> [dynamic]i64 {
++	out: [dynamic]i64
++	if v, ok := o[key].(json.Array); ok {
++		for x in v {
++			if n, okn := x.(json.Integer); okn { append(&out, i64(n)) }
++		}
++	}
++	return out
++}
++
++jw3 :: proc(o: json.Object, key: string, def: [3]i32) -> [3]i32 {
++	a := jarr_i(o, key)
++	if len(a) == 3 { return {i32(a[0]), i32(a[1]), i32(a[2])} }
++	return def
++}
++
++// Catalog errors stringify through here (the app surfaces them at startup;
++// core never touches fmt-for-side-effects, so this stays a pure formatter).
++catalog_error_string :: proc(err: Catalog_Error, allocator := context.allocator) -> string {
++	return fmt.aprintf("catalog %s: field %r — %s", err.file, err.field, err.rule, allocator = allocator)
++}
+diff --git a/core/catalogs_testkit.odin b/core/catalogs_testkit.odin
+new file mode 100644
+index 0000000..832b7e2
+--- /dev/null
++++ b/core/catalogs_testkit.odin
+@@ -0,0 +1,20 @@
++package core
++
++// catalogs_testkit.odin — shared test/harness fixture: the REAL catalogs,
++// #load-embedded (compile-time; the core itself never touches the filesystem).
++// Tests and the harness run against the exact shipping data (ODN-5).
++
++test_catalog_sources :: proc(src: ^Catalog_Sources) {
++	src.packet_types = #load("../data/packet_types.json")
++	src.pipe_tiers   = #load("../data/pipe_tiers.json")
++	src.node_types   = #load("../data/node_types.json")
++	src.demand       = #load("../data/demand.json")
++	src.crises       = #load("../data/crises.json")
++	src.balance      = #load("../data/balance.json")
++}
++
++must_catalogs :: proc() -> (^Catalogs, Catalog_Error) {
++	src: Catalog_Sources
++	test_catalog_sources(&src)
++	return catalogs_load(&src)
++}
+diff --git a/core/command.odin b/core/command.odin
+new file mode 100644
+index 0000000..ba2dffc
+--- /dev/null
++++ b/core/command.odin
+@@ -0,0 +1,75 @@
++package core
++
++// command.odin — validated Commands (ODN-12). Raw input becomes an Intent in
++// the app; the Command_Bus resolves it (snap-to-node, preview) into a Command;
++// the core's topology_apply_edit is the single validation authority. The
++// action log stores post-validation, post-snap commands (ODN-11), so replay
++// can never drift from live play on legality.
++
++Command :: struct {
++	// apply_tick is the tick the command is applied at in replay. Live edits
++	// land IMMEDIATELY via the edit fast-path (ODN-2) and are logged with
++	// apply_tick = next tick; replay applies all entries with apply_tick == N
++	// before stepping N — live and replay see identical state at every step
++	// boundary. THE CONVENTION IS PINNED by replay_test.odin (Perkins r1 on
++	// the Godot prototype: an undocumented +1 convention diverged replays).
++	apply_tick: u64,
++	kind:       Command_Kind,
++}
++
++Command_Kind :: union {
++	Cmd_Draw_Pipe,
++	Cmd_Upgrade_Pipe,
++	Cmd_Demolish,
++	Cmd_Set_Lane_Weights,
++	Cmd_Set_Pipe_Priority,
++	Cmd_Set_Junction_Triage,
++	Cmd_Place_Router,
++}
++
++Cmd_Draw_Pipe :: struct {
++	a, b: u32,      // node ids (resolved, post-snap)
++	tier: u16,      // pipe_tiers catalog index
++}
++
++Cmd_Upgrade_Pipe :: struct {
++	pipe:    u32,
++	to_tier: u16,
++}
++
++// is_node: demolishing a junction severs ALL incident pipes first (in pipe-id
++// order — deterministic, E27), each per E1 (reroute-or-drop), then removes the
++// vertex. Perkins r1 on the Godot prototype: one-pipe-per-neighbor cascades
++// left ghost pipes when parallel pipes shared a neighbor — the Odin cascade
++// collects by incidence, not by neighbor.
++Cmd_Demolish :: struct {
++	target:  u32,
++	is_node: bool,
++}
++
++Cmd_Set_Lane_Weights :: struct {
++	pipe:    u32,
++	weights: [3]i32,
++}
++
++// The PROTO QoS surface (GDD § M2 'priority emphasis' dial): "" = neutral
++// (all classes ride Standard), else the named class rides Express and the
++// others ride Best on this pipe.
++Cmd_Set_Pipe_Priority :: struct {
++	pipe:         u32,
++	priority:     i32, // class index, or -1 for neutral
++}
++
++// Junction triage (E2.3): which class wins contention THROUGH this junction.
++Cmd_Set_Junction_Triage :: struct {
++	junction: u32,
++	triage:   i32, // class index, or -1 for neutral
++}
++
++// Router placement (the Mini-Motorways-style inventory ruling): routers are
++// PLAYER-placed from the tray, never director-spawned. Consuming one router
++// of the tier from inventory; placement must clear the separation rule.
++Cmd_Place_Router :: struct {
++	type_idx: u16,    // node_types catalog index (must be a router kind)
++	pos:      [2]i32, // tile coords
++}
+diff --git a/core/crisis.odin b/core/crisis.odin
+new file mode 100644
+index 0000000..645eb68
+--- /dev/null
++++ b/core/crisis.odin
+@@ -0,0 +1,87 @@
++package core
++
++// crisis.odin — S4 Crisis Engine (ODN-4, architecture §6.4; PROTO ships the
++// Surge archetype only). DOWNSTREAM of the flow: reads topology + flow state,
++// produces warnings + crisis events. Never owns the demand timeline (that's
++// the Director, upstream — a crisis is a consequence, never its own cause,
++// REVIEW M1). Fairness is structural here: node health derives from MEASURED
++// load (never a phantom), the surge is forecast by the catalog timeline, and
++// every Crisis_Triggered carries a structured root_cause + the preventive
++// redesign lives in crises.json.
++//
++// Dedup (E13): one active crisis per root cause across the whole activation —
++// the surge fires once, resolves once; warnings fire on transitions only.
++
++Crisis_State :: struct {
++	node_health:  [dynamic]Health_State, // per node slot
++	surge_active: bool,
++}
++
++crisis_ensure :: proc(c: ^Crisis_State, t: ^Topology) {
++	if len(c.node_health) < len(t.node_alive) {
++		n := len(t.node_alive) - len(c.node_health)
++		for _ in 0 ..< n { append(&c.node_health, Health_State.Healthy) }
++	}
++}
++
++crisis_evaluate :: proc(state: ^Run_State, tick: u64, plan: ^Pressure_Plan) {
++	c := &state.crisis
++	t := &state.topology
++	f := &state.flow
++	cat := state.catalogs
++	bal := &cat.balance
++	crisis_ensure(c, t)
++
++	// Node health from this tick's measured load (the warning surface; the
++	// strain/critical thresholds are catalog values). 🔴 is always traceable
++	// to a measured load — never a phantom.
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] {
++			c.node_health[i] = .Healthy
++			continue
++		}
++		level := Health_State.Healthy
++		if t.node_throughput[i] > 0 && i < len(f.node_load) {
++			pct := (f.node_load[i] * 100) / t.node_throughput[i]
++			if pct >= bal.health_critical_threshold_pct {
++				level = .Critical
++			} else if pct >= bal.health_strain_threshold_pct {
++				level = .Strained
++			}
++		}
++		prev := c.node_health[i]
++		if level != prev {
++			c.node_health[i] = level
++			if level == .Healthy {
++				emit(state, tick, Ev_Warning_Cleared{node = t.node_id[i]})
++			} else {
++				emit(state, tick, Ev_Warning_Raised{node = t.node_id[i], level = level})
++			}
++		}
++	}
++
++	// The forecast ("weather report") + surge lifecycle, from the catalog
++	// timeline the Director owns. Dedup via the Director_State flags.
++	d := &state.director
++	for i in 0 ..< len(cat.demand.set_pieces) {
++		if i >= len(d.forecasted) { break }
++		sp := &cat.demand.set_pieces[i]
++		if !d.forecasted[i] && set_piece_forecasted(sp, tick) {
++			d.forecasted[i] = true
++			emit(state, tick, Ev_Forecast_Issued{set_piece = u16(i)})
++		}
++		if !d.triggered[i] && set_piece_active(sp, tick) {
++			d.triggered[i] = true
++			c.surge_active = true
++			// Fairness contract: the structured root cause + preventive
++			// redesign (crises.json carries the copy).
++			rc := Root_Cause{pattern = .No_Spare_Capacity_For_Forecast_Spike, node = 0}
++			emit(state, tick, Ev_Crisis_Triggered{archetype = .Surge, set_piece = u16(i), root_cause = rc})
++		}
++		if d.triggered[i] && !d.resolved[i] && tick >= sp.start_tick + sp.duration_ticks {
++			d.resolved[i] = true
++			c.surge_active = false
++			emit(state, tick, Ev_Crisis_Resolved{archetype = .Surge, set_piece = u16(i)})
++		}
++	}
++}
+diff --git a/core/demand.odin b/core/demand.odin
+new file mode 100644
+index 0000000..7c7301f
+--- /dev/null
++++ b/core/demand.odin
+@@ -0,0 +1,166 @@
++package core
++
++// demand.odin — the scripted CrisisDirector (ODN-7, architecture §6.4). The
++// Director owns the demand timeline + map growth UPSTREAM of the flow; the
++// Crisis Engine evaluates DOWNSTREAM; the Director must never read crisis
++// state (REVIEW M1) — here that rule is structural: plan_pressure receives no
++// handle to Run_State.
++//
++// plan_pressure is pure w.r.t. sim state in PROTO: a function of
++// (era, tick, catalog) — the rng parameter exists for the seam contract
++// (ODN-7) and the scripted impl never draws from it (Perkins r1: a display-
++// path plan call must not perturb the sim's rng stream — the scripted plan
++// consumes none, ever).
++//
++// Map growth (E31): the candidate pool is drawn from the run's seeded rng ONCE
++// at bootstrap (24 positions), so growth consumes zero rng during the run and
++// the demand stream is untouched. Spawns proceed OUTWARD from the router mesh
++// (within growth_spawn_near_junction of a junction) with a minimum separation;
++// the pool is rejection-sampled deterministically, then a full row-major scan
++// fallback, then a min-dist-only scan (never strand a spawn far from the
++// network — the lesson the Godot prototype paid for).
++
++Pressure_Plan :: struct {
++	tick:       u64,
++	entries:    []Demand_Entry,   // base demand (slice into the catalog — read-only)
++	set_pieces: [dynamic]u16,     // active set-piece indices this tick
++}
++
++effective_volume :: proc(plan: ^Pressure_Plan, class: u16, base: i32, cat: ^Catalogs) -> i32 {
++	v := base
++	for sp_idx in plan.set_pieces {
++		sp := cat.demand.set_pieces[sp_idx]
++		if sp.class == class && set_piece_active(&sp, plan.tick) {
++			v *= sp.multiplier
++		}
++	}
++	return v
++}
++
++Director_State :: struct {
++	growth_pool:     [dynamic][2]i32,
++	growth_pool_idx: int,
++	growth_next:     u64,
++	growth_done:     int,
++	forecasted:      [dynamic]bool, // per set-piece: forecast event already issued
++	triggered:       [dynamic]bool, // per set-piece: crisis event fired
++	resolved:        [dynamic]bool,
++}
++
++director_init_growth :: proc(d: ^Director_State, rng: ^Rng, bal: ^Balance, allocator := context.allocator) {
++	context.allocator = allocator
++	clear(&d.growth_pool)
++	for _ in 0 ..< bal.growth_pool_size {
++		x := rng_range(rng, bal.growth_box[0], bal.growth_box[1])
++		y := rng_range(rng, bal.growth_box[2], bal.growth_box[3])
++		append(&d.growth_pool, [2]i32{x, y})
++	}
++	d.growth_pool_idx = 0
++	d.growth_next = u64(bal.growth_first_tick)
++	d.growth_done = 0
++}
++
++scripted_plan_pressure :: proc(cat: ^Catalogs, tick: u64, scratch := context.temp_allocator) -> Pressure_Plan {
++	plan: Pressure_Plan
++	plan.tick = tick
++	plan.entries = cat.demand.entries[:]
++	plan.set_pieces = make([dynamic]u16, scratch)
++	for sp, i in cat.demand.set_pieces {
++		s := sp
++		if set_piece_active(&s, tick) {
++			append(&plan.set_pieces, u16(i))
++		}
++	}
++	return plan
++}
++
++// Growth due this tick (0 or 1 spawn), deterministic given (seed, tick,
++// topology). Returns (type_idx, pos, ok). Emits nothing — Run_State applies
++// the spawn and emits Ev_Node_Spawned.
++director_plan_growth :: proc(d: ^Director_State, t: ^Topology, cat: ^Catalogs, tick: u64) -> (u16, [2]i32, bool) {
++	bal := &cat.balance
++	if len(bal.growth_roles) == 0 { return 0, {}, false }
++	if d.growth_done >= len(bal.growth_roles) { return 0, {}, false }
++	if tick < d.growth_next { return 0, {}, false }
++	role := bal.growth_roles[d.growth_done]
++	type_idx, ok := node_type_index(cat, role)
++	if !ok { return 0, {}, false }
++	pos, found := next_growth_pos(d, t, bal)
++	if !found {
++		// stall throttle: retry after the interval, never full-scan every tick
++		d.growth_next = tick + u64(max(1, bal.growth_interval_ticks))
++		return 0, {}, false
++	}
++	d.growth_done += 1
++	interval := bal.growth_interval_ticks
++	if d.growth_done >= (len(bal.growth_roles)+1)/2 {
++		interval = bal.growth_interval_short_ticks
++	}
++	d.growth_next = tick + u64(max(1, interval))
++	return type_idx, pos, true
++}
++
++manhattan :: proc(a, b: [2]i32) -> i32 {
++	return abs(a[0]-b[0]) + abs(a[1]-b[1])
++}
++
++min_dist_ok :: proc(t: ^Topology, cand: [2]i32, min_d: i32) -> bool {
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		if manhattan(t.node_pos[i], cand) < min_d { return false }
++	}
++	return true
++}
++
++pos_free :: proc(t: ^Topology, cand: [2]i32, bal: ^Balance) -> bool {
++	near_junction := false
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		d := manhattan(t.node_pos[i], cand)
++		if d < bal.growth_min_dist_tiles { return false }
++		if t.node_kind[i] == .Junction && d <= bal.growth_spawn_near_junction {
++			near_junction = true
++		}
++	}
++	return near_junction
++}
++
++next_growth_pos :: proc(d: ^Director_State, t: ^Topology, bal: ^Balance) -> ([2]i32, bool) {
++	pool := len(d.growth_pool)
++	if pool > 0 {
++		for i in 0 ..< pool {
++			cand := d.growth_pool[(d.growth_pool_idx+i)%pool]
++			if pos_free(t, cand, bal) {
++				d.growth_pool_idx = (d.growth_pool_idx + i + 1) % pool
++				return cand, true
++			}
++		}
++	}
++	// Fallback: exhaustive deterministic row-major scan, full check.
++	for y in bal.growth_box[2] ..= bal.growth_box[3] {
++		for x in bal.growth_box[0] ..= bal.growth_box[1] {
++			cand := [2]i32{x, y}
++			if pos_free(t, cand, bal) { return cand, true }
++		}
++	}
++	// Last resort: anchored at each junction, scanning outward for the nearest
++	// cell that respects min separation — a spawn is ALWAYS reachable from the
++	// mesh (E31; never the min-dist-only-anywhere scan that stranded a house
++	// 20+ tiles from every router in the Godot prototype).
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] || t.node_kind[i] != .Junction { continue }
++		base := t.node_pos[i]
++		for radius in bal.growth_min_dist_tiles ..= bal.growth_spawn_near_junction {
++			for dy in -radius ..= radius {
++				for dx in -radius ..= radius {
++					if abs(dx) + abs(dy) != radius { continue } // ring only
++					cand := [2]i32{base[0] + dx, base[1] + dy}
++					if cand[0] < bal.growth_box[0] || cand[0] > bal.growth_box[1] ||
++					   cand[1] < bal.growth_box[2] || cand[1] > bal.growth_box[3] { continue }
++					if min_dist_ok(t, cand, bal.growth_min_dist_tiles) { return cand, true }
++				}
++			}
++		}
++	}
++	return {}, false
++}
+diff --git a/core/events.odin b/core/events.odin
+new file mode 100644
+index 0000000..1ea104a
+--- /dev/null
++++ b/core/events.odin
+@@ -0,0 +1,61 @@
++package core
++
++// events.odin — the per-tick event buffer (ODN-14). Cross-layer communication
++// is a tagged-union array on Run_State, appended during core.step and drained
++// by the app once per frame in append order. Every event carries its tick —
++// the harness's assertion language and event-stream goldens depend on it.
++//
++// Ordering is program order; there are no callbacks, no bus, no globals.
++
++Event :: struct {
++	tick: u64,
++	kind: Event_Kind,
++}
++
++Event_Kind :: union {
++	Ev_Packet_Arrived,
++	Ev_Packet_Dropped,
++	Ev_Node_Spawned,
++	Ev_Forecast_Issued,
++	Ev_Warning_Raised,
++	Ev_Warning_Cleared,
++	Ev_Crisis_Triggered,
++	Ev_Crisis_Resolved,
++	Ev_Grace_Started,
++	Ev_Grace_Expired,
++	Ev_Meter_Changed,
++	Ev_Run_Won,
++	Ev_Run_Lost,
++	Ev_Stock_Arrived,
++}
++
++Ev_Packet_Arrived :: struct { class: u16 }
++Ev_Packet_Dropped :: struct { class: u16, reason: Drop_Reason }
++Ev_Node_Spawned :: struct { node: u32, type_idx: u16 }
++// hardware delivery landed in the tray (inventory grant; totals this delivery)
++Ev_Stock_Arrived :: struct { links: i32, routers: i32 }
++Ev_Forecast_Issued :: struct { set_piece: u16 } // demand-catalog set-piece index
++Ev_Warning_Raised :: struct { node: u32, level: Health_State } // Strained|Critical
++Ev_Warning_Cleared :: struct { node: u32 }
++Ev_Crisis_Triggered :: struct { archetype: Crisis_Archetype, set_piece: u16, root_cause: Root_Cause }
++Ev_Crisis_Resolved :: struct { archetype: Crisis_Archetype, set_piece: u16 }
++Ev_Grace_Started :: struct {}
++Ev_Grace_Expired :: struct {}
++Ev_Meter_Changed :: struct { pct: i32 }
++Ev_Run_Won :: struct { surge_uptime_pct: i32 }
++Ev_Run_Lost :: struct {}
++
++Crisis_Archetype :: enum u8 { Surge = 0 }
++
++// The fairness contract made structured (FORGE #3): every crisis carries the
++// topology flaw that caused it + the redesign that would have prevented it.
++Root_Cause :: struct {
++	pattern: Root_Cause_Pattern,
++	node:    u32, // the strained locus when known; 0 = map-wide
++}
++
++Root_Cause_Pattern :: enum u8 { No_Spare_Capacity_For_Forecast_Spike = 0 }
++
++emit :: proc(state: ^Run_State, tick: u64, kind: Event_Kind) {
++	append(&state.events, Event{tick = tick, kind = kind})
++}
+diff --git a/core/flow.odin b/core/flow.odin
+new file mode 100644
+index 0000000..d2c16c7
+--- /dev/null
++++ b/core/flow.odin
+@@ -0,0 +1,575 @@
++package core
++
++// flow.odin — S2 Packet-Flow Simulation (architecture §6.2): the deterministic
++// tick loop. Spawn from the demand plan (seeded weighted picks) -> route (BFS,
++// round-robin / capacity-weighted at parallel pipes) -> traverse (bandwidth-
++// shared per pipe, QoS lane caps) -> deliver at the sink or drop (contention /
++// severance) -> accumulate per-class SLA. QoS procs (qos.odin) and SLA
++// accumulators live INSIDE the flow (ODN-3 — no peer systems).
++//
++// Integer-only (ODN-10); arrays only (no map iteration); every random choice
++// draws state.rng. Cosmetic packet positions are integer Q8 edge-fractions
++// (vis_q8) — deterministic, and excluded from nothing: they ride the T1 hash
++// too (Perkins r1: the Godot fingerprint omitted in-flight packet state; the
++// Odin fingerprint covers ALL of it — see serialize.odin).
++
++MAX_ROUTE :: 32          // max pipes along a packet's path (nodes <= 64 in PROTO)
++ROLLING_MAX :: 128       // balance.rolling_window_ticks must be <= this
++
++Packet :: struct {
++	id:                 u64,
++	class:              u16,
++	src, dst:           u32,              // node ids
++	route:              [MAX_ROUTE]u32,   // pipe ids along the chosen path
++	route_len:          u8,
++	edge_idx:           u8,
++	progress_units:     i32,              // bandwidth units traversed on the current edge
++	lane:               Lane,             // the class's catalog default (informational)
++	spawn_tick:         u64,
++	bandwidth_demand:   i32,              // cached from the catalog at spawn
++	accrued_latency_ms: i32,              // integer ms (sub-tick resolution, m16)
++	vis_q8:             i32,  // Q8 edge-fractions along the route (cosmetic, deterministic)
++	done:               bool, // scratch: arrived (delivered/dropped) this tick
++	delivered_marker:   bool,
++	drop_reason:        Drop_Reason,
++}
++
++Sla_Accumulator :: struct {
++	delivered:        u64,
++	dropped:          u64,
++	total_latency_ms: u64,
++	demand_seen:      u64,
++}
++
++Flow_Report :: struct {
++	spawned:   i32,
++	delivered: i32,
++	dropped:   i32,
++	unmet:     i32,
++}
++
++Flow_State :: struct {
++	packets:        [dynamic]Packet,
++	next_packet_id: u64,
++	sla:            [dynamic]Sla_Accumulator, // per class
++	ms_per_tick:    i32,
++	// round-robin cursors per unordered node pair (parallel arrays; lookup by
++	// linear scan — pairs are few; insertion order is the iteration order)
++	rr_a, rr_b:     [dynamic]u32,
++	rr_cursor:      [dynamic]u32,
++	// rolling recent-uptime window per class (forgives the build phase)
++	roll_del:       [dynamic][ROLLING_MAX]i32,
++	roll_drop:      [dynamic][ROLLING_MAX]i32,
++	roll_ds:        [dynamic]i32,
++	roll_dps:       [dynamic]i32,
++	roll_idx:       i32,
++	roll_window:    i32, // the catalog's rolling_window_ticks (<= ROLLING_MAX)
++	tick_del:       [dynamic]i32, // per class, this tick
++	tick_drop:      [dynamic]i32,
++	// per-node-slot per-tick surfaces (the warning surface + inspect panel)
++	node_load:      [dynamic]i32, // per node slot
++	node_flow:      [dynamic]i32, // node_slot * MAX_CLASSES + class
++	// BFS scratch (resized as the topology grows)
++	bfs_prev:       []i32,
++	bfs_queue:      []u32,
++	// per-tick scratch (persistent — no per-tick allocator churn)
++	sc_src_ids:     [dynamic]u32,
++	sc_src_w:       [dynamic]i32,
++	sc_dst_ids:     [dynamic]u32,
++	sc_dst_w:       [dynamic]i32,
++	sc_survivors:   [dynamic]Packet,
++}
++
++flow_init :: proc(f: ^Flow_State, cat: ^Catalogs, allocator := context.allocator) {
++	context.allocator = allocator
++	f.next_packet_id = 1
++	f.ms_per_tick = 1000 / cat.balance.logic_hz // logic_hz is the single source (Perkins r1)
++	f.roll_window = cat.balance.rolling_window_ticks
++	for _ in cat.packet_types {
++		append(&f.sla, Sla_Accumulator{})
++		append(&f.roll_del, [ROLLING_MAX]i32{})
++		append(&f.roll_drop, [ROLLING_MAX]i32{})
++		append(&f.roll_ds, 0)
++		append(&f.roll_dps, 0)
++		append(&f.tick_del, 0)
++		append(&f.tick_drop, 0)
++	}
++}
++
++flow_ensure_scratch :: proc(f: ^Flow_State, t: ^Topology) {
++	nslots := len(t.node_alive)
++	if len(f.node_load) < nslots {
++		resize(&f.node_load, nslots)
++		resize(&f.node_flow, nslots*MAX_CLASSES)
++	}
++	if len(f.bfs_prev) < nslots {
++		prev := f.bfs_prev
++		queue := f.bfs_queue
++		f.bfs_prev = make([]i32, nslots*2)
++		f.bfs_queue = make([]u32, nslots*2)
++		copy(f.bfs_prev, prev)
++		copy(f.bfs_queue, queue)
++		delete(prev)
++		delete(queue)
++	}
++}
++
++// --- demand resolution (seeded weighted picks; E28 unroutable accrues, never
++// --- spawns a phantom) --------------------------------------------------------
++
++weighted_pick :: proc(items: []u32, weights: []i32, rng: ^Rng) -> u32 {
++	if len(items) == 0 { return 0 }
++	if len(items) == 1 { return items[0] }
++	total: i64 = 0
++	for w in weights { total += i64(w) }
++	if total <= 0 {
++		return items[rng_range(rng, 0, i32(len(items))-1)]
++	}
++	r := i64(rng_range(rng, 0, i32(total)-1))
++	acc: i64 = 0
++	for item, i in items {
++		acc += i64(weights[i])
++		if r < acc { return item }
++	}
++	return items[len(items)-1]
++}
++
++// gather terminals of a role into scratch slices (insertion order)
++terminals_of :: proc(t: ^Topology, role: Terminal_Role, ids: ^[dynamic]u32, weights: ^[dynamic]i32) {
++	clear(&ids^)
++	clear(&weights^)
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		if t.node_kind[i] == .Terminal && t.node_role[i] == role {
++			append(ids, t.node_id[i])
++			append(weights, 1) // demand_weight is uniform in the PROTO roster
++		}
++	}
++}
++
++// --- routing (BFS shortest path; parallel-pipe pick per hop) ------------------
++
++rr_next :: proc(f: ^Flow_State, a, b: u32, n: int) -> int {
++	if n <= 0 { return 0 }
++	lo, hi := a, b
++	if hi < lo { lo, hi = hi, lo }
++	for i in 0 ..< len(f.rr_a) {
++		if f.rr_a[i] == lo && f.rr_b[i] == hi {
++			c := f.rr_cursor[i]
++			f.rr_cursor[i] = (c + 1) % u32(n)
++			return int(c % u32(n))
++		}
++	}
++	append(&f.rr_a, lo)
++	append(&f.rr_b, hi)
++	append(&f.rr_cursor, 1 % u32(max(1, n)))
++	return 0
++}
++
++// Pick among parallel pipes connecting a-b. LB mode is TIER-DETERMINED (GDD
++// M3): smart junctions (lb_weighted) take the highest-capacity pipe, ties
++// spread round-robin; basic = round-robin via the per-pair cursor.
++pick_pipe :: proc(f: ^Flow_State, t: ^Topology, a, b: u32, pipe_ids: []u32) -> u32 {
++	if len(pipe_ids) == 1 { return pipe_ids[0] }
++	// junction endpoint (a first, matching the reference)
++	junc_slot: u32 = 0
++	has_junc := false
++	if sa, ok := node_slot(t, a); ok && t.node_kind[sa] == .Junction {
++		junc_slot, has_junc = sa, true
++	} else if sb, ok2 := node_slot(t, b); ok2 && t.node_kind[sb] == .Junction {
++		junc_slot, has_junc = sb, true
++	}
++	candidates := pipe_ids
++	best_buf: [MAX_ROUTE]u32
++	if has_junc && t.node_lb_weighted[junc_slot] {
++		best_cap: i32 = -1
++		for pid in pipe_ids {
++			ps := t.pipe_by_id[pid]
++			best_cap = max(best_cap, t.pipe_capacity[ps])
++		}
++		n := 0
++		for pid in pipe_ids {
++			ps := t.pipe_by_id[pid]
++			if t.pipe_capacity[ps] == best_cap && n < MAX_ROUTE {
++				best_buf[n] = pid
++				n += 1
++			}
++		}
++		if n == 1 { return best_buf[0] }
++		candidates = best_buf[:n]
++	}
++	idx := rr_next(f, a, b, len(candidates))
++	return candidates[idx]
++}
++
++// BFS over adjacency (insertion-ordered) -> per-hop parallel-pipe pick.
++// Returns the pipe-id route into p.route / p.route_len (empty = unreachable).
++compute_route :: proc(f: ^Flow_State, t: ^Topology, src, dst: u32, p: ^Packet) {
++	p.route_len = 0
++	if src == dst { return }
++	nslots := len(t.node_alive)
++	for i in 0 ..< nslots { f.bfs_prev[i] = -1 }
++	src_slot, ok_src := node_slot(t, src)
++	dst_slot, ok_dst := node_slot(t, dst)
++	if !ok_src || !ok_dst { return }
++	head, tail: int = 0, 1
++	f.bfs_queue[0] = src_slot
++	f.bfs_prev[src_slot] = -2 // visited marker (src)
++	nb_buf: [64]u32
++	found := false
++	for head < tail {
++		cur := f.bfs_queue[head]
++		head += 1
++		if cur == dst_slot { found = true; break }
++		n := neighbors(t, t.node_id[cur], nb_buf[:])
++		for i in 0 ..< n {
++			ns, ok := node_slot(t, nb_buf[i])
++			if !ok { continue }
++			if f.bfs_prev[ns] == -1 {
++				f.bfs_prev[ns] = i32(cur)
++				f.bfs_queue[tail] = ns
++				tail += 1
++			}
++		}
++	}
++	if !found && f.bfs_prev[dst_slot] == -1 { return }
++	// walk back dst -> src, then reverse into pipe picks
++	path_buf: [64]u32 // node slots
++	plen := 0
++	n := dst_slot
++	for {
++		path_buf[plen] = n
++		plen += 1
++		if n == src_slot { break }
++		prev := f.bfs_prev[n]
++		if prev < 0 { plen = 0; break }
++		n = u32(prev)
++		if plen >= len(path_buf) { plen = 0; break }
++	}
++	if plen < 2 { return }
++	pair_buf: [MAX_ROUTE]u32
++	for i in 0 ..< plen-1 {
++		na := t.node_id[path_buf[plen-1-i]]
++		nb := t.node_id[path_buf[plen-2-i]]
++		cnt := pipes_between(t, na, nb, pair_buf[:])
++		if cnt == 0 { p.route_len = 0; return }
++		if i >= MAX_ROUTE { p.route_len = 0; return }
++		p.route[i] = pick_pipe(f, t, na, nb, pair_buf[:cnt])
++	}
++	p.route_len = u8(min(plen-1, MAX_ROUTE))
++}
++
++// The node a packet has reached = src walked through every COMPLETED edge.
++// Completed edges may be TOMBSTONED (an E27 cascade can kill the pipe behind
++// an in-flight packet): their endpoint data persists in the arrays, so the
++// walk follows ids regardless of liveness — the anchor is the far endpoint of
++// the last completed edge, never a teleport back to the source (Perkins r2
++// review note N4).
++current_node :: proc(p: ^Packet, t: ^Topology) -> u32 {
++	node := p.src
++	for i in 0 ..< int(p.edge_idx) {
++		ps, ok := t.pipe_by_id[p.route[i]] // id->slot persists after tombstone
++		if !ok { return node }
++		a, b := t.pipe_a[ps], t.pipe_b[ps]
++		if node == a { node = b } else if node == b { node = a } else { return node }
++	}
++	return node
++}
++
++// --- the step -----------------------------------------------------------------
++
++flow_step :: proc(state: ^Run_State, tick: u64, plan: ^Pressure_Plan) -> Flow_Report {
++	f := &state.flow
++	t := &state.topology
++	cat := state.catalogs
++	rng := &state.rng
++	report: Flow_Report
++	for i in 0 ..< len(f.tick_del) { f.tick_del[i] = 0; f.tick_drop[i] = 0 }
++
++	flow_ensure_scratch(f, t)
++
++	// scratch for terminal sets (persistent buffers, cleared per use)
++	src_ids := &f.sc_src_ids
++	src_w := &f.sc_src_w
++	dst_ids := &f.sc_dst_ids
++	dst_w := &f.sc_dst_w
++
++	// 1. SPAWN from demand.
++	for entry in plan.entries {
++		volume := effective_volume(plan, entry.class, entry.volume, cat)
++		if volume <= 0 { continue }
++		terminals_of(t, entry.source_role, src_ids, src_w)
++		terminals_of(t, entry.sink_role, dst_ids, dst_w)
++		acc := &f.sla[entry.class]
++		if len(src_ids) == 0 || len(dst_ids) == 0 {
++			// E28: undelivered demand feeds strain exactly like a loss
++			report.unmet += volume
++			report.dropped += volume
++			acc.demand_seen += u64(volume)
++			acc.dropped += u64(volume)
++			f.tick_drop[entry.class] += volume
++			continue
++		}
++		for _ in 0 ..< volume {
++			src := weighted_pick(src_ids[:], src_w[:], rng)
++			dst := pick_dst(dst_ids[:], dst_w[:], src, rng)
++			acc.demand_seen += 1
++			p: Packet
++			p.id = f.next_packet_id
++			f.next_packet_id += 1
++			p.class = entry.class
++			p.src, p.dst = src, dst
++			pt := cat.packet_types[entry.class]
++			p.bandwidth_demand = max(1, pt.bandwidth_demand)
++			p.lane = entry.default_lane
++			p.spawn_tick = tick
++			compute_route(f, t, src, dst, &p)
++			if p.route_len == 0 {
++				// E28: unroutable demand is not spawned — it accrues as
++				// SLA-undelivered (feeds strain exactly like a loss).
++				acc.dropped += 1
++				f.tick_drop[entry.class] += 1
++				report.unmet += 1
++				report.dropped += 1
++				emit(state, tick, Ev_Packet_Dropped{class = entry.class, reason = .Unreachable})
++				continue
++			}
++			if len(f.packets) >= int(cat.balance.packet_pool_cap) {
++				// E22: pool exhaustion — the spawn fails as a drop. (PROTO
++				// shape: fail the incoming spawn. The spec's lane-ordered
++				// shedding is [LATER] — the per-lane queue depth sheds long
++				// before this cap is reached at PROTO scale.)
++				acc.dropped += 1
++				f.tick_drop[entry.class] += 1
++				report.dropped += 1
++				emit(state, tick, Ev_Packet_Dropped{class = entry.class, reason = .Pool_Exhaustion})
++				continue
++			}
++			// deterministic spawn phase so packets spread along the route
++			p.vis_q8 = i32(p.id % 64) * 4 * i32(p.route_len)
++			append(&f.packets, p)
++			report.spawned += 1
++		}
++	}
++
++	// 2. ADVANCE in-flight packets (bandwidth-shared per pipe, QoS lane caps).
++	advance(state, tick, &report)
++
++	// 3. rolling recent-uptime window
++	push_rolling(f)
++
++	return report
++}
++
++pick_dst :: proc(sinks: []u32, weights: []i32, src: u32, rng: ^Rng) -> u32 {
++	// prefer dst != src when the sink set has alternatives (email P2P)
++	if len(sinks) <= 1 {
++		return weighted_pick(sinks, weights, rng)
++	}
++	cand: [dynamic]u32
++	cand_w: [dynamic]i32
++	defer delete(cand)
++	defer delete(cand_w)
++	for s, i in sinks {
++		if s != src {
++			append(&cand, s)
++			append(&cand_w, weights[i])
++		}
++	}
++	return weighted_pick(cand[:], cand_w[:], rng)
++}
++
++advance :: proc(state: ^Run_State, tick: u64, report: ^Flow_Report) {
++	f := &state.flow
++	t := &state.topology
++	cat := state.catalogs
++	bal := &cat.balance
++
++	// per-node load + per-class flow counts (the warning surface + inspect)
++	for i in 0 ..< len(f.node_load) { f.node_load[i] = 0 }
++	for i in 0 ..< len(f.node_flow) { f.node_flow[i] = 0 }
++	for p, _ in f.packets {
++		if p.route_len == 0 { continue }
++		ps, ok := pipe_slot(t, p.route[p.edge_idx])
++		if !ok { continue }
++		for endp in 0 ..< 2 {
++			nid := t.pipe_a[ps] if endp == 0 else t.pipe_b[ps]
++			if ns, ok2 := node_slot(t, nid); ok2 {
++				f.node_load[ns] += p.bandwidth_demand
++				f.node_flow[int(ns)*MAX_CLASSES + int(p.class)] += 1
++			}
++		}
++	}
++
++	// serve each pipe's backlog by QoS lane (Express -> Standard -> Best),
++	// each lane bounded by its allocated capacity (qos_allocate).
++	arrived := make([dynamic]int, 0, 64, context.temp_allocator) // tiny; tick arena
++	for pi in 0 ..< len(t.pipe_alive) {
++		if !t.pipe_alive[pi] { continue }
++		pipe_id := t.pipe_id[pi]
++		// junction endpoint (a first — matches the reference rule)
++		junc_triage: i32 = -1
++		if na, ok := node_slot(t, t.pipe_a[pi]); ok && t.node_kind[na] == .Junction {
++			junc_triage = t.node_triage[na]
++		} else if nb, ok2 := node_slot(t, t.pipe_b[pi]); ok2 && t.node_kind[nb] == .Junction {
++			junc_triage = t.node_triage[nb]
++		}
++		weights := t.pipe_weights[pi]
++		if emphasized(t.pipe_priority[pi], junc_triage) {
++			weights = bal.emphasis_preset
++		}
++		caps := qos_allocate(t.pipe_capacity[pi], weights, bal.default_lane_weights)
++		// lane readiness this tick (for the E7 floor)
++		lane_ready := [3]bool{}
++		for p in f.packets {
++			if p.done || p.route_len == 0 || int(p.edge_idx) >= int(p.route_len) { continue }
++			if p.route[p.edge_idx] != pipe_id { continue }
++			lane_ready[int(effective_lane(t.pipe_priority[pi], junc_triage, p.class))] = true
++		}
++		// Serve Express -> Standard -> Best. WORK-CONSERVING GAP-FILL (ODN-3 /
++		// §11.2): a lane's unused allocation carries DOWN to the next lane — a
++		// dialed pipe never throttles lone traffic — plus the E7 WRR floor: a
++		// non-empty lane whose allocation rounds to zero still gets a quantum
++		// of 1 unit while capacity remains (floors truncate in lane order when
++		// the pipe is exhausted — E6's defined truncation).
++		leftover: i32 = 0
++		remaining := t.pipe_capacity[pi]
++		for lane_i in 0 ..< LANE_COUNT {
++			avail := caps[lane_i] + leftover
++			if avail <= 0 && remaining > 0 && lane_ready[lane_i] {
++				avail = 1 // E7 floor quantum
++			}
++			avail = min(avail, remaining)
++			idx_in_lane := 0
++			for idx in 0 ..< len(f.packets) {
++				p := &f.packets[idx]
++				if p.done { continue }
++				if p.route_len == 0 || int(p.edge_idx) >= int(p.route_len) { continue }
++				if p.route[p.edge_idx] != pipe_id { continue }
++				if effective_lane(t.pipe_priority[pi], junc_triage, p.class) != Lane(lane_i) { continue }
++				idx_in_lane += 1
++				if idx_in_lane > int(bal.queue_drop_depth) {
++					// per-lane queue bound: beyond the depth, packets shed
++					// newest-first (the Godot prototype's actual behavior —
++					// its comment claimed oldest-first; the comment lied)
++					drop_packet(f, idx, .Queue_Overflow, &arrived)
++					continue
++				}
++				if avail <= 0 { continue } // lane exhausted this tick; packet waits
++				need := p.bandwidth_demand - p.progress_units
++				served := min(need, avail)
++				p.progress_units += served
++				avail -= served
++				remaining -= served
++				if served > 0 {
++					// flow forward visually ONLY when served — congestion piles
++					// along the pipe, not at sinks (the readable panic)
++					p.vis_q8 = min(p.vis_q8 + 64, i32(p.route_len) * 256)
++				}
++				if p.progress_units >= p.bandwidth_demand {
++					p.progress_units = 0
++					p.edge_idx += 1
++					if int(p.edge_idx) >= int(p.route_len) {
++						p.done = true
++						p.delivered_marker = true
++						append(&arrived, idx)
++					}
++				}
++			}
++			// unused allocation carries down to the next lane (gap-fill)
++			leftover = avail
++		}
++	}
++
++	// severed pipes (E1): packets whose current pipe is gone reroute from
++	// their current node, or drop with Severance
++	for idx in 0 ..< len(f.packets) {
++		p := &f.packets[idx]
++		if p.route_len == 0 { continue }
++		if int(p.edge_idx) >= int(p.route_len) { continue }
++		if _, ok := pipe_slot(t, p.route[p.edge_idx]); ok { continue }
++		cur := current_node(p, t)
++		compute_route(f, t, cur, p.dst, p)
++		p.edge_idx = 0
++		p.progress_units = 0
++		if p.route_len == 0 {
++			drop_packet(f, idx, .Severance, &arrived)
++		}
++	}
++
++	// latency accrual (integer ms; packets drop on contention/severance/
++	// unreachable — never on latency alone in PROTO) + cull delivered/dropped
++	survivors := &f.sc_survivors
++	clear(survivors)
++	for i in 0 ..< len(f.packets) {
++		p := f.packets[i]
++		if p.done { continue }
++		p.accrued_latency_ms += f.ms_per_tick
++		append(survivors, p)
++	}
++	// account the arrived (delivered/dropped) packets
++	for idx in arrived {
++		p := f.packets[idx]
++		acc := &f.sla[p.class]
++		if p.delivered_marker {
++			acc.delivered += 1
++			acc.total_latency_ms += u64(p.accrued_latency_ms)
++			f.tick_del[p.class] += 1
++			report.delivered += 1
++			emit(state, tick, Ev_Packet_Arrived{class = p.class})
++		} else {
++			acc.dropped += 1
++			f.tick_drop[p.class] += 1
++			report.dropped += 1
++			emit(state, tick, Ev_Packet_Dropped{class = p.class, reason = p.drop_reason})
++		}
++	}
++	// swap the survivor set in (insertion order preserved — determinism)
++	clear(&f.packets)
++	for p in survivors { append(&f.packets, p) }
++}
++
++// Packet bookkeeping for arrivals is done on a scratch marker struct so the
++// packet array isn't reordered mid-iteration.
++drop_packet :: proc(f: ^Flow_State, idx: int, reason: Drop_Reason, arrived: ^[dynamic]int) {
++	f.packets[idx].drop_reason = reason
++	f.packets[idx].delivered_marker = false
++	f.packets[idx].done = true
++	append(arrived, idx)
++}
++
++// --- SLA / rolling window -------------------------------------------------------
++
++push_rolling :: proc(f: ^Flow_State) {
++	window := int(f.roll_window) // catalog-sized (N7: the knob is live)
++	idx := int(f.roll_idx) % window
++	for c in 0 ..< len(f.sla) {
++		f.roll_ds[c] -= f.roll_del[c][idx]
++		f.roll_dps[c] -= f.roll_drop[c][idx]
++		f.roll_del[c][idx] = f.tick_del[c]
++		f.roll_drop[c][idx] = f.tick_drop[c]
++		f.roll_ds[c] += f.tick_del[c]
++		f.roll_dps[c] += f.tick_drop[c]
++	}
++	f.roll_idx += 1
++}
++
++// Overall recent uptime % across classes; -1 = no traffic in window (neutral,
++// E24 — the health meter treats it as neither breach nor credit).
++recent_overall_uptime :: proc(f: ^Flow_State) -> i32 {
++	td, tr: i32 = 0, 0
++	for c in 0 ..< len(f.sla) {
++		td += f.roll_ds[c]
++		tr += f.roll_dps[c]
++	}
++	tot := td + tr
++	if tot <= 0 { return -1 }
++	return (td * 100) / tot
++}
++
++recent_class_uptime :: proc(f: ^Flow_State, class: u16) -> i32 {
++	if int(class) >= len(f.sla) { return -1 }
++	tot := f.roll_ds[class] + f.roll_dps[class]
++	if tot <= 0 { return -1 }
++	return (f.roll_ds[class] * 100) / tot
++}
+diff --git a/core/health.odin b/core/health.odin
+new file mode 100644
+index 0000000..b1221c3
+--- /dev/null
++++ b/core/health.odin
+@@ -0,0 +1,114 @@
++package core
++
++// health.odin — S5 Network Health (architecture §6.5): the aggregate loss
++// condition. Drains while the rolling overall uptime breaches the threshold
++// (after a grace countdown), recharges when healthy; empty meter = Error 404.
++// Win = hold surge-window uptime >= threshold through the surge.
++//
++// Carried contracts: drain = severity-proportional + per-tick cap (E16, never
++// instant); Run_Lost supersedes (E17); hysteresis (E30): breach ENTER at
++// win_uptime_pct, EXIT at breach_exit_pct — an oscillating class can't flap
++// the episode every tick, and a re-breach during an active grace window is a
++// no-op (one countdown per episode); grace refills GRADUALLY on recovery
++// (+grace_refill_per_tick, capped) — a single healthy tick must not re-arm
++// the whole window (the never-lose exploit the Godot prototype carried);
++// surge-window accumulators reset when a new surge starts (Perkins r1).
++
++Health_Meter :: struct {
++	meter_pct:        i32,
++	grace_ticks_left: i32,
++	in_grace:         bool,
++	in_breach:        bool, // E30 hysteresis band state
++	healthy_streak:   i32,  // sustained-recovery gate for grace refill
++	won:              bool,
++	lost:             bool,
++	surge_delivered:  u64,
++	surge_dropped:    u64,
++	prev_in_surge:    bool,
++}
++
++health_init :: proc(h: ^Health_Meter, bal: ^Balance) {
++	h.meter_pct = bal.meter_start_pct
++	h.grace_ticks_left = bal.grace_window_ticks
++}
++
++health_update :: proc(state: ^Run_State, tick: u64, report: ^Flow_Report, plan: ^Pressure_Plan, recent_uptime: i32) {
++	h := &state.health
++	if h.won || h.lost { return } // terminal — frozen
++	bal := &state.catalogs.balance
++	in_surge := len(plan.set_pieces) > 0
++
++	if in_surge && !h.prev_in_surge {
++		// a new surge starts a fresh window (never double-count)
++		h.surge_delivered = 0
++		h.surge_dropped = 0
++	}
++	if in_surge {
++		h.surge_delivered += u64(report.delivered)
++		h.surge_dropped += u64(report.dropped)
++	}
++
++	// E30 hysteresis: enter the breach episode below the enter threshold;
++	// exit only above the exit threshold. Zero-demand (uptime -1) is neutral.
++	if recent_uptime < 0 {
++		// neutral: no breach, no credit — but an open episode stays open
++	} else if !h.in_breach && recent_uptime < bal.win_uptime_pct {
++		h.in_breach = true
++	} else if h.in_breach && recent_uptime >= bal.breach_exit_pct {
++		h.in_breach = false
++	}
++
++	if h.in_breach {
++		h.healthy_streak = 0
++		if !h.in_grace && h.grace_ticks_left > 0 {
++			h.in_grace = true
++			emit(state, tick, Ev_Grace_Started{})
++		}
++		if h.grace_ticks_left > 0 {
++			h.grace_ticks_left -= 1
++			if h.grace_ticks_left == 0 {
++				emit(state, tick, Ev_Grace_Expired{})
++			}
++		} else {
++			severity := bal.win_uptime_pct - recent_uptime
++			drain := clamp(severity / 10, 1, bal.meter_drain_per_tick_max) // E16
++			h.meter_pct = max(0, h.meter_pct - drain)
++			emit(state, tick, Ev_Meter_Changed{pct = h.meter_pct})
++		}
++	} else {
++		h.in_grace = false
++		h.healthy_streak += 1
++		// grace refills gradually and ONLY after a sustained recovery streak —
++		// never an instant re-arm, and a flapping line (streak never reaches
++		// the gate) never refills at all (the never-lose exploit, review W1)
++		if h.healthy_streak >= bal.grace_refill_streak_ticks &&
++		   h.grace_ticks_left < bal.grace_window_ticks {
++			h.grace_ticks_left = min(bal.grace_window_ticks, h.grace_ticks_left + bal.grace_refill_per_tick)
++		}
++		if h.meter_pct < 100 {
++			h.meter_pct = min(100, h.meter_pct + bal.meter_recharge_per_tick)
++			emit(state, tick, Ev_Meter_Changed{pct = h.meter_pct})
++		}
++	}
++
++	// win: the surge JUST ended -> check the surge-window uptime
++	if h.prev_in_surge && !in_surge && !h.lost {
++		total := h.surge_delivered + h.surge_dropped
++		// a zero-traffic window is NEUTRAL (no win, no credit) — the win must
++		// be earned against real surge traffic
++		if total > 0 {
++			uptime := i32((h.surge_delivered * 100) / total)
++			if uptime >= bal.win_uptime_pct {
++				h.won = true
++				emit(state, tick, Ev_Run_Won{surge_uptime_pct = uptime})
++			}
++		}
++	}
++	h.prev_in_surge = in_surge
++
++	// lose: meter empty -> Error 404 (Run_Lost supersedes everything, E17)
++	if h.meter_pct <= 0 && !h.won && !h.lost {
++		h.lost = true
++		emit(state, tick, Ev_Run_Lost{})
++	}
++}
+diff --git a/core/qos.odin b/core/qos.odin
+new file mode 100644
+index 0000000..438f5e7
+--- /dev/null
++++ b/core/qos.odin
+@@ -0,0 +1,66 @@
++package core
++
++MAX_WEIGHT :: 64 // §6.3 weight-domain bound (Command_Bus validation)
++
++// qos.odin — S3 QoS lane model (ODN-3, architecture §6.3): pure procs inside
++// the flow, NOT a system. Per-pipe 3-lane bandwidth partition (WFQ weights,
++// largest-remainder integers) + serialization order. Stateless; weights live
++// on pipes (Topology owns the data).
++//
++// PROTO control surface: the single "priority emphasis" dial per pipe (a pipe
++// priority or junction triage switches the pipe to the emphasis preset from
++// balance.json — catalog data, never a literal; Perkins r1: the Godot (4,1,1)
++// preset was hardcoded).
++
++// Partition a pipe's capacity across its 3 lanes by WFQ weights. Largest-
++// remainder method (no bandwidth vanishes to truncation, E8); ties resolve
++// Express -> Standard -> Best. All-zero weights fall back to the catalog
++// default preset (E5). Sums/remainders in i64 (weight domain is bounded at
++// the Command_Bus).
++qos_allocate :: proc(capacity: i32, w: [3]i32, default_w: [3]i32) -> (caps: [3]i32) {
++	ww := w
++	total := i64(ww[0]) + i64(ww[1]) + i64(ww[2])
++	if total == 0 {
++		ww = default_w
++		total = i64(ww[0]) + i64(ww[1]) + i64(ww[2])
++	}
++	if total <= 0 || capacity <= 0 { return {} }
++	nums := [3]i64{i64(capacity) * i64(ww[0]), i64(capacity) * i64(ww[1]), i64(capacity) * i64(ww[2])}
++	caps = {i32(nums[0] / total), i32(nums[1] / total), i32(nums[2] / total)}
++	remainder := i32(i64(capacity) - (nums[0]/total + nums[1]/total + nums[2]/total))
++	// largest fractional remainder; tie order = lane order (E,S,B) — selection
++	// sort, deterministic.
++	order := [3]int{0, 1, 2}
++	for i in 0 ..< 2 {
++		for j in i+1 ..< 3 {
++			fi := nums[order[i]] % total
++			fj := nums[order[j]] % total
++			if fj > fi {
++				order[i], order[j] = order[j], order[i]
++			}
++		}
++	}
++	for i in 0 ..< int(remainder) {
++		caps[order[i]] += 1
++	}
++	return caps
++}
++
++// The lane a packet's class rides on a given pipe (the Godot-prototype rule,
++// carried): the pipe's OWN dial wins; else the junction's triage order applies
++// (triaged class -> Express, the others -> Best); neutral -> all Standard.
++effective_lane :: proc(pipe_priority: i32, junction_triage: i32, class: u16) -> Lane {
++	if pipe_priority >= 0 {
++		return .Express if i32(class) == pipe_priority else .Best
++	}
++	if junction_triage >= 0 {
++		return .Express if i32(class) == junction_triage else .Best
++	}
++	return .Standard
++}
++
++// Whether this pipe runs the emphasis preset (its own dial or its junction's
++// triage) — the promoted class gets a guaranteed share (the differentiator).
++emphasized :: proc(pipe_priority: i32, junction_triage: i32) -> bool {
++	return pipe_priority >= 0 || junction_triage >= 0
++}
+diff --git a/core/rng.odin b/core/rng.odin
+new file mode 100644
+index 0000000..217bec2
+--- /dev/null
++++ b/core/rng.odin
+@@ -0,0 +1,57 @@
++package core
++
++// rng.odin — the owned PRNG (ODN-9). PCG32 XSH-RR (64-bit state, 32-bit output)
++// with seed expansion via splitmix64. Explicit integer code; the algorithm's
++// constants are written in the source (the canonical pcg-random.org PCG32).
++// NOT core:math/rand — the stdlib implementation may drift between Odin
++// releases; the determinism guarantee must not depend on the toolchain.
++//
++// Test vectors: seed 0's first 8 outputs are pinned in rng_test.odin. Any
++// future port (server validator, wasm) must reproduce them — this is the
++// cross-language determinism conformance test (REVIEW m6).
++
++Rng :: struct {
++	state: u64,
++	inc:   u64, // odd (the PCG stream selector)
++}
++
++PCG32_MULT :: 6364136223846793005  // the PCG32 multiplier (pinned)
++PCG32_INC  :: 1442695040888963407  // default stream (only used as a base constant)
++
++splitmix64 :: proc(s: ^u64) -> u64 {
++	s^ += 0x9E3779B97F4A7C15
++	z := s^
++	z = (z ~ (z >> 30)) * 0xBF58476D1CE4E5B9
++	z = (z ~ (z >> 27)) * 0x94D049BB133111EB
++	return z ~ (z >> 31)
++}
++
++// Seed from a single u64: splitmix64 expands the seed into the PCG state and
++// an odd stream selector, then two advances mix before first output.
++rng_seed :: proc(r: ^Rng, seed: u64) {
++	s := seed
++	r.state = splitmix64(&s)
++	r.inc = splitmix64(&s) | 1
++	rng_next(r)
++	r.state += splitmix64(&s)
++	rng_next(r)
++}
++
++// pcg32 XSH-RR: output is a function of the OLD state, then the state advances.
++rng_next :: proc(r: ^Rng) -> u32 {
++	old := r.state
++	r.state = old * PCG32_MULT + r.inc
++	xorshifted := u32(((old >> 18) ~ old) >> 27)
++	rot := u32(old >> 59)
++	return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
++}
++
++// Bounded draw in [lo, hi] INCLUSIVE. Multiply-shift (Lemire) instead of
++// modulo: bias is < 2^-32 and the draw is a single multiply — the bias-
++// avoidance note ODN-9 asks to keep with the code. Callers pass span-ordered
++// (lo <= hi) bounds; a degenerate span returns lo.
++rng_range :: proc(r: ^Rng, lo, hi: i32) -> i32 {
++	if hi <= lo { return lo }
++	span := u64(u32(hi - lo)) + 1
++	return lo + i32((u64(rng_next(r)) * span) >> 32)
++}
+diff --git a/core/run.odin b/core/run.odin
+new file mode 100644
+index 0000000..481fef7
+--- /dev/null
++++ b/core/run.odin
+@@ -0,0 +1,194 @@
++package core
++
++// run.odin — Run_State: the whole authoritative sim state (ODN-1/13), the
++// bootstrap (fixed seed map + seeded growth pool), and core.step — the ONLY
++// entry point that advances the simulation.
++//
++// Step order (the §4 data flow, pinned):
++//   1. topology_apply_all (replay/tooling commands; live edits already landed
++//      via the ODN-2 fast-path)
++//   2. map growth (Director, deterministic spawn validity E31)
++//   3. director.plan_pressure (scripted, upstream)
++//   4. flow_step (QoS + SLA inside)
++//   5. crisis_evaluate (downstream of flow)
++//   6. health_update (downstream of SLA)
++//   Terminal-event barrier (E17): once Run_Lost is appended, the remaining
++//   systems in the tick are skipped — one terminal event per run.
++
++Run_State :: struct {
++	seed:      u64,
++	tick:      u64,
++	rng:       Rng,
++	catalogs:  ^Catalogs,
++	topology:  Topology,
++	flow:      Flow_State,
++	crisis:    Crisis_State,
++	health:    Health_Meter,
++	director:  Director_State,
++	era:       u8, // PROTO pins era 3 (the surge slice); the Era FSM is [LATER]
++	// the hardware tray (Mini-Motorways-style countable inventory — the
++	// post-A/B economy ruling); arrays owned by the run allocator
++	inventory: Inventory,
++	events:    [dynamic]Event,
++	// cumulative run counters (deterministic; part of the T1 fingerprint)
++	spawned_total:   u64,
++	delivered_total: u64,
++	dropped_total:   u64,
++	unmet_total:     u64,
++	// the action log (ODN-11): post-validation, post-snap commands with
++	// apply_tick; replay reproduces the run bit-for-bit
++	action_log: [dynamic]Command,
++	// set when a replayed command fails validation — CRITICAL (ODN-11); the
++	// harness treats it as a failed run
++	replay_error: bool,
++	// allocator for all run-lifetime growth (the run arena's)
++	allocator: mem.Allocator,
++}
++
++import "core:mem"
++
++// The fixed seed map (the Godot prototype's proven-fun 6-node start): one
++// content host, four residentials, one MID router. Positions are integer tile
++// coords on the catalog map grid. All stats come from the node-types catalog
++// (numbers single-source — Perkins r1: the Godot bootstrap hardcoded the
++// content host's throughput).
++bootstrap_map :: proc(state: ^Run_State) {
++	t := &state.topology
++	cat := state.catalogs
++	host, _ := node_type_index(cat, "content_host")
++	res, _ := node_type_index(cat, "residential")
++	mid, _ := node_type_index(cat, "router_mid")
++	spawn_node(t, host, {30, 14}, 0, cat)
++	spawn_node(t, res, {8, 5}, 0, cat)
++	spawn_node(t, res, {8, 14}, 0, cat)
++	spawn_node(t, res, {8, 22}, 0, cat)
++	spawn_node(t, res, {14, 24}, 0, cat)
++	spawn_node(t, mid, {18, 14}, 0, cat)
++}
++
++run_init :: proc(state: ^Run_State, seed: u64, cat: ^Catalogs, allocator: mem.Allocator) {
++	run_init_bare(state, seed, cat, allocator)
++	bootstrap_map(state)
++	// Seed the growth pool from the run rng AFTER the fixed map and BEFORE the
++	// first demand draw — growth consumes exactly pool-size draws at bootstrap,
++	// then none during the run (the demand stream is untouched).
++	director_init_growth(&state.director, &state.rng, &cat.balance)
++}
++
++// Bare init (no seed map, no growth schedule) — test/harness fixtures that
++// build their own topology. Growth is disabled (schedule exhausted).
++run_init_bare :: proc(state: ^Run_State, seed: u64, cat: ^Catalogs, allocator: mem.Allocator) {
++	state.allocator = allocator
++	// NOTE: never assigns context.allocator — the core must not mutate the
++	// caller's context (allocator mixing = heap aborts; r1 lesson)
++	state.seed = seed
++	state.tick = 0
++	rng_seed(&state.rng, seed)
++	state.catalogs = cat
++	state.era = 3
++	// seed the tray from the catalog (per-tier counts; run-allocator-owned)
++	state.inventory = Inventory{
++		links = make([]i32, len(cat.pipe_tiers), allocator),
++		routers = make([]i32, len(cat.node_types), allocator),
++	}
++	copy(state.inventory.links, cat.balance.starting_links[:])
++	copy(state.inventory.routers, cat.balance.starting_routers[:])
++	topology := Topology{
++		node_by_id = make(map[u32]u32),
++		pipe_by_id = make(map[u32]u32),
++		next_node_id = 1, // ids are 1-based: 0 is the 'none' sentinel everywhere
++		next_pipe_id = 1,
++	}
++	state.topology = topology
++	flow_init(&state.flow, cat)
++	health_init(&state.health, &cat.balance)
++	// director flags per set-piece
++	for _ in cat.demand.set_pieces {
++		append(&state.director.forecasted, false)
++		append(&state.director.triggered, false)
++		append(&state.director.resolved, false)
++	}
++	state.director.growth_done = 1 << 30 // bare: no growth
++}
++
++run_destroy :: proc(state: ^Run_State) {
++	delete(state.topology.node_by_id)
++	delete(state.topology.pipe_by_id)
++}
++
++// The ONLY entry point that advances the simulation (ODN-1).
++step :: proc(state: ^Run_State, tick: u64, commands: []Command) {
++	// all run-state growth inside a step uses the run arena — save/restore so
++	// the caller's allocator is untouched (mixed-allocator append/delete =
++	// the "freed was not allocated" abort class)
++	prev_allocator := context.allocator
++	context.allocator = state.allocator
++	defer { context.allocator = prev_allocator }
++	// Terminal-event barrier (E17): a won/lost run never steps again — no
++	// growth, no flow, no events, not even the tick counter; the state hash
++	// freezes for replay tails.
++	if state.health.won || state.health.lost { return }
++	state.tick = tick
++
++	// 1. replay/tooling commands. The action log is a STREAM of individually
++	//    validated commands (each live edit validated against the state of its
++	//    moment), so replay applies entries IN ORDER, each validated against
++	//    the state the previous entries produced — NOT as one atomic E23 batch
++	//    (a tick's log can legitimately hold draw+priority on the same pipe;
++	//    atomic validation would reject the priority against the un-drawn
++	//    pipe). Live edits already landed via the ODN-2 fast-path and are NOT
++	//    re-applied here.
++	if len(commands) > 0 {
++		for cmd in commands {
++			_, err := topology_apply_edit(&state.topology, cmd, state.catalogs, state.inventory, cmd.apply_tick)
++			if err != .None {
++				// a command that fails validation during replay is a CRITICAL
++				// error (ODN-11) — play and replay can never drift on legality
++				state.replay_error = true
++			}
++		}
++	}
++
++	// 1b. hardware deliveries (grants): deterministic by tick, before growth —
++	//     a delivery landing the same tick a player needs it is never lucky.
++	for g in state.catalogs.balance.grants {
++		if g.at_tick == tick {
++			nl, nr: i32
++			for it in g.links {
++				state.inventory.links[it.idx] += it.n
++				nl += it.n
++			}
++			for it in g.routers {
++				state.inventory.routers[it.idx] += it.n
++				nr += it.n
++			}
++			emit(state, tick, Ev_Stock_Arrived{links = nl, routers = nr})
++		}
++	}
++
++	// 2. map growth (deterministic; applied before demand so new nodes join
++	//    immediately — unconnected = visible pressure)
++	if type_idx, pos, ok := director_plan_growth(&state.director, &state.topology, state.catalogs, tick); ok {
++		id := spawn_node(&state.topology, type_idx, pos, tick, state.catalogs)
++		emit(state, tick, Ev_Node_Spawned{node = id, type_idx = type_idx})
++	}
++
++	// 3. Director plans pressure (pure function of catalog + tick in PROTO;
++	//    the rng is passed for the seam contract and never drawn — REVIEW M1).
++	plan := scripted_plan_pressure(state.catalogs, tick, context.temp_allocator)
++
++	// 4. flow (QoS + SLA inside)
++	report := flow_step(state, tick, &plan)
++	state.spawned_total += u64(report.spawned)
++	state.delivered_total += u64(report.delivered)
++	state.dropped_total += u64(report.dropped)
++	state.unmet_total += u64(report.unmet)
++
++	// 5. crisis (downstream of flow)
++	crisis_evaluate(state, tick, &plan)
++
++	// 6. health (downstream of SLA)
++	health_update(state, tick, &report, &plan, recent_overall_uptime(&state.flow))
++
++	// (Era FSM / Economy score — [LATER] layers; the slots are reserved here.)
++}
+diff --git a/core/serialize.odin b/core/serialize.odin
+new file mode 100644
+index 0000000..b62280f
+--- /dev/null
++++ b/core/serialize.odin
+@@ -0,0 +1,344 @@
++package core
++
++// serialize.odin — the canonical serialized form (ODN-11/T1). Field-wise
++// little-endian, lengths-not-capacities, no padding, no pointers — INCLUDING
++// rng state, in-flight packet internals (route/edge/progress/latency/vis),
++// rolling windows, rr cursors, growth state, and the tick's event stream.
++// (Perkins r1 on the Godot prototype: the fingerprint omitted in-flight packet
++// state + latency, so replay-equality could pass while packet internals
++// diverged. Here the fingerprint covers ALL sim state.)
++//
++// Also the action-log binary format (ODN-11): versioned little-endian header
++// (magic, version, seed, era, catalog_hash, logic_hz) + length-prefixed
++// records of post-validation commands. "Byte-identical replay" = mem.compare.
++
++Writer :: struct {
++	buf: [dynamic]u8,
++}
++
++w_u8 :: proc(w: ^Writer, v: u8) { append(&w.buf, v) }
++
++w_u16 :: proc(w: ^Writer, v: u16) {
++	append(&w.buf, u8(v), u8(v >> 8))
++}
++
++w_u32 :: proc(w: ^Writer, v: u32) {
++	append(&w.buf, u8(v), u8(v >> 8), u8(v >> 16), u8(v >> 24))
++}
++
++w_i32 :: proc(w: ^Writer, v: i32) { w_u32(w, u32(v)) }
++
++w_u64 :: proc(w: ^Writer, v: u64) {
++	for i in 0 ..< 8 { append(&w.buf, u8(v >> (8 * uint(i)))) }
++}
++
++w_i64 :: proc(w: ^Writer, v: i64) { w_u64(w, u64(v)) }
++
++w_bool :: proc(w: ^Writer, v: bool) { w_u8(w, 1 if v else 0) }
++
++// --- the T1 state hash ---------------------------------------------------------
++
++// Serialize the full sim state and FNV-1a-64 it. Called per tick by the
++// harness (and by the replay-equality unit test).
++state_dump :: proc(state: ^Run_State, tick_events: []Event, scratch := context.temp_allocator) -> []u8 {
++	w := state_writer(state, tick_events, scratch)
++	return w.buf[:]
++}
++
++state_hash :: proc(state: ^Run_State, tick_events: []Event, scratch := context.temp_allocator) -> u64 {
++	w := state_writer(state, tick_events, scratch)
++	return fnv1a64(w.buf[:])
++}
++
++state_writer :: proc(state: ^Run_State, tick_events: []Event, scratch := context.temp_allocator) -> Writer {
++	w: Writer
++	w.buf = make([dynamic]u8, 0, 4096, scratch)
++
++	w_u64(&w, state.seed)
++	w_u64(&w, state.tick)
++	w_u64(&w, state.rng.state)
++	w_u64(&w, state.rng.inc)
++	w_u8(&w, state.era)
++	// inventory (the hardware tray — per-tier counts, canonical field-wise)
++	w_u32(&w, u32(len(state.inventory.links)))
++	for n in state.inventory.links { w_i32(&w, n) }
++	w_u32(&w, u32(len(state.inventory.routers)))
++	for n in state.inventory.routers { w_i32(&w, n) }
++	w_u64(&w, state.spawned_total)
++	w_u64(&w, state.delivered_total)
++	w_u64(&w, state.dropped_total)
++	w_u64(&w, state.unmet_total)
++
++	// topology — arrays in insertion order (deterministic, ODN-10)
++	t := &state.topology
++	w_u32(&w, t.next_node_id)
++	w_u32(&w, t.next_pipe_id)
++	w_u32(&w, u32(len(t.node_alive)))
++	for i in 0 ..< len(t.node_alive) {
++		w_bool(&w, t.node_alive[i])
++		w_u32(&w, t.node_id[i])
++		w_u16(&w, t.node_type[i])
++		w_u8(&w, u8(t.node_kind[i]))
++		w_i32(&w, i32(t.node_role[i]))
++		w_i32(&w, t.node_pos[i][0])
++		w_i32(&w, t.node_pos[i][1])
++		w_i32(&w, t.node_throughput[i])
++		w_i32(&w, t.node_ports[i])
++		w_bool(&w, t.node_lb_weighted[i])
++		w_i32(&w, t.node_triage[i])
++		w_u64(&w, t.node_spawn_tick[i])
++	}
++	w_u32(&w, u32(len(t.pipe_alive)))
++	for i in 0 ..< len(t.pipe_alive) {
++		w_bool(&w, t.pipe_alive[i])
++		w_u32(&w, t.pipe_id[i])
++		w_u32(&w, t.pipe_a[i])
++		w_u32(&w, t.pipe_b[i])
++		w_u16(&w, t.pipe_tier[i])
++		w_i32(&w, t.pipe_capacity[i])
++		w_i32(&w, t.pipe_span[i])
++		w_i32(&w, t.pipe_weights[i][0])
++		w_i32(&w, t.pipe_weights[i][1])
++		w_i32(&w, t.pipe_weights[i][2])
++		w_i32(&w, t.pipe_priority[i])
++		w_u64(&w, t.pipe_spawn_tick[i])
++	}
++
++	// flow — ALL packet internals (the Perkins r1 gap closed)
++	f := &state.flow
++	w_u64(&w, f.next_packet_id)
++	w_i32(&w, f.ms_per_tick)
++	w_u32(&w, u32(len(f.packets)))
++	for p in f.packets {
++		w_u64(&w, p.id)
++		w_u16(&w, p.class)
++		w_u32(&w, p.src)
++		w_u32(&w, p.dst)
++		w_u8(&w, p.route_len)
++		for i in 0 ..< int(p.route_len) { w_u32(&w, p.route[i]) }
++		w_u8(&w, p.edge_idx)
++		w_i32(&w, p.progress_units)
++		w_u8(&w, u8(p.lane))
++		w_u64(&w, p.spawn_tick)
++		w_i32(&w, p.bandwidth_demand)
++		w_i32(&w, p.accrued_latency_ms)
++		w_i32(&w, p.vis_q8)
++	}
++	for acc in f.sla {
++		w_u64(&w, acc.delivered)
++		w_u64(&w, acc.dropped)
++		w_u64(&w, acc.total_latency_ms)
++		w_u64(&w, acc.demand_seen)
++	}
++	w_u32(&w, u32(len(f.rr_a)))
++	for i in 0 ..< len(f.rr_a) {
++		w_u32(&w, f.rr_a[i])
++		w_u32(&w, f.rr_b[i])
++		w_u32(&w, f.rr_cursor[i])
++	}
++	w_i32(&w, f.roll_idx)
++	for c in 0 ..< len(f.sla) {
++		w_i32(&w, f.roll_ds[c])
++		w_i32(&w, f.roll_dps[c])
++		window := len(f.roll_del[c])
++		w_u32(&w, u32(window))
++		for i in 0 ..< window {
++			w_i32(&w, f.roll_del[c][i])
++			w_i32(&w, f.roll_drop[c][i])
++		}
++	}
++
++	// crisis + health + director
++	c := &state.crisis
++	w_u32(&w, u32(len(c.node_health)))
++	for h in c.node_health { w_u8(&w, u8(h)) }
++	w_bool(&w, c.surge_active)
++	h := &state.health
++	w_i32(&w, h.meter_pct)
++	w_i32(&w, h.grace_ticks_left)
++	w_bool(&w, h.in_grace)
++	// Perkins r2 W1: the fingerprint covers ALL health state — the hysteresis
++	// band and the refill streak gate transitions exactly like meter_pct does
++	w_bool(&w, h.in_breach)
++	w_i32(&w, h.healthy_streak)
++	w_bool(&w, h.won)
++	w_bool(&w, h.lost)
++	w_u64(&w, h.surge_delivered)
++	w_u64(&w, h.surge_dropped)
++	w_bool(&w, h.prev_in_surge)
++	d := &state.director
++	w_u32(&w, u32(d.growth_pool_idx))
++	w_u64(&w, d.growth_next)
++	w_u32(&w, u32(d.growth_done))
++	for v in d.growth_pool { w_i32(&w, v[0]); w_i32(&w, v[1]) }
++	for v in d.forecasted { w_bool(&w, v) }
++	for v in d.triggered { w_bool(&w, v) }
++	for v in d.resolved { w_bool(&w, v) }
++
++	// the tick's event stream
++	w_u32(&w, u32(len(tick_events)))
++	for e in tick_events {
++		w_u64(&w, e.tick)
++		switch k in e.kind {
++		case Ev_Packet_Arrived:
++			w_u8(&w, 1); w_u16(&w, k.class)
++		case Ev_Packet_Dropped:
++			w_u8(&w, 2); w_u16(&w, k.class); w_u8(&w, u8(k.reason))
++		case Ev_Node_Spawned:
++			w_u8(&w, 3); w_u32(&w, k.node); w_u16(&w, k.type_idx)
++		case Ev_Forecast_Issued:
++			w_u8(&w, 4); w_u16(&w, k.set_piece)
++		case Ev_Warning_Raised:
++			w_u8(&w, 5); w_u32(&w, k.node); w_u8(&w, u8(k.level))
++		case Ev_Warning_Cleared:
++			w_u8(&w, 6); w_u32(&w, k.node)
++		case Ev_Crisis_Triggered:
++			w_u8(&w, 7); w_u8(&w, u8(k.archetype)); w_u16(&w, k.set_piece)
++			w_u8(&w, u8(k.root_cause.pattern)); w_u32(&w, k.root_cause.node)
++		case Ev_Crisis_Resolved:
++			w_u8(&w, 8); w_u8(&w, u8(k.archetype)); w_u16(&w, k.set_piece)
++		case Ev_Grace_Started:
++			w_u8(&w, 9)
++		case Ev_Grace_Expired:
++			w_u8(&w, 10)
++		case Ev_Meter_Changed:
++			w_u8(&w, 11); w_i32(&w, k.pct)
++		case Ev_Run_Won:
++			w_u8(&w, 12); w_i32(&w, k.surge_uptime_pct)
++		case Ev_Run_Lost:
++			w_u8(&w, 13)
++		case Ev_Stock_Arrived:
++			w_u8(&w, 14); w_i32(&w, k.links); w_i32(&w, k.routers)
++		}
++	}
++
++	return w
++}
++
++// --- the action log (ODN-11 binary) --------------------------------------------
++
++LOG_MAGIC   :: 0x314C5050 // "PPL1" little-endian
++LOG_VERSION :: 1
++
++log_write :: proc(state: ^Run_State, scratch := context.temp_allocator) -> []u8 {
++	w: Writer
++	w.buf = make([dynamic]u8, 0, 256, scratch)
++	w_u32(&w, LOG_MAGIC)
++	w_u32(&w, LOG_VERSION)
++	w_u64(&w, state.seed)
++	w_u8(&w, state.era)
++	w_u64(&w, state.catalogs.hash)
++	w_i32(&w, state.catalogs.balance.logic_hz)
++	w_u32(&w, u32(len(state.action_log)))
++	for cmd in state.action_log {
++		w_u64(&w, cmd.apply_tick)
++		switch c in cmd.kind {
++		case Cmd_Draw_Pipe:
++			w_u8(&w, 1); w_u32(&w, c.a); w_u32(&w, c.b); w_u16(&w, c.tier)
++		case Cmd_Upgrade_Pipe:
++			w_u8(&w, 2); w_u32(&w, c.pipe); w_u16(&w, c.to_tier)
++		case Cmd_Demolish:
++			w_u8(&w, 3); w_u32(&w, c.target); w_bool(&w, c.is_node)
++		case Cmd_Set_Lane_Weights:
++			w_u8(&w, 4); w_u32(&w, c.pipe)
++			w_i32(&w, c.weights[0]); w_i32(&w, c.weights[1]); w_i32(&w, c.weights[2])
++		case Cmd_Set_Pipe_Priority:
++			w_u8(&w, 5); w_u32(&w, c.pipe); w_i32(&w, c.priority)
++		case Cmd_Set_Junction_Triage:
++			w_u8(&w, 6); w_u32(&w, c.junction); w_i32(&w, c.triage)
++		case Cmd_Place_Router:
++			w_u8(&w, 7); w_u16(&w, c.type_idx); w_i32(&w, c.pos[0]); w_i32(&w, c.pos[1])
++		}
++	}
++	return w.buf[:]
++}
++
++// --- log reader (the replay half) ------------------------------------------------
++
++Reader :: struct {
++	data: []u8,
++	pos:  int,
++	bad:  bool, // set on any past-end read (truncation = corrupt, never silent)
++}
++
++r_u8 :: proc(r: ^Reader) -> u8 {
++	if r.pos >= len(r.data) {
++		r.bad = true
++		return 0
++	}
++	v := r.data[r.pos]
++	r.pos += 1
++	return v
++}
++
++r_u16 :: proc(r: ^Reader) -> u16 {
++	return u16(r_u8(r)) | u16(r_u8(r)) << 8
++}
++
++r_u32 :: proc(r: ^Reader) -> u32 {
++	return u32(r_u8(r)) | u32(r_u8(r)) << 8 | u32(r_u8(r)) << 16 | u32(r_u8(r)) << 24
++}
++
++r_i32 :: proc(r: ^Reader) -> i32 { return i32(r_u32(r)) }
++
++r_u64 :: proc(r: ^Reader) -> u64 {
++	v: u64 = 0
++	for i in 0 ..< 8 { v |= u64(r_u8(r)) << (8 * uint(i)) }
++	return v
++}
++
++Log_Header :: struct {
++	seed:         u64,
++	era:          u8,
++	catalog_hash: u64,
++	logic_hz:     i32,
++}
++
++// Parse an action log; validates magic/version. ok=false on corruption
++// (critical error handling, ODN-11).
++log_read :: proc(data: []u8, allocator := context.allocator) -> (Log_Header, []Command, bool) {
++	cmds: []Command
++	r := Reader{data = data}
++	if r_u32(&r) != LOG_MAGIC { return {}, nil, false }
++	if r_u32(&r) != LOG_VERSION { return {}, nil, false }
++	h: Log_Header
++	h.seed = r_u64(&r)
++	h.era = r_u8(&r)
++	h.catalog_hash = r_u64(&r)
++	h.logic_hz = r_i32(&r)
++	n := r_u32(&r)
++	// bounds sanity before allocation: the smallest record is 9 bytes
++	// (apply_tick u64 + tag u8); a count beyond the remaining bytes is corrupt
++	if u64(n) * 9 > u64(len(r.data) - r.pos) { return {}, nil, false }
++	cmds = make([]Command, n, allocator)
++	for i in 0 ..< int(n) {
++		cmd: Command
++		cmd.apply_tick = r_u64(&r)
++		switch r_u8(&r) {
++		case 1:
++			cmd.kind = Cmd_Draw_Pipe{a = r_u32(&r), b = r_u32(&r), tier = r_u16(&r)}
++		case 2:
++			cmd.kind = Cmd_Upgrade_Pipe{pipe = r_u32(&r), to_tier = r_u16(&r)}
++		case 3:
++			target := r_u32(&r)
++			is_node := r_u8(&r)
++			if is_node > 1 { return {}, nil, false }
++			cmd.kind = Cmd_Demolish{target = target, is_node = is_node == 1}
++		case 4:
++			pipe := r_u32(&r)
++			w := [3]i32{r_i32(&r), r_i32(&r), r_i32(&r)}
++			cmd.kind = Cmd_Set_Lane_Weights{pipe = pipe, weights = w}
++		case 5:
++			cmd.kind = Cmd_Set_Pipe_Priority{pipe = r_u32(&r), priority = r_i32(&r)}
++		case 6:
++			cmd.kind = Cmd_Set_Junction_Triage{junction = r_u32(&r), triage = r_i32(&r)}
++		case 7:
++			cmd.kind = Cmd_Place_Router{type_idx = r_u16(&r), pos = {r_i32(&r), r_i32(&r)}}
++		case:
++			return {}, nil, false
++		}
++		cmds[i] = cmd
++	}
++	if r.bad || r.pos != len(r.data) { return {}, nil, false } // truncation/trailing = corrupt
++	return h, cmds, true
++}
+diff --git a/core/snapshot.odin b/core/snapshot.odin
+new file mode 100644
+index 0000000..f963286
+--- /dev/null
++++ b/core/snapshot.odin
+@@ -0,0 +1,241 @@
++package core
++
++import "core:slice"
++
++// snapshot.odin — the sole contract between Core and Presentation (ODN-1).
++// The view reads only the immutable snapshot; it can never perturb the sim.
++// PROTO renders at sim rate (the Godot reference's cadence — its vis-dist
++// smoothness is carried as vis_q8), so a single live snapshot rewritten per
++// tick (and topology-only on edit fast-path) replaces the ping-pong pair.
++
++Snap_Node :: struct {
++	id:          u32,
++	type_idx:    u16,
++	kind:        Node_Kind,
++	role:        Terminal_Role,
++	pos:         [2]i32,
++	throughput:  i32,
++	load:        i32,
++	ports:       i32,
++	ports_used:  i32,
++	lb_weighted: bool,
++	triage:      i32,
++	health:      Health_State,
++	flow_counts: [MAX_CLASSES]i32, // in-flight packets of each class through this node
++}
++
++Snap_Pipe :: struct {
++	id:        u32,
++	a, b:      u32,
++	tier:      u16,
++	span:      i32,
++	capacity:  i32,
++	weights:   [3]i32,
++	lane_caps: [3]i32, // this tick's effective allocation (emphasis applied)
++	priority:  i32,
++	on_pipe:   i32,    // in-flight packets currently traversing (pressure)
++}
++
++Snap_Packet :: struct {
++	class: u16,
++	lane:  Lane,
++	pipe:  u32, // the pipe the packet is visually ON (0 = at a node)
++	frac_q8: i32, // Q8 fraction along that pipe (0..256), a->b direction
++	node:  u32, // when pipe == 0: the node it sits at
++}
++
++Snap_Class :: struct {
++	delivered:  u64,
++	dropped:    u64,
++	uptime_pct: i32, // recent rolling uptime; -1 = neutral (no traffic)
++	avg_latency_ms: i32,
++}
++
++Snap_Forecast :: struct {
++	set_piece:   u16,
++	ticks_until: i64, // until start (forecast) — the countdown numeral
++}
++
++Snapshot :: struct {
++	tick:            u64,
++	era:             u8,
++	meter_pct:       i32,
++	grace_ticks_left: i32,
++	in_grace:        bool,
++	won:             bool,
++	lost:            bool,
++	uptime_pct:      i32, // overall recent; -1 = neutral
++	in_flight:       i32,
++	inv_links:       []i32, // per pipe-tier tray counts (HUD tray)
++	inv_routers:     []i32, // per node-type tray counts (router kinds)
++	spawned_total:   u64,
++	delivered_total: u64,
++	dropped_total:   u64,
++	unmet_total:     u64,
++	nodes:           [dynamic]Snap_Node,
++	pipes:           [dynamic]Snap_Pipe,
++	packets:         [dynamic]Snap_Packet,
++	classes:         [dynamic]Snap_Class,
++	forecasts:       [dynamic]Snap_Forecast,
++	surge_active:    bool,
++	surge_ends_in:   i64, // ticks until the active surge ends; -1 if none
++}
++
++snapshot_write :: proc(snap: ^Snapshot, state: ^Run_State, allocator := context.temp_allocator) {
++	t := &state.topology
++	f := &state.flow
++	cat := state.catalogs
++	snap.tick = state.tick
++	snap.era = state.era
++	snap.meter_pct = state.health.meter_pct
++	snap.grace_ticks_left = state.health.grace_ticks_left
++	snap.in_grace = state.health.in_grace
++	snap.won = state.health.won
++	snap.lost = state.health.lost
++	snap.uptime_pct = recent_overall_uptime(f)
++	snap.in_flight = i32(len(f.packets))
++	snap.inv_links = slice.clone(state.inventory.links, allocator)
++	snap.inv_routers = slice.clone(state.inventory.routers, allocator)
++	snap.spawned_total = state.spawned_total
++	snap.delivered_total = state.delivered_total
++	snap.dropped_total = state.dropped_total
++	snap.unmet_total = state.unmet_total
++	snap.surge_active = state.crisis.surge_active
++	snap.surge_ends_in = -1
++
++	clear(&snap.nodes)
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		load: i32 = 0
++		if i < len(f.node_load) { load = f.node_load[i] }
++		health: Health_State = .Healthy
++		if i < len(state.crisis.node_health) { health = state.crisis.node_health[i] }
++		fc: [MAX_CLASSES]i32
++		if i < len(f.node_load) {
++			for c in 0 ..< len(cat.packet_types) {
++				fc[c] = f.node_flow[i*MAX_CLASSES + c]
++			}
++		}
++		append(&snap.nodes, Snap_Node{
++			id = t.node_id[i],
++			type_idx = t.node_type[i],
++			kind = t.node_kind[i],
++			role = t.node_role[i],
++			pos = t.node_pos[i],
++			throughput = t.node_throughput[i],
++			load = load,
++			ports = t.node_ports[i],
++			ports_used = i32(incident_pipe_count(t, t.node_id[i])),
++			lb_weighted = t.node_lb_weighted[i],
++			triage = t.node_triage[i],
++			health = health,
++			flow_counts = fc,
++		})
++	}
++
++	clear(&snap.pipes)
++	for i in 0 ..< len(t.pipe_alive) {
++		if !t.pipe_alive[i] { continue }
++		junc_triage: i32 = -1
++		if na, ok := node_slot(t, t.pipe_a[i]); ok && t.node_kind[na] == .Junction {
++			junc_triage = t.node_triage[na]
++		} else if nb, ok2 := node_slot(t, t.pipe_b[i]); ok2 && t.node_kind[nb] == .Junction {
++			junc_triage = t.node_triage[nb]
++		}
++		weights := t.pipe_weights[i]
++		if emphasized(t.pipe_priority[i], junc_triage) {
++			weights = cat.balance.emphasis_preset
++		}
++		on_pipe: i32 = 0
++		for p in f.packets {
++			if p.route_len > 0 && int(p.edge_idx) < int(p.route_len) && p.route[p.edge_idx] == t.pipe_id[i] {
++				on_pipe += 1
++			}
++		}
++		append(&snap.pipes, Snap_Pipe{
++			id = t.pipe_id[i],
++			a = t.pipe_a[i], b = t.pipe_b[i],
++			tier = t.pipe_tier[i],
++			span = t.pipe_span[i],
++			capacity = t.pipe_capacity[i],
++			weights = t.pipe_weights[i],
++			lane_caps = qos_allocate(t.pipe_capacity[i], weights, cat.balance.default_lane_weights),
++			priority = t.pipe_priority[i],
++			on_pipe = on_pipe,
++		})
++	}
++
++	clear(&snap.packets)
++	for p in f.packets {
++		pipe, frac, node := packet_edge_pos(p, t)
++		append(&snap.packets, Snap_Packet{class = p.class, lane = p.lane, pipe = pipe, frac_q8 = frac, node = node})
++	}
++
++	clear(&snap.classes)
++	for acc, i in f.sla {
++		avg: i32 = 0
++		if acc.delivered > 0 { avg = i32(acc.total_latency_ms / acc.delivered) }
++		append(&snap.classes, Snap_Class{
++			delivered = acc.delivered,
++			dropped = acc.dropped,
++			uptime_pct = recent_class_uptime(f, u16(i)),
++			avg_latency_ms = avg,
++		})
++	}
++
++	clear(&snap.forecasts)
++	for sp, i in cat.demand.set_pieces {
++		s := sp
++		if set_piece_forecasted(&s, state.tick) {
++			append(&snap.forecasts, Snap_Forecast{
++				set_piece = u16(i),
++				ticks_until = i64(s.start_tick) - i64(state.tick),
++			})
++		}
++		if set_piece_active(&s, state.tick) {
++			snap.surge_ends_in = i64(s.start_tick + s.duration_ticks) - i64(state.tick)
++		}
++	}
++}
++
++// Integer walk of the route consuming vis_q8 (Q8 edge-fractions): which pipe
++// the packet visually rides + the fraction along it. The view maps (pipe,
++// frac) onto the pipe's BEZIER so dots follow the rendered curve. Direction
++// matters: frac runs from the packet's FROM node toward its TO node.
++packet_edge_pos :: proc(p: Packet, t: ^Topology) -> (pipe: u32, frac_q8: i32, node: u32) {
++	if p.route_len == 0 { return 0, 0, p.src }
++	remaining := p.vis_q8
++	for i in 0 ..< int(p.route_len) {
++		pid := p.route[i]
++		if remaining <= 256 {
++			// orient: frac measured from the traversal direction's start
++			ps, ok := pipe_slot(t, pid)
++			if !ok { return 0, 0, p.src }
++			a := t.pipe_a[ps]
++			b := t.pipe_b[ps]
++			// the packet's direction along the pipe: from src-side to dst-side.
++			// The route walk tracks the node it came from; recompute quickly:
++			// for edge i the entry node is the entry node.
++			entry := route_entry_node(p, t, i)
++			rem := max(0, remaining)
++			if entry == b {
++				rem = 256 - rem // frac always a->b; flip when traversing b->a
++			}
++			return pid, rem, 0
++		}
++		remaining -= 256
++	}
++	return 0, 0, p.dst
++}
++
++// the node the packet ENTERED edge i from (src walked through completed edges)
++route_entry_node :: proc(p: Packet, t: ^Topology, edge: int) -> u32 {
++	node := p.src
++	for i in 0 ..< edge {
++		ps, ok := pipe_slot(t, p.route[i])
++		if !ok { return node }
++		a, b := t.pipe_a[ps], t.pipe_b[ps]
++		node = b if a == node else (a if b == node else node)
++	}
++	return node
++}
+diff --git a/core/testkit.odin b/core/testkit.odin
+new file mode 100644
+index 0000000..4482510
+--- /dev/null
++++ b/core/testkit.odin
+@@ -0,0 +1,230 @@
++package core
++
++// testkit.odin — harness/test tooling (NOT used by the game). The demo
++// autopilot: wires the network the way a good player does — junctions mesh
++// first (router-to-router links), then houses attach to the nearest router
++// with a free port; standard legs escalating to wide when span demands. Every
++// command goes through topology_apply_edit — the single authority — and lands
++// in the action log, so autopilot runs replay bit-for-bit.
++
++// Apply the boot network (the Godot prototype's demo wiring): 2 parallel wide
++// content<->router pipes (the LAG bundle) + wide legs to every house, one
++// content pipe set to streaming priority. Returns the number of pipes drawn.
++testkit_wire_boot :: proc(state: ^Run_State, tick: u64) -> int {
++	t := &state.topology
++	cat := state.catalogs
++	wide, _ := tier_index(cat, "wide")
++	host: u32 = 0
++	router: u32 = 0
++	houses: [dynamic]u32
++	defer delete(houses)
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		if t.node_kind[i] == .Junction {
++			router = t.node_id[i]
++		} else if t.node_role[i] == .Content_Host {
++			host = t.node_id[i]
++		} else if t.node_role[i] == .Residential {
++			append(&houses, t.node_id[i])
++		}
++	}
++	drawn := 0
++	submit := proc(state: ^Run_State, cmd: Command, tick: u64) -> bool {
++		// the pinned convention: apply with apply_tick = next tick, both for
++		// the entity spawn ticks and the log record (live == replay)
++		apply_tick := tick + 1
++		res, err := topology_apply_edit(&state.topology, cmd, state.catalogs, state.inventory, apply_tick)
++		if err != .None { return false }
++		logged := cmd
++		logged.apply_tick = apply_tick
++		append(&state.action_log, logged)
++		return res.applied
++	}
++	if host != 0 && router != 0 {
++		for _ in 0 ..< 2 {
++			if submit(state, Command{kind = Cmd_Draw_Pipe{a = host, b = router, tier = wide}}, tick) {
++				drawn += 1
++			}
++		}
++	}
++	for h in houses {
++		if router != 0 && submit(state, Command{kind = Cmd_Draw_Pipe{a = router, b = h, tier = wide}}, tick) {
++			drawn += 1
++		}
++	}
++	// streaming priority on the first content<->router pipe (the QoS dial)
++	if host != 0 && router != 0 {
++		pair: [8]u32
++		n := pipes_between(&state.topology, host, router, pair[:])
++		if n > 0 {
++			streaming, _ := class_index(cat, "streaming")
++			submit(state, Command{kind = Cmd_Set_Pipe_Priority{pipe = pair[0], priority = i32(streaming)}}, tick)
++		}
++	}
++	return drawn
++}
++
++// Wire newly spawned nodes (growth): houses attach to the nearest junction
++// with a free port (standard, wide on span rejection / empty standard tray).
++// When no junction can take it, the autopilot PLACES a router from the tray
++// beside the house (the Mini-Motorways-style ruling: routers are player
++// hardware) and meshes it to the nearest junction. Call once per tick after
++// step. Tracks wired nodes in `wired` (caller-owned scratch map).
++testkit_autowire :: proc(state: ^Run_State, tick: u64, wired: ^map[u32]bool) {
++	t := &state.topology
++	cat := state.catalogs
++	wide, _ := tier_index(cat, "wide")
++	standard, _ := tier_index(cat, "standard")
++
++	submit := proc(state: ^Run_State, kind: Command_Kind, tick: u64) -> bool {
++		apply_tick := tick + 1 // the pinned convention, for the apply AND the log
++		cmd := Command{kind = kind}
++		_, err := topology_apply_edit(&state.topology, cmd, state.catalogs, state.inventory, apply_tick)
++		if err != .None { return false }
++		cmd.apply_tick = apply_tick
++		append(&state.action_log, cmd)
++		return true
++	}
++	draw :: proc(submit: proc(state: ^Run_State, kind: Command_Kind, tick: u64) -> bool,
++	             state: ^Run_State, a, b: u32, tiers: []u16, tick: u64) -> bool {
++		for tier in tiers {
++			if submit(state, Cmd_Draw_Pipe{a = a, b = b, tier = tier}, tick) { return true }
++		}
++		return false
++	}
++
++	// hub selection: nearest live junction with at least min_free ports free.
++	// House wires RESERVE a mesh port (min_free=2): filling a router's last
++	// port strands every router that would mesh through it (the surge-slice
++	// deadlock that killed the autopilot build at 152s).
++	free_ports :: proc(t: ^Topology, slot: u32) -> i32 {
++		cap := t.node_ports[slot]
++		if cap <= 0 { return 1 << 29 }
++		return i32(cap) - i32(incident_pipe_count(t, t.node_id[slot]))
++	}
++	nearest_hub :: proc(t: ^Topology, from_slot: u32, min_free: i32) -> (u32, i64) {
++		best: u32 = 0
++		best_d: i64 = 1 << 62
++		for j in 0 ..< len(t.node_alive) {
++			if !t.node_alive[j] || u32(j) == from_slot { continue }
++			if t.node_kind[j] != .Junction { continue }
++			if free_ports(t, u32(j)) < min_free { continue }
++			d := dist2(t.node_pos[from_slot], t.node_pos[j])
++			if d < best_d || (d == best_d && t.node_id[j] < best) {
++				best_d = d
++				best = t.node_id[j]
++			}
++		}
++		return best, best_d
++	}
++	// the biggest in-stock router tier (more ports + throughput per placement)
++	best_router_in_stock :: proc(state: ^Run_State) -> (u16, bool) {
++		best: u16 = 0
++		found := false
++		best_ports: i32 = -1
++		for nt, i in state.catalogs.node_types {
++			if nt.kind != .Junction { continue }
++			if i >= len(state.inventory.routers) || state.inventory.routers[i] <= 0 { continue }
++			if nt.port_capacity > best_ports {
++				best_ports = nt.port_capacity
++				best = u16(i)
++				found = true
++			}
++		}
++		return best, found
++	}
++
++	// deterministic spiral around a center: exact center first, then 8
++	// compass rings outward (first valid placement wins; radius >= the
++	// separation rule is reached quickly so crowded maps still converge).
++	place_near :: proc(state: ^Run_State, submit: proc(state: ^Run_State, kind: Command_Kind, tick: u64) -> bool,
++	                   center: [2]i32, rt: u16, tick: u64) -> u32 {
++		dirs := [8][2]i32{{1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1}}
++		if submit(state, Cmd_Place_Router{type_idx = rt, pos = center}, tick) {
++			return state.topology.next_node_id - 1
++		}
++		for r in i32(2) ..= 14 {
++			for d in dirs {
++				pos := center + d * r
++				if submit(state, Cmd_Place_Router{type_idx = rt, pos = pos}, tick) {
++					return state.topology.next_node_id - 1
++				}
++			}
++		}
++		return 0
++	}
++
++	// PASS A — houses: wire to the nearest hub with a spare-reserve port; if
++	// no hub or every tier is out of span, drop a router beside the house and
++	// attach locally (the mesh pass below reaches back toward the network).
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		id := t.node_id[i]
++		if wired[id] { continue }
++		if t.node_kind[i] != .Terminal || t.node_role[i] != .Residential { continue }
++		best, _ := nearest_hub(t, u32(i), 2)
++		if best != 0 && draw(submit, state, id, best, []u16{standard, wide}, tick) {
++			wired[id] = true
++			continue
++		}
++		rt, ok := best_router_in_stock(state)
++		if !ok { continue }
++		if new_id := place_near(state, submit, t.node_pos[i], rt, tick); new_id != 0 {
++			wired[new_id] = true
++			if draw(submit, state, id, new_id, []u16{standard, wide}, tick) {
++				wired[id] = true
++			}
++		}
++	}
++
++	// PASS B — junction mesh. "Reachable" = connected to the content host by
++	// live pipes (BFS; tiny n). Only REACHABLE junctions with a free port are
++	// mesh hubs — islands must chain TOWARD THE NETWORK, never to each other
++	// (island-to-island chaining wandered off-map and never converged).
++	host_slot := -1
++	for i in 0 ..< len(t.node_alive) {
++		if t.node_alive[i] && t.node_role[i] == .Content_Host { host_slot = i; break }
++	}
++	seen_or :: proc(m: map[u32]bool, k: u32) -> bool { return m[k] }
++	reachable := make(map[u32]bool, context.temp_allocator)
++	if host_slot >= 0 {
++		queue := make([dynamic]u32, context.temp_allocator)
++		append(&queue, u32(host_slot)); reachable[u32(host_slot)] = true
++		for qi := 0; qi < len(queue); qi += 1 {
++			cur := queue[qi]
++			for pi in 0 ..< len(t.pipe_alive) {
++				if !t.pipe_alive[pi] { continue }
++				a := t.node_by_id[t.pipe_a[pi]]; b := t.node_by_id[t.pipe_b[pi]]
++				if a == cur && !seen_or(reachable, b) { reachable[b] = true; append(&queue, b) }
++				if b == cur && !seen_or(reachable, a) { reachable[a] = true; append(&queue, a) }
++			}
++		}
++	}
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		if t.node_kind[i] != .Junction { continue }
++		if reachable[u32(i)] { continue } // already part of the mesh
++		// nearest REACHABLE junction with a free port
++		hub: u32 = 0
++		best_d: i64 = 1 << 62
++		for j in 0 ..< len(t.node_alive) {
++			if !t.node_alive[j] || j == i { continue }
++			if t.node_kind[j] != .Junction || !reachable[u32(j)] { continue }
++			if free_ports(t, u32(j)) < 1 { continue }
++			d := dist2(t.node_pos[i], t.node_pos[j])
++			if d < best_d || (d == best_d && t.node_id[j] < hub) {
++				best_d = d
++				hub = t.node_id[j]
++			}
++		}
++		if hub == 0 { continue }
++		if draw(submit, state, t.node_id[i], hub, []u16{wide, standard}, tick) { continue }
++		// span defeats the direct link: drop a relay at the midpoint; it is
++		// itself an island and chains one hop per tick toward the network
++		rt, ok := best_router_in_stock(state)
++		if !ok { continue }
++		hub_slot := t.node_by_id[hub]
++		mid := (t.node_pos[i] + t.node_pos[hub_slot]) / 2
++		place_near(state, submit, mid, rt, tick)
++	}
++}
+diff --git a/core/topology.odin b/core/topology.odin
+new file mode 100644
+index 0000000..c461a03
+--- /dev/null
++++ b/core/topology.odin
+@@ -0,0 +1,441 @@
++package core
++
++import "core:slice"
++
++// topology.odin — S1 Topology Graph (ODN-1, architecture §6.1). The
++// authoritative network model: terminal nodes (residential / content host) and
++// junction nodes (routers: merge/split/repeater + port limits), and pipes
++// (tier / span / lane weights / priority). Owns adjacency and edit
++// application; does not route (flow.odin) or read input (Command_Bus).
++//
++// Data layout: parallel arrays indexed by slot (insertion-ordered — core
++// iterates ARRAYS only, ODN-10); maps are lookup-only, never iterated. Ids are
++// monotonic per run, never recycled (E11): a demolished entity's id is never
++// reused; slots are tombstoned, not compacted, so live ids stay stable.
++//
++// The 'play the internet' rule (E26, art amendment A6): terminals connect via
++// routers only — never terminal-to-terminal.
++
++Topology :: struct {
++	// nodes (parallel arrays; index = slot; tombstones keep ids stable)
++	node_alive:      [dynamic]bool,
++	node_id:         [dynamic]u32,
++	node_type:       [dynamic]u16, // node_types catalog index
++	node_kind:       [dynamic]Node_Kind,
++	node_role:       [dynamic]Terminal_Role,
++	node_pos:        [dynamic][2]i32, // integer tile grid (ODN-10)
++	node_throughput: [dynamic]i32,
++	node_ports:      [dynamic]i32,      // port capacity; 0 = unlimited (terminals)
++	node_lb_weighted:[dynamic]bool,
++	node_triage:     [dynamic]i32,      // class index, -1 = neutral
++	node_spawn_tick: [dynamic]u64,
++	node_by_id:      map[u32]u32,       // id -> slot (lookup only)
++	next_node_id:    u32,
++
++	// pipes (parallel arrays; index = slot)
++	pipe_alive:    [dynamic]bool,
++	pipe_id:       [dynamic]u32,
++	pipe_a:        [dynamic]u32, // node ids
++	pipe_b:        [dynamic]u32,
++	pipe_tier:     [dynamic]u16,
++	pipe_capacity: [dynamic]i32,  // cached from the tier at draw/upgrade (hot loop)
++	pipe_span:     [dynamic]i32,  // integer Euclidean (rounded) — span/cost/snap metric
++	pipe_weights:  [dynamic][3]i32,
++	pipe_priority: [dynamic]i32,  // class index, -1 = neutral (the QoS dial)
++	pipe_spawn_tick: [dynamic]u64,
++	pipe_by_id:    map[u32]u32,
++	next_pipe_id:  u32,
++}
++
++node_count :: proc(t: ^Topology) -> int {
++	n := 0
++	for alive in t.node_alive { if alive { n += 1 } }
++	return n
++}
++
++pipe_count :: proc(t: ^Topology) -> int {
++	n := 0
++	for alive in t.pipe_alive { if alive { n += 1 } }
++	return n
++}
++
++node_slot :: proc(t: ^Topology, id: u32) -> (u32, bool) {
++	s, ok := t.node_by_id[id]
++	return s, ok && t.node_alive[s]
++}
++
++pipe_slot :: proc(t: ^Topology, id: u32) -> (u32, bool) {
++	s, ok := t.pipe_by_id[id]
++	return s, ok && t.pipe_alive[s]
++}
++
++// Integer Euclidean span, rounded (span/cost/snap metric — pinned). A single
++// correctly-rounded isqrt-free computation: we avoid sqrt entirely by
++// comparing squares where possible; where a length is needed (cost), use the
++// integer Newton isqrt — deterministic on every target (ODN-10).
++isqrt :: proc(x: i64) -> i64 {
++	if x <= 0 { return 0 }
++	r := x
++	y := (r + 1) / 2
++	for y < r {
++		r = y
++		y = (r + x / r) / 2
++	}
++	return r
++}
++
++// Rounded Euclidean distance between two grid points (matches the proven-fun
++// reference's round(sqrt(dx^2+dy^2)), computed integer-only).
++span_between :: proc(a, b: [2]i32) -> i32 {
++	dx := i64(abs(a[0] - b[0]))
++	dy := i64(abs(a[1] - b[1]))
++	d2 := dx*dx + dy*dy
++	r := isqrt(d2)
++	// round half up: isqrt floors; bump when d2 - r*r > r (i.e. frac >= .5)
++	if d2 - r*r > r { r += 1 }
++	return i32(r)
++}
++
++dist2 :: proc(a, b: [2]i32) -> i64 {
++	dx := i64(a[0] - b[0])
++	dy := i64(a[1] - b[1])
++	return dx*dx + dy*dy
++}
++
++spawn_node :: proc(t: ^Topology, type_idx: u16, pos: [2]i32, tick: u64, cat: ^Catalogs) -> u32 {
++	nt := cat.node_types[type_idx]
++	slot := u32(len(t.node_alive))
++	id := t.next_node_id
++	t.next_node_id += 1
++	append(&t.node_alive, true)
++	append(&t.node_id, id)
++	append(&t.node_type, type_idx)
++	append(&t.node_kind, nt.kind)
++	append(&t.node_role, nt.terminal_role)
++	append(&t.node_pos, pos)
++	append(&t.node_throughput, nt.throughput_units)
++	append(&t.node_ports, nt.port_capacity)
++	append(&t.node_lb_weighted, nt.lb_mode_capable)
++	append(&t.node_triage, -1)
++	append(&t.node_spawn_tick, tick)
++	t.node_by_id[id] = slot
++	return id
++}
++
++is_terminal :: proc(t: ^Topology, slot: u32) -> bool {
++	return t.node_kind[slot] == .Terminal
++}
++
++// Pipes incident to a node — a port is consumed per CONNECTED PIPE, so
++// parallel pipes each take a port (canon #14).
++incident_pipe_count :: proc(t: ^Topology, node_id: u32) -> int {
++	n := 0
++	for i in 0 ..< len(t.pipe_alive) {
++		if !t.pipe_alive[i] { continue }
++		if t.pipe_a[i] == node_id || t.pipe_b[i] == node_id { n += 1 }
++	}
++	return n
++}
++
++ports_available :: proc(t: ^Topology, node_slot_idx: u32) -> bool {
++	cap := t.node_ports[node_slot_idx]
++	if cap <= 0 { return true }
++	return incident_pipe_count(t, t.node_id[node_slot_idx]) < int(cap)
++}
++
++// All live pipes between a node pair, in pipe-id (insertion) order.
++// `out` is caller scratch (slice into it); deterministic.
++pipes_between :: proc(t: ^Topology, a, b: u32, out: []u32) -> int {
++	n := 0
++	for i in 0 ..< len(t.pipe_alive) {
++		if !t.pipe_alive[i] { continue }
++		pa, pb := t.pipe_a[i], t.pipe_b[i]
++		if (pa == a && pb == b) || (pa == b && pb == a) {
++			if n < len(out) { out[n] = t.pipe_id[i] }
++			n += 1
++		}
++	}
++	return n
++}
++
++// Neighbors of a node (insertion order = pipe insertion order).
++neighbors :: proc(t: ^Topology, node_id: u32, out: []u32) -> int {
++	n := 0
++	for i in 0 ..< len(t.pipe_alive) {
++		if !t.pipe_alive[i] { continue }
++		other: u32 = 0
++		if t.pipe_a[i] == node_id { other = t.pipe_b[i] } else if t.pipe_b[i] == node_id { other = t.pipe_a[i] } else { continue }
++		seen := false
++		for j in 0 ..< n { if out[j] == other { seen = true; break } }
++		if !seen && n < len(out) { out[n] = other; n += 1 }
++	}
++	return n
++}
++
++// Inventory: views of the run's hardware-tray arrays (Mini-Motorways-style
++// countable hardware — the post-A/B economy ruling). links is per pipe-tier
++// index; routers is per node-type index (router kinds only). Edits consume
++// and return ITEMS — no prices, no refunds.
++Inventory :: struct {
++	links:   []i32,
++	routers: []i32,
++}
++
++// --- validation (the single authority; the Command_Bus merely previews it) ---
++
++validate_command :: proc(t: ^Topology, cmd: Command, cat: ^Catalogs, inv: Inventory) -> Edit_Error {
++	switch c in cmd.kind {
++	case Cmd_Draw_Pipe:
++		if c.a == c.b { return .Self_Loop }
++		sa, oka := node_slot(t, c.a)
++		sb, okb := node_slot(t, c.b)
++		if !oka || !okb { return .Missing_Node }
++		if is_terminal(t, sa) && is_terminal(t, sb) { return .Terminal_To_Terminal } // E26
++		if int(c.tier) >= len(cat.pipe_tiers) { return .Unknown_Tier }
++		if !ports_available(t, sa) || !ports_available(t, sb) { return .Router_Ports_Full }
++		tier := cat.pipe_tiers[c.tier]
++		span := span_between(t.node_pos[sa], t.node_pos[sb])
++		if span > tier.max_span { return .Span_Exceeds_Tier }
++		if int(c.tier) >= len(inv.links) || inv.links[c.tier] <= 0 { return .Out_Of_Links }
++		return .None
++	case Cmd_Upgrade_Pipe:
++		ps, ok := pipe_slot(t, c.pipe)
++		if !ok { return .Missing_Pipe }
++		if int(c.to_tier) >= len(cat.pipe_tiers) { return .Unknown_Tier }
++		tier := cat.pipe_tiers[c.to_tier]
++		// An upgrade may not produce an over-span pipe (Perkins r1: the Godot
++		// version skipped the span check on upgrades).
++		if t.pipe_span[ps] > tier.max_span { return .Span_Exceeds_Tier }
++		// an upgrade is an EXCHANGE: the old tier's link goes back to the tray,
++		// the new tier's link comes out — you must hold one of the new tier
++		if t.pipe_tier[ps] != c.to_tier && (int(c.to_tier) >= len(inv.links) || inv.links[c.to_tier] <= 0) {
++			return .Out_Of_Links
++		}
++		return .None
++	case Cmd_Demolish:
++		if c.is_node {
++			ns, ok := node_slot(t, c.target)
++			if !ok { return .Missing_Node }
++			if is_terminal(t, ns) { return .Terminal_Demolish } // E2
++			return .None
++		}
++		if _, ok := pipe_slot(t, c.target); !ok { return .Missing_Pipe }
++		return .None
++	case Cmd_Set_Lane_Weights:
++		if _, ok := pipe_slot(t, c.pipe); !ok { return .Missing_Pipe }
++		if c.weights[0] < 0 || c.weights[1] < 0 || c.weights[2] < 0 { return .Negative_Weight }
++		if c.weights[0] > MAX_WEIGHT || c.weights[1] > MAX_WEIGHT || c.weights[2] > MAX_WEIGHT { return .Invalid_Weights }
++		return .None
++	case Cmd_Set_Pipe_Priority:
++		if _, ok := pipe_slot(t, c.pipe); !ok { return .Missing_Pipe }
++		if c.priority >= i32(len(cat.packet_types)) { return .Unknown_Command }
++		return .None
++	case Cmd_Set_Junction_Triage:
++		ns, ok := node_slot(t, c.junction)
++		if !ok { return .Missing_Junction }
++		if !is_terminal(t, ns) && t.node_kind[ns] == .Junction {
++			if c.triage >= i32(len(cat.packet_types)) { return .Invalid_Triage }
++			return .None
++		}
++		return .Not_A_Junction
++	case Cmd_Place_Router:
++		if int(c.type_idx) >= len(cat.node_types) { return .Unknown_Tier }
++		nt := cat.node_types[c.type_idx]
++		if nt.kind != .Junction { return .Not_A_Junction }
++		if int(c.type_idx) >= len(inv.routers) || inv.routers[c.type_idx] <= 0 { return .Out_Of_Routers }
++		if !placement_valid(t, c.pos, &cat.balance) { return .Invalid_Placement }
++		return .None
++	}
++	return .Unknown_Command
++}
++
++// Router placement validity: inside the map grid and clear of every live node
++// by the growth separation distance (E31's spacing rule, shared so the map
++// never gets two nodes on top of each other regardless of who placed them).
++placement_valid :: proc(t: ^Topology, pos: [2]i32, bal: ^Balance) -> bool {
++	if pos[0] < 0 || pos[0] >= bal.map_w_tiles { return false }
++	if pos[1] < 0 || pos[1] >= bal.map_h_tiles { return false }
++	sep2 := bal.growth_min_dist_tiles * bal.growth_min_dist_tiles
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		d := t.node_pos[i] - pos
++		if d[0]*d[0] + d[1]*d[1] < sep2 { return false }
++	}
++	return true
++}
++
++// --- apply (assumes validated by validate_command / topology_apply_edit) ------
++// Moves inventory items directly (consume on build, return on demolish) —
++// the tray arrays are run-owned; topology is the only mutator.
++
++apply_command :: proc(t: ^Topology, cmd: Command, cat: ^Catalogs, inv: Inventory, tick: u64) -> (res: Edit_Result) {
++	switch c in cmd.kind {
++	case Cmd_Draw_Pipe:
++		sa := t.node_by_id[c.a]
++		sb := t.node_by_id[c.b]
++		tier := cat.pipe_tiers[c.tier]
++		span := span_between(t.node_pos[sa], t.node_pos[sb])
++		slot := u32(len(t.pipe_alive))
++		id := t.next_pipe_id
++		t.next_pipe_id += 1
++		append(&t.pipe_alive, true)
++		append(&t.pipe_id, id)
++		append(&t.pipe_a, c.a)
++		append(&t.pipe_b, c.b)
++		append(&t.pipe_tier, c.tier)
++		append(&t.pipe_capacity, tier.capacity_units)
++		append(&t.pipe_span, span)
++		append(&t.pipe_weights, cat.balance.default_lane_weights)
++		append(&t.pipe_priority, -1)
++		append(&t.pipe_spawn_tick, tick)
++		t.pipe_by_id[id] = slot
++		inv.links[c.tier] -= 1
++		return {true, id}
++	case Cmd_Upgrade_Pipe:
++		ps := t.pipe_by_id[c.pipe]
++		old_tier := t.pipe_tier[ps]
++		tier := cat.pipe_tiers[c.to_tier]
++		if old_tier != c.to_tier { // exchange: old link back, new link out
++			inv.links[old_tier] += 1
++			inv.links[c.to_tier] -= 1
++		}
++		t.pipe_tier[ps] = c.to_tier
++		t.pipe_capacity[ps] = tier.capacity_units
++		return {true, 0}
++	case Cmd_Demolish:
++		if c.is_node {
++			// Junction demolish (E27): sever ALL incident pipes in pipe-id
++			// order (deterministic), returning each link to the tray; then
++			// tombstone the node and return the router to the tray.
++			// (Perkins r1 ghost-pipe fix: collect by INCIDENCE — parallel
++			// pipes to the same neighbor are all severed.)
++			target := c.target
++			victims: [dynamic]u32
++			defer delete(victims)
++			for i in 0 ..< len(t.pipe_alive) {
++				if !t.pipe_alive[i] { continue }
++				if t.pipe_a[i] == target || t.pipe_b[i] == target {
++					victims = append_victim(victims, t.pipe_id[i])
++				}
++			}
++			for pid in victims {
++				remove_pipe(t, pid, cat, inv)
++			}
++			ns := t.node_by_id[target]
++			inv.routers[t.node_type[ns]] += 1
++			t.node_alive[ns] = false
++			// the id->slot entry SURVIVES the tombstone (E11 monotonic ids;
++			// the severance anchor walk in flow reads endpoint data of dead
++			// pipes); liveness is guarded by node_alive everywhere
++			return {true, 0}
++		}
++		remove_pipe(t, c.target, cat, inv)
++		return {true, 0}
++	case Cmd_Set_Lane_Weights:
++		ps := t.pipe_by_id[c.pipe]
++		w := c.weights
++		if w[0] + w[1] + w[2] == 0 { w = cat.balance.default_lane_weights } // E5
++		t.pipe_weights[ps] = w
++		return {true, 0}
++	case Cmd_Set_Pipe_Priority:
++		ps := t.pipe_by_id[c.pipe]
++		t.pipe_priority[ps] = c.priority
++		return {true, 0}
++	case Cmd_Set_Junction_Triage:
++		ns := t.node_by_id[c.junction]
++		t.node_triage[ns] = c.triage
++		return {true, 0}
++	case Cmd_Place_Router:
++		id := spawn_node(t, c.type_idx, c.pos, tick, cat)
++		inv.routers[c.type_idx] -= 1
++		return {true, id}
++	}
++	return {false, 0}
++}
++
++append_victim :: proc(v: [dynamic]u32, id: u32) -> [dynamic]u32 {
++	// keep pipe-id (insertion) order: victims are collected by array scan,
++	// which is already id-ordered; append preserves it.
++	vv := v
++	append(&vv, id)
++	return vv
++}
++
++// Remove one pipe; its link goes back to the tray (redesign is the game, GDD
++// Player Assistance; no punishment for tearing up a bad route — the hardware
++// is yours to reuse).
++remove_pipe :: proc(t: ^Topology, id: u32, cat: ^Catalogs, inv: Inventory) {
++	ps, ok := pipe_slot(t, id)
++	if !ok { return }
++	inv.links[t.pipe_tier[ps]] += 1
++	t.pipe_alive[ps] = false
++	// id->slot entry survives (see demolish note)
++}
++
++// Validate-all-then-apply (E23): a rejected batch mutates NOTHING. Each
++// command validates against the state the PRIOR batch commands produce (a
++// speculative clone — batch sizes are tiny), so intra-batch dependencies
++// (demolish-then-redraw) validate truthfully, and the tray is checked as a
++// RUNNING inventory (a batch can never drive a count negative).
++topology_apply_all :: proc(t: ^Topology, cmds: []Command, cat: ^Catalogs, inv: Inventory, tick: u64, scratch := context.temp_allocator) -> (err: Edit_Error) {
++	if len(cmds) == 0 { return .None }
++	shadow := topology_clone(t, scratch)
++	shadow_inv := Inventory{
++		links = slice.clone(inv.links, scratch),
++		routers = slice.clone(inv.routers, scratch),
++	}
++	for cmd in cmds {
++		if e := validate_command(&shadow, cmd, cat, shadow_inv); e != .None { return e }
++		apply_command(&shadow, cmd, cat, shadow_inv, tick)
++	}
++	for cmd in cmds {
++		apply_command(t, cmd, cat, inv, tick)
++	}
++	return .None
++}
++
++topology_clone :: proc(t: ^Topology, allocator := context.temp_allocator) -> Topology {
++	c: Topology
++	c.node_alive = slice.clone_to_dynamic(t.node_alive[:], allocator)
++	c.node_id = slice.clone_to_dynamic(t.node_id[:], allocator)
++	c.node_type = slice.clone_to_dynamic(t.node_type[:], allocator)
++	c.node_kind = slice.clone_to_dynamic(t.node_kind[:], allocator)
++	c.node_role = slice.clone_to_dynamic(t.node_role[:], allocator)
++	c.node_pos = slice.clone_to_dynamic(t.node_pos[:], allocator)
++	c.node_throughput = slice.clone_to_dynamic(t.node_throughput[:], allocator)
++	c.node_ports = slice.clone_to_dynamic(t.node_ports[:], allocator)
++	c.node_lb_weighted = slice.clone_to_dynamic(t.node_lb_weighted[:], allocator)
++	c.node_triage = slice.clone_to_dynamic(t.node_triage[:], allocator)
++	c.node_spawn_tick = slice.clone_to_dynamic(t.node_spawn_tick[:], allocator)
++	c.next_node_id = t.next_node_id
++	// rebuild the lookup maps from the arrays (array iteration only, ODN-10) —
++	// a shared map would take the speculative inserts
++	c.node_by_id = make(map[u32]u32, allocator)
++	for i in 0 ..< len(t.node_alive) {
++		c.node_by_id[t.node_id[i]] = u32(i)
++	}
++	c.pipe_alive = slice.clone_to_dynamic(t.pipe_alive[:], allocator)
++	c.pipe_id = slice.clone_to_dynamic(t.pipe_id[:], allocator)
++	c.pipe_a = slice.clone_to_dynamic(t.pipe_a[:], allocator)
++	c.pipe_b = slice.clone_to_dynamic(t.pipe_b[:], allocator)
++	c.pipe_tier = slice.clone_to_dynamic(t.pipe_tier[:], allocator)
++	c.pipe_capacity = slice.clone_to_dynamic(t.pipe_capacity[:], allocator)
++	c.pipe_span = slice.clone_to_dynamic(t.pipe_span[:], allocator)
++	c.pipe_weights = slice.clone_to_dynamic(t.pipe_weights[:], allocator)
++	c.pipe_priority = slice.clone_to_dynamic(t.pipe_priority[:], allocator)
++	c.pipe_spawn_tick = slice.clone_to_dynamic(t.pipe_spawn_tick[:], allocator)
++	c.next_pipe_id = t.next_pipe_id
++	c.pipe_by_id = make(map[u32]u32, allocator)
++	for i in 0 ..< len(t.pipe_alive) {
++		c.pipe_by_id[t.pipe_id[i]] = u32(i)
++	}
++	return c
++}
++
++topology_apply_edit :: proc(t: ^Topology, cmd: Command, cat: ^Catalogs, inv: Inventory, tick: u64) -> (Edit_Result, Edit_Error) {
++	if e := validate_command(t, cmd, cat, inv); e != .None {
++		return {}, e
++	}
++	res := apply_command(t, cmd, cat, inv, tick)
++	return res, .None
++}
+diff --git a/core/types.odin b/core/types.odin
+new file mode 100644
+index 0000000..3c64ba4
+--- /dev/null
++++ b/core/types.odin
+@@ -0,0 +1,58 @@
++package core
++
++// types.odin — shared enums and small value types for the sim core.
++// Pure data; no behavior. Naming per project-context (Ada_Case types).
++
++// The 3 DiffServ lanes (ODN-3). Order is load-bearing: the contention drop
++// ladder (E9) sheds Best first; serialization serves Express first.
++Lane :: enum u8 { Express = 0, Standard = 1, Best = 2 }
++LANE_COUNT :: 3
++
++Node_Kind :: enum u8 { Terminal = 0, Junction = 1 }
++
++// Terminal roles (typed demand selectors). `none` for junctions.
++Terminal_Role :: enum i32 {
++	None         = -1,
++	Residential  = 0,
++	Content_Host = 1,
++}
++
++// Node health states — the warning surface (GDD § M5). Never color alone in
++// the view (ring pulse + icon pair with the state).
++Health_State :: enum u8 { Healthy = 0, Strained = 1, Critical = 2 }
++
++Drop_Reason :: enum u8 {
++	None = 0,
++	Queue_Overflow,  // per-lane backlog beyond the catalog depth sheds newest-first
++	Unreachable,     // no route at spawn/advance time (E28 accrues as SLA-undelivered)
++	Severance,       // pipe demolished under the packet, no reroute (E1)
++	Pool_Exhaustion, // global pool cap hit (E22)
++}
++
++Edit_Error :: enum u8 {
++	None = 0,
++	Self_Loop,
++	Missing_Node,
++	Missing_Pipe,
++	Missing_Junction,
++	Not_A_Junction,
++	Terminal_To_Terminal, // E26 — the 'play the internet' topology rule
++	Terminal_Demolish,    // E2
++	Router_Ports_Full,    // canon #14: one port per connected pipe
++	Span_Exceeds_Tier,
++	Out_Of_Links,     // no unbuilt links of that tier left in the tray
++	Out_Of_Routers,   // no unplaced routers of that tier left in the tray
++	Invalid_Placement, // router placement: out of bounds or too close to a node
++	Unknown_Tier,
++	Negative_Weight,
++	Invalid_Weights, // over MAX_WEIGHT
++	Invalid_Triage,
++	Unknown_Command,
++}
++
++Edit_Result :: struct {
++	applied: bool,
++	pipe:    u32, // meaningful when applied && the command was a draw
++}
++
++App_Mode :: enum u8 { Boot, Menu, Run, Paused, Game_Over }

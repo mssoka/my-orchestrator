@@ -1,0 +1,581 @@
+diff --git a/server/src/audit/event_type.gleam b/server/src/audit/event_type.gleam
+index d7035d40..0dccc075 100644
+--- a/server/src/audit/event_type.gleam
++++ b/server/src/audit/event_type.gleam
+@@ -34,6 +34,7 @@ pub type AuditEvent {
+   PolicyAcceptedOnSignup
+   ProfileUpdated
+   ReferenceCallCreated
++  ReferenceCallLinkResent
+   ReferenceCallReEnabled
+   ReferenceCallSkipped
+   RefundTermsAccepted
+@@ -71,6 +72,7 @@ pub fn to_string(event: AuditEvent) -> String {
+     PolicyAcceptedOnSignup -> "policy_accepted_on_signup"
+     ProfileUpdated -> "profile_updated"
+     ReferenceCallCreated -> "reference_call_created"
++    ReferenceCallLinkResent -> "reference_call_link_resent"
+     ReferenceCallReEnabled -> "reference_call_re_enabled"
+     ReferenceCallSkipped -> "reference_call_skipped"
+     RefundTermsAccepted -> "refund_terms_accepted"
+diff --git a/server/src/middleware.gleam b/server/src/middleware.gleam
+index 714df1b6..27193fa0 100644
+--- a/server/src/middleware.gleam
++++ b/server/src/middleware.gleam
+@@ -291,6 +291,9 @@ pub fn is_public_path(path: List(String)) -> Bool {
+     ["contact"] -> True
+     ["erase", _] -> True
+     ["dsar", _] -> True
++    // Referee form capability-token routes (AD-3): GET form, per-question
++    // answer POST/PUT, expired-link resend POST. Token = auth, no session.
++    ["reference", ..] -> True
+     ["tools"] -> True
+     ["tools", "rpz-calculator"] -> True
+     ["tools", "affordability-calculator"] -> True
+@@ -337,6 +340,9 @@ fn redact_token_route(segments: List(String)) -> Result(String, Nil) {
+       Ok("/apply/" <> code <> "/resume/<redacted>")
+     ["apply", code, "draft-erasure", ..] ->
+       Ok("/apply/" <> code <> "/draft-erasure/<redacted>")
++    // Reference-check referee form (AD-3) — the referee's form_token rides
++    // the path; covers /answer + /resend sub-paths via prefix match.
++    ["reference", ..] -> Ok("/reference/<redacted>")
+     _ -> Error(Nil)
+   }
+ }
+diff --git a/server/src/router.gleam b/server/src/router.gleam
+index ab4baab4..34c8e77a 100644
+--- a/server/src/router.gleam
++++ b/server/src/router.gleam
+@@ -42,6 +42,7 @@ import notification/notification_handler
+ import payment/payment_handler
+ import payment/webhook_handler
+ import pog
++import reference_checks/form_handler
+ import reference_checks/trigger
+ import sentry/csp_report_handler
+ import sentry/sentry_client.{type Sentry}
+@@ -958,6 +959,20 @@ pub fn handle_request(ctx: Context, req: Request) -> Response {
+     http.Post, ["dsar", token] ->
+       dsar_handler.handle_download(req, ctx.config, token)
+ 
++    // Public referee form (AD-3 capability-token route, Story RC3.3) —
++    // token = auth, no session; registered in middleware.is_public_path and
++    // redact_token_route alongside. The catch-all GET keeps typo'd deep
++    // links off the SPA shell (which loads analytics against the URL).
++    http.Get, ["reference", token] ->
++      form_handler.handle_get(req, ctx.config, token)
++    http.Post, ["reference", token, "answer"] ->
++      form_handler.handle_answer_post(req, ctx.config, token)
++    http.Put, ["reference", token, "answer"] ->
++      form_handler.handle_answer_put(req, ctx.config, token)
++    http.Post, ["reference", token, "resend"] ->
++      form_handler.handle_resend(req, ctx.config, token)
++    http.Get, ["reference", ..] -> form_handler.handle_unknown_path(req)
++
+     // SPA shell — all unmatched GET routes serve index.html for client-side routing
+     http.Get, _ -> serve_spa_shell(req, spa_html: ctx.spa_html)
+ 
+diff --git a/server/src/reference_checks/sql.gleam b/server/src/reference_checks/sql.gleam
+index 28d9e8ae..42ada583 100644
+--- a/server/src/reference_checks/sql.gleam
++++ b/server/src/reference_checks/sql.gleam
+@@ -171,6 +171,154 @@ WHERE a.id = $1
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `get_form_context_by_form_token` query
++/// defined in `./src/reference_checks/sql/get_form_context_by_form_token.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type GetFormContextByFormTokenRow {
++  GetFormContextByFormTokenRow(
++    id: String,
++    application_id: String,
++    ref_slot: String,
++    status: String,
++    form_token: Option(String),
++    contact_name: String,
++    contact_email: Option(String),
++    contact_phone: Option(String),
++    corrected_email: Option(String),
++    corrected_phone: Option(String),
++    form_token_expires_at: String,
++    is_expired: String,
++    form_opened_at: String,
++    draft_answers: String,
++    taken_over_at: String,
++    applicant_first_name: String,
++    applicant_last_name: String,
++    employer_name: Option(String),
++    job_title: Option(String),
++    employment_duration: Option(String),
++    monthly_income_cents: Int,
++    landlord_display_name: String,
++    origin_domain: String,
++  )
++}
++
++/// - get_form_context_by_form_token(form_token: String)
++/// The referee-form session read (Story RC3.3): one join carrying the
++/// reference_call row's session fields, the application's as-stated pre-fill
++/// fields, and the landlord/vacancy display fields the pages + the resend
++/// flow need. Nullable non-text columns use COALESCE(x::text, '') — squirrel
++/// types cast expressions as non-optional (and cannot codegen timestamptz
++/// results at all), so '' is the absent marker, mirroring the NULLIF($n,'')
++/// input convention. Plain nullable TEXT columns stay Option(String).
++/// form_token itself is selected: the resend flow needs the CURRENT token to
++/// build the fresh form URL after a remint.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn get_form_context_by_form_token(
++  db: pog.Connection,
++  arg_1: String,
++) -> Result(pog.Returned(GetFormContextByFormTokenRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    use application_id <- decode.field(1, decode.string)
++    use ref_slot <- decode.field(2, decode.string)
++    use status <- decode.field(3, decode.string)
++    use form_token <- decode.field(4, decode.optional(decode.string))
++    use contact_name <- decode.field(5, decode.string)
++    use contact_email <- decode.field(6, decode.optional(decode.string))
++    use contact_phone <- decode.field(7, decode.optional(decode.string))
++    use corrected_email <- decode.field(8, decode.optional(decode.string))
++    use corrected_phone <- decode.field(9, decode.optional(decode.string))
++    use form_token_expires_at <- decode.field(10, decode.string)
++    use is_expired <- decode.field(11, decode.string)
++    use form_opened_at <- decode.field(12, decode.string)
++    use draft_answers <- decode.field(13, decode.string)
++    use taken_over_at <- decode.field(14, decode.string)
++    use applicant_first_name <- decode.field(15, decode.string)
++    use applicant_last_name <- decode.field(16, decode.string)
++    use employer_name <- decode.field(17, decode.optional(decode.string))
++    use job_title <- decode.field(18, decode.optional(decode.string))
++    use employment_duration <- decode.field(19, decode.optional(decode.string))
++    use monthly_income_cents <- decode.field(20, decode.int)
++    use landlord_display_name <- decode.field(21, decode.string)
++    use origin_domain <- decode.field(22, decode.string)
++    decode.success(GetFormContextByFormTokenRow(
++      id:,
++      application_id:,
++      ref_slot:,
++      status:,
++      form_token:,
++      contact_name:,
++      contact_email:,
++      contact_phone:,
++      corrected_email:,
++      corrected_phone:,
++      form_token_expires_at:,
++      is_expired:,
++      form_opened_at:,
++      draft_answers:,
++      taken_over_at:,
++      applicant_first_name:,
++      applicant_last_name:,
++      employer_name:,
++      job_title:,
++      employment_duration:,
++      monthly_income_cents:,
++      landlord_display_name:,
++      origin_domain:,
++    ))
++  }
++
++  "--- get_form_context_by_form_token(form_token: String)
++-- The referee-form session read (Story RC3.3): one join carrying the
++-- reference_call row's session fields, the application's as-stated pre-fill
++-- fields, and the landlord/vacancy display fields the pages + the resend
++-- flow need. Nullable non-text columns use COALESCE(x::text, '') — squirrel
++-- types cast expressions as non-optional (and cannot codegen timestamptz
++-- results at all), so '' is the absent marker, mirroring the NULLIF($n,'')
++-- input convention. Plain nullable TEXT columns stay Option(String).
++-- form_token itself is selected: the resend flow needs the CURRENT token to
++-- build the fresh form URL after a remint.
++SELECT rc.id::text,
++       rc.application_id::text,
++       rc.ref_slot,
++       rc.status::text            AS status,
++       rc.form_token,
++       rc.contact_name,
++       rc.contact_email,
++       rc.contact_phone,
++       rc.corrected_email,
++       rc.corrected_phone,
++       COALESCE(rc.form_token_expires_at::text, '') AS form_token_expires_at,
++       (rc.form_token_expires_at IS NOT NULL AND rc.form_token_expires_at <= now())::text AS is_expired,
++       COALESCE(rc.form_opened_at::text, '') AS form_opened_at,
++       COALESCE(rc.draft_answers::text, '') AS draft_answers,
++       COALESCE(rc.taken_over_at::text, '') AS taken_over_at,
++       a.first_name               AS applicant_first_name,
++       a.last_name                AS applicant_last_name,
++       a.employer_name,
++       a.job_title,
++       a.employment_duration,
++       a.monthly_income_cents,
++       l.name                     AS landlord_display_name,
++       v.origin_domain
++FROM reference_call rc
++JOIN application a ON a.id = rc.application_id
++JOIN vacancy v ON v.id = a.vacancy_id
++JOIN landlord l ON l.id = v.user_id
++WHERE rc.form_token = $1;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(arg_1))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `get_reference_call_by_form_token` query
+ /// defined in `./src/reference_checks/sql/get_reference_call_by_form_token.sql`.
+ ///
+@@ -1006,6 +1154,220 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `remint_form_token` query
++/// defined in `./src/reference_checks/sql/remint_form_token.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type RemintFormTokenRow {
++  RemintFormTokenRow(id: String)
++}
++
++/// - remint_form_token(old_token: String, new_token: String)
++/// The expired-link "Send me a new link" flow (Story RC3.3, UX §8.5):
++/// re-mints the capability token and stamps a fresh 10-day TTL (A3) in one
++/// guarded UPDATE. Guards: the row must still be open (contact_initiated),
++/// not taken over (a taken-over row's messages are the landlord's domain,
++/// A7), and genuinely expired — which makes the endpoint self-rate-limiting:
++/// a replay with the old token finds no row (the token died here), and a
++/// replay with the new token fails the expiry guard (fresh 10-day window).
++/// 0 rows = the state moved under the referee; the handler re-classifies
++/// and renders the truthful page instead.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn remint_form_token(
++  db: pog.Connection,
++  arg_1: String,
++  arg_2: String,
++) -> Result(pog.Returned(RemintFormTokenRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(RemintFormTokenRow(id:))
++  }
++
++  "--- remint_form_token(old_token: String, new_token: String)
++-- The expired-link \"Send me a new link\" flow (Story RC3.3, UX §8.5):
++-- re-mints the capability token and stamps a fresh 10-day TTL (A3) in one
++-- guarded UPDATE. Guards: the row must still be open (contact_initiated),
++-- not taken over (a taken-over row's messages are the landlord's domain,
++-- A7), and genuinely expired — which makes the endpoint self-rate-limiting:
++-- a replay with the old token finds no row (the token died here), and a
++-- replay with the new token fails the expiry guard (fresh 10-day window).
++-- 0 rows = the state moved under the referee; the handler re-classifies
++-- and renders the truthful page instead.
++UPDATE reference_call
++SET form_token = $2::text,
++    form_token_expires_at = now() + interval '10 days'
++WHERE form_token = $1
++  AND status = 'contact_initiated'
++  AND taken_over_at IS NULL
++  AND form_token_expires_at IS NOT NULL
++  AND form_token_expires_at < now()
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(arg_1))
++  |> pog.parameter(pog.text(arg_2))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `restore_form_token` query
++/// defined in `./src/reference_checks/sql/restore_form_token.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type RestoreFormTokenRow {
++  RestoreFormTokenRow(id: String)
++}
++
++/// - restore_form_token(new_token: String, old_token: String, old_expiry: String)
++/// The resend rollback (Story RC3.3 edge-case pass): when a remint succeeded
++/// but EVERY channel send then failed or skipped, the referee would hold a
++/// dead old link and never receive the new one — and the "On its way" page
++/// would lie. The handler restores the old token + its (expired) TTL so the
++/// referee's retry starts from the truthful expired page again. Guarded on
++/// the new token (identity) AND the live status — a concurrent terminal
++/// transition mid-resend must not get a resurrected token.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn restore_form_token(
++  db: pog.Connection,
++  arg_1: String,
++  arg_2: String,
++  arg_3: String,
++) -> Result(pog.Returned(RestoreFormTokenRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(RestoreFormTokenRow(id:))
++  }
++
++  "--- restore_form_token(new_token: String, old_token: String, old_expiry: String)
++-- The resend rollback (Story RC3.3 edge-case pass): when a remint succeeded
++-- but EVERY channel send then failed or skipped, the referee would hold a
++-- dead old link and never receive the new one — and the \"On its way\" page
++-- would lie. The handler restores the old token + its (expired) TTL so the
++-- referee's retry starts from the truthful expired page again. Guarded on
++-- the new token (identity) AND the live status — a concurrent terminal
++-- transition mid-resend must not get a resurrected token.
++UPDATE reference_call
++SET form_token = $2::text,
++    form_token_expires_at = NULLIF($3, '')::timestamptz
++WHERE form_token = $1
++  AND status = 'contact_initiated'
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(arg_1))
++  |> pog.parameter(pog.text(arg_2))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `save_draft_answer` query
++/// defined in `./src/reference_checks/sql/save_draft_answer.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type SaveDraftAnswerRow {
++  SaveDraftAnswerRow(id: String)
++}
++
++/// - save_draft_answer(form_token: String, patch: Json)
++/// A2 autosave: merge one question's answer patch into draft_answers (top-
++/// level jsonb || = per-key upsert; keys are the question registry's draft
++/// keys). Guarded (AD-14): only a live, unexpired row accepts writes — a
++/// terminal row stands down silently (0 rows) and a taken-over row still
++/// saves (the form link stays live through warm handoff, A7). The status
++/// guard names the single live state; every other state stands down.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn save_draft_answer(
++  db: pog.Connection,
++  arg_1: String,
++  arg_2: Json,
++) -> Result(pog.Returned(SaveDraftAnswerRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(SaveDraftAnswerRow(id:))
++  }
++
++  "--- save_draft_answer(form_token: String, patch: Json)
++-- A2 autosave: merge one question's answer patch into draft_answers (top-
++-- level jsonb || = per-key upsert; keys are the question registry's draft
++-- keys). Guarded (AD-14): only a live, unexpired row accepts writes — a
++-- terminal row stands down silently (0 rows) and a taken-over row still
++-- saves (the form link stays live through warm handoff, A7). The status
++-- guard names the single live state; every other state stands down.
++UPDATE reference_call
++SET draft_answers = COALESCE(draft_answers, '{}'::jsonb) || $2::jsonb
++WHERE form_token = $1
++  AND status = 'contact_initiated'
++  AND (form_token_expires_at IS NULL OR form_token_expires_at > now())
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(arg_1))
++  |> pog.parameter(pog.text(json.to_string(arg_2)))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `stamp_form_opened` query
++/// defined in `./src/reference_checks/sql/stamp_form_opened.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type StampFormOpenedRow {
++  StampFormOpenedRow(id: String)
++}
++
++/// - stamp_form_opened(form_token: String)
++/// AD-10: the first live-form GET stamps form_opened_at (the
++/// completion_seconds input for form_session fraud signals). Guarded on
++/// IS NULL so repeat opens never move the stamp; 0 rows = already stamped
++/// (or unknown token), which the handler treats as success either way.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn stamp_form_opened(
++  db: pog.Connection,
++  arg_1: String,
++) -> Result(pog.Returned(StampFormOpenedRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(StampFormOpenedRow(id:))
++  }
++
++  "--- stamp_form_opened(form_token: String)
++-- AD-10: the first live-form GET stamps form_opened_at (the
++-- completion_seconds input for form_session fraud signals). Guarded on
++-- IS NULL so repeat opens never move the stamp; 0 rows = already stamped
++-- (or unknown token), which the handler treats as success either way.
++UPDATE reference_call
++SET form_opened_at = now()
++WHERE form_token = $1
++  AND form_opened_at IS NULL
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(arg_1))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `update_reference_call_status` query
+ /// defined in `./src/reference_checks/sql/update_reference_call_status.sql`.
+ ///
+diff --git a/server/src/reference_checks/sql/get_form_context_by_form_token.sql b/server/src/reference_checks/sql/get_form_context_by_form_token.sql
+new file mode 100644
+index 00000000..da2b403a
+--- /dev/null
++++ b/server/src/reference_checks/sql/get_form_context_by_form_token.sql
+@@ -0,0 +1,38 @@
++--- get_form_context_by_form_token(form_token: String)
++-- The referee-form session read (Story RC3.3): one join carrying the
++-- reference_call row's session fields, the application's as-stated pre-fill
++-- fields, and the landlord/vacancy display fields the pages + the resend
++-- flow need. Nullable non-text columns use COALESCE(x::text, '') — squirrel
++-- types cast expressions as non-optional (and cannot codegen timestamptz
++-- results at all), so '' is the absent marker, mirroring the NULLIF($n,'')
++-- input convention. Plain nullable TEXT columns stay Option(String).
++-- form_token itself is selected: the resend flow needs the CURRENT token to
++-- build the fresh form URL after a remint.
++SELECT rc.id::text,
++       rc.application_id::text,
++       rc.ref_slot,
++       rc.status::text            AS status,
++       rc.form_token,
++       rc.contact_name,
++       rc.contact_email,
++       rc.contact_phone,
++       rc.corrected_email,
++       rc.corrected_phone,
++       COALESCE(rc.form_token_expires_at::text, '') AS form_token_expires_at,
++       (rc.form_token_expires_at IS NOT NULL AND rc.form_token_expires_at <= now())::text AS is_expired,
++       COALESCE(rc.form_opened_at::text, '') AS form_opened_at,
++       COALESCE(rc.draft_answers::text, '') AS draft_answers,
++       COALESCE(rc.taken_over_at::text, '') AS taken_over_at,
++       a.first_name               AS applicant_first_name,
++       a.last_name                AS applicant_last_name,
++       a.employer_name,
++       a.job_title,
++       a.employment_duration,
++       a.monthly_income_cents,
++       l.name                     AS landlord_display_name,
++       v.origin_domain
++FROM reference_call rc
++JOIN application a ON a.id = rc.application_id
++JOIN vacancy v ON v.id = a.vacancy_id
++JOIN landlord l ON l.id = v.user_id
++WHERE rc.form_token = $1;
+diff --git a/server/src/reference_checks/sql/remint_form_token.sql b/server/src/reference_checks/sql/remint_form_token.sql
+new file mode 100644
+index 00000000..20db539f
+--- /dev/null
++++ b/server/src/reference_checks/sql/remint_form_token.sql
+@@ -0,0 +1,19 @@
++--- remint_form_token(old_token: String, new_token: String)
++-- The expired-link "Send me a new link" flow (Story RC3.3, UX §8.5):
++-- re-mints the capability token and stamps a fresh 10-day TTL (A3) in one
++-- guarded UPDATE. Guards: the row must still be open (contact_initiated),
++-- not taken over (a taken-over row's messages are the landlord's domain,
++-- A7), and genuinely expired — which makes the endpoint self-rate-limiting:
++-- a replay with the old token finds no row (the token died here), and a
++-- replay with the new token fails the expiry guard (fresh 10-day window).
++-- 0 rows = the state moved under the referee; the handler re-classifies
++-- and renders the truthful page instead.
++UPDATE reference_call
++SET form_token = $2::text,
++    form_token_expires_at = now() + interval '10 days'
++WHERE form_token = $1
++  AND status = 'contact_initiated'
++  AND taken_over_at IS NULL
++  AND form_token_expires_at IS NOT NULL
++  AND form_token_expires_at < now()
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/restore_form_token.sql b/server/src/reference_checks/sql/restore_form_token.sql
+new file mode 100644
+index 00000000..6f1d9eb3
+--- /dev/null
++++ b/server/src/reference_checks/sql/restore_form_token.sql
+@@ -0,0 +1,14 @@
++--- restore_form_token(new_token: String, old_token: String, old_expiry: String)
++-- The resend rollback (Story RC3.3 edge-case pass): when a remint succeeded
++-- but EVERY channel send then failed or skipped, the referee would hold a
++-- dead old link and never receive the new one — and the "On its way" page
++-- would lie. The handler restores the old token + its (expired) TTL so the
++-- referee's retry starts from the truthful expired page again. Guarded on
++-- the new token (identity) AND the live status — a concurrent terminal
++-- transition mid-resend must not get a resurrected token.
++UPDATE reference_call
++SET form_token = $2::text,
++    form_token_expires_at = NULLIF($3, '')::timestamptz
++WHERE form_token = $1
++  AND status = 'contact_initiated'
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/save_draft_answer.sql b/server/src/reference_checks/sql/save_draft_answer.sql
+new file mode 100644
+index 00000000..a729559e
+--- /dev/null
++++ b/server/src/reference_checks/sql/save_draft_answer.sql
+@@ -0,0 +1,13 @@
++--- save_draft_answer(form_token: String, patch: Json)
++-- A2 autosave: merge one question's answer patch into draft_answers (top-
++-- level jsonb || = per-key upsert; keys are the question registry's draft
++-- keys). Guarded (AD-14): only a live, unexpired row accepts writes — a
++-- terminal row stands down silently (0 rows) and a taken-over row still
++-- saves (the form link stays live through warm handoff, A7). The status
++-- guard names the single live state; every other state stands down.
++UPDATE reference_call
++SET draft_answers = COALESCE(draft_answers, '{}'::jsonb) || $2::jsonb
++WHERE form_token = $1
++  AND status = 'contact_initiated'
++  AND (form_token_expires_at IS NULL OR form_token_expires_at > now())
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/stamp_form_opened.sql b/server/src/reference_checks/sql/stamp_form_opened.sql
+new file mode 100644
+index 00000000..c0bdbdca
+--- /dev/null
++++ b/server/src/reference_checks/sql/stamp_form_opened.sql
+@@ -0,0 +1,10 @@
++--- stamp_form_opened(form_token: String)
++-- AD-10: the first live-form GET stamps form_opened_at (the
++-- completion_seconds input for form_session fraud signals). Guarded on
++-- IS NULL so repeat opens never move the stamp; 0 rows = already stamped
++-- (or unknown token), which the handler treats as success either way.
++UPDATE reference_call
++SET form_opened_at = now()
++WHERE form_token = $1
++  AND form_opened_at IS NULL
++RETURNING id::text;

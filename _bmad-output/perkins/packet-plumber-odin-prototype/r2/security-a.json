@@ -1,0 +1,32 @@
+[
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "boundary",
+    "title": "log_read leaks the full command-array allocation on every corrupt/truncated/unknown-tag log",
+    "location": "core/serialize.odin:313-342 (caller: harness/replay.odin:70)",
+    "evidence": "\tcmds = make([]Command, n, allocator)\n\tfor i in 0 ..< int(n) {\n\t\tcmd: Command\n\t\tcmd.apply_tick = r_u64(&r)\n\t\tswitch r_u8(&r) {\n...\n\t\tcase 7:\n\t\t\tcmd.kind = Cmd_Place_Router{type_idx = r_u16(&r), pos = {r_i32(&r), r_i32(&r)}}\n\t\tcase:\n\t\t\treturn {}, nil, false\n\t\t}\n\t\tcmds[i] = cmd\n\t}\n\tif r.bad || r.pos != len(r.data) { return {}, nil, false } // truncation/trailing = corrupt\n\treturn h, cmds, true\n--- harness/replay.odin:70:\n\theader, cmds, ok := pp.log_read(data, context.allocator)",
+    "detail": "Every failure return after `make` (unknown tag, truncation, trailing bytes) drops the record array; the caller receives nil and cannot free the heap allocation, which is proportional to the log length. A crafted replay file turns input size into unrecoverable memory.",
+    "recommended_fix": "delete(cmds) before each post-allocation `return {}, nil, false`, or parse into context.temp_allocator so the harness's per-tick free_all reclaims it."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Grant/starting-inventory counts accept negative and Float-typed values — a negative grant drives tray stock negative and locks that tier for the run",
+    "location": "core/catalog.odin:406-418 + core/run.odin:158-163 + core/topology.odin:199",
+    "evidence": "catalog.odin:\n\t\t\t\tfor name, v in lm {\n\t\t\t\t\tn, okn := jcount(v); if !okn { continue }\n\t\t\t\t\tti, okti := tier_index(cat, name)\n\t\t\t\t\tif !okti { return cat, {\"balance.json\", name, \"grant links names an unknown pipe tier\"} }\n\t\t\t\t\tappend(&g.links, Grant_Item{idx = ti, n = i32(n)})\n\t\t\t\t}\n--- jcount:\njcount :: proc(v: json.Value) -> (i32, bool) {\n\t#partial switch x in v {\n\tcase json.Integer: return i32(x), true\n\tcase json.Float:   return i32(x), true\n\t}\n\treturn 0, false\n}\n--- run.odin:158:\n\t\t\t\tstate.inventory.links[it.idx] += it.n\n--- topology.odin:199:\n\t\tif int(c.tier) >= len(inv.links) || inv.links[c.tier] <= 0 { return .Out_Of_Links }",
+    "detail": "The loader's own contract says out-of-range values abort with a named error, but grant/starting counts are only type-checked: a negative n is applied raw by `+= it.n`, silently corrupting the tray invariant and soft-locking that tier's draws for the rest of the run.",
+    "recommended_fix": "Reject n <= 0 (and json.Float) in starting_inventory and grants with a named Catalog_Error, mirroring the unknown-tier checks two lines below."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "resource",
+    "title": "Catalog loader leaks heap allocations on success (jarr_i color/weight arrays never freed) and orphans partial Catalogs on every error path",
+    "location": "core/catalog.odin:205, 369-370, 544-556",
+    "evidence": "\t\t\tc := jarr_i(eo, \"color_rgba\")\n...\n\t\tb.default_lane_weights = jw3(obj, \"default_lane_weights\", {1, 4, 1})\n\t\tb.emphasis_preset = jw3(obj, \"emphasis_preset\", {4, 1, 1})\n--- jarr_i:\njarr_i :: proc(o: json.Object, key: string) -> [dynamic]i64 {\n\tout: [dynamic]i64\n\tif v, ok := o[key].(json.Array); ok {\n\t\tfor x in v {\n\t\t\tif n, okn := x.(json.Integer); okn { append(&out, i64(n)) }\n\t\t}\n\t}\n\treturn out\n}",
+    "detail": "jarr_i allocates on the load allocator and no caller deletes it: one leaked array per packet_type (color) plus two per load (jw3 presets); every must_catalogs() test call leaks, and the new(Catalogs) plus partial arrays are orphaned whenever catalogs_load returns an error.",
+    "recommended_fix": "defer delete(c) in the color path and free jarr_i's out buffer in jw3; delete the partial catalogs before each error return in catalogs_load."
+  }
+]
