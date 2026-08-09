@@ -1,0 +1,5 @@
+# Field notes — righttenantry-refcheck-rc3-2 (2026-08-09)
+
+- The 2026-08-08 stop-link amendment does NOT rewrite the docs in place everywhere: UX §6.3/§6.4 still read "Reply STOP" and the epics AC still says it too — the architecture amendments register (top of file) is the authoritative supersedure list. Always read the register FIRST on refcheck stories; briefing compressions of it ("the Art 14 notice + the opt-out both point to the stop-link") need resolving against §9.1, which keeps TWO distinct links (notice URL + stop-link).
+- gleam format + the atomic-multi-edit trap compound: `gleam format` reflowed split string literals between my write and a follow-up edit, so a stale oldText silently failed to match — grep the CURRENT line-break positions before re-issuing edits to formatted Gleam files (second sighting after dream-2026-08-03).
+- `gh pr create --body "$(cat <<'EOF' ...)"` breaks on apostrophe-heavy bodies ("unexpected EOF") — write the body to a file and use `--body-file` (and verify any claimed counts in it with grep before pushing: I had to `gh pr edit` a wrong test count).

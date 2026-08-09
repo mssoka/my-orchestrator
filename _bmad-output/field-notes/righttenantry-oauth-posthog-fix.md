@@ -1,0 +1,5 @@
+# righttenantry-oauth-posthog-fix
+
+- The inline analytics bridge snippets live in BOTH `Makefile` (build-client) and `Dockerfile` perl chains, each with their own substring-pin guard list — any snippet change must hit 4 places (2 chains + 2 guards), and the guard pin must be a substring UNIQUE to the changed arm (e.g. reset-arm adjacency), or the guard can't detect the regression.
+- Squirrel regen: `gleam run -m squirrel` with `DATABASE_URL` pointed at your own test container — then revert the known whitespace churn in `ai/sql.gleam` + `application/sql.gleam` + `inbound_email/sql.gleam`. `(xmax = 0) AS is_new` in an upsert RETURNING codegens cleanly as `Bool` (atomic insert-vs-update flag — reviewers prefer it over a pre-check SELECT).
+- The analytics bridge cookie lifetimes are a cross-cutting contract: `rt_landlord_id` (identify, 60s) vs `rt_landlord_external_id`/`rt_ph_reset` (sentinels, 10s) — pinned in 3 test assertions, 2 build guard lists, and multiple doc comments; changing one without the others is a silent contract drift.

@@ -1,0 +1,5 @@
+# Field notes — righttenantry-form-e2e-pass
+
+- agent-browser on this form: `click` silently no-ops on below-fold elements (emulated viewport + smooth scroll) — eval `scrollIntoView({behavior:'instant'})` first; `fill` can't set `input[type=date]` (set value + dispatch input/change); click the `label[for=field-X]` not the visually-hidden radio. 4/5 mega-minions hit the same three traps independently.
+- posthog-js `_is_bot()` drops ALL capture for HeadlessChrome UAs — local analytics E2E sees zero network events; wrap `window.posthog.capture` in-page and assert the call stream instead. Also: `rt_consent_test=1` auto-accepts with analytics:false — for analytics legs, click the real banner's Accept-all.
+- form-bug-hunt's documented `test+{SCENARIO}-{RUN_ID}@example.com` template produces `/` in email local parts (slug contains `/`) which shared/email.is_valid rejects — fixed in SKILL.md (sanitise `/`→`-`, ≤64 chars); Resend 422s example.com recipients locally, use `delivered+tag@resend.dev` when the send itself must succeed.

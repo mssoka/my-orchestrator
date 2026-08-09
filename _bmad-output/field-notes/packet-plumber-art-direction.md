@@ -1,0 +1,5 @@
+# Field-notes shard: packet-plumber-art-direction
+
+- 2026-08-07: the worktree was STALE (2 commits behind origin/main) — the narrative spec landed via PR #5 after my branch was cut, so `narrative-v1.md` was missing from my working tree though present on main. Always `git log HEAD..origin/main` for sibling merges that touch your deliverable's sources, and rebase onto origin/main before opening the PR.
+- 2026-08-07: `game/data/*.json` catalogs are UNCOMMITTED (only `game/data/.gitkeep` is tracked) — reading them as "the runtime source of truth" misleads; the committed design docs (GDD + narrative) are the real authority. Don't treat uncommitted local working files as canonical, and don't commit data owned by another job (the prototype) from an art-direction PR.
+- 2026-08-07: a "go with your recommendations" approval can be given before a sibling doc that changes a decision's basis is seen (I hadn't read the narrative when OQ-1 approved orange). When you later discover a sibling canonical doc that flips a decision's evidence, SURFACE it and use veto power rather than silently deferring — the user explicitly reminded me "you have the veto power on theme, looks."
