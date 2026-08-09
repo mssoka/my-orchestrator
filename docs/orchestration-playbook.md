@@ -126,6 +126,13 @@ Silas Ramsbottom — Gru's chief operating officer. A long-lived pi session
 standing orders + startup checklist; nefario-watch is gated to
 `PI_SILAS=1`, so ALL sensors alert Silas — Gru's context stays clean.
 
+**Model:** Silas runs on **`deepseek/deepseek-v4-flash`** — set it when
+launched (`/model deepseek/deepseek-v4-flash`). NOT the kimi default:
+Silas's work is relay + documented ops execution (instruction-following +
+pattern-matching against this playbook), not frontier reasoning, so a
+mid-tier model serves it well AND frees kimi quota for the game-coding
+minions that genuinely need the frontier model. (User ruling 2026-08-09.)
+
 **Silas owns (Gru never touches):**
 
 - Every nefario-watch alert: classify via transcript, act, ledger.
