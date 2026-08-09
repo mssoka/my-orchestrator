@@ -1,0 +1,42 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "rate-limit-toctou",
+    "title": "Cross-vacancy fan-out bound (3/recipient/hour) is bypassable under concurrency",
+    "location": "server/src/application/sql/claim_continue_link_send.sql:21",
+    "evidence": "  AND (\n    SELECT count(*) FROM application_draft d2\n    WHERE d2.email = lower($2)\n      AND d2.last_link_sent_at IS NOT NULL\n      AND d2.last_link_sent_at > now() - interval '1 hour'\n  ) < 3",
+    "detail": "The count runs on the statement snapshot and locks only the claimed row. Concurrent claims for the same email across different vacancy rows (attacker seeds drafts with the victim's email on up to 20 own vacancies) all see the pre-burst count and all send — one burst of up to K branded emails, repeatable hourly, vs the intended 3/hour.",
+    "recommended_fix": "Serialize per-recipient claims: SELECT pg_advisory_xact_lock(hashtext(lower($2))) before the UPDATE (or a locked per-recipient send-ledger row), so the count observes committed sibling sends."
+  },
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "mail-relay",
+    "title": "Continue-link bound is recipient-keyed only: unauthenticated distinct-recipient spam run (500 sends per known vacancy code)",
+    "location": "server/src/application/sql/claim_continue_link_send.sql:17",
+    "evidence": "WHERE vacancy_id = $1::uuid\n  AND email = lower($2)\n  AND submitted_at IS NULL\n  AND erased_at IS NULL\n  AND (\n    last_link_sent_at IS NULL\n    OR last_link_sent_at < now() - interval '10 minutes'\n  )\n--- and middleware.gleam:\n    // F3 save-and-resume draft endpoints (token = auth, no session).\n    [\"apply\", _, \"draft\"] -> True\n    [\"apply\", _, \"continue-link\"] -> True",
+    "detail": "A fresh (vacancy, email) pair always claims (last_link_sent_at IS NULL). Draft creation is unauthenticated, so a script cycling fabricated recipient emails through one public vacancy code makes the server send real branded Resend email to up to 500 distinct strangers (the per-vacancy draft cap is the only ceiling; no per-IP/global send budget, no edge rule on this path). Sender-reputation and quota risk.",
+    "recommended_fix": "Add a requester-keyed budget: per-IP rate limit on /apply/*/continue-link (Cloudflare Worker pattern) and/or a global per-vacancy daily send cap with alerting on send-volume anomalies."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "availability",
+    "title": "500/vacancy draft cap saturation makes legit saves silently no-op while returning ok:true",
+    "location": "server/src/application/draft_handler.gleam:193",
+    "evidence": "  OR (\n    SELECT count(*) FROM application_draft d\n    WHERE d.vacancy_id = $1::uuid\n  ) < 500\n--- upsert_application_draft.sql; and draft_handler.gleam:\n                  case\n                    sql.upsert_application_draft(\n                      config.db,\n                      vacancy_uuid,\n                      applicant_email,\n                      fields_to_json(filtered),\n                      wisp.random_string(48),\n                    )\n                  {\n                    Ok(_) -> {\n                      ...\n                      wisp.json_response(json_ok(True), 200)",
+    "detail": "An attacker fills all 500 slots with garbage emails via unauthenticated saves (also reachable organically on hot listings; the count includes submitted/erased tombstones). New legit pairs then get Ok(0 rows) mapped to {\"ok\":true}: applicants are told progress saved while nothing is written, and continue-link silently sends nothing. Silent data loss on a defended promise.",
+    "recommended_fix": "Distinguish 0-row upserts: when no existing row and cap hit, return ok:false (cap-hit is distinguishable from tombstone without oracle harm), and alert on vacancies nearing the cap."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "rate-limit-gap",
+    "title": "New anonymous token endpoints (resume GET, draft-erasure POST) ship without the edge rate limit the project applies to the identical /erase/:token + /dsar/:token class",
+    "location": "server/src/router.gleam:796",
+    "evidence": "    http.Get, [\"apply\", code, \"resume\", token] ->\n      draft_handler.handle_resume(req, ctx.config, code, token)\n    http.Get, [\"apply\", code, \"draft-erasure\", token] ->\n      draft_handler.handle_erasure_confirm(req, ctx.config, code, token)\n    http.Post, [\"apply\", code, \"draft-erasure\", token] ->\n      draft_handler.handle_erasure_delete(req, ctx.config, code, token)\n--- vs deployment/terraform/cloudflare-rate-limits.tf:\n    expression  = \"(starts_with(http.request.uri.path, \\\"/erase/\\\") or starts_with(http.request.uri.path, \\\"/dsar/\\\"))\"",
+    "detail": "The tf comments call the /erase//dsar/ rule 'the front line, capping brute-force enumeration and absorbing email-client link prefetchers' for 288-bit anonymous token URLs. The new same-class token routes (PII-reflecting resume GET; destructive erasure POST) are uncovered; the Worker's AUTH_WRITE_PATTERN only matches /api/v1 auth writes. Token entropy remains the primary defense, so this is defense-in-depth, not a blocker.",
+    "recommended_fix": "Extend the zone rule expression (same rule, free-tier 1-rule cap respected) to cover /apply/*/resume/ and /apply/*/draft-erasure/, or add an equivalent Worker counter."
+  }
+]

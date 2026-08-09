@@ -1,0 +1,1122 @@
+diff --git a/.env.example b/.env.example
+index edb5bff7..e97a98bd 100644
+--- a/.env.example
++++ b/.env.example
+@@ -37,6 +37,16 @@ STRIPE_EXTENSION_PRICE_CENTS=9900
+ RESEND_API_KEY=
+ RESEND_WEBHOOK_SECRET=
+ 
++# Twilio (SMS client + Lookup line-type). Optional at build/test time —
++# sms_client + reference_lookup no-op when these are unset (AC2/AC3 of
++# rc3-1). The sender is a Registered Alphanumeric Sender ID (AD-5): there is
++# NO TWILIO_FROM number. Live SMS delivery also needs the ComReg Sender-ID
++# registration (an ops task, not code).
++TWILIO_ACCOUNT_SID=
++TWILIO_AUTH_TOKEN=
++TWILIO_ALPHA_SENDER=RTenantry
++TWILIO_STATUS_CALLBACK_BASE_URL=https://righttenantry.ie
++
+ # Supabase Auth
+ SUPABASE_URL=
+ SUPABASE_SERVICE_ROLE_KEY=
+diff --git a/_bmad-output/implementation-artifacts/spec-rc3-1-sms-client-twilio-lookup-infrastructure-slice.md b/_bmad-output/implementation-artifacts/spec-rc3-1-sms-client-twilio-lookup-infrastructure-slice.md
+new file mode 100644
+index 00000000..41523392
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-rc3-1-sms-client-twilio-lookup-infrastructure-slice.md
+@@ -0,0 +1,201 @@
++---
++baseline_commit: 0368bc9215c68c92e31f47584973aed7b12a4b3c
++---
++
++# Story RC3.1: SMS Client + Twilio Lookup (Infrastructure Slice)
++
++Status: review
++
++Epic: RC3 (Reference-Checking — Messaging & Collection) · Story key: `rc3-1-sms-client-twilio-lookup-infrastructure-slice`
++Sprint: refcheck-v1 (tracker: `_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml`)
++
++## Story
++
++As the platform,
++I want a minimal Twilio SMS client and a line-type lookup module behind config,
++so that collection messages and fraud signals have their single new dependency isolated and safely optional.
++
++## Scope (what THIS story owns — and what it does NOT)
++
++**Owns (the infrastructure slice):**
++
++1. `server/src/notification/sms_client.gleam` — a minimal Twilio REST helper: **send SMS** + **status-callback URL** wiring.
++2. `server/src/reference_checks/lookup.gleam` — Twilio **Lookup v2 line-type** query.
++3. `server/src/config.gleam` + `server/src/server.gleam` — load the four Twilio env vars into the existing `ServerConfig` mechanism.
++4. Unit tests for both new modules (pure builders + no-op path).
++
++**Does NOT own (later stories — do not build them):**
++
++- The actual **cadence/sends logic** (who gets messaged, when, T0/T+24h/…) → **rc3-5**.
++- **Message templates / copy** (invitation SMS body, STOP notice) → **rc3-2**.
++- The **`webhooks/twilio-sms` route + `X-Twilio-Signature` verification + delivery-failure handling** → **rc3-6**.
++- Wiring the line-type result into the **`fraud_signals` payload** → **rc3-7**.
++- Any DB schema change. rc3-1 is client infra only — it reads no rows and writes no rows.
++
++The deliverable is a **callable, tested, no-op-safe** client + lookup. Callers arrive in rc3-2/rc3-5/rc3-7.
++
++## Acceptance Criteria (BDD — verbatim from epics, with this story's scope note)
++
++**AC1 — SMS send goes through Twilio REST with delivery-status callback, mirroring `email_client.gleam`'s shape (AD-5).**
++Given `server/src/notification/sms_client.gleam`, when an SMS is sent, then it `POST`s to the Twilio Messages resource with the Registered Alpha Sender ID "RTenantry" as `From` (NO from-number), the recipient as `To`, the message as `Body`, and a `StatusCallback` URL — mirroring `email_client.gleam`'s REST-helper structure.
++
++**AC2 — Graceful no-op without keys.**
++Without Twilio keys configured, the client no-ops with a log line (the "shortlist email skipped" precedent) — it **never crashes a caller**. Build + unit tests MUST pass without real Twilio creds.
++
++**AC3 — Lookup returns line type and no-ops without keys.**
++Given the `reference_lookup` module, when a line-type lookup runs for a phone number, then it returns the Twilio Lookup line type (`mobile` / `landline` / `voip` / `unknown`) and no-ops without keys.
++
++**AC4 — Env vars load through the existing config mechanism; secrets never committed.**
++When the server starts, Twilio env vars (account SID, auth token, sender ID `RTenantry`, status-callback base URL) load through the existing `ServerConfig` mechanism. Secrets are never committed.
++
++**AC5 — Sentry captures Twilio API failures with context.**
++Given a Twilio API failure (send or lookup), when it occurs, then Sentry captures it with context (status / error kind / endpoint tags). The no-op-without-keys path does NOT capture (it is expected, not an error).
++
++**Verify:** one test module per new module (mocked HTTP per existing patterns — i.e. pure builders + parse functions + the Disabled no-op branch, matching how `email_client_test.gleam` tests `build_send_body` without exercising `httpc`); no-op path verified without keys; `make test-server` green.
++
++## Tasks / Subtasks
++
++- [x] **T1 — `sms_client.gleam` (AC1, AC2, AC5)**
++  - [x] T1.1 `pub type Twilio { Enabled(SID, AuthToken, alpha_sender, status_callback_base_url); Disabled }` — mirrors `sentry_client.{Enabled,Disabled}`.
++  - [x] T1.2 `pub fn init() -> Twilio` — reads `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_ALPHA_SENDER` / `TWILIO_STATUS_CALLBACK_BASE_URL` via `envoy`; returns `Disabled` when any required key is absent (log a one-line "Twilio SMS disabled — keys not set" warning once). Mirrors `sentry_client.init()`.
++  - [x] T1.3 `pub type SendOutcome { Sent(message_sid: String); Skipped }` — `Skipped` is the no-op result (AC2).
++  - [x] T1.4 `pub fn send_sms(twilio, sentry, to to:, body body:) -> Result(SendOutcome, String)`:
++    - `Disabled` → `wisp.log_info("SMS skipped — Twilio not configured")` → `Ok(Skipped)`. **No Sentry capture.**
++    - `Enabled` → build request via `build_send_request`, dispatch with an **explicit 10s timeout** (`httpc.configure() |> httpc.timeout(10_000)` + `httpc.dispatch`), parse `sid`/`status`; on HTTP/decode failure → `sentry_client.capture(sentry, BackgroundEvent(...))` with tags + `wisp.log_error` + `Error(reason)`.
++  - [x] T1.5 `pub fn build_messages_url(account_sid) -> String` (pure) → `https://api.twilio.com/2010-04-01/Accounts/<SID>/Messages.json`.
++  - [x] T1.6 `pub fn build_send_form_body(alpha_sender, to, body, status_callback_url) -> String` (pure) — `application/x-www-form-urlencoded` via `form_encode`, params `From`/`To`/`Body`/`StatusCallback`.
++  - [x] T1.7 `pub fn status_callback_url(base) -> String` (pure) → `<base>/webhooks/twilio-sms` (the route rc3-6 owns; fixed by architecture §7.2).
++  - [x] T1.8 `pub fn parse_send_response(body) -> Result(String, String)` (pure) → decodes `sid` from the JSON response.
++  - [x] T1.9 `pub fn build_send_request(twilio, to, body) -> Request(...)` (pure) — assembles URL + `Authorization: Basic <base64(SID:AuthToken)>` + `content-type: application/x-www-form-urlencoded` + body; **exposed `@internal` for unit tests**.
++- [x] **T2 — `lookup.gleam` (AC3, AC5)**
++  - [x] T2.1 `pub type LineType { Mobile; Landline; VoIP; Unknown }`.
++  - [x] T2.2 `pub fn lookup_line_type(twilio, sentry, phone) -> LineType` — the convenient entrypoint:
++    - `Disabled` → log "Twilio Lookup skipped — not configured" → `Unknown`. **No Sentry capture.**
++    - `Enabled` → `GET` Lookup v2 with `Fields=line_type_intelligence`, 10s timeout; on success → `parse_line_type`; on HTTP/decode failure → Sentry capture + log → `Unknown` (never blocks the caller).
++  - [x] T2.3 `pub fn parse_line_type(body) -> LineType` (pure) — maps `line_type_intelligence.type`: `mobile`→Mobile, `landline`→Landline, `fixedVoIP`/`nonFixedVoIP`→VoIP, anything else or absent/`valid:false`→Unknown.
++  - [x] T2.4 `pub fn build_lookup_url(phone) -> String` (pure) — `https://lookups.twilio.com/v2/PhoneNumbers/<percent_encode(phone)>?Fields=line_type_intelligence`.
++  - [x] T2.5 `pub fn voip(line_type) -> Bool` (pure) — `line_type == VoIP` (the `voip_or_burner` fraud signal; honesty note in Dev Notes).
++- [x] **T3 — Config wiring (AC4)**
++  - [x] T3.1 Add `twilio: sms_client.Twilio` field to `ServerConfig` in `config.gleam`.
++  - [x] T3.2 Construct it in `server.gleam` via `sms_client.init()` (next to `sentry_client.init()` / `posthog_client.init()`), add `twilio:` to the `ServerConfig(...)` constructor (label-shorthand).
++- [x] **T4 — Tests (AC verify)**
++  - [x] T4.1 `server/test/notification/sms_client_test.gleam` — `build_send_form_body` asserts `From=RTenantry` (Alpha Sender), `To`, `Body`, `StatusCallback` present + correctly encoded; `build_messages_url` correct; `status_callback_url` correct; `parse_send_response` decodes sid; `send_sms(Disabled, _, _)` returns `Ok(Skipped)` without HTTP.
++  - [x] T4.2 `server/test/reference_checks/lookup_test.gleam` — `parse_line_type` for `mobile`/`landline`/`fixedVoIP`/`nonFixedVoIP`/absent/`valid:false`; `build_lookup_url` percent-encodes the `+`; `lookup_line_type(Disabled, _, _)` returns `Unknown`.
++- [x] **T5 — Tracker + env docs**
++  - [x] T5.1 Add the four `TWILIO_*` vars to `.env.example` (placeholders only — never real secrets).
++  - [x] T5.2 Tracker: `rc3-1 → done` (post-implementation); `epic-rc3 → in-progress` (create-story step).
++
++## Dev Notes
++
++### Verified Twilio API contracts (ground-truthed against vendor docs 2026-08-08)
++
++**Send — Messages resource** ([Source: twilio.com/docs/messaging/api/message-resource]):
++- `POST https://api.twilio.com/2010-04-01/Accounts/{AccountSid}/Messages.json`
++- Content type: **`application/x-www-form-urlencoded`** (NOT JSON — confirmed `encodingType` in the spec). Mirror `stripe_client.form_encode` (`uri.percent_encode(k) <> "=" <> uri.percent_encode(pair.1)`, joined with `&`).
++- Body params this story uses: `From` (Alpha Sender ID string "RTenantry"), `To` (E.164), `Body`, `StatusCallback` (URL).
++- Auth: **HTTP Basic** with username=AccountSID, password=AuthToken → header `Authorization: Basic <base64(SID:AuthToken)>`. Build with `bit_array.from_string(sid <> ":" <> token) |> bit_array.base64_encode(False)` (precedent: `inbound_email/svix.gleam:66`).
++- Response: JSON with `sid` (`SM...`), `status` (`queued`/`sent`/`failed`/...), `error_code`, `error_message`.
++- The `From` field accepts an alphanumeric sender ID directly — confirmed by the spec ("The sender's Twilio phone number (in E.164 format), **alphanumeric sender ID**, ..."). So `TWILIO_ALPHA_SENDER="RTenantry"` goes in `From`. **This is why there is no `TWILIO_FROM`** (a from-number is impossible for IE SMS — Twilio IE numbers are voice-only; the Alpha Sender ID IS the sender).
++
++**Lookup — v2 API** ([Source: twilio.com/docs/lookup/v2-api]):
++- `GET https://lookups.twilio.com/v2/PhoneNumbers/{PhoneNumber}?Fields=line_type_intelligence`
++- `{PhoneNumber}` is E.164 in the PATH; the `+` MUST be percent-encoded → `%2B` (curl example uses `%2B14159929960`). Use `uri.percent_encode`.
++- Auth: same HTTP Basic (AccountSID:AuthToken). Same creds as send (AD-5: "Lookup reuses the same Account SID + Auth Token").
++- Response: `valid: bool`, `line_type_intelligence: null | { type: string, carrier_name: string, ... }`.
++- `line_type_intelligence.type` values: `mobile`, `landline`, `fixedVoIP`, `nonFixedVoIP`, `tollFree`, `premium`, `sharedCost`, `personal`, `unknown`, etc. This story maps to `{Mobile, Landline, VoIP, Unknown}` (AC3).
++- **Cost note:** `Fields=line_type_intelligence` is a paid data package. Double-check the param string in tests (a malformed `Fields` silently returns the free Basic Lookup with `line_type_intelligence: null`, which would mask a real bug).
++
++### Pattern fidelity — mirror these exactly
++
++- **`email_client.gleam`** (`server/src/notification/email_client.gleam`): the structural template. Pure `build_send_body` exposed for tests; `do_send` is the thin HTTP glue; `httpc.configure() |> httpc.timeout(10_000)` + `httpc.dispatch` (NEVER bare `httpc.send` — AGENTS.md mandates explicit timeouts and a grep lint bans the literal `httpc.send` in rationale comments); `Result(String, String)` return; `wisp.log_error` on failure.
++- **`sentry_client.{Enabled,Disabled}` + `init()`** (`server/src/sentry/sentry_client.gleam`): the Enabled/Disabled + init-from-env pattern. `sms_client.Twilio` mirrors this. Capture-with-context: `sentry_client.capture(sentry, BackgroundEvent(event_type:, message:, level: LevelError, tags: [...]))` — precedent `ai/ai_client.gleam:2069`, `reference_checks/trigger.gleam:984`, `notification/digest_handler.gleam:125`.
++- **`stripe_client.form_encode`** (`server/src/payment/stripe_client.gleam:610`): the form-body encoder. Reuse the same `uri.percent_encode` approach (do NOT re-implement percent-encoding).
++- **`ServerConfig` wiring** (`server/src/config.gleam` + `server/src/server.gleam:291`): add the field to the record; construct via `sms_client.init()` next to the other `*_client.init()` calls; pass it with label-shorthand `twilio:` in the `ServerConfig(...)` literal.
++
++### No-op-without-keys — the "shortlist email skipped" precedent (AC2/AC3)
++
++The established pattern (`notification/digest_handler.gleam`): when a dependency isn't configured, the code logs one line and returns a benign result rather than crashing. For sms_client that is `SendOutcome.Skipped`; for lookup that is `LineType.Unknown`. The caller never has to guard — the client owns the no-op. **Crucially, the no-op is NOT a Sentry event** (it's expected config state, not a failure); only real Twilio API failures capture (AC5). This is the difference between AC2 (no-op, silent) and AC5 (failure, captured).
++
++### Honesty note on `voip_or_burner` (AD-10)
++
++AD-10 lists the fraud signal as `line_type` / `voip_or_burner`. The Lookup **Line Type Intelligence** package returns `type` (mobile/landline/voip/...) and `carrier_name`. It does **NOT** return a "burner" flag — burner detection would need `sms_pumping_risk` (a different package) or a third-party vendor. Per AD-10's "honestly scoped to what's collectible today" principle, this story returns `line_type` + a `voip` boolean derived from it (`type` ∈ {fixedVoIP, nonFixedVoIP}). The `voip_or_burner` signal downstream (rc3-7) is honestly just `voip` from this source. Do NOT fabricate a burner flag. This matches the recurring finding: "never present fabricated detections as real".
++
++### Constraints (RT-specific — APPLY here)
++
++- **No em-dashes in user-facing copy** (RT global ban, CI-guarded). These modules have NO user-facing copy (log lines + JSON), but keep the em-dash ban in comments/docstrings too — the lint is repo-wide on text.
++- **Send FROM `TWILIO_ALPHA_SENDER` ("RTenantry") — NO from-number.** The one-way Alpha Sender ID reality (AD-5 corrected in PR #592, verified MERGED 2026-08-08).
++- **Explicit HTTP timeouts** — 10s for both send and lookup (`httpc.configure() |> httpc.timeout(10_000)` + `httpc.dispatch`). Never `httpc.send`/`send_bits`. Rationale comments must not contain the literal `httpc.send`.
++- **No `let assert`** in production code — use `case`. (`let assert` only in tests.)
++- **No JavaScript FFI.** Server Erlang FFI is fine; none needed here.
++- **Lookup fraud signals are display/confidence only — never auto-reject** (AD-10). This story doesn't make decisions, but the `LineType` type + the no-op-to-Unknown design enforce "never blocks the caller".
++- **Code builds + unit-tests without real Twilio creds.** The `Disabled` branch + the fact that `init()` returns `Disabled` when keys are absent is what makes this true. CI runs `make test` (unit only, no Docker) — it MUST be green with no Twilio env set.
++
++### Project Structure Notes
++
++- `server/src/notification/sms_client.gleam` — NEW (alongside `email_client.gleam`). Module path: `notification/sms_client`.
++- `server/src/reference_checks/lookup.gleam` — NEW (the `reference_checks/` folder already exists with `sql.gleam` + `trigger.gleam`). Module path: `reference_checks/lookup`. (Epics story text writes the path as `reference_checks/lookup.gleam`; the briefing's "reference_lookup module" is the logical name — the file is `lookup.gleam` to match the epics file path, which is authoritative.)
++- `server/src/config.gleam` — UPDATE (add `twilio` field).
++- `server/src/server.gleam` — UPDATE (construct `sms_client.init()`, pass `twilio:`).
++- `server/test/notification/sms_client_test.gleam` — NEW.
++- `server/test/reference_checks/lookup_test.gleam` — NEW.
++- `.env.example` — UPDATE (add four `TWILIO_*` placeholders).
++- No DB migration, no Squirrel, no new deps (`gleam/http`, `gleam/httpc`, `gleam/uri`, `gleam/bit_array`, `gleam/json`, `gleam/dynamic/decode`, `envoy`, `wisp` all already deps).
++
++### Decisions & rationale (for the PR + future minions)
++
++1. **`From=<alpha_sender>` not `MessagingServiceSid`.** The env var is `TWILIO_ALPHA_SENDER` (sender string "RTenantry"), not a Messaging Service SID (`MG...`). AD-5's "Messaging Service" language is loose; the env-var name is definitive. The Twilio `From` field accepts an alphanumeric sender ID directly (verified). Rejected: adding a `TWILIO_MESSAGING_SERVICE_SID` env var — out of the AC's four-var scope, and the alpha sender string is what the config names.
++2. **`Twilio` handle (Enabled/Disabled) over passing individual strings.** Mirrors `sentry_client`. The client owns the no-op, so callers never guard. Rejected: passing `account_sid: String` everywhere (email_client style) — that pushes the no-op check onto every caller and re-reads env per call.
++3. **Send/lookup take a `sentry` param.** `email_client` does not capture (it only `wisp.log_error`s), but AC5 explicitly requires Sentry capture on Twilio failure. Threading `sentry` (like `digest_handler.execute_digest`) is the cleanest reconciliation. Rejected: capturing inside `init()` (no handle to pass) or relying on the caller to capture (violates "the client owns failure handling").
++4. **`lookup_line_type` returns `LineType` (Unknown on failure), not `Result`.** The consumer (rc3-7 fraud comparator) needs a value, never a crash, and treats lookup-failure as Unknown. Returning `Result` would push `Unknown`-on-error mapping onto every caller. A pure `parse_line_type` is still exposed for direct testing.
++5. **`status_callback_url` hardcodes `/webhooks/twilio-sms`.** That route is owned by rc3-6, but the callback URL must be sent with each message NOW (rc3-1) so delivery callbacks resolve later. The path is fixed by architecture §7.2 — it's a contract rc3-6 implements, not invents. Noted in the PR so rc3-6 doesn't rename it without a redirect.
++6. **No live Twilio integration test in this story.** Creds live in Secret Manager at runtime; unit tests cover the pure builders + the Disabled no-op (matching `email_client_test`'s approach). A live test is optional and flagged if attempted.
++
++### References
++
++- [Source: `_bmad-output/planning-artifacts/epics-reference-checking-v1-2026-07-30.md#Story RC3.1`] — acceptance criteria (AC1–AC5).
++- [Source: `_bmad-output/planning-artifacts/architecture-reference-checking-v1-2026-07-29.md#AD-5`] — Alpha Sender ID rule (corrected 2026-08-08, PR #592).
++- [Source: `.../architecture...#AD-10`] — fraud honesty table; `line_type`/`voip_or_burner` mechanism.
++- [Source: `.../architecture...#7.2`] — `sms_client.gleam` + `reference_lookup` dependency rows; `webhooks/twilio-sms` route contract.
++- [Source: `.../architecture...#7.3`] — line-type lookup runs at row creation.
++- [Source: `server/src/notification/email_client.gleam`] — REST-helper structure to mirror.
++- [Source: `server/src/sentry/sentry_client.gleam`] — Enabled/Disabled + init() + `capture(BackgroundEvent)`.
++- [Source: `server/src/payment/stripe_client.gleam#form_encode`] — form-body encoder.
++- [Source: `server/src/inbound_email/svix.gleam:66`] — `bit_array.base64_encode` precedent for Basic auth.
++- Twilio Messages resource: https://www.twilio.com/docs/messaging/api/message-resource (form-encoded, Basic auth, `From` accepts alpha sender).
++- Twilio Lookup v2: https://www.twilio.com/docs/lookup/v2-api (`Fields=line_type_intelligence`, `%2B` path encoding, `line_type_intelligence.type`).
++- PR #592 (MERGED 2026-08-08): AD-5 sender-type correction — verified.
++
++## Dev Agent Record
++
++### Agent Model Used
++
++(pi default — unset in briefing)
++
++### Debug Log References
++
++- Verified Twilio API contracts against vendor docs (2026-08-08): Messages resource is `application/x-www-form-urlencoded` with HTTP Basic auth; Lookup v2 uses `Fields=line_type_intelligence` with `%2B` path encoding.
++- Verified PR #592 (AD-5 Alpha Sender ID correction) is MERGED before relying on it.
++- Found + fixed a real correctness bug: gleam `uri.percent_encode` leaves `+` unencoded (valid URI sub-delimiter), but `+` means space in a form body — an E.164 `To=+353...` would arrive as ` 353...` with a leading space. Added a `+`→`%2B` re-encode in both `sms_client.form_encode` and `lookup.build_lookup_url`. (stripe_client has the same latent gap but its values rarely carry a leading `+`; not in scope here.)
++- Port 54321 (default test DB) was owned by a sibling worktree (`draft-grace-period-test-db-1`); ran integration on an isolated container at 54324 per the field-notes recipe.
++
++### Completion Notes List
++
++- `sms_client.gleam`: `Twilio` handle (Enabled/Disabled, mirrors `sentry_client`), `init()` reads the four `TWILIO_*` env vars, `send_sms` no-ops to `Skipped` when Disabled, sends via form-encoded POST with Basic auth + 10s timeout, captures real API failures to Sentry (no-op path does not). Send uses `From=<TWILIO_ALPHA_SENDER>` (the Alpha Sender ID "RTenantry") — no from-number.
++- `lookup.gleam`: `lookup_line_type` returns `LineType` (Mobile/Landline/VoIP/Unknown), no-ops to `Unknown` when Disabled, `parse_line_type` maps `line_type_intelligence.type` (`fixedVoIP`/`nonFixedVoIP`→VoIP; `valid:false`/absent/malformed→Unknown), `voip/1` derives the `voip_or_burner` signal (honestly scoped to voip only — Lookup can't detect burners).
++- `config.gleam` + `server.gleam`: added `twilio: sms_client.Twilio` to `ServerConfig`, constructed via `sms_client.init()`.
++- `.env.example`: added the four `TWILIO_*` placeholders.
++- Graceful no-op verified without keys: `make test`/`make test-server`/`make build` all green with no Twilio env set; `make test-integration` green on isolated DB (419 passed).
++- No new deps, no DB migration, no routes, no handlers — pure client infra. Callers arrive in rc3-2/rc3-5/rc3-7.
++
++### File List
++
++- `server/src/notification/sms_client.gleam` (NEW)
++- `server/src/reference_checks/lookup.gleam` (NEW)
++- `server/src/config.gleam` (MODIFIED — added `twilio` field + import)
++- `server/src/server.gleam` (MODIFIED — `sms_client.init()` + `twilio:` in constructor)
++- `server/test/notification/sms_client_test.gleam` (NEW)
++- `server/test/reference_checks/lookup_test.gleam` (NEW)
++- `server/test/integration/helpers.gleam` (MODIFIED — `twilio: sms_client.Disabled` in test ServerConfig)
++- `.env.example` (MODIFIED — four `TWILIO_*` placeholders)
++- `_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml` (MODIFIED — epic-rc3 → in-progress, rc3-1 → review)
++- `_bmad-output/implementation-artifacts/spec-rc3-1-sms-client-twilio-lookup-infrastructure-slice.md` (this story)
+diff --git a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+index aec84601..e7dfd1a3 100644
+--- a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
++++ b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+@@ -70,8 +70,8 @@ development_status:
+   epic-rc2-retrospective: optional
+ 
+   # Epic RC3: Written-First Collection Engine
+-  epic-rc3: backlog
+-  rc3-1-sms-client-twilio-lookup-infrastructure-slice: backlog
++  epic-rc3: in-progress
++  rc3-1-sms-client-twilio-lookup-infrastructure-slice: review
+   rc3-2-message-templates-send-helpers: backlog
+   rc3-3-referee-form-session-open-answer-autosave: backlog
+   rc3-4-form-completion-exit-routes-submit-decline-objection-wrong-person: backlog
+diff --git a/server/src/config.gleam b/server/src/config.gleam
+index 5ad9f5b5..a05e6d2f 100644
+--- a/server/src/config.gleam
++++ b/server/src/config.gleam
+@@ -2,6 +2,7 @@
+ //// Passed through handlers instead of threading individual parameters.
+ 
+ import meta/meta_client
++import notification/sms_client
+ import pog
+ import posthog/posthog_client
+ import sentry/sentry_client
+@@ -30,6 +31,7 @@ pub type ServerConfig {
+     posthog: posthog_client.PostHog,
+     meta: meta_client.Meta,
+     google_ads_conversion_id: String,
++    twilio: sms_client.Twilio,
+   )
+ }
+ 
+diff --git a/server/src/notification/sms_client.gleam b/server/src/notification/sms_client.gleam
+new file mode 100644
+index 00000000..5861505a
+--- /dev/null
++++ b/server/src/notification/sms_client.gleam
+@@ -0,0 +1,316 @@
++//// Twilio SMS Client
++//// Minimal Twilio REST helper for sending SMS via the Messages resource.
++////
++//// Mirrors `notification/email_client.gleam`'s REST-helper structure: a thin
++//// HTTP envelope over pure, tested builders. The sender is a Registered
++//// Alphanumeric Sender ID (`TWILIO_ALPHA_SENDER`, "RTenantry") — there is no
++//// from-number, because Irish numbers are voice-only and the Alpha Sender ID
++//// IS the sender (architecture AD-5, corrected 2026-08-08 / PR #592).
++////
++//// Without Twilio keys configured the client no-ops (returns `Skipped`) — it
++//// never crashes a caller. Real Twilio API failures are captured to Sentry
++//// with context; the no-op path is not (it is expected config state).
++
++import envoy
++import gleam/bit_array
++import gleam/dynamic/decode
++import gleam/http
++import gleam/http/request
++import gleam/httpc
++import gleam/int
++import gleam/json
++import gleam/list
++import gleam/option.{type Option, None, Some}
++import gleam/string
++import gleam/uri
++import sentry/sentry_client
++import wisp
++
++/// The route rc3-6 owns for `X-Twilio-Signature`-verified delivery-status
++/// callbacks (architecture §7.2). Fixed here so the `StatusCallback` URL sent
++/// with every message resolves to that route once rc3-6 wires it. rc3-6 must
++/// not rename it without a redirect — it is a live contract the messages
++/// already in flight depend on.
++const status_callback_path = "/webhooks/twilio-sms"
++
++/// Twilio send timeout. Matches the established Resend/Stripe-client pattern
++/// (`notification/email_client.gleam`, `payment/stripe_client.gleam`): bounds
++/// how long a stalled Twilio hop can run on the dispatching thread. Sends are
++/// spawned by the cadence sweep (rc3-5), so a stalled request must not pin the
++/// sweep indefinitely.
++const send_timeout_ms = 10_000
++
++/// The configured Twilio credentials + sender. Constructed once at startup by
++/// `init` from env vars and threaded through `ServerConfig` (mirrors
++/// `sentry_client.{Enabled,Disabled}`).
++pub type TwilioConfig {
++  TwilioConfig(
++    account_sid: String,
++    auth_token: String,
++    alpha_sender: String,
++    status_callback_base_url: String,
++  )
++}
++
++/// A Twilio handle. `Disabled` (no keys) makes every send a no-op. The caller
++/// never has to guard — the client owns the no-op.
++pub type Twilio {
++  Enabled(TwilioConfig)
++  Disabled
++}
++
++/// The outcome of a send attempt. `Skipped` is the no-op result (no keys
++/// configured) — it is NOT an error.
++pub type SendOutcome {
++  Sent(message_sid: String)
++  Skipped
++}
++
++/// Read Twilio config from env. Returns `Disabled` when any of the account SID,
++/// auth token, or Alpha Sender ID is unset/empty (the three values a send
++/// cannot proceed without). A missing status-callback base URL does not
++/// disable the client — sends then omit the `StatusCallback` parameter (the
++/// Twilio API treats it as optional). Mirrors `sentry_client.init`.
++pub fn init() -> Twilio {
++  let sid = read_env("TWILIO_ACCOUNT_SID")
++  let token = read_env("TWILIO_AUTH_TOKEN")
++  let alpha_sender = read_env("TWILIO_ALPHA_SENDER")
++  let base_url = read_env("TWILIO_STATUS_CALLBACK_BASE_URL")
++
++  case sid, token, alpha_sender {
++    Some(sid), Some(token), Some(alpha_sender) ->
++      Enabled(TwilioConfig(
++        account_sid: sid,
++        auth_token: token,
++        alpha_sender:,
++        status_callback_base_url: base_url |> option.unwrap(""),
++      ))
++    _, _, _ -> {
++      wisp.log_warning(
++        "Twilio SMS disabled — TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_ALPHA_SENDER not all set. SMS sends will no-op.",
++      )
++      Disabled
++    }
++  }
++}
++
++fn read_env(name: String) -> Option(String) {
++  case envoy.get(name) {
++    Ok("") -> None
++    Ok(value) -> Some(value)
++    Error(_) -> None
++  }
++}
++
++/// Send an SMS via the Twilio Messages resource. No-ops (returns `Skipped`)
++/// when Twilio is `Disabled`. On a real Twilio API failure, captures the
++/// failure to Sentry with context and returns `Error(reason)` — the no-op path
++/// never captures (it is expected, not a failure).
++pub fn send_sms(
++  twilio twilio: Twilio,
++  sentry sentry: sentry_client.Sentry,
++  to to: String,
++  body body: String,
++) -> Result(SendOutcome, String) {
++  case twilio {
++    Disabled -> {
++      wisp.log_info("SMS skipped — Twilio not configured")
++      Ok(Skipped)
++    }
++    Enabled(cfg) -> do_send(cfg, sentry, to, body)
++  }
++}
++
++fn do_send(
++  cfg: TwilioConfig,
++  sentry: sentry_client.Sentry,
++  to: String,
++  body: String,
++) -> Result(SendOutcome, String) {
++  case build_send_request(cfg, to:, body:) {
++    Error(reason) -> {
++      capture_failure(sentry, endpoint: "messages", message: reason, tags: [
++        #("phase", "build_request"),
++      ])
++      Error(reason)
++    }
++    Ok(req) -> {
++      let http_cfg = httpc.configure() |> httpc.timeout(send_timeout_ms)
++      case httpc.dispatch(http_cfg, req) {
++        Ok(resp) ->
++          case resp.status {
++            200 | 201 ->
++              case parse_send_response(resp.body) {
++                Ok(sid) -> Ok(Sent(message_sid: sid))
++                Error(reason) -> {
++                  capture_failure(
++                    sentry,
++                    endpoint: "messages",
++                    message: reason <> " body=" <> truncate(resp.body),
++                    tags: [#("http_status", int.to_string(resp.status))],
++                  )
++                  Error(reason)
++                }
++              }
++            status -> {
++              let reason = "Twilio API error: HTTP " <> int.to_string(status)
++              capture_failure(
++                sentry,
++                endpoint: "messages",
++                message: reason <> " body=" <> truncate(resp.body),
++                tags: [#("http_status", int.to_string(status))],
++              )
++              wisp.log_error(reason <> " body=" <> truncate(resp.body))
++              Error(reason)
++            }
++          }
++        Error(_) -> {
++          capture_failure(
++            sentry,
++            endpoint: "messages",
++            message: "HTTP request to Twilio failed",
++            tags: [#("error_kind", "connection")],
++          )
++          wisp.log_error("Connection failed to Twilio API")
++          Error("HTTP request to Twilio failed")
++        }
++      }
++    }
++  }
++}
++
++/// The Twilio Messages resource URL for an account. Pure for tests.
++pub fn build_messages_url(account_sid account_sid: String) -> String {
++  "https://api.twilio.com/2010-04-01/Accounts/"
++  <> account_sid
++  <> "/Messages.json"
++}
++
++/// The delivery-status callback URL for a given base. `base` is the public
++/// origin (e.g. `https://righttenantry.ie`); the path is the rc3-6 route.
++pub fn status_callback_url(base base: String) -> String {
++  base <> status_callback_path
++}
++
++/// The Basic-auth header value (`base64(SID:AuthToken)`) for the
++/// `Authorization: Basic ...` header. Twilio authenticates with HTTP Basic
++/// using AccountSID as the username and AuthToken as the password.
++pub fn basic_auth_header(
++  account_sid account_sid: String,
++  auth_token auth_token: String,
++) -> String {
++  let credentials = account_sid <> ":" <> auth_token
++  <<credentials:utf8>> |> bit_array.base64_encode(True)
++}
++
++/// The `application/x-www-form-urlencoded` body for a send. `callback` is
++/// included only when `Some` (a missing base URL sends without a callback).
++/// Pure for tests — verifies `From` carries the Alpha Sender ID (no
++/// from-number) and `StatusCallback` rides the request.
++pub fn build_send_form_body(
++  from from: String,
++  to to: String,
++  body body: String,
++  callback callback: Option(String),
++) -> String {
++  let params = [#("From", from), #("To", to), #("Body", body)]
++  let with_callback = case callback {
++    Some(url) -> list.append(params, [#("StatusCallback", url)])
++    None -> params
++  }
++  form_encode(with_callback)
++}
++
++/// Assemble the full Twilio Messages POST request. Exposed `@internal` for
++/// unit tests (asserts the URL, Basic auth header, content type, and body).
++@internal
++pub fn build_send_request(
++  cfg: TwilioConfig,
++  to to: String,
++  body body: String,
++) -> Result(request.Request(String), String) {
++  let url = build_messages_url(cfg.account_sid)
++  let callback = case cfg.status_callback_base_url {
++    "" -> option.None
++    base -> Some(status_callback_url(base))
++  }
++  case request.to(url) {
++    Ok(req) ->
++      req
++      |> request.set_method(http.Post)
++      |> request.set_header(
++        "authorization",
++        "Basic " <> basic_auth_header(cfg.account_sid, cfg.auth_token),
++      )
++      |> request.set_header("content-type", "application/x-www-form-urlencoded")
++      |> request.set_body(build_send_form_body(
++        from: cfg.alpha_sender,
++        to:,
++        body:,
++        callback:,
++      ))
++      |> Ok
++    Error(_) -> Error("Invalid Twilio Messages URL")
++  }
++}
++
++/// Decode the `sid` from a Twilio Messages response (`SM...`). Pure for tests.
++pub fn parse_send_response(body: String) -> Result(String, String) {
++  let decoder = {
++    use sid <- decode.field("sid", decode.string)
++    decode.success(sid)
++  }
++  case json.parse(body, decoder) {
++    Ok(sid) -> Ok(sid)
++    Error(_) -> Error("Couldn't parse Twilio send response")
++  }
++}
++
++// -- internals ---------------------------------------------------------------
++
++fn capture_failure(
++  sentry: sentry_client.Sentry,
++  endpoint endpoint: String,
++  message message: String,
++  tags tags: List(#(String, String)),
++) -> Nil {
++  sentry_client.capture(
++    sentry,
++    sentry_client.BackgroundEvent(
++      event_type: "TwilioSmsFailed",
++      message: sentry_client.truncate_message(message),
++      level: sentry_client.LevelError,
++      tags: [#("endpoint", endpoint), ..tags],
++    ),
++  )
++}
++
++/// Cap a Twilio response body for logging. Twilio error bodies echo the
++/// request `To`/`Body`; truncating bounds the PII footprint while still
++/// capturing the `error_code`/`message` envelope (mirrors stripe_client).
++fn truncate(body: String) -> String {
++  let max = 512
++  case string.length(body) > max {
++    True -> string.slice(body, 0, max) <> "…(truncated)"
++    False -> body
++  }
++}
++
++/// URL-encode form parameters for `application/x-www-form-urlencoded`.
++/// gleam's `uri.percent_encode` is a URI-component encoder and leaves `+`
++/// unencoded (a valid URI sub-delimiter) — but in a form body `+` means a
++/// space, so an E.164 `+353...` `To` value would arrive as ` 353...` with
++/// a leading space. We percent-encode, then re-encode any `+` as `%2B`.
++/// (Space is already `%20`, which form decoders accept.) Mirrors
++/// `payment/stripe_client.form_encode` with the `+` fix.
++fn form_encode(params: List(#(String, String))) -> String {
++  params
++  |> list.map(fn(pair) {
++    encode_form_value(pair.0) <> "=" <> encode_form_value(pair.1)
++  })
++  |> string.join("&")
++}
++
++fn encode_form_value(value: String) -> String {
++  uri.percent_encode(value) |> string.replace("+", "%2B")
++}
+diff --git a/server/src/reference_checks/lookup.gleam b/server/src/reference_checks/lookup.gleam
+new file mode 100644
+index 00000000..695d9f11
+--- /dev/null
++++ b/server/src/reference_checks/lookup.gleam
+@@ -0,0 +1,205 @@
++//// Twilio Lookup v2 — line-type intelligence at capture (AD-10).
++////
++//// Queries the Twilio Lookup API for a phone number's line type (mobile /
++//// landline / VoIP) to populate the fraud-signal `line_type` /
++//// `voip_or_burner` fields. Reuses the SAME Twilio credentials as
++//// `notification/sms_client` (Account SID + Auth Token, AD-5) — there is no
++//// separate provisioning.
++////
++//// Without Twilio keys configured the lookup no-ops to `Unknown`. On a real
++//// Twilio API failure, captures to Sentry and returns `Unknown` — it NEVER
++//// blocks the caller. Per AD-10, line type is display / confidence content
++//// only; it never auto-rejects ("not verified" is not "fraudulent").
++
++import gleam/dynamic/decode
++import gleam/http
++import gleam/http/request
++import gleam/httpc
++import gleam/int
++import gleam/json
++import gleam/option
++import gleam/string
++import gleam/uri
++import notification/sms_client
++import sentry/sentry_client
++import wisp
++
++/// Lookup timeout. A stalled Lookup hop must not pin the row-creation path;
++/// on timeout the caller proceeds with `Unknown` (a missing fraud signal is
++/// always preferable to a blocked write).
++const lookup_timeout_ms = 10_000
++
++/// The line type of a phone number, mapped from Twilio Lookup's
++/// `line_type_intelligence.type` (which itself returns `mobile`, `landline`,
++/// `fixedVoIP`, `nonFixedVoIP`, `tollFree`, `premium`, `unknown`, ...). The
++/// `voip` helper derives the `voip_or_burner` signal from this.
++pub type LineType {
++  Mobile
++  Landline
++  VoIP
++  Unknown
++}
++
++/// Look up the line type for a phone number (E.164, e.g. `"+35386..."`).
++/// No-ops to `Unknown` when Twilio is `Disabled`; on any API failure captures
++/// to Sentry and returns `Unknown`. The caller is never blocked.
++pub fn lookup_line_type(
++  twilio twilio: sms_client.Twilio,
++  sentry sentry: sentry_client.Sentry,
++  phone phone: String,
++) -> LineType {
++  case twilio {
++    sms_client.Disabled -> {
++      wisp.log_info("Twilio Lookup skipped — not configured")
++      Unknown
++    }
++    sms_client.Enabled(cfg) -> do_lookup(cfg, sentry, phone)
++  }
++}
++
++fn do_lookup(
++  cfg: sms_client.TwilioConfig,
++  sentry: sentry_client.Sentry,
++  phone: String,
++) -> LineType {
++  case build_lookup_request(cfg, phone) {
++    Error(_) -> {
++      capture_failure(
++        sentry,
++        message: "Invalid Twilio Lookup URL for phone " <> phone,
++        tags: [#("phase", "build_request")],
++      )
++      Unknown
++    }
++    Ok(req) -> {
++      let http_cfg = httpc.configure() |> httpc.timeout(lookup_timeout_ms)
++      case httpc.dispatch(http_cfg, req) {
++        Ok(resp) ->
++          case resp.status {
++            200 -> parse_line_type(resp.body)
++            status -> {
++              capture_failure(
++                sentry,
++                message: "Twilio Lookup HTTP "
++                  <> int.to_string(status)
++                  <> " for phone "
++                  <> phone,
++                tags: [#("http_status", int.to_string(status))],
++              )
++              wisp.log_warning(
++                "Twilio Lookup failed: HTTP "
++                <> int.to_string(status)
++                <> " for phone "
++                <> phone,
++              )
++              Unknown
++            }
++          }
++        Error(_) -> {
++          capture_failure(
++            sentry,
++            message: "HTTP request to Twilio Lookup failed for phone " <> phone,
++            tags: [#("error_kind", "connection")],
++          )
++          wisp.log_warning("Connection failed to Twilio Lookup API")
++          Unknown
++        }
++      }
++    }
++  }
++}
++
++/// The Twilio Lookup v2 URL for a phone number. The `+` of an E.164 number is
++/// percent-encoded (`%2B`) for the path segment — gleam's `uri.percent_encode`
++/// leaves `+` unencoded (a valid URI sub-delimiter), so we re-encode it; the
++/// Twilio docs' curl examples use `%2B`. `Fields=line_type_intelligence`
++/// selects the paid line-type data package. Pure for tests.
++pub fn build_lookup_url(phone phone: String) -> String {
++  let encoded = uri.percent_encode(phone) |> string.replace("+", "%2B")
++  "https://lookups.twilio.com/v2/PhoneNumbers/"
++  <> encoded
++  <> "?Fields=line_type_intelligence"
++}
++
++/// Assemble the full Twilio Lookup GET request (HTTP Basic auth, same creds as
++/// SMS). Exposed `@internal` for unit tests.
++@internal
++pub fn build_lookup_request(
++  cfg: sms_client.TwilioConfig,
++  phone: String,
++) -> Result(request.Request(String), Nil) {
++  case request.to(build_lookup_url(phone:)) {
++    Ok(req) ->
++      req
++      |> request.set_method(http.Get)
++      |> request.set_header(
++        "authorization",
++        "Basic "
++          <> sms_client.basic_auth_header(
++          account_sid: cfg.account_sid,
++          auth_token: cfg.auth_token,
++        ),
++      )
++      |> Ok
++    Error(_) -> Error(Nil)
++  }
++}
++
++/// Decode a Twilio Lookup response into a `LineType`. Maps
++/// `line_type_intelligence.type`: `mobile`→Mobile, `landline`→Landline,
++/// `fixedVoIP`/`nonFixedVoIP`→VoIP; an absent/null `line_type_intelligence`,
++/// `valid:false`, or any parse failure → `Unknown`. Pure for tests.
++pub fn parse_line_type(body: String) -> LineType {
++  let lti_decoder = {
++    use typ <- decode.field("type", decode.string)
++    decode.success(typ)
++  }
++  let decoder = {
++    use valid <- decode.optional_field("valid", True, decode.bool)
++    use lti <- decode.optional_field(
++      "line_type_intelligence",
++      option.None,
++      decode.optional(lti_decoder),
++    )
++    let type_str = option.unwrap(lti, "")
++    decode.success(#(valid, type_str))
++  }
++  case json.parse(body, decoder) {
++    Ok(#(valid, type_str)) ->
++      case valid, type_str {
++        False, _ -> Unknown
++        True, "mobile" -> Mobile
++        True, "landline" -> Landline
++        True, "fixedVoIP" -> VoIP
++        True, "nonFixedVoIP" -> VoIP
++        True, _ -> Unknown
++      }
++    Error(_) -> Unknown
++  }
++}
++
++/// Whether a line type is VoIP — the `voip_or_burner` fraud signal's honest
++/// v1 value. (Line-type intelligence cannot detect "burner" numbers; that
++/// would need a different Lookup package or vendor. Per AD-10's honesty
++/// principle, v1 reports `voip` only.)
++pub fn voip(line_type line_type: LineType) -> Bool {
++  line_type == VoIP
++}
++
++// -- internals ---------------------------------------------------------------
++
++fn capture_failure(
++  sentry: sentry_client.Sentry,
++  message message: String,
++  tags tags: List(#(String, String)),
++) -> Nil {
++  sentry_client.capture(
++    sentry,
++    sentry_client.BackgroundEvent(
++      event_type: "TwilioLookupFailed",
++      message: sentry_client.truncate_message(message),
++      level: sentry_client.LevelWarning,
++      tags: [#("endpoint", "lookup"), ..tags],
++    ),
++  )
++}
+diff --git a/server/src/server.gleam b/server/src/server.gleam
+index 571798f1..818a4a4a 100644
+--- a/server/src/server.gleam
++++ b/server/src/server.gleam
+@@ -13,6 +13,7 @@ import gleam/int
+ import gleam/result
+ import meta/meta_client
+ import mist
++import notification/sms_client
+ import payment/invoice_cache
+ import posthog/posthog_client
+ import router
+@@ -261,6 +262,7 @@ fn start() -> Result(Nil, String) {
+   let sentry = sentry_client.init()
+   let posthog = posthog_client.init()
+   let meta = meta_client.init(sentry)
++  let twilio = sms_client.init()
+ 
+   // Public Google Ads tag id for the SSR content pages. Empty/unset means the
+   // gtag snippet isn't rendered (staging keeps this "" on purpose — Smart
+@@ -310,6 +312,7 @@ fn start() -> Result(Nil, String) {
+       posthog:,
+       meta:,
+       google_ads_conversion_id:,
++      twilio:,
+     )
+ 
+   use _ <- result.try(analysis_sweep.start(server_config))
+diff --git a/server/test/integration/helpers.gleam b/server/test/integration/helpers.gleam
+index 51dc420e..484c7f21 100644
+--- a/server/test/integration/helpers.gleam
++++ b/server/test/integration/helpers.gleam
+@@ -13,6 +13,7 @@ import gleam/erlang/process
+ import gleam/json
+ import integration/test_db
+ import meta/meta_client
++import notification/sms_client
+ import pog
+ import posthog/posthog_client
+ import sentry/sentry_client
+@@ -57,6 +58,7 @@ pub fn test_server_config(db: pog.Connection) -> config.ServerConfig {
+     posthog: posthog_client.Disabled,
+     meta: meta_client.Disabled,
+     google_ads_conversion_id: "",
++    twilio: sms_client.Disabled,
+   )
+ }
+ 
+diff --git a/server/test/notification/sms_client_test.gleam b/server/test/notification/sms_client_test.gleam
+new file mode 100644
+index 00000000..cce35cc4
+--- /dev/null
++++ b/server/test/notification/sms_client_test.gleam
+@@ -0,0 +1,165 @@
++//// Unit tests for notification/sms_client — pure builders + the no-op path.
++//// Mirrors email_client_test's approach: the HTTP envelope (do_send) is thin
++//// glue exercised by integration/E2E, not unit-tested against httpc.
++
++import gleam/http
++import gleam/http/request
++import gleam/option.{None, Some}
++import gleam/string
++import gleeunit/should
++import notification/sms_client
++import sentry/sentry_client
++
++// -- build_send_form_body: the Alpha Sender ID is From (no from-number) ----
++
++pub fn form_body_uses_alpha_sender_as_from_test() {
++  let body =
++    sms_client.build_send_form_body(
++      from: "RTenantry",
++      to: "+353861234567",
++      body: "Hi",
++      callback: Some("https://righttenantry.ie/webhooks/twilio-sms"),
++    )
++  // The load-bearing assertion: From carries the Alpha Sender ID, not a number.
++  string.contains(body, "From=RTenantry")
++  |> should.be_true
++}
++
++pub fn form_body_encodes_to_e164_plus_test() {
++  let body =
++    sms_client.build_send_form_body(
++      from: "RTenantry",
++      to: "+353861234567",
++      body: "Hi",
++      callback: None,
++    )
++  string.contains(body, "To=%2B353861234567") |> should.be_true
++}
++
++pub fn form_body_includes_status_callback_when_present_test() {
++  let body =
++    sms_client.build_send_form_body(
++      from: "RTenantry",
++      to: "+353861234567",
++      body: "Hi",
++      callback: Some("https://righttenantry.ie/webhooks/twilio-sms"),
++    )
++  string.contains(body, "StatusCallback=https%3A%2F%2F") |> should.be_true
++}
++
++pub fn form_body_omits_status_callback_when_absent_test() {
++  let body =
++    sms_client.build_send_form_body(
++      from: "RTenantry",
++      to: "+353861234567",
++      body: "Hi",
++      callback: None,
++    )
++  string.contains(body, "StatusCallback") |> should.be_false
++}
++
++pub fn form_body_exact_without_callback_test() {
++  let body =
++    sms_client.build_send_form_body(
++      from: "RTenantry",
++      to: "+353861234567",
++      body: "Hi",
++      callback: None,
++    )
++  body
++  |> should.equal("From=RTenantry&To=%2B353861234567&Body=Hi")
++}
++
++// -- URLs -------------------------------------------------------------------
++
++pub fn build_messages_url_test() {
++  sms_client.build_messages_url(account_sid: "AC123abc")
++  |> should.equal(
++    "https://api.twilio.com/2010-04-01/Accounts/AC123abc/Messages.json",
++  )
++}
++
++pub fn status_callback_url_appends_route_test() {
++  sms_client.status_callback_url(base: "https://righttenantry.ie")
++  |> should.equal("https://righttenantry.ie/webhooks/twilio-sms")
++}
++
++// -- Basic auth -------------------------------------------------------------
++
++pub fn basic_auth_header_base64_encodes_credentials_test() {
++  sms_client.basic_auth_header(
++    account_sid: "ACtestsid",
++    auth_token: "sekrettoken",
++  )
++  |> should.equal("QUN0ZXN0c2lkOnNla3JldHRva2Vu")
++}
++
++// -- parse_send_response ----------------------------------------------------
++
++pub fn parse_send_response_decodes_sid_test() {
++  sms_client.parse_send_response("{\"sid\":\"SM123abc\",\"status\":\"queued\"}")
++  |> should.equal(Ok("SM123abc"))
++}
++
++pub fn parse_send_response_rejects_missing_sid_test() {
++  sms_client.parse_send_response("{\"status\":\"queued\"}")
++  |> should.be_error
++}
++
++pub fn parse_send_response_rejects_malformed_test() {
++  sms_client.parse_send_response("{not json")
++  |> should.be_error
++}
++
++// -- no-op path: Disabled never reaches HTTP (AC2) -------------------------
++
++pub fn send_sms_no_ops_when_disabled_test() {
++  sms_client.send_sms(
++    twilio: sms_client.Disabled,
++    sentry: sentry_client.Disabled,
++    to: "+353861234567",
++    body: "Hi",
++  )
++  |> should.equal(Ok(sms_client.Skipped))
++}
++
++// -- build_send_request: the assembled POST (AC1) --------------------------
++
++pub fn build_send_request_sets_post_basic_auth_and_form_body_test() {
++  let cfg =
++    sms_client.TwilioConfig(
++      account_sid: "ACtestsid",
++      auth_token: "sekrettoken",
++      alpha_sender: "RTenantry",
++      status_callback_base_url: "https://righttenantry.ie",
++    )
++  let req =
++    sms_client.build_send_request(cfg, to: "+353861234567", body: "Hi")
++    |> should.be_ok
++
++  req.method |> should.equal(http.Post)
++  request.get_header(req, "authorization")
++  |> should.equal(Ok("Basic QUN0ZXN0c2lkOnNla3JldHRva2Vu"))
++  request.get_header(req, "content-type")
++  |> should.equal(Ok("application/x-www-form-urlencoded"))
++  string.contains(req.body, "From=RTenantry")
++  |> should.be_true
++  string.contains(req.body, "StatusCallback=")
++  |> should.be_true
++}
++
++pub fn build_send_request_omits_callback_when_base_empty_test() {
++  let cfg =
++    sms_client.TwilioConfig(
++      account_sid: "ACtestsid",
++      auth_token: "sekrettoken",
++      alpha_sender: "RTenantry",
++      status_callback_base_url: "",
++    )
++  let req =
++    sms_client.build_send_request(cfg, to: "+353861234567", body: "Hi")
++    |> should.be_ok
++
++  string.contains(req.body, "StatusCallback")
++  |> should.be_false
++}
+diff --git a/server/test/reference_checks/lookup_test.gleam b/server/test/reference_checks/lookup_test.gleam
+new file mode 100644
+index 00000000..c9239b94
+--- /dev/null
++++ b/server/test/reference_checks/lookup_test.gleam
+@@ -0,0 +1,101 @@
++//// Unit tests for reference_checks/lookup — line-type parsing, URL
++//// encoding, and the no-op path. The HTTP envelope (do_lookup) is thin glue
++//// exercised by integration, not unit-tested against httpc (mirrors
++//// email_client_test).
++
++import gleeunit/should
++import notification/sms_client
++import reference_checks/lookup
++import sentry/sentry_client
++
++// -- parse_line_type: maps Twilio line_type_intelligence.type (AC3) --------
++
++pub fn parse_line_type_mobile_test() {
++  lookup.parse_line_type(
++    "{\"valid\":true,\"line_type_intelligence\":{\"type\":\"mobile\"}}",
++  )
++  |> should.equal(lookup.Mobile)
++}
++
++pub fn parse_line_type_landline_test() {
++  lookup.parse_line_type(
++    "{\"valid\":true,\"line_type_intelligence\":{\"type\":\"landline\"}}",
++  )
++  |> should.equal(lookup.Landline)
++}
++
++pub fn parse_line_type_fixed_voip_test() {
++  lookup.parse_line_type(
++    "{\"valid\":true,\"line_type_intelligence\":{\"type\":\"fixedVoIP\"}}",
++  )
++  |> should.equal(lookup.VoIP)
++}
++
++pub fn parse_line_type_nonfixed_voip_test() {
++  lookup.parse_line_type(
++    "{\"valid\":true,\"line_type_intelligence\":{\"type\":\"nonFixedVoIP\"}}",
++  )
++  |> should.equal(lookup.VoIP)
++}
++
++pub fn parse_line_type_other_type_is_unknown_test() {
++  lookup.parse_line_type(
++    "{\"valid\":true,\"line_type_intelligence\":{\"type\":\"tollFree\"}}",
++  )
++  |> should.equal(lookup.Unknown)
++}
++
++pub fn parse_line_type_invalid_number_is_unknown_test() {
++  // valid:false wins — an invalid number never reports a line type.
++  lookup.parse_line_type("{\"valid\":false,\"line_type_intelligence\":null}")
++  |> should.equal(lookup.Unknown)
++}
++
++pub fn parse_line_type_null_intelligence_is_unknown_test() {
++  lookup.parse_line_type("{\"valid\":true,\"line_type_intelligence\":null}")
++  |> should.equal(lookup.Unknown)
++}
++
++pub fn parse_line_type_missing_intelligence_is_unknown_test() {
++  // Basic Lookup (no Fields) returns no line_type_intelligence.
++  lookup.parse_line_type("{\"valid\":true,\"phone_number\":\"+353861234567\"}")
++  |> should.equal(lookup.Unknown)
++}
++
++pub fn parse_line_type_malformed_is_unknown_test() {
++  lookup.parse_line_type("{not json") |> should.equal(lookup.Unknown)
++}
++
++// -- build_lookup_url: the + is percent-encoded (AC3) ----------------------
++
++pub fn build_lookup_url_percent_encodes_plus_test() {
++  lookup.build_lookup_url(phone: "+353861234567")
++  |> should.equal(
++    "https://lookups.twilio.com/v2/PhoneNumbers/%2B353861234567?Fields=line_type_intelligence",
++  )
++}
++
++// -- no-op path: Disabled never reaches HTTP (AC2/AC3) ---------------------
++
++pub fn lookup_line_type_no_ops_to_unknown_when_disabled_test() {
++  lookup.lookup_line_type(
++    twilio: sms_client.Disabled,
++    sentry: sentry_client.Disabled,
++    phone: "+353861234567",
++  )
++  |> should.equal(lookup.Unknown)
++}
++
++// -- voip helper (the voip_or_burner signal, honestly scoped) --------------
++
++pub fn voip_true_for_voip_test() {
++  lookup.voip(line_type: lookup.VoIP) |> should.be_true
++}
++
++pub fn voip_false_for_mobile_test() {
++  lookup.voip(line_type: lookup.Mobile) |> should.be_false
++}
++
++pub fn voip_false_for_unknown_test() {
++  lookup.voip(line_type: lookup.Unknown) |> should.be_false
++}

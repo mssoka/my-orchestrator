@@ -1,0 +1,1474 @@
+You are reviewing a code diff. You have read-only access to the repository and may verify the diff's claims against the actual codebase using your available tools.
+
+--- PROJECT CONVENTIONS ---
+Read /Users/moses/.herdr/worktrees/RightTenantry/perkins-form-save-resume-f3-r4/AGENTS.md in full before reviewing — it is the project's standing convention doc (no `let assert` in production code, no JavaScript FFI, explicit httpc timeouts, Squirrel-only SQL, landlord-centric copy voice, backward-compatibility contracts, naming and testing conventions). Treat it as loaded conventions for every judgment below.
+
+--- CONTEXT ---
+This is chunk 3 of 3 — server/test (Gleam unit + integration tests) of one PR diff (RightTenantry PR #563, "feat: application save-and-resume (F3) + reminder continue-link", reviewed sha d3f7700c6b62c0bfbbf1fac3024ad9ad9df3e930). The full PR was chunked by file group for review; review ONLY the diff bytes below, but you may read ANY file in the worktree at /Users/moses/.herdr/worktrees/RightTenantry/perkins-form-save-resume-f3-r4 (a checkout at exactly the reviewed sha) to verify claims. Findings outside this chunk's files will be handled by another reviewer — do not report them.
+
+Spec / context docs (read them before judging):
+- Original job briefing (your spec): /Users/moses/code/_bmad-output/briefings/righttenantry-form-save-resume-f3.md
+- Spec of record it names: /Users/moses/.herdr/worktrees/RightTenantry/perkins-form-save-resume-f3-r4/_bmad-output/planning-artifacts/problem-solving-application-form-completion-2026-07-31.md — the F3 row of the Generated Solutions table, Solution Analysis, Recommended Solution (Wave 1 build pack), Risk Mitigation (incl. the draft data-protection row), and the E2 reminder row are the load-bearing sections.
+
+--- DIFF ---
+diff --git a/server/test/application/draft_handler_test.gleam b/server/test/application/draft_handler_test.gleam
+new file mode 100644
+index 00000000..909017ff
+--- /dev/null
++++ b/server/test/application/draft_handler_test.gleam
+@@ -0,0 +1,68 @@
++//// Unit tests for the F3 draft field filter — the server-side half of the
++//// "what may never persist in a draft" contract (the JS serializer is the
++//// client half; both are pinned).
++
++import application/draft_handler
++import gleam/dict
++import gleam/int
++import gleam/list
++import gleam/string
++import gleeunit/should
++
++pub fn filter_fields_drops_internal_and_consent_keys_test() {
++  let fields =
++    dict.from_list([
++      #("first_name", "Ada"),
++      #("_website", "bot-bait"),
++      #("_form_loaded_at", "123456"),
++      #("gdpr_consent", "on"),
++    ])
++  draft_handler.filter_fields(fields)
++  |> should.equal([#("first_name", "Ada")])
++}
++
++pub fn filter_fields_drops_upload_slot_keys_even_as_scalars_test() {
++  // W10: the "no documents in drafts" rule is a NAME-level guarantee too —
++  // a hand-crafted payload with a file slot's name (the serializer skips
++  // type=file controls client-side) must not park a string under a
++  // document slot's identity.
++  let fields =
++    dict.from_list([
++      #("landlord_ref_primary", "data:application/pdf;base64,xx"),
++      #("employer_ref_coapplicant_1", "fake"),
++      #("proof_of_income_coapplicant_0", "fake"),
++      #("additional_docs", "fake"),
++      #("landlord_reference_name", "Jane"),
++    ])
++  draft_handler.filter_fields(fields)
++  |> should.equal([#("landlord_reference_name", "Jane")])
++}
++
++pub fn filter_fields_caps_key_count_and_length_test() {
++  let long_key = string.repeat("k", 65)
++  let fields =
++    dict.from_list([#(long_key, "v"), #("ok", "v"), #("", "empty-key")])
++  draft_handler.filter_fields(fields)
++  |> should.equal([#("ok", "v")])
++}
++
++pub fn filter_fields_caps_entries_at_120_test() {
++  let fields =
++    int.range(1, 200, [], fn(acc, i) { [#("field_" <> pad(i), "v"), ..acc] })
++    |> dict.from_list
++  draft_handler.filter_fields(fields)
++  |> list.length
++  |> should.equal(120)
++}
++
++fn pad(i: Int) -> String {
++  let s = int.to_string(i)
++  string.repeat("0", 3 - string.length(s)) <> s
++}
++
++pub fn filter_fields_truncates_oversize_values_test() {
++  let fields =
++    dict.from_list([#("personal_statement", string.repeat("x", 5000))])
++  draft_handler.filter_fields(fields)
++  |> should.equal([#("personal_statement", string.repeat("x", 4000))])
++}
+diff --git a/server/test/application/form_pages_test.gleam b/server/test/application/form_pages_test.gleam
+index 4c495eda..3e139d32 100644
+--- a/server/test/application/form_pages_test.gleam
++++ b/server/test/application/form_pages_test.gleam
+@@ -1,6 +1,9 @@
+ //// Tests for application form pages — confirmation, duplicate, error resubmission.
+ 
+ import application/form_pages
++import application/form_view
++import gleam/int
++import gleam/option.{type Option, None, Some}
+ import gleam/string
+ import gleeunit/should
+ import test_helpers
+@@ -309,3 +312,60 @@ pub fn confirmation_page_spam_render_shows_no_referee_line_test() {
+   |> string.contains("contact your referees shortly")
+   |> should.be_false
+ }
++
++// -- Resume page (F3) ---------------------------------------------------------
++
++pub fn resume_page_has_resume_marker_banner_and_no_error_banner_test() {
++  let vacancy = test_helpers.test_vacancy_row()
++  let html =
++    form_pages.view_resume_page(
++      vacancy,
++      [#("first_name", "Ada")],
++      "tok-resume",
++      "phc_test",
++    )
++  html
++  |> string.contains("data-apply-page=\"form-resume\"")
++  |> should.be_true
++  html |> string.contains("draft-resume-banner") |> should.be_true
++  // …the token rides an inline-script global, NEVER a DOM attribute
++  // (PostHog autocapture reads element attributes into $elements_chain).
++  html
++  |> string.contains("window.__rtResumeToken=\"tok-resume\";")
++  |> should.be_true
++  html |> string.contains("data-resume-token") |> should.be_false
++  html |> string.contains("form_draft.js") |> should.be_true
++  // No error machinery — a resume is not a failed submit.
++  html |> string.contains("error-summary") |> should.be_false
++  html |> string.contains("data-first-error-field") |> should.be_false
++  // The capability-token scrub rides this page too (its URL carries it).
++  html |> string.contains("sanitize_properties:function(p)") |> should.be_true
++}
++
++pub fn resume_page_backdates_the_timing_field_test() {
++  // The <2s anti-bot window must not swallow an honest resumed submit: the
++  // token-gated render stamps _form_loaded_at ~10s in the past.
++  let vacancy = test_helpers.test_vacancy_row()
++  let before = form_view.current_unix_ms() - 5000
++  let html = form_pages.view_resume_page(vacancy, [], "tok-resume", "phc_test")
++  let stamped = timing_field_value(html)
++  case stamped {
++    Some(v) -> should.be_true(v < before)
++    None -> panic as "no _form_loaded_at value on the resume page"
++  }
++}
++
++fn timing_field_value(html: String) -> Option(Int) {
++  case string.split(html, "name=\"_form_loaded_at\"") {
++    [_, rest, ..] ->
++      case string.split(rest, "value=\"") {
++        [_, digits_rest, ..] ->
++          case string.split(digits_rest, "\"") {
++            [digits, ..] -> int.parse(digits) |> option.from_result
++            _ -> None
++          }
++        _ -> None
++      }
++    _ -> None
++  }
++}
+diff --git a/server/test/application/form_view_test.gleam b/server/test/application/form_view_test.gleam
+index af4ad39e..8d453798 100644
+--- a/server/test/application/form_view_test.gleam
++++ b/server/test/application/form_view_test.gleam
+@@ -617,3 +617,17 @@ pub fn document_slots_carry_what_counts_helper_copy_test() {
+   |> string.contains("Photos from your phone are fine")
+   |> should.be_true
+ }
++
++// F3: the resume page's URL carries the 288-bit continue token (a read
++// capability for applicant PII). The apply snippet must scrub resume /
++// draft-erasure tokens from every URL-ish event property before capture —
++// the erasure pages' no-PostHog precedent, applied as redaction because the
++// resume page needs its funnel events.
++pub fn apply_form_posthog_scrubs_draft_tokens_test() {
++  let vacancy = test_helpers.test_vacancy_row()
++  let html = form_view.view_application_page(vacancy, "phc_test_key")
++  html
++  |> string.contains("sanitize_properties:function(p)")
++  |> should.be_true
++  html |> string.contains("resume|draft-erasure") |> should.be_true
++}
+diff --git a/server/test/auth/csrf_test.gleam b/server/test/auth/csrf_test.gleam
+index f6d71847..aeef5cb5 100644
+--- a/server/test/auth/csrf_test.gleam
++++ b/server/test/auth/csrf_test.gleam
+@@ -171,3 +171,20 @@ pub fn post_with_correct_csrf_token_passes_test() {
+   let resp = csrf.validate(req, secret, fn() { ok_handler() })
+   resp.status |> should.equal(200)
+ }
++
++pub fn draft_routes_skip_csrf_test() {
++  // F3 draft writes: no session exists to hijack (the /apply precedent);
++  // erasure POST is capability-gated by its 288-bit token.
++  let save = simulate.request(http.Post, "/apply/abc123/draft")
++  csrf.validate(save, "secret", fn() { ok_handler() }).status
++  |> should.equal(200)
++  let save_put = simulate.request(http.Put, "/apply/abc123/draft")
++  csrf.validate(save_put, "secret", fn() { ok_handler() }).status
++  |> should.equal(200)
++  let link = simulate.request(http.Post, "/apply/abc123/continue-link")
++  csrf.validate(link, "secret", fn() { ok_handler() }).status
++  |> should.equal(200)
++  let erase = simulate.request(http.Post, "/apply/abc123/draft-erasure/tok")
++  csrf.validate(erase, "secret", fn() { ok_handler() }).status
++  |> should.equal(200)
++}
+diff --git a/server/test/integration/draft_integration_test.gleam b/server/test/integration/draft_integration_test.gleam
+new file mode 100644
+index 00000000..f672fe1f
+--- /dev/null
++++ b/server/test/integration/draft_integration_test.gleam
+@@ -0,0 +1,939 @@
++//// F3 save-and-resume integration tests — draft round-trip (save → token →
++//// resume), token scoping + uniformity, the 10-minute continue-link
++//// cooldown, strip-on-submit, self-service erasure, vacancy-close expiry
++//// (retention phase), and the vacancy FK cascade.
++
++import application/application_handler
++import application/draft_handler
++import application/form_view
++import application/sql as app_sql
++import gleam/http
++import gleam/int
++import gleam/json
++import gleam/list
++import gleam/result
++import gleam/string
++import gleeunit/should
++import integration/helpers.{setup, test_server_config}
++import integration/test_db
++import pog
++import retention/retention_job
++import sentry/sentry_client
++import test_helpers
++import unitest
++import wisp/simulate
++import youid/uuid
++
++// ============================================================================
++// Helpers
++// ============================================================================
++
++fn vacancy_short_code(db: pog.Connection, vacancy_id: String) -> String {
++  test_db.query_text(
++    db,
++    "SELECT short_code FROM vacancy WHERE id = '" <> vacancy_id <> "'::uuid",
++  )
++  |> result.unwrap("")
++}
++
++fn draft_field(db: pog.Connection, vacancy_id: String, column: String) -> String {
++  test_db.query_text(
++    db,
++    "SELECT COALESCE(" <> column <> "::text, '') FROM application_draft
++     WHERE vacancy_id = '" <> vacancy_id <> "'::uuid",
++  )
++  |> result.unwrap("")
++}
++
++fn draft_count(db: pog.Connection) -> Int {
++  test_db.query_int(db, "SELECT count(*)::int FROM application_draft")
++  |> result.unwrap(-1)
++}
++
++fn save_body() -> json.Json {
++  json.object([
++    #("email", json.string("Tenant@Example.com")),
++    #(
++      "fields",
++      json.object([
++        #("first_name", json.string("Ada")),
++        #("last_name", json.string("Byrne")),
++        #("email", json.string("Tenant@Example.com")),
++        #("_website", json.string("bot-bait")),
++        #("_form_loaded_at", json.string("123")),
++        #("gdpr_consent", json.string("on")),
++      ]),
++    ),
++  ])
++}
++
++fn save_draft(db: pog.Connection, code: String) {
++  let req =
++    simulate.request(http.Put, "/apply/" <> code <> "/draft")
++    |> simulate.json_body(save_body())
++  draft_handler.handle_save_draft(req, test_server_config(db), code)
++}
++
++/// Mint a draft + continue token straight through the SQL layer (bypasses
++/// the cooldown so tests can claim freely).
++fn seed_draft_with_token(
++  db: pog.Connection,
++  vacancy_id: String,
++  token: String,
++) -> String {
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++  let assert Ok(_) =
++    app_sql.upsert_application_draft(
++      db,
++      uuid,
++      "tenant@example.com",
++      json.object([#("first_name", json.string("Ada"))]),
++      "tok-seed",
++    )
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE application_draft SET continue_token = $1
++       WHERE vacancy_id = $2::uuid",
++    )
++    |> pog.parameter(pog.text(token))
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.execute(db)
++  token
++}
++
++// ============================================================================
++// Save (PUT/POST /apply/:code/draft)
++// ============================================================================
++
++pub fn save_draft_persists_filtered_fields_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++
++  let resp = save_draft(db, code)
++  resp.status |> should.equal(200)
++
++  // Row exists, email lowercased by the writer…
++  draft_count(db) |> should.equal(1)
++  draft_field(db, vacancy_id, "email") |> should.equal("tenant@example.com")
++  // …internals and consent stripped server-side…
++  let fields = draft_field(db, vacancy_id, "fields")
++  fields |> string.contains("first_name") |> should.be_true
++  fields |> string.contains("_website") |> should.be_false
++  fields |> string.contains("_form_loaded_at") |> should.be_false
++  fields |> string.contains("gdpr_consent") |> should.be_false
++  // …and no file content could ever land here (schema has no such column).
++}
++
++pub fn save_draft_rejects_invalid_email_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++
++  let req =
++    simulate.request(http.Put, "/apply/" <> code <> "/draft")
++    |> simulate.json_body(
++      json.object([
++        #("email", json.string("not-an-email")),
++        #("fields", json.object([#("first_name", json.string("Ada"))])),
++      ]),
++    )
++  draft_handler.handle_save_draft(req, test_server_config(db), code).status
++  |> should.equal(400)
++  draft_count(db) |> should.equal(0)
++}
++
++pub fn save_draft_on_closed_vacancy_refuses_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_closed_vacancy(db, landlord_id)
++  let code = vacancy_short_code(db, vacancy_id)
++
++  let resp = save_draft(db, code)
++  resp.status |> should.equal(200)
++  simulate.read_body(resp)
++  |> string.contains("\"closed\":true")
++  |> should.be_true
++  draft_count(db) |> should.equal(0)
++}
++
++// ============================================================================
++// Continue-link (POST /apply/:code/continue-link) — cooldown + no-leak
++// The Resend send itself is exercised by manual E2E, not here (the empty
++// test key would make a real api.resend.com call — same precedent as the
++// resend-confirmation tests).
++// ============================================================================
++
++pub fn claim_continue_link_send_mints_once_then_cools_down_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-seeded")
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++
++  // Existing token is kept (previously emailed links keep working)…
++  let assert Ok(kept) =
++    app_sql.claim_continue_link_send(db, uuid, "tenant@example.com", "tok-new")
++  kept.rows |> list.length |> should.equal(1)
++  draft_field(db, vacancy_id, "continue_token") |> should.equal("tok-seeded")
++  draft_field(db, vacancy_id, "last_link_sent_at") |> should.not_equal("")
++
++  // …and an immediate re-claim is the cooldown's empty result.
++  let assert Ok(cooled) =
++    app_sql.claim_continue_link_send(db, uuid, "tenant@example.com", "tok-2")
++  cooled.rows |> list.length |> should.equal(0)
++}
++
++pub fn upsert_mints_the_token_at_save_time_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++  // W1: tokens mint at SAVE time, so every live draft — including the
++  // debounced auto-save cohort — is reachable by the stage-2 reminder's
++  // continue-link, not just explicit "email me a link" clicks.
++  let assert Ok(_) =
++    app_sql.upsert_application_draft(
++      db,
++      uuid,
++      "tenant@example.com",
++      json.object([#("first_name", json.string("Ada"))]),
++      "tok-minted",
++    )
++  draft_field(db, vacancy_id, "continue_token")
++  |> should.equal("tok-minted")
++
++  // A re-save keeps the minted token (previously emailed links keep
++  // working) — the candidate is only a fallback.
++  let assert Ok(_) =
++    app_sql.upsert_application_draft(
++      db,
++      uuid,
++      "tenant@example.com",
++      json.object([#("first_name", json.string("Adaeze"))]),
++      "tok-other",
++    )
++  draft_field(db, vacancy_id, "continue_token")
++  |> should.equal("tok-minted")
++  draft_field(db, vacancy_id, "fields")
++  |> string.contains("Adaeze")
++  |> should.be_true
++}
++
++pub fn clear_last_link_sent_re_arms_the_claim_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-clear")
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++
++  // Claim → cooldown active → clear (the send-failure path) → re-claim wins.
++  let assert Ok(_) =
++    app_sql.claim_continue_link_send(db, uuid, "tenant@example.com", "tok-x")
++  let assert Ok(cleared) =
++    app_sql.clear_last_link_sent(db, uuid, "tenant@example.com")
++  cleared.rows |> list.length |> should.equal(1)
++  draft_field(db, vacancy_id, "last_link_sent_at") |> should.equal("")
++  let assert Ok(reclaimed) =
++    app_sql.claim_continue_link_send(db, uuid, "tenant@example.com", "tok-y")
++  reclaimed.rows |> list.length |> should.equal(1)
++}
++
++pub fn continue_link_on_cooldown_answers_uniform_200_without_send_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-cool")
++  // Pre-stamp the cooldown so the claim returns no row — the handler must
++  // answer a bare ok:true WITHOUT attempting a send, and the body must not
++  // carry any send/cooldown state (N14: a `sent` flag oracles the victim's
++  // draft state to an empty-fields poller).
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE application_draft SET last_link_sent_at = now()
++       WHERE vacancy_id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.execute(db)
++
++  let resp =
++    simulate.request(http.Post, "/apply/" <> code <> "/continue-link")
++    |> simulate.json_body(save_body())
++    |> fn(req) {
++      draft_handler.handle_continue_link(req, test_server_config(db), code)
++    }
++  resp.status |> should.equal(200)
++  let body = simulate.read_body(resp)
++  body |> string.contains("\"ok\":true") |> should.be_true
++  body |> string.contains("sent") |> should.be_false
++  // The upsert half still ran — fields are fresh even when no email goes.
++  draft_field(db, vacancy_id, "fields")
++  |> string.contains("Byrne")
++  |> should.be_true
++}
++
++// ============================================================================
++// Resume (GET /apply/:code/resume/:token)
++// ============================================================================
++
++pub fn resume_restores_draft_without_stamping_get_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let token = seed_draft_with_token(db, vacancy_id, "tok-resume-1")
++
++  let req = simulate.request(http.Get, "/apply/" <> code <> "/resume/" <> token)
++  let resp =
++    draft_handler.handle_resume(req, test_server_config(db), code, token)
++  resp.status |> should.equal(200)
++  let body = simulate.read_body(resp)
++  body
++  |> string.contains("data-apply-page=\"form-resume\"")
++  |> should.be_true
++  body |> string.contains("draft-resume-banner") |> should.be_true
++  // Restored value threaded into the SSR form…
++  body |> string.contains("value=\"Ada\"") |> should.be_true
++  // …the analytics event contract rides along…
++  body |> string.contains("form_draft.js") |> should.be_true
++  // …and the page carries the token for the re-engagement stamp (JS
++  // global, not a DOM attribute — autocapture must never see it).
++  body
++  |> string.contains("window.__rtResumeToken=\"" <> token <> "\";")
++  |> should.be_true
++  body |> string.contains("data-resume-token") |> should.be_false
++
++  // The GET itself must NOT stamp resumed_at (mail-scanner prefetch guard).
++  draft_field(db, vacancy_id, "resumed_at") |> should.equal("")
++}
++
++pub fn first_post_resume_save_stamps_resumed_at_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let token = seed_draft_with_token(db, vacancy_id, "tok-engage")
++
++  // A save carrying the resume token (what form_draft.js sends from the
++  // resume render) stamps resumed_at…
++  let req =
++    simulate.request(http.Post, "/apply/" <> code <> "/draft")
++    |> simulate.json_body(
++      json.object([
++        #("email", json.string("tenant@example.com")),
++        #("resume_token", json.string(token)),
++        #("fields", json.object([#("first_name", json.string("Adaeze"))])),
++      ]),
++    )
++  draft_handler.handle_save_draft(req, test_server_config(db), code).status
++  |> should.equal(200)
++  draft_field(db, vacancy_id, "resumed_at") |> should.not_equal("")
++
++  // …and a token from ANOTHER vacancy's draft stamps nothing here.
++  let assert Ok(other_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let other_code = vacancy_short_code(db, other_id)
++  let _ = seed_draft_with_token(db, other_id, "tok-other")
++  let forged =
++    simulate.request(http.Post, "/apply/" <> other_code <> "/draft")
++    |> simulate.json_body(
++      json.object([
++        #("email", json.string("tenant@example.com")),
++        #("resume_token", json.string("tok-engage")),
++        #("fields", json.object([#("first_name", json.string("X"))])),
++      ]),
++    )
++  draft_handler.handle_save_draft(forged, test_server_config(db), other_code).status
++  |> should.equal(200)
++  draft_field(db, other_id, "resumed_at") |> should.equal("")
++}
++
++pub fn empty_fields_save_never_wipes_a_draft_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-wipe")
++
++  let req =
++    simulate.request(http.Put, "/apply/" <> code <> "/draft")
++    |> simulate.json_body(
++      json.object([
++        #("email", json.string("tenant@example.com")),
++        #("fields", json.object([])),
++      ]),
++    )
++  draft_handler.handle_save_draft(req, test_server_config(db), code).status
++  |> should.equal(200)
++  // The real draft's answers survived the empty payload.
++  draft_field(db, vacancy_id, "fields")
++  |> string.contains("Ada")
++  |> should.be_true
++}
++
++pub fn late_save_after_submit_never_resurrects_the_draft_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-late")
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++  let assert Ok(_) =
++    app_sql.strip_draft_on_submit(db, uuid, "tenant@example.com")
++
++  // The pagehide beacon racing the final POST lands here — the stripped
++  // row must stay stripped (fields '{}', token NULL, submitted_at set).
++  let resp = save_draft(db, code)
++  resp.status |> should.equal(200)
++  draft_field(db, vacancy_id, "fields") |> should.equal("{}")
++  draft_field(db, vacancy_id, "continue_token") |> should.equal("")
++  draft_field(db, vacancy_id, "submitted_at") |> should.not_equal("")
++}
++
++pub fn resume_with_unknown_token_is_uniform_404_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-real")
++
++  let req =
++    simulate.request(http.Get, "/apply/" <> code <> "/resume/tok-forged")
++  let resp =
++    draft_handler.handle_resume(req, test_server_config(db), code, "tok-forged")
++  resp.status |> should.equal(404)
++  simulate.read_body(resp)
++  |> string.contains("draft-not-found")
++  |> should.be_true
++}
++
++pub fn resume_token_is_scoped_to_the_vacancy_code_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_a) = test_db.seed_vacancy(db, landlord_id, True)
++  let assert Ok(vacancy_b) = test_db.seed_vacancy(db, landlord_id, True)
++  let code_b = vacancy_short_code(db, vacancy_b)
++  let token = seed_draft_with_token(db, vacancy_a, "tok-scoped")
++
++  // The same token under vacancy B's code must not resolve.
++  let req =
++    simulate.request(http.Get, "/apply/" <> code_b <> "/resume/" <> token)
++  draft_handler.handle_resume(req, test_server_config(db), code_b, token).status
++  |> should.equal(404)
++}
++
++pub fn resume_after_submit_is_gone_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let token = seed_draft_with_token(db, vacancy_id, "tok-submitted")
++
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++  let assert Ok(_) =
++    app_sql.strip_draft_on_submit(db, uuid, "tenant@example.com")
++
++  let req = simulate.request(http.Get, "/apply/" <> code <> "/resume/" <> token)
++  draft_handler.handle_resume(req, test_server_config(db), code, token).status
++  |> should.equal(404)
++}
++
++// ============================================================================
++// Strip-on-submit (the application row becomes the system of record)
++// ============================================================================
++
++pub fn strip_on_submit_empties_payload_keeps_metric_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-strip")
++
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++  let assert Ok(returned) =
++    app_sql.strip_draft_on_submit(db, uuid, "TENANT@example.com")
++  // Case-insensitive match (writer lowercases).
++  returned.rows |> list.length |> should.equal(1)
++
++  draft_field(db, vacancy_id, "fields") |> should.equal("{}")
++  draft_field(db, vacancy_id, "continue_token") |> should.equal("")
++  draft_field(db, vacancy_id, "submitted_at") |> should.not_equal("")
++}
++
++// ============================================================================
++// Erasure (GET+POST /apply/:code/draft-erasure/:token)
++// ============================================================================
++
++pub fn draft_erasure_confirms_then_deletes_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let token = seed_draft_with_token(db, vacancy_id, "tok-erase")
++
++  // GET renders the confirm page (prefetch-safe)…
++  let get_req =
++    simulate.request(http.Get, "/apply/" <> code <> "/draft-erasure/" <> token)
++  let confirm =
++    draft_handler.handle_erasure_confirm(
++      get_req,
++      test_server_config(db),
++      code,
++      token,
++    )
++  confirm.status |> should.equal(200)
++  simulate.read_body(confirm)
++  |> string.contains("draft-erasure-confirm-form")
++  |> should.be_true
++  draft_count(db) |> should.equal(1)
++
++  // …POST tombstones the draft (fields/token wiped, suppression key kept)…
++  let post_req =
++    simulate.request(http.Post, "/apply/" <> code <> "/draft-erasure/" <> token)
++  let deleted =
++    draft_handler.handle_erasure_delete(
++      post_req,
++      test_server_config(db),
++      code,
++      token,
++    )
++  deleted.status |> should.equal(200)
++  simulate.read_body(deleted)
++  |> string.contains("draft-erasure-success-message")
++  |> should.be_true
++  // Tombstone, not a hard delete: the row stays as the suppression record.
++  draft_count(db) |> should.equal(1)
++  draft_field(db, vacancy_id, "fields") |> should.equal("{}")
++  draft_field(db, vacancy_id, "continue_token") |> should.equal("")
++  draft_field(db, vacancy_id, "erased_at") |> should.not_equal("")
++  draft_field(db, vacancy_id, "email") |> should.equal("tenant@example.com")
++
++  // …and a replayed POST is the uniform 404 (token is gone).
++  let replay =
++    draft_handler.handle_erasure_delete(
++      post_req,
++      test_server_config(db),
++      code,
++      token,
++    )
++  replay.status |> should.equal(404)
++}
++
++/// W3: a still-open tab's save after a confirmed erasure must NOT
++/// re-create the PII — the tombstone's (vacancy, email) key plus the
++/// upsert's erased_at guard reject it.
++pub fn save_after_erasure_is_silently_rejected_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let token = seed_draft_with_token(db, vacancy_id, "tok-tomb")
++  let post_req =
++    simulate.request(http.Post, "/apply/" <> code <> "/draft-erasure/" <> token)
++  let _ =
++    draft_handler.handle_erasure_delete(
++      post_req,
++      test_server_config(db),
++      code,
++      token,
++    )
++
++  // The open tab's pagehide beacon lands after the deletion — 200 (the
++  // saver stays silent by design) but nothing is resurrected.
++  let resp = save_draft(db, code)
++  resp.status |> should.equal(200)
++  draft_count(db) |> should.equal(1)
++  draft_field(db, vacancy_id, "fields") |> should.equal("{}")
++  draft_field(db, vacancy_id, "continue_token") |> should.equal("")
++  draft_field(db, vacancy_id, "erased_at") |> should.not_equal("")
++}
++
++// ============================================================================
++// Expiry (retention sweep) + cascade
++// ============================================================================
++
++pub fn retention_sweep_expires_drafts_at_vacancy_close_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  // Active vacancy (draft must survive)…
++  let assert Ok(active_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, active_id, "tok-active")
++  // Manually closed vacancy (status='closed')…
++  let assert Ok(closed_id) = test_db.seed_closed_vacancy(db, landlord_id)
++  let _ = seed_draft_with_token(db, closed_id, "tok-closed")
++  // Still-active status but closes_at already passed (auto-close window)…
++  let assert Ok(past_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, past_id, "tok-past")
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE vacancy SET closes_at = now() - interval '1 hour'
++       WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(past_id))
++    |> pog.execute(db)
++  // Archived vacancy: drafts SURVIVE (archiving is restorable and the
++  // emailed promise is "until the vacancy closes")…
++  let assert Ok(archived_id) = test_db.seed_archived_vacancy(db, landlord_id)
++  let _ = seed_draft_with_token(db, archived_id, "tok-archived")
++
++  let assert Ok(summary) =
++    retention_job.run(db, "", "", "", "", sentry_client.Disabled)
++  summary.application_drafts_expired |> should.equal(2)
++
++  draft_count(db) |> should.equal(2)
++  draft_field(db, active_id, "continue_token") |> should.equal("tok-active")
++  draft_field(db, archived_id, "continue_token")
++  |> should.equal("tok-archived")
++}
++
++pub fn vacancy_delete_cascades_drafts_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-cascade")
++
++  // landlord.free_vacancy_id points at the seeded vacancy — clear it so
++  // the delete exercises only the draft cascade (as a landlord-account
++  // deletion would, after nulling its own references).
++  let assert Ok(_) =
++    pog.query("UPDATE landlord SET free_vacancy_id = NULL WHERE id = $1::uuid")
++    |> pog.parameter(pog.text(landlord_id))
++    |> pog.execute(db)
++  let assert Ok(_) =
++    pog.query("DELETE FROM vacancy WHERE id = $1::uuid")
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.execute(db)
++  draft_count(db) |> should.equal(0)
++}
++
++// ============================================================================
++// W7 — strip wiring through the real submission path
++// ============================================================================
++
++pub fn successful_submission_strips_the_matching_draft_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, False)
++  let code = vacancy_short_code(db, vacancy_id)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-strip-wire")
++
++  // Minimum valid submission (student → no employer fields; never rented
++  // skips eviction). Mirrors the gdpr integration fixture.
++  let loaded_at = form_view_now_ms() - 30_000
++  let values = [
++    #("first_name", "Aoife"),
++    #("last_name", "O'Neill"),
++    #("email", "tenant@example.com"),
++    #("phone", "+353851234567"),
++    #("current_address", "1 Test Street, Dublin 2"),
++    #("employment_status", "student"),
++    #("monthly_income_cents", "3500"),
++    #("desired_move_in_date", near_future_date()),
++    #("num_occupants", "1"),
++    #("has_pets", "no"),
++    #("is_smoker", "no"),
++    #("never_rented_before", "false"),
++    #("has_eviction_history", "no"),
++    #("has_ccjs", "no"),
++    #("co_applicant_sharing", "no"),
++    #("landlord_ref_name", "Previous Landlord"),
++    #("landlord_ref_phone", "+353871234567"),
++    #("landlord_ref_email", "landlord@example.com"),
++    #("personal_statement", "Quiet student, long-term let."),
++    #("gdpr_consent", "on"),
++    #("reference_contact_choice", "declined"),
++    #("_website", ""),
++    #("_form_loaded_at", int.to_string(loaded_at)),
++  ]
++  let file =
++    simulate.FileUpload(
++      file_name: "reference.pdf",
++      content_type: "application/pdf",
++      content: <<"%PDF-1.4 fake":utf8>>,
++    )
++  let resp =
++    simulate.request(http.Post, "/apply/" <> code)
++    |> simulate.multipart_body(values, [#("landlord_ref_primary", file)])
++    |> application_handler.handle_post_form(test_server_config(db), code)
++  resp.status |> should.equal(200)
++
++  // The application row exists…
++  test_db.query_int(
++    db,
++    "SELECT count(*)::int FROM application WHERE vacancy_id = '"
++      <> vacancy_id
++      <> "'::uuid",
++  )
++  |> should.equal(Ok(1))
++  // …and the draft was stripped by the finalise hook, not by hand.
++  draft_field(db, vacancy_id, "fields") |> should.equal("{}")
++  draft_field(db, vacancy_id, "continue_token") |> should.equal("")
++  draft_field(db, vacancy_id, "submitted_at") |> should.not_equal("")
++}
++
++fn form_view_now_ms() -> Int {
++  form_view.current_unix_ms()
++}
++
++fn near_future_date() -> String {
++  test_helpers.near_future_iso_date()
++}
++
++// ============================================================================
++// W8 — stage-2 reminder data path (list_resumable_draft_tokens)
++// ============================================================================
++
++pub fn list_resumable_draft_tokens_filters_live_only_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  // Live draft with token (save-time mint) → included…
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-live")
++  // …submitted draft → excluded…
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++  let assert Ok(_) =
++    app_sql.upsert_application_draft(
++      db,
++      uuid,
++      "done@example.com",
++      json.object([#("first_name", json.string("X"))]),
++      "tok-done",
++    )
++  let assert Ok(_) = app_sql.strip_draft_on_submit(db, uuid, "done@example.com")
++  // …erased draft → excluded…
++  let assert Ok(_) =
++    app_sql.upsert_application_draft(
++      db,
++      uuid,
++      "gone@example.com",
++      json.object([#("first_name", json.string("Y"))]),
++      "tok-gone",
++    )
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE application_draft SET erased_at = now(), continue_token = NULL
++       WHERE vacancy_id = $1::uuid AND email = 'gone@example.com'",
++    )
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.execute(db)
++
++  let assert Ok(pog.Returned(_, rows)) =
++    app_sql.list_resumable_draft_tokens(db, uuid)
++  list.length(rows) |> should.equal(1)
++  let assert [row, ..] = rows
++  row.email |> should.equal("tenant@example.com")
++  row.continue_token |> should.equal("tok-live")
++}
++
++// ============================================================================
++// W9 — resume GET on a closed vacancy renders the closed page
++// ============================================================================
++
++pub fn resume_on_closed_vacancy_renders_closed_page_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_closed_vacancy(db, landlord_id)
++  let code = vacancy_short_code(db, vacancy_id)
++  let token = seed_draft_with_token(db, vacancy_id, "tok-closed-resume")
++
++  let req = simulate.request(http.Get, "/apply/" <> code <> "/resume/" <> token)
++  let resp =
++    draft_handler.handle_resume(req, test_server_config(db), code, token)
++  resp.status |> should.equal(200)
++  let body = simulate.read_body(resp)
++  body
++  |> string.contains("data-apply-page=\"form-resume\"")
++  |> should.be_false
++  body |> string.contains("draft-resume-banner") |> should.be_false
++}
++
++// ============================================================================
++// W5 — per-vacancy draft cap bounds the unauthenticated write surface
++// ============================================================================
++
++pub fn draft_cap_allows_existing_pairs_but_blocks_new_inserts_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  // Fill the vacancy to the 500-draft cap directly.
++  let assert Ok(_) =
++    pog.query(
++      "INSERT INTO application_draft (vacancy_id, email, fields)
++       SELECT $1::uuid, 'user' || g || '@example.com', '{}'::jsonb
++       FROM generate_series(1, 500) g",
++    )
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.execute(db)
++
++  // A NEW email can't mint row 501 (silent 200 — the saver stays quiet)…
++  let resp = save_draft(db, code)
++  resp.status |> should.equal(200)
++  draft_count(db) |> should.equal(500)
++
++  // …but an EXISTING pair still updates (the cap must not wedge real
++  // applicants mid-form).
++  let req =
++    simulate.request(http.Put, "/apply/" <> code <> "/draft")
++    |> simulate.json_body(
++      json.object([
++        #("email", json.string("user7@example.com")),
++        #("fields", json.object([#("first_name", json.string("Lucky"))])),
++      ]),
++    )
++  draft_handler.handle_save_draft(req, test_server_config(db), code).status
++  |> should.equal(200)
++  test_db.query_text(db, "SELECT fields->>'first_name' FROM application_draft
++     WHERE vacancy_id = '" <> vacancy_id <> "'::uuid AND email = 'user7@example.com'")
++  |> should.equal(Ok("Lucky"))
++}
++
++// ============================================================================
++// W6 — cross-vacancy fan-out bound (3 continue emails / recipient / hour)
++pub fn fan_out_bound_end_to_end_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  // Seed one draft per vacancy for the same victim, then stamp three sends.
++  let assert Ok(vacancies) = seed_n_vacancies(db, landlord_id, 4)
++  list.each(vacancies, fn(v) {
++    let assert Ok(u) = uuid.from_string(v)
++    let assert Ok(_) =
++      app_sql.upsert_application_draft(
++        db,
++        u,
++        "victim@example.com",
++        json.object([#("first_name", json.string("V"))]),
++        "tok-" <> v,
++      )
++  })
++  let claim = fn(v) {
++    let assert Ok(u) = uuid.from_string(v)
++    let assert Ok(returned) =
++      app_sql.claim_continue_link_send(db, u, "victim@example.com", "tx")
++    list.length(returned.rows)
++  }
++  // Sends 1–3 win; send 4 hits the cross-vacancy hourly bound.
++  let assert [v1, v2, v3, v4] = vacancies
++  claim(v1) |> should.equal(1)
++  claim(v2) |> should.equal(1)
++  claim(v3) |> should.equal(1)
++  claim(v4) |> should.equal(0)
++}
++
++fn seed_n_vacancies(
++  db: pog.Connection,
++  landlord_id: String,
++  n: Int,
++) -> Result(List(String), String) {
++  case n {
++    0 -> Ok([])
++    _ ->
++      case test_db.seed_vacancy(db, landlord_id, True) {
++        Error(e) -> Error(e)
++        Ok(v) ->
++          case seed_n_vacancies(db, landlord_id, n - 1) {
++            Error(e) -> Error(e)
++            Ok(rest) -> Ok([v, ..rest])
++          }
++      }
++  }
++}
++
++// ============================================================================
++// N21 — the cooldown VALUE is 10 minutes
++// ============================================================================
++
++pub fn cooldown_window_is_ten_minutes_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-window")
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++
++  let stamp = fn(interval: String) {
++    let assert Ok(_) =
++      pog.query(
++        "UPDATE application_draft SET last_link_sent_at = now() - interval '"
++        <> interval
++        <> "' WHERE vacancy_id = $1::uuid",
++      )
++      |> pog.parameter(pog.text(vacancy_id))
++      |> pog.execute(db)
++    Nil
++  }
++  // 9 minutes ago → still cooling.
++  stamp("9 minutes")
++  let assert Ok(cooling) =
++    app_sql.claim_continue_link_send(db, uuid, "tenant@example.com", "t")
++  list.length(cooling.rows) |> should.equal(0)
++  // 11 minutes ago → the window has passed.
++  stamp("11 minutes")
++  let assert Ok(past) =
++    app_sql.claim_continue_link_send(db, uuid, "tenant@example.com", "t")
++  list.length(past.rows) |> should.equal(1)
++}
++
++// ============================================================================
++// N26 — resumed_at stamps once, and never on a submitted draft
++// ============================================================================
++
++pub fn mark_resumed_keeps_the_earliest_stamp_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-once")
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE application_draft SET resumed_at = '2026-01-01T00:00:00Z'
++       WHERE vacancy_id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.execute(db)
++  let assert Ok(_) = app_sql.mark_draft_resumed_by_token(db, "tok-once", uuid)
++  draft_field(db, vacancy_id, "resumed_at")
++  |> string.contains("2026-01-01")
++  |> should.be_true
++}
++
++pub fn mark_resumed_never_stamps_a_submitted_draft_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-sub")
++  let assert Ok(uuid) = uuid.from_string(vacancy_id)
++  let assert Ok(_) =
++    app_sql.strip_draft_on_submit(db, uuid, "tenant@example.com")
++  let assert Ok(returned) =
++    app_sql.mark_draft_resumed_by_token(db, "tok-sub", uuid)
++  list.length(returned.rows) |> should.equal(0)
++  draft_field(db, vacancy_id, "resumed_at") |> should.equal("")
++}
+diff --git a/server/test/integration/test_db.gleam b/server/test/integration/test_db.gleam
+index 26d43bf9..8af0954d 100644
+--- a/server/test/integration/test_db.gleam
++++ b/server/test/integration/test_db.gleam
+@@ -77,7 +77,7 @@ pub fn should_run() -> Bool {
+ pub fn truncate_all(db: pog.Connection) -> Nil {
+   let _ =
+     pog.query(
+-      "TRUNCATE audit_log, acknowledgement_record, notification, inbound_email, document, ai_analysis, payment_terms_acceptance, payment, application_co_applicant, application_income_source, application, vacancy_view, vacancy, landlord, storage_deletion_queue, processed_stripe_event, reference_call, reference_objection_log CASCADE",
++      "TRUNCATE audit_log, acknowledgement_record, notification, inbound_email, document, ai_analysis, payment_terms_acceptance, payment, application_co_applicant, application_income_source, application, application_draft, vacancy_view, vacancy, landlord, storage_deletion_queue, processed_stripe_event, reference_call, reference_objection_log CASCADE",
+     )
+     |> pog.execute(db)
+   Nil
+diff --git a/server/test/middleware/middleware_test.gleam b/server/test/middleware/middleware_test.gleam
+index 48387e6a..4a63e7f2 100644
+--- a/server/test/middleware/middleware_test.gleam
++++ b/server/test/middleware/middleware_test.gleam
+@@ -509,3 +509,114 @@ pub fn apply_keeps_public_cache_on_nonce_free_html_test() {
+   list.key_find(response.headers, "cache-control")
+   |> should.equal(Ok("public, max-age=60, must-revalidate"))
+ }
++
++// -- F3 draft endpoint arms -----------------------------------------------------
++
++pub fn draft_endpoints_are_public_test() {
++  middleware.is_public_path(["apply", "abc-123", "draft"]) |> should.be_true
++  middleware.is_public_path(["apply", "abc-123", "continue-link"])
++  |> should.be_true
++  middleware.is_public_path(["apply", "abc-123", "resume", "tok"])
++  |> should.be_true
++  middleware.is_public_path(["apply", "abc-123", "draft-erasure", "tok"])
++  |> should.be_true
++}
++
++pub fn sentry_safe_path_redacts_draft_tokens_test() {
++  let token = "tok-" <> "secret-draft-token-value"
++  let resume = middleware.sentry_safe_path(["apply", "abc123", "resume", token])
++  resume |> should.equal("/apply/abc123/resume/<redacted>")
++  resume |> string.contains(token) |> should.be_false
++  let erasure =
++    middleware.sentry_safe_path(["apply", "abc123", "draft-erasure", token])
++  erasure |> should.equal("/apply/abc123/draft-erasure/<redacted>")
++  erasure |> string.contains(token) |> should.be_false
++}
++
++// Draft writes get the 64 KB JSON cap with the same CL/TE strictness as the
++// multipart POST — fetch/sendBeacon always send a Content-Length.
++
++pub fn body_size_draft_write_at_limit_is_allowed_test() {
++  middleware.evaluate_body_size(
++    ["apply", "abc-123", "draft"],
++    http.Post,
++    Ok(middleware.max_draft_body_size),
++    Error(Nil),
++  )
++  |> should.equal(middleware.BodySizeOk)
++  middleware.evaluate_body_size(
++    ["apply", "abc-123", "draft"],
++    http.Put,
++    Ok(middleware.max_draft_body_size),
++    Error(Nil),
++  )
++  |> should.equal(middleware.BodySizeOk)
++}
++
++pub fn body_size_draft_write_over_limit_rejects_with_json_test() {
++  // Over 64 KB → JSON envelope (applicant_facing: False — fetch/beacon
++  // callers, not form submissions), NOT the SSR 413 page.
++  middleware.evaluate_body_size(
++    ["apply", "abc-123", "draft"],
++    http.Post,
++    Ok(middleware.max_draft_body_size + 1),
++    Error(Nil),
++  )
++  |> should.equal(middleware.BodySizeReject(applicant_facing: False))
++  middleware.evaluate_body_size(
++    ["apply", "abc-123", "continue-link"],
++    http.Post,
++    Ok(middleware.max_draft_body_size + 1),
++    Error(Nil),
++  )
++  |> should.equal(middleware.BodySizeReject(applicant_facing: False))
++}
++
++pub fn body_size_draft_write_missing_content_length_rejects_test() {
++  middleware.evaluate_body_size(
++    ["apply", "abc-123", "draft"],
++    http.Post,
++    Error(Nil),
++    Error(Nil),
++  )
++  |> should.equal(middleware.BodySizeReject(applicant_facing: False))
++}
++
++pub fn body_size_draft_write_with_transfer_encoding_rejects_test() {
++  middleware.evaluate_body_size(
++    ["apply", "abc-123", "draft"],
++    http.Post,
++    Ok(100),
++    Ok("chunked"),
++  )
++  |> should.equal(middleware.BodySizeReject(applicant_facing: False))
++}
++
++pub fn body_size_draft_write_uses_draft_cap_not_upload_cap_test() {
++  // 1 MB is fine for the multipart POST but must not ride the draft route.
++  middleware.evaluate_body_size(
++    ["apply", "abc-123", "draft"],
++    http.Put,
++    Ok(1_000_000),
++    Error(Nil),
++  )
++  |> should.equal(middleware.BodySizeReject(applicant_facing: False))
++}
++
++pub fn body_size_draft_write_put_over_limit_rejects_test() {
++  // N20: the PUT arm (debounced saver) rejects oversize identically to POST.
++  middleware.evaluate_body_size(
++    ["apply", "abc-123", "draft"],
++    http.Put,
++    Ok(middleware.max_draft_body_size + 1),
++    Error(Nil),
++  )
++  |> should.equal(middleware.BodySizeReject(applicant_facing: False))
++  middleware.evaluate_body_size(
++    ["apply", "abc-123", "draft"],
++    http.Put,
++    Error(Nil),
++    Error(Nil),
++  )
++  |> should.equal(middleware.BodySizeReject(applicant_facing: False))
++}
+diff --git a/server/test/notification/email_client_test.gleam b/server/test/notification/email_client_test.gleam
+index 999c3d9d..173b02e5 100644
+--- a/server/test/notification/email_client_test.gleam
++++ b/server/test/notification/email_client_test.gleam
+@@ -446,9 +446,10 @@ pub fn welcome_html_escapes_name_test() {
+ 
+ // -- Wave 1a copy pack: honest-expectation doctrine ---------------------------
+ //
+-// The checklist (both third-party letters up front, real time expectation,
+-// one-visit rule) and the death of the "few minutes" lie are load-bearing
+-// conversion copy per the 2026-07-31 completion problem-solving session.
++// The checklist (both third-party letters up front, real time expectation)
++// and the death of the "few minutes" lie are load-bearing conversion copy
++// per the 2026-07-31 completion problem-solving session. With F3, the old
++// one-visit rule is replaced by the save-and-continue promise.
+ 
+ pub fn invite_html_leads_with_document_checklist_test() {
+   let html =
+@@ -479,7 +480,7 @@ pub fn invite_html_kills_the_few_minutes_lie_test() {
+   |> should.be_false
+ }
+ 
+-pub fn invite_html_sets_reviewed_first_and_one_visit_expectations_test() {
++pub fn invite_html_sets_reviewed_first_and_save_resume_expectations_test() {
+   let html =
+     email_client.build_invite_html(
+       property_name: "70 Meadowgate",
+@@ -488,9 +489,13 @@ pub fn invite_html_sets_reviewed_first_and_one_visit_expectations_test() {
+   html
+   |> string.contains("complete applications are reviewed first")
+   |> should.be_true
++  // F3: the one-visit rule is dead — emails must promise save-and-continue.
+   html
+-  |> string.contains("doesn't save your progress")
++  |> string.contains("save your progress")
+   |> should.be_true
++  html
++  |> string.contains("doesn't save your progress")
++  |> should.be_false
+ }
+ 
+ pub fn invite_html_tags_application_url_with_utm_test() {
+@@ -554,6 +559,7 @@ pub fn reminder_stage2_names_the_closing_date_test() {
+       property_name: "70 Meadowgate",
+       application_url: "https://righttenantry.ie/apply/abc123",
+       closes_on: "2026-08-13 17:00:00+00",
++      continue_url: "",
+     )
+   html
+   |> string.contains("close on <strong>13 August 2026</strong>")
+@@ -564,6 +570,99 @@ pub fn reminder_stage2_names_the_closing_date_test() {
+   html |> string.contains("few minutes") |> should.be_false
+ }
+ 
++pub fn reminder_stage2_without_draft_keeps_plain_cta_test() {
++  let html =
++    email_client.build_reminder_stage2_html(
++      property_name: "70 Meadowgate",
++      application_url: "https://righttenantry.ie/apply/abc123",
++      closes_on: "2026-08-13 17:00:00+00",
++      continue_url: "",
++    )
++  html |> string.contains("Start your application") |> should.be_true
++  html
++  |> string.contains("Continue where you left off")
++  |> should.be_false
++}
++
++pub fn reminder_stage2_with_draft_makes_cta_the_continue_link_test() {
++  let html =
++    email_client.build_reminder_stage2_html(
++      property_name: "70 Meadowgate",
++      application_url: "https://righttenantry.ie/apply/abc123",
++      closes_on: "2026-08-13 17:00:00+00",
++      continue_url: "https://righttenantry.ie/apply/abc123/resume/tok999",
++    )
++  // F3×E2 seam: draft holders get the tokenized continue-link.
++  html
++  |> string.contains("Continue where you left off")
++  |> should.be_true
++  html
++  |> string.contains("/apply/abc123/resume/tok999")
++  |> should.be_true
++  html
++  |> string.contains("utm_content=application_reminder_2_continue")
++  |> should.be_true
++  html
++  |> string.contains("saved answers are waiting")
++  |> should.be_true
++  // The plain CTA label must be fully replaced, not just prepended.
++  html
++  |> string.contains("Start your application")
++  |> should.be_false
++  html
++  |> string.contains("close on <strong>13 August 2026</strong>")
++  |> should.be_true
++}
++
++// -- F3 save-and-resume: continue-link email ----------------------------------
++
++pub fn continue_draft_email_carries_continue_and_erasure_links_test() {
++  let html =
++    email_client.build_continue_draft_html(
++      property_name: "70 Meadowgate",
++      continue_url: "https://righttenantry.ie/apply/abc123/resume/tok999",
++      erasure_url: "https://righttenantry.ie/apply/abc123/draft-erasure/tok999",
++      closes_on: "2026-08-13 17:00:00+00",
++    )
++  html
++  |> string.contains("/apply/abc123/resume/tok999")
++  |> should.be_true
++  html
++  |> string.contains("/apply/abc123/draft-erasure/tok999")
++  |> should.be_true
++  html
++  |> string.contains("Continue your application")
++  |> should.be_true
++  // Expiry promise = vacancy close (the retention sweep's mandate).
++  html
++  |> string.contains("13 August 2026")
++  |> should.be_true
++  // Documents are never in drafts — the email must set that expectation.
++  html
++  |> string.contains("never save uploaded documents")
++  |> should.be_true
++  html
++  |> string.contains("utm_content=application_draft_continue")
++  |> should.be_true
++  html |> string.contains("few minutes") |> should.be_false
++}
++
++pub fn continue_draft_email_escapes_property_name_test() {
++  email_client.build_continue_draft_html(
++    property_name: "<script>alert(1)</script>",
++    continue_url: "https://righttenantry.ie/apply/abc123/resume/tok999",
++    erasure_url: "https://righttenantry.ie/apply/abc123/draft-erasure/tok999",
++    closes_on: "",
++  )
++  |> string.contains("<script>")
++  |> should.be_false
++}
++
++pub fn continue_draft_subject_leads_with_property_test() {
++  email_client.continue_draft_subject("70 Meadowgate")
++  |> should.equal("70 Meadowgate \u{2014} pick up where you left off")
++}
++
+ pub fn format_close_date_renders_human_date_test() {
+   email_client.format_close_date("2026-08-13 17:00:00+00")
+   |> should.equal("13 August 2026")
+
+
+--- YOUR LENS ---
+You are a pure path tracer. Do not comment on whether the code is good or bad — list only unhandled paths reachable from the changed lines.
+
+Method: mechanically walk every branching path and boundary condition directly reachable from the diff hunks. Derive edge classes from the changed code itself — no fixed checklist. Examples: boundary conditions (empty lists, nulls, zero counts, max sizes), concurrent operations and race conditions, unhandled error paths in new code, external service unavailability (DB, APIs, auth), off-by-one errors, implicit type coercion, state the new code doesn't account for, input the new code doesn't validate.
+
+For each path, determine whether the diff handles it. Report ONLY unhandled paths that lack an explicit guard in the diff; discard handled ones silently. No editorializing.
+
+--- OUTPUT ---
+Return ONE valid JSON array. Each element must match this schema exactly:
+{
+  "source": "<one of: blind | edge | acceptance | security | architecture | codebase | tests — use the value assigned to you>",
+  "severity": "blocker" | "warning" | "note",
+  "category": "<short tag, e.g. auth, boundary, coupling, coverage-gap>",
+  "title": "<one-line summary>",
+  "location": "<file:line | file:hunk | N/A>",
+  "evidence": "<the exact lines you READ from the file/diff that prove the claim, pasted verbatim. Use 'N/A' ONLY for findings that have no possible code reference (e.g. a missing-spec concern). Do not paraphrase. Do not reconstruct from memory. If you cannot quote the lines, you have not done the work to file the finding.>",
+  "detail": "<why this is a problem, ≤40 words>",
+  "recommended_fix": "<the change to apply, ≤40 words>"
+}
+
+Output contract:
+- Write ONLY the JSON array to this exact file path (paste it, do not derive it): /Users/moses/code/_bmad-output/perkins/righttenantry-form-save-resume-f3/r4/edge-c3.json
+- Use your file-writing tool to create that file. The file must contain ONLY the JSON array — no prose, no markdown fencing, no preamble.
+- Empty array `[]` is valid and expected when you find nothing.
+- Do not invent findings to fill a quota.
+- After writing the file, reply with just the word done and stop.
+
+ACCURACY MANDATE — this is the most important instruction in this prompt:
+
+NO claim you make will be taken at face value. Every finding you emit will be independently re-verified against the actual codebase before it reaches the report. Findings that fail verification are DISCARDED SILENTLY — they will not appear in the report, you will not be asked to defend them, you get no second chance.
+
+Therefore:
+- Open the file. Read the relevant lines. Do not guess from filenames, do not assume from similar-looking code, do not generalise from one example to another.
+- The `evidence` field must contain the EXACT lines you read. If you cannot paste them, you have not verified the issue and the finding does not belong in your output. A finding without locatable evidence is a hallucination — drop it before it leaves your output.
+- Hedging language ("might", "could", "possibly", "potentially") is a signal that you have not actually verified the issue. Either verify it and report it crisply, or do not report it.
+- Prefer fewer, well-grounded findings over many speculative ones. The user values accuracy over volume — an empty array is a fine and honest answer when nothing is wrong.

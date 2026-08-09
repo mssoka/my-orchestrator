@@ -1,0 +1,1169 @@
+diff --git a/game/project.godot b/game/project.godot
+index 579c72b..459951a 100644
+--- a/game/project.godot
++++ b/game/project.godot
+@@ -12,23 +12,27 @@ config_version=5
+ 
+ config/name="Packet Plumber"
+ config/description="Top-down routing puzzle: draw pipes, route packets, keep the internet alive. Godot 4.7 placeholder; the routing prototype build is to come."
+-run/main_scene="res://scenes/main.tscn"
++run/main_scene="res://scenes/run.tscn"
+ config/features=PackedStringArray("4.7", "GL Compatibility")
+ config/icon="res://icon.svg"
+ 
++[autoload]
++
++MCPRuntime="*uid://1nrmjgkqqhm0"
++
+ [display]
+ 
+ window/size/viewport_width=1280
+ window/size/viewport_height=720
+ window/stretch/mode="canvas_items"
+ window/stretch/aspect="expand"
+-window/handheld/orientation=0
++
++[editor_plugins]
++
++enabled=PackedStringArray("res://addons/auto_reload/plugin.cfg", "res://addons/godot_mcp_editor/plugin.cfg", "res://addons/godot_mcp_runtime/plugin.cfg")
+ 
+ [rendering]
+ 
+ renderer/rendering_method="gl_compatibility"
+ renderer/rendering_method.mobile="gl_compatibility"
+-
+-[editor_plugins]
+-
+-enabled=PackedStringArray("res://addons/auto_reload/plugin.cfg", "res://addons/godot_mcp_editor/plugin.cfg", "res://addons/godot_mcp_runtime/plugin.cfg")
++environment/defaults/default_clear_color=Color(0.07, 0.08, 0.11, 1)
+diff --git a/game/scenes/main.tscn b/game/scenes/main.tscn
+index 0bff9af..7d09fac 100644
+--- a/game/scenes/main.tscn
++++ b/game/scenes/main.tscn
+@@ -1,8 +1,8 @@
+-[gd_scene load_steps=2 format=3]
++[gd_scene format=3 uid="uid://bmhhyj353r0gv"]
+ 
+-[ext_resource type="Script" path="res://scripts/main.gd" id="1_main"]
++[ext_resource type="Script" uid="uid://c2mgf0cu6b8nk" path="res://scripts/main.gd" id="1_main"]
+ 
+-[node name="Main" type="Control"]
++[node name="Main" type="Control" unique_id=1414506580]
+ layout_mode = 3
+ anchors_preset = 15
+ anchor_right = 1.0
+@@ -11,7 +11,7 @@ grow_horizontal = 2
+ grow_vertical = 2
+ script = ExtResource("1_main")
+ 
+-[node name="Label" type="Label" parent="."]
++[node name="Label" type="Label" parent="." unique_id=133998004]
+ layout_mode = 1
+ anchors_preset = 8
+ anchor_left = 0.5
+diff --git a/game/scenes/run.tscn b/game/scenes/run.tscn
+new file mode 100644
+index 0000000..96d557c
+--- /dev/null
++++ b/game/scenes/run.tscn
+@@ -0,0 +1,25 @@
++[gd_scene load_steps=4 format=3]
++
++[ext_resource type="Script" path="res://scripts/run/run_controller.gd" id="1_ctrl"]
++[ext_resource type="Script" path="res://scripts/run/run_view.gd" id="2_view"]
++[ext_resource type="Script" path="res://scripts/run/hud.gd" id="3_hud"]
++
++[node name="Run" type="Node"]
++
++[node name="Controller" type="Node" parent="."]
++unique_name_in_owner = true
++script = ExtResource("1_ctrl")
++
++[node name="World" type="Node2D" parent="."]
++script = ExtResource("2_view")
++
++[node name="HudLayer" type="CanvasLayer" parent="."]
++
++[node name="Hud" type="Control" parent="HudLayer"]
++anchors_preset = 15
++anchor_right = 1.0
++anchor_bottom = 1.0
++grow_horizontal = 2
++grow_vertical = 2
++mouse_filter = 2
++script = ExtResource("3_hud")
+diff --git a/game/scripts/run/hud.gd b/game/scripts/run/hud.gd
+new file mode 100644
+index 0000000..a1e801d
+--- /dev/null
++++ b/game/scripts/run/hud.gd
+@@ -0,0 +1,190 @@
++## Hud — Network Health meter, surge forecast, budget, per-class SLA, win/lose
++## overlay (architecture §9.2). Reads ONLY the snapshot. CanvasLayer-sibling of
++## the World; mouse_filter IGNORE so input passes through to RunView.
++class_name Hud
++extends Control
++
++@onready var controller: RunController = get_node("%Controller")
++var _snapshot: SimSnapshot = null
++var _ended: bool = false
++var _won: bool = false
++var _show_onboard: bool = true     # first-run briefing (Dispatcher voice); skipped in demo
++# LIGHT canvas canon (look-book-v1.md §2)
++const INK: Color = Color("#33414F")
++const INK_SOFT: Color = Color("#6A7078")
++const CARD: Color = Color("#F5EFDF")
++const CARD_EDGE: Color = Color("#C2B694")
++const WARM: Color = Color("#F2B544")
++const RED: Color = Color("#E84545")
++const GREEN: Color = Color("#37D67A")
++
++
++func _ready() -> void:
++	mouse_filter = Control.MOUSE_FILTER_IGNORE
++	if controller == null:
++		var p := get_parent()
++		if p != null and p.get_parent() != null and p.get_parent().has_node("Controller"):
++			controller = p.get_parent().get_node("Controller")
++	if controller != null:
++		controller.snapshot_ready.connect(_on_snapshot)
++		controller.run_ended.connect(_on_run_ended)
++		# pause the sim while the first-run briefing is up (skip in demo/capture runs)
++		if controller.demo_mode:
++			_show_onboard = false
++		else:
++			controller.set_paused(true)
++	queue_redraw()
++
++
++func _on_snapshot(snap: SimSnapshot) -> void:
++	_snapshot = snap
++	queue_redraw()
++
++
++func _on_run_ended(won: bool) -> void:
++	_ended = true
++	_won = won
++	queue_redraw()
++
++
++func _unhandled_input(event: InputEvent) -> void:
++	if _show_onboard and event is InputEvent and event.is_pressed() and (event is InputEventKey or event is InputEventMouseButton):
++		_show_onboard = false
++		if controller != null:
++			controller.set_paused(false)
++		queue_redraw()
++		return
++	if _ended and event is InputEventKey and event.pressed and event.keycode == KEY_R:
++		controller.restart()
++		_ended = false
++		_won = false
++
++
++func _draw() -> void:
++	if _snapshot != null:
++		_draw_health_meter()
++		_draw_forecast()
++		_draw_stats()
++	if _ended:
++		_draw_end_overlay()
++	if _show_onboard:
++		_draw_onboarding()
++
++
++func _draw_health_meter() -> void:
++	var pct: int = _snapshot.health_pct
++	var bar_w: float = 240.0
++	var bar_h: float = 18.0
++	var origin := Vector2(22, 84)   # below the GOAL/controls strip (no overlap)
++	# translucent backdrop for legibility over the map
++	draw_rect(Rect2(12, 66, bar_w + 22, 46), Color(1, 1, 1, 0.62), true)
++	draw_rect(Rect2(12, 66, bar_w + 22, 46), CARD_EDGE, false, 1.0)
++	# frame
++	draw_rect(Rect2(origin - Vector2(2, 2), Vector2(bar_w + 4, bar_h + 4)),
++		CARD_EDGE, false, 1.0)
++	# fill (green->yellow->red as it drains)
++	var fill_frac: float = clampf(float(pct) / 100.0, 0.0, 1.0)
++	var col: Color = GREEN if pct > 60 else (WARM if pct > 30 else RED)
++	draw_rect(Rect2(origin, Vector2(bar_w * fill_frac, bar_h)), col, true)
++	draw_string(_font(), origin + Vector2(0, -8), "NETWORK HEALTH  %d%%" % pct,
++		HORIZONTAL_ALIGNMENT_LEFT, -1, 14, INK)
++
++
++func _draw_forecast() -> void:
++	var y: float = 56.0
++	var has_forecast: bool = not _snapshot.forecast_ids.is_empty()
++	var has_active: bool = not _snapshot.active_set_piece_ids.is_empty()
++	if has_active:
++		draw_string(_font(), Vector2(1040, y), "⚡ SURGE ACTIVE",
++			HORIZONTAL_ALIGNMENT_LEFT, -1, 22, RED)
++		y += 28.0
++	elif has_forecast:
++		draw_string(_font(), Vector2(1040, y), "⚠ SURGE INCOMING",
++			HORIZONTAL_ALIGNMENT_LEFT, -1, 22, WARM)
++		y += 28.0
++	# SLA per class
++	var sx: float = 1040.0
++	for cls: StringName in _snapshot.sla_summary:
++		var s: Dictionary = _snapshot.sla_summary[cls]
++		var up: int = int(s["uptime"])
++		var label: String = "%s: %s" % [String(cls), "idle" if up < 0 else "%d%%" % up]
++		var lcol: Color = INK_SOFT if up < 0 else (GREEN if up >= 85 else RED)
++		draw_string(_font(), Vector2(sx, y), label, HORIZONTAL_ALIGNMENT_LEFT, -1, 16, lcol)
++		y += 22.0
++
++
++func _draw_stats() -> void:
++	draw_string(_font(), Vector2(20, 700), "tick %d   budget %d   in-flight %d" %
++		[_snapshot.tick, _snapshot.budget_remaining, _snapshot.in_flight],
++		HORIZONTAL_ALIGNMENT_LEFT, -1, 14, INK_SOFT)
++	var era_name: String = "era %d" % _snapshot.era_id
++	if _snapshot.forecast_ids.is_empty() and _snapshot.active_set_piece_ids.is_empty():
++		draw_string(_font(), Vector2(560, 30), "PACKET PLUMBER — %s" % era_name,
++			HORIZONTAL_ALIGNMENT_CENTER, -1, 18, INK_SOFT)
++
++
++func _draw_end_overlay() -> void:
++	draw_rect(Rect2(Vector2.ZERO, Vector2(1280, 720)), Color(0, 0, 0, 0.6), true)
++	var msg: String = "ERROR 404 — THE INTERNET IS DOWN" if not _won else "INTERNET SAVED! 🛠"
++	var col: Color = Color(1, 0.4, 0.4) if not _won else Color(0.5, 0.95, 0.6)
++	draw_string(_font(), Vector2(640, 340), msg, HORIZONTAL_ALIGNMENT_CENTER, -1, 40, col)
++	draw_string(_font(), Vector2(640, 390), "press [R] to retry",
++		HORIZONTAL_ALIGNMENT_CENTER, -1, 18, Color(0.8, 0.85, 0.9))
++
++
++func _draw_onboarding() -> void:
++	# First-run briefing in the Dispatcher's voice (narrative-v1 §2.2): urgent,
++	# wry, warm — a veteran coaching a rookie. Plain language, not a lecture.
++	draw_rect(Rect2(Vector2.ZERO, Vector2(1280, 720)), Color(0.02, 0.03, 0.06, 0.78), true)
++	var px: float = 290.0
++	var pw: float = 700.0
++	draw_rect(Rect2(Vector2(px, 70), Vector2(pw, 580)), CARD, true)
++	draw_rect(Rect2(Vector2(px, 70), Vector2(pw, 580)), CARD_EDGE, false, 2.0)
++	var ink: Color = INK
++	var soft: Color = INK_SOFT
++	var warm: Color = WARM
++	var blue: Color = Color("#1E4A98")
++	var x: float = px + 28.0
++	var y: float = 104.0
++	draw_string(_font(), Vector2(x, y), "PACKET PLUMBER — night shift", HORIZONTAL_ALIGNMENT_LEFT, 0, 26, ink)
++	y += 30
++	draw_string(_font(), Vector2(x, y), "The Dispatcher, in your ear:", HORIZONTAL_ALIGNMENT_LEFT, 0, 15, warm)
++	y += 30
++	var lines: Array = [
++		["You're on the internet tonight. One job: keep it alive.", ink],
++		["", ink],
++		["THE MAP", warm],
++		["Content Host — streams video OUT to everyone.", soft],
++		["Residentials — your users. They want that stream, AND they", soft],
++		["swap email with each other, peer-to-peer.", soft],
++		["Router — the junction you wire everything through.", soft],
++		["", ink],
++		["YOUR MOVE", warm],
++		["DRAG node-to-node to lay a pipe. Connect Content Host ->", soft],
++		["Router -> Residentials so the stream reaches everyone.", soft],
++		["(Email finds its own way through whatever you build.)", soft],
++		["", ink],
++		["THE CATCH", warm],
++		["A streaming surge is coming — watch the forecast. One pipe", soft],
++		["jams fast: lay PARALLEL pipes or upgrade to WIDE [3].", soft],
++		["RIGHT-CLICK a pipe to prioritize streaming when it's choking.", soft],
++		["", ink],
++		["WIN: hold the network alive (>=90%) through the surge.", blue],
++		["LOSE: the Network Health meter empties -> Error 404.", Color("#E84545")],
++	]
++	for ln: Array in lines:
++		draw_string(_font(), Vector2(x, y), String(ln[0]), HORIZONTAL_ALIGNMENT_LEFT, 0, 15, ln[1])
++		y += 22
++	y += 12
++	draw_string(_font(), Vector2(x, y), "drag = draw  ·  [1/2/3] tier  ·  right-click pipe = priority  ·  [SPACE] pause", HORIZONTAL_ALIGNMENT_LEFT, 0, 13, soft)
++	y += 28
++	draw_string(_font(), Vector2(x + 220, y), "press any key to clock in ▶", HORIZONTAL_ALIGNMENT_LEFT, 0, 18, warm)
++
++
++func _font() -> Font:
++	var win: Window = get_window()
++	if win != null:
++		var f: Font = win.get_theme_default_font()
++		if f != null:
++			return f
++	return ThemeDB.get_default_theme().default_font
+diff --git a/game/scripts/run/hud.gd.uid b/game/scripts/run/hud.gd.uid
+new file mode 100644
+index 0000000..1f33f49
+--- /dev/null
++++ b/game/scripts/run/hud.gd.uid
+@@ -0,0 +1 @@
++uid://b7114f3xmmfny
+diff --git a/game/scripts/run/run_controller.gd b/game/scripts/run/run_controller.gd
+new file mode 100644
+index 0000000..9043202
+--- /dev/null
++++ b/game/scripts/run/run_controller.gd
+@@ -0,0 +1,177 @@
++## RunController — Presentation/orchestration layer (ADR-2, architecture §9).
++##
++## Holds the RunState + SimDriver and drives the fixed-timestep accumulator in
++## _process: clamp delta ([FinLT]), step the sim N times to catch up, capped to
++## avoid spiral-of-death. Slow-mo: if it can't keep up it falls behind (never
++## skips ticks, AC-E21). Player commands queue for the next step (validate-all-
++## then-apply happens in the Core, AC-E23). Emits snapshot_ready each step.
++##
++## This is a Godot Node (Presentation) — the ONLY Node that touches the Core's
++## RunState. Pause freezes stepping (E7.4); resume continues deterministically.
++class_name RunController
++extends Node
++
++const MAX_STEPS_PER_FRAME: int = 5      # catch-up cap; excess carries (slow-mo, AC-E21)
++
++var seed_value: int = 1337
++var state: RunState = null
++var driver: SimDriver = null
++var catalogs: GameCatalogs = null
++var balance: BalanceData = null
++var director: ScriptedDirector = null
++
++var accumulator: float = 0.0
++var tick_len: float = 0.05            # seconds per logic tick (1/logic_hz)
++var paused: bool = false
++var _cmd_queue: Array = []            # Array[Command] for the next step
++var _logic_tick: int = 0
++var demo_mode: bool = false
++var time_scale: float = 1.0          # demo: compress real-time so the surge hits sooner
++
++var latest_snapshot: SimSnapshot = null
++
++signal snapshot_ready(snap: SimSnapshot)
++signal run_ended(won: bool)
++
++
++func _ready() -> void:
++	if _has_arg("demo"):
++		demo_mode = true
++		time_scale = 4.0   # ~4x: surge at 60s sim -> ~15s real
++	boot()
++
++
++static func _has_arg(name: String) -> bool:
++	for a: String in OS.get_cmdline_args():
++		if a == name:
++			return true
++	for a: String in OS.get_cmdline_user_args():
++		if a == name:
++			return true
++	return false
++
++
++func boot() -> void:
++	catalogs = GameCatalogs.load_default()
++	balance = catalogs.balance
++	director = ScriptedDirector.load_from("res://data/demand.json")
++	if catalogs.has_errors() or not director.load_ok:
++		push_error("[RunController] catalog/director load failed — running with partial data")
++	state = RunState.bootstrap(seed_value, catalogs, balance, director)
++	driver = SimDriver.new()
++	tick_len = 1.0 / float(balance.logic_hz) if balance.logic_hz > 0 else 0.05
++	accumulator = 0.0
++	_logic_tick = 0
++	paused = false
++	_cmd_queue.clear()
++	if demo_mode:
++		_apply_demo_network()
++	# emit an initial snapshot so the View can render before the first step
++	latest_snapshot = _snapshot_now()
++	snapshot_ready.emit(latest_snapshot)
++
++
++# Demo: auto-build a survivable starter network so a capture run shows flow + the
++# surge without human input. Manual play (no --demo arg) starts with NO pipes.
++func _apply_demo_network() -> void:
++	var ids: Array = state.topology.all_node_ids()
++	var content_id: int = -1
++	var router_id: int = -1
++	var residentials: Array[int] = []
++	for nid: int in ids:
++		var n: NetNode = state.topology.get_node(nid)
++		if n == null:
++			continue
++		if n.terminal_role == CoreConst.TerminalRole.CONTENT_HOST:
++			content_id = nid
++		elif n.is_junction():
++			router_id = nid
++		elif n.terminal_role == CoreConst.TerminalRole.RESIDENTIAL:
++			residentials.append(nid)
++	if content_id >= 0 and router_id >= 0:
++		# 2 parallel wide pipes content->router (redundancy + round-robin, E1.5) so the
++		# single link isn't the surge bottleneck (the lesson the player must learn).
++		state.topology.apply_edit(Command.DrawPipeCmd.new(0, content_id, router_id, &"wide"))
++		state.topology.apply_edit(Command.DrawPipeCmd.new(0, content_id, router_id, &"wide"))
++	for rid: int in residentials:
++		if router_id >= 0:
++			state.topology.apply_edit(Command.DrawPipeCmd.new(0, router_id, rid, &"wide"))
++	# set one content->router pipe to STREAMING priority so a capture shows the label
++	if content_id >= 0 and router_id >= 0:
++		var snap := state.topology.snapshot()
++		var pair: Array = snap.pipes_between(content_id, router_id)
++		if not pair.is_empty():
++			state.topology.apply_edit(Command.SetPipePriorityCmd.new(0, (pair[0] as NetPipe).id, &"streaming"))
++
++
++func _process(delta: float) -> void:
++	if paused or state == null:
++		return
++	delta = minf(delta, CoreConst.MAX_FRAME_DELTA) * time_scale   # [FinLT] clamp
++	accumulator += delta
++	var steps: int = 0
++	while accumulator >= tick_len and steps < MAX_STEPS_PER_FRAME:
++		_do_step()
++		accumulator -= tick_len
++		steps += 1
++	# slow-mo: if still behind after the cap, drop excess so accumulator can't
++	# grow unbounded (the sim simply runs slow — AC-E21: never skips ticks).
++	if accumulator > tick_len * float(MAX_STEPS_PER_FRAME):
++		accumulator = tick_len * float(MAX_STEPS_PER_FRAME)
++
++
++func _do_step() -> void:
++	_logic_tick += 1
++	var cmds: Array = _cmd_queue
++	_cmd_queue = []
++	latest_snapshot = driver.step(state, _logic_tick, cmds)
++	snapshot_ready.emit(latest_snapshot)
++	if state.health.is_terminal():
++		run_ended.emit(state.health.won)
++		paused = true
++
++
++func _snapshot_now() -> SimSnapshot:
++	# build a snapshot without advancing (for boot + paused redraws)
++	var plan: PressurePlan = director.plan_pressure(state.topology.snapshot(),
++		state.era.era_id, _logic_tick, state.rng)
++	var report: FlowReport = FlowReport.new()
++	report.sla = state.flow.sla
++	var cr: CrisisReport = state.crisis.evaluate(_logic_tick, state.topology.snapshot(),
++		state.flow, state.era.era_id, director)
++	return state.snapshot(cr, report, plan)
++
++
++## Apply a player command IMMEDIATELY (paused or running) and emit a fresh
++## snapshot so the edit is visible at once — pause-and-plan must feel responsive
++## (E7.4: edits apply instantly, never tick-gated). Returns the EditResult so the
++## caller can surface a rejection reason (span/budget/etc.) instead of failing silently.
++func submit_command(cmd: Command) -> EditResult:
++	if state == null:
++		return EditResult.rejected(&"no_state")
++	cmd.tick = _logic_tick
++	var r: EditResult = state.topology.apply_all([cmd])
++	if r.ok:
++		state.action_log.append(cmd)
++	latest_snapshot = _snapshot_now()
++	snapshot_ready.emit(latest_snapshot)
++	return r
++
++
++## Queue a player command for the next logic step (legacy; submit_command is preferred).
++func queue_command(cmd: Command) -> void:
++	_cmd_queue.append(cmd)
++
++
++func set_paused(p: bool) -> void:
++	paused = p
++
++
++func toggle_pause() -> void:
++	paused = not paused
++
++
++func restart(new_seed: int = -1) -> void:
++	if new_seed >= 0:
++		seed_value = new_seed
++	boot()
+diff --git a/game/scripts/run/run_controller.gd.uid b/game/scripts/run/run_controller.gd.uid
+new file mode 100644
+index 0000000..b25f2e2
+--- /dev/null
++++ b/game/scripts/run/run_controller.gd.uid
+@@ -0,0 +1 @@
++uid://gftdxrsa0nj5
+diff --git a/game/scripts/run/run_view.gd b/game/scripts/run/run_view.gd
+new file mode 100644
+index 0000000..2802371
+--- /dev/null
++++ b/game/scripts/run/run_view.gd
+@@ -0,0 +1,669 @@
++## RunView — renders the SimSnapshot (architecture §9.1, ADR-1: reads ONLY snapshot).
++##
++## Mini Motorways graybox: dark map, glowing pipes (width = tier capacity), node
++## shapes by kind/role + icon letter (never color alone, UX-DR4), flowing packet
++## dots colored by class. Mouse drag node->node snaps within the radius (inclusive,
++## AC-E4) and submits a DrawPipeCmd; number keys cycle the active tier. Redraws on
++## each snapshot (20 Hz); interpolation to 60 fps is a later polish (ADR-2).
++class_name RunView
++extends Node2D
++
++var tile_scale: float = 26.0
++var snap_radius_px: float = 36.0
++const NODE_RADIUS_TERMINAL: float = 22.0
++const NODE_RADIUS_JUNCTION: float = 18.0
++const PACKET_RADIUS: float = 7.0
++# LIGHT canvas canon (look-book-v1.md §2, PR #9 — user lavish A/B verdict 2026-08-08)
++const CANVAS_BASE: Color = Color("#E8DDC2")        # warm cream play surface
++const GRID_FAINT: Color = Color("#C2B694")        # subtle darker grid (snap lattice)
++const INK_BRIGHT: Color = Color("#33414F")        # primary label text
++const INK_SOFT: Color = Color("#6A7078")          # secondary text
++const STATE_HEALTHY: Color = Color("#37D67A")
++const STATE_STRAINED: Color = Color("#F2B544")
++const STATE_CRITICAL: Color = Color("#E84545")
++const STREAM_BLUE: Color = Color("#1E4A98")       # saturated blue (reads on cream)
++const EMAIL_GREY: Color = Color("#5A6270")        # distinct grey
++const HOST_BODY: Color = Color("#3E78D0")
++const HOST_DARK: Color = Color("#264C8E")
++const ROUTER_BODY: Color = Color("#5E6E80")
++const ROUTER_DARK: Color = Color("#3E4A5C")
++const ROUTER_LED: Color = Color("#2E8B57")
++const PORT_CHANNEL: Color = Color("#7B6CB8")   # port-channel/LAG bundle ring accent
++const PIPE_COPPER: Color = Color("#8E5E2E")
++const PIPE_STEEL: Color = Color("#78808C")
++const PIPE_FIBER: Color = Color("#2E5494")
++const HOUSE_BODIES: Array[Color] = [Color("#E85A4A"), Color("#F2C94C"), Color("#5ECB6B"), Color("#4A9BE2")]
++const HOUSE_ROOFS: Array[Color] = [Color("#7A2E26"), Color("#7A5418"), Color("#2C6A34"), Color("#26507E")]
++
++@onready var controller: RunController = get_node("%Controller")
++var tile_offset: Vector2 = Vector2.ZERO
++var _fit_done: bool = false
++
++var current_tier_id: StringName = &"standard"
++var _drag_active: bool = false
++var _drag_from_node: int = -1
++var _drag_mouse: Vector2 = Vector2.ZERO
++
++var _snapshot: SimSnapshot = null
++var _class_colors: Dictionary = {}     # StringName -> Color
++var _capture_mode: bool = false
++var _capture_timer: float = 0.0
++var _capture_idx: int = 0
++var _hint: String = ""        # transient rejection/error hint
++var _hint_time: float = 0.0
++const CAPTURE_INTERVAL: float = 1.2
++const CAPTURE_DIR: String = "/tmp/pp_captures/"
++
++
++func _ready() -> void:
++	for a: String in OS.get_cmdline_args() + OS.get_cmdline_user_args():
++		if a == "demo" or a == "capture":
++			_capture_mode = true
++	print("[RunView] capture_mode=%s" % _capture_mode)
++	# default tier = standard (the player upgrades to wide for the surge)
++	_controller_or_null()
++	if controller != null:
++		controller.snapshot_ready.connect(_on_snapshot)
++		controller.run_ended.connect(_on_run_ended)
++	# packet-class colors from the catalog (cosmetic; icon+shape carry type too)
++	var c := GameCatalogs.load_default()
++	for pid: StringName in c.packet_types:
++		var pt: PacketTypeData = c.packet_types[pid]
++		_class_colors[pid] = Color.from_string(pt.color_hex, Color.WHITE)
++	snap_radius_px = float(c.balance.snap_radius) * 1.6   # screen-space generosity
++	set_process_unhandled_input(true)
++
++
++func _process(delta: float) -> void:
++	if _hint_time > 0.0:
++		_hint_time -= delta
++		if _hint_time <= 0.0:
++			_hint_time = 0.0
++			_hint = ""
++			queue_redraw()
++	if not _capture_mode:
++		return
++	_capture_timer += delta
++	if _capture_timer >= CAPTURE_INTERVAL:
++		_capture_timer = 0.0
++		_capture_viewport()
++
++
++func _capture_viewport() -> void:
++	# Windowed (even offscreen) yields a real image; --headless gives NULL ([FinLT]).
++	var tex: ViewportTexture = get_viewport().get_texture()
++	if tex == null:
++		return
++	var img: Image = tex.get_image()
++	if img == null:
++		return
++	DirAccess.make_dir_recursive_absolute(CAPTURE_DIR)
++	var path: String = CAPTURE_DIR + "frame_%04d.png" % _capture_idx
++	_capture_idx += 1
++	img.save_png(path)
++	# textual companion: prove what was on screen (agent can't view PNGs; this logs it)
++	var s: SimSnapshot = _snapshot
++	var state_line: String = "tick=%d health=%d in_flight=%d pipes=%d forecast=%d active_sp=%d won=%s lost=%s" % [
++		(s.tick if s != null else -1), (s.health_pct if s != null else -1),
++		(s.in_flight if s != null else -1),
++		(s.topology.pipes.size() if s != null and s.topology != null else -1),
++		(s.forecast_ids.size() if s != null else -1),
++		(s.active_set_piece_ids.size() if s != null else -1),
++		(s.won if s != null else false), (s.lost if s != null else false)]
++	print("[capture] saved %s  (%s)" % [path, state_line])
++
++
++func _controller_or_null() -> void:
++	if controller == null:
++		# fallback if %Controller not resolved (scene not using unique names)
++		var p := get_parent()
++		if p != null and p.has_node("Controller"):
++			controller = p.get_node("Controller")
++
++
++func _on_snapshot(snap: SimSnapshot) -> void:
++	_snapshot = snap
++	if not _fit_done and snap != null and snap.topology != null:
++		_fit_view_to_nodes(snap.topology)
++		_fit_done = true
++	queue_redraw()
++
++
++func _on_run_ended(won: bool) -> void:
++	queue_redraw()
++
++
++# --- coordinate transform (tile grid -> screen) -------------------------------
++
++func _fit_view_to_nodes(topo: TopologySnapshot) -> void:
++	if topo.nodes.is_empty():
++		tile_offset = Vector2(640, 360)
++		return
++	var minp: Vector2 = Vector2(1e9, 1e9)
++	var maxp: Vector2 = Vector2(-1e9, -1e9)
++	for nid: int in topo.nodes:
++		var n: NetNode = topo.nodes[nid]
++		minp.x = minf(minp.x, float(n.pos.x))
++		minp.y = minf(minp.y, float(n.pos.y))
++		maxp.x = maxf(maxp.x, float(n.pos.x))
++		maxp.y = maxf(maxp.y, float(n.pos.y))
++	# fit the node bbox into the playable area (leave room for HUD on the right +
++	# margins), choosing the tile scale that fits both width and height.
++	var play_w: float = 1000.0   # playable width (left margin..right HUD)
++	var play_h: float = 600.0    # playable height (below top bar, above bottom bar)
++	var span_x: float = maxf(1.0, maxp.x - minp.x)
++	var span_y: float = maxf(1.0, maxp.y - minp.y)
++	var scale_w: float = 1000.0 / span_x
++	var scale_h: float = 600.0 / span_y
++	tile_scale = clampf(minf(scale_w, scale_h), 14.0, 34.0)
++	var center_tile: Vector2 = (minp + maxp) * 0.5
++	tile_offset = Vector2(560, 380) - center_tile * tile_scale
++
++
++func world_to_screen(tile: Vector2) -> Vector2:
++	return tile * tile_scale + tile_offset
++
++
++func screen_to_world(screen: Vector2) -> Vector2:
++	return (screen - tile_offset) / tile_scale
++
++
++func _nearest_node(screen_pos: Vector2) -> int:
++	if _snapshot == null or _snapshot.topology == null:
++		return -1
++	var best: int = -1
++	var best_d: float = snap_radius_px
++	for nid: int in _snapshot.topology.nodes:
++		var n: NetNode = _snapshot.topology.nodes[nid]
++		var sp: Vector2 = world_to_screen(Vector2(float(n.pos.x), float(n.pos.y)))
++		var d: float = sp.distance_to(screen_pos)
++		if d <= best_d:                     # inclusive at boundary (AC-E4)
++			best_d = d
++			best = nid
++	return best
++
++
++# --- input: drag node->node to draw a pipe (FR1) ------------------------------
++
++func _unhandled_input(event: InputEvent) -> void:
++	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
++		var mb: InputEventMouseButton = event
++		if mb.pressed:
++			var nid: int = _nearest_node(mb.position)
++			if nid >= 0:
++				_drag_active = true
++				_drag_from_node = nid
++				_drag_mouse = mb.position
++		else:
++			if _drag_active:
++				var to_node: int = _nearest_node(mb.position)
++				if to_node >= 0 and to_node != _drag_from_node:
++					var r: EditResult = controller.submit_command(Command.DrawPipeCmd.new(
++						0, _drag_from_node, to_node, current_tier_id))
++					if not r.ok:
++						_set_hint(_reject_text(r.reason))
++			_drag_active = false
++			_drag_from_node = -1
++			queue_redraw()
++	elif event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_RIGHT and event.pressed:
++		# right-click a pipe -> cycle its QoS priority (S3 E2.2, the differentiator)
++		var pid: int = _nearest_pipe((event as InputEventMouseButton).position)
++		if pid >= 0:
++			_cycle_pipe_priority(pid)
++	elif event is InputEventMouseMotion and _drag_active:
++		_drag_mouse = event.position
++		queue_redraw()
++	elif event is InputEventKey and event.pressed:
++		match event.keycode:
++			KEY_1: current_tier_id = &"narrow"; queue_redraw()
++			KEY_2: current_tier_id = &"standard"; queue_redraw()
++			KEY_3: current_tier_id = &"wide"; queue_redraw()
++			KEY_SPACE: controller.toggle_pause()
++
++
++func _nearest_pipe(screen_pos: Vector2) -> int:
++	if _snapshot == null or _snapshot.topology == null:
++		return -1
++	var best: int = -1
++	var best_d: float = 14.0   # px hit radius for a pipe
++	for pid: int in _snapshot.topology.pipes:
++		var p: NetPipe = _snapshot.topology.pipes[pid]
++		var a: NetNode = _snapshot.topology.nodes.get(p.a_id)
++		var b: NetNode = _snapshot.topology.nodes.get(p.b_id)
++		if a == null or b == null:
++			continue
++		var ap := world_to_screen(Vector2(float(a.pos.x), float(a.pos.y)))
++		var bp := world_to_screen(Vector2(float(b.pos.x), float(b.pos.y)))
++		var d: float = _point_seg_dist(screen_pos, ap, bp)
++		if d < best_d:
++			best_d = d
++			best = pid
++	return best
++
++
++static func _point_seg_dist(p: Vector2, a: Vector2, b: Vector2) -> float:
++	var ab: Vector2 = b - a
++	var l2: float = ab.dot(ab)
++	if l2 <= 0.0001:
++		return p.distance_to(a)
++	var t: float = clampf((p - a).dot(ab) / l2, 0.0, 1.0)
++	return p.distance_to(a + ab * t)
++
++
++func _cycle_pipe_priority(pid: int) -> void:
++	if _snapshot == null or _snapshot.topology == null:
++		return
++	var p: NetPipe = _snapshot.topology.pipes.get(pid)
++	if p == null:
++		return
++	# cycle the WHOLE port-channel bundle (all parallel pipes on this pair) so
++	# right-clicking any link prioritizes the connection as one logical LAG.
++	var bundle: Array = _snapshot.topology.pipes_between(p.a_id, p.b_id)
++	if bundle.is_empty():
++		return
++	var first: NetPipe = (bundle[0] as NetPipe)
++	var nxt: StringName = &"streaming" if first.priority_class == &"" else (&"email" if first.priority_class == &"streaming" else &"")
++	for pp: NetPipe in bundle:
++		var r: EditResult = controller.submit_command(Command.SetPipePriorityCmd.new(0, pp.id, nxt))
++		if not r.ok:
++			_set_hint("can't set priority on that pipe")
++			return
++
++
++func _set_hint(msg: String) -> void:
++	_hint = msg
++	_hint_time = 3.0
++	queue_redraw()
++
++
++func _reject_text(reason: StringName) -> String:
++	match reason:
++		&"self_loop": return "Can't connect a node to itself."
++		&"span_exceeds_tier": return "Too far for %s tier — use a higher tier or a Router junction." % String(current_tier_id)
++		&"over_budget": return "Not enough budget for that pipe."
++		&"unknown_tier": return "Unknown tier."
++		&"missing_node": return "Start or end the drag on a node."
++	return "Can't draw a pipe there."
++
++
++# --- drawing ------------------------------------------------------------------
++
++func _draw() -> void:
++	if _snapshot == null:
++		return
++	_draw_background()
++	_draw_demand_lines()
++	_draw_pipes()
++	_draw_bundles()
++	_draw_drag_preview()
++	_draw_nodes()
++	_draw_packets()
++	_draw_legend()
++	_draw_tier_indicator()
++	_draw_hint()
++
++
++func _draw_background() -> void:
++	draw_rect(Rect2(Vector2.ZERO, Vector2(1280, 720)), CANVAS_BASE, true)
++	# faint topology grid (the coordinate reference / snap lattice, art-direction §4.1)
++	var step: float = tile_scale
++	var ox: float = fmod(tile_offset.x, step)
++	var oy: float = fmod(tile_offset.y, step)
++	for x: float in range(ox, 1280.0, step):
++		draw_line(Vector2(x, 0), Vector2(x, 720), GRID_FAINT * 0.35, 1.0)
++	for y: float in range(oy, 720.0, step):
++		draw_line(Vector2(0, y), Vector2(1280, y), GRID_FAINT * 0.35, 1.0)
++
++
++func _draw_demand_lines() -> void:
++	# Directional source->sink demand hints (sprint-plan §3.4, art-direction §6):
++	# the player must SEE "connect the Content host to the Residential nodes."
++	# Dashed (distinct from solid drawn pipes), streaming-blue, with arrowheads.
++	if _snapshot.topology == null:
++		return
++	var sources: Array = _snapshot.topology.terminals(&"content_host")
++	var sinks: Array = _snapshot.topology.terminals(&"residential")
++	for sid: int in sources:
++		var snode: NetNode = _snapshot.topology.nodes.get(sid)
++		if snode == null:
++			continue
++		var spos := world_to_screen(Vector2(float(snode.pos.x), float(snode.pos.y)))
++		for kid: int in sinks:
++			var knode: NetNode = _snapshot.topology.nodes.get(kid)
++			if knode == null:
++				continue
++			var kpos := world_to_screen(Vector2(float(knode.pos.x), float(knode.pos.y)))
++			_draw_dashed_arrow(spos, kpos, STREAM_BLUE * Color(1, 1, 1, 0.55), 2.0)
++
++
++# Dashed line + arrowhead at the destination end (direction = source -> sink).
++func _draw_dashed_arrow(a: Vector2, b: Vector2, col: Color, w: float) -> void:
++	var dir: Vector2 = (b - a)
++	var len: float = dir.length()
++	if len < 1.0:
++		return
++	dir = dir / len
++	var dash: float = 8.0
++	var gap: float = 7.0
++	var d: float = 0.0
++	while d < len - 14.0:
++		draw_line(a + dir * d, a + dir * minf(d + dash, len - 14.0), col, w)
++		d += dash + gap
++	# arrowhead near b
++	var tip: Vector2 = b - dir * 18.0
++	var perp: Vector2 = Vector2(-dir.y, dir.x)
++	var head: PackedVector2Array = PackedVector2Array([
++		tip + dir * 9.0, tip + perp * 6.0, tip - perp * 6.0])
++	draw_colored_polygon(head, col)
++
++
++func _draw_pipes() -> void:
++	if _snapshot.topology == null:
++		return
++	# group pipes by node pair so PARALLEL pipes can be drawn side-by-side
++	# (redundancy must be VISIBLE — otherwise stacked pipes look like one)
++	var by_pair: Dictionary = {}
++	for pid: int in _snapshot.topology.pipes:
++		var pp: NetPipe = _snapshot.topology.pipes[pid]
++		var key: String = TopologySnapshot._pair_key(pp.a_id, pp.b_id)
++		if not by_pair.has(key):
++			by_pair[key] = []
++		(by_pair[key] as Array).append(pid)
++	for pid: int in _snapshot.topology.pipes:
++		var p: NetPipe = _snapshot.topology.pipes[pid]
++		var a: NetNode = _snapshot.topology.nodes.get(p.a_id)
++		var b: NetNode = _snapshot.topology.nodes.get(p.b_id)
++		if a == null or b == null:
++			continue
++		var ap := world_to_screen(Vector2(float(a.pos.x), float(a.pos.y)))
++		var bp := world_to_screen(Vector2(float(b.pos.x), float(b.pos.y)))
++		# perpendicular offset for parallel pipes (side-by-side, not stacked)
++		var key: String = TopologySnapshot._pair_key(p.a_id, p.b_id)
++		var group: Array = by_pair[key]
++		var count: int = group.size()
++		var idx: int = group.find(pid)
++		var seg: Vector2 = bp - ap
++		var slen: float = seg.length()
++		if count > 1 and slen > 0.1:
++			var perp: Vector2 = Vector2(-seg.y, seg.x) / slen
++			var off: float = (float(idx) - (float(count) - 1.0) / 2.0) * 20.0
++			ap += perp * off
++			bp += perp * off
++		var w: float = _tier_width(p.tier_id)
++		var col: Color = _tier_color(p.tier_id)
++		# a prioritized pipe tints toward the promoted class's canon color
++		if p.priority_class == &"streaming":
++			col = STREAM_BLUE
++		elif p.priority_class == &"email":
++			col = EMAIL_GREY
++		# subtle darker underlay (NO bloom on the light canvas — look-book §4)
++		draw_line(ap, bp, col.darkened(0.35), w + 4.0)
++		draw_line(ap, bp, col, w)
++		# priority marker at the midpoint — clear label, not cryptic S/E (P2)
++		if p.priority_class != &"":
++			var mid: Vector2 = (ap + bp) * 0.5
++			var is_s: bool = p.priority_class == &"streaming"
++			var glyph: String = "▶" if is_s else "✉"
++			var txt: String = "STREAM PRIORITY" if is_s else "EMAIL PRIORITY"
++			draw_circle(mid, 12.0, Color(0.05, 0.07, 0.1, 0.92), true)
++			draw_arc(mid, 12.0, 0.0, TAU, 24, col, 2.0)
++			draw_string(_font(), mid + Vector2(-5, 5), glyph, HORIZONTAL_ALIGNMENT_CENTER, -1, 16, col)
++			draw_string(_font(), mid + Vector2(18, 5), txt, HORIZONTAL_ALIGNMENT_LEFT, 0, 13, col)
++
++
++# Port-channel / LAG bundle: when 2+ parallel pipes connect a node pair, draw a
++# solid CAPSULE sleeve over the CENTER of the links (the Cisco EtherChannel glyph)
++# with the link count inside — the parallel links stay visible entering/exiting
++# either side, and the sleeve reads as ONE logical port-channel.
++func _draw_bundles() -> void:
++	if _snapshot == null or _snapshot.topology == null:
++		return
++	var by_pair: Dictionary = {}
++	for pid: int in _snapshot.topology.pipes:
++		var pp: NetPipe = _snapshot.topology.pipes[pid]
++		var key: String = TopologySnapshot._pair_key(pp.a_id, pp.b_id)
++		if not by_pair.has(key):
++			by_pair[key] = []
++		(by_pair[key] as Array).append(pid)
++	for key: String in by_pair:
++		var group: Array = by_pair[key]
++		if group.size() < 2:
++			continue
++		var p0: NetPipe = _snapshot.topology.pipes.get(group[0])
++		if p0 == null:
++			continue
++		var a: NetNode = _snapshot.topology.nodes.get(p0.a_id)
++		var b: NetNode = _snapshot.topology.nodes.get(p0.b_id)
++		if a == null or b == null:
++			continue
++		var ap := world_to_screen(Vector2(float(a.pos.x), float(a.pos.y)))
++		var bp := world_to_screen(Vector2(float(b.pos.x), float(b.pos.y)))
++		var seg: Vector2 = bp - ap
++		var len: float = seg.length()
++		if len < 40.0:
++			continue
++		var mid: Vector2 = (ap + bp) * 0.5
++		var ang: float = seg.angle()
++		var count: int = group.size()
++		var cap_len: float = clampf(len * 0.42, 44.0, 96.0)
++		var cap_w: float = (float(count) - 1.0) * 20.0 + 30.0
++		# centered capsule sleeve over the middle (fill + rounded end caps + outline)
++		draw_set_transform(mid, ang, Vector2.ONE)
++		draw_rect(Rect2(Vector2(-cap_len / 2.0, -cap_w / 2.0), Vector2(cap_len, cap_w)),
++			PORT_CHANNEL * Color(1, 1, 1, 0.92), true)
++		draw_circle(Vector2(-cap_len / 2.0, 0.0), cap_w / 2.0, PORT_CHANNEL * Color(1, 1, 1, 0.92), true)
++		draw_circle(Vector2(cap_len / 2.0, 0.0), cap_w / 2.0, PORT_CHANNEL * Color(1, 1, 1, 0.92), true)
++		draw_rect(Rect2(Vector2(-cap_len / 2.0, -cap_w / 2.0), Vector2(cap_len, cap_w)),
++			PORT_CHANNEL.darkened(0.25), false, 2.0)
++		draw_arc(Vector2(-cap_len / 2.0, 0.0), cap_w / 2.0, 0.0, TAU, 20, PORT_CHANNEL.darkened(0.25), 2.0)
++		draw_arc(Vector2(cap_len / 2.0, 0.0), cap_w / 2.0, 0.0, TAU, 20, PORT_CHANNEL.darkened(0.25), 2.0)
++		draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
++		# link-count badge at the center (horizontal, readable)
++		draw_circle(mid, 13.0, Color("#F5EFDF"), true)
++		draw_arc(mid, 13.0, 0.0, TAU, 24, PORT_CHANNEL.darkened(0.25), 2.0)
++		draw_string(_font(), mid + Vector2(-2, 5), "×%d" % count, HORIZONTAL_ALIGNMENT_CENTER, 0, 15, PORT_CHANNEL)
++
++
++func _draw_ellipse(center: Vector2, rx: float, ry: float, angle: float,
++					col: Color, filled: bool, line_w: float) -> void:
++	var pts: PackedVector2Array = PackedVector2Array()
++	var n: int = 40
++	for i: int in n:
++		var t: float = (float(i) / float(n)) * TAU
++		var p: Vector2 = Vector2(cos(t) * rx, sin(t) * ry).rotated(angle)
++		pts.append(center + p)
++	if filled:
++		draw_colored_polygon(pts, col)
++	else:
++		pts.append(pts[0])
++		draw_polyline(pts, col, line_w)
++
++
++func _draw_drag_preview() -> void:
++	if not _drag_active or _drag_from_node < 0:
++		return
++	var n: NetNode = _snapshot.topology.nodes.get(_drag_from_node)
++	if n == null:
++		return
++	var from := world_to_screen(Vector2(float(n.pos.x), float(n.pos.y)))
++	var col: Color = Color(0.6, 0.8, 1.0, 0.6)
++	draw_line(from, _drag_mouse, col, 2.0)
++
++
++func _draw_nodes() -> void:
++	if _snapshot.topology == null:
++		return
++	for nid: int in _snapshot.topology.nodes:
++		var n: NetNode = _snapshot.topology.nodes[nid]
++		var sp := world_to_screen(Vector2(float(n.pos.x), float(n.pos.y)))
++		var hs: int = int(_snapshot.node_health.get(nid, CoreConst.HealthState.HEALTHY))
++		var health_col: Color = _health_color(hs)
++		# state ring (canon triad; the warning surface) — steady ring (pulse is S6)
++		_draw_state_ring(sp, health_col, hs)
++		var r: float = NODE_RADIUS_TERMINAL
++		if n.is_terminal():
++			if n.terminal_role == CoreConst.TerminalRole.CONTENT_HOST:
++				_draw_server(sp)
++				r = NODE_RADIUS_TERMINAL + 5.0
++			else:
++				_draw_house(sp, nid)
++			var role_txt: String = "SENDS  ▶" if n.terminal_role == CoreConst.TerminalRole.CONTENT_HOST else "WANTS  ▶  ✉"
++			draw_string(_font(), sp + Vector2(-r, r + 18), role_txt, HORIZONTAL_ALIGNMENT_CENTER, r * 2, 12, INK_SOFT)
++		else:
++			# junction = HARDWARE chassis (a switch, not a building) — look-book D3
++			_draw_router(sp)
++		var label: String = _node_label(n)
++		draw_string(_font(), sp + Vector2(0, r + 38), label, HORIZONTAL_ALIGNMENT_CENTER, 150, 14, INK_BRIGHT)
++
++
++# Residential = a literal peaked-roof house (look-book D2: "beautiful art, not
++# abstract shapes"). Varied cheerful body + dark roof = a neighbourhood of homes.
++func _draw_house(sp: Vector2, nid: int) -> void:
++	var r: float = NODE_RADIUS_TERMINAL
++	var body_c: Color = HOUSE_BODIES[nid % HOUSE_BODIES.size()]
++	var roof_c: Color = HOUSE_ROOFS[nid % HOUSE_ROOFS.size()]
++	# body
++	var body: Rect2 = Rect2(sp + Vector2(-r * 0.72, -r * 0.05), Vector2(r * 1.44, r * 1.15))
++	draw_rect(body, body_c, true)
++	draw_rect(body, body_c.darkened(0.3), false, 2.0)
++	# peaked roof (the silhouette that reads "house")
++	var roof: PackedVector2Array = PackedVector2Array([
++		sp + Vector2(-r * 0.95, -r * 0.05), sp + Vector2(r * 0.95, -r * 0.05),
++		sp + Vector2(0.0, -r * 1.0)])
++	draw_colored_polygon(roof, roof_c)
++	# door
++	draw_rect(Rect2(sp + Vector2(-r * 0.2, r * 0.35), Vector2(r * 0.4, r * 0.7)), roof_c.darkened(0.15), true)
++
++
++# Content host = a server/broadcast block (brand-blue, distinct from houses).
++func _draw_server(sp: Vector2) -> void:
++	var r: float = NODE_RADIUS_TERMINAL + 5.0
++	var block: Rect2 = Rect2(sp - Vector2(r, r * 1.1), Vector2(r * 2.0, r * 2.2))
++	draw_rect(block, HOST_BODY, true)
++	draw_rect(block, HOST_DARK, false, 2.0)
++	# server rack lines
++	for i: int in 3:
++		var ly: float = -r * 0.7 + float(i) * r * 0.6
++		draw_line(sp + Vector2(-r * 0.75, ly), sp + Vector2(r * 0.75, ly), HOST_DARK, 2.0)
++	# broadcast play glyph (white)
++	var t: PackedVector2Array = PackedVector2Array([
++		sp + Vector2(-r * 0.22, -r * 0.3), sp + Vector2(-r * 0.22, r * 0.3), sp + Vector2(r * 0.4, 0.0)])
++	draw_colored_polygon(t, Color.WHITE)
++
++
++# Router = capacity-scaled HARDWARE (a switch chassis: ports + LEDs), a distinct
++# family from buildings so it's never mistaken for a destination (look-book D3).
++func _draw_router(sp: Vector2) -> void:
++	var r: float = NODE_RADIUS_JUNCTION
++	var chassis: Rect2 = Rect2(sp - Vector2(r, r * 0.62), Vector2(r * 2.0, r * 1.24))
++	draw_rect(chassis, ROUTER_BODY, true)
++	draw_rect(chassis, ROUTER_DARK, false, 2.0)
++	# port marks along the front edge
++	for i: int in 4:
++		draw_rect(Rect2(sp + Vector2(-r * 0.72 + float(i) * r * 0.46, r * 0.18), Vector2(r * 0.26, r * 0.26)), ROUTER_DARK, true)
++	# indicator LEDs
++	draw_circle(sp + Vector2(-r * 0.62, -r * 0.28), 2.6, ROUTER_LED, true)
++	draw_circle(sp + Vector2(-r * 0.4, -r * 0.28), 2.6, STATE_STRAINED, true)
++
++
++func _draw_state_ring(sp: Vector2, col: Color, hs: int) -> void:
++	var rad: float = NODE_RADIUS_TERMINAL + 10.0
++	var w: float = 3.0 if hs != CoreConst.HealthState.HEALTHY else 2.0
++	draw_arc(sp, rad, 0.0, TAU, 40, col, w)
++
++
++func _tier_color(tier_id: StringName) -> Color:
++	match tier_id:
++		&"narrow": return PIPE_COPPER
++		&"wide": return PIPE_FIBER
++	return PIPE_STEEL
++
++
++func _tier_width(tier_id: StringName) -> float:
++	match tier_id:
++		&"narrow": return 4.0
++		&"wide": return 11.0
++	return 7.0
++
++
++func _node_label(n: NetNode) -> String:
++	if n.is_junction():
++		return "Router"
++	if n.terminal_role == CoreConst.TerminalRole.CONTENT_HOST:
++		return "Content Host"
++	return "Residential"
++
++
++func _health_color(state: int) -> Color:
++	match state:
++		CoreConst.HealthState.STRAINED: return STATE_STRAINED
++		CoreConst.HealthState.CRITICAL: return STATE_CRITICAL
++	return STATE_HEALTHY
++
++
++func _draw_packets() -> void:
++	for pd: Dictionary in _snapshot.packet_render:
++		var sp := world_to_screen(Vector2(float(pd["x"]), float(pd["y"])))
++		var cls: StringName = pd["class_id"]
++		var col: Color = _class_colors.get(cls, Color.WHITE)
++		var is_stream: bool = cls == &"streaming"
++		var dark: Color = col.darkened(0.45)
++		# solid saturated shape + darker outline for definition on the cream canvas
++		# (NO bloom — look-book §4: minimal/no bloom on the light look)
++		if is_stream:
++			_draw_triangle(sp, PACKET_RADIUS + 2.5, dark)
++			_draw_triangle(sp, PACKET_RADIUS + 1.0, col)
++		else:
++			draw_circle(sp, PACKET_RADIUS, dark, true)
++			draw_circle(sp, PACKET_RADIUS - 1.5, col, true)
++
++
++func _draw_triangle(sp: Vector2, r: float, col: Color) -> void:
++	var pts: PackedVector2Array = PackedVector2Array([
++		sp + Vector2(-r, r * 0.8), sp + Vector2(r, r * 0.8), sp + Vector2(0.0, -r)])
++	draw_colored_polygon(pts, col)
++
++
++func _draw_hint() -> void:
++	if _hint == "":
++		return
++	# centered transient hint with a backdrop so it reads over the map
++	var w: float = 700.0
++	var rect: Rect2 = Rect2(Vector2(640 - w / 2.0, 120), Vector2(w, 34))
++	draw_rect(rect, Color(1, 1, 1, 0.85), true)
++	draw_rect(rect, STATE_CRITICAL, false, 2.0)
++	draw_string(_font(), Vector2(640, 143), _hint, HORIZONTAL_ALIGNMENT_CENTER, w, 16, INK_BRIGHT)
++
++
++func _draw_legend() -> void:
++	# a small legend so the player learns the visual language (P2 comprehensibility)
++	var x: float = 20.0
++	var y: float = 626.0
++	draw_rect(Rect2(x - 8, y - 16, 392, 64), Color(1, 1, 1, 0.72), true)
++	draw_rect(Rect2(x - 8, y - 16, 392, 64), GRID_FAINT, false, 1.0)
++	_draw_triangle(Vector2(x + 8, y), 6.0, STREAM_BLUE)
++	draw_string(_font(), Vector2(x + 20, y + 5), "Streaming", HORIZONTAL_ALIGNMENT_LEFT, 0, 13, INK_BRIGHT)
++	draw_circle(Vector2(x + 8, y + 24), 5.0, EMAIL_GREY, true)
++	draw_string(_font(), Vector2(x + 20, y + 29), "Email", HORIZONTAL_ALIGNMENT_LEFT, 0, 13, INK_BRIGHT)
++	draw_string(_font(), Vector2(x + 110, y + 5), "RIGHT-CLICK a pipe cycles:", HORIZONTAL_ALIGNMENT_LEFT, 0, 12, INK_SOFT)
++	draw_string(_font(), Vector2(x + 110, y + 24), "off  →  ▶ Stream priority  →  ✉ Email priority", HORIZONTAL_ALIGNMENT_LEFT, 0, 12, STREAM_BLUE)
++
++
++func _draw_tier_indicator() -> void:
++	# GOAL (top, prominent) + concise controls (the comprehensibility bar).
++	# Translucent backdrop so the text stays legible over flowing packets.
++	draw_rect(Rect2(12, 10, 1010, 50), Color(1, 1, 1, 0.62), true)
++	draw_rect(Rect2(12, 10, 1010, 50), GRID_FAINT, false, 1.0)
++	draw_string(_font(), Vector2(22, 30), "GOAL: connect the Content Host to the Residential nodes — survive the streaming surge.",
++		HORIZONTAL_ALIGNMENT_LEFT, 0, 17, INK_BRIGHT)
++	draw_string(_font(), Vector2(22, 50), "DRAG node-to-node = draw pipe   ·   [1/2/3] tier (%s)   ·   RIGHT-CLICK pipe = QoS priority   ·   [SPACE] pause" % String(current_tier_id),
++		HORIZONTAL_ALIGNMENT_LEFT, 0, 14, INK_SOFT)
++
++
++func _font() -> Font:
++	var win: Window = get_window()
++	if win != null:
++		var f: Font = win.get_theme_default_font()
++		if f != null:
++			return f
++	return ThemeDB.get_default_theme().default_font
+diff --git a/game/scripts/run/run_view.gd.uid b/game/scripts/run/run_view.gd.uid
+new file mode 100644
+index 0000000..d8b90e8
+--- /dev/null
++++ b/game/scripts/run/run_view.gd.uid
+@@ -0,0 +1 @@
++uid://cfy41mh8ykvdd

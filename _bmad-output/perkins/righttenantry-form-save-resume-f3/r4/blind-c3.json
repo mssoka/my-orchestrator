@@ -1,0 +1,72 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "test-helper-false-pass",
+    "title": "draft_field's result.unwrap(\"\") makes negative security assertions pass on query failure or missing row",
+    "location": "server/test/integration/draft_integration_test.gleam:36",
+    "evidence": "fn draft_field(db: pog.Connection, vacancy_id: String, column: String) -> String {\n  test_db.query_text(\n    db,\n    \"SELECT COALESCE(\" <> column <> \"::text, '') FROM application_draft\n     WHERE vacancy_id = '\" <> vacancy_id <> \"'::uuid\",\n  )\n  |> result.unwrap(\"\")\n}",
+    "detail": "Query error, missing row, and NULL column all collapse to \"\". Negative assertions like `draft_field(db, vacancy_id, \"continue_token\") |> should.equal(\"\")` and `resumed_at |> should.equal(\"\")` pass falsely if the SQL breaks (e.g. typo'd interpolated column name).",
+    "recommended_fix": "Return Result from draft_field and `let assert Ok(v)` at call sites, or have query_text fail loudly on error so only genuine NULL/empty maps to \"\"."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "redundant-code",
+    "title": "seed_draft_with_token performs a redundant UPDATE — the upsert already mints the passed token",
+    "location": "server/test/integration/draft_integration_test.gleam:75",
+    "evidence": "  let assert Ok(_) =\n    app_sql.upsert_application_draft(\n      db,\n      uuid,\n      \"tenant@example.com\",\n      json.object([#(\"first_name\", json.string(\"Ada\"))]),\n      \"tok-seed\",\n    )\n  let assert Ok(_) =\n    pog.query(\n      \"UPDATE application_draft SET continue_token = $1\n       WHERE vacancy_id = $2::uuid\",\n    )",
+    "detail": "upsert_mints_the_token_at_save_time_test proves the upsert's 5th parameter becomes continue_token on insert. Passing \"tok-seed\" then overwriting with an UPDATE is a wasted round-trip; passing `token` directly is equivalent.",
+    "recommended_fix": "Drop the pog.query UPDATE and pass `token` as the upsert's token argument."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "assertion-gap",
+    "title": "resume_on_closed_vacancy_renders_closed_page_test asserts only absences — a blank 200 page passes",
+    "location": "server/test/integration/draft_integration_test.gleam:hunk (W9 section)",
+    "evidence": "  resp.status |> should.equal(200)\n  let body = simulate.read_body(resp)\n  body\n  |> string.contains(\"data-apply-page=\\\"form-resume\\\"\")\n  |> should.be_false\n  body |> string.contains(\"draft-resume-banner\") |> should.be_false",
+    "detail": "The title claims the closed page is rendered, but no positive marker for the closed page (e.g. a closed-vacancy testid or copy) is asserted. Any 200 body lacking resume markers satisfies the test.",
+    "recommended_fix": "Add one positive assertion on the closed page's marker/copy, mirroring how save_draft_on_closed_vacancy_refuses_test pins \"closed\":true."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "missing-coverage",
+    "title": "Continue-link section promises 'no-leak' but never tests the unknown-email enumeration path",
+    "location": "server/test/integration/draft_integration_test.gleam:hunk (Continue-link section header)",
+    "evidence": "// Continue-link (POST /apply/:code/continue-link) — cooldown + no-leak\n// The Resend send itself is exercised by manual E2E, not here (the empty\n// test key would make a real api.resend.com call — same precedent as the\n// resend-confirmation tests).",
+    "detail": "The only no-leak test covers the cooldown path of an existing draft. The most enumeration-sensitive case — continue-link for an email with no draft at all — is untested, despite N14's anti-oracle concern and the upsert half creating rows.",
+    "recommended_fix": "Add a test: POST continue-link for an email with no draft → same bare ok:true 200, no `sent` flag, and assert whether a draft row is or is not created."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "assertion-gap",
+    "title": "120-entry cap test pins only the count; which fields survive truncation is unspecified",
+    "location": "server/test/application/draft_handler_test.gleam:44",
+    "evidence": "pub fn filter_fields_caps_entries_at_120_test() {\n  let fields =\n    int.range(1, 200, [], fn(acc, i) { [#(\"field_\" <> pad(i), \"v\"), ..acc] })\n    |> dict.from_list\n  draft_handler.filter_fields(fields)\n  |> list.length\n  |> should.equal(120)\n}",
+    "detail": "dict.from_list/to_list ordering is unspecified, so the test cannot (and does not) pin which 80 entries are dropped. If the implementation truncates in dict order, an applicant could lose first_name while field_199 survives — untested and unpinned.",
+    "recommended_fix": "Either pin deterministic survivors in the test, or document in the test comment that survivor selection is intentionally arbitrary."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "form_view_now_ms and near_future_date are single-use pass-through wrappers",
+    "location": "server/test/integration/draft_integration_test.gleam:hunk (after W7 test)",
+    "evidence": "fn form_view_now_ms() -> Int {\n  form_view.current_unix_ms()\n}\n\nfn near_future_date() -> String {\n  test_helpers.near_future_iso_date()\n}",
+    "detail": "Both wrappers are used exactly once (in successful_submission_strips_the_matching_draft_test) and add no logic, naming clarity, or abstraction over the direct calls they wrap. Pure indirection.",
+    "recommended_fix": "Inline form_view.current_unix_ms() and test_helpers.near_future_iso_date() at the call site and delete the wrappers."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "unverifiable-dependency",
+    "title": "New tests call test_db.seed_closed_vacancy/seed_archived_vacancy, but this chunk's test_db.gleam change adds neither",
+    "location": "server/test/integration/test_db.gleam:80",
+    "evidence": "pub fn truncate_all(db: pog.Connection) -> Nil {\n  let _ =\n    pog.query(\n      \"TRUNCATE audit_log, acknowledgement_record, notification, inbound_email, document, ai_analysis, payment_terms_acceptance, payment, application_co_applicant, application_income_source, application, application_draft, vacancy_view, vacancy, landlord, storage_deletion_queue, processed_stripe_event, reference_call, reference_objection_log CASCADE\",\n    )\n    |> pog.execute(db)\n  Nil\n}",
+    "detail": "The only test_db.gleam change in this chunk is the truncate_all table list. seed_closed_vacancy and seed_archived_vacancy are used by the new integration tests but defined nowhere in the shown diff — compilation depends on them pre-existing on the base branch. Cannot be verified from the diff alone.",
+    "recommended_fix": "Confirm both helpers already exist on the base branch; if they were introduced by this PR, their definitions are missing from the test chunk."
+  }
+]

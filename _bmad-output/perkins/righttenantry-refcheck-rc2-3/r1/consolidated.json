@@ -1,0 +1,154 @@
+{
+  "round": 1,
+  "job": "righttenantry-refcheck-rc2-3",
+  "pr": 591,
+  "repo": "solarity-services/RightTenantry",
+  "reviewed_sha": "109ec5db89858af69c778d89b9b2dd6ef1117b5b",
+  "diff_file": "/Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc2-3/r1/diff.patch",
+  "failed_layers": [],
+  "lenses_completed": 7,
+  "verification": {
+    "total_findings": 15,
+    "confirmed": 14,
+    "rejected": 1,
+    "unverifiable_speculative": 0
+  },
+  "verdict": "NEEDS CHANGES",
+  "blocker_count": 1,
+  "warning_count": 5,
+  "note_count": 5,
+  "findings": [
+    {
+      "title": "Advisory test gate: FAIL",
+      "severity": "blocker",
+      "category": "coverage-gate",
+      "sources": ["tests"],
+      "verification": "confirmed",
+      "location": "N/A",
+      "evidence": "P0 behaviours (slot selection landlord/character, no-contact skip, declined suppression, pre-v1, ON CONFLICT idempotency, audit-on-create) are FULL via reference_checks_trigger_integration_test.gleam. P1 behaviours are largely NONE: the 3 HTTP handlers, ownership/archived prechecks, slot validation, UUID parse, and the maybe_trigger_reference_checks dispatcher are all untested (grep of server/test for callers of handle_start/handle_skip/handle_re_enable/maybe_trigger_reference_checks: zero). P1 ≈ 25%, overall ≈ 65%.",
+      "detail": "Gate thresholds require P0 100% AND P1 ≥80% AND overall ≥80%. The story's headline AC — 'when the status PATCH succeeds, reference_call rows are created' — has no automated pin through the real hook; the production wiring (apply_status_update hook + 3 router arms) could break and CI stays green.",
+      "recommended_fix": "Add HTTP-level integration tests for handle_start/handle_skip/handle_re_enable (happy 200 + cross-tenant 404 + archived 422 + unknown-slot 400) and one end-to-end viewed-PATCH-creates-rows test through the real hook. That lifts P1 and overall above 80%."
+    },
+    {
+      "title": "Production hook maybe_trigger_reference_checks and its Viewed-only dispatch branch are never exercised by any test",
+      "severity": "warning",
+      "category": "coverage-gap",
+      "sources": ["tests"],
+      "verification": "confirmed",
+      "location": "server/src/reference_checks/trigger.gleam:54-75 | server/src/application/application_detail_handler.gleam:694",
+      "evidence": "trigger.gleam:54-75: 'pub fn maybe_trigger_reference_checks(...) -> Nil { case new_status { app_sql.Viewed -> ... run_create_checks(...) _ -> Nil } }'. Wired at application_detail_handler.gleam:694 'trigger.maybe_trigger_reference_checks('. Grep across server/test/ shows zero callers of maybe_trigger_reference_checks. The one viewed-transition test (application_integration_test.gleam patch_status_to_viewed_writes_audit_row_test) seeds via test_db.seed_application_with_status — no referee trio — so the trigger creates nothing and asserts nothing about reference_call.",
+      "detail": "The actual production wiring (PATCH status→viewed→reference_call rows) is unasserted end-to-end. The dispatcher's Viewed-vs-other branch and its fail-open Sentry path are untested; integration tests prove core logic but not that it fires on the right transition.",
+      "recommended_fix": "Add one integration test that calls handle_update_status with status='viewed' on an application seeded with referee trios and asserts reference_call rows + reference_call_created audit appear — exercising the real hook path."
+    },
+    {
+      "title": "Three new HTTP handlers (handle_start/handle_skip/handle_re_enable) have zero direct test coverage; integration tests call only the inner functions",
+      "severity": "warning",
+      "category": "coverage-gap",
+      "sources": ["tests", "blind", "acceptance"],
+      "verification": "confirmed",
+      "location": "server/src/router.gleam:371-426 | server/test/integration/reference_checks_trigger_integration_test.gleam:215-457",
+      "evidence": "router.gleam routes the three new POST arms to the handlers ('trigger.handle_start(' / 'trigger.handle_skip(' / 'trigger.handle_re_enable('). But every test in reference_checks_trigger_integration_test.gleam invokes only inner functions ('trigger.run_create_checks(...)', 'trigger.do_skip(...)', 'trigger.do_re_enable(...)'). No test calls handle_start/handle_skip/handle_re_enable. Spec I/O matrix rows 'Unknown slot → 400', 'Skip a non-queued live row → 409', 'Not owner / archived vacancy → 404/422' have no test.",
+      "detail": "3 new authenticated endpoints have 0 HTTP-level coverage. run_action_with_prechecks (ownership 404, archived 422), is_valid_slot (400), parse_app_uuids (400) and all branded responses are unverified. The defended ownership/authz invariant has no negative test on these arms.",
+      "recommended_fix": "Add integration tests calling handle_start/handle_skip/handle_re_enable directly: cross-tenant 404, archived-vacancy 422, unknown-slot 400, contact_initiated-skip 409, and happy-path 200 each."
+    },
+    {
+      "title": "Skip racing a concurrent viewed-trigger returns 200 'skipped: True' while the slot is actually queued — the landlord's exclusion is silently lost",
+      "severity": "warning",
+      "category": "concurrency",
+      "sources": ["edge"],
+      "verification": "confirmed",
+      "location": "server/src/reference_checks/trigger.gleam:508,569-573",
+      "evidence": "create_skipped_slot: 'case pog.transaction(config.db, run) { Ok(_) -> json_ok(json.object([#(\"skipped\", json.bool(True))])) ... }' and create_one_skipped_slot: '// 0 rows — a live row appeared between our read and this insert (a concurrent action), so nothing was created... Ok(_) -> Ok(Nil)'. do_skip's None branch (no live row) inserts a 'skipped' row; if the viewed trigger commits a queued row between do_skip's read (find_live_row_for_slot) and this insert, the queued row (live for idx_reference_call_live) conflicts → 0 rows → Ok(Nil) → 200 skipped:True. The slot is actually queued; the sweep (RC3.5) will contact the referee.",
+      "detail": "Skip's before-trigger path treats a 0-row insert as success without re-reading the slot. Concurrent trigger + skip loses the exclusion while the response lies. transition_to_skipped handles the same race correctly (0 rows → 409).",
+      "recommended_fix": "On 0-row insert, re-read the slot's live status; if anything other than 'skipped', return branded 409 'This reference changed state. Refresh and try again.' instead of 200."
+    },
+    {
+      "title": "Spec-mandated unit test file server/test/reference_checks/trigger_test.gleam is absent from the PR",
+      "severity": "warning",
+      "category": "coverage-gap",
+      "sources": ["blind", "acceptance", "tests"],
+      "verification": "confirmed",
+      "location": "server/test/reference_checks/trigger_test.gleam (absent; only schema_migration_test.gleam present)",
+      "evidence": "Spec Tasks list: '- [ ] server/test/reference_checks/trigger_test.gleam — unit tests: slot selection (rented vs never-rented), no-contact skip, declined suppression, pre-v1 allowed, double-trigger idempotency, pre-excluded-slot respected, audit-on-create, declined-manual-start suppression'. ls server/test/reference_checks/ returns only schema_migration_test.gleam.",
+      "detail": "A spec-named deliverable (the unit test file) is absent. The same behaviours are covered at DB level by reference_checks_trigger_integration_test.gleam, so this is a deliverable/process gap, not a behaviour gap.",
+      "recommended_fix": "Either ship trigger_test.gleam with the listed unit cases, or update the spec's Tasks/Review-Order to record that integration coverage substitutes for the unit file."
+    },
+    {
+      "title": "CreateOutcome.Created count returns eligible-slot count, not actual inserts — contradicts its own doc comment",
+      "severity": "warning",
+      "category": "contract-bug",
+      "sources": ["blind"],
+      "verification": "confirmed",
+      "location": "server/src/reference_checks/trigger.gleam:56-61,192",
+      "evidence": "Doc: '/// Outcome of a creation pass. `Created` carries the number of rows actually /// inserted (0 when every applicable slot already had a live row or none were /// eligible)'. Impl at line 192: 'Ok(_) -> Ok(Created(count: list.length(eligible)))'. The double-trigger test codifies 'second |> should.equal(Ok(trigger.Created(count: 2)))' — 2 with 0 rows inserted.",
+      "detail": "Public type contract is false: count is eligible slots, not inserted rows. No functional impact today (both callers discard the outcome) but misleading for RC3.5/RC4.x callers.",
+      "recommended_fix": "Have create_one_slot return whether it actually inserted and sum those, or rewrite the doc to 'number of eligible slots considered' and drop the '0 when already had a live row' clause."
+    },
+    {
+      "title": "do_re_enable skips the app↔vacancy relationship check that do_skip and handle_update_status perform",
+      "severity": "note",
+      "category": "authz",
+      "sources": ["security"],
+      "verification": "confirmed",
+      "location": "server/src/reference_checks/trigger.gleam:618-624",
+      "evidence": "do_re_enable takes (config, app_uuid, landlord_uuid, slot) — no vacancy_uuid; find_skipped_row_for_slot(db, app_uuid, slot) scopes by app only. Contrast do_skip (line 359) which takes vacancy_uuid and re-verifies via get_application_reference_data (SQL WHERE a.id = $1 AND v.user_id = $2 AND a.vacancy_id = $3) → mismatched URL vacancy_id yields 404. verify_application_ownership (JOIN vacancy v ON v.id = a.vacancy_id WHERE a.id = $1 AND v.user_id = $2) still blocks cross-tenant access.",
+      "detail": "With a mismatched URL vacancy_id (both owned by the same landlord), the archived-vacancy guard checks the wrong vacancy — re-enable can proceed on an app whose real vacancy is archived. Landlord's own rows only; low impact but deviates from the mandated handle_update_status pattern.",
+      "recommended_fix": "Pass vacancy_uuid into do_re_enable and verify the app↔vacancy join (mirror do_skip's get_application_reference_data) before find_skipped_row_for_slot."
+    },
+    {
+      "title": "find_live_row_for_slot swallows list-query errors as None, pushing do_skip down the wrong branch",
+      "severity": "note",
+      "category": "concurrency",
+      "sources": ["edge"],
+      "verification": "confirmed",
+      "location": "server/src/reference_checks/trigger.gleam:751-757",
+      "evidence": "'case sql.list_reference_calls_for_application(db, app_uuid) { Ok(pog.Returned(_, rows)) -> ... Error(_) -> None }' — a transient DB error on the list read is conflated with 'no live row'. do_skip then enters create_skipped_slot; if a queued row actually exists, the ON CONFLICT yields the misleading 200 above rather than surfacing the read failure.",
+      "detail": "DB failure on the read masquerades as 'no live row'. Outcome either the wrong 200 (race finding) or a 500 from the follow-up insert — never a clean 500 naming the read failure.",
+      "recommended_fix": "Propagate the QueryError and have do_skip return a branded 500 when the list query fails, mirroring the get_application_reference_data Error branch already in do_skip."
+    },
+    {
+      "title": "find_skipped_row_for_slot swallows list-query errors as None, making do_re_enable return a wrong 404",
+      "severity": "note",
+      "category": "concurrency",
+      "sources": ["edge"],
+      "verification": "confirmed",
+      "location": "server/src/reference_checks/trigger.gleam:774-780",
+      "evidence": "'Error(_) -> None' — a transient DB error on list_reference_calls_for_application is conflated with 'no skipped row'. do_re_enable then returns 404 'This reference isn't skipped.' even though a skipped row exists.",
+      "detail": "Landlord sees incorrect state on a transient DB failure (retriable, but wrong); hides the real error from logs as a 404.",
+      "recommended_fix": "Propagate the QueryError and have do_re_enable return a branded 500 when the list query fails, instead of the unchecked None-to-404 path."
+    },
+    {
+      "title": "Terminal-status list duplicated across migration + 2 SQL files + Gleam helper without a cross-layer sync guard",
+      "severity": "note",
+      "category": "maintainability",
+      "sources": ["architecture"],
+      "verification": "confirmed",
+      "location": "server/src/reference_checks/trigger.gleam:787-798",
+      "evidence": "Four copies of the 8-status terminal set: supabase/migrations/20260731222000_create_reference_call.sql:138-140 (idx_reference_call_live), insert_reference_call_if_absent.sql:28-32 and insert_reference_call_skipped.sql:24-28 (ON CONFLICT predicates), trigger.gleam is_terminal (787-798). server/test/reference_checks/schema_migration_test.gleam skipped_not_in_live_index_exclusion_test pins ONLY the migration index's NOT IN set.",
+      "detail": "The 8-status set is hand-copied into four layers; today all four match, but only the migration copy is pinned. A future status addition can silently desync live-slot semantics across layers.",
+      "recommended_fix": "Extend schema_migration_test (or a sibling) to read the two insert SQL files and assert their ON CONFLICT NOT IN set and trigger.is_terminal's output match the idx_reference_call_live predicate."
+    },
+    {
+      "title": "parse_app_uuids near-duplicates the existing private with_three_uuids helper",
+      "severity": "note",
+      "category": "coupling",
+      "sources": ["codebase"],
+      "verification": "confirmed",
+      "location": "server/src/reference_checks/trigger.gleam:716 vs server/src/application/application_detail_handler.gleam:37",
+      "evidence": "Both parse the same three path UUIDs with the same triple-case. with_three_uuids is private (fn, not pub) so cannot be imported; parse_app_uuids re-implements it with a brand-voice message ('That application link didn't look right.' vs 'Invalid ID format').",
+      "detail": "Third copy of the same triple-parse logic (the diff doc itself says it mirrors with_three_uuids). Low impact; DRY nicety for when a fourth caller appears.",
+      "recommended_fix": "If a fourth caller appears, promote the UUID-triple parse to a shared helper module and have both application_detail_handler and trigger consume it. Out of scope for RC2.3."
+    },
+    {
+      "title": "Spec task 'extend test_db.gleam truncate list for reference_call' — already satisfied by RC2.1 (REJECTED: false positive)",
+      "severity": "note",
+      "category": "coverage-gap",
+      "sources": ["blind"],
+      "verification": "rejected",
+      "location": "server/test/integration/test_db.gleam:80",
+      "evidence": "test_db.gleam line 80: 'TRUNCATE audit_log, acknowledgement_record, notification, inbound_email, document, ai_analysis, payment_terms_acceptance, payment, application_co_applicant, application_income_source, application, application_draft, vacancy_view, vacancy, landlord, storage_deletion_queue, processed_stripe_event, reference_call, reference_objection_log CASCADE' — reference_call already truncated (added by RC2.1).",
+      "detail": "Blind lens could not see beyond the diff; the truncate-list extension was already shipped when the table landed in RC2.1. No action needed.",
+      "recommended_fix": "None."
+    }
+  ]
+}

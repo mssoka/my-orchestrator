@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "test-validity",
+    "title": "draft_field helper unwraps query errors to \"\", so load-bearing resumed_at == \"\" assertions false-pass if the raw SQL breaks",
+    "location": "server/test/integration/draft_integration_test.gleam:39",
+    "evidence": "fn draft_field(db: pog.Connection, vacancy_id: String, column: String) -> String {\n  test_db.query_text(\n    db,\n    \"SELECT COALESCE(\" <> column <> \"::text, '') FROM application_draft\n     WHERE vacancy_id = '\" <> vacancy_id <> \"'::uuid\",\n  )\n  |> result.unwrap(\"\")\n}\n... and the load-bearing sites:\n  draft_field(db, vacancy_id, \"resumed_at\") |> should.equal(\"\")   (line 318)\n  draft_field(db, other_id, \"resumed_at\") |> should.equal(\"\")     (line 359)\n... with test_db.query_text mapping failures to Error: `|> result.map_error(fn(_) { \"Query failed\" })`",
+    "detail": "query_text returns Error on failure; unwrap(\"\") turns it into \"\". Lines 318 (prefetch no-stamp guard) and 359 (cross-vacancy no-stamp) assert equal(\"\") with no companion row-read guard, so a broken query (e.g. renamed column — raw SQL strings don't fail compilation) passes silently.",
+    "recommended_fix": "Make draft_field panic on query error (e.g. result.lazy_unwrap/expect with message) or use a non-empty sentinel, so equal(\"\") can only succeed from a real NULL column."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Exact cap boundaries unpinned: 64-char key, 120/121 entries, 4000/4001-char value never exercised",
+    "location": "server/test/application/draft_handler_test.gleam:41",
+    "evidence": "pub fn filter_fields_caps_key_count_and_length_test() {\n  let long_key = string.repeat(\"k\", 65)\n...\n    int.range(1, 200, [], fn(acc, i) { [#(\"field_\" <> pad(i), \"v\"), ..acc] })\n...\n    dict.from_list([#(\"personal_statement\", string.repeat(\"x\", 5000))])\n... against production guards: `const max_key_length = 64` / `&& string.length(key) <= max_key_length` / `|> list.take(max_field_keys)` (120) / `#(key, string.slice(value, 0, max_value_length))` (4000)",
+    "detail": "Tests pin only 65-dropped, 200→120, 5000→4000. Exactly-64 kept, 120 kept / 121 trimmed, and 4000 untouched / 4001 truncated are unpinned, so an off-by-one regression (<= to <, take(119), slice(0, 3999)) escapes detection.",
+    "recommended_fix": "Add boundary cases: a 64-char key survives; exactly 120 entries all kept and 121 trimmed to 120; a 4000-char value unchanged and 4001 truncated to 4000."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Cooldown pinned at 9 and 11 minutes only — exactly-at-10-minutes claim behaviour untested",
+    "location": "server/test/integration/draft_integration_test.gleam:891",
+    "evidence": "  stamp(\"9 minutes\")\n  let assert Ok(cooling) =\n    app_sql.claim_continue_link_send(db, uuid, \"tenant@example.com\", \"t\")\n  list.length(cooling.rows) |> should.equal(0)\n  // 11 minutes ago → the window has passed.\n  stamp(\"11 minutes\")\n... against the SQL: `OR last_link_sent_at < now() - interval '10 minutes'`",
+    "detail": "The claim uses a strict `<` comparison, so a stamp exactly 10 minutes old is still on cooldown — but no test pins the boundary, so a drift to `<=` (or an off-by-one interval) would go uncaught.",
+    "recommended_fix": "Optionally assert the boundary with a stamp of '10 minutes' (or '10 minutes 1 second' / '9 minutes 59 seconds') documenting the strict-< semantics."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "resume_on_closed_vacancy test asserts only absence of resume markers — a blank or wrong 200 page passes",
+    "location": "server/test/integration/draft_integration_test.gleam:766",
+    "evidence": "  resp.status |> should.equal(200)\n  let body = simulate.read_body(resp)\n  body\n  |> string.contains(\"data-apply-page=\\\"form-resume\\\"\")\n  |> should.be_false\n  body |> string.contains(\"draft-resume-banner\") |> should.be_false\n... while the closed page carries positive markers: `attribute(\"data-testid\", \"closed-vacancy-notice\"),` and `html.text(\"Applications have closed\")`",
+    "detail": "Status 200 plus two negative substring checks would also pass for an empty body, an error page rendered with 200, or the wrong template. The closed-vacancy page's own testid/copy is available but never asserted.",
+    "recommended_fix": "Assert a positive marker of the closed page, e.g. body contains \"closed-vacancy-notice\" or \"Applications have closed\"."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Erasure-confirm GET with an unknown/forged token never exercised — only the valid-token confirm and the replay-POST 404 are pinned",
+    "location": "server/test/integration/draft_integration_test.gleam:491",
+    "evidence": "  // GET renders the confirm page (prefetch-safe)…\n  let get_req =\n    simulate.request(http.Get, \"/apply/\" <> code <> \"/draft-erasure/\" <> token)\n  ...\n  |> string.contains(\"draft-erasure-confirm-form\")\n... while handle_erasure_confirm has a distinct lookup-failure arm: `case lookup_draft(req, config, code, token) {\n        Error(resp) -> resp`",
+    "detail": "The uniform-404 contract is pinned for resume (resume_with_unknown_token_is_uniform_404_test) and for the erasure POST replay, but the erasure-confirm GET's bad-token path — the link a mail-scanner or attacker actually probes — has no test.",
+    "recommended_fix": "Add a GET draft-erasure test with an unknown token asserting 404 and the draft-not-found marker, mirroring resume_with_unknown_token_is_uniform_404_test."
+  }
+]

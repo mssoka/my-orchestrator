@@ -1,0 +1,1810 @@
+You are reviewing a code diff. You have read-only access to the repository and may verify the diff's claims against the actual codebase using your available tools.
+
+--- PROJECT CONVENTIONS ---
+Read /Users/moses/.herdr/worktrees/RightTenantry/perkins-form-save-resume-f3-r4/AGENTS.md in full before reviewing — it is the project's standing convention doc (no `let assert` in production code, no JavaScript FFI, explicit httpc timeouts, Squirrel-only SQL, landlord-centric copy voice, backward-compatibility contracts, naming and testing conventions). Treat it as loaded conventions for every judgment below.
+
+--- CONTEXT ---
+This is chunk 1 of 3 — non-server files (.gitignore, .memlog.md, _bmad-output spec doc, scripts/js-tests, server/priv/static JS+CSS, supabase migration) of one PR diff (RightTenantry PR #563, "feat: application save-and-resume (F3) + reminder continue-link", reviewed sha d3f7700c6b62c0bfbbf1fac3024ad9ad9df3e930). The full PR was chunked by file group for review; review ONLY the diff bytes below, but you may read ANY file in the worktree at /Users/moses/.herdr/worktrees/RightTenantry/perkins-form-save-resume-f3-r4 (a checkout at exactly the reviewed sha) to verify claims. Findings outside this chunk's files will be handled by another reviewer — do not report them.
+
+Spec / context docs (read them before judging):
+- Original job briefing (your spec): /Users/moses/code/_bmad-output/briefings/righttenantry-form-save-resume-f3.md
+- Spec of record it names: /Users/moses/.herdr/worktrees/RightTenantry/perkins-form-save-resume-f3-r4/_bmad-output/planning-artifacts/problem-solving-application-form-completion-2026-07-31.md — the F3 row of the Generated Solutions table, Solution Analysis, Recommended Solution (Wave 1 build pack), Risk Mitigation (incl. the draft data-protection row), and the E2 reminder row are the load-bearing sections.
+
+--- DIFF ---
+diff --git a/.gitignore b/.gitignore
+index a5720b54..77ab3aba 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -35,6 +35,7 @@ server/priv/static/*
+ !server/priv/static/form.js
+ !server/priv/static/apply_analytics.js
+ !server/priv/static/form_stepper.js
++!server/priv/static/form_draft.js
+ !server/priv/static/consent.js
+ !server/priv/static/favicon.ico
+ !server/priv/static/favicon-32.png
+diff --git a/.memlog.md b/.memlog.md
+index 49dcb72b..26696785 100644
+--- a/.memlog.md
++++ b/.memlog.md
+@@ -1,8 +1,11 @@
+ ---
+-updated: 2026-07-31T21:59
++updated: 2026-08-02T16:14
+ ---
+ 
+ - (note by minion form-completion-ps) form-completion-ps: diagnosed 70 Meadowgate 11% invite→completion. Root cause: single-sitting, documents-in-hand form vs multi-session mobile journey (mandatory third-party letters, no save-resume, 'few minutes' promise). Evidence: prod DB aggregates (73 enquirers, 8 apps, 26.6h median lag, ~3% reminder recovery) + Herald PostHog (129 loads, 80% mobile, median 88s on page, email channel works). Moses rulings: target 20-30%; bold changes OK; letters LOCKED (B1 letters-later parked + flagged for compliance re-review). Plan: I1 instrumentation + copy pack (invite/header/reminders) + F1 stepper + F3 save-resume + backlog re-activation to the 66. Artifact: _bmad-output/planning-artifacts/problem-solving-application-form-completion-2026-07-31.md
+ - sprint-status-refcheck-v1.yaml generated: 5 epics (RC1-RC5), 18 stories, all backlog; retros optional; sibling to canonical sprint-status.yaml
+ - added dependency_notes + external_gates sections beyond stock format per briefing (ComReg/Twilio/counsel/Cloudflare gates as notes, not stories)
+ - lavish review 2026-07-31: user said proceed; mermaid diagram in review HTML failed to render (syntax error — HTML entities in labels) — YAML deliverable unaffected
++- perkins r1 addressed: B1 origin-poisoning fixed via build_entity_url(vacancy.origin_domain); W1 tokens mint at save; W3 erasure tombstone (suppression key); W4 archive keeps drafts; W5 500/vacancy cap; W6 3/hr cross-vacancy email bound; W2 wiring pinned via _initBrowser(env); 377 int + 1171 unit + 97 js green
++- perkins r2: detached window.setTimeout broke the debounced save in real browsers (Illegal invocation) — wrap host timers at every seam + brand-checked-timers pin; N14 sent-flag oracle removed (uniform ok:true); N1 spec POST fix
++- perkins r3 (final): resume token moved off DOM (autocapture attr__ leak) to CSP-nonced inline global + recursive sanitize key-scrub; 413 envelope treated as failure in continue-button; brand-check pin covers clearTimeout seam
+diff --git a/_bmad-output/implementation-artifacts/spec-form-save-resume-f3.md b/_bmad-output/implementation-artifacts/spec-form-save-resume-f3.md
+new file mode 100644
+index 00000000..4d74dfb4
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-form-save-resume-f3.md
+@@ -0,0 +1,297 @@
++---
++title: 'F3 application save-and-resume + reminder continue-link'
++type: 'feature'
++created: '2026-08-02'
++status: 'done'
++baseline_commit: 'b9bef7b112095dac0ffc9da1dff0b5323238d90e'
++review_loop_iteration: 0
++context: []
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** The /apply form loses multi-session applicants: mandatory third-party reference letters take days to gather, but nothing persists before the final POST, so leaving is a dead end (root cause C2 of the 2026-07-31 completion session). Reminder stage-2 also still points at a blank form.
++
++**Approach:** Email-keyed server-side drafts saved (debounced) on stepper section change; a tokenized "Email me a link to continue" magic link (existing Resend path) restoring draft values into the SSR form; drafts expire at vacancy close via the retention job and carry a self-service erasure path; reminder stage-2 CTA becomes the per-recipient continue-link when a draft exists.
++
++Spec of record: `_bmad-output/planning-artifacts/problem-solving-application-form-completion-2026-07-31.md` (F3 row, risk table, success metrics). F1 stepper is MERGED (PR #561): `rt:form-step-changed` CustomEvent `{step_index, section_id, total}` fires on every user step change from `form_stepper.js` — that is the save hook.
++
++## Boundaries & Constraints
++
++**Always:**
++- No documents in drafts — field values only; files transmit only at the final POST (schema-verifiable: no content/storage-path columns).
++- No per-keystroke writes — debounce the step-change event; plus a `pagehide` beacon flush.
++- Never store the GDPR consent checkbox, honeypot (`_website`), or timing (`_form_loaded_at`) fields.
++- New endpoints are public (`is_public_path` + CSRF `should_skip` + `redact_token_route` arms) and must not weaken the `/apply/:code` contract or existing W0/F1 analytics events.
++- New applicant-facing copy lives in `application/form_copy.gleam`, brand voice (calm, specific; never "Error/Failed").
++- Migration is expand-only, applied ONLY to the local/test DB (never staging/prod); Squirrel codegen against the local test DB (field-notes trap: never `run_squirrel.sh` — it sources .env → staging).
++- Draft keyed `(vacancy_id, lower(email))`; the 288-bit `continue_token` (`wisp.random_string(48)`) IS the auth, same model as `application.erasure_token`.
++- On final submit, strip the matching draft (fields→`{}`, token→NULL, `submitted_at` set) — best-effort (fail-open, logged), never blocks submission.
++
++**Ask First:**
++- Deleting drafts immediately on manual vacancy close (default: daily retention sweep covers all closes) or adding Cloudflare edge rate-limit rules (Terraform) for the new endpoints.
++
++**Never:**
++- Never run migrations/Squirrel against staging/prod; never touch `.env`.
++- Never persist file data, file names-as-content, or storage paths in the draft.
++- Never leak whether a token/email exists (uniform friendly 404 on bad token; continue-link returns 200 regardless of send outcome).
++- No JS-FFI in Gleam; browser code is a plain static asset mirroring `apply_analytics.js`'s IIFE + CommonJS-export test pattern.
++- No changes to existing W0/F1 event shapes — additive only.
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| Save | `rt:form-step-changed`, email filled | Debounced `PUT|POST /apply/:code/draft` upserts `(vacancy, email)`; first success fires PostHog `application_draft_saved` | Save failure silent (form still works); invalid/missing email → no save |
++| Tab close mid-section | pagehide with dirty state | `navigator.sendBeacon` flush | Best-effort; no retry |
++| Continue link | click "Email me a link to continue", valid email | Draft upserted, token ensured, Resend email with continue + erasure URLs; UI confirms "link sent" | <10 min since `last_link_sent_at` → 200, no email (cooldown); Resend down → friendly inline copy, draft kept |
++| Resume | GET `/apply/:code/resume/:token` | SSR form pre-filled from `fields`, restored banner, stepper starts at first incomplete section, `resumed_at` set once, PostHog `application_draft_resumed` | Unknown token → friendly 404; vacancy closed → existing closed page |
++| Resume + documents | draft restored | File inputs empty; documents step still gates — applicant re-attaches; banner copy says so | N/A |
++| Submit after resume | valid POST | Application inserted; draft stripped + `submitted_at` set | Strip fails → log only |
++| Expiry | vacancy closed or `closes_at` passed | Daily retention sweep deletes its drafts | Sweep failure logs + Sentry like other phases |
++| Erasure | GET+POST `/apply/:code/draft-erasure/:token` (link in continue email) | Confirm page → POST deletes → confirmation | Bad token → same friendly 404 |
++| Abuse | continue-link with victim email; oversize/odd payloads | Per-draft 10-min cooldown bounds sends; uniform 200; 64 KB body cap; server field-key filter | Reject oversize with 413 |
++| No-JS | form without JS | Long form, one POST, honest one-visit line stays (JS swaps copy only when saver active) | N/A |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `server/priv/static/form_stepper.js` — `rt:form-step-changed` hook; `firstErrorIndex` is the template for first-incomplete-section start
++- `server/priv/static/apply_analytics.js` — marker-driven events; add `form-resume` arm
++- `server/src/application/application_handler.gleam` — GET/POST `/apply/:code`; `prepare_and_insert_application` (draft-strip hook)
++- `server/src/application/form_pages.gleam` — `view_form_with_errors` = values-threading template for the resume page
++- `server/src/application/form_view.gleam` — `view_prep_block` F3-SEAM comment; script tags
++- `server/src/application/form_copy.gleam` — applicant-facing copy home
++- `server/src/notification/email_client.gleam` — `send_email_with_tags`, `build_reminder_stage2_html` (E2 seam), wrapper/cta helpers
++- `server/src/inbound_email/inbound_handler.gleam` — `send_reminders_background` (per-recipient continue-URL lookup)
++- `server/src/erasure/erasure_handler.gleam` + `erasure_view.gleam` — token-confirm/delete pattern to mirror
++- `server/src/retention/retention_job.gleam` + `retention/sql/` — sweep-phase pattern (`sweep_inbound_emails` template)
++- `server/src/middleware.gleam` (`is_public_path`, `redact_token_route`, `evaluate_body_size`), `server/src/auth/csrf.gleam` (`should_skip`), `server/src/router.gleam`
++- `server/src/application/sql/` — Squirrel home (timestamptz `::text` rules); `supabase/migrations/`
++- `scripts/js-tests/`, `server/test/integration/` (+`test_db.gleam` helpers)
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `supabase/migrations/<ts>_create_application_draft.sql` — `application_draft(id uuid PK DEFAULT gen_random_uuid(), vacancy_id uuid NOT NULL REFERENCES vacancy(id) ON DELETE CASCADE, email text NOT NULL, fields jsonb NOT NULL DEFAULT '{}', continue_token text NULL, last_link_sent_at timestamptz NULL, resumed_at timestamptz NULL, submitted_at timestamptz NULL, created_at/updated_at timestamptz NOT NULL DEFAULT now(), UNIQUE(vacancy_id, email))` + partial unique index on `continue_token WHERE NOT NULL`; email stored lowercased
++- [x] `server/src/application/sql/*.sql` + Squirrel vs LOCAL test DB — upsert_draft, get_draft_by_continue_token, touch_last_link_sent, mark_resumed, strip_on_submit, delete_by_token, delete_expired
++- [x] `server/src/application/draft_handler.gleam` — `PUT|POST /apply/:code/draft` (JSON upsert; email validate; field filter: drop `_`-prefixed + `gdpr_consent`; ≤120 keys, key ≤64, value ≤4000 chars) · `POST /apply/:code/continue-link` (upsert + token + cooldown send, uniform 200) · `GET /apply/:code/resume/:token` (resume page, `resumed_at` once) · `GET`/`POST /apply/:code/draft-erasure/:token` (confirm → delete, mirroring erasure_handler)
++- [x] `server/src/application/draft_view.gleam` — resume banner ("Welcome back… documents need re-attaching"), erasure confirm/confirmation pages, friendly 404
++- [x] `server/src/application/form_pages.gleam` + `form_view.gleam` — `view_resume_page` (values threaded, empty errors, `data-apply-page="form-resume"`, banner); pristine + resume pages load `form_draft.js`; F3-SEAM prep-note line swapped for JS-active copy
++- [x] `server/src/notification/email_client.gleam` — `build_continue_draft_html` + `send_draft_continue_link` (tag `application_draft_continue`; continue + erasure URLs; "expires when the vacancy closes"); extend `build_reminder_stage2_html` with `continue_url: String` ("" = today's behaviour; non-empty → CTA "Continue where you left off")
++- [x] `server/src/inbound_email/inbound_handler.gleam` — stage-2 send: per-recipient draft lookup → continue URL into `build_reminder_stage2_html`
++- [x] `server/priv/static/form_draft.js` — IIFE + CommonJS exports; step-change listener + 800 ms debounce; serializer (skip file/hidden/`_`-prefixed/`gdpr_consent`); `fetch` POST (PUT also routed) + `sendBeacon` pagehide flush; inject continue-link button + result copy into prep block; swap prep-note to save-and-continue promise when active
++- [x] `server/priv/static/form_stepper.js` — `shouldActivate("form-resume")`; start at `firstIncompleteIndex` (mirrors `firstErrorIndex`)
++- [x] `server/priv/static/apply_analytics.js` — `form-resume` arm: fire `application_draft_resumed`, suppress section funnel (as form-errors)
++- [x] `server/src/middleware.gleam` + `server/src/auth/csrf.gleam` — public/CSRF-skip/redact arms for the 4 new path shapes; `evaluate_body_size`: draft + continue-link writes → 64 KB, CL required, TE rejected
++- [x] `server/src/router.gleam` — routes before SPA catch-all
++- [x] `server/src/retention/retention_job.gleam` + `retention/sql/delete_expired_application_drafts.sql` — `sweep_application_drafts` phase (fail-open + Sentry pattern), `RunSummary.drafts_expired`
++- [x] `server/src/application/application_handler.gleam` — strip matching draft after successful insert (fail-open)
++- [x] Tests — JS: `scripts/js-tests/form_draft.test.js` (serializer/debounce/beacon/copy-swap), extend `form_stepper.test.js` + `apply_analytics.test.js`; server unit: email builders, field filter, middleware/body-size arms; integration: `server/test/integration/draft_integration_test.gleam` (round-trip, resume-once, strip-on-submit, expiry sweep, erasure, unique key)
++
++**Acceptance Criteria:**
++- Given a started form with email, when the applicant changes section, then a debounced upsert persists field values (no files, no consent, no `_`-fields) verifiable in the DB.
++- Given a saved draft, when the applicant requests a link and opens it, then the form renders pre-filled at the first incomplete section with the restored banner, `resumed_at` set, documents empty.
++- Given a resumed draft, when the applicant submits successfully, then the application inserts and the draft is stripped with `submitted_at` set.
++- Given a closed/expired vacancy, when the retention job runs, then its drafts are deleted; given a continue email, when the applicant uses the erasure link, then the draft is deleted after confirmation.
++- Given a stage-2 reminder to an enquirer with a draft, when the email builds, then its CTA is the tokenized continue-link; without a draft it stays the plain application URL.
++- Given no JS, the prep block keeps the one-visit line and the form submits as today; given JS, it promises save-and-continue.
++- `make test` and `make test-integration` green.
++
++## Spec Change Log
++
++- **2026-08-02, review round 1 (Blind Hunter + Edge Case Hunter, 13 actionable findings):**
++  all classified `patch` and fixed in place (no loopback — no intent gaps,
++  no spec deviations beyond the two semantic refinements noted below).
++  Fixed: form_draft.js missing from .gitignore whitelist (blocker — would
++  not have shipped); node_modules symlink staged (unstaged + excluded);
++  failed Resend send consuming the 10-min cooldown (new
++  clear_last_link_sent.sql, mirrors inbound stamp-clearing); PostHog
++  $pageview leaking the 288-bit resume token (sanitize_properties scrub in
++  the apply snippet); sub-2s resumed submit falling into the
++  fake-confirmation black hole (resume render backdates _form_loaded_at 10s
++  + form.js no longer clobbers it on form-resume); empty-fields PUT wiping
++  drafts (guard on both save + continue-link); continue-link sending a
++  stale-state email when its own upsert fails (aborts before claim); client
++  reading the closed-vacancy 200 as success (body.ok check + saver
++  disables); stage-2 N+1 draft lookups (single prefetch +
++  list_resumable_draft_tokens.sql); erasure confirm canonical carrying the
++  token (now the apply path); upsert resurrecting stripped drafts after a
++  late beacon (ON CONFLICT ... WHERE submitted_at IS NULL); archived
++  vacancies escaping the expiry sweep (OR archived_at IS NOT NULL).
++  **Semantic refinement 1 (metric honesty):** `resumed_at` is stamped on
++  the applicant's first post-resume SAVE (re-engagement), not on the resume
++  GET — mail-scanner prefetches would otherwise inflate the drafts-resumed
++  funnel (same reason erasure is GET-confirm + POST-delete). The resume
++  page carries the token in `data-resume-token`; the saver includes it in
++  the payload. The frozen I/O matrix's "resumed_at set once" still holds
++  (COALESCE); WHEN it sets moved from render to re-engagement.
++  **Semantic refinement 2 (email copy):** the shared requirements checklist
++  (invite/auto-reply/reminder-1/reminder-2) loses the one-visit rule for
++  the save-and-continue promise — the F3-SEAM seam's spirit applied to the
++  email half of the same claim.
++  KEEP: the debounced step-change save hook (F1's rt:form-step-changed),
++  the token-as-auth model, uniform-200/404 no-leak responses, the
++  strip-on-submit contract, and all pinned tests.
++  **Rejected:** two-tabs-stale-beacon overwrite (last-writer-wins is
++  acceptable at this scale; revision timestamps are over-engineering).
++
++- **2026-08-02, Perkins round 1 (B1 + W1–W11; all verified against source, all fixed):**
++  B1 (blocker, exfiltration): emailed capability URLs now build from
++  `vacancy.origin_domain` via `email_client.build_entity_url` — never the
++  request origin (`canonical_origin` trusts any *.run.app X-Forwarded-Host;
++  on a public endpoint that ships the victim's genuine Resend email with
++  their live token to an attacker's domain). canonical_origin stays for
++  response-local SSR pages only.
++  W1: tokens mint at SAVE time (upsert arg 4, COALESCE keeps existing) —
++  the auto-save cohort is reachable by the stage-2 continue-link (frozen AC
++  restored). W3: erasure is a tombstone (fields/token wiped, erased_at set,
++  email kept as suppression record until vacancy close + disclosed on the
++  confirm page) — a still-open tab can no longer resurrect erased PII.
++  W4: archive no longer sweeps drafts (restorable; the emailed promise is
++  "until the vacancy closes"). W5: per-vacancy 500-draft cap (existing
++  pairs update past the cap). W6: cross-vacancy fan-out bound (3 continue
++  emails/recipient/hour). W7/W8/W9: wiring pinned (real handle_post_form
++  strip, list_resumable filters, closed-vacancy resume). W10: upload-slot
++  names dropped by the server filter (name-level no-documents guarantee).
++  W11: form.js resume-guard pinned (form.test.js). W2: wiring pinned at
++  node level via exported _initBrowser(env) (form_draft_wiring.test.js);
++  phantom bug-hunt scenario claim corrected (the harness can't read email —
++  the round-trip stays manual E2E per Resend precedent).
++  Notes fixed: N2,N3,N4,N5 (updated_at trigger convention),N8,N9,N13,N15,
++  N16,N17,N19,N20,N21,N23,N24,N25,N26. Replies-only: N1 (POST beside PUT is
++  the beacon), N6/N7 (triplication/preamble — refactor follow-up), N11
++  (beacon-stamp = human-only, scanners don't run JS), N12 (accepted,
++  documented), N14 (upsert-first makes sent:true non-oracular), N18
++  (contract pinned via N9), N22 (test-helper convention), N27 (covered by
++  handler tests + manual E2E).
++  KEEP: the B1-safe token model itself, tombstone-not-delete, mint-at-save,
++  and every pinned test.
++
++- **2026-08-02, Perkins round 2 (B1 verified empirically in Chromium + N14/N1 rebuttals overturned):**
++  B1: detached `window.setTimeout`/`clearTimeout` refs threw
++  "Illegal invocation" in every real browser — the debounced save (the
++  feature's core mechanism) never scheduled; only the pagehide beacon
++  persisted drafts. Node couldn't catch it (no brand check). Both timer
++  call sites now WRAP the host functions; a brand-checked-timers wiring
++  test pins the regression. LESSON: a saved host-function reference is
++  never safe to invoke unbound in browser JS — wrap at the seam.
++  N14 (my r1 rebuttal was wrong): the continue-link response no longer
++  carries a `sent` flag — an empty-fields poll (skips upsert by design)
++  could otherwise watch a victim's draft flip to submitted. Response is
++  ok:true on every claim outcome, ok:false only on Resend failure.
++  N1: spec text corrected — the fetch save is POST (PUT also routed; the
++  beacon is POST-only).
++  KEEP: wrapped-timer discipline, the no-oracle response contract.
++
++- **2026-08-02, Perkins round 3 (final; r2 fixes re-verified empirically — one new blocker + one warning):**
++  Blocker (autocapture leak): the resume token no longer sits in ANY DOM
++  attribute — PostHog autocapture reads element attributes into
++  $elements_chain (attr__data-resume-token) and the URL regex never saw it.
++  The token now reaches the saver via a CSP-nonced inline-script global
++  (`window.__rtResumeToken`, unsafe_raw_html + nonce placeholder, URL-safe
++  charset), and sanitize_properties grew a recursive key-scrub
++  (/resume-token/i on any property key, any depth) as belt-and-braces.
++  Warning (413 envelope): the continue-button chain now treats any non-2xx
++  or non-ok:true body as failure — the generic 413 envelope lacks ok:false
++  and previously rendered "Link sent" + phantom application_draft_saved on
++  rejected payloads.
++  Note (3 lenses): the brand-check pin now drives the clearTimeout seam too
++  (re-trigger clear+reschedule and pagehide cancel under brand-checked refs).
++  LESSON: a capability token belongs in exactly two places — the URL path
++  (scrubbed) and JS memory — never in the DOM.
++
++## Design Notes
++
++- A dedicated `view_resume_page` (not `view_form_with_errors(errors: [])`) keeps the analytics marker honest; the resume page suppresses the section funnel like form-errors (pre-filled values would fake completions) and fires `application_draft_resumed` instead.
++- Cooldown (10 min on `last_link_sent_at`) is the server-side abuse bound; a Cloudflare edge rule is a documented follow-up, not this PR.
++- Squirrel trap (field notes): own docker test DB on a free port, `TEST_DB_PORT` for `scripts/reset-test-db.sh`, then `cd server && DATABASE_URL=postgresql://test:test@localhost:<port>/righttenantry_test gleam run -m squirrel`; revert whitespace churn in `server/src/ai/sql.gleam` afterwards.
++
++## Verification
++
++**Commands:**
++- `make format && make test && make build` — all green (includes `node --test scripts/js-tests/*.test.js`)
++- `TEST_DB_PORT=<own> bash scripts/reset-test-db.sh && cd server && TEST_DATABASE_URL=postgresql://test:test@localhost:<port>/righttenantry_test gleam test -- --tag integration` — draft + retention integration tests pass
++- `psql <test-db> -c '\d application_draft'` — no file-content columns; unique `(vacancy_id, email)`
++
++**Manual checks (if no CLI):**
++- `make dev` → start form → change steps → row appears; request link → resume in fresh browser → state restored, banner shown, stepper at first incomplete section.
++
++## Suggested Review Order
++
++**Entry point & draft contract**
++
++- The whole feature in one handler: save, continue-link, resume, erasure.
++  [`draft_handler.gleam:141`](../../server/src/application/draft_handler.gleam#L141)
++
++- What may never persist: server-side field filter (consent, internals, caps).
++  [`draft_handler.gleam:78`](../../server/src/application/draft_handler.gleam#L78)
++
++- Schema: field values only (no document columns), token model, cascade.
++  [`20260802120000_create_application_draft.sql`](../../supabase/migrations/20260802120000_create_application_draft.sql)
++
++- Upsert never resurrects a submitted (stripped) draft.
++  [`upsert_application_draft.sql`](../../server/src/application/sql/upsert_application_draft.sql)
++
++**Save path (client)**
++
++- Debounced step-change saver + pagehide beacon + continue button; the never-leave-the-page contract.
++  [`form_draft.js`](../../server/priv/static/form_draft.js)
++
++- F1 seam consumed: resume start = first incomplete section.
++  [`form_stepper.js:274`](../../server/priv/static/form_stepper.js#L274)
++
++**Continue link & emails**
++
++- Atomic cooldown claim (mint + stamp in one UPDATE) and its send-failure release.
++  [`claim_continue_link_send.sql`](../../server/src/application/sql/claim_continue_link_send.sql)
++  [`clear_last_link_sent.sql`](../../server/src/application/sql/clear_last_link_sent.sql)
++
++- Continue email (continue + erasure URLs, expiry-at-close promise); stage-2 CTA variant.
++  [`email_client.gleam:564`](../../server/src/notification/email_client.gleam#L564)
++
++- E2 seam: one prefetch, per-recipient continue-URL for draft holders.
++  [`inbound_handler.gleam:822`](../../server/src/inbound_email/inbound_handler.gleam#L822)
++
++**Resume render & its three traps**
++
++- Marker, banner, data-resume-token, backdated timing stamp.
++  [`form_pages.gleam:387`](../../server/src/application/form_pages.gleam#L387)
++
++- form.js must not clobber the deliberate backdate on form-resume.
++  [`form.js:9`](../../server/priv/static/form.js#L9)
++
++- PostHog sanitize: capability tokens never reach the analytics store.
++  [`form_view.gleam:278`](../../server/src/application/form_view.gleam#L278)
++
++- resumed_at stamps on re-engagement save, never on the prefetch-able GET.
++  [`draft_handler.gleam:358`](../../server/src/application/draft_handler.gleam#L358)
++
++**Lifecycle & perimeter**
++
++- Strip-on-submit hook (fail-open) after a successful insert.
++  [`application_handler.gleam:2025`](../../server/src/application/application_handler.gleam#L2025)
++
++- Expiry sweep phase: closed, archived, or past closes_at.
++  [`retention_job.gleam:314`](../../server/src/retention/retention_job.gleam#L314)
++  [`delete_expired_application_drafts.sql`](../../server/src/retention/sql/delete_expired_application_drafts.sql)
++
++- Public-path / CSRF / token-redaction / 64 KB body arms.
++  [`middleware.gleam:459`](../../server/src/middleware.gleam#L459)
++  [`router.gleam:787`](../../server/src/router.gleam#L787)
++
++**Tests**
++
++- Handler+SQL round-trip, cooldown, resume, erasure, expiry, cascade.
++  [`draft_integration_test.gleam`](../../server/test/integration/draft_integration_test.gleam)
++
++- Serializer/debounce/contract pins; stepper + analytics additions.
++  [`form_draft.test.js`](../../scripts/js-tests/form_draft.test.js)
++
++- Field-filter + middleware/body-size/email builder pins.
++  [`draft_handler_test.gleam`](../../server/test/application/draft_handler_test.gleam)
++  [`middleware_test.gleam`](../../server/test/middleware/middleware_test.gleam)
++  [`email_client_test.gleam`](../../server/test/notification/email_client_test.gleam)
+diff --git a/scripts/js-tests/apply_analytics.test.js b/scripts/js-tests/apply_analytics.test.js
+index fb013bc3..cae7eef3 100644
+--- a/scripts/js-tests/apply_analytics.test.js
++++ b/scripts/js-tests/apply_analytics.test.js
+@@ -107,6 +107,12 @@ test("outcomeEvent disambiguates submit vs error vs reload vs spam", () => {
+   assert.equal(analytics.outcomeEvent("confirmation"), E.confirmation);
+   assert.equal(analytics.outcomeEvent("duplicate"), E.duplicate);
+   assert.equal(analytics.outcomeEvent("form-errors"), E.submitFailed);
++  assert.equal(
++    analytics.outcomeEvent("form-resume"),
++    E.draftResumed,
++    "F3: a restored draft is its own page outcome (and its outcome branch is\n" +
++      "what keeps pre-filled values out of the section funnel)",
++  );
+   assert.equal(
+     analytics.outcomeEvent("form"),
+     null,
+@@ -121,6 +127,23 @@ test("outcomeEvent disambiguates submit vs error vs reload vs spam", () => {
+   assert.equal(analytics.outcomeEvent(null), null);
+ });
+ 
++test("F3 draft event names are pinned (DB + PostHog metric contract)", () => {
++  const E = analytics.EVENTS;
++  assert.equal(E.draftResumed, "application_draft_resumed");
++  assert.equal(E.draftSaved, "application_draft_saved");
++  assert.equal(E.domDraftSaved, "rt:draft-saved");
++});
++
++test("cross-file DOM event contract: producer and consumer names agree", () => {
++  // form_draft.js dispatches; apply_analytics.js listens. A drift between
++  // these two strings silently kills application_draft_saved.
++  const producer = require("../../server/priv/static/form_draft.js");
++  assert.equal(producer.EVENT_DRAFT_SAVED, analytics.EVENTS.domDraftSaved);
++  // The stepper's step-changed event is the saver's trigger.
++  const stepper = require("../../server/priv/static/form_stepper.js");
++  assert.equal(stepper.EVENT_STEP_CHANGED, producer.EVENT_STEP_CHANGED);
++});
++
+ // ---------- Minimal DOM for section rules ----------
+ 
+ let idSeq = 0;
+diff --git a/scripts/js-tests/form.test.js b/scripts/js-tests/form.test.js
+new file mode 100644
+index 00000000..35bae2be
+--- /dev/null
++++ b/scripts/js-tests/form.test.js
+@@ -0,0 +1,56 @@
++// Pins form.js's resume-guard: the anti-spam timing IIFE must NOT overwrite
++// the SSR-backdated _form_loaded_at on the F3 resume render (a restored
++// draft can honestly submit inside the <2s suspicion window — the 288-bit
++// token is the abuse proof there). Reverting the guard silently re-opens
++// the fake-confirmation black hole for honest resumed submits.
++//
++// form.js runs its IIFEs at require time against globals, so each case
++// installs a fresh fake document/window and evicts the require cache.
++
++const { test } = require("node:test");
++const assert = require("node:assert/strict");
++
++const FORM_JS = require.resolve("../../server/priv/static/form.js");
++
++function fakeDocument(marker, fieldValue) {
++  const field = { name: "_form_loaded_at", value: fieldValue };
++  return {
++    field,
++    body: {
++      getAttribute: (k) => (k === "data-apply-page" ? marker : null),
++    },
++    readyState: "complete",
++    querySelector: (sel) =>
++      sel === 'input[name="_form_loaded_at"]' ? field : null,
++    querySelectorAll: () => [],
++    createElement: () => ({ style: {}, setAttribute() {}, appendChild() {} }),
++    addEventListener: () => {},
++  };
++}
++
++function loadWith(doc) {
++  global.document = doc;
++  global.window = global;
++  delete require.cache[FORM_JS];
++  require(FORM_JS);
++}
++
++test("resume render keeps the server's backdated timing stamp", () => {
++  const doc = fakeDocument("form-resume", "1000000000000");
++  loadWith(doc);
++  assert.equal(doc.field.value, "1000000000000");
++});
++
++test("pristine form refreshes the stamp to the real load time", () => {
++  const doc = fakeDocument("form", "1");
++  const before = Date.now();
++  loadWith(doc);
++  const stamped = parseInt(doc.field.value, 10);
++  assert.ok(stamped >= before, "stamp refreshed to Date.now()");
++});
++
++test("error re-render refreshes the stamp (unchanged behaviour)", () => {
++  const doc = fakeDocument("form-errors", "1");
++  loadWith(doc);
++  assert.notEqual(doc.field.value, "1");
++});
+diff --git a/scripts/js-tests/form_draft.test.js b/scripts/js-tests/form_draft.test.js
+new file mode 100644
+index 00000000..b43ea470
+--- /dev/null
++++ b/scripts/js-tests/form_draft.test.js
+@@ -0,0 +1,244 @@
++// Unit tests for server/priv/static/form_draft.js — run with
++// `node --test scripts/js-tests/*.test.js` (wired into `make test` as test-js).
++//
++// Pins the F3 draft contract: what may NEVER leave the page (files, the
++// consent checkbox, _-prefixed internals), the serializer's value semantics
++// (radios/checkboxes/email), the activation gate, and the debounce that
++// stands between the stepper's step-changed event and the "no per-keystroke
++// writes" rule. The browser choreography (fetch save, pagehide beacon,
++// continue-button flow, prep-note swap, capability gate) is pinned at node
++// level in form_draft_wiring.test.js via the exported _initBrowser(env)
++// seam; the full email round-trip is manual E2E (Resend sends are never
++// automated — repo precedent).
++
++const { test } = require("node:test");
++const assert = require("node:assert/strict");
++
++const draft = require("../../server/priv/static/form_draft.js");
++
++// ---------- Control factories ----------
++
++function ctl(overrides = {}) {
++  return {
++    name: "first_name",
++    type: "text",
++    value: "Moses",
++    disabled: false,
++    checked: false,
++    ...overrides,
++  };
++}
++
++function formOf(controls) {
++  return { elements: controls };
++}
++
++// ---------- Activation ----------
++
++test("shouldActivate covers pristine, resume, and error renders only", () => {
++  assert.equal(draft.shouldActivate("form"), true);
++  assert.equal(draft.shouldActivate("form-resume"), true);
++  assert.equal(draft.shouldActivate("form-errors"), true);
++  assert.equal(draft.shouldActivate("confirmation"), false);
++  assert.equal(draft.shouldActivate("duplicate"), false);
++  assert.equal(draft.shouldActivate(null), false);
++});
++
++// ---------- Email plausibility ----------
++
++test("validEmail accepts ordinary addresses, trims whitespace", () => {
++  assert.equal(draft.validEmail("tenant@example.com"), true);
++  assert.equal(draft.validEmail("  tenant@example.ie "), true);
++});
++
++test("validEmail rejects the near-misses that must not gate a save", () => {
++  assert.equal(draft.validEmail(""), false);
++  assert.equal(draft.validEmail("tenant"), false);
++  assert.equal(draft.validEmail("tenant@"), false);
++  assert.equal(draft.validEmail("tenant@example"), false);
++  assert.equal(draft.validEmail("two words@example.com"), false);
++  assert.equal(draft.validEmail(undefined), false);
++});
++
++// ---------- The never-leave-the-page contract ----------
++
++test("shouldSkipControl blocks file inputs — documents are never in drafts", () => {
++  assert.equal(
++    draft.shouldSkipControl(ctl({ name: "landlord_reference", type: "file" })),
++    true,
++  );
++});
++
++test("shouldSkipControl blocks the consent checkbox and _-prefixed internals", () => {
++  assert.equal(
++    draft.shouldSkipControl(ctl({ name: "gdpr_consent", type: "checkbox", checked: true })),
++    true,
++  );
++  assert.equal(draft.shouldSkipControl(ctl({ name: "_website" })), true);
++  assert.equal(draft.shouldSkipControl(ctl({ name: "_form_loaded_at" })), true);
++});
++
++test("shouldSkipControl blocks disabled, nameless, and non-data controls", () => {
++  assert.equal(draft.shouldSkipControl(ctl({ disabled: true })), true);
++  assert.equal(draft.shouldSkipControl(ctl({ name: "" })), true);
++  assert.equal(draft.shouldSkipControl(ctl({ type: "submit" })), true);
++  assert.equal(draft.shouldSkipControl(ctl({ type: "button" })), true);
++  assert.equal(draft.shouldSkipControl(ctl({ type: "fieldset" })), true);
++});
++
++test("shouldSkipControl lets ordinary data controls through", () => {
++  assert.equal(draft.shouldSkipControl(ctl({})), false);
++  assert.equal(draft.shouldSkipControl(ctl({ type: "radio", name: "has_pets" })), false);
++});
++
++// ---------- Serializer ----------
++
++test("serializeForm collects text/select values and extracts a trimmed email", () => {
++  const data = draft.serializeForm(
++    formOf([
++      ctl({ name: "first_name", value: "Ada" }),
++      ctl({ name: "email", type: "email", value: "  ada@example.com " }),
++      ctl({ name: "personal_statement", type: "textarea", value: "hello" }),
++    ]),
++  );
++  assert.equal(data.email, "ada@example.com");
++  assert.deepEqual(data.fields, {
++    first_name: "Ada",
++    email: "  ada@example.com ",
++    personal_statement: "hello",
++  });
++});
++
++test("serializeForm keeps only the checked radio of a group", () => {
++  const data = draft.serializeForm(
++    formOf([
++      ctl({ name: "has_pets", type: "radio", value: "yes", checked: false }),
++      ctl({ name: "has_pets", type: "radio", value: "no", checked: true }),
++      ctl({ name: "email", type: "email", value: "a@b.co" }),
++    ]),
++  );
++  assert.equal(data.fields.has_pets, "no");
++});
++
++test("serializeForm stores checked checkboxes as on, skips unticked", () => {
++  const data = draft.serializeForm(
++    formOf([
++      ctl({ name: "never_rented_before", type: "checkbox", value: "", checked: true }),
++      ctl({ name: "has_guarantor", type: "checkbox", checked: false }),
++      ctl({ name: "email", type: "email", value: "a@b.co" }),
++    ]),
++  );
++  assert.equal(data.fields.never_rented_before, "on");
++  assert.equal("has_guarantor" in data.fields, false);
++});
++
++test("serializeForm never serializes files, consent, or internals", () => {
++  const data = draft.serializeForm(
++    formOf([
++      ctl({ name: "landlord_reference", type: "file", value: "C:\\fake\\ref.pdf" }),
++      ctl({ name: "gdpr_consent", type: "checkbox", checked: true }),
++      ctl({ name: "_website", value: "bot-bait" }),
++      ctl({ name: "_form_loaded_at", value: "123" }),
++      ctl({ name: "email", type: "email", value: "a@b.co" }),
++    ]),
++  );
++  assert.deepEqual(data.fields, { email: "a@b.co" });
++});
++
++test("serializeForm first control wins on a shared name", () => {
++  const data = draft.serializeForm(
++    formOf([
++      ctl({ name: "phone", value: "111" }),
++      ctl({ name: "phone", value: "222" }),
++    ]),
++  );
++  assert.equal(data.fields.phone, "111");
++});
++
++// ---------- Payload ----------
++
++test("buildPayload is the {email, fields} JSON the server decodes", () => {
++  const parsed = JSON.parse(draft.buildPayload("a@b.co", { first_name: "Ada" }));
++  assert.deepEqual(parsed, { email: "a@b.co", fields: { first_name: "Ada" } });
++});
++
++// ---------- Debounce ----------
++
++function fakeTimers() {
++  const pending = new Map();
++  let seq = 0;
++  return {
++    pending,
++    set: (fn, ms) => {
++      const id = ++seq;
++      pending.set(id, { fn, ms });
++      return id;
++    },
++    clear: (id) => pending.delete(id),
++    runAll: () => {
++      [...pending.keys()].forEach((id) => {
++        const t = pending.get(id);
++        pending.delete(id);
++        if (t) t.fn();
++      });
++    },
++  };
++}
++
++test("debounce coalesces a burst of step changes into one save", () => {
++  const timers = fakeTimers();
++  let calls = 0;
++  const d = draft.createDebounced(() => calls++, 800, timers);
++  d.trigger();
++  d.trigger();
++  d.trigger();
++  assert.equal(d.pending(), true);
++  assert.equal(timers.pending.size, 1);
++  timers.runAll();
++  assert.equal(calls, 1);
++  assert.equal(d.pending(), false);
++});
++
++test("debounce cancel drops the pending save (pagehide takes over)", () => {
++  const timers = fakeTimers();
++  let calls = 0;
++  const d = draft.createDebounced(() => calls++, 800, timers);
++  d.trigger();
++  d.cancel();
++  assert.equal(d.pending(), false);
++  timers.runAll();
++  assert.equal(calls, 0);
++});
++
++test("debounce passes the configured delay", () => {
++  const timers = fakeTimers();
++  const d = draft.createDebounced(() => {}, 800, timers);
++  d.trigger();
++  const [{ ms }] = [...timers.pending.values()];
++  assert.equal(ms, 800);
++  assert.equal(draft.DEBOUNCE_MS, 800);
++});
++
++// ---------- Copy pins (sync with form_copy.gleam) ----------
++
++test("continue-link copy never blames the applicant and names no tech", () => {
++  assert.match(draft.CONTINUE_FAILED, /^Couldn\u2019t send/);
++  assert.ok(!/Error|Failed/i.test(draft.CONTINUE_FAILED));
++  assert.ok(draft.PREP_NOTE_SAVE.includes("save"));
++  assert.ok(draft.CONTINUE_NEEDS_EMAIL.includes("email"));
++});
++
++test("buildPayload includes resume_token only when present", () => {
++  const withToken = JSON.parse(
++    draft.buildPayload("a@b.co", { first_name: "Ada" }, "tok-123"),
++  );
++  assert.deepEqual(withToken, {
++    email: "a@b.co",
++    fields: { first_name: "Ada" },
++    resume_token: "tok-123",
++  });
++  const without = JSON.parse(draft.buildPayload("a@b.co", {}, ""));
++  assert.equal("resume_token" in without, false);
++  const undef = JSON.parse(draft.buildPayload("a@b.co", {}));
++  assert.equal("resume_token" in undef, false);
++});
+diff --git a/scripts/js-tests/form_draft_wiring.test.js b/scripts/js-tests/form_draft_wiring.test.js
+new file mode 100644
+index 00000000..476bab8e
+--- /dev/null
++++ b/scripts/js-tests/form_draft_wiring.test.js
+@@ -0,0 +1,370 @@
++// Wiring tests for server/priv/static/form_draft.js — drives the browser
++// choreography (step-change → debounced fetch, pagehide beacon, continue
++// button flow, prep-note swap, capability gate) through the exported
++// _initBrowser(env) seam with a fake DOM. Pure serializer/debounce contract
++// lives in form_draft.test.js; the full email round-trip is manual E2E
++// (Resend sends are never automated — repo precedent).
++
++const { test } = require("node:test");
++const assert = require("node:assert/strict");
++
++const draft = require("../../server/priv/static/form_draft.js");
++
++// ---------- Fake DOM ----------
++
++function fakeTimers() {
++  const pending = new Map();
++  let seq = 0;
++  return {
++    pending,
++    set: (fn, ms) => {
++      const id = ++seq;
++      pending.set(id, { fn, ms });
++      return id;
++    },
++    clear: (id) => pending.delete(id),
++    runAll: () => {
++      [...pending.keys()].forEach((id) => {
++        const t = pending.get(id);
++        pending.delete(id);
++        if (t) t.fn();
++      });
++    },
++  };
++}
++
++function textInput(name, value) {
++  return { name, type: "text", value, disabled: false, checked: false };
++}
++
++// Builds the fake environment; returns { env, stubs } where stubs expose
++// the recorded side effects and the captured listeners for driving events.
++function fakeEnv(opts = {}) {
++  const listeners = { doc: {}, env: {} };
++  const fetchCalls = [];
++  const beaconCalls = [];
++  const dispatched = [];
++  const created = [];
++  const timers = fakeTimers();
++
++  const note = { textContent: "SSR one-visit line" };
++  const prepBlock = {
++    children: [],
++    querySelector: (sel) =>
++      sel === '[data-testid="prep-note"]' ? note : null,
++    appendChild(el) {
++      this.children.push(el);
++    },
++  };
++  const form = {
++    elements: opts.controls || [
++      textInput("first_name", "Ada"),
++      textInput("email", "ada@example.com"),
++    ],
++  };
++  const body = {
++    getAttribute: (k) =>
++      ({
++        "data-apply-page": opts.marker || "form",
++        "data-vacancy-short-code": "code123",
++      })[k] || null,
++  };
++  const doc = {
++    body,
++    readyState: "complete",
++    querySelector: (sel) => {
++      if (sel === '[data-testid="application-form"]') return form;
++      if (sel === '[data-testid="apply-prep-block"]') {
++        return opts.withoutPrep ? null : prepBlock;
++      }
++      return null;
++    },
++    createElement: (tag) => {
++      const el = {
++        tag,
++        children: [],
++        attrs: {},
++        listeners: {},
++        className: "",
++        type: "",
++        disabled: false,
++        textContent: "",
++        setAttribute(k, v) {
++          this.attrs[k] = v;
++        },
++        appendChild(c) {
++          this.children.push(c);
++        },
++        addEventListener(name, cb) {
++          this.listeners[name] = cb;
++        },
++        click() {
++          if (this.listeners.click) this.listeners.click();
++        },
++      };
++      created.push(el);
++      return el;
++    },
++    addEventListener: (name, cb) => {
++      listeners.doc[name] = cb;
++    },
++    dispatchEvent: (e) => dispatched.push(e),
++  };
++
++  const env = {
++    document: doc,
++    __rtResumeToken: opts.resumeToken || "",
++    JSON,
++    CustomEvent: class {
++      constructor(name, init) {
++        this.type = name;
++        this.detail = init && init.detail;
++      }
++    },
++    Blob: class {
++      constructor(parts, options) {
++        this.parts = parts;
++        this.type = options && options.type;
++      }
++    },
++    navigator: {
++      sendBeacon: (url, blob) => beaconCalls.push({ url, blob }),
++    },
++    setTimeout: timers.set,
++    clearTimeout: timers.clear,
++    addEventListener: (name, cb) => {
++      listeners.env[name] = cb;
++    },
++    fetch: (url, init) => {
++      fetchCalls.push({ url, init });
++      const responder = opts.responder || { ok: true, body: { ok: true } };
++      return Promise.resolve({
++        ok: responder.ok,
++        json: () => Promise.resolve(responder.body),
++      });
++    },
++  };
++  return {
++    env,
++    timers,
++    note,
++    prepBlock,
++    created,
++    listeners,
++    fetchCalls,
++    beaconCalls,
++    dispatched,
++  };
++}
++
++function drive(env) {
++  draft._initBrowser(env.env);
++  return env;
++}
++
++function fireStepChanged(env) {
++  env.listeners.doc[draft.EVENT_STEP_CHANGED]({
++    detail: { step_index: 2, section_id: "your_situation", total: 8 },
++  });
++}
++
++// ---------- Save wiring ----------
++
++test("step-changed triggers a debounced POST to the draft endpoint", () => {
++  const env = drive(fakeEnv());
++  assert.equal(env.fetchCalls.length, 0);
++  fireStepChanged(env);
++  env.timers.runAll();
++  assert.equal(env.fetchCalls.length, 1);
++  const call = env.fetchCalls[0];
++  assert.equal(call.url, "/apply/code123/draft");
++  assert.equal(call.init.method, "POST");
++  const payload = JSON.parse(call.init.body);
++  assert.equal(payload.email, "ada@example.com");
++  assert.deepEqual(payload.fields, {
++    first_name: "Ada",
++    email: "ada@example.com",
++  });
++  assert.equal("resume_token" in payload, false);
++});
++
++test("no valid email → the save never fires (draft is email-keyed)", () => {
++  const env = drive(
++    fakeEnv({ controls: [textInput("first_name", "Ada"), textInput("email", " typo ")] }),
++  );
++  fireStepChanged(env);
++  env.timers.runAll();
++  assert.equal(env.fetchCalls.length, 0);
++});
++
++test("acknowledged payload is not re-sent on the next step change", () => {
++  const env = drive(fakeEnv());
++  fireStepChanged(env);
++  env.timers.runAll();
++  return Promise.resolve()
++    .then(() => Promise.resolve())
++    .then(() => {
++      fireStepChanged(env);
++      env.timers.runAll();
++      assert.equal(env.fetchCalls.length, 1);
++    });
++});
++
++test("first acknowledged save announces rt:draft-saved exactly once", () => {
++  const env = drive(fakeEnv());
++  fireStepChanged(env);
++  env.timers.runAll();
++  return Promise.resolve()
++    .then(() => Promise.resolve())
++    .then(() => {
++      const saves = env.dispatched.filter(
++        (e) => e.type === draft.EVENT_DRAFT_SAVED,
++      );
++      assert.equal(saves.length, 1);
++      assert.equal(saves[0].detail.vacancy_short_code, "code123");
++    });
++});
++
++test("closed-vacancy answer disables the saver terminally", () => {
++  const env = drive(
++    fakeEnv({ responder: { ok: true, body: { ok: false, closed: true } } }),
++  );
++  fireStepChanged(env);
++  env.timers.runAll();
++  return Promise.resolve()
++    .then(() => Promise.resolve())
++    .then(() => {
++      assert.equal(env.fetchCalls.length, 1);
++      fireStepChanged(env);
++      env.timers.runAll();
++      assert.equal(env.fetchCalls.length, 1, "no retry after closed");
++      env.listeners.env.pagehide();
++      assert.equal(env.beaconCalls.length, 0, "no beacon after closed");
++    });
++});
++
++test("pagehide flushes a dirty payload via sendBeacon", () => {
++  const env = drive(fakeEnv());
++  env.listeners.env.pagehide();
++  assert.equal(env.beaconCalls.length, 1);
++  assert.equal(env.beaconCalls[0].url, "/apply/code123/draft");
++  assert.equal(env.beaconCalls[0].blob.type, "application/json");
++  const payload = JSON.parse(env.beaconCalls[0].blob.parts[0]);
++  assert.equal(payload.email, "ada@example.com");
++});
++
++test("resume render includes resume_token in every save", () => {
++  const env = drive(fakeEnv({ marker: "form-resume", resumeToken: "tok-9" }));
++  env.listeners.env.pagehide();
++  const payload = JSON.parse(env.beaconCalls[0].blob.parts[0]);
++  assert.equal(payload.resume_token, "tok-9");
++});
++
++// ---------- Prep block + continue button ----------
++
++test("prep note is swapped and the continue button injected", () => {
++  const env = drive(fakeEnv());
++  assert.equal(env.note.textContent, draft.PREP_NOTE_SAVE);
++  const holder = env.prepBlock.children[0];
++  const button = holder.children[0];
++  const status = holder.children[1];
++  assert.equal(button.textContent, draft.CONTINUE_BUTTON_LABEL);
++  assert.equal(button.attrs["data-testid"], "draft-continue-link");
++  assert.equal(status.attrs["data-testid"], "draft-continue-status");
++});
++
++test("continue click with a valid email posts and confirms", () => {
++  const env = drive(fakeEnv());
++  const holder = env.prepBlock.children[0];
++  const button = holder.children[0];
++  const status = holder.children[1];
++  button.click();
++  assert.equal(env.fetchCalls.length, 1);
++  assert.equal(env.fetchCalls[0].url, "/apply/code123/continue-link");
++  return Promise.resolve()
++    .then(() => Promise.resolve())
++    .then(() => Promise.resolve())
++    .then(() => {
++      assert.equal(status.textContent, draft.CONTINUE_SENT);
++      assert.equal(button.disabled, false);
++    });
++});
++
++test("continue click without a valid email asks for it, no fetch", () => {
++  const env = drive(
++    fakeEnv({ controls: [textInput("email", "")] }),
++  );
++  const holder = env.prepBlock.children[0];
++  const button = holder.children[0];
++  const status = holder.children[1];
++  button.click();
++  assert.equal(env.fetchCalls.length, 0);
++  assert.equal(status.textContent, draft.CONTINUE_NEEDS_EMAIL);
++});
++
++test("failed send shows the friendly copy, never a raw error", () => {
++  const env = drive(fakeEnv({ responder: { ok: true, body: { ok: false } } }));
++  const holder = env.prepBlock.children[0];
++  const button = holder.children[0];
++  const status = holder.children[1];
++  button.click();
++  return Promise.resolve()
++    .then(() => Promise.resolve())
++    .then(() => Promise.resolve())
++    .then(() => {
++      assert.equal(status.textContent, draft.CONTINUE_FAILED);
++    });
++});
++
++// ---------- Capability gate ----------
++
++test("no fetch capability → no saver, no copy swap (honest one-visit form)", () => {
++  const fake = fakeEnv();
++  delete fake.env.fetch;
++  draft._initBrowser(fake.env);
++  assert.equal(fake.note.textContent, "SSR one-visit line");
++  assert.equal(fake.prepBlock.children.length, 0);
++  assert.equal(fake.listeners.doc[draft.EVENT_STEP_CHANGED], undefined);
++});
++
++test("no prep block (error re-render) → saver still wires, no button crash", () => {
++  const env = drive(fakeEnv({ withoutPrep: true, marker: "form-errors" }));
++  fireStepChanged(env);
++  env.timers.runAll();
++  assert.equal(env.fetchCalls.length, 1);
++});
++
++test("debounce survives brand-checked host timers (Perkins r2 B1)", () => {
++  // Browsers brand-check window.setTimeout: a detached ref invoked as
++  // t.set(...) throws "Illegal invocation" (this !== window) — which killed
++  // the production debounced save. Emulate the check: the fake env's timer
++  // functions only accept the env itself as receiver.
++  const fake = fakeEnv();
++  const realSet = fake.env.setTimeout;
++  const realClear = fake.env.clearTimeout;
++  fake.env.setTimeout = function (fn, ms) {
++    if (this !== fake.env) throw new TypeError("Illegal invocation");
++    return realSet(fn, ms);
++  };
++  fake.env.clearTimeout = function (id) {
++    if (this !== fake.env) throw new TypeError("Illegal invocation");
++    return realClear(id);
++  };
++  draft._initBrowser(fake.env);
++  fake.listeners.doc[draft.EVENT_STEP_CHANGED]({ detail: {} });
++  fake.timers.runAll();
++  assert.equal(
++    fake.fetchCalls.length,
++    1,
++    "the save must schedule through wrapped (never detached) timer refs",
++  );
++  // The clear seam is equally brand-checked in browsers: re-trigger
++  // (clear+reschedule) and pagehide (cancel) must not throw either.
++  return Promise.resolve()
++    .then(() => Promise.resolve())
++    .then(() => {
++      fake.listeners.doc[draft.EVENT_STEP_CHANGED]({ detail: {} });
++      fake.listeners.env.pagehide();
++      assert.equal(fake.fetchCalls.length, 1);
++    });
++});
+diff --git a/scripts/js-tests/form_stepper.test.js b/scripts/js-tests/form_stepper.test.js
+index cd1510c6..6c95dcb0 100644
+--- a/scripts/js-tests/form_stepper.test.js
++++ b/scripts/js-tests/form_stepper.test.js
+@@ -340,9 +340,10 @@ test("step-changed event name and gating copy are stable for the F3 seam", () =>
+ 
+ // ---------- Activation gate + event payload ----------
+ 
+-test("shouldActivate enhances only the two form renders", () => {
++test("shouldActivate enhances the form renders including F3 resume", () => {
+   assert.equal(stepper.shouldActivate("form"), true);
+   assert.equal(stepper.shouldActivate("form-errors"), true);
++  assert.equal(stepper.shouldActivate("form-resume"), true);
+   // Outcome pages (confirmation/duplicate/spam) and missing markers get no
+   // chrome — the no-JS/no-enhancement guarantee.
+   assert.equal(stepper.shouldActivate("confirmation"), false);
+@@ -360,6 +361,40 @@ test("stepChangeDetail pins the rt:form-step-changed payload shape", () => {
+   });
+ });
+ 
++// ---------- F3 resume start step ----------
++
++test("firstIncompleteIndex starts at the first section still blocking advance", () => {
++  const filled = section([textInput("Jane")]);
++  const empty = section([textInput("")]);
++  assert.equal(stepper.firstIncompleteIndex([empty, filled, filled]), 0);
++  assert.equal(stepper.firstIncompleteIndex([filled, empty, filled]), 1);
++  assert.equal(stepper.firstIncompleteIndex([filled, filled, empty]), 2);
++});
++
++test("firstIncompleteIndex with a complete draft lands on the review step", () => {
++  const filled = section([textInput("Jane")]);
++  assert.equal(
++    stepper.firstIncompleteIndex([filled, filled, filled]),
++    2,
++    "everything filled → last section (review & consent)",
++  );
++});
++
++test("firstIncompleteIndex respects the visible-required gating rule", () => {
++  // A required control inside a hidden data-condition wrapper must NOT
++  // count as incomplete — the stepper would demand a field the applicant
++  // can't see.
++  const hiddenWrap = el("div", { hidden: true }, [textInput("")]);
++  const s = section([hiddenWrap]);
++  assert.equal(
++    stepper.firstIncompleteIndex([s]),
++    0,
++    "single-section form clamps to 0",
++  );
++  const visibleEmpty = section([textInput("")]);
++  assert.equal(stepper.firstIncompleteIndex([s, visibleEmpty]), 1);
++});
++
+ // ---------- Anchor routing (real error-summary href shapes) ----------
+ 
+ test("resolveAnchorTarget resolves #field-<key> hrefs end to end", () => {
+diff --git a/server/priv/static/apply_analytics.js b/server/priv/static/apply_analytics.js
+index 076bddd2..18e64aba 100644
+--- a/server/priv/static/apply_analytics.js
++++ b/server/priv/static/apply_analytics.js
+@@ -15,11 +15,18 @@
+ //                           of the confirmation page lands here)
+ //   marker "form-errors"  → application_submit_failed (+ error_count,
+ //                           first_error_field — field KEY, never a value)
++//   marker "form-resume"  → application_draft_resumed (F3: draft restored;
++//                           section funnel suppressed — pre-filled values
++//                           would fake completions, as on form-errors)
+ //   marker "form"         → section funnel on the pristine form:
+ //                             application_form_section_entered
+ //                             application_form_section_completed
+ //                             application_form_section_abandoned
+ //
++// Plus, on any form marker (form / form-resume / form-errors), the F3
++// draft saver's `rt:draft-saved` DOM event is relayed through the consent
++// gate as application_draft_saved.
++//
+ // Consent gate: every capture queues until analytics consent is granted
+ // (rt:consent-changed, same gate as the $pageview capture in the inline
+ // posthog snippet) and is dropped if consent is rejected or never given.
+@@ -38,6 +45,11 @@
+   var EVENT_SECTION_ENTERED = "application_form_section_entered";
+   var EVENT_SECTION_COMPLETED = "application_form_section_completed";
+   var EVENT_SECTION_ABANDONED = "application_form_section_abandoned";
++  // F3 save-and-resume: resume-page outcome event + the DOM event
++  // form_draft.js fires on its first successful save per page life.
++  var EVENT_DRAFT_RESUMED = "application_draft_resumed";
++  var EVENT_DRAFT_SAVED = "application_draft_saved";
++  var DOM_EVENT_DRAFT_SAVED = "rt:draft-saved";
+ 
+   // Hard cap on the pre-consent queue — boundless growth is impossible in
+   // practice (a handful of page-outcome + section events per pageview) but a
+@@ -136,6 +148,12 @@
+         return EVENT_DUPLICATE;
+       case "form-errors":
+         return EVENT_SUBMIT_FAILED;
++      // F3: a restored draft is its own page outcome — and like form-errors
++      // its pre-filled values must stay OUT of the section funnel (the
++      // outcome branch returns before funnel wiring, so this case is also
++      // what suppresses section events on the resume render).
++      case "form-resume":
++        return EVENT_DRAFT_RESUMED;
+       default:
+         return null;
+     }
+@@ -329,6 +347,19 @@
+       return { vacancy_short_code: shortCode };
+     }
+ 
++    // F3: relay the draft saver's first-save announcement through the
++    // consent gate (queued pre-consent like every other event). Only the
++    // form markers can host the saver.
++    if (
++      marker === "form" ||
++      marker === "form-resume" ||
++      marker === "form-errors"
++    ) {
++      doc.addEventListener(DOM_EVENT_DRAFT_SAVED, function () {
++        tracker.capture(EVENT_DRAFT_SAVED, baseProps());
++      });
++    }
++
+     // Page-outcome events (no section funnel on these markers).
+     var outcome = outcomeEvent(marker);
+     if (outcome) {
+@@ -475,6 +506,9 @@
+       sectionEntered: EVENT_SECTION_ENTERED,
+       sectionCompleted: EVENT_SECTION_COMPLETED,
+       sectionAbandoned: EVENT_SECTION_ABANDONED,
++      draftResumed: EVENT_DRAFT_RESUMED,
++      draftSaved: EVENT_DRAFT_SAVED,
++      domDraftSaved: DOM_EVENT_DRAFT_SAVED,
+     },
+   };
+ 
+diff --git a/server/priv/static/form.css b/server/priv/static/form.css
+index 60441ef8..8e9b126d 100644
+--- a/server/priv/static/form.css
++++ b/server/priv/static/form.css
+@@ -195,6 +195,35 @@ textarea:focus-visible {
+   line-height: 1.55;
+ }
+ 
++/* ── F3 save-and-resume ────────────────────────────────────────────────── */
++
++/* Injected by form_draft.js into the prep block — the continue-link button
++   (reuses .btn-step-back for the outline style) plus its status line. */
++.draft-continue {
++  margin-top: 1rem;
++  display: flex;
++  flex-direction: column;
++  gap: 0.5rem;
++  align-items: flex-start;
++}
++
++.draft-continue-button {
++  flex: none;
++}
++
++.draft-continue-status {
++  font-size: 0.875rem;
++  color: var(--slate);
++  line-height: 1.55;
++  margin: 0;
++}
++
++/* The resume banner reuses .prep-block; the teal left edge distinguishes
++   "your answers are back" from the amber prep checklist. */
++.draft-resume-banner {
++  border-left-color: var(--teal, #0F766E);
++}
++
+ /* ── Form sections ─────────────────────────────────────────────────────── */
+ 
+ .form-section {
+diff --git a/server/priv/static/form.js b/server/priv/static/form.js
+index 7a9b3f64..008fe2f0 100644
+--- a/server/priv/static/form.js
++++ b/server/priv/static/form.js
+@@ -1,6 +1,12 @@
+ // Anti-spam timing field — records when the page loaded so the server
+ // can reject submissions that arrive suspiciously fast (< 2 s).
++// Exception: the F3 resume render DELIBERATELY backdates the stamp (a
++// restored draft can honestly reach Submit inside the suspicion window;
++// the 288-bit token is the abuse proof there) — don't clobber it.
+ (function () {
++  var marker =
++    document.body && document.body.getAttribute("data-apply-page");
++  if (marker === "form-resume") return;
+   var field = document.querySelector('input[name="_form_loaded_at"]');
+   if (field) {
+     field.value = Date.now().toString();
+diff --git a/server/priv/static/form_draft.js b/server/priv/static/form_draft.js
+new file mode 100644
+index 00000000..7a295ee9
+--- /dev/null
++++ b/server/priv/static/form_draft.js
+@@ -0,0 +1,374 @@
++// form_draft.js — F3 save-and-resume draft saver for the public /apply/:code
++// form (Wave 1 build pack, 2026-07 application-completion problem-solving
++// session).
++//
++// Progressive enhancement ONLY: without this file the form is the honest
++// one-visit form the SSR prep-note describes. When active it:
++//   1. Saves the applicant's FIELD VALUES (never files, never the consent
++//      checkbox, never _-prefixed internals) to the server-side draft —
++//      debounced on every `rt:form-step-changed` from form_stepper.js, plus
++//      a navigator.sendBeacon flush on pagehide (tab-close abandonment is
++//      the dominant mobile pattern this feature exists for).
++//   2. Swaps the prep-block's one-visit line for the save-and-continue
++//      promise (only once the capability is real — the SSR line stays for
++//      no-JS) and injects the "Email me a link to continue" button, which
++//      save-then-sends the tokenized magic link.
++//   3. Announces the first successful save per page life via
++//      `rt:draft-saved` — apply_analytics.js turns that into the
++//      consent-gated PostHog `application_draft_saved` event.
++//
++// Drafts are keyed (vacancy, email): nothing saves until the email field
++// holds a plausible address. Drafts expire at vacancy close; the continue
++// email carries the self-service erasure link. No localStorage — the draft
++// lives server-side so the link works across devices.
++//
++// Testability: the pure internals are exported (CommonJS) for `node --test`;
++// browser wiring runs only when a document is present. Mirrors
++// apply_analytics.js's module pattern.
++
++(function (root) {
++  "use strict";
++
++  var EVENT_STEP_CHANGED = "rt:form-step-changed";
++  // Outbound DOM event — consumed by apply_analytics.js (consent gate owns
++  // the actual PostHog capture; this file never touches PostHog).
++  var EVENT_DRAFT_SAVED = "rt:draft-saved";
++  var DEBOUNCE_MS = 800;
++
++  // Applicant-facing copy — KEEP IN SYNC with server/src/application/
++  // form_copy.gleam (same precedent as REVIEW_HINT_STEPPER in
++  // form_stepper.js: plain static JS can't import Gleam constants).
++  var PREP_NOTE_SAVE =
++    "Complete applications are reviewed first. You don’t have to finish in one visit — once your email is in, your answers save as you go, and you can email yourself a link to pick up where you left off.";
++  var CONTINUE_BUTTON_LABEL = "Email me a link to continue";
++  var CONTINUE_SENT =
++    "Link sent — check your inbox. You can keep going here too.";
++  var CONTINUE_NEEDS_EMAIL =
++    "Add your email in the About you section first — that’s where we’ll send the link.";
++  var CONTINUE_FAILED =
++    "Couldn’t send the link just now — your answers are still safe on this page. Try again in a moment.";
++
++  // ---------- Pure internals (exported for tests) ----------
++
++  // Activation gate: the pristine form, the draft-resume render, and the
++  // validation-error re-render (a failed submit is exactly the moment a
++  // draft is worth having).
++  function shouldActivate(marker) {
++    return (
++      marker === "form" || marker === "form-resume" || marker === "form-errors"
++    );
++  }
++
++  // Client-side plausibility only — the server re-validates with the real
++  // rule (shared/email.is_valid). currentPayload GATES on this: a near-miss
++  // email means no save at all (a draft keyed to a typo'd address would be
++  // unreachable by its own continue link anyway).
++  function validEmail(s) {
++    return typeof s === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
++  }
++
++  // The draft contract in one predicate: what may NEVER leave this page.
++  function shouldSkipControl(el) {
++    if (!el || el.disabled) return true;
++    var name = el.name || "";
++    if (!name) return true;
++    // _website honeypot, _form_loaded_at timing — server-side internals.
++    if (name.charAt(0) === "_") return true;
++    // Consent is captured at submit (with its own record), never in drafts.
++    if (name === "gdpr_consent") return true;
++    var type = (el.type || "").toLowerCase();
++    // Documents are only ever transmitted at the final POST.
++    if (type === "file") return true;
++    if (type === "submit" || type === "button" || type === "fieldset") {
++      return true;
++    }
++    return false;
++  }
++
++  // serializeForm(form) → { email, fields } — the name→value map the draft
++  // stores. Radios contribute only their checked member's value; checkboxes
++  // only when ticked (as "on", matching the server's get_form_bool); first
++  // control wins on a shared name.
++  function serializeForm(form) {
++    var fields = {};
++    var email = "";
++    var els = form && form.elements ? form.elements : [];
++    for (var i = 0; i < els.length; i++) {
++      var el = els[i];
++      if (shouldSkipControl(el)) continue;
++      var type = (el.type || "").toLowerCase();
++      if (type === "radio" && !el.checked) continue;
++      if (type === "checkbox" && !el.checked) continue;
++      var name = el.name;
++      if (Object.prototype.hasOwnProperty.call(fields, name)) continue;
++      var value =
++        type === "checkbox"
++          ? el.value || "on"
++          : String(el.value == null ? "" : el.value);
++      fields[name] = value;
++      if (name === "email") email = String(value).trim();
++    }
++    return { email: email, fields: fields };
++  }
++
++  function buildPayload(email, fields, resumeToken) {
++    var body = { email: email, fields: fields };
++    if (resumeToken) body.resume_token = resumeToken;
++    return JSON.stringify(body);
++  }
++
++  // createDebounced(fn, ms, timers) → { trigger, cancel, pending }.
++  // timers injectable for node tests. CRITICAL: window.setTimeout is
++  // brand-checked — a detached ref invoked as t.set(...) throws
++  // "Illegal invocation" in every real browser (this !== window), which
++  // killed the debounced save in production (Perkins r2 B1, verified in
++  // Chromium). Both call sites therefore WRAP the host functions so the
++  // host stays the receiver.
++  function createDebounced(fn, ms, timers) {
++    var t = timers || {
++      set: function (cb, delay) {
++        return root.setTimeout(cb, delay);
++      },
++      clear: function (id) {
++        root.clearTimeout(id);
++      },
++    };
++    var id = null;
++    return {
++      trigger: function () {
++        if (id !== null) t.clear(id);
++        id = t.set(function () {
++          id = null;
++          fn();
++        }, ms);
++      },
++      cancel: function () {
++        if (id !== null) t.clear(id);
++        id = null;
++      },
++      pending: function () {
++        return id !== null;
++      },
++    };
++  }
++
++  // ---------- Browser wiring ----------
++
++  function initBrowser(env) {
++    env = env || root;
++    var doc = env.document;
++    var body = doc && doc.body;
++    if (!body) return;
++    var marker = body.getAttribute("data-apply-page");
++    if (!shouldActivate(marker)) return;
++    // Capability gate (N10): the saver is fetch + JSON; on ancient browsers
++    // without them the form must stay the honest one-visit form — including
++    // the prep-note (never swap the copy past the capability).
++    if (
++      typeof env.fetch !== "function" ||
++      typeof env.CustomEvent !== "function" ||
++      typeof env.JSON === "undefined"
++    ) {
++      return;
++    }
++    var shortCode = body.getAttribute("data-vacancy-short-code") || "";
++    var form = doc.querySelector('[data-testid="application-form"]');
++    if (!shortCode || !form) return;
++
++    var draftUrl = "/apply/" + shortCode + "/draft";
++    var continueUrl = "/apply/" + shortCode + "/continue-link";
++    // Present only on the resume render — rides every save so the server
++    // can stamp resumed_at on re-engagement (never on the resume GET).
++    // Delivered via inline-script global: a DOM attribute would leak into
++    // PostHog autocapture's $elements_chain (Perkins r3).
++    var resumeToken = env.__rtResumeToken || "";
++
++    var lastSentPayload = null;
++    var announcedSave = false;
++    // Terminal state (vacancy closed mid-session): stop saving — retries
++    // and the beacon would only re-learn the same closed answer.
++    var saverDisabled = false;
++
++    function currentPayload() {
++      var data = serializeForm(form);
++      if (!validEmail(data.email)) return null;
++      return buildPayload(data.email, data.fields, resumeToken);
++    }
++
++    function announceSaved() {
++      if (announcedSave) return;
++      announcedSave = true;
++      try {
++        doc.dispatchEvent(new env.CustomEvent(EVENT_DRAFT_SAVED, {
++          detail: { vacancy_short_code: shortCode },
++        }));
++      } catch (_) {
++        // Analytics must never break the saver — ignore.
++      }
++    }
++
++    // saveNow(reason) → the debounced saver's inner call. Dedupes against
++    // the last acknowledged payload; failures leave state dirty so the next
++    // trigger (or the pagehide beacon) retries. Silent by design — the form
++    // itself never depends on the save succeeding.
++    function saveNow() {
++      if (saverDisabled) return;
++      var payload = currentPayload();
++      if (!payload || payload === lastSentPayload) return;
++      env
++        .fetch(draftUrl, {
++          method: "POST",
++          headers: { "Content-Type": "application/json" },
++          body: payload,
++          keepalive: true,
++        })
++        .then(function (res) {
++          if (!res || !res.ok) return;
++          return res.json();
++        })
++        .then(function (body) {
++          if (!body) return;
++          // HTTP 200 is not enough — the closed-vacancy arm answers 200
++          // with ok:false; only a body-level ok marks the save acknowledged.
++          if (body.ok === true) {
++            lastSentPayload = payload;
++            announceSaved();
++          } else if (body.closed === true) {
++            saverDisabled = true;
++          }
++        })
++        .catch(function () {
++          // Silent — the applicant loses nothing on this page.
++        });
++    }
++
++    var debounced = createDebounced(saveNow, DEBOUNCE_MS, {
++      // Wrapped, never detached — see createDebounced's brand-check note.
++      set: function (cb, delay) {
++        return env.setTimeout(cb, delay);
++      },
++      clear: function (id) {
++        env.clearTimeout(id);
++      },
++    });
++
++    doc.addEventListener(EVENT_STEP_CHANGED, function () {
++      debounced.trigger();
++    });
++
++    // Tab close / background kill: one last flush. sendBeacon only POSTs —
++    // the route accepts POST beside PUT for exactly this reason.
++    env.addEventListener("pagehide", function () {
++      debounced.cancel();
++      if (saverDisabled) return;
++      var payload = currentPayload();
++      if (!payload || payload === lastSentPayload) return;
++      if (env.navigator && typeof env.navigator.sendBeacon === "function") {
++        env.navigator.sendBeacon(
++          draftUrl,
++          new env.Blob([payload], { type: "application/json" })
++        );
++      }
++    });
++
++    // ---- Prep-block swap + continue-link button ----
++    var prepBlock = doc.querySelector('[data-testid="apply-prep-block"]');
++    if (prepBlock) {
++      var note = prepBlock.querySelector('[data-testid="prep-note"]');
++      if (note) note.textContent = PREP_NOTE_SAVE;
++
++      var holder = doc.createElement("div");
++      holder.className = "draft-continue";
++      var button = doc.createElement("button");
++      button.type = "button";
++      button.className = "btn-step-back draft-continue-button";
++      button.setAttribute("data-testid", "draft-continue-link");
++      button.textContent = CONTINUE_BUTTON_LABEL;
++      var status = doc.createElement("p");
++      status.className = "draft-continue-status";
++      status.setAttribute("data-testid", "draft-continue-status");
++      status.setAttribute("role", "status");
++      status.setAttribute("aria-live", "polite");
++      holder.appendChild(button);
++      holder.appendChild(status);
++      prepBlock.appendChild(holder);
++
++      button.addEventListener("click", function () {
++        var data = serializeForm(form);
++        if (!validEmail(data.email)) {
++          status.textContent = CONTINUE_NEEDS_EMAIL;
++          return;
++        }
++        button.disabled = true;
++        var sentPayload = buildPayload(data.email, data.fields, resumeToken);
++        env
++          .fetch(continueUrl, {
++            method: "POST",
++            headers: { "Content-Type": "application/json" },
++            body: sentPayload,
++          })
++          .then(function (res) {
++            // Any non-2xx (413 body gate, 500) is a failure regardless of
++            // what the envelope says — it lacks ok:false (Perkins r3).
++            if (!res || !res.ok) return { ok: false };
++            return res.json();
++          })
++          .then(function (body) {
++            // The response deliberately carries no send/cooldown state
++            // (an oracle for the victim's draft state — N14); ok:true
++            // reads as "on its way", anything else as a failure.
++            status.textContent =
++              body && body.ok === true ? CONTINUE_SENT : CONTINUE_FAILED;
++            if (body && body.ok === true) {
++              // The server just upserted this exact state save-side — the
++              // pagehide beacon doesn't need to repeat it.
++              lastSentPayload = sentPayload;
++              announceSaved();
++            }
++          })
++          .catch(function () {
++            status.textContent = CONTINUE_FAILED;
++          })
++          .finally(function () {
++            button.disabled = false;
++          });
++      });
++    }
++  }
++
++  // ---------- Exports ----------
++
++  var api = {
++    EVENT_STEP_CHANGED: EVENT_STEP_CHANGED,
++    EVENT_DRAFT_SAVED: EVENT_DRAFT_SAVED,
++    DEBOUNCE_MS: DEBOUNCE_MS,
++    PREP_NOTE_SAVE: PREP_NOTE_SAVE,
++    CONTINUE_BUTTON_LABEL: CONTINUE_BUTTON_LABEL,
++    CONTINUE_SENT: CONTINUE_SENT,
++    CONTINUE_NEEDS_EMAIL: CONTINUE_NEEDS_EMAIL,
++    CONTINUE_FAILED: CONTINUE_FAILED,
++    shouldActivate: shouldActivate,
++    validEmail: validEmail,
++    shouldSkipControl: shouldSkipControl,
++    serializeForm: serializeForm,
++    buildPayload: buildPayload,
++    createDebounced: createDebounced,
++    _initBrowser: initBrowser,
++  };
++
++  if (typeof module !== "undefined" && module.exports) {
++    module.exports = api;
++  }
++
++  if (
++    typeof root.document !== "undefined" &&
++    root.document &&
++    root.document.body
++  ) {
++    if (root.document.readyState === "loading") {
++      root.document.addEventListener("DOMContentLoaded", initBrowser);
++    } else {
++      initBrowser();
++    }
++  }
++})(typeof window !== "undefined" ? window : this);
+diff --git a/server/priv/static/form_stepper.js b/server/priv/static/form_stepper.js
+index 85fc4896..7a87ecd3 100644
+--- a/server/priv/static/form_stepper.js
++++ b/server/priv/static/form_stepper.js
+@@ -265,12 +265,27 @@
+     return 0;
+   }
+ 
++  // firstIncompleteIndex(sectionEls) → index of the first section still
++  // blocking advance (visible required controls unfilled), or the LAST
++  // section when everything is filled (a complete draft resumes at the
++  // review step). The F3 resume-start rule; mirrors firstErrorIndex's
++  // resolution shape, reusing the gating rule itself so "incomplete" means
++  // exactly what Continue would hold the applicant for.
++  function firstIncompleteIndex(sectionEls) {
++    for (var i = 0; i < sectionEls.length; i++) {
++      if (findInvalidControls(sectionEls[i]).length > 0) return i;
++    }
++    return Math.max(0, sectionEls.length - 1);
++  }
++
+   // ---------- Browser wiring ----------
+ 
+-  // Activation gate (exported for tests): the stepper only enhances the two
+-  // form renders.
++  // Activation gate (exported for tests): the stepper enhances the two
++  // form renders plus the F3 draft-resume render.
+   function shouldActivate(marker) {
+-    return marker === "form" || marker === "form-errors";
++    return (
++      marker === "form" || marker === "form-errors" || marker === "form-resume"
++    );
+   }
+ 
+   // stepperOffInSearch(search) → bool: the ?stepper=off E2E hook. Exported
+@@ -336,7 +351,9 @@
+                 body.getAttribute("data-first-error-field") || "",
+               doc: doc,
+             })
+-          : 0,
++          : marker === "form-resume"
++            ? firstIncompleteIndex(sectionEls)
++            : 0,
+     });
+ 
+     // ---- Progress chrome (sticky header) ----
+@@ -654,6 +671,7 @@
+     resolveFieldElement: resolveFieldElement,
+     resolveAnchorTarget: resolveAnchorTarget,
+     firstErrorIndex: firstErrorIndex,
++    firstIncompleteIndex: firstIncompleteIndex,
+   };
+ 
+   if (typeof module !== "undefined" && module.exports) {
+diff --git a/supabase/migrations/20260802120000_create_application_draft.sql b/supabase/migrations/20260802120000_create_application_draft.sql
+new file mode 100644
+index 00000000..811b00bf
+--- /dev/null
++++ b/supabase/migrations/20260802120000_create_application_draft.sql
+@@ -0,0 +1,64 @@
++-- F3 save-and-resume: application_draft (2026-07-31 completion session,
++-- F3 row + data-protection risk row).
++--
++-- One row per (vacancy, applicant email) holding FIELD VALUES ONLY for an
++-- in-progress application, so a multi-session applicant can leave and
++-- resume via a tokenized magic link. Data-protection stance per the spec's
++-- risk table:
++--   * NO documents — files are only ever transmitted at the final POST;
++--     this table has no content/path columns by design.
++--   * Expiry — the daily retention job deletes rows whose vacancy is
++--     closed or past closes_at.
++--   * Erasure — the continue email carries a self-service delete link
++--     (POST /apply/:code/draft-erasure/:token) that removes the row.
++--   * Submit strip — a successful final POST empties `fields` and NULLs
++--     the token (the application row becomes the system of record);
++--     submitted_at keeps the resume→submit funnel metric DB-readable.
++--
++-- email is stored lowercased by the writer (landlord_email_lower_index
++-- precedent) so resume/upsert matching is case-insensitive without a
++-- functional unique index.
++--
++-- continue_token is 288 bits of URL-safe entropy (wisp.random_string(48)),
++-- same capability model as application.erasure_token: the token IS the
++-- auth. Partial unique index — most rows have NULL (token minted lazily on
++-- the first "email me a link" request).
++--
++-- vacancy_id ON DELETE CASCADE: landlord account deletion hard-deletes
++-- vacancies, and their drafts must go with them (no PII orphans).
++--
++-- Expand-only and idempotent; no existing rows touched.
++
++CREATE TABLE IF NOT EXISTS application_draft (
++  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
++  vacancy_id         UUID NOT NULL REFERENCES vacancy(id) ON DELETE CASCADE,
++  email              TEXT NOT NULL CHECK (length(email) BETWEEN 3 AND 320),
++  fields             JSONB NOT NULL DEFAULT '{}'::jsonb,
++  continue_token     TEXT,
++  last_link_sent_at  TIMESTAMPTZ,
++  resumed_at         TIMESTAMPTZ,
++  submitted_at       TIMESTAMPTZ,
++  -- Erasure tombstone: a confirmed Art. 17 deletion wipes fields/token but
++  -- keeps the (vacancy, email) key until vacancy close so a still-open form
++  -- tab's next auto-save hits the upsert's erased_at guard instead of
++  -- silently re-creating the PII payload. Email kept as a suppression
++  -- record (GDPR-recognised) and disclosed on the erasure confirm page.
++  erased_at          TIMESTAMPTZ,
++  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
++  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++
++CREATE UNIQUE INDEX IF NOT EXISTS application_draft_vacancy_email_key
++  ON application_draft (vacancy_id, email);
++
++CREATE UNIQUE INDEX IF NOT EXISTS application_draft_continue_token_key
++  ON application_draft (continue_token)
++  WHERE continue_token IS NOT NULL;
++
++-- updated_at follows the repo's trigger convention (update_updated_at_column
++-- from 20260409000001_add_ai_analysis_updated_at.sql), not manual SETs.
++DROP TRIGGER IF EXISTS update_application_draft_updated_at ON application_draft;
++CREATE TRIGGER update_application_draft_updated_at
++  BEFORE UPDATE ON application_draft
++  FOR EACH ROW
++  EXECUTE FUNCTION update_updated_at_column();
+
+
+--- YOUR LENS ---
+Architectural fit review. Given the diff and the surrounding codebase:
+- Does it follow existing patterns and conventions?
+- Does it introduce unnecessary coupling between modules?
+- Is there a simpler alternative with the same outcome?
+- Does it respect module boundaries and separation of concerns?
+- Will it create technical debt or make future changes harder?
+- Does complexity match the problem? Any premature abstraction?
+
+--- OUTPUT ---
+Return ONE valid JSON array. Each element must match this schema exactly:
+{
+  "source": "<one of: blind | edge | acceptance | security | architecture | codebase | tests — use the value assigned to you>",
+  "severity": "blocker" | "warning" | "note",
+  "category": "<short tag, e.g. auth, boundary, coupling, coverage-gap>",
+  "title": "<one-line summary>",
+  "location": "<file:line | file:hunk | N/A>",
+  "evidence": "<the exact lines you READ from the file/diff that prove the claim, pasted verbatim. Use 'N/A' ONLY for findings that have no possible code reference (e.g. a missing-spec concern). Do not paraphrase. Do not reconstruct from memory. If you cannot quote the lines, you have not done the work to file the finding.>",
+  "detail": "<why this is a problem, ≤40 words>",
+  "recommended_fix": "<the change to apply, ≤40 words>"
+}
+
+Output contract:
+- Write ONLY the JSON array to this exact file path (paste it, do not derive it): /Users/moses/code/_bmad-output/perkins/righttenantry-form-save-resume-f3/r4/architecture-c1.json
+- Use your file-writing tool to create that file. The file must contain ONLY the JSON array — no prose, no markdown fencing, no preamble.
+- Empty array `[]` is valid and expected when you find nothing.
+- Do not invent findings to fill a quota.
+- After writing the file, reply with just the word done and stop.
+
+ACCURACY MANDATE — this is the most important instruction in this prompt:
+
+NO claim you make will be taken at face value. Every finding you emit will be independently re-verified against the actual codebase before it reaches the report. Findings that fail verification are DISCARDED SILENTLY — they will not appear in the report, you will not be asked to defend them, you get no second chance.
+
+Therefore:
+- Open the file. Read the relevant lines. Do not guess from filenames, do not assume from similar-looking code, do not generalise from one example to another.
+- The `evidence` field must contain the EXACT lines you read. If you cannot paste them, you have not verified the issue and the finding does not belong in your output. A finding without locatable evidence is a hallucination — drop it before it leaves your output.
+- Hedging language ("might", "could", "possibly", "potentially") is a signal that you have not actually verified the issue. Either verify it and report it crisply, or do not report it.
+- Prefer fewer, well-grounded findings over many speculative ones. The user values accuracy over volume — an empty array is a fine and honest answer when nothing is wrong.

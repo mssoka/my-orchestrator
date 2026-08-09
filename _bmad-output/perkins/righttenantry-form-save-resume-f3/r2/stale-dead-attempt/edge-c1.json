@@ -1,0 +1,42 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "error-path",
+    "title": "Continue button reads the 64KB 413 envelope as success: shows \"Link sent\", marks unsaved state as saved, suppresses the beacon retry",
+    "location": "server/priv/static/form_draft.js:292-303",
+    "evidence": ".then(function (res) {\n            return res && res.json ? res.json() : {};\n          })\n          .then(function (body) {\n            // sent:true and the cooldown's sent:false both read as \"on its\n            // way\" — the copy never leaks send timing (and the first email\n            // genuinely is in the inbox on cooldown).\n            status.textContent =\n              body && body.ok === false ? CONTINUE_FAILED : CONTINUE_SENT;\n            if (body && body.ok !== false) {\n              // The server just upserted this exact state save-side — the\n              // pagehide beacon doesn't need to repeat it.\n              lastSentPayload = sentPayload;\n              announceSaved();\n            }\n— and middleware.gleam oversized_response(False, _): wisp.json_response(\n        \"{\\\"error\\\":{\\\"code\\\":\\\"PAYLOAD_TOO_LARGE\\\",\\\"message\\\":\\\"Request body too large\\\"}}\",\n        413,\n      )",
+    "detail": "The success test never checks res.ok; the 413 JSON envelope parses and has no \"ok\" key, so body.ok !== false is true: user sees \"Link sent — check your inbox\", lastSentPayload is set (pagehide beacon deduped away), and application_draft_saved fires — but nothing was stored and no email exists. Honest >64KB paste reaches it (no client maxlength).",
+    "recommended_fix": "In the continue-link .then, treat res.ok === false as failure before parsing (or check body.ok === true for the SENT branch), so 413/other non-ok envelopes land on CONTINUE_FAILED and leave the payload dirty."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "race-condition",
+    "title": "Post-submit pagehide beacon can INSERT a fresh unsubmitted draft (full PII + live token) — the round-2 late-beacon guard only covers the UPDATE arm",
+    "location": "server/priv/static/form_draft.js:242-253 + server/src/application/sql/upsert_application_draft.sql:10-19",
+    "evidence": "env.addEventListener(\"pagehide\", function () {\n      debounced.cancel();\n      if (saverDisabled) return;\n      var payload = currentPayload();\n      if (!payload || payload === lastSentPayload) return;\n      if (env.navigator && typeof env.navigator.sendBeacon === \"function\") {\n        env.navigator.sendBeacon(\n          draftUrl,\n          new env.Blob([payload], { type: \"application/json\" })\n        );\n      }\n    });\n— and the upsert: INSERT INTO application_draft (vacancy_id, email, fields, continue_token)\nSELECT $1::uuid, lower($2), $3::jsonb, $4\nWHERE EXISTS ( ... )\n  OR ( SELECT count(*) ... ) < 500\nON CONFLICT (vacancy_id, email) DO UPDATE ...\n  WHERE application_draft.submitted_at IS NULL\n    AND application_draft.erased_at IS NULL",
+    "detail": "pagehide fires on the submit navigation (or tab-close mid-submit) and the beacon carries the final form state; there is no submitted flag client-side. The submitted_at/erased_at guard lives only on ON CONFLICT DO UPDATE — it protects existing rows. When no draft row exists for the final email (all debounced saves failed on flaky mobile, form.js didn't run so the stepper never fired saves, or the email was edited inside the 800ms debounce), strip_on_submit matches zero rows and the late beacon INSERTs a new unsubmitted draft with full field PII and a minted continue_token — the exact resurrection the SQL comment claims is impossible (\"a late beacon ... must not bring the PII back\"). Row persists until vacancy-close sweep; stage-2 emails don't reach it only because that funnel excludes applicants.",
+    "recommended_fix": "Set a submitted flag on the form's submit event and skip the beacon when set (fresh init re-arms on error re-render), or have the upsert INSERT arm also reject when a matching application row exists for (vacancy, lower(email))."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "race-condition",
+    "title": "Cross-vacancy fan-out bound (3 emails/recipient/hour) is TOCTOU — concurrent claims on different rows all pass the count check",
+    "location": "server/src/application/sql/claim_continue_link_send.sql:21-27",
+    "evidence": "  AND (\n    SELECT count(*) FROM application_draft d2\n    WHERE d2.email = lower($2)\n      AND d2.last_link_sent_at IS NOT NULL\n      AND d2.last_link_sent_at > now() - interval '1 hour'\n  ) < 3",
+    "detail": "The per-row UPDATE lock serializes claims for the same (vacancy,email), but claims for the same email across different vacancies touch different rows: a simultaneous burst (attacker seeds the victim's email as drafts on K vacancies of their own free landlord account, then fires K continue-link requests) lets every claim see count<3 and send — the W6 3/hour bound only holds for sequential sends.",
+    "recommended_fix": "Serialize per-recipient inside the claim, e.g. pg_advisory_xact_lock(hashtext(lower($2))) before the count subquery, or move the fan-out check to a locked single row (per-email ledger)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "unhandled-path",
+    "title": "Per-vacancy 500-draft cap rejection is indistinguishable from success: save answers ok:true (and fires draft-saved analytics) for a write that stored nothing",
+    "location": "server/src/application/draft_handler.gleam:201-217",
+    "evidence": "                    Ok(_) -> {\n                      // First save after a resume stamps resumed_at (honest\n                      // metric: re-engagement, never the prefetch-able GET).\n                      // Fail-open.\n                      ...\n                      wisp.json_response(json_ok(True), 200)\n— with the upsert's INSERT arm: OR (\n    SELECT count(*) FROM application_draft d\n    WHERE d.vacancy_id = $1::uuid\n  ) < 500 ... RETURNING id::text;",
+    "detail": "When the cap blocks a NEW pair's INSERT, the upsert succeeds with zero RETURNING rows — the same Ok(_) shape as a tombstone/submitted-guard suppression — so the handler answers ok:true; the client acks the payload, announces application_draft_saved, and a later continue-link click claims zero rows and shows \"Link sent\" with no email ever arriving. Abuse-regime only (500 drafts/vacancy), but the cap event is invisible in logs/metrics.",
+    "recommended_fix": "Match on the RETURNING count for the save path (pog.Returned(n, rows)) and wisp.log_warning when a non-guarded upsert wrote zero rows, so cap hits are observable; keep the 200 body unchanged to preserve the no-oracle stance."
+  }
+]

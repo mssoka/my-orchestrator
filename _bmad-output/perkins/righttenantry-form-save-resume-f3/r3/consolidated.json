@@ -1,0 +1,268 @@
+{
+ "job_id": "righttenantry-form-save-resume-f3",
+ "round": 3,
+ "pr": 563,
+ "reviewed_sha": "8789054f998c64db804dc36c8fdfeca88b134249",
+ "chunking": "diff 5416 lines > 3000 -> chunk1 (.gitignore + .memlog + _bmad-output spec + scripts/js-tests + server/priv/static + supabase migration, 1726 lines), chunk2 (server/src, 2274 lines), chunk3 (server/test, 1419 lines); one full 7-lens wave per chunk, sequentially.",
+ "lenses_completed": [
+  "blind",
+  "edge",
+  "acceptance",
+  "security",
+  "architecture",
+  "codebase",
+  "tests"
+ ],
+ "waves": 3,
+ "lens_retries": [],
+ "failed_layers": [],
+ "fix_audit": {
+  "prior_round": "r2 (sha 11fcaa3f, 37 findings: 1B/10W/26N) + 11 carried r1 notes",
+  "fixed": [
+   "r2-B1 detached window.setTimeout/clearTimeout \u2014 FIXED: both call sites wrap host functions (form_draft.js:127-134 default + :243-250 initBrowser seam); brand-checked-timers wiring pin added (form_draft_wiring.test.js:337); VERIFIED EMPIRICALLY in Chromium via agent-browser: production seam (deferred script, env=window, rt:form-step-changed) schedules the debounced save \u2014 one coalesced POST fired, zero errors",
+   "r1-N14 sent-flag oracle \u2014 FIXED (minion's honest overturn): json_ok_with deleted; uniform ok:true on every claim outcome; integration test pins body must NOT contain 'sent' (draft_integration_test.gleam:276-278)",
+   "r1-N1 POST-vs-PUT spec drift \u2014 FIXED: frozen matrix now 'PUT|POST', execution text 'fetch POST (PUT also routed; the beacon is POST-only)'"
+  ],
+  "still_present": [
+   {
+    "id": "r2-W1..W10",
+    "note": "all 10 round-2 warnings verified still present by direct read (upsert SQL, claim SQL, draft_handler save path, form_stepper tests, form_view/pages tests, email_client tests all unchanged in the r3 delta)"
+   },
+   {
+    "id": "r2-N1..N26",
+    "note": "all 26 round-2 notes verified still present (r3 delta touched none of the cited sites; spot-verified N2 migration header, N3 spec review-order line 261, N7 stamp asymmetry at draft_handler.gleam:281-291, N15 lookup doc, N22 draft_field helper)"
+   },
+   {
+    "id": "r1-carried N6,N7,N8,N11,N12,N15,N18,N22,N27",
+    "note": "9 carried round-1 notes still present (deferred refactors + acknowledged trade-offs + unpinned wiring)"
+   }
+  ]
+ },
+ "counts": {
+  "raw_findings": 23,
+  "rejected": 0,
+  "gate_findings_merged": 3,
+  "surviving_new": 14,
+  "carried_forward": 45,
+  "unverifiable_speculative": 0,
+  "blocker": 1,
+  "warning": 1,
+  "note": 12
+ },
+ "findings": [
+  {
+   "id": "B1",
+   "severity": "blocker",
+   "source": [
+    "edge"
+   ],
+   "category": "token-leak",
+   "title": "PostHog autocapture element chain leaks the raw data-resume-token past the sanitize_properties scrub",
+   "location": "server/src/application/form_view.gleam:269 (init config) + server/src/application/form_pages.gleam:401 (attribute)",
+   "detail": "The resume render puts the raw 288-bit continue token on <body data-resume-token> (a read-capability for applicant PII). posthog.init leaves autocapture at the SDK default TRUE (no key in the init config; empirically posthog.config.autocapture===true without it). Verified against posthog-js 1.409.5 source (the version the array loader ships): the autocapture elements-chain builder walks ancestors up to AND INCLUDING <body>, and captures every attribute of non-sensitive elements as attr__<name>. So a consenting applicant's click on the resume page emits an $autocapture event whose $elements_chain contains attr__data-resume-token=\"<token>\". The sanitize_properties regex /(\\/(?:resume|draft-erasure)\\/)[^\\s&#/?]+/g only redacts tokens preceded by a literal /resume/ or /draft-erasure/ path segment \u2014 the attribute value is the bare token, no prefix, so it passes through UNREDACTED. The feature's own comment states the invariant: 'the token must never land in the analytics store'.",
+   "recommended_fix": "Disable autocapture on the apply-form pages (the funnel is custom events) or add element_attribute_ignorelist:['data-resume-token'] to the init; belt-and-braces: extend the scrub to redact attr__data-resume-token values, and strengthen the scrub test (see N12) to assert the replacement, not just the pattern's presence.",
+   "verification": "confirmed (code read + posthog-js 1.409.5 source-verified chain/attr mechanics + empirical default-true check)"
+  },
+  {
+   "id": "W1",
+   "severity": "warning",
+   "source": [
+    "codebase",
+    "edge"
+   ],
+   "category": "response-contract",
+   "title": "Draft-write 413 envelope lacks ok:false \u2014 continue-link UI reports 'Link sent' on a rejected request and suppresses the retry",
+   "location": "server/src/middleware.gleam:582 + server/priv/static/form_draft.js:309",
+   "detail": "The body-size gate answers 413 {\"error\":{...}} (no ok key). The continue-link click handler parses the JSON regardless of status, then body.ok === false is false: the UI shows 'Link sent \u2014 check your inbox', sets lastSentPayload (suppressing the pagehide beacon), and fires a phantom application_draft_saved \u2014 though nothing was saved or emailed. Reachable: form inputs have no maxlength (0 occurrences in form_pages/form_view), ~40 free-text fields can exceed the 64 KB draft-write cap.",
+   "recommended_fix": "Add ok:false to the 413 JSON envelope (and any other non-handler JSON rejections on these endpoints), or check res.ok in the click handler before parsing.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N1",
+   "severity": "note",
+   "source": [
+    "acceptance",
+    "blind",
+    "tests"
+   ],
+   "category": "test-gap",
+   "title": "Brand-checked-timers pin never exercises the wrapped clearTimeout seam",
+   "location": "scripts/js-tests/form_draft_wiring.test.js:337",
+   "detail": "The new B1 regression pin fires step-changed exactly once, so trigger() runs with id===null and t.clear is never called; cancel() (pagehide) is also never driven. Reverting `clear` to a detached env.clearTimeout \u2014 half of the B1 fix \u2014 ships green.",
+   "recommended_fix": "Fire step-changed twice (trigger's id!==null branch calls t.clear) or dispatch pagehide after a trigger, asserting no throw and correct fetch count.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N2",
+   "severity": "note",
+   "source": [
+    "acceptance",
+    "blind"
+   ],
+   "category": "doc-contract",
+   "title": "No-oracle doc comment overclaims: ok:false also fires on the upsert-abort arm, not 'only when the Resend call itself failed'",
+   "location": "server/src/application/draft_handler.gleam:233",
+   "detail": "The rewritten docstring states ok:false occurs 'only when the Resend call itself failed', but a failed draft upsert also aborts before the claim with ok:false/200 (draft_handler.gleam:279). The contract text misstates the round-3 response shape.",
+   "recommended_fix": "Reword: ok:false on upsert failure or Resend send failure; ok:true on every claim outcome.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N3",
+   "severity": "note",
+   "source": [
+    "architecture"
+   ],
+   "category": "api-consistency",
+   "title": "Continue-link upsert-failure abort answers 200 ok:false while claim DB failure answers 500 \u2014 and save-path upsert failure is also 500",
+   "location": "server/src/application/draft_handler.gleam:279",
+   "detail": "Two server-side DB failures in one handler get different status conventions (200-ok:false vs 500); handle_save_draft's identical upsert failure is 500 (line 219). The client tolerates both, but the inconsistency is undocumented and surprises future callers.",
+   "recommended_fix": "Pick one convention for DB-failure on these endpoints (500, matching the save path) or document why continue-link deliberately differs.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N4",
+   "severity": "note",
+   "source": [
+    "architecture",
+    "blind",
+    "codebase"
+   ],
+   "category": "convention-drift",
+   "title": "strip_draft_on_submit.sql manually SETs updated_at = now() \u2014 dead code the BEFORE UPDATE trigger overwrites, contradicting the migration's stated convention",
+   "location": "server/src/application/sql/strip_draft_on_submit.sql:10",
+   "detail": "The migration header states updated_at 'follows the repo's trigger convention ... not manual SETs' and the update_application_draft_updated_at trigger fires on every UPDATE; claim/clear/erase/mark_resumed all rely on it. Strip's manual SET is dead weight contradicting the file's own convention.",
+   "recommended_fix": "Drop the updated_at = now() line from strip_draft_on_submit.sql.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N5",
+   "severity": "note",
+   "source": [
+    "edge"
+   ],
+   "category": "unhandled-error-path",
+   "title": "saveNow's keepalive fetch throws synchronously for >64 KiB bodies, escaping the promise chain on every step change",
+   "location": "server/priv/static/form_draft.js:217",
+   "detail": "Per the Fetch spec a keepalive request whose body exceeds 64 KiB throws a TypeError synchronously (Request construction), before any promise exists \u2014 the .catch never runs and the exception propagates uncaught out of the debounce listener. Reachable: inputs have no maxlength; ~40 free-text fields can exceed 64 KiB.",
+   "recommended_fix": "Wrap the fetch call in try/catch (leave state dirty) or cap serialized payload size client-side before send.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N6",
+   "severity": "note",
+   "source": [
+    "blind"
+   ],
+   "category": "spec-contradiction",
+   "title": "Spec task schema literal for application_draft omits erased_at that the migration in the same diff creates",
+   "location": "_bmad-output/implementation-artifacts/spec-form-save-resume-f3.md:79",
+   "detail": "The checked-off migration task enumerates every column but lacks erased_at; the migration adds it (W3 tombstone, documented only in the change log at line 151).",
+   "recommended_fix": "Add erased_at to the task's column list.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N7",
+   "severity": "note",
+   "source": [
+    "blind"
+   ],
+   "category": "spec-contradiction",
+   "title": "Spec claims the serializer skips hidden inputs; shouldSkipControl has no hidden-type arm",
+   "location": "_bmad-output/implementation-artifacts/spec-form-save-resume-f3.md:86 vs server/priv/static/form_draft.js:71-86",
+   "detail": "The spec's skip-list names 'hidden'; the predicate skips only file/submit/button/fieldset types plus _-prefixed and gdpr_consent names. Harmless today (the only hidden input, _form_loaded_at, is _-prefixed) but the stated contract is wrong.",
+   "recommended_fix": "Correct the spec skip-list (file/submit/button/fieldset + _-prefixed + gdpr_consent) or add the hidden arm.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N8",
+   "severity": "note",
+   "source": [
+    "blind"
+   ],
+   "category": "comment-fixture-mismatch",
+   "title": "Submission-fixture comment claims 'never rented skips eviction' but the fixture submits never_rented_before=\"false\" and answers the eviction question",
+   "location": "server/test/integration/draft_integration_test.gleam:639",
+   "detail": "With \"false\" the applicant HAS rented, so eviction history applies \u2014 and the fixture indeed answers it (\"no\"). The comment describes the opposite branch (never-rented skip).",
+   "recommended_fix": "Fix the comment to describe the rented-with-no-eviction branch the fixture drives.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N9",
+   "severity": "note",
+   "source": [
+    "codebase"
+   ],
+   "category": "stale-doc-anchor",
+   "title": "Spec Suggested Review Order: two draft_handler.gleam line anchors point at the wrong code",
+   "location": "_bmad-output/implementation-artifacts/spec-form-save-resume-f3.md:211 and :254",
+   "detail": "Anchor :141 ('the whole feature in one handler') lands inside lookup_accepting_vacancy's case arms; anchor :358 ('resumed_at stamps on re-engagement save') lands on a closing brace \u2014 the stamp lives at ~201/434.",
+   "recommended_fix": "Re-anchor both lines (or drop line numbers for function names).",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N10",
+   "severity": "note",
+   "source": [
+    "codebase"
+   ],
+   "category": "dry-test-helper",
+   "title": "Byte-identical fakeTimers() helper duplicated across the two new JS test files",
+   "location": "scripts/js-tests/form_draft.test.js:167 and scripts/js-tests/form_draft_wiring.test.js:15",
+   "detail": "Both files were added in this PR; AGENTS.md's DRY rule (extract when logic repeats 2+ places) applies \u2014 a timer-semantics tweak must now be made twice. (Machine-verified byte-identical.)",
+   "recommended_fix": "Extract to a shared scripts/js-tests/helpers module.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N11",
+   "severity": "note",
+   "source": [
+    "tests"
+   ],
+   "category": "wiring-gap",
+   "title": "Stage-2 reminder send wiring (prefetch -> per-recipient continue_url) has no test; both ends pinned, the mapping between them is not",
+   "location": "server/src/inbound_email/inbound_handler.gleam:822-852",
+   "detail": "The recipient->draft mapping (dict build, lowercase keying, token !='' guard, /resume/ URL join, prefetch-failure degradation) can regress silently: draft holders then get the plain CTA or a broken link. SQL filter and email builder are pinned; the handler mapping is not.",
+   "recommended_fix": "One handler-level test: recipients with/without drafts get the tokenized / plain CTA respectively.",
+   "verification": "confirmed"
+  },
+  {
+   "id": "N12",
+   "severity": "note",
+   "source": [
+    "tests"
+   ],
+   "category": "weak-assertion",
+   "title": "PostHog token-scrub pinned only by substring presence \u2014 a regex regression that disables redaction keeps both pinned substrings and stays green",
+   "location": "server/test/application/form_view_test.gleam:626",
+   "detail": "The test asserts only 'sanitize_properties:function(p)' and 'resume|draft-erasure' substrings; the replacement ('$1<redacted>') and character class \u2014 the parts that actually redact \u2014 are unasserted. (B1's autocapture bypass proves the scrub needs a stronger pin.)",
+   "recommended_fix": "Assert the replacement string and the negated char class, or drive the scrub function against a tokenised URL in a JS test.",
+   "verification": "confirmed"
+  }
+ ],
+ "merged_gate_findings": [
+  {
+   "source": "tests-c1#1",
+   "title": "Advisory test gate: PASS",
+   "disposition": "kept as gate note \u2014 P0 100%, suite 98/98 js"
+  },
+  {
+   "source": "tests-c2#1",
+   "title": "Advisory test gate: PASS",
+   "disposition": "kept as gate note \u2014 P0 100% (all four draft endpoints + r3 no-oracle pin)"
+  },
+  {
+   "source": "tests-c3#1",
+   "title": "Advisory test gate: PASS",
+   "disposition": "kept as gate note \u2014 P0 100% feature suite"
+  }
+ ],
+ "reviewer_agreement": [
+  "W1 413 envelope lacks ok:false -> false 'Link sent' (codebase+edge)",
+  "N1 brand-check pin misses the clear seam (acceptance+blind+tests \u2014 3 reports)",
+  "N2 no-oracle doc overclaims ok:false (acceptance+blind)",
+  "N4 strip manual updated_at vs trigger (architecture+blind+codebase \u2014 3 reports)"
+ ],
+ "rejected_findings": [],
+ "verdict": "NEEDS CHANGES",
+ "verdict_rule": "1 blocker (PostHog autocapture leaks data-resume-token past the scrub \u2014 confirmed) -> request-changes"
+}

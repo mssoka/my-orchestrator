@@ -1,0 +1,62 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "input-mapping",
+    "title": "Router triage popover labels are swapped: the 'stream' button prioritizes the email class and 'email' prioritizes streaming",
+    "location": "app/main.odin:267-271 (popover_click) with data/packet_types.json and core/qos.odin:52-59",
+    "evidence": "app/main.odin:\n\t\tlabels := [3]string{\"none\", \"stream\", \"email\"}\n\t\tfor i in 0 ..< 3 {\n\t\t\tr := rnd.triage_button_rect(pop, i)\n\t\t\tif rl.CheckCollisionPointRec(mouse, r) {\n\t\t\t\ttriage := i32(i - 1)\ndata/packet_types.json:\n  \"entries\": [\n    { \"id\": \"email\", ... },\n    { \"id\": \"streaming\", ... }\ncore/qos.odin effective_lane:\n\tif junction_triage >= 0 {\n\t\treturn .Express if i32(class) == junction_triage else .Best\ncore/command.odin:\n\ttriage:   i32, // class index, or -1 for neutral",
+    "detail": "Button 'stream' (i=1) submits triage=0 = class index 0, which packet_types.json defines as email; 'email' submits 1 = streaming. The dial promotes the opposite class of its label.",
+    "recommended_fix": "Map buttons through class_index: labels[1] should submit class_index(cat,\"streaming\") and labels[2] class_index(cat,\"email\"), or reorder labels to match indices."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "unreachable-path",
+    "title": "Clicking empty ground never closes an open popover: the dismiss path only runs when the press landed on a node",
+    "location": "app/main.odin:201-206, 225-240",
+    "evidence": "app/main.odin:\n\tif popover_click(app, mouse, frame_ms) {\n\t\treturn // swallowed\n\t}\n\tif nid, ok := prun.snap_node(&app.rc, f64(wx), f64(wy)); ok {\n\t\tapp.press_node = nid\n\t\tapp.press_valid = true\n\t\tapp.drag.active = true\n\t\tapp.drag.from_node = nid\n\t}\n\t...\n\tif rl.IsMouseButtonReleased(.LEFT) && app.drag.active {\n\t\tapp.drag.active = false\n\t\tmoved := rl.Vector2Distance(mouse, app.press) > 6\n\t\t...\n\t\tif !moved {\n\t\t\t// a click, not a drag: select\n\t\t\thandle_click_select(app, mouse, frame_ms)\n\t\t}\n\t}\napp/main.odin handle_click_select:\n\tapp.sel = {} // empty ground closes the popover",
+    "detail": "drag.active is set only when the press snaps a node; a press on empty ground leaves it false, so the release branch never calls handle_click_select and the popover stays open until ESC or another node/pipe click.",
+    "recommended_fix": "In the LEFT-release path, run the click-select/dismiss logic when drag.active is false too (press on empty ground), or close sel on any press that popover_click returns false for."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "fmt_bprintf/write_uint write past fixed stack buffers with no length guard; draw_forecast's [32] buffer needs 27 literal chars before the digits",
+    "location": "app/render/view.odin:355-418 (fmt_bprintf, write_int, write_uint); app/render/hud.odin draw_forecast",
+    "evidence": "app/render/view.odin:\n\t\tif format[i] == '%' && i + 1 < len(format) && format[i+1] == 'd' {\n\t\t\tif ai < len(args) {\n\t\t\t\tif val, ok := args[ai].(int); ok {\n\t\t\t\t\tn += write_int(buf[n:], val)\nwrite_uint :: proc(buf: []u8, v: u64) -> int {\n\ttmp: [20]u8\n\tn := 0\n\tx := v\n\tif x == 0 { tmp[0] = '0'; n = 1 }\n\tfor x > 0 {\n\t\ttmp[n] = u8('0' + x % 10)\n\t\tx /= 10\n\t\tn += 1\n\t}\napp/render/hud.odin draw_forecast:\n\t\tbuf: [32]u8\n\t\ttxt := fmt_bprintf(buf[:], \"~%ds out - build capacity NOW\", int(secs))",
+    "detail": "Neither fmt_bprintf nor write_uint checks the destination length; write_uint emits up to 20 digits plus sign. '~%ds out - build capacity NOW' is 27 chars, so a horizon of 6+ digits or any negative secs overflows the [32] stack buffer. Shipped data (start_tick 1200) fits today.",
+    "recommended_fix": "Have fmt_bprintf/write_int/write_uint bound writes against len(buf) and truncate (or skip); keep buffers sized for worst-case i32 digits."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "map_draw grid loops spin forever when tile == 0: the minimized-window state (scale == 0) is guarded in from_screen but not in the draw path",
+    "location": "app/render/map.odin:64-72; app/render/view.odin:53-54",
+    "evidence": "app/render/map.odin:\n\ttile := v.tile_px * v.scale\n\tx := v.off_x\n\tfor x < f32(v.win_w) {\n\t\trl.DrawLine(i32(x), 0, i32(x), v.win_h, grid_soft)\n\t\tx += tile\n\t}\napp/render/view.odin:\n\tif v.scale <= 0 { return 0, 0 } // minimized window guard",
+    "detail": "With a zero window dimension, view_compute sets scale=0, so tile=0 and the grid loop's x never advances; off_x=win_w/2 < win_w enters the loop. draw_frame calls draw_world unconditionally, so the app hangs where from_screen already guards the same state.",
+    "recommended_fix": "Skip map_draw/draw_world (or the grid pass) when v.scale <= 0, mirroring the from_screen minimized-window guard."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "leak",
+    "title": "action_log backing is heap-allocated by bus_submit/testkit and never freed: run_context_destroy leaks it on every restart",
+    "location": "app/run/run.odin:117-126 (bus_submit), 88-96 (run_context_destroy)",
+    "evidence": "app/run/run.odin bus_submit:\n\tlogged := cmd\n\tlogged.apply_tick = apply_tick\n\tappend(&rc.state.action_log, logged)\napp/run/run.odin run_context_destroy:\n\tdelete(rc.snapshot.nodes)\n\tdelete(rc.snapshot.pipes)\n\tdelete(rc.snapshot.packets)\n\tdelete(rc.snapshot.classes)\n\tdelete(rc.snapshot.forecasts)\n\tdelete(rc.autopilot_wired)\n\tdelete(rc.arena_buf)\n\trc.state = nil",
+    "detail": "bus_submit appends with the caller's default heap allocator while the run arena (arena_buf) is deleted; no delete of action_log exists anywhere, so each R restart/start_run leaks the log's heap backing. Small per run but unbounded across a session.",
+    "recommended_fix": "delete(rc.state.action_log) in run_context_destroy (and delete events), or append with the run arena allocator so arena teardown reclaims it."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "error-path",
+    "title": "tier_by_name drops tier_index's ok: an unknown/missing tier silently maps the 1/2/3 keys to tier 0 instead of rejecting",
+    "location": "app/main.odin:340-342; core/catalog.odin:431-434",
+    "evidence": "app/main.odin:\ntier_by_name :: proc(app: ^App, name: string) -> u16 {\n\tidx, _ := pp.tier_index(app.catalogs, name)\n\treturn idx\n}\ncore/catalog.odin:\ntier_index :: proc(cat: ^Catalogs, id: string) -> (u16, bool) {\n\tfor t, i in cat.pipe_tiers {\n\t\tif t.id == id { return u16(i), true }\n\t}\n\treturn 0, false\n}",
+    "detail": "Catalog load cross-validates node types (content_host/residential/router_mid) and classes (email/streaming) but not pipe-tier ids; a dev-edited pipe_tiers.json missing 'narrow'/'standard'/'wide' makes keys 1/2/3 silently select the first tier with no hint.",
+    "recommended_fix": "In tier_by_name, return (0, false) when tier_index fails and ignore the keypress (or hint), and add narrow/standard/wide to catalogs_load required-content checks."
+  }
+]

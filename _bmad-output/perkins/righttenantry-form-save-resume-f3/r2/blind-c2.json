@@ -1,0 +1,62 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "silent-failure",
+    "title": "Cap-blocked draft INSERT silently drops the save; handler still answers ok:true",
+    "location": "server/src/application/draft_handler.gleam (handle_save_draft upsert branch) + server/src/application/sql/upsert_application_draft.sql",
+    "evidence": "+INSERT INTO application_draft (vacancy_id, email, fields, continue_token)\n+SELECT $1::uuid, lower($2), $3::jsonb, $4\n+WHERE EXISTS (\n+    SELECT 1 FROM application_draft d\n+    WHERE d.vacancy_id = $1::uuid AND d.email = lower($2)\n+  )\n+  OR (\n+    SELECT count(*) FROM application_draft d\n+    WHERE d.vacancy_id = $1::uuid\n+  ) < 500\n ... handler:\n+                  case\n+                    sql.upsert_application_draft(\n+                      config.db,\n+                      vacancy_uuid,\n+                      applicant_email,\n+                      fields_to_json(filtered),\n+                      wisp.random_string(48),\n+                    )\n+                  {\n+                    Ok(_) -> {",
+    "detail": "At the 500/vacancy cap the INSERT...SELECT yields zero rows; upsert returns Ok(Returned(_, [])) and handle_save_draft maps any Ok(_) to {\"ok\":true}. The endpoint is unauthenticated so the cap is attacker-fillable; legit saves then vanish while the client reports success.",
+    "recommended_fix": "Match on empty RETURNING from the upsert and answer ok:false (or 503) for cap-blocked inserts; keep the silent-200 only for the submitted/erased guard case."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "rate-limit-logic",
+    "title": "Fan-out subquery counts stamped draft rows, not sends — documented \"max 3 continue emails per recipient per hour\" is not enforced",
+    "location": "server/src/application/sql/claim_continue_link_send.sql:14-27",
+    "evidence": "+-- (max 3 continue emails per recipient per hour across ALL vacancies: the\n ...\n+  AND (\n+    last_link_sent_at IS NULL\n+    OR last_link_sent_at < now() - interval '10 minutes'\n+  )\n+  AND (\n+    SELECT count(*) FROM application_draft d2\n+    WHERE d2.email = lower($2)\n+      AND d2.last_link_sent_at IS NOT NULL\n+      AND d2.last_link_sent_at > now() - interval '1 hour'\n+  ) < 3",
+    "detail": "The <3 check counts rows stamped in the last hour. One draft re-sends every 10 minutes (6/hr) while its count stays 1; two drafts sustain 12/hr. Only a third distinct draft trips the bound, so the advertised per-recipient ceiling is overshot up to 4x.",
+    "recommended_fix": "Count actual sends (append a send-event row per claim, or a sends counter per recipient) or rewrite the comment to state the real invariant: per-draft 10-minute cooldown plus max 3 distinct drafts stamped per hour."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "cap-accounting",
+    "title": "500/vacancy draft cap counts stripped (submitted) and tombstoned rows that persist until vacancy close",
+    "location": "server/src/application/sql/upsert_application_draft.sql:14-17",
+    "evidence": "+  OR (\n+    SELECT count(*) FROM application_draft d\n+    WHERE d.vacancy_id = $1::uuid\n+  ) < 500\n ... strip_draft_on_submit.sql:\n+-- empty the draft's PII payload, kill the continue token, and stamp the\n+-- resume→submit metric. The row itself stays (email + timestamps only)\n+-- until the retention sweep removes it at vacancy close.\n ... erase_draft_by_token.sql:\n+-- (vacancy, email) key is kept as a suppression record until the retention\n+-- sweep removes it at vacancy close",
+    "detail": "The cap subquery has no submitted_at/erased_at filter, while submit-strip and erasure both retain the row until vacancy close. Every submission or erasure permanently burns a cap slot; ~500 lifetime applicants disables new drafts for the vacancy's entire life.",
+    "recommended_fix": "Add AND d.submitted_at IS NULL AND d.erased_at IS NULL to the cap count subquery so only live drafts consume the budget."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "behavior-asymmetry",
+    "title": "resumed_at stamped for empty-fields continue-link payload but not for the identical save payload",
+    "location": "server/src/application/draft_handler.gleam (handle_save_draft vs handle_continue_link)",
+    "evidence": "save path:\n+              case filtered {\n+                [] -> wisp.json_response(json_ok(True), 200)\n (returns before the stamp block)\n continue-link path:\n+              let filtered = filter_fields(payload.fields)\n+              let upserted = case filtered {\n+                [] -> Ok(Nil)\n ...then after Ok(_) ->:\n+                  // Same re-engagement stamp as the plain save path.\n+                  case payload.resume_token {\n+                    \"\" -> Nil\n+                    token -> {",
+    "detail": "handle_save_draft's empty-filtered branch returns before the resume_token stamp; handle_continue_link stamps it for the same payload despite the \"Same re-engagement stamp\" comment. The drafts-resumed funnel diverges by endpoint for identical client state.",
+    "recommended_fix": "Hoist the resumed_at stamp ahead of the filtered-fields branch in both handlers, or skip it in both when the payload carried no usable fields."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Dead COALESCEs: claim RETURNING and list_resumable SELECT cannot observe a NULL continue_token",
+    "location": "server/src/application/sql/claim_continue_link_send.sql:27; server/src/application/sql/list_resumable_draft_tokens.sql:5",
+    "evidence": "claim:\n+SET continue_token = COALESCE(continue_token, $3),\n ...\n+RETURNING COALESCE(continue_token, '') AS continue_token;\n list_resumable:\n+SELECT email, COALESCE(continue_token, '') AS continue_token\n+FROM application_draft\n+WHERE vacancy_id = $1::uuid\n+  AND submitted_at IS NULL\n+  AND continue_token IS NOT NULL;\n handler guard:\n+      Ok(token) if token != \"\" -> application_url <> \"/resume/\" <> token",
+    "detail": "The SET clause already guarantees non-NULL on returned rows, and the IS NOT NULL filter makes the SELECT COALESCE dead; the inbound handler's token != \"\" guard then defends an impossible empty string. Noise that obscures the mint-at-save invariant.",
+    "recommended_fix": "Return/select continue_token bare and drop the empty-string guard, or keep one defensive COALESCE with a comment naming the legacy NULL case it protects."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "filter-gap",
+    "title": "File-slot filter defines 5 primary document slots but only 2 co-applicant prefixes",
+    "location": "server/src/application/draft_handler.gleam (file_slot_names / coapplicant_slot_prefixes)",
+    "evidence": "+pub fn file_slot_names() -> List(String) {\n+  [\n+    \"proof_of_income_primary\",\n+    \"landlord_ref_primary\",\n+    \"character_ref_primary\",\n+    \"employer_ref_primary\",\n+    \"additional_docs\",\n+  ]\n+}\n+\n+const coapplicant_slot_prefixes = [\n+  \"proof_of_income_coapplicant_\", \"employer_ref_coapplicant_\",\n+]\n ... stated purpose:\n+/// skips type=file controls; the server filter drops these names too, so a\n+/// hand-crafted JSON payload can't park anything under a document slot's\n+/// identity",
+    "detail": "The filter's own slot taxonomy spans income/landlord/character/employer/additional, yet co-applicant coverage is limited to income and employer prefixes. The comment's universal claim (\"can't park anything under a document slot's identity\") outruns what the filter blocks.",
+    "recommended_fix": "Add landlord_ref_coapplicant_ and character_ref_coapplicant_ (and the co-applicant additional-docs naming if one exists) to coapplicant_slot_prefixes, or narrow the comment."
+  }
+]

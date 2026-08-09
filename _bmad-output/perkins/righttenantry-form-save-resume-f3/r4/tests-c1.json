@@ -1,0 +1,62 @@
+[
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Continue-button non-2xx branch (Perkins r3's named 413 fix) has no pinning test — every wired failure test uses an HTTP-ok response",
+    "location": "server/priv/static/form_draft.js:313",
+    "evidence": "form_draft.js:313-316:\n          .then(function (res) {\n            // Any non-2xx (413 body gate, 500) is a failure regardless of\n            // what the envelope says — it lacks ok:false (Perkins r3).\n            if (!res || !res.ok) return { ok: false };\n            return res.json();\nvs form_draft_wiring.test.js:306 (the only continue-failure test):\n  const env = drive(fakeEnv({ responder: { ok: true, body: { ok: false } } }));\n— fakeEnv's fetch resolves `{ ok: responder.ok, ... }` (line 142), so `res.ok` is true in every test; grep confirms no responder ever sets ok:false.",
+    "detail": "The r3 changelog calls out the 413-envelope misrender ('Link sent' + phantom application_draft_saved) as a fixed regression, yet the exact branch that fixes it (`!res.ok → {ok:false}`) is never driven. Reverting it ships green.",
+    "recommended_fix": "Add a wiring test with `responder: { ok: false, body: {} }` asserting status shows CONTINUE_FAILED and no rt:draft-saved is dispatched."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "saveNow transient-failure path untested — nothing pins that a failed save stays dirty and is retried on the next step change",
+    "location": "server/priv/static/form_draft.js:226",
+    "evidence": "form_draft.js:213-217 (dedupe guard) and 226-228:\n      var payload = currentPayload();\n      if (!payload || payload === lastSentPayload) return;\n      ...\n        .then(function (res) {\n          if (!res || !res.ok) return;\n          return res.json();\n        })\nlastSentPayload is only assigned inside `if (body.ok === true)` (line 234). All 14 wiring tests use HTTP-ok responders; the only failure test is the terminal closed-vacancy arm (`{ ok: true, body: { ok: false, closed: true } }`, test line 230). No test fails a save then asserts a later trigger re-sends.",
+    "detail": "The designed failure mode (silent retry via dirty state) is the core resilience behaviour of the save path. A regression that marks the payload sent optimistically, or swallows the retry, would pass all current tests while drafts silently stop persisting after any transient error.",
+    "recommended_fix": "Add a wiring test: first fetch rejects (or ok:false without closed) → fire step-changed again → assert a second fetch with the same payload."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "rt:draft-saved → application_draft_saved relay registration in apply_analytics.js is untested (marker gating + listener wiring)",
+    "location": "server/priv/static/apply_analytics.js:358",
+    "evidence": "apply_analytics.js:352-362:\n    if (\n      marker === \"form\" ||\n      marker === \"form-resume\" ||\n      marker === \"form-errors\"\n    ) {\n      doc.addEventListener(DOM_EVENT_DRAFT_SAVED, function () {\n        tracker.capture(EVENT_DRAFT_SAVED, baseProps());\n      });\n    }\ninitBrowser is not exported (api exports only createCapture/outcomeEvent/section helpers/createAbandonFlow/EVENTS), and no test in apply_analytics.test.js drives this listener — the new tests pin only outcomeEvent('form-resume'), the EVENTS name constants, and the cross-file name contract.",
+    "detail": "Producer side (announce-once in form_draft.js) and the consent-gated capture queue are both pinned, and event names are cross-pinned, but the relay registration itself — including the marker whitelist — has zero coverage. Restricting the markers or dropping the listener would silently kill the feature's headline saved-draft metric with all tests green.",
+    "recommended_fix": "Export an _initBrowser(env) seam like form_draft.js's and add a test: fire rt:draft-saved on a form marker → capture queued; on confirmation marker → no listener registered."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Stepper resume-start wiring (form-resume → firstIncompleteIndex) untested at init level; only the pure function is pinned",
+    "location": "server/priv/static/form_stepper.js:355",
+    "evidence": "form_stepper.js:351-356:\n          : marker === \"form-resume\"\n            ? firstIncompleteIndex(sectionEls)\n            : 0,\ninitBrowser is not exported; form_stepper.test.js covers firstIncompleteIndex (3 tests incl. complete-draft→last-section and hidden-wrapper boundary) and shouldActivate('form-resume'), but no test drives the start-step selection itself.",
+    "detail": "The acceptance criterion 'stepper starts at first incomplete section' depends on this one ternary. It mirrors the pre-existing (equally untested) firstErrorIndex wiring, so it follows repo convention — residual risk is low but the wiring could regress (e.g. marker typo) with green tests.",
+    "recommended_fix": "Extract the start-step choice into an exported pure predicate (marker, sectionEls) and pin the three marker arms, or accept and document the convention."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "pagehide beacon ack-dedupe branch untested — no test asserts an already-acknowledged payload is not re-beaconed",
+    "location": "server/priv/static/form_draft.js:265",
+    "evidence": "form_draft.js:261-266 (pagehide listener):\n      debounced.cancel();\n      if (saverDisabled) return;\n      var payload = currentPayload();\n      if (!payload || payload === lastSentPayload) return;\n      if (env.navigator && typeof env.navigator.sendBeacon === \"function\") {\nWiring tests fire pagehide only with no prior acknowledged save ('pagehide flushes a dirty payload', 'resume render includes resume_token') or after terminal closed ('no beacon after closed'). The continue-click test sets lastSentPayload save-side but never fires pagehide afterwards.",
+    "detail": "Impact of a regression is one redundant idempotent upsert per page life (harmless server-side), hence note-level — but the branch exists to prevent exactly that and is unpinned.",
+    "recommended_fix": "Extend the continue-click or acknowledged-save wiring test: fire pagehide after the ack and assert beaconCalls.length stays 0."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: CONCERNS",
+    "location": "N/A",
+    "evidence": "Traceability over this chunk: P0 behaviours 100% (never-leave-page serializer contract: form_draft.test.js shouldSkipControl/serializeForm pins; debounced save happy path + brand-checked timers: form_draft_wiring.test.js; form.js resume-guard anti-spam black hole: form.test.js; migration schema: server/test/integration/draft_integration_test.gleam, present in repo). P1 ≈85% — FULL: email gate, closed-vacancy disable, beacon flush, prep-swap + capability gate, outcomeEvent('form-resume') + funnel-suppression pin, event-name/cross-file contracts, copy-voice pins; PARTIAL: continue-button flow (non-2xx branch NONE), saveNow failure/retry (NONE), rt:draft-saved relay registration (NONE), stepper resume-start wiring (NONE). P2/P3 gaps: beacon ack-dedupe. Overall ≥80%.",
+    "detail": "P0 fully covered and overall coverage exceeds 80%, but P1 sits at ~85% (below the 90% PASS bar): four verifiable gaps, three of them in the save/continue/analytics-relay wiring that form_draft_wiring.test.js exists to pin — including one named r3 regression fix (413 envelope) shipped without its own pin.",
+    "recommended_fix": "Add the four wiring tests above (non-2xx continue failure, failed-save retry, relay listener via exported seam, beacon dedupe). That lifts P1 to ~100% and the gate to PASS."
+  }
+]

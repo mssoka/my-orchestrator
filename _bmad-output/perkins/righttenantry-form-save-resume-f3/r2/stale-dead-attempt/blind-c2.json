@@ -1,0 +1,42 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "silent-failure",
+    "title": "Draft save returns ok:true when the 500/vacancy cap silently drops the write",
+    "location": "server/src/application/draft_handler.gleam (handle_save_draft) + server/src/application/sql/upsert_application_draft.sql",
+    "evidence": "  OR (\n    SELECT count(*) FROM application_draft d\n    WHERE d.vacancy_id = $1::uuid\n  ) < 500\nON CONFLICT (vacancy_id, email) DO UPDATE\n  SET fields = EXCLUDED.fields,\n      continue_token = COALESCE(\n        application_draft.continue_token,\n        EXCLUDED.continue_token\n      )\n  WHERE application_draft.submitted_at IS NULL\n    AND application_draft.erased_at IS NULL\nRETURNING id::text;\n---\n                  case\n                    sql.upsert_application_draft(\n                      config.db,\n                      vacancy_uuid,\n                      applicant_email,\n                      fields_to_json(filtered),\n                      wisp.random_string(48),\n                    )\n                  {\n                    Ok(_) -> {\n                      // First save after a resume stamps resumed_at (honest\n                      // metric: re-engagement, never the prefetch-able GET).\n                      // Fail-open.\n                      case payload.resume_token {\n                        \"\" -> Nil\n                        token -> {\n                          let _ =\n                            sql.mark_draft_resumed_by_token(\n                              config.db,\n                              token,\n                              vacancy_uuid,\n                            )\n                          Nil\n                        }\n                      }\n                      wisp.json_response(json_ok(True), 200)",
+    "detail": "Cap rejection makes INSERT...SELECT yield zero rows, so upsert returns Ok with 0 rows; handler matches Ok(_) and answers ok:true. A new applicant's answers are not saved while the UI claims they are. On the continue-link path the same no-op leads to claim finding no row, sent:false, and the UI still reading \"Link sent\".",
+    "recommended_fix": "Distinguish zero-row Ok for a non-existent pair (cap hit) from the deliberate tombstone/submitted no-op; on cap rejection return a non-ok JSON so the client stops promising saves."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "logic",
+    "title": "500/vacancy cap counts tombstoned and submitted rows that persist until vacancy close",
+    "location": "server/src/application/sql/upsert_application_draft.sql (count subquery)",
+    "evidence": "  OR (\n    SELECT count(*) FROM application_draft d\n    WHERE d.vacancy_id = $1::uuid\n  ) < 500\n---\n-- A successful final POST makes the application row the system of record:\n-- empty the draft's PII payload, kill the continue token, and stamp the\n-- resume→submit metric. The row itself stays (email + timestamps only)\n-- until the retention sweep removes it at vacancy close.\n---\n-- hard delete. Fields/token/link-stamps are wiped and erased_at set; the\n-- (vacancy, email) key is kept as a suppression record until the retention\n-- sweep removes it at vacancy close",
+    "detail": "Strip-on-submit and erasure deliberately keep their rows until vacancy close, and the cap subquery has no submitted_at/erased_at filter. Every submission permanently consumes draft-cap headroom, so a high-traffic vacancy exhausts the 500 on dead rows and starts rejecting live drafts.",
+    "recommended_fix": "Add AND d.submitted_at IS NULL AND d.erased_at IS NULL to the count subquery so the cap bounds live drafts; dead rows are not attacker-scalable (submit/erasure are gated)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "inconsistency",
+    "title": "resumed_at stamping is asymmetric on empty fields; \"Same re-engagement stamp\" comment is false",
+    "location": "server/src/application/draft_handler.gleam (handle_save_draft vs handle_continue_link)",
+    "evidence": "              case filtered {\n                // An empty/fully-filtered map must NOT wipe a real draft —\n                // upserting '{}' would erase the applicant's saved answers\n                // (an unauthenticated destructive write needing only the\n                // victim's email + the public vacancy code).\n                [] -> wisp.json_response(json_ok(True), 200)\n---\n              let filtered = filter_fields(payload.fields)\n              let upserted = case filtered {\n                [] -> Ok(Nil)\n                _ ->\n                  sql.upsert_application_draft(\n                    config.db,\n                    vacancy_uuid,\n                    applicant_email,\n                    fields_to_json(filtered),\n                    wisp.random_string(48),\n                  )\n                  |> result.replace(Nil)\n                  |> result.map_error(fn(err) {\n                    wisp.log_error(\n                      \"draft upsert (continue-link) failed: \"\n                      <> string.inspect(err),\n                    )\n                    Nil\n                  })\n              }\n              case upserted {\n                Error(_) -> wisp.json_response(json_ok(False), 200)\n                Ok(_) -> {\n                  // Same re-engagement stamp as the plain save path.\n                  case payload.resume_token {\n                    \"\" -> Nil\n                    token -> {\n                      let _ =\n                        sql.mark_draft_resumed_by_token(",
+    "detail": "With an empty fields map, the save path early-returns before the resume_token stamp, but the continue-link path stamps resumed_at anyway (upsert skipped, stamp still runs). The comment claiming parity with the plain save path is wrong for exactly this case; the re-engagement metric diverges between endpoints.",
+    "recommended_fix": "Gate the continue-link stamp the same way (only when an actual upsert ran), or fix the comment and pin the intended asymmetry."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "inconsistency",
+    "title": "Resume page restores values to every section except review_consent, but filter_fields still saves that section's non-consent fields",
+    "location": "server/src/application/form_pages.gleam (view_resume_page) + server/src/application/draft_handler.gleam (filter_fields)",
+    "evidence": "              form_sections.view_section_about_you(values:, errors: []),\n              form_sections.view_section_your_situation(values:, errors: []),\n              form_sections.view_section_work_income(values:, errors: []),\n              form_sections.view_section_references(values:, errors: []),\n              form_sections.view_section_guarantor(values:, errors: []),\n              form_sections.view_section_tell_us_more(values:, errors: []),\n              form_sections.view_section_documents(values:, errors: []),\n              form_sections.view_section_review_consent(errors: []),\n---\n    !string.starts_with(key, \"_\")\n    && key != \"gdpr_consent\"\n    && !is_file_slot_key(key)",
+    "detail": "filter_fields excludes only _-prefixed internals, gdpr_consent, and file slots, so any other review_consent-section input (e.g. the §5.4 attestation radios evidenced by attestation_choice_error in form_copy) is persisted into the draft — yet view_resume_page passes no values to that section, so those saved values are never restored.",
+    "recommended_fix": "Either exclude the consent-section non-consent fields in filter_fields (like gdpr_consent) or pass values to view_section_review_consent on the resume page; don't round-trip dead data."
+  }
+]

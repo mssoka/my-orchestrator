@@ -1,0 +1,475 @@
+diff --git a/server/src/application/draft_view.gleam b/server/src/application/draft_view.gleam
+index 1c5a4240..6769bc9b 100644
+--- a/server/src/application/draft_view.gleam
++++ b/server/src/application/draft_view.gleam
+@@ -76,7 +76,7 @@ pub fn view_erasure_confirm(
+             html.ul([], [
+               html.li([], [
+                 html.text(
+-                  "Just your email address, until the vacancy closes — so a browser tab you left open can't quietly re-save the draft you just deleted. Then it's gone too.",
++                  "Just your email address, for about 7 days after the vacancy closes — so a browser tab you left open can't quietly re-save the draft you just deleted. Then it's gone too.",
+                 ),
+               ]),
+             ]),
+diff --git a/server/src/notification/email_client.gleam b/server/src/notification/email_client.gleam
+index 543a1788..2643c1c5 100644
+--- a/server/src/notification/email_client.gleam
++++ b/server/src/notification/email_client.gleam
+@@ -560,7 +560,9 @@ pub fn continue_draft_subject(property_name: String) -> String {
+ /// Carries two tokenized links: the continue URL (restores the draft into
+ /// the SSR form) and the erasure URL (GDPR Art. 17 surface for drafts, per
+ /// the spec's data-protection risk row). The expiry promise is the vacancy
+-/// close — drafts die with it via the retention sweep.
++/// close — drafts die 7 days after it via the retention sweep
++/// (draft-grace-period amendment: an in-grace pay-to-extend resurrects the
++/// journey this email sells).
+ pub fn build_continue_draft_html(
+   property_name property_name: String,
+   continue_url continue_url: String,
+diff --git a/server/src/retention/retention_job.gleam b/server/src/retention/retention_job.gleam
+index 0ef5c128..8856d465 100644
+--- a/server/src/retention/retention_job.gleam
++++ b/server/src/retention/retention_job.gleam
+@@ -305,11 +305,13 @@ pub fn run(
+ }
+ 
+ // -- Application-draft expiry (F3) --------------------------------------------
+-// Drafts die at vacancy close: manual close (status='closed') or closes_at
+-// in the past (also covers the auto-close fast-path at request time). Runs
+-// after the lifecycle phase so a vacancy this run just closed has its
+-// drafts swept in the same pass. Fail-open like the other observational
+-// sweeps: a failure is logged + Sentry-flagged, never fails the run.
++// Drafts die 7 days AFTER vacancy close (draft-grace-period amendment): an
++// in-grace pay-to-extend resurrects the save-resume journey, so close-day
++// deletion would orphan it. Close moment per branch: closes_at for the
++// time-based path, closed_notified_at (stamped by close_vacancy) for manual
++// closes. Runs after the lifecycle phase; fail-open like the other
++// observational sweeps: a failure is logged + Sentry-flagged, never fails
++// the run.
+ 
+ fn sweep_application_drafts(
+   db_conn: pog.Connection,
+diff --git a/server/src/retention/sql.gleam b/server/src/retention/sql.gleam
+index d76203ef..10392c30 100644
+--- a/server/src/retention/sql.gleam
++++ b/server/src/retention/sql.gleam
+@@ -276,13 +276,43 @@ pub type DeleteExpiredApplicationDraftsRow {
+ }
+ 
+ /// - delete_expired_application_drafts()
+-/// F3 draft expiry: drafts die at vacancy close (manual status='closed' or
+-/// closes_at in the past — the latter also catches the daily lifecycle
+-/// auto-close window). Archived vacancies keep their drafts: archiving is
+-/// restorable (AGENTS.md), the emailed promise is "until the vacancy
+-/// closes", and an archived draft is unreachable (the form/resume render the
+-/// closed page) but not yet broken. Runs inside the retention job's
+-/// per-phase fail-open pattern.
++/// F3 draft expiry, amended 2026-08 (draft-grace-period): drafts die 7 days
++/// AFTER vacancy close, not at close. The pay-to-extend webhook reopens the
++/// vacancy and restores auto-closed applications, so a draft destroyed at
++/// close would orphan the save-resume journey the extension was bought to
++/// revive. During grace the form/resume already render the closed page, so
++/// the draft is unreachable but intact; an in-grace extension makes the
++/// continue token work again exactly as before. Grace applies regardless of
++/// closed_via (auto vs manual) — kinder and simpler.
++/// 
++/// Close moment, per branch (the OR means the EARLIEST anchor wins — grace
++/// starts at the first close event, never resets on later transitions):
++/// * Time-based: closes_at itself is the contractual expiry moment — exact
++/// whether or not the lifecycle job has flipped status to 'closed' yet,
++/// and covers every auto-close (all auto-close paths require
++/// closes_at < now()). Edge, accepted: a vacancy that sits
++/// active-but-expired for >7 days (lifecycle job down AND no landlord
++/// dashboard visit to trigger the request-time auto-close) loses its
++/// drafts while still technically extendable — strictly kinder than the
++/// pre-amendment behavior (deletion AT closes_at) and requires a ≥7-day
++/// lifecycle outage.
++/// * Manual close (status='closed'): close_vacancy.sql stamps
++/// closed_notified_at = now() in the same UPDATE that flips status, so it
++/// IS the close moment. COALESCE falls back to closes_at for rows with no
++/// close stamp: every auto-close has closes_at in the past, and legacy
++/// rows closed before closed_notified_at existed (2026-05 lifecycle
++/// migration) have long-expired closes_at by construction — no draft
++/// zombies (closes_at is NOT NULL, so the COALESCE always lands
++/// somewhere real). Corollary of earliest-anchor-wins: manually closing
++/// an already >7-days-expired vacancy grants no fresh 7 days — the
++/// expiry, not the bookkeeping click, started the grace.
++/// No archived_at guard, unchanged from the pre-amendment predicate:
++/// archived vacancies follow the same rules (auto-close paths exclude
++/// archived rows, but the time-based branch still sweeps an
++/// archived-and-long-expired vacancy's drafts). Documented honestly here
++/// because the pre-amendment comment claimed archived drafts always survive,
++/// which was never true of the expired branch.
++/// Runs inside the retention job's per-phase fail-open pattern.
+ ///
+ /// > 🐿️ This function was generated automatically using v4.6.0 of
+ /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+@@ -296,19 +326,53 @@ pub fn delete_expired_application_drafts(
+   }
+ 
+   "--- delete_expired_application_drafts()
+--- F3 draft expiry: drafts die at vacancy close (manual status='closed' or
+--- closes_at in the past — the latter also catches the daily lifecycle
+--- auto-close window). Archived vacancies keep their drafts: archiving is
+--- restorable (AGENTS.md), the emailed promise is \"until the vacancy
+--- closes\", and an archived draft is unreachable (the form/resume render the
+--- closed page) but not yet broken. Runs inside the retention job's
+--- per-phase fail-open pattern.
++-- F3 draft expiry, amended 2026-08 (draft-grace-period): drafts die 7 days
++-- AFTER vacancy close, not at close. The pay-to-extend webhook reopens the
++-- vacancy and restores auto-closed applications, so a draft destroyed at
++-- close would orphan the save-resume journey the extension was bought to
++-- revive. During grace the form/resume already render the closed page, so
++-- the draft is unreachable but intact; an in-grace extension makes the
++-- continue token work again exactly as before. Grace applies regardless of
++-- closed_via (auto vs manual) — kinder and simpler.
++--
++-- Close moment, per branch (the OR means the EARLIEST anchor wins — grace
++-- starts at the first close event, never resets on later transitions):
++--   * Time-based: closes_at itself is the contractual expiry moment — exact
++--     whether or not the lifecycle job has flipped status to 'closed' yet,
++--     and covers every auto-close (all auto-close paths require
++--     closes_at < now()). Edge, accepted: a vacancy that sits
++--     active-but-expired for >7 days (lifecycle job down AND no landlord
++--     dashboard visit to trigger the request-time auto-close) loses its
++--     drafts while still technically extendable — strictly kinder than the
++--     pre-amendment behavior (deletion AT closes_at) and requires a ≥7-day
++--     lifecycle outage.
++--   * Manual close (status='closed'): close_vacancy.sql stamps
++--     closed_notified_at = now() in the same UPDATE that flips status, so it
++--     IS the close moment. COALESCE falls back to closes_at for rows with no
++--     close stamp: every auto-close has closes_at in the past, and legacy
++--     rows closed before closed_notified_at existed (2026-05 lifecycle
++--     migration) have long-expired closes_at by construction — no draft
++--     zombies (closes_at is NOT NULL, so the COALESCE always lands
++--     somewhere real). Corollary of earliest-anchor-wins: manually closing
++--     an already >7-days-expired vacancy grants no fresh 7 days — the
++--     expiry, not the bookkeeping click, started the grace.
++-- No archived_at guard, unchanged from the pre-amendment predicate:
++-- archived vacancies follow the same rules (auto-close paths exclude
++-- archived rows, but the time-based branch still sweeps an
++-- archived-and-long-expired vacancy's drafts). Documented honestly here
++-- because the pre-amendment comment claimed archived drafts always survive,
++-- which was never true of the expired branch.
++-- Runs inside the retention job's per-phase fail-open pattern.
+ DELETE FROM application_draft d
+ USING vacancy v
+ WHERE d.vacancy_id = v.id
+   AND (
+-    v.status = 'closed'
+-    OR (v.closes_at IS NOT NULL AND v.closes_at <= now())
++    (
++      v.status = 'closed'
++      AND COALESCE(v.closed_notified_at, v.closes_at)
++          <= now() - interval '7 days'
++    )
++    OR v.closes_at <= now() - interval '7 days'
+   )
+ RETURNING d.id::text;
+ "
+diff --git a/server/src/retention/sql/delete_expired_application_drafts.sql b/server/src/retention/sql/delete_expired_application_drafts.sql
+index 846adbbe..d5ca977f 100644
+--- a/server/src/retention/sql/delete_expired_application_drafts.sql
++++ b/server/src/retention/sql/delete_expired_application_drafts.sql
+@@ -1,16 +1,50 @@
+ --- delete_expired_application_drafts()
+--- F3 draft expiry: drafts die at vacancy close (manual status='closed' or
+--- closes_at in the past — the latter also catches the daily lifecycle
+--- auto-close window). Archived vacancies keep their drafts: archiving is
+--- restorable (AGENTS.md), the emailed promise is "until the vacancy
+--- closes", and an archived draft is unreachable (the form/resume render the
+--- closed page) but not yet broken. Runs inside the retention job's
+--- per-phase fail-open pattern.
++-- F3 draft expiry, amended 2026-08 (draft-grace-period): drafts die 7 days
++-- AFTER vacancy close, not at close. The pay-to-extend webhook reopens the
++-- vacancy and restores auto-closed applications, so a draft destroyed at
++-- close would orphan the save-resume journey the extension was bought to
++-- revive. During grace the form/resume already render the closed page, so
++-- the draft is unreachable but intact; an in-grace extension makes the
++-- continue token work again exactly as before. Grace applies regardless of
++-- closed_via (auto vs manual) — kinder and simpler.
++--
++-- Close moment, per branch (the OR means the EARLIEST anchor wins — grace
++-- starts at the first close event, never resets on later transitions):
++--   * Time-based: closes_at itself is the contractual expiry moment — exact
++--     whether or not the lifecycle job has flipped status to 'closed' yet,
++--     and covers every auto-close (all auto-close paths require
++--     closes_at < now()). Edge, accepted: a vacancy that sits
++--     active-but-expired for >7 days (lifecycle job down AND no landlord
++--     dashboard visit to trigger the request-time auto-close) loses its
++--     drafts while still technically extendable — strictly kinder than the
++--     pre-amendment behavior (deletion AT closes_at) and requires a ≥7-day
++--     lifecycle outage.
++--   * Manual close (status='closed'): close_vacancy.sql stamps
++--     closed_notified_at = now() in the same UPDATE that flips status, so it
++--     IS the close moment. COALESCE falls back to closes_at for rows with no
++--     close stamp: every auto-close has closes_at in the past, and legacy
++--     rows closed before closed_notified_at existed (2026-05 lifecycle
++--     migration) have long-expired closes_at by construction — no draft
++--     zombies (closes_at is NOT NULL, so the COALESCE always lands
++--     somewhere real). Corollary of earliest-anchor-wins: manually closing
++--     an already >7-days-expired vacancy grants no fresh 7 days — the
++--     expiry, not the bookkeeping click, started the grace.
++-- No archived_at guard, unchanged from the pre-amendment predicate:
++-- archived vacancies follow the same rules (auto-close paths exclude
++-- archived rows, but the time-based branch still sweeps an
++-- archived-and-long-expired vacancy's drafts). Documented honestly here
++-- because the pre-amendment comment claimed archived drafts always survive,
++-- which was never true of the expired branch.
++-- Runs inside the retention job's per-phase fail-open pattern.
+ DELETE FROM application_draft d
+ USING vacancy v
+ WHERE d.vacancy_id = v.id
+   AND (
+-    v.status = 'closed'
+-    OR (v.closes_at IS NOT NULL AND v.closes_at <= now())
++    (
++      v.status = 'closed'
++      AND COALESCE(v.closed_notified_at, v.closes_at)
++          <= now() - interval '7 days'
++    )
++    OR v.closes_at <= now() - interval '7 days'
+   )
+ RETURNING d.id::text;
+diff --git a/server/test/integration/draft_integration_test.gleam b/server/test/integration/draft_integration_test.gleam
+index f672fe1f..998580de 100644
+--- a/server/test/integration/draft_integration_test.gleam
++++ b/server/test/integration/draft_integration_test.gleam
+@@ -21,6 +21,7 @@ import retention/retention_job
+ import sentry/sentry_client
+ import test_helpers
+ import unitest
++import vacancy/sql as vacancy_sql
+ import wisp/simulate
+ import youid/uuid
+ 
+@@ -570,28 +571,57 @@ pub fn save_after_erasure_is_silently_rejected_test() {
+ // Expiry (retention sweep) + cascade
+ // ============================================================================
+ 
+-pub fn retention_sweep_expires_drafts_at_vacancy_close_test() {
++/// UPDATE a seeded vacancy into a manual close stamped `ago` in the past
++/// (close_vacancy.sql stamps closed_notified_at at the close moment).
++fn close_vacancy_manual(db: pog.Connection, vacancy_id: String, ago: String) {
++  pog.query("UPDATE vacancy
++     SET status = 'closed', closed_via = 'manual',
++         closed_notified_at = now() - interval '" <> ago <> "'
++     WHERE id = $1::uuid")
++  |> pog.parameter(pog.text(vacancy_id))
++  |> pog.execute(db)
++}
++
++/// UPDATE a seeded vacancy into an auto-close with closes_at `ago` past.
++fn auto_close_with_closes_at(
++  db: pog.Connection,
++  vacancy_id: String,
++  ago: String,
++) {
++  pog.query("UPDATE vacancy
++     SET status = 'closed', closed_via = 'auto',
++         closes_at = now() - interval '" <> ago <> "'
++     WHERE id = $1::uuid")
++  |> pog.parameter(pog.text(vacancy_id))
++  |> pog.execute(db)
++}
++
++pub fn retention_sweep_grace_keeps_recent_close_deletes_old_close_test() {
+   use <- unitest.tag("integration")
+   let db = setup()
+   let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
+   // Active vacancy (draft must survive)…
+   let assert Ok(active_id) = test_db.seed_vacancy(db, landlord_id, True)
+   let _ = seed_draft_with_token(db, active_id, "tok-active")
+-  // Manually closed vacancy (status='closed')…
+-  let assert Ok(closed_id) = test_db.seed_closed_vacancy(db, landlord_id)
+-  let _ = seed_draft_with_token(db, closed_id, "tok-closed")
+-  // Still-active status but closes_at already passed (auto-close window)…
+-  let assert Ok(past_id) = test_db.seed_vacancy(db, landlord_id, True)
+-  let _ = seed_draft_with_token(db, past_id, "tok-past")
+-  let assert Ok(_) =
+-    pog.query(
+-      "UPDATE vacancy SET closes_at = now() - interval '1 hour'
+-       WHERE id = $1::uuid",
+-    )
+-    |> pog.parameter(pog.text(past_id))
+-    |> pog.execute(db)
+-  // Archived vacancy: drafts SURVIVE (archiving is restorable and the
+-  // emailed promise is "until the vacancy closes")…
++  // Manual close 3 days ago — INSIDE the 7-day grace (survives)…
++  let assert Ok(manual_recent_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, manual_recent_id, "tok-manual-recent")
++  let assert Ok(_) = close_vacancy_manual(db, manual_recent_id, "3 days")
++  // Manual close 8 days ago — grace expired (deleted via closed_notified_at;
++  // closes_at stays +30d out, isolating the manual-close branch)…
++  let assert Ok(manual_old_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, manual_old_id, "tok-manual-old")
++  let assert Ok(_) = close_vacancy_manual(db, manual_old_id, "8 days")
++  // Auto-closed with closes_at 3 days past — INSIDE grace (survives)…
++  let assert Ok(time_recent_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, time_recent_id, "tok-time-recent")
++  let assert Ok(_) = auto_close_with_closes_at(db, time_recent_id, "3 days")
++  // Auto-closed with closes_at 8 days past — grace expired (deleted via the
++  // time-based branch)…
++  let assert Ok(time_old_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, time_old_id, "tok-time-old")
++  let assert Ok(_) = auto_close_with_closes_at(db, time_old_id, "8 days")
++  // Archived vacancy: drafts SURVIVE (archiving is restorable)…
+   let assert Ok(archived_id) = test_db.seed_archived_vacancy(db, landlord_id)
+   let _ = seed_draft_with_token(db, archived_id, "tok-archived")
+ 
+@@ -599,12 +629,154 @@ pub fn retention_sweep_expires_drafts_at_vacancy_close_test() {
+     retention_job.run(db, "", "", "", "", sentry_client.Disabled)
+   summary.application_drafts_expired |> should.equal(2)
+ 
+-  draft_count(db) |> should.equal(2)
++  draft_count(db) |> should.equal(4)
+   draft_field(db, active_id, "continue_token") |> should.equal("tok-active")
++  draft_field(db, manual_recent_id, "continue_token")
++  |> should.equal("tok-manual-recent")
++  draft_field(db, time_recent_id, "continue_token")
++  |> should.equal("tok-time-recent")
+   draft_field(db, archived_id, "continue_token")
+   |> should.equal("tok-archived")
+ }
+ 
++/// The gap this grace window closes: a vacancy auto-closed 1 day ago has its
++/// drafts swept by nothing (grace), the pay-to-extend webhook path reopens
++/// it (extend_vacancy), and the applicant's save-resume journey picks up
++/// exactly where it left off — token resumes, fields intact, submit strips.
++pub fn closed_then_extended_within_grace_resume_and_submit_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let code = vacancy_short_code(db, vacancy_id)
++  let token = seed_draft_with_token(db, vacancy_id, "tok-grace-extend")
++
++  // Auto-close 1 day ago, then run the retention sweep: the draft must
++  // SURVIVE (inside the 7-day grace).
++  let assert Ok(_) = auto_close_with_closes_at(db, vacancy_id, "1 day")
++  let assert Ok(summary) =
++    retention_job.run(db, "", "", "", "", sentry_client.Disabled)
++  summary.application_drafts_expired |> should.equal(0)
++  draft_field(db, vacancy_id, "continue_token")
++  |> should.equal("tok-grace-extend")
++
++  // While closed, the resume link renders the closed page (unchanged F3
++  // behaviour)…
++  let closed_req =
++    simulate.request(http.Get, "/apply/" <> code <> "/resume/" <> token)
++  let closed_resp =
++    draft_handler.handle_resume(closed_req, test_server_config(db), code, token)
++  simulate.read_body(closed_resp)
++  |> string.contains("data-apply-page=\"form-resume\"")
++  |> should.be_false
++
++  // …the landlord buys the extension (Stripe webhook → extend_vacancy)…
++  let assert Ok(vacancy_uuid) = uuid.from_string(vacancy_id)
++  let assert Ok(pog.Returned(_, [extended, ..])) =
++    vacancy_sql.extend_vacancy(db, vacancy_uuid)
++  extended.previous_status |> should.equal("closed")
++  extended.previous_closed_via |> should.equal("auto")
++
++  // …and the save-resume journey is whole again: the token renders the
++  // resume page with the saved fields.
++  let resp =
++    simulate.request(http.Get, "/apply/" <> code <> "/resume/" <> token)
++  let resumed =
++    draft_handler.handle_resume(resp, test_server_config(db), code, token)
++  resumed.status |> should.equal(200)
++  let body = simulate.read_body(resumed)
++  body
++  |> string.contains("data-apply-page=\"form-resume\"")
++  |> should.be_true
++  body |> string.contains("value=\"Ada\"") |> should.be_true
++
++  // Submit through the real form path — works, and strips the draft.
++  let loaded_at = form_view_now_ms() - 30_000
++  let values = [
++    #("first_name", "Ada"),
++    #("last_name", "Byrne"),
++    #("email", "tenant@example.com"),
++    #("phone", "+353851234567"),
++    #("current_address", "1 Test Street, Dublin 2"),
++    #("employment_status", "student"),
++    #("monthly_income_cents", "3500"),
++    #("desired_move_in_date", near_future_date()),
++    #("num_occupants", "1"),
++    #("has_pets", "no"),
++    #("is_smoker", "no"),
++    #("never_rented_before", "false"),
++    #("has_eviction_history", "no"),
++    #("has_ccjs", "no"),
++    #("co_applicant_sharing", "no"),
++    #("landlord_ref_name", "Previous Landlord"),
++    #("landlord_ref_phone", "+353871234567"),
++    #("landlord_ref_email", "landlord@example.com"),
++    #("personal_statement", "Quiet student, long-term let."),
++    #("gdpr_consent", "on"),
++    #("reference_contact_choice", "declined"),
++    #("_website", ""),
++    #("_form_loaded_at", int.to_string(loaded_at)),
++  ]
++  let file =
++    simulate.FileUpload(
++      file_name: "reference.pdf",
++      content_type: "application/pdf",
++      content: <<"%PDF-1.4 fake":utf8>>,
++    )
++  let submit =
++    simulate.request(http.Post, "/apply/" <> code)
++    |> simulate.multipart_body(values, [#("landlord_ref_primary", file)])
++    |> application_handler.handle_post_form(test_server_config(db), code)
++  submit.status |> should.equal(200)
++  test_db.query_int(
++    db,
++    "SELECT count(*)::int FROM application WHERE vacancy_id = '"
++      <> vacancy_id
++      <> "'::uuid",
++  )
++  |> should.equal(Ok(1))
++  draft_field(db, vacancy_id, "submitted_at") |> should.not_equal("")
++  draft_field(db, vacancy_id, "continue_token") |> should.equal("")
++}
++
++/// Pins the extend → re-close cycle: extend_vacancy MUST clear
++/// closed_notified_at, or a re-closed vacancy's stale stamp (already >7 days
++/// old) would win the COALESCE and void the second grace period. If a future
++/// edit drops that NULL-clear, this test fails.
++pub fn extend_clears_close_stamp_so_reclose_gets_fresh_grace_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let _ = seed_draft_with_token(db, vacancy_id, "tok-reclose")
++
++  // Auto-close 1 day ago, sweep — draft survives the first grace…
++  let assert Ok(_) = auto_close_with_closes_at(db, vacancy_id, "1 day")
++  let assert Ok(first) =
++    retention_job.run(db, "", "", "", "", sentry_client.Disabled)
++  first.application_drafts_expired |> should.equal(0)
++
++  // …extend (webhook path) — the close stamp must be cleared…
++  let assert Ok(vacancy_uuid) = uuid.from_string(vacancy_id)
++  let assert Ok(pog.Returned(_, [_extended, ..])) =
++    vacancy_sql.extend_vacancy(db, vacancy_uuid)
++  test_db.query_text(
++    db,
++    "SELECT COALESCE(closed_notified_at::text, '') FROM vacancy
++     WHERE id = '" <> vacancy_id <> "'::uuid",
++  )
++  |> should.equal(Ok(""))
++
++  // …auto-close again at the new closes_at, sweep — the SECOND grace keeps
++  // the draft. With a stale stamp this sweep would delete it.
++  let assert Ok(_) = auto_close_with_closes_at(db, vacancy_id, "1 day")
++  let assert Ok(second) =
++    retention_job.run(db, "", "", "", "", sentry_client.Disabled)
++  second.application_drafts_expired |> should.equal(0)
++  draft_field(db, vacancy_id, "continue_token")
++  |> should.equal("tok-reclose")
++}
++
+ pub fn vacancy_delete_cascades_drafts_test() {
+   use <- unitest.tag("integration")
+   let db = setup()

@@ -1,0 +1,82 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "pipes_between can return a count larger than the caller's buffer; compute_route then slices pair_buf[:cnt] out of bounds",
+    "location": "core/flow.odin:257",
+    "evidence": "+\t\tif (pa == a && pb == b) || (pa == b && pb == a) {\n+\t\t\tif n < len(out) { out[n] = t.pipe_id[i] }\n+\t\t\tn += 1\n+\t\t}\n... (topology.odin) ...\n+\t\tcnt := pipes_between(t, na, nb, pair_buf[:])\n+\t\tif cnt == 0 { p.route_len = 0; return }\n+\t\tif i >= MAX_ROUTE { p.route_len = 0; return }\n+\t\tp.route[i] = pick_pipe(f, t, na, nb, pair_buf[:cnt])",
+    "detail": "n increments past len(out); pair_buf is [MAX_ROUTE]u32 (32). More than 32 parallel pipes between one pair panics the slice. Prevented only by catalog port capacities, which the loader never enforces for junctions (port_capacity 0 validates fine).",
+    "recommended_fix": "Clamp the return to len(out) in pipes_between, or reject cnt > MAX_ROUTE before slicing; validate junction port_capacity > 0 at load."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Paths longer than MAX_ROUTE silently become 'unreachable' — the packet/demand drops though a route exists",
+    "location": "core/flow.odin:256",
+    "evidence": "+\t\tif i >= MAX_ROUTE { p.route_len = 0; return }",
+    "detail": "A reachable destination beyond 32 pipes reports route_len=0, indistinguishable from genuinely unroutable; E28 accrual and the Unreachable drop reason then misattribute the loss. Out of PROTO scale, but silent.",
+    "recommended_fix": "Assert topology/path bounds at load or use a distinct drop reason for route-overflow."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "state-reset",
+    "title": "Severance reroute resets edge_idx/progress_units but not vis_q8 — the visual fraction can overrun the new route",
+    "location": "core/flow.odin:hunk",
+    "evidence": "+\t\tcur := current_node(p, t)\n+\t\tcompute_route(f, t, cur, p.dst, p)\n+\t\tp.edge_idx = 0\n+\t\tp.progress_units = 0",
+    "detail": "vis_q8 (T1-hashed, deterministic) is unchanged; on a shorter new route packet_edge_pos falls through to 'return 0, 0, p.dst', rendering the packet at its destination. Cosmetic, but a visible teleport after reroute.",
+    "recommended_fix": "Reset or rescale vis_q8 when a reroute replaces the route."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "validation",
+    "title": "Cmd_Set_Pipe_Priority / Cmd_Set_Junction_Triage accept any negative value below -1",
+    "location": "core/topology.odin:hunk",
+    "evidence": "+\tcase Cmd_Set_Pipe_Priority:\n+\t\tif _, ok := pipe_slot(t, c.pipe); !ok { return .Missing_Pipe }\n+\t\tif c.priority >= i32(len(cat.packet_types)) { return .Unknown_Command }\n+\t\treturn .None",
+    "detail": "No lower bound: -2..min(i32) pass validation, are stored and serialized as distinct states, yet behave as neutral (-1). Two byte-different encodings of 'neutral' diverge the hash for identical behavior.",
+    "recommended_fix": "Reject priority/triage < -1 in validate_command (and in log replay)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "validation",
+    "title": "Set-piece fields unvalidated: duration_ticks 0 never activates; forecast_lead_ticks > start_tick never forecasts",
+    "location": "core/catalog.odin:hunk",
+    "evidence": "+\t\t\t\tsp.duration_ticks = u64(jint(so, \"duration_ticks\", 0))\n+\t\t\t\tsp.forecast_lead_ticks = u64(jint(so, \"forecast_lead_ticks\", 0))\n... (catalog.odin set-piece guard) ...\n+\treturn sp.forecast_lead_ticks <= sp.start_tick &&\n+\t       tick >= sp.start_tick - sp.forecast_lead_ticks && tick < sp.start_tick",
+    "detail": "The lead guard silently never fires on a misconfigured lead time; a zero-duration surge never triggers and never resolves. ODN-5 fail-fast validation does not cover these fields.",
+    "recommended_fix": "Validate duration_ticks >= 1 and forecast_lead_ticks <= start_tick at catalog load."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Hysteresis band drains 1/tick even at zero/negative severity (uptime at/above the win threshold)",
+    "location": "core/health.odin:73",
+    "evidence": "+\t\t\tseverity := bal.win_uptime_pct - recent_uptime\n+\t\t\tdrain := clamp(severity / 10, 1, bal.meter_drain_per_tick_max) // E16",
+    "detail": "Inside an open episode, uptime between win_uptime_pct (90) and breach_exit_pct (93) keeps in_breach true with severity <= 0; the clamp floor forces a 1/tick drain while uptime is at/above the win bar. Undocumented if intended.",
+    "recommended_fix": "Gate the drain on recent_uptime < win_uptime_pct, or document the deliberate band bleed."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "validation",
+    "title": "jint silently truncates fractional JSON numbers in integer catalog fields",
+    "location": "core/catalog.odin:464",
+    "evidence": "+\t\t#partial switch x in v {\n+\t\tcase json.Integer: return i32(x)\n+\t\tcase json.Float:   return i32(x)\n+\t\t}",
+    "detail": "With parse_integers=true a Float appears only from a non-integer literal (e.g. 1.9); it truncates to 1 instead of failing. ODN-5 promises fail-fast on bad values; wrong-type values slip through truncated.",
+    "recommended_fix": "Reject json.Float in integer fields (fail-fast), or round-trip check i32(x) == x."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "control-flow",
+    "title": "Overlapping set pieces: surge_active goes false while a later surge is still active; surge_ends_in is last-wins",
+    "location": "core/crisis.odin:83",
+    "evidence": "+\t\tif d.triggered[i] && !d.resolved[i] && tick >= sp.start_tick + sp.duration_ticks {\n+\t\t\td.resolved[i] = true\n+\t\t\tc.surge_active = false\n+\t\t\temit(state, tick, Ev_Crisis_Resolved{archetype = .Surge, set_piece = u16(i)})\n+\t\t}",
+    "detail": "A single boolean and a single countdown serve a list of set pieces; two overlapping surges leave the run 'not in surge' during the second. The PROTO catalog has one surge, so latent — the schema permits more.",
+    "recommended_fix": "Compute surge_active/surge_ends_in from the currently-active set-piece set."
+  }
+]

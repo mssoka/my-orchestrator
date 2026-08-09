@@ -1,0 +1,72 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "vacuous-test",
+    "title": "mark_resumed_never_stamps_a_submitted_draft_test cannot fail — strip already NULLs the token, so the by-token mark matches nothing with or without the submitted_at guard",
+    "location": "server/test/integration/draft_integration_test.gleam (mark_resumed_never_stamps_a_submitted_draft_test hunk)",
+    "evidence": "  let assert Ok(_) =\n    app_sql.strip_draft_on_submit(db, uuid, \"tenant@example.com\")\n  let assert Ok(returned) =\n    app_sql.mark_draft_resumed_by_token(db, \"tok-sub\", uuid)\n  list.length(returned.rows) |> should.equal(0)\n  draft_field(db, vacancy_id, \"resumed_at\") |> should.equal(\"\")",
+    "detail": "The N26 'never on a submitted draft' boundary is advertised as pinned, but strip_draft_on_submit NULLs continue_token (asserted in strip_on_submit_empties_payload_keeps_metric_test: draft_field(db, vacancy_id, \"continue_token\") |> should.equal(\"\")). mark_draft_resumed_by_token(\"tok-sub\") matches zero rows regardless of any submitted_at guard, so the test passes even if that guard were deleted. The claimed invariant is not exercised.",
+    "recommended_fix": "Seed via raw SQL a row with submitted_at set but continue_token intact, then assert mark_draft_resumed_by_token leaves resumed_at NULL — or drop the guard claim from the section banner."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "test-isolation",
+    "title": "W8 erased-draft exclusion is proven by the NULLed token, not by erased_at — the erased_at filter arm of list_resumable_draft_tokens is never isolated",
+    "location": "server/test/integration/draft_integration_test.gleam (list_resumable_draft_tokens_filters_live_only_test hunk)",
+    "evidence": "  // …erased draft → excluded…\n  let assert Ok(_) =\n    app_sql.upsert_application_draft(\n      db,\n      uuid,\n      \"gone@example.com\",\n      json.object([#(\"first_name\", json.string(\"Y\"))]),\n      \"tok-gone\",\n    )\n  let assert Ok(_) =\n    pog.query(\n      \"UPDATE application_draft SET erased_at = now(), continue_token = NULL\n       WHERE vacancy_id = $1::uuid AND email = 'gone@example.com'\",\n    )",
+    "detail": "One UPDATE sets erased_at AND continue_token = NULL together, so the row is excluded by the token-IS-NOT-NULL condition alone. If the SQL's erased_at IS NULL filter were removed, this test still passes — that arm of the 'live only' contract has no independent failing path.",
+    "recommended_fix": "Set erased_at while keeping continue_token in a second raw UPDATE (or separate draft), asserting it is also excluded, so each filter arm has its own failing path."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "weak-assertion",
+    "title": "resume_on_closed_vacancy_renders_closed_page_test asserts only absence of resume markers — a blank or broken 200 page passes",
+    "location": "server/test/integration/draft_integration_test.gleam (resume_on_closed_vacancy_renders_closed_page_test hunk)",
+    "evidence": "  resp.status |> should.equal(200)\n  let body = simulate.read_body(resp)\n  body\n  |> string.contains(\"data-apply-page=\\\"form-resume\\\"\")\n  |> should.be_false\n  body |> string.contains(\"draft-resume-banner\") |> should.be_false",
+    "detail": "The test name claims the closed page is rendered, but there is no positive assertion of any closed-page content (closed copy or its data-apply-page marker). Any 200 body lacking the two resume strings — including an empty or wrong page — satisfies the test.",
+    "recommended_fix": "Add a positive assertion for the closed vacancy page's marker or copy (e.g. its data-apply-page value) alongside the two negative assertions."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "comment-mismatch",
+    "title": "W7 fixture contradicts its own comment: 'never rented skips eviction' but never_rented_before is false and has_eviction_history is supplied",
+    "location": "server/test/integration/draft_integration_test.gleam (successful_submission_strips_the_matching_draft_test hunk)",
+    "evidence": "  // Minimum valid submission (student → no employer fields; never rented\n  // skips eviction). Mirrors the gdpr integration fixture.\n  ...\n    #(\"never_rented_before\", \"false\"),\n    #(\"has_eviction_history\", \"no\"),",
+    "detail": "The comment says the fixture relies on the never-rented path to skip eviction, yet the fixture sets never_rented_before to false and provides has_eviction_history anyway. The comment misdescribes the data the test actually submits.",
+    "recommended_fix": "Either correct the comment to describe the fixture as-is, or set never_rented_before to \"true\" and drop the eviction field so the fixture matches the claim."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "test-helper-footgun",
+    "title": "seed_draft_with_token's UPDATE has no email predicate — it rewrites continue_token on every draft row for the vacancy, and its 'tok-seed' candidate is always overwritten",
+    "location": "server/test/integration/draft_integration_test.gleam (seed_draft_with_token helper)",
+    "evidence": "  let assert Ok(_) =\n    pog.query(\n      \"UPDATE application_draft SET continue_token = $1\n       WHERE vacancy_id = $2::uuid\",\n    )\n    |> pog.parameter(pog.text(token))\n    |> pog.parameter(pog.text(vacancy_id))\n    |> pog.execute(db)",
+    "detail": "The helper upserts one draft then rewrites continue_token for ALL drafts on the vacancy (no email clause). On a multi-draft vacancy (as built later in the W8 test) a second call would silently clobber other drafts' tokens. The 'tok-seed' upsert candidate is dead weight — always replaced by this UPDATE.",
+    "recommended_fix": "Add AND email = 'tenant@example.com' to the UPDATE, or pass the desired token straight to upsert_application_draft and delete the redundant UPDATE."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "form_view_now_ms and near_future_date are single-use 1:1 wrappers; the form_view import exists only to be renamed",
+    "location": "server/test/integration/draft_integration_test.gleam (helpers below successful_submission_strips_the_matching_draft_test)",
+    "evidence": "fn form_view_now_ms() -> Int {\n  form_view.current_unix_ms()\n}\n\nfn near_future_date() -> String {\n  test_helpers.near_future_iso_date()\n}",
+    "detail": "Each wrapper delegates unchanged to the underlying function and is called exactly once (loaded_at and desired_move_in_date). The form_view import is used nowhere else. Pure indirection with no abstraction value — same class as round-1 N4.",
+    "recommended_fix": "Call form_view.current_unix_ms() and test_helpers.near_future_iso_date() directly at the two call sites and delete both wrappers."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "style-consistency",
+    "title": "W6 section banner is missing the closing separator line every other section in the file has",
+    "location": "server/test/integration/draft_integration_test.gleam (fan_out_bound_end_to_end_test banner)",
+    "evidence": "// ============================================================================\n// W6 — cross-vacancy fan-out bound (3 continue emails / recipient / hour)\npub fn fan_out_bound_end_to_end_test() {",
+    "detail": "Every other section header in this file (Helpers, Save, W5, W7, W8, W9, N21, N26, etc.) is bracketed by // ==== lines above and below. The W6 header has only the top line, so the test function visually merges into the banner.",
+    "recommended_fix": "Add the closing // ============================================================================ line under the W6 title to match the file's banner convention."
+  }
+]

@@ -1,0 +1,72 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "health-loss",
+    "title": "NetworkHealth win/lose/drain has ZERO test coverage (P0 health/loss + the MVP win condition)",
+    "location": "game/scripts/core/network_health.gd:update + game/tests/run_tests.gd:8-15",
+    "evidence": "network_health.gd:\n\t\t\tvar severity: int = balance.win_uptime_pct - recent_uptime\n\t\t\tvar drain: int = clampi(severity / 10, 1, balance.meter_drain_per_tick_max)\n\t\t\tmeter_pct = maxi(0, meter_pct - drain)\n...\n\t\tif surge_uptime >= balance.win_uptime_pct:\n\t\t\twon = true\n...\n\tif meter_pct <= 0 and not won:\n\t\tlost = true\n\nrun_tests.gd (full suite list — no health/win/lose suite):\n\tvar suite_paths: Array[String] = [\n\t\t\"res://tests/core/test_parse_gate.gd\",\n\t\t\"res://tests/core/test_catalogs.gd\",\n\t\t\"res://tests/core/test_qos.gd\",\n\t\t\"res://tests/core/test_demand.gd\",\n\t\t\"res://tests/core/test_director.gd\",\n\t\t\"res://tests/core/test_topology.gd\",\n\t\t\"res://tests/core/test_routing.gd\",\n\t\t\"res://tests/core/test_replay.gd\",\n\t]\n(grep for NetworkHealth/.won/.lost/meter_pct across game/tests/ = no matches)",
+    "detail": "update() implements AC-E16 drain, AC-E17 precedence, and the FR12 surge-window win — the MVP pass/fail. No test asserts won/lost/meter; a win-condition regression ships silently.",
+    "recommended_fix": "Add a headless suite driving breach→drain→lost and surge→win; assert meter drains only post-grace, lost supersedes, won fires when surge-end uptime ≥ threshold."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "qos",
+    "title": "QoS priority behavior (promote/demote, drop ladder, starvation, pool) untested — only the WFQ partition helper is covered",
+    "location": "game/scripts/core/packet_flow.gd:151-224 + game/tests/core/test_qos.gd:5-9",
+    "evidence": "packet_flow.gd:\n\tif pipe.priority_class == &\"streaming\" or pipe.priority_class == &\"email\":\n\t\tweights = Vector3i(4, 1, 1)\n...\nfunc _effective_lane(pipe: NetPipe, class_id: StringName) -> int:\n\tmatch pipe.priority_class:\n\t\t&\"streaming\":\n\t\t\treturn CoreConst.Lane.EXPRESS if class_id == &\"streaming\" else CoreConst.Lane.BEST\n...\n\t\t\tif idx_in_lane > QUEUE_DROP_DEPTH:\n\t\t\t\t_drop(p, &\"queue_overflow\", arrived)\n\ntest_qos.gd (entire suite — every case calls QoSEngine.allocate only):\nfunc run() -> Array:\n\t_test_even_split_no_vanish()\n\t_test_default_weights_split()\n\t_test_all_zero_fallback()\n\t_test_zero_capacity()\n\treturn results\n(grep for priority_class/SetPipePriority/EXPRESS/BEST across game/tests/ = no matches)",
+    "detail": "The differentiator (FORGE #4) — SetPipePriority promote/demote, the Best→Std→Express drop ladder (AC-E9), no-starvation (AC-E7), pool-exhaustion (AC-E22) — has no behavioral test; only allocate() is covered.",
+    "recommended_fix": "Add a saturated-pipe test: set priority_class, overload the pipe, assert the demoted class drops first and the promoted class gets the Express share; add an IN_FLIGHT_CAP pool-exhaustion drop assertion."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "determinism",
+    "title": "Replay-equality keystone runs on a no-pipe topology — routing/traversal/QoS determinism never exercised",
+    "location": "game/tests/core/test_replay.gd + game/scripts/core/run_state.gd:_bootstrap_map",
+    "evidence": "run_state.gd (bootstrap spawns nodes only, draws no pipes — grep for apply_edit/DrawPipeCmd/_add_pipe in run_state.gd = no matches):\nstatic func _bootstrap_map(s: RunState) -> void:\n\ts.topology.spawn_node(CoreConst.NodeKind.TERMINAL, &\"content_host\",\n\t\tCoreConst.TerminalRole.CONTENT_HOST, Vector2i(30, 14), 40, 0)\n\nrun_tests loads test_replay.gd, whose header calls it \"the determinism spine's keystone test\" and whose own comment admits:\n\t# (Fingerprints can converge in the degenerate no-pipes case because the rng-\n\t# dependent dst picks don't affect the drop aggregates, so rng state is the honest\n\t# signal here.)",
+    "detail": "Every spawned packet drops 'unreachable' on the empty graph, so BFS routing, bandwidth traversal, and lane serving never run — their determinism is unverified by the keystone test.",
+    "recommended_fix": "Add a replay-equality variant that draws pipes and steps past delivery so routing/traversal/QoS divergence surfaces in the snapshot fingerprint."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "routing",
+    "title": "Demolish-in-transit reroute / 'severance' drop (AC-E1) untested",
+    "location": "game/scripts/core/packet_flow.gd:268-279",
+    "evidence": "packet_flow.gd:\nfunc _handle_severed(pipe_id: int, backlog: Array, topology: TopologySnapshot,\n\t\t\t\t\t arrived: Array) -> void:\n\t# A pipe was demolished while packets were on it (E1). Try to reroute from\n\t# the packet's current node; if no path to dst, drop with \"severance\".\n...\n\t\telse:\n\t\t\t_drop(p, &\"severance\", arrived)\n(grep for severance/_handle_severed/AC-E1 across game/tests/ = no matches)",
+    "detail": "AC-E1 (in-flight packets reroute or drop visibly on demolish) is a pinned headless contract (story E1.3) with no test — a severance-path regression would be silent.",
+    "recommended_fix": "Add a test: flow packets onto a pipe, demolish it mid-traversal, assert reroute when an alt path exists and a visible 'severance' drop when none."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "sla",
+    "title": "SLA uptime aggregation (overall/recent/class) untested — it feeds the untested NetworkHealth breach input",
+    "location": "game/scripts/core/flow_report.gd:overall_uptime_pct + packet_flow.gd:recent_overall_uptime_pct",
+    "evidence": "flow_report.gd:\nfunc overall_uptime_pct() -> int:\n\tvar sum_delivered: int = 0\n\tvar sum_total: int = 0\n\t...\n\tif sum_total <= 0:\n\t\treturn -1\n\treturn (sum_delivered * 100) / sum_total\n(grep for overall_uptime/uptime_pct/SlaAccumulator across game/tests/ = no matches)",
+    "detail": "overall/recent/class uptime (E6.1, AC-E24 zero-demand-neutral) drive the meter's breach detection, yet no test asserts the aggregation or the -1 neutral path — the breach input is unverified.",
+    "recommended_fix": "Assert overall_uptime_pct over known delivered/dropped, the -1 zero-demand-neutral return, and that the rolling recent-uptime window advances and decays correctly."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "warning-surface",
+    "title": "node_health_states (🟡/🔴 warning surface, '🔴 traceable to measured strain') untested",
+    "location": "game/scripts/core/packet_flow.gd:374",
+    "evidence": "packet_flow.gd:\nfunc node_health_states(topology: TopologySnapshot) -> Dictionary:\n\t...\n\t\tif pct >= crit:\n\t\t\tout[nid] = CoreConst.HealthState.CRITICAL\n\t\telif pct >= strain:\n\t\t\tout[nid] = CoreConst.HealthState.STRAINED\n\t\telse:\n\t\t\tout[nid] = CoreConst.HealthState.HEALTHY\n(grep for node_health_states across game/tests/ = no matches)",
+    "detail": "The S2 warning surface (E3.3) and the 'critical must trace to measured load' invariant (GDD-inv, FR11) have no test — a phantom-🔴 or threshold-off regression ships silently.",
+    "recommended_fix": "Add a test loading a node past strain/critical thresholds and asserting STRAINED/CRITICAL map to the measured utilization (and HEALTHY at zero load)."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "Per the lens gate thresholds (FAIL if P0<100% OR P1<80% OR overall<80%). P0 critical paths: health/loss 0% covered (NetworkHealth untested), QoS-priority behavior ~25% (only allocate() covered — promote/demote, drop ladder AC-E9, no-starvation AC-E7, pool AC-E22 untested), determinism partial (replay-equality keystone runs on a no-pipe graph, per its own comment). P1 ≈50% (severance AC-E1, QoS contention behaviors, SLA-uptime aggregation all NONE). Overall behavioral coverage <80%.",
+    "detail": "P0 is not 100% (health/loss 0%, QoS-priority behavior ~25%, determinism partial) and P1 is well under 80%, so the prototype's critical paths — the win condition and the QoS differentiator — are not test-locked.",
+    "recommended_fix": "Add suites for NetworkHealth win/lose, QoS priority under contention, and a wired-topology replay-equality; that lifts P0 to 100% and P1 above 80% to reach CONCERNS/PASS."
+  }
+]

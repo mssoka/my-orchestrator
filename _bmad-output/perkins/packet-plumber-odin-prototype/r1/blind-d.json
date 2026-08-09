@@ -1,0 +1,142 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "bounds-check",
+    "title": "`demolish node` with no name reads fields[2] out of bounds — harness panics instead of returning a parse error",
+    "location": "harness/demo_parse.odin:parse_intent demolish case",
+    "evidence": "+\tcase \"demolish\":\n+\t\tif len(fields) < 2 { return it, fmt.tprintf(\"line %d: demolish a-b|node name\", ln) }\n+\t\tif fields[1] == \"node\" {\n+\t\t\tit.verb = \"demolish_node\"\n+\t\t\tit.a = strings.clone(fields[2])",
+    "detail": "A demo line `demolish node` (two fields) passes the len(fields)<2 guard, then indexes fields[2], which does not exist. The parser's stated contract is malformed input = parse error, not crash; this panics the whole harness run.",
+    "recommended_fix": "Guard the node branch with len(fields) >= 3 before reading fields[2], returning the same 'demolish a-b|node name' parse error otherwise."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "parse-strictness",
+    "title": "Malformed `within` window is silently coerced to 0..0 instead of a parse error",
+    "location": "harness/demo_parse.odin:parse_expect",
+    "evidence": "+\t\t\tif len(rest) >= 2 && rest[0] == \"within\" {\n+\t\t\t\trange := strings.split(rest[1], \"..\", context.temp_allocator)\n+\t\t\t\tif len(range) == 2 {\n+\t\t\t\t\tlo, ok1 := parse_ms_str(range[0])\n+\t\t\t\t\thi, ok2 := parse_ms_str(range[1])\n+\t\t\t\t\tif !ok1 || !ok2 { return e, fmt.tprintf(\"line %d: bad window\", ln) }\n+\t\t\t\t\te.lo_ms = lo\n+\t\t\t\t\te.hi_ms = hi\n+\t\t\t\t}\n+\t\t\t}",
+    "detail": "When rest[1] does not split into exactly two parts (\"within 100\", \"within 1..2..3\") no error is returned: lo_ms/hi_ms stay 0, narrowing the expectation to tick 0. Trailing tokens after a valid window are also ignored. Violates the header's 'never silent coercions' contract.",
+    "recommended_fix": "Add an else branch returning a 'bad window' parse error when len(range) != 2, and reject leftover tokens after a valid window."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "replay-fixture",
+    "title": "Replay gate always boots the six-node map — bare-fixture demos replay against the wrong fixture",
+    "location": "harness/replay.odin:verify_replay + harness/main.odin:run_demo",
+    "evidence": "+\t// the fixture flag is carried by the demo; bare demos don't reach here\n+\t// with commands, but replay the same way\n+\tbar := false\n+\t_ = bar\n+\treplayed, ok := replay_hashes(log_path, catalogs, u64(len(live_hashes)), false, &fails)\n\n+// bare selects the empty-map fixture (the log doesn't record the fixture; the demo does)\n+replay_hashes :: proc(log_path: string, catalogs: ^pp.Catalogs, ticks: u64, bare: bool, fails: ^[dynamic]string) -> ([dynamic]u64, bool) {\n...\n+\trc: prun.Run_Context\n+\tif bare {\n+\t\tprun.run_context_create_bare(&rc, header.seed, catalogs)\n+\t} else {\n+\t\tprun.run_context_create(&rc, header.seed, catalogs)\n+\t}\n\n+\t\t\trep_ok := verify_replay(name, log_path, catalogs, hashes[:])",
+    "detail": "main.odin calls verify_replay for every demo that passes T1 — bare demos included, with no fixture argument — but verify_replay hardcodes bare=false (run_replay does too), so replay boots the six-node map while the live run used run_context_create_bare. Bare demos' hashes diverge and the gate fails; the dead `bar` variable is the dropped flag.",
+    "recommended_fix": "Thread demo.map_fixture through verify_replay/run_replay into replay_hashes' bare argument (delete bar), or record the fixture in the log header."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "memory-leak",
+    "title": "Captured frame image leaks in both T2 failure branches of check_golden",
+    "location": "harness/goldens.odin:check_golden",
+    "evidence": "+\t} else if mismatch > 0 {\n+\t\tdir := save_diff_bundle(demo, ms, img, golden)\n+\t\tappend(&report.diff_dirs, dir)\n+\t\tappend(fails, fmt.tprintf(\"T2 %dms: %d pixels differ (bbox %v) — diff bundle at %s\",\n+\t\t\tms, mismatch, bbox, dir))\n+\t} else {\n+\t\trl.UnloadImage(img)\n+\t}",
+    "detail": "rl.UnloadImage(img) runs only in the all-match branch. On mismatch>0 (and mismatch<0, which passes {} instead) the captured image — whose buffer was LoadImageColors-allocated in swizzle_rb — goes to save_diff_bundle, which only samples it, so every failing frame leaks its pixel buffer. Failing frames are the harness's main workload.",
+    "recommended_fix": "Call rl.UnloadImage(img) in the mismatch<0 and mismatch>0 branches after save_diff_bundle, mirroring the missing-golden branch."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "allocator-mismatch",
+    "title": "Diff image data is Odin temp-allocator memory, freed by raylib's UnloadImage (cross-allocator free)",
+    "location": "harness/goldens.odin:save_diff_bundle",
+    "evidence": "+\t\tout := make([]rl.Color, n, context.temp_allocator)\n...\n+\t\tdimg.data = raw_data(out)\n...\n+\t\trl.UnloadImage(dimg)",
+    "detail": "out is allocated with Odin's temp allocator; dimg.data points at it; rl.UnloadImage(dimg) frees image.data with raylib's allocator. Freeing arena memory through free() is undefined behavior — heap corruption/crash on every diff-bundle write, i.e. every T2 failure.",
+    "recommended_fix": "Allocate out with context.allocator and delete it with Odin after ExportImage, or skip UnloadImage for an image whose data it doesn't own; never mix allocators."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "unused-import",
+    "title": "core:strconv imported in goldens.odin but never referenced anywhere in the file",
+    "location": "harness/goldens.odin:3",
+    "evidence": "+import \"core:strconv\"",
+    "detail": "Every procedure body in goldens.odin uses only fmt/os/strings/rl/pp/rnd/prun; strconv appears nowhere in the file. Odin builds that flag unused imports refuse to compile the harness; at minimum it is a dead import.",
+    "recommended_fix": "Remove the core:strconv import line from goldens.odin."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "duplicate-code",
+    "title": "write_file and write_log are byte-identical duplicate procedures in goldens.odin",
+    "location": "harness/goldens.odin:write_file/write_log",
+    "evidence": "+// os.write_entire_file with the error checked-and-logged (never dropped)\n+write_file :: proc(path: string, data: []byte) {\n+\tif err := os.write_entire_file(path, data); err != nil {\n+\t\tfmt.eprintfln(\"harness: write failed %s: %v\", path, err)\n+\t}\n+}\n...\n+// os.write_entire_file with the error checked-and-logged (never dropped)\n+write_log :: proc(path: string, data: []byte) {\n+\tif err := os.write_entire_file(path, data); err != nil {\n+\t\tfmt.eprintfln(\"harness: write failed %s: %v\", path, err)\n+\t}\n+}",
+    "detail": "Two identical procedures with identical comments in the same file; main.odin calls write_log while goldens.odin calls write_file. A fix applied to one silently misses the other — a drift hazard.",
+    "recommended_fix": "Collapse to a single write_file used from main.odin too, or give write_log a distinct purpose."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Unreachable duplicate os.exists check left in check_golden",
+    "location": "harness/goldens.odin:check_golden",
+    "evidence": "+\tif !os.exists(path) { /* handled above */ }",
+    "detail": "The preceding if !os.exists(path) branch returns, so this second check can never execute — leftover from an earlier draft.",
+    "recommended_fix": "Delete the dead line."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "silent-drop",
+    "title": "Intents scheduled after the last tick frame are queued but never applied — the audit only counts submissions",
+    "location": "harness/main.odin:run_demo",
+    "evidence": "+\tfor frame <= total_frames {\n+\t\t// this frame's intents, through the real bus (the player path)\n+\t\tfor intent_idx < len(demo.intents) && demo.intents[intent_idx].frame <= frame {\n+\t\t\tit := &demo.intents[intent_idx]\n+\t\t\tintent_idx += 1\n+\t\t\tcmd := intent_command(it, names, &rc.state.topology)\n+\t\t\terr := prun.bus_submit(&rc, cmd)\n...\n+\t\tif frame > 0 && frame % i64(frames_per_tick) == 0 && !rc.ended {\n...\n+\tif intent_idx != len(demo.intents) {\n+\t\tappend(&fail_msgs, fmt.tprintf(\"%d intent(s) never applied (past run end?)\", len(demo.intents) - intent_idx))\n+\t}",
+    "detail": "Ticks fire only at frames where frame % frames_per_tick == 0 (e.g. run_ms=550, hz=10: last tick at frame 30). An intent at frame 33 is submitted via bus_submit after the last tick; no later step applies it, and the audit compares intent_idx (submission count) only, so the drop is silent.",
+    "recommended_fix": "Track the last stepped frame and flag intents whose frame exceeds it, or reject intents past the final tick at parse time."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "lint-gap",
+    "title": "Lint gate 2 regex cannot match file-scope `x := 5` declarations — globals slip through",
+    "location": "tools/lint.sh:gate 2",
+    "evidence": "+HITS=$(grep -rnE '^[a-z_][a-z0-9_]*[ ]*:[ ]' core/*.odin | grep -v '_test\\.odin' | grep -v '::' || true)",
+    "detail": "The pattern requires ':' followed by whitespace; in `x := 5` the colon is followed by '='. The ODN-13 'no globals' gate therefore passes exactly the most common file-scope declaration form it claims to forbid.",
+    "recommended_fix": "Extend the regex to also match ':=' (e.g. '^[a-z_][a-z0-9_]*[ ]*:=?[ ]'), and account for constants/procs being excluded by existing filters."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "lint-gap",
+    "title": "Lint gate 4 only matches a bare `_ = ` at line start — `x, _ :=` and `_, _ :=` discards pass",
+    "location": "tools/lint.sh:gate 4",
+    "evidence": "+HITS=$(grep -rnE '^\\s*_ = ' core/*.odin | grep -v '_test\\.odin' || true)",
+    "detail": "The regex requires the line to start with '_' then ' = '. Multi-value discards like `x, _ := f()` or `_, _ := f()` start with other characters and use ':=', so dropped error returns in the common compound form are never flagged.",
+    "recommended_fix": "Widen the pattern to catch compound discards (e.g. '(_|\\w+, )_ :=' plus the bare form) or accept and document the heuristic's blind spot."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "parse-strictness",
+    "title": "A bare `capture` line with no times is silently accepted as zero captures",
+    "location": "harness/demo_parse.odin:parse_demo capture case",
+    "evidence": "+\tcase \"capture\":\n+\t\trest := strings.join(fields[1:], \" \", context.temp_allocator)\n+\t\trest = strings.trim_prefix(rest, \"at\")\n+\t\tfor part in strings.split(rest, \",\", context.temp_allocator) {\n+\t\t\tp := strings.trim_space(part)\n+\t\t\tif len(p) == 0 { continue }",
+    "detail": "`capture` or `capture at` yields an empty rest; the split produces one empty part which is skipped, and no error is raised. A typo'd capture directive silently records nothing, contrary to the header's strict-parse contract.",
+    "recommended_fix": "Return a parse error when no capture time survives parsing."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "exit-code",
+    "title": "`harness save` exits 0 and prints 'blessed' even when expectation checks failed during the bless",
+    "location": "harness/main.odin:run_demo return + main save branch",
+    "evidence": "+\tok := len(fail_msgs) == 0\n+\tif save {\n+\t\tfmt.printf(\"  save %-20s ticks=%d captures=%d\\n\", name, len(hashes), len(demo.capture_frames))\n+\t} else if ok {\n...\n+\treturn ok || save\n...\n+\tif verb == \"save\" {\n+\t\tif failures > 0 {\n+\t\t\tfmt.printf(\"harness: %d demo(s) FAILED during bless\\n\", failures)\n+\t\t\tos.exit(1)\n+\t\t}\n+\t\tfmt.printf(\"harness: blessed %d demo(s)\\n\", len(names))\n+\t\tos.exit(0)\n+\t}",
+    "detail": "run_demo returns ok || save, so expectation failures during a bless never increment failures and the 'FAILED during bless' branch is unreachable for them; save mode also skips the FAIL printout and write_report. A failed run is blessed silently with exit 0.",
+    "recommended_fix": "Print and count failures in save mode too (return ok, not ok || save), so a bless that fails expectations exits non-zero."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "build-script",
+    "title": "build_raylib_sw.sh header says 'release tarball' but the script git-clones, and an interrupted clone is treated as complete",
+    "location": "tools/build_raylib_sw.sh",
+    "evidence": "+# raylib 6.0 release tarball; cached under tools/raylib-sw/ (gitignored).\n...\n+if [ ! -d \"$SRC\" ]; then\n+  mkdir -p \"$WORK\"\n+  echo \"-- fetching raylib $RAYLIB_TAG source\"\n+  git clone --depth 1 --branch \"$RAYLIB_TAG\" https://github.com/raysan5/raylib.git \"$SRC\"\n+fi",
+    "detail": "Comment/implementation mismatch (tarball vs git tag clone), and the existence of $SRC — not clone success — gates the fetch, so a partial clone silently builds a broken raylib and every later run reuses it.",
+    "recommended_fix": "Update the comment, and verify clone success (check for $SRC/src/raylib.h, or clone to a temp dir and rename on success)."
+  }
+]

@@ -1,0 +1,112 @@
+{
+  "job": "righttenantry-draft-grace-period",
+  "round": 1,
+  "pr": 571,
+  "reviewed_sha": "ca0e3b9c318a4e4460125d65b3f2a6e1fbc0d78a",
+  "diff_file": "/Users/moses/code/_bmad-output/perkins/righttenantry-draft-grace-period/r1/diff.patch",
+  "worktree": "/Users/moses/.herdr/worktrees/RightTenantry/perkins-draft-grace-period-r1",
+  "spec_files": [
+    "/Users/moses/code/_bmad-output/briefings/righttenantry-draft-grace-period.md",
+    "/Users/moses/code/_bmad-output/briefings/righttenantry-form-save-resume-f3.md",
+    "/Users/moses/code/_bmad-output/perkins/righttenantry-draft-grace-period/r1/pr-body.md"
+  ],
+  "reviewers_completed": ["blind", "edge", "acceptance", "security", "architecture", "codebase", "tests"],
+  "failed_layers": [],
+  "chunking": "none (475-line diff, under 3000-line threshold)",
+  "counts": {
+    "raw_findings": 9,
+    "confirmed": 7,
+    "rejected": 2,
+    "unverifiable_speculative": 0,
+    "unique_after_dedup": 6,
+    "blockers": 0,
+    "warnings": 2,
+    "notes": 4
+  },
+  "rejected_findings": [
+    {
+      "source": ["blind"],
+      "title": "New comment asserts closes_at is NOT NULL, but the replaced predicate explicitly guarded IS NOT NULL — one of them is wrong",
+      "rejection_reason": "vacancy.closes_at is TIMESTAMPTZ NOT NULL (supabase/migrations/00000000000001_initial_schema.sql:54). The new comment is correct; the old IS NOT NULL guard was dead code. Blind lens cannot see the schema by design."
+    },
+    {
+      "source": ["blind"],
+      "title": "Continue-draft email still frames the expiry promise as 'the vacancy close' while retention now keeps drafts 7 days beyond it",
+      "rejection_reason": "The email body (email_client.gleam:580-583) promises link functionality ('This link works until the vacancy closes'), which stays literally true — the link renders the closed page once closed; grace changes draft retention, never link availability. No deletion-timing disclosure exists in the email, so no storage-limitation breach. The deletion-timing copy (draft_view.gleam erasure confirm) WAS updated."
+    }
+  ],
+  "findings": [
+    {
+      "source": ["blind"],
+      "severity": "warning",
+      "category": "vacuous-test",
+      "verification": "confirmed",
+      "title": "Re-close grace pin test never stamps closed_notified_at, so it passes even if extend_vacancy drops the NULL-clear it claims to guard",
+      "location": "server/test/integration/draft_integration_test.gleam:743-780 (extend_clears_close_stamp_so_reclose_gets_fresh_grace_test)",
+      "evidence": "auto_close_with_closes_at (lines 586-594) sets only 'status = \\'closed\\', closed_via = \\'auto\\', closes_at = now() - interval ...' — never closed_notified_at; seed_vacancy leaves the stamp NULL; the post-extend assertion 'SELECT COALESCE(closed_notified_at::text, \\'\\') ... should.equal(Ok(\\'\\'))' (line 765) therefore passes vacuously.",
+      "detail": "extend_vacancy.sql:41 today clears closed_notified_at = NULL (verified), but every assertion in this test passes with that clear dropped: the stamp is NULL from seed throughout. In production auto-closed rows DO get stamped (mark_vacancy_close_notified.sql), so the stale-stamp scenario the doc comment describes is real — and no test would catch a regression that drops the clear. The test's comment ('If a future edit drops that NULL-clear, this test fails') overclaims; the PR body's 'Review pass' section repeats the claim.",
+      "recommended_fix": "Stamp closed_notified_at explicitly in the first close (close_vacancy_manual or a direct UPDATE) old enough to exceed 7 days at the second sweep; seed the draft after the first sweep so a stale stamp would actually delete it."
+    },
+    {
+      "source": ["blind", "tests"],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "verification": "confirmed",
+      "title": "Active-but-expired vacancy (status not 'closed', closes_at past) lost its draft-sweep pin in the test rewrite — documented lifecycle-outage edge untested",
+      "location": "server/test/integration/draft_integration_test.gleam:586-635",
+      "evidence": "Removed by the diff: '// Still-active status but closes_at already passed (auto-close window)… let assert Ok(past_id) = test_db.seed_vacancy(db, landlord_id, True)'. Both new helpers force status='closed' ('SET status = \\'closed\\', closed_via = \\'auto\\',' line 590). The SQL comment documents the untested state: 'Edge, accepted: a vacancy that sits active-but-expired for >7 days (lifecycle job down AND no landlord dashboard visit...) loses its drafts'.",
+      "detail": "The old suite pinned deletion for a still-active vacancy with closes_at past; the rewrite exercises the status-agnostic time-based branch only with status='closed' rows. Neither the in-grace survival (active, closes_at 3d past) nor the documented >7d-outage deletion of an active-but-expired vacancy is pinned. A future edit adding a status condition to the time-based branch would ship green.",
+      "recommended_fix": "Add two cases: vacancy left status='active' with closes_at 3d past (draft survives) and 8d past (draft swept via the time-based branch)."
+    },
+    {
+      "source": ["codebase"],
+      "severity": "note",
+      "category": "stale-comment",
+      "verification": "confirmed",
+      "title": "RunSummary.application_drafts_expired field doc still preaches the pre-amendment 'drafts die at vacancy close' semantic",
+      "location": "server/src/retention/retention_job.gleam:108-111",
+      "evidence": "    /// F3 application drafts expired on this run (vacancy closed or past\n    /// closes_at — drafts die at vacancy close per the spec's\n    /// data-protection risk row).\n    application_drafts_expired: Int,",
+      "detail": "The diff updated the sweep_application_drafts comment ~200 lines below in the same file ('Drafts die 7 days AFTER vacancy close (draft-grace-period amendment)') and both SQL comments, but missed this field doc, which still states the old close-time deletion semantic.",
+      "recommended_fix": "Reword to match the amendment, e.g. 'vacancy close older than the 7-day extension grace (draft-grace-period amendment)'."
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "boundary",
+      "verification": "confirmed",
+      "title": "Exact 7-day grace threshold unpinned — any constant in (3d, 8d] passes the new tests",
+      "location": "server/src/retention/sql/delete_expired_application_drafts.sql:45-48",
+      "evidence": "Predicate: '<= now() - interval \\'7 days\\'' (both branches). Test offsets are exclusively 1/3/8 days: 'close_vacancy_manual(db, manual_recent_id, \"3 days\")', '\"8 days\"', 'auto_close_with_closes_at(db, time_recent_id, \"3 days\")', '\"8 days\"'.",
+      "detail": "Factually true: a regression of the constant to 4-8 days satisfies every assertion. Demoted to note: the briefing's acceptance criteria literally specified the 3d/8d brackets, and the daily sweep cadence already makes the effective boundary fuzzy (a draft 7d0h vs 7d23h past close is swept on the same daily run).",
+      "recommended_fix": "Optional: bracket the threshold (e.g. closes_at 6 days 23 hours past survives, 7 days 1 hour past deleted) for at least one branch."
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage-gap",
+      "verification": "confirmed",
+      "title": "Documented archived-and-long-expired sweep behavior has no test pin",
+      "location": "server/test/integration/test_db.gleam:541; server/src/retention/sql/delete_expired_application_drafts.sql:33-36",
+      "evidence": "seed_archived_vacancy inserts 'NOW() + INTERVAL \\'30 days\\'' for closes_at; the only archived assertion is survival ('draft_field(db, archived_id, \"continue_token\") |> should.equal(\"tok-archived\")'). The new SQL comment documents: 'the time-based branch still sweeps an archived-and-long-expired vacancy\\'s drafts'.",
+      "detail": "The amended SQL comment newly documents that an archived vacancy with closes_at >7d past still loses drafts, but no test pins archived+expired deletion. Pre-existing behavior, disclosed in the PR body as deliberately unchanged.",
+      "recommended_fix": "Add one case: archived vacancy with closes_at 8 days past and a seeded draft; assert the sweep deletes it."
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage-gate",
+      "verification": "confirmed",
+      "title": "Advisory test gate: PASS",
+      "location": "N/A",
+      "evidence": "N/A",
+      "detail": "P0 (deletion predicate: manual branch via closed_notified_at, COALESCE fallback, time-based branch, in/out-of-grace, active+archived survival, FK cascade) ~100% integration-covered; P1 (in-grace extend → resume → submit round-trip; extend→re-close cycle; erasure flow) ~100%. Residual gaps are P2/P3 only (the warnings/notes above). Mix is appropriate per AGENTS.md. Gate rationale verified during the consolidation pass against the test file.",
+      "recommended_fix": "Landing the gap fixes above would raise P2 to full; gate remains PASS either way."
+    }
+  ],
+  "reviewer_agreement": [
+    "Active-but-expired vacancy lost its draft-sweep pin (blind + tests)"
+  ],
+  "verdict": "READY TO MERGE",
+  "verdict_rule": "0 blockers -> READY TO MERGE (2 warnings, 4 notes)",
+  "review_event": "approve"
+}

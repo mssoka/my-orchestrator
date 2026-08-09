@@ -1,0 +1,392 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-guarantor-autofill-fix.md b/_bmad-output/implementation-artifacts/spec-guarantor-autofill-fix.md
+new file mode 100644
+index 00000000..cd7e17d2
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-guarantor-autofill-fix.md
+@@ -0,0 +1,99 @@
++---
++title: 'guarantor-autofill-fix'
++type: 'bugfix'
++created: '2026-08-05'
++status: 'in-progress'
++review_loop_iteration: 0
++baseline_commit: 'e0c4d8945f104cf871bb5f94e7bf957a828756fc'
++context: []
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** The Guarantor step's text fields (name, phone, email, income, employer) reject browser autofill — the browser suggests entries but clicking them does not populate the fields. Root cause: `form_fields.autocomplete_for` stamps `autocomplete="off"` (an explicit autofill opt-out) on every field not in an 8-name whitelist (`first_name`, `last_name`, `email`, `phone`, `current_address`, `current_city`, `current_county`, `eircode`). All five guarantor fields hit the `_ -> "off"` fallback. The whitelisted sections (About You contact trio, Situation address quartet) are exactly the ones that autofill today; the same bug silently affects references, work/income, co-applicant, and additional-income fields. The JS layer is clean: the cohort module only writes `_guarantor_*` synthetic hidden inputs, the condition engine only toggles `el.hidden`, and no handler clobbers field values.
++
++**Approach:** Give every form text field a proper HTML `autocomplete` token via a suffix-aware mapping in `autocomplete_for` (exact names first, then suffix rules covering both bare and bracket-prefixed `co_applicant[N][...]` / `additional_income[N][...]` names), keeping `"off"` only for fields with no standard token (dates, counts, free text). Pure SSR attribute change — no JS, no conditional-logic changes.
++
++## Boundaries & Constraints
++
++**Always:**
++- Every text field gets a semantically correct token: `_name` → `name`, `_email` → `email`, `_phone` → `tel`, `_employer` / `employer_name` → `organization`, `_monthly_income_cents` / `amount` → `transaction-amount`, `job_title` → `organization-title`. First/last name keep `given-name`/`family-name`; address quartet keeps its current tokens.
++- `"off"` remains ONLY for token-less fields (`desired_move_in_date`, `num_occupants`, `pet_details`, `reason_for_moving`, `employment_duration`, `eviction_details`, income notes, `additional_income[N][note]`, `co_applicant[N][note]`) and the honeypot.
++- No changes to `data-condition` engine, cohort module, hidden-state logic, field names, IDs, or types. Conditional show/hide must behave exactly as before (guarantor hidden when not required, visible when required).
++- `autocomplete_for` stays a pure function; bracket-prefixed names normalize to their inner field name before matching so one rule set covers bare and prefixed fields.
++
++**Ask First:** None expected — the briefing prescribes the tokens.
++
++**Never:** No JS changes; no DOM behavior changes; no autofill tokens on file inputs or the honeypot; no changing `view_select_field` / `view_textarea_field` (selects get no autocomplete attr, textareas stay token-free).
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| BARE_CONTACT | `guarantor_name`, `guarantor_phone`, `guarantor_email` | `name`, `tel`, `email` | n/a |
++| BARE_ORG_AMOUNT | `guarantor_employer`, `employer_name`, `guarantor_monthly_income_cents`, `monthly_income_cents` | `organization`, `organization`, `transaction-amount`, `transaction-amount` | n/a |
++| SUFFIX_ONLY | `landlord_ref_name`, `character_ref_phone`, `employer_ref_email` | `name`, `tel`, `email` | n/a |
++| BRACKETED | `co_applicant[0][first_name]`, `co_applicant[2][guarantor_email]`, `additional_income[1][amount]` | `given-name`, `email`, `transaction-amount` | n/a |
++| NAME_VS_ORG | `employer_name` (org) vs `employer_ref_name` (person) | `organization` vs `name` — exact match wins before suffix `_name` | n/a |
++| TOKENLESS | `desired_move_in_date`, `pet_details`, `reason_for_moving` | `off` | n/a |
++| WHITELIST_KEPT | `first_name`, `email`, `current_address`, `eircode` | `given-name`, `email`, `street-address`, `postal-code` (unchanged) | n/a |
++
++## Code Map
++
++- `server/src/application/form_fields.gleam` -- `autocomplete_for` + `view_text_field` (the only file stamped with autocomplete attrs)
++- `server/src/application/form_sections/guarantor.gleam` -- the reported-broken section (renders through `view_text_field`)
++- `server/src/application/form_sections/references.gleam`, `work_income.gleam`, `situation.gleam` -- sibling sections hit by the same `off` fallback (audit fix)
++- `server/test/application/guarantor_section_test.gleam` -- existing SSR pins; extend with autocomplete pins
++- `server/priv/static/form.js` -- read-only reference: proves no JS clobbers field values (verified clean)
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `server/src/application/form_fields.gleam` -- extend `autocomplete_for`: exact-name table (existing 8 + `job_title`, `employer_name`, `guarantor_employer`, `monthly_income_cents`, `guarantor_monthly_income_cents`, `employer_ref_name`, `amount`) then suffix rules (`_name`, `_email`, `_phone`, `_employer`, `_monthly_income_cents`, `_amount`) then `"off"`; normalize bracket-prefixed names to their inner field name first
++- [x] `server/src/application/form_fields.gleam` -- co-applicant phones (`co_applicant[N][..._phone]`) map to `tel-national` (separate Chromium type bucket — see Design Notes)
++- [x] `server/test/application/form_fields_test.gleam` -- NEW: pin `autocomplete_for` for every field name in the form (bare + bracketed) and assert `view_text_field` renders the attribute
++- [x] `server/test/application/guarantor_section_test.gleam` -- add pins: rendered guarantor HTML carries `autocomplete="name"` / `"tel"` / `"email"` / `"organization"` / `"transaction-amount"`
++- [x] Full suite: `make format && make test && make build`, then `make test-integration` (Docker DB)
++- [x] Real-browser verification: Chromium autofill fills the guarantor phone + employer on click (local server + seeded vacancy); conditional show/hide re-checked (guarantor hidden when not required, visible when required)
++- [x] Commit on `guarantor-autofill-fix`, push, `gh pr create --base develop` titled "fix: guarantor fields accept browser autofill + autocomplete attribute audit" with **Decisions & rationale**; never merge
++
++**Acceptance Criteria:**
++- Given the apply form with a seeded vacancy, when the guarantor section is opened (required cohort or `has_guarantor` tick) and an autofill suggestion is clicked in a real Chromium, then `guarantor_name` / `guarantor_phone` / `guarantor_email` populate.
++- Given the SSR source, when every form section is grepped for text inputs, then each carries an appropriate `autocomplete` token (`name`/`given-name`/`family-name`/`tel`/`email`/`organization`/`organization-title`/`transaction-amount`/`street-address`/`address-level1`/`address-level2`/`postal-code`) or `"off"` for token-less fields — never a bare missing attribute.
++- Given the conditional logic, when `never_rented_before` / `employment_status` / `has_guarantor` change, then the guarantor fields show/hide exactly as before (existing SSR pins + browser check unregressed).
++- Given the test suite, when `make test` and `make test-integration` run, then all tests pass.
++
++## Spec Change Log
++
++## Design Notes
++
++Golden mapping examples (bare → suffix → bracket-normalized):
++
++```
++guarantor_name            -> name            (suffix _name)
++employer_name             -> organization    (exact — NOT _name)
++co_applicant[0][first_name] -> given-name    (normalize to first_name, exact)
++co_applicant[2][guarantor_employer] -> organization (normalize, suffix _employer)
++additional_income[1][amount] -> transaction-amount (normalize to amount, exact)
++desired_move_in_date      -> off             (no standard token)
++```
++
++`name` (not `given-name`) is correct for single "Full name" fields per the HTML spec — Chrome fills it from the profile's full name. `transaction-amount` is the only standard token for currency amounts; Chrome has no income profile field, so the token's job is to stop `off` suppressing form-fillers.
++
++**Chromium per-type fill cap (discovered in real-browser verification, 2026-08-05):**
++Chromium's `kTypeValueFormFillingLimit = 9` (`autofill_constants.h`) — at most 9 fields per type fill per fill action, counted across the whole form in DOM order (`form_filler.cc` `GetFillingSkipReasonsForField`). The apply form's contact repetition (About You + 3 reference trios + 3 co-applicant cards × employer/guarantor blocks) makes the primary guarantor block the 10th NAME_FULL / 11th PHONE / 11th EMAIL instance — Chrome suppresses those three on every fill action, which reproduces the reported bug exactly (other sections fill; the guarantor trio doesn't; the employer at COMPANY count 8 fills). Counts verified against Chrome 150's autofill-internals fill records.
++
++**The one honest token lever:** `tel` vs `tel-national` are separate Chrome type buckets. Co-applicant phones map to `tel-national` (standard WHATWG token — national-format phone), keeping the primary block at 5 `tel` and co-applicant blocks at 6 `tel-national` — every phone in the form is fillable (verified: guarantor_phone fills). NAME and EMAIL have no alternative standard tokens, so the guarantor name/email remain subject to the cap — a Chromium limit, not a form defect; the lever is a product decision (reduce co-applicant card duplication) if it ever matters.
++
++## Verification
++
++**Commands:**
++- `make format && make test && make build` -- expected: format idempotent, all unit tests green, client+server compile
++- `make test-integration` -- expected: integration suite green (Docker DB up)
++- `bash run_squirrel.sh` -- NOT needed: no SQL changes (skip; running it would emit churn)
++
++**Manual checks:**
++- Real-browser Chromium autofill: with a seeded autofill profile, open the form, tick `has_guarantor` (or use a required cohort), click into `guarantor_name`, click the suggestion — field populates. Repeat for phone/email. Also verify a token-less field (e.g. `reason_for_moving`) shows no autofill dropdown.
++- Conditional logic: required cohort (first-time renter) renders fields expanded with no checkbox; optional cohort renders checkbox, fields hidden until ticked; untick hides and clears.
+diff --git a/server/src/application/form_fields.gleam b/server/src/application/form_fields.gleam
+index da7b8053..a5a24a3c 100644
+--- a/server/src/application/form_fields.gleam
++++ b/server/src/application/form_fields.gleam
+@@ -5,24 +5,95 @@
+ //// Pass value: "" and error: "" for clean (initial) form rendering.
+ 
+ import gleam/list
++import gleam/result
++import gleam/string
+ import lustre/attribute.{attribute}
+ import lustre/element
+ import lustre/element/html
+ 
++/// HTML `autocomplete` token for a text field, per the WHATWG autofill
++/// spec. Exact names first — they outrank the suffix rules where a bare
++/// `_name` suffix would lie (`employer_name` is an organisation, not a
++/// person) — then suffix rules for the repeated contact-trio patterns,
++/// then `"off"` for fields with no standard token (dates, counts, free
++/// text).
++///
++/// `"off"` must never be stamped on name/phone/email-like fields: it is an
++/// explicit autofill opt-out that makes browsers show heuristic
++/// suggestions without filling them (the guarantor autofill bug, 2026-08
++/// — the whitelist's `_ -> "off"` fallback swallowed every non-whitelisted
++/// field, guarantor and siblings alike).
++///
++/// Bracket-prefixed names (`co_applicant[0][employer_ref_name]`,
++/// `additional_income[1][amount]`) normalize to their inner field name so
++/// one rule set covers both shapes.
++///
++/// Co-applicant phone fields get `tel-national` (not `tel`) on purpose:
++/// Chromium caps autofill at 9 fields per type per fill
++/// (`kTypeValueFormFillingLimit`, counted across the whole form in DOM
++/// order), and the three co-applicant cards push the primary guarantor
++/// phone to the 11th `tel` instance — past the cap — so it never fills.
++/// `tel` and `tel-national` are separate type buckets, so splitting the
++/// phone fields across both standard phone tokens keeps every phone in the
++/// form fillable (primary block at 5 `tel`, co-applicant blocks at 6
++/// `tel-national`). National format is a legitimate standard value for a
++/// phone field.
+ pub fn autocomplete_for(name: String) -> String {
+-  case name {
+-    "first_name" -> "given-name"
+-    "last_name" -> "family-name"
+-    "email" -> "email"
+-    "phone" -> "tel"
+-    "current_address" -> "street-address"
+-    "current_city" -> "address-level2"
+-    "current_county" -> "address-level1"
+-    "eircode" -> "postal-code"
+-    _ -> "off"
++  // Bracketed co-applicant phones end with `_phone]` — checked before the
++  // suffix rules so `co_applicant[N][..._phone]` never falls into `tel`.
++  case
++    string.contains(name, "co_applicant[") && string.ends_with(name, "_phone]")
++  {
++    True -> "tel-national"
++    False -> {
++      let inner = inner_field_name(name)
++      case inner {
++        "first_name" -> "given-name"
++        "last_name" -> "family-name"
++        "email" -> "email"
++        "phone" -> "tel"
++        "current_address" -> "street-address"
++        "current_city" -> "address-level2"
++        "current_county" -> "address-level1"
++        "eircode" -> "postal-code"
++        "job_title" -> "organization-title"
++        "employer_name" -> "organization"
++        "guarantor_employer" -> "organization"
++        "monthly_income_cents" -> "transaction-amount"
++        "guarantor_monthly_income_cents" -> "transaction-amount"
++        "amount" -> "transaction-amount"
++        _ -> autocomplete_for_suffix(inner)
++      }
++    }
+   }
+ }
+ 
++/// Normalize a bracket-index-prefixed name (`co_applicant[0][first_name]`
++/// → `first_name`) to its inner field name. Bare names pass through
++/// unchanged; anything that doesn't split into exactly two segments is
++/// left alone (defensive — every prefixed name in this form is
++/// `prefix[index][field]`).
++fn inner_field_name(name: String) -> String {
++  case string.split(name, "][") {
++    [_, inner] -> string.drop_end(inner, 1)
++    _ -> name
++  }
++}
++
++fn autocomplete_for_suffix(name: String) -> String {
++  // First matching suffix wins; the list is ordered most-specific first.
++  let rules = [
++    #(string.ends_with(name, "_monthly_income_cents"), "transaction-amount"),
++    #(string.ends_with(name, "_employer"), "organization"),
++    #(string.ends_with(name, "_phone"), "tel"),
++    #(string.ends_with(name, "_email"), "email"),
++    #(string.ends_with(name, "_name"), "name"),
++  ]
++  list.find(rules, fn(pair) { pair.0 })
++  |> result.map(fn(pair) { pair.1 })
++  |> result.unwrap("off")
++}
++
+ /// Render the children of a label/`.radio-label` span: the bare label text
+ /// plus a sibling span carrying either the required `*` marker or the
+ /// `(optional)` suffix. Kept as separate sibling spans (never inlined into
+diff --git a/server/test/application/form_fields_test.gleam b/server/test/application/form_fields_test.gleam
+new file mode 100644
+index 00000000..c6aef110
+--- /dev/null
++++ b/server/test/application/form_fields_test.gleam
+@@ -0,0 +1,144 @@
++//// Autocomplete-token pins for the SSR application form fields
++//// (2026-08-05 — guarantor autofill fix). Every text field must carry a
++//// standard WHATWG autocomplete token; `"off"` is allowed only where no
++//// token exists (dates, counts, free text). These pins are the grep-proof
++//// audit: they enumerate every field name the form renders.
++
++import application/form_fields
++import gleam/string
++import gleeunit/should
++import lustre/element
++
++pub fn bare_contact_and_address_fields_test() {
++  // The original whitelist — unchanged behavior.
++  form_fields.autocomplete_for("first_name") |> should.equal("given-name")
++  form_fields.autocomplete_for("last_name") |> should.equal("family-name")
++  form_fields.autocomplete_for("email") |> should.equal("email")
++  form_fields.autocomplete_for("phone") |> should.equal("tel")
++  form_fields.autocomplete_for("current_address")
++  |> should.equal("street-address")
++  form_fields.autocomplete_for("current_city") |> should.equal("address-level2")
++  form_fields.autocomplete_for("current_county")
++  |> should.equal("address-level1")
++  form_fields.autocomplete_for("eircode") |> should.equal("postal-code")
++}
++
++pub fn guarantor_fields_get_real_tokens_test() {
++  // The reported bug: these fell into the `_ -> "off"` fallback.
++  form_fields.autocomplete_for("guarantor_name") |> should.equal("name")
++  form_fields.autocomplete_for("guarantor_phone") |> should.equal("tel")
++  form_fields.autocomplete_for("guarantor_email") |> should.equal("email")
++  form_fields.autocomplete_for("guarantor_employer")
++  |> should.equal("organization")
++  form_fields.autocomplete_for("guarantor_monthly_income_cents")
++  |> should.equal("transaction-amount")
++}
++
++pub fn sibling_sections_get_real_tokens_test() {
++  // References trios — audit finding: same fallback bug as the guarantor.
++  form_fields.autocomplete_for("landlord_ref_name") |> should.equal("name")
++  form_fields.autocomplete_for("landlord_ref_phone") |> should.equal("tel")
++  form_fields.autocomplete_for("landlord_ref_email") |> should.equal("email")
++  form_fields.autocomplete_for("character_ref_name") |> should.equal("name")
++  form_fields.autocomplete_for("character_ref_phone") |> should.equal("tel")
++  form_fields.autocomplete_for("character_ref_email") |> should.equal("email")
++  form_fields.autocomplete_for("employer_ref_name") |> should.equal("name")
++  form_fields.autocomplete_for("employer_ref_phone") |> should.equal("tel")
++  form_fields.autocomplete_for("employer_ref_email") |> should.equal("email")
++  // Work & income.
++  form_fields.autocomplete_for("job_title")
++  |> should.equal("organization-title")
++  form_fields.autocomplete_for("employer_name") |> should.equal("organization")
++  form_fields.autocomplete_for("monthly_income_cents")
++  |> should.equal("transaction-amount")
++}
++
++pub fn bracket_prefixed_fields_normalize_test() {
++  // Co-applicant cards — `co_applicant[N][field]` shapes.
++  form_fields.autocomplete_for("co_applicant[0][first_name]")
++  |> should.equal("given-name")
++  form_fields.autocomplete_for("co_applicant[0][last_name]")
++  |> should.equal("family-name")
++  form_fields.autocomplete_for("co_applicant[0][employer_name]")
++  |> should.equal("organization")
++  form_fields.autocomplete_for("co_applicant[0][employer_ref_name]")
++  |> should.equal("name")
++  form_fields.autocomplete_for("co_applicant[0][employer_ref_phone]")
++  |> should.equal("tel-national")
++  form_fields.autocomplete_for("co_applicant[0][employer_ref_email]")
++  |> should.equal("email")
++  form_fields.autocomplete_for("co_applicant[0][monthly_income_cents]")
++  |> should.equal("transaction-amount")
++  // Co-applicant guarantor blocks — the same trio as the primary block.
++  form_fields.autocomplete_for("co_applicant[0][guarantor_name]")
++  |> should.equal("name")
++  form_fields.autocomplete_for("co_applicant[2][guarantor_phone]")
++  |> should.equal("tel-national")
++  form_fields.autocomplete_for("co_applicant[2][guarantor_email]")
++  |> should.equal("email")
++  form_fields.autocomplete_for("co_applicant[2][guarantor_employer]")
++  |> should.equal("organization")
++  form_fields.autocomplete_for(
++    "co_applicant[2][guarantor_monthly_income_cents]",
++  )
++  |> should.equal("transaction-amount")
++  // Additional income rows.
++  form_fields.autocomplete_for("additional_income[1][amount]")
++  |> should.equal("transaction-amount")
++  form_fields.autocomplete_for("additional_income[1][note]")
++  |> should.equal("off")
++  form_fields.autocomplete_for("co_applicant[0][note]")
++  |> should.equal("off")
++}
++
++pub fn primary_phones_stay_tel_while_coapplicant_phones_split_test() {
++  // Chromium's per-type fill cap (9 per type per form, kTypeValueFormFillingLimit)
++  // counts every same-typed field in DOM order; the three co-applicant cards
++  // would push the primary guarantor phone past the cap. `tel` vs
++  // `tel-national` are separate buckets, so the split keeps every phone
++  // fillable: primary block = 5 × `tel`, co-applicant blocks = 6 ×
++  // `tel-national`.
++  form_fields.autocomplete_for("phone") |> should.equal("tel")
++  form_fields.autocomplete_for("landlord_ref_phone") |> should.equal("tel")
++  form_fields.autocomplete_for("character_ref_phone") |> should.equal("tel")
++  form_fields.autocomplete_for("employer_ref_phone") |> should.equal("tel")
++  form_fields.autocomplete_for("guarantor_phone") |> should.equal("tel")
++  form_fields.autocomplete_for("co_applicant[0][employer_ref_phone]")
++  |> should.equal("tel-national")
++  form_fields.autocomplete_for("co_applicant[1][employer_ref_phone]")
++  |> should.equal("tel-national")
++  form_fields.autocomplete_for("co_applicant[2][employer_ref_phone]")
++  |> should.equal("tel-national")
++  form_fields.autocomplete_for("co_applicant[0][guarantor_phone]")
++  |> should.equal("tel-national")
++  form_fields.autocomplete_for("co_applicant[1][guarantor_phone]")
++  |> should.equal("tel-national")
++  form_fields.autocomplete_for("co_applicant[2][guarantor_phone]")
++  |> should.equal("tel-national")
++}
++
++pub fn tokenless_fields_stay_off_test() {
++  // No standard token exists — `off` is the honest opt-out here.
++  form_fields.autocomplete_for("desired_move_in_date") |> should.equal("off")
++  form_fields.autocomplete_for("num_occupants") |> should.equal("off")
++  form_fields.autocomplete_for("pet_details") |> should.equal("off")
++  form_fields.autocomplete_for("reason_for_moving") |> should.equal("off")
++  form_fields.autocomplete_for("employment_duration") |> should.equal("off")
++  form_fields.autocomplete_for("eviction_details") |> should.equal("off")
++}
++
++pub fn view_text_field_renders_the_token_test() {
++  // The attribute must land in the serialized HTML, not just the mapping.
++  let html =
++    form_fields.view_text_field(
++      name: "guarantor_name",
++      label: "Full name",
++      input_type: "text",
++      required: True,
++      min_val: "",
++      value: "",
++      error: "",
++    )
++    |> element.to_string
++  html |> string.contains("autocomplete=\"name\"") |> should.be_true
++}
+diff --git a/server/test/application/guarantor_section_test.gleam b/server/test/application/guarantor_section_test.gleam
+index 7cb22e44..d6bdf335 100644
+--- a/server/test/application/guarantor_section_test.gleam
++++ b/server/test/application/guarantor_section_test.gleam
+@@ -114,6 +114,22 @@ pub fn optional_path_posted_uncheck_roundtrips_test() {
+   html |> string.contains(checked_shape) |> should.be_false
+ }
+ 
++pub fn autocomplete_attributes_render_test() {
++  // 2026-08-05 autofill fix: the six guarantor fields must carry real
++  // WHATWG autocomplete tokens in the serialized HTML (they used to fall
++  // into the `_ -> "off"` fallback, which suppresses browser autofill).
++  let html = render([#("never_rented_before", "on")])
++  html |> string.contains("autocomplete=\"name\"") |> should.be_true
++  html |> string.contains("autocomplete=\"tel\"") |> should.be_true
++  html |> string.contains("autocomplete=\"email\"") |> should.be_true
++  html
++  |> string.contains("autocomplete=\"organization\"")
++  |> should.be_true
++  html
++  |> string.contains("autocomplete=\"transaction-amount\"")
++  |> should.be_true
++}
++
+ pub fn cohort_mirror_agrees_with_required_rule_test() {
+   // The view mirror and the render derivation must never drift apart.
+   common.guarantor_cohort_is_required(common.guarantor_cohort_first_rental)

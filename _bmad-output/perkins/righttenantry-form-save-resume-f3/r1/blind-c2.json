@@ -1,0 +1,82 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "data-loss",
+    "title": "Retention sweep deletes drafts on vacancy archive, contradicting the 'link works until the vacancy closes' promise and risking permanent loss on a transient state",
+    "location": "server/src/retention/sql/delete_expired_application_drafts.sql:8-14",
+    "evidence": "+DELETE FROM application_draft d\n+USING vacancy v\n+WHERE d.vacancy_id = v.id\n+  AND (\n+    v.status = 'closed'\n+    OR v.archived_at IS NOT NULL\n+    OR (v.closes_at IS NOT NULL AND v.closes_at <= now())\n+  )\n+RETURNING d.id::text;\n\nvs the continue-link email copy in this same chunk:\n+      \"This link works until the vacancy closes on <strong>\"\n+      <> escape_html(format_close_date(closes_on))\n+      <> \"</strong>\".\"",
+    "detail": "Archive is a distinct condition from close (the SQL lists them separately), and the chunk's own comment says an archived vacancy merely 'stops accepting'. The daily sweep permanently deletes drafts the moment a vacancy is archived; if it later returns to active, saved answers and emailed continue links are dead despite the 'until the vacancy closes' promise.",
+    "recommended_fix": "Delete drafts only on closed/closes_at; either leave archived-vacancy drafts until close, or sweep them only after an archive-age threshold (e.g. 30 days) so short archives don't wipe in-progress applicants."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "abuse-vector",
+    "title": "Unauthenticated draft-save endpoint has no per-vacancy or aggregate bound — fabricated-email rows accumulate until vacancy close",
+    "location": "server/src/application/draft_handler.gleam:8-17",
+    "evidence": "+////   - The save endpoint writes but never reads back: worst case an attacker\n+////     stores field values against an email they don't own, visible only to\n+////     whoever holds that inbox (the continue link goes to the email, not\n+////     the requester).\n\nand\n+INSERT INTO application_draft (vacancy_id, email, fields)\n+VALUES ($1::uuid, lower($2), $3::jsonb)\n+ON CONFLICT (vacancy_id, email) DO UPDATE",
+    "detail": "The abuse model considers only PII visibility, not volume. The upsert keys on (vacancy, email), so invented emails yield unlimited rows up to ~64 KB each; nothing in the chunk rate-limits the write, and retention sweeps only at vacancy close — an open vacancy's draft table can be bloated indefinitely.",
+    "recommended_fix": "Add a per-vacancy draft cap (reject new keys past N) and/or a per-IP throttle on /apply/:code/draft; the 64 KB body cap alone does not bound row count."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "inconsistency",
+    "title": "strip_draft_on_submit email is not trimmed, but the draft-save path trims — a whitespace mismatch leaves the draft PII unstripped",
+    "location": "server/src/application/application_handler.gleam:2026-2034",
+    "evidence": "+      case\n+        sql.strip_draft_on_submit(\n+          db,\n+          vacancy_uuid,\n+          get_form_value(values, \"email\"),\n+        )\n\nvs draft_handler save path:\n+      let applicant_email = string.trim(payload.email)",
+    "detail": "Drafts are keyed on lower(trim(email)); the strip matches lower($2) with no visible trim on the submit-side value. If the final form value isn't normalized elsewhere, leading/trailing whitespace makes the UPDATE match nothing and the pre-submit PII payload lingers until vacancy close.",
+    "recommended_fix": "Trim the form email before calling strip_draft_on_submit (or lower(trim($2)) in the SQL) so the strip key is byte-identical to the upsert key."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "info-leak",
+    "title": "continue-link 'sent' flag is a submission-status oracle, contradicting the 'never reveals' comment",
+    "location": "server/src/application/draft_handler.gleam:207-211",
+    "evidence": "+/// Always 200\n+/// on well-formed payloads: the response never reveals whether a draft or\n+/// mailbox exists\n\nvs the claim SQL:\n+WHERE vacancy_id = $1::uuid\n+  AND email = lower($2)\n+  AND submitted_at IS NULL\n\nand\n+                    Ok(pog.Returned(_, [])) ->\n+                      wisp.json_response(\n+                        json_ok_with([#(\"sent\", json.bool(False))]),\n+                        200,\n+                      )",
+    "detail": "Anyone knowing the applicant's email + vacancy code can poll with an empty fields map (skips upsert, claims against the existing draft). sent:true flips to permanent sent:false exactly when the victim submits — the response does reveal something the header comment claims it never does.",
+    "recommended_fix": "Answer sent:true even when the claim returns zero rows (the client copy already reads cooldown and sent identically); keep ok:false only for genuine send failures."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-contradiction",
+    "title": "'Always 200 on well-formed payloads' is false: claim DB failure returns 500 while upsert DB failure returns 200",
+    "location": "server/src/application/draft_handler.gleam:hunk (handle_continue_link)",
+    "evidence": "+              case upserted {\n+                Error(_) -> wisp.json_response(json_ok(False), 200)\n...\n+                    Error(err) -> {\n+                      wisp.log_error(\n+                        \"continue-link claim failed: \" <> string.inspect(err),\n+                      )\n+                      wisp.internal_server_error()\n+                    }",
+    "detail": "Two DB failures on identical, well-formed requests produce different status codes (200 vs 500), and the 500 contradicts the endpoint's own 'Always 200' doc line. The client's retry/'try again' behaviour now depends on which internal call failed.",
+    "recommended_fix": "Pick one posture — return ok:false/200 for both failure modes (matching the doc), or 500 for both, and update the comment."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-contradiction",
+    "title": "Comment claims stage-2 email without continue_url is 'byte-identical to the pre-F3 stage 2', but the shared checklist copy changed in the same diff",
+    "location": "server/src/notification/email_client.gleam:497-501",
+    "evidence": "+  // F3×E2 seam: when the enquirer has a live draft, the CTA becomes the\n+  // tokenized continue-link (tracked as its own template so the funnel can\n+  // separate continue-clicks from fresh-start clicks); otherwise the email\n+  // is byte-identical to the pre-F3 stage 2.\n\nvs the requirements_checklist_html() change both branches call:\n-  <> \"The form is completed in one visit &mdash; it doesn't save your progress &mdash; so it's worth gathering everything before you open it.\"\n+  <> \"You don&rsquo;t have to finish in one visit &mdash; on the form you can save your progress and email yourself a link to pick up where you left off.\"",
+    "detail": "Both branches of the stage-2 builder call requirements_checklist_html(), whose closing paragraph was rewritten in this PR — so the no-continue_url email is not byte-identical to pre-F3. The comment misleads anyone verifying the funnel split.",
+    "recommended_fix": "Reword the comment to 'identical except the CTA/saved-line' (the checklist change applies to both variants), or drop the byte-identical claim."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "strip-gap",
+    "title": "Submit-time strip only matches the final form email — drafts keyed under an earlier/edited email keep their PII",
+    "location": "server/src/application/sql/strip_draft_on_submit.sql:11-12",
+    "evidence": "+WHERE vacancy_id = $1::uuid\n+  AND email = lower($2)\n+RETURNING id::text;",
+    "detail": "Drafts are keyed per (vacancy, email); a typo then correction, or editing the email field after saves, creates a second draft row. The strip at finalise targets only the submitted email, so the earlier row's field payload survives until vacancy close with no continue-link owner aware of it.",
+    "recommended_fix": "Strip all draft rows for the vacancy matching any email the applicant used this session, or add an applicant-side sweep/TTL for stale unsubmitted drafts independent of the final submit email."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-columns",
+    "title": "get_draft_by_continue_token selects resumed_at and vacancy_id that no handler in the chunk reads",
+    "location": "server/src/application/sql/get_draft_by_continue_token.sql:5-13",
+    "evidence": "+SELECT\n+  d.id::text,\n+  d.vacancy_id::text,\n+  d.email,\n+  d.fields::text,\n+  COALESCE(d.resumed_at::text, '') AS resumed_at,\n+  COALESCE(d.submitted_at::text, '') AS submitted_at\n\nhandlers use only draft.id, draft.email, draft.fields, draft.submitted_at",
+    "detail": "Two decoded row fields are never consumed by resume, erasure-confirm, or erasure-delete. Harmless but dead surface in a generated row type that every future reader must reason about.",
+    "recommended_fix": "Drop vacancy_id and resumed_at from the SELECT/row type, or use them (e.g. vacancy_id to cross-check the route code instead of the JOIN alone)."
+  }
+]

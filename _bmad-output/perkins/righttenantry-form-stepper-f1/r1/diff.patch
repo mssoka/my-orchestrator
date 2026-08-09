@@ -1,0 +1,3444 @@
+diff --git a/.gitignore b/.gitignore
+index f183efb..a5720b5 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -34,6 +34,7 @@ server/priv/static/*
+ !server/priv/static/form.css
+ !server/priv/static/form.js
+ !server/priv/static/apply_analytics.js
++!server/priv/static/form_stepper.js
+ !server/priv/static/consent.js
+ !server/priv/static/favicon.ico
+ !server/priv/static/favicon-32.png
+diff --git a/_bmad-output/implementation-artifacts/deferred-work.md b/_bmad-output/implementation-artifacts/deferred-work.md
+index 13ce872..ccddba1 100644
+--- a/_bmad-output/implementation-artifacts/deferred-work.md
++++ b/_bmad-output/implementation-artifacts/deferred-work.md
+@@ -545,3 +545,6 @@ Items that are real but will not be fixed: blocked by a project policy, by V1 sc
+ - source_spec: `_bmad-output/implementation-artifacts/spec-form-funnel-w0-w1a.md`
+   summary: Light DOM-level test of apply_analytics.js initBrowser wiring (listener registration, marker reads) via happy-dom/jsdom
+   evidence: Perkins r1 note — state machines are unit-tested; the DOM glue is not executed anywhere.
++- source_spec: `_bmad-output/implementation-artifacts/spec-form-stepper-f1.md`
++  summary: form.js upload-preflight per-file inline errors render invisibly — `showInlineError` writes textContent but never sets display on the `display:none` `.field-error` span
++  evidence: `server/priv/static/form.js` `showInlineError` (no style change) vs `.field-error { display: none; }` in `server/priv/static/form.css:339` with no `.has-error` reveal; same root cause as the documents.gleam SSR upload-slot gap fixed in the form-stepper-f1 PR. Surfaced by the F1 review swarm (blind-hunter#3 / edge-hunter#4 note). The stepper now holds applicants on the documents step when `data-preflight-blocked`, so the aggregate banner (visible) carries the message — but the per-file inline message needs the one-line form.js fix.
+diff --git a/_bmad-output/implementation-artifacts/review-form-stepper-f1/blind-hunter.md b/_bmad-output/implementation-artifacts/review-form-stepper-f1/blind-hunter.md
+new file mode 100644
+index 0000000..dd667d5
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/review-form-stepper-f1/blind-hunter.md
+@@ -0,0 +1,146 @@
++# Blind Hunter — adversarial review, form-stepper-f1
++
++Reviewed cold against the diff, the spec of record, and the on-disk source
++(`form_stepper.js`, `form.js`, `apply_analytics.js`, `form_sections/*`,
++`form_fields.gleam`, `error_summary.gleam`, `form_pages.gleam`, `.gitignore`,
++tests). `make test-server` (1131 pass), `node --test scripts/js-tests/*` (46
++pass), and `gleam format --check` are all green — every finding below
++survives a green build.
++
++1. **Blocker — `.gitignore:31` — `form_stepper.js` is git-ignored; the feature never ships.**
++   `.gitignore` has `server/priv/static/*` with a per-file whitelist
++   (`form.css`, `form.js`, `apply_analytics.js`, `consent.js`, …) that was
++   not extended for the new file. `git status` shows no trace of
++   `server/priv/static/form_stepper.js`; `git add -A` will not pick it up.
++   Either CI fails (the committed `scripts/js-tests/form_stepper.test.js`
++   `require()`s the missing module), or — worse — the script tags ship
++   without the file: `/static/form_stepper.js` 404s in production, the
++   stepper silently never runs, and every SSR pin still passes because they
++   only assert the `<script>` tag exists. The whole F1 feature would deploy
++   as a dead tag.
++   **Fix:** add `!server/priv/static/form_stepper.js` to `.gitignore` next to
++   the `apply_analytics.js` line and `git add -f` the file.
++
++2. **High — `server/priv/static/form_stepper.js:438-443` — error-summary anchor routing is dead for every link.**
++   The banner renders `href="#field-<key>"` (`form_pages.gleam` `view_error_row`
++   → `error_summary.anchor_for` = `"field-" <> key`). The click handler does
++   `id = href.slice(1)` → `"field-email"` and passes it to
++   `resolveFieldElement`, which prepends again → `getElementById("field-field-email")`
++   → null; the testid fallback likewise looks for `field-field-email` → null →
++   `return` **without** `preventDefault`. The browser's native anchor jump then
++   targets an element inside a `hidden` section: no scroll, no focus, no step
++   switch. The spec's error re-render acceptance row ("summary links switch
++   steps + focus the field") fails for 100% of links pointing outside the
++   current step — the exact scenario the stepper-on-error-page exists for.
++   Unit tests escape it because they only call `resolveFieldElement` with raw
++   keys, never through the click path.
++   **Fix:** strip the prefix before resolving
++   (`resolveFieldElement(doc, id.replace(/^field-/, ""))`) or try
++   `doc.getElementById(id)` first, and add a click-level test using a real
++   `#field-<key>` href.
++
++3. **Medium — `server/priv/static/form_stepper.js:353` (`onContinue`) — a preflight-blocked file passes gating and dead-ends the submit on step 8.**
++   Gating checks only `files.length` (`controlSatisfied`), so an applicant who
++   stages a 6MB file on the documents step sails through Continue while
++   form.js's preflight has already set `data-preflight-blocked` on the submit
++   button. On step 8 the consent checkbox re-runs `__rtRecomputeSubmitDisabled`,
++   which keeps the button disabled — with zero visible explanation, because the
++   reason (an inline `.field-error` on the documents step) is now hidden, and
++   is itself `display:none` (see finding 8). Pre-stepper the applicant could at
++   least scroll back to the documents area; the stepper removes even that cue.
++   **Fix:** when gating the documents step, treat the documented form.js
++   markers as blocking — e.g. if the submit carries `data-preflight-blocked`
++   or any `.field-error[data-preflight-error="true"]` is non-empty, keep the
++   applicant on that step (form.js stays untouched; the stepper only reads).
++
++4. **Medium — `server/priv/static/form_stepper.js:302-327` (`markInvalid` / `clearSatisfiedStepperErrors`) — stepper clobbers server-rendered error messages, then erases them.**
++   On the error re-render, `markInvalid` reuses the field's existing
++   `.field-error` span — which may carry the server's specific message — and
++   overwrites it with the generic `GATING_MESSAGE`, tagging it
++   `data-stepper-error`. When the field becomes merely non-empty,
++   `clearSatisfiedStepperErrors` empties the span and removes `has-error`:
++   a still server-invalid field (e.g. malformed email) renders as valid, its
++   specific guidance destroyed. The code comment above
++   `clearSatisfiedStepperErrors` ("Server-rendered messages (no
++   data-stepper-error) are never touched") is false — `markInvalid` tags
++   whatever span it finds.
++   **Fix:** in `markInvalid`, skip spans that already carry server text (only
++   fill empty or stepper-created spans), or snapshot the original
++   text/display and restore instead of blanking.
++
++5. **Medium — `server/priv/static/apply_analytics.js` interplay — `application_form_section_completed` loses truth on hidden sections.**
++   With sections 2–8 `hidden`, analytics' `hasVisibleRequired` returns false
++   for every hidden section, so its debounced `recheck` degrades to
++   "completed = interacted" for anything not currently shown. Two concrete
++   distortions vs pre-stepper: (a) reload with browser-restored values —
++   Continue gating passes on restored values with zero `input` events, so
++   those sections **never** fire `section_completed` (pre-stepper, the first
++   keystroke anywhere truthfully completed every filled section); (b)
++   Back-retreat — emptying a required field after passing, then ungated Back,
++   leaves the section hidden with `interacted=true`, firing a phantom
++   `section_completed` on the next keystroke. The funnel is a load-bearing
++   contract (spec: "funnel keys off them"); section-level completion rates
++   will shift and mislead.
++   **Fix:** without editing `apply_analytics.js`, dispatch a bubbling `input`
++   event from the section element on every gated Continue (marks it
++   `interacted` while gating guarantees completeness — completion-on-
++   interaction is then semantically correct), and document the residual
++   Back-retreat edge.
++
++6. **Medium — `scripts/js-tests/form_stepper.test.js` — spec-mandated test surface missing; the gap already let finding 2 ship.**
++   The spec's task list requires unit tests for "every I/O-matrix row + no-op
++   guards + event payload". Delivered: none for the no-op guards
++   (`data-apply-page` absent / no `application-form` → no chrome), none for
++   the `rt:form-step-changed` payload (`{step_index, section_id, total}` —
++   only the event-name constant is pinned), and none for the anchor-routing
++   click path.
++   **Fix:** add tests for the event detail shape, initBrowser no-op cases,
++   and an anchor-click routing test with real `#field-<key>` hrefs.
++
++7. **Low — `server/priv/static/form_stepper.js:143` (`resolveFieldElement`) + `error_summary.gleam` — the `gdpr_consent` summary row is unresolvable even after fixing finding 2.**
++   `anchor_for("gdpr_consent")` = `field-gdpr_consent`, but no such id or
++   `field-<key>` testid exists: the checkbox is `id="gdpr-consent"`, the
++   block `data-testid="gdpr-consent-block"` (`review_consent.gleam`). The
++   anchor was already dead on the long form (pre-existing); the stepper's
++   new router was the chance to fix it and doesn't.
++   **Fix:** special-case `gdpr_consent` → `doc.getElementById("gdpr-consent")`
++   in `resolveFieldElement`.
++
++8. **Low (pre-existing, surfaced by this feature) — `server/src/application/form_sections/documents.gleam:340` — server-rendered upload-slot errors are invisible.**
++   `view_upload_area`'s `.field-error` span never gets the inline
++   `style="display:flex"` that `form_fields.view_error_span` adds, and
++   `.field-error` is `display:none` by default (`form.css:339`) with no
++   `.has-error`-triggered reveal (upload containers never get `has-error`).
++   A server-side upload rejection therefore renders text nobody can see.
++   Pre-existing — but the stepper's error-page start-step now deliberately
++   routes applicants to the documents step to fix a message that isn't
++   visible.
++   **Fix:** add `attribute("style", "display:flex")` when `error != ""`,
++   mirroring `view_error_span`.
++
++9. **Low — `server/test/application/form_view_test.gleam:444` — the no-JS pin checks a 200-char substring, not the fieldset tag it claims to inspect.**
++   `string.slice(0, 200)` past each `<fieldset` split point will
++   false-positive the moment a legitimate inner `hidden` (e.g. documents'
++   `hidden=""` co-applicant wrapper) or any attribute value containing the
++   substring "hidden" lands within 200 chars of a fieldset start. Green
++   today only by layout accident; fails loudly for the wrong reason later.
++   **Fix:** slice to the first `">"` after `<fieldset` (or regex the tag
++   itself) before asserting `hidden` absent.
++
++10. **Low — `server/src/application/form_sections/situation.gleam:158` — new applicant-facing string inlined, against the spec's copy boundary.**
++    The spec's frozen boundary says applicant-facing strings live in
++    `server/src/copy.gleam` (whose module doc states "views never inline
++    them"); the F5 helpers went there, but the new `<summary>` text "Add
++    your current address (optional)" is inlined. The JS-side stepper strings
++    (gating line, review hint, Back/Continue) can't move — static JS — but
++    this SSR string can.
++    **Fix:** move to `copy.gleam` (e.g. `pub fn address_cluster_summary()`).
++
++11. **Low — `server/priv/static/form_stepper.js:249-258` (`updateProgress`) — on the error re-render, earlier steps render as teal "done" even when they contain server errors.**
++    Starting at the first-error step colors every previous segment
++    `stepper-segment-done` regardless of error state, contradicting the
++    banner's "a few things need your attention" for applicants whose errors
++    span multiple sections.
++    **Fix:** on `data-apply-page="form-errors"`, render unvisited segments
++    neutral (or only mark segments done once actually visited in this page
++    life).
+diff --git a/_bmad-output/implementation-artifacts/review-form-stepper-f1/diff.txt b/_bmad-output/implementation-artifacts/review-form-stepper-f1/diff.txt
+new file mode 100644
+index 0000000..02a6072
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/review-form-stepper-f1/diff.txt
+@@ -0,0 +1,1466 @@
++diff --git a/server/priv/static/form.css b/server/priv/static/form.css
++index 89de94c..62fa486 100644
++--- a/server/priv/static/form.css
+++++ b/server/priv/static/form.css
++@@ -763,6 +763,161 @@ textarea:focus-visible {
++   cursor: not-allowed;
++ }
++ 
+++/* ── Stepper (F1 progressive disclosure) ─────────────────────────────────
+++   All chrome is JS-built (form_stepper.js) — no-JS renders none of this.
+++   The progress header is sticky so mobile applicants keep their bearings
+++   while scrolling a section. */
+++
+++.stepper-progress {
+++  position: sticky;
+++  top: 0;
+++  z-index: 20;
+++  background-color: var(--off-white);
+++  padding: 0.75rem 0 0.625rem;
+++  margin-bottom: 0.75rem;
+++  border-bottom: 1px solid var(--border);
+++}
+++
+++.stepper-status {
+++  font-family: var(--font-headline);
+++  font-size: 0.9375rem;
+++  font-weight: 700;
+++  letter-spacing: -0.015em;
+++  color: var(--navy);
+++  margin-bottom: 0.5rem;
+++}
+++
+++.stepper-segments {
+++  display: grid;
+++  grid-auto-flow: column;
+++  gap: 0.25rem;
+++}
+++
+++.stepper-segment {
+++  height: 0.25rem;
+++  border-radius: 999px;
+++  background-color: var(--border);
+++  transition: background-color 0.2s ease;
+++}
+++
+++.stepper-segment-done {
+++  background-color: var(--teal);
+++}
+++
+++.stepper-segment-active {
+++  background-color: var(--amber);
+++}
+++
+++/* Sections clear the sticky bar when scrolled to (step change, anchors). */
+++.form-section {
+++  scroll-margin-top: 5.5rem;
+++}
+++
+++/* fieldset[hidden] wins over UA display on every modern browser, but the
+++   explicit guard keeps the stepper's show/hide unambiguous. */
+++.form-section[hidden] {
+++  display: none;
+++}
+++
+++.stepper-nav {
+++  display: flex;
+++  gap: 0.75rem;
+++  margin-top: 1.25rem;
+++}
+++
+++.stepper-nav:empty {
+++  display: none;
+++}
+++
+++.btn-step-continue,
+++.btn-step-back {
+++  font-family: var(--font-headline);
+++  font-size: 1rem;
+++  font-weight: 700;
+++  letter-spacing: -0.025em;
+++  border-radius: 0.5rem;
+++  cursor: pointer;
+++  min-height: 2.75rem; /* 44px touch target */
+++  padding: 0.625rem 1.25rem;
+++  transition: background-color 0.15s ease, transform 0.1s ease;
+++}
+++
+++.btn-step-continue {
+++  flex: 1;
+++  color: var(--white);
+++  background-color: var(--amber);
+++  border: none;
+++}
+++
+++.btn-step-continue:hover {
+++  background-color: #C08425;
+++}
+++
+++.btn-step-back {
+++  color: var(--navy);
+++  background-color: var(--white);
+++  border: 1px solid var(--border);
+++}
+++
+++.btn-step-back:hover {
+++  background-color: var(--off-white);
+++}
+++
+++.btn-step-continue:active,
+++.btn-step-back:active {
+++  transform: scale(0.98);
+++}
+++
+++/* Only-child nav rows (step 1: Continue alone) stay full-width; with a
+++   Back sibling the Continue button takes the remaining space. */
+++.stepper-nav .btn-step-continue:first-child:last-child {
+++  width: 100%;
+++}
+++
+++/* ── Optional field clusters (F4 field diet) ─────────────────────────────
+++   Collapses optional-but-scoring-relevant clusters (e.g. the current
+++   address block) behind a native <details> — works with and without JS. */
+++
+++.optional-cluster {
+++  border: 1px solid var(--border);
+++  border-radius: var(--radius);
+++  padding: 0.875rem 1rem;
+++  margin-bottom: 1rem;
+++  background-color: var(--white);
+++}
+++
+++.optional-cluster > summary {
+++  font-family: var(--font-headline);
+++  font-size: 0.9375rem;
+++  font-weight: 700;
+++  color: var(--navy);
+++  cursor: pointer;
+++  list-style: none;
+++  display: flex;
+++  align-items: center;
+++  gap: 0.5rem;
+++  min-height: 2.75rem; /* 44px touch target */
+++}
+++
+++.optional-cluster > summary::before {
+++  content: "+";
+++  font-size: 1.125rem;
+++  line-height: 1;
+++  color: var(--amber);
+++}
+++
+++.optional-cluster[open] > summary::before {
+++  content: "\2212"; /* minus */
+++}
+++
+++.optional-cluster > summary::-webkit-details-marker {
+++  display: none;
+++}
+++
+++.optional-cluster[open] > summary {
+++  margin-bottom: 0.75rem;
+++}
+++
++ /* ── Footer ────────────────────────────────────────────────────────────── */
++ 
++ .form-footer {
++diff --git a/server/src/application/form_pages.gleam b/server/src/application/form_pages.gleam
++index 1e93d49..528891a 100644
++--- a/server/src/application/form_pages.gleam
+++++ b/server/src/application/form_pages.gleam
++@@ -341,6 +341,14 @@ pub fn view_form_with_errors(
++           [attribute("src", "/static/form.js"), attribute("defer", "")],
++           [],
++         ),
+++        // F1 stepper on the error re-render too — the error-summary anchors
+++        // point at fields the stepper would otherwise keep hidden; it starts
+++        // at the first error's section and routes those clicks.
+++        element.element(
+++          "script",
+++          [attribute("src", "/static/form_stepper.js"), attribute("defer", "")],
+++          [],
+++        ),
++         form_view.view_apply_analytics_script(),
++       ],
++     ),
++diff --git a/server/src/application/form_sections/documents.gleam b/server/src/application/form_sections/documents.gleam
++index c39f659..a07b085 100644
++--- a/server/src/application/form_sections/documents.gleam
+++++ b/server/src/application/form_sections/documents.gleam
++@@ -107,7 +107,7 @@ pub fn view(
++           hint_id: hint_id,
++           required: False,
++           multiple: False,
++-          helper_text: "",
+++          helper_text: copy.proof_of_income_helper(),
++           error: common.get_err(errors, "proof_of_income_primary"),
++           condition_attrs: [],
++         ),
++@@ -130,7 +130,7 @@ pub fn view(
++           hint_id: hint_id,
++           required: True,
++           multiple: False,
++-          helper_text: "A written reference from your current or previous landlord.",
+++          helper_text: copy.landlord_ref_helper(),
++           error: common.get_err(errors, "landlord_ref_primary"),
++           condition_attrs: [
++             attribute("data-condition", "never_rented_before"),
++@@ -144,7 +144,7 @@ pub fn view(
++           hint_id: hint_id,
++           required: True,
++           multiple: False,
++-          helper_text: "A written reference from someone who can vouch for you — not family.",
+++          helper_text: copy.character_ref_helper(),
++           error: common.get_err(errors, "character_ref_primary"),
++           condition_attrs: [
++             attribute("data-condition", "never_rented_before"),
++@@ -158,7 +158,7 @@ pub fn view(
++           hint_id: hint_id,
++           required: employer_required_primary,
++           multiple: False,
++-          helper_text: "A written reference from your employer, on letterhead if possible.",
+++          helper_text: copy.employer_ref_helper(),
++           error: common.get_err(errors, "employer_ref_primary"),
++           condition_attrs: [],
++         ),
++@@ -181,7 +181,7 @@ pub fn view(
++           hint_id: hint_id,
++           required: False,
++           multiple: True,
++-          helper_text: "Anything else that helps your application \u{2014} up to 2 files.",
+++          helper_text: copy.additional_docs_helper(),
++           error: common.get_err(errors, "additional_docs"),
++           condition_attrs: [],
++         ),
++@@ -213,7 +213,7 @@ fn view_co_applicant_proof_slot(
++     hint_id: hint_id,
++     required: False,
++     multiple: False,
++-    helper_text: "",
+++    helper_text: copy.proof_of_income_helper(),
++     error: common.get_err(errors, field_name),
++     condition_attrs: [
++       attribute("data-condition", "co_applicant_count"),
++@@ -247,7 +247,7 @@ fn view_co_applicant_employer_ref_slot(
++     hint_id: hint_id,
++     required: employer_required,
++     multiple: False,
++-    helper_text: "",
+++    helper_text: copy.employer_ref_helper(),
++     error: common.get_err(errors, field_name),
++     condition_attrs: [
++       attribute("data-condition", "co_applicant_count"),
++diff --git a/server/src/application/form_sections/situation.gleam b/server/src/application/form_sections/situation.gleam
++index 1ded140..999b45d 100644
++--- a/server/src/application/form_sections/situation.gleam
+++++ b/server/src/application/form_sections/situation.gleam
++@@ -50,44 +50,7 @@ pub fn view(
++           "A bit about where you are now and what you\u{2019}re looking for.",
++         ),
++       ]),
++-      form_fields.view_text_field(
++-        name: "current_address",
++-        label: "Current address",
++-        input_type: "text",
++-        required: False,
++-        min_val: "",
++-        value: common.get_val(values, "current_address"),
++-        error: "",
++-      ),
++-      html.div([attribute.class("field-row")], [
++-        form_fields.view_text_field(
++-          name: "current_city",
++-          label: "City",
++-          input_type: "text",
++-          required: False,
++-          min_val: "",
++-          value: common.get_val(values, "current_city"),
++-          error: "",
++-        ),
++-        form_fields.view_text_field(
++-          name: "current_county",
++-          label: "County",
++-          input_type: "text",
++-          required: False,
++-          min_val: "",
++-          value: common.get_val(values, "current_county"),
++-          error: "",
++-        ),
++-      ]),
++-      form_fields.view_text_field(
++-        name: "eircode",
++-        label: "Eircode",
++-        input_type: "text",
++-        required: False,
++-        min_val: "",
++-        value: common.get_val(values, "eircode"),
++-        error: "",
++-      ),
+++      view_address_cluster(values),
++       form_fields.view_select_field(
++         name: "current_living_situation",
++         label: "Current living situation",
++@@ -166,6 +129,76 @@ pub fn view(
++   )
++ }
++ 
+++// -- Optional address cluster (F4) ---------------------------------------------
+++
+++/// The current-address quartet is optional but feeds the scorer
+++/// (`eircode` → location checks), so it stays on the form — collapsed behind
+++/// a native `<details>` (F4 field diet) to take four controls off the first
+++/// render. Works without JS; renders `open` when a re-render carries values
+++/// so the applicant always sees their own input.
+++fn view_address_cluster(values: List(#(String, String))) -> element.Element(a) {
+++  let prefilled =
+++    list.any(
+++      ["current_address", "current_city", "current_county", "eircode"],
+++      fn(key) { common.get_val(values, key) != "" },
+++    )
+++  let open_attrs = case prefilled {
+++    True -> [attribute("open", "")]
+++    False -> []
+++  }
+++  element.element(
+++    "details",
+++    [
+++      attribute.class("optional-cluster"),
+++      attribute("data-testid", "address-cluster"),
+++      ..open_attrs
+++    ],
+++    [
+++      element.element("summary", [], [
+++        html.text("Add your current address (optional)"),
+++      ]),
+++      form_fields.view_text_field(
+++        name: "current_address",
+++        label: "Current address",
+++        input_type: "text",
+++        required: False,
+++        min_val: "",
+++        value: common.get_val(values, "current_address"),
+++        error: "",
+++      ),
+++      html.div([attribute.class("field-row")], [
+++        form_fields.view_text_field(
+++          name: "current_city",
+++          label: "City",
+++          input_type: "text",
+++          required: False,
+++          min_val: "",
+++          value: common.get_val(values, "current_city"),
+++          error: "",
+++        ),
+++        form_fields.view_text_field(
+++          name: "current_county",
+++          label: "County",
+++          input_type: "text",
+++          required: False,
+++          min_val: "",
+++          value: common.get_val(values, "current_county"),
+++          error: "",
+++        ),
+++      ]),
+++      form_fields.view_text_field(
+++        name: "eircode",
+++        label: "Eircode",
+++        input_type: "text",
+++        required: False,
+++        min_val: "",
+++        value: common.get_val(values, "eircode"),
+++        error: "",
+++      ),
+++    ],
+++  )
+++}
+++
++ // -- Co-applicant block ------------------------------------------------------
++ 
++ /// Shown only when `num_occupants >= 2`. Mirrors the existing
++diff --git a/server/src/application/form_sections/work_income.gleam b/server/src/application/form_sections/work_income.gleam
++index 8ed2da1..3e717e3 100644
++--- a/server/src/application/form_sections/work_income.gleam
+++++ b/server/src/application/form_sections/work_income.gleam
++@@ -28,11 +28,12 @@ const income_source_type_options = [
++   #("other", "Other"),
++ ]
++ 
++-/// Whitelist of listing-source values offered by the `listing_source` select.
++-/// Must stay in sync with `application_handler.is_valid_listing_source` and
++-/// the `application_listing_source_check` DB constraint. Exposed so a parity
++-/// test can pin the form-side mirror against the handler whitelist, matching
++-/// the `guarantor.relationship_options` pattern.
+++/// Whitelist of listing-source values accepted by the handler. The form no
+++/// longer asks the question (F4 field diet, 2026-08: the self-reported
+++/// acquisition signal wasn't scoring-relevant and cost a control on the
+++/// longest step) — this const remains as the form-side mirror of
+++/// `application_handler.is_valid_listing_source` for the parity test, so a
+++/// stale cached page can still post the field without a validation error.
++ pub const listing_source_options = [
++   #("", "Select..."),
++   #("daft", "Daft.ie"),
++@@ -127,14 +128,6 @@ pub fn view(
++       ]),
++       view_student_helper(),
++       view_additional_income_block(values, errors),
++-      form_fields.view_select_field(
++-        name: "listing_source",
++-        label: "Where did you find this listing?",
++-        required: False,
++-        options: listing_source_options,
++-        selected: common.get_val(values, "listing_source"),
++-        error: common.get_err(errors, "listing_source"),
++-      ),
++     ],
++   )
++ }
++diff --git a/server/src/application/form_view.gleam b/server/src/application/form_view.gleam
++index 50c86d9..2537d32 100644
++--- a/server/src/application/form_view.gleam
+++++ b/server/src/application/form_view.gleam
++@@ -97,6 +97,14 @@ pub fn view_application_page(
++           [attribute("src", "/static/form.js"), attribute("defer", "")],
++           [],
++         ),
+++        // F1 stepper — progressive enhancement only. Loads after form.js so
+++        // the condition engine's initial pass has run; without JS the long
+++        // form above remains the submission path.
+++        element.element(
+++          "script",
+++          [attribute("src", "/static/form_stepper.js"), attribute("defer", "")],
+++          [],
+++        ),
++         view_apply_analytics_script(),
++       ],
++     ),
++diff --git a/server/src/copy.gleam b/server/src/copy.gleam
++index fe43a64..ff02d66 100644
++--- a/server/src/copy.gleam
+++++ b/server/src/copy.gleam
++@@ -60,3 +60,33 @@ pub fn additional_docs_label() -> String {
++ pub fn file_too_large_inline() -> String {
++   "This file's bigger than 5MB. Try a smaller copy, or compress the PDF and upload it again."
++ }
+++
+++// ── Per-slot upload helpers (F5 mobile upload copy) ──────────────────────
+++// Each document slot says WHAT counts as evidence and reassures the
+++// applicant that a phone photo is acceptable — 80% of form traffic is
+++// mobile, and "written reference" read as "scan a letter" before this.
+++
+++/// Proof-of-income slot (primary + each co-applicant).
+++pub fn proof_of_income_helper() -> String {
+++  "A recent payslip works best — or your latest tax summary if you're self-employed. A clear photo from your phone is fine."
+++}
+++
+++/// Previous-landlord reference slot.
+++pub fn landlord_ref_helper() -> String {
+++  "A signed letter or email from your current or previous landlord. A clear photo or scan from your phone counts."
+++}
+++
+++/// Character-reference slot (first-time renters).
+++pub fn character_ref_helper() -> String {
+++  "A short letter or email from someone who can vouch for you — not family. A coworker, mentor, coach or family friend works. A clear photo from your phone is fine."
+++}
+++
+++/// Employer-reference slot (primary + each co-applicant).
+++pub fn employer_ref_helper() -> String {
+++  "A letter or email from your manager or HR confirming you work there — on letterhead if you can get it. A clear photo or PDF from your phone counts."
+++}
+++
+++/// Supporting-documents slot (multi-file, optional).
+++pub fn additional_docs_helper() -> String {
+++  "Anything else that helps your application — up to 2 files. Photos from your phone are fine."
+++}
++diff --git a/server/test/application/application_handler_test.gleam b/server/test/application/application_handler_test.gleam
++index a5d3a20..6adc89d 100644
++--- a/server/test/application/application_handler_test.gleam
+++++ b/server/test/application/application_handler_test.gleam
++@@ -896,11 +896,12 @@ pub fn relationship_options_match_validator_whitelist_test() {
++   |> should.be_true
++ }
++ 
++-// Same drift guard for `listing_source`: the form's `<select>` options must
++-// all validate through `is_valid_listing_source`, and (defense-in-depth) the
++-// DB CHECK constraint `application_listing_source_check` mirrors the same
++-// whitelist. A future addition to the dropdown without a corresponding
++-// validator entry would silently slip through here.
+++// Same drift guard for `listing_source`: the accepted set mirrored in
+++// `work_income_section.listing_source_options` must all validate through
+++// `is_valid_listing_source`, and (defense-in-depth) the DB CHECK constraint
+++// `application_listing_source_check` mirrors the same whitelist. The form no
+++// longer renders the select (F4 field diet, 2026-08) but the handler keeps
+++// accepting the field — a stale cached page must never hit a validation wall.
++ pub fn listing_source_options_match_validator_whitelist_test() {
++   let real_options =
++     work_income_section.listing_source_options
++diff --git a/server/test/application/form_view_test.gleam b/server/test/application/form_view_test.gleam
++index f15c015..9c6772e 100644
++--- a/server/test/application/form_view_test.gleam
+++++ b/server/test/application/form_view_test.gleam
++@@ -403,3 +403,154 @@ pub fn form_renders_all_eight_stable_section_ids_test() {
++     |> should.be_true
++   })
++ }
+++
+++// -- F1 stepper: progressive enhancement contract -------------------------------
+++
+++pub fn form_sections_render_in_funnel_dom_order_test() {
+++  // The stepper and the analytics funnel both walk [data-section-id] in DOM
+++  // order — "Step N of 8" and section_index must agree. Pin the order.
+++  let vacancy = test_helpers.test_vacancy_row()
+++  let html = form_view.view_application_page(vacancy, "")
+++  let ids = [
+++    "about_you", "your_situation", "work_income", "references", "guarantor",
+++    "tell_us_more", "documents", "review_consent",
+++  ]
+++  let positions =
+++    list.map(ids, fn(id) {
+++      let assert Ok(#(before, _)) =
+++        string.split_once(html, "data-section-id=\"" <> id <> "\"")
+++      string.length(before)
+++    })
+++  positions
+++  |> list.fold(-1, fn(prev, pos) {
+++    should.be_true(pos > prev)
+++    pos
+++  })
+++  |> fn(_) { Nil }
+++}
+++
+++pub fn no_js_fallback_all_fieldsets_render_without_hidden_test() {
+++  // The no-JS fallback IS the long form: every section fieldset must render
+++  // visible (the stepper hides them client-side only). A hidden attribute
+++  // sneaking into a fieldset's SSR would strand no-JS applicants. Inner
+++  // conditional divs legitimately carry hidden, so we only inspect each
+++  // fieldset's own tag.
+++  let vacancy = test_helpers.test_vacancy_row()
+++  let html = form_view.view_application_page(vacancy, "")
+++  let chunks = string.split(html, "<fieldset") |> list.drop(1)
+++  list.length(chunks) |> should.equal(8)
+++  list.each(chunks, fn(chunk) {
+++    chunk
+++    |> string.slice(0, 200)
+++    |> string.contains("hidden")
+++    |> should.be_false
+++  })
+++}
+++
+++pub fn stepper_script_loads_and_chrome_is_js_built_test() {
+++  let vacancy = test_helpers.test_vacancy_row()
+++  let pristine = form_view.view_application_page(vacancy, "")
+++  pristine
+++  |> string.contains("src=\"/static/form_stepper.js\"")
+++  |> should.be_true
+++  // Progressive enhancement: the SSR HTML carries zero stepper chrome —
+++  // progress bar and nav buttons are built by form_stepper.js only.
+++  pristine
+++  |> string.contains("stepper-progress")
+++  |> should.be_false
+++  pristine
+++  |> string.contains("stepper-nav")
+++  |> should.be_false
+++  // The error re-render loads the stepper too — its anchor links point at
+++  // fields the stepper would otherwise keep hidden.
+++  let with_errors =
+++    form_pages.view_form_with_errors(vacancy, [#("email", "bad")], [], "")
+++  with_errors
+++  |> string.contains("src=\"/static/form_stepper.js\"")
+++  |> should.be_true
+++}
+++
+++// -- F4 field diet ----------------------------------------------------------------
+++
+++pub fn pristine_form_omits_listing_source_test() {
+++  // F4: the optional, non-scoring acquisition question cost a control on
+++  // the longest step. The handler still accepts the field (cached pages may
+++  // post it) but the form no longer asks.
+++  let vacancy = test_helpers.test_vacancy_row()
+++  let html = form_view.view_application_page(vacancy, "")
+++  html
+++  |> string.contains("name=\"listing_source\"")
+++  |> should.be_false
+++  // Even a re-render carrying a posted value must not resurrect the field.
+++  let with_errors =
+++    form_pages.view_form_with_errors(
+++      vacancy,
+++      [#("email", "bad")],
+++      [#("listing_source", "daft")],
+++      "",
+++    )
+++  with_errors
+++  |> string.contains("name=\"listing_source\"")
+++  |> should.be_false
+++}
+++
+++pub fn address_cluster_collapsed_pristine_open_when_prefilled_test() {
+++  // F4: the optional address quartet (all scoring inputs — they stay
+++  // submittable) collapses behind a native <details> on first render…
+++  let vacancy = test_helpers.test_vacancy_row()
+++  let pristine = form_view.view_application_page(vacancy, "")
+++  pristine
+++  |> string.contains("data-testid=\"address-cluster\"")
+++  |> should.be_true
+++  pristine
+++  |> string.contains("address-cluster\" open")
+++  |> should.be_false
+++  // …but a re-render carrying the applicant's own values renders it open so
+++  // they always see their input.
+++  let prefilled =
+++    form_pages.view_form_with_errors(
+++      vacancy,
+++      [#("email", "bad")],
+++      [#("current_city", "Gorey")],
+++      "",
+++    )
+++  prefilled
+++  |> string.contains("address-cluster\" open")
+++  |> should.be_true
+++  // Fields themselves unchanged — same names, still optional, still posted.
+++  pristine
+++  |> string.contains("name=\"current_address\"")
+++  |> should.be_true
+++  pristine
+++  |> string.contains("name=\"eircode\"")
+++  |> should.be_true
+++}
+++
+++// -- F5 upload copy -----------------------------------------------------------------
+++
+++pub fn document_slots_carry_what_counts_helper_copy_test() {
+++  let vacancy = test_helpers.test_vacancy_row()
+++  let html = form_view.view_application_page(vacancy, "")
+++  // Proof of income (previously no helper at all).
+++  html
+++  |> string.contains("A recent payslip works best")
+++  |> should.be_true
+++  // Landlord reference — what counts, and that a phone photo is fine.
+++  html
+++  |> string.contains(
+++    "A signed letter or email from your current or previous landlord",
+++  )
+++  |> should.be_true
+++  // Character reference (first-time renters).
+++  html
+++  |> string.contains("A coworker, mentor, coach or family friend works")
+++  |> should.be_true
+++  // Employer reference.
+++  html
+++  |> string.contains("confirming you work there")
+++  |> should.be_true
+++  // Supporting documents.
+++  html
+++  |> string.contains("Photos from your phone are fine")
+++  |> should.be_true
+++}
++=== NEW FILE: server/priv/static/form_stepper.js ===
++// form_stepper.js — F1 progressive-disclosure stepper for the public
++// /apply/:code form (Wave 1 build pack, 2026-07 application-completion
++// problem-solving session).
++//
++// Progressive enhancement ONLY: the SSR page renders all 8 sections visible
++// (the no-JS fallback — a single long form that posts once). When this file
++// loads, it hides every section but the current one, adds a sticky "Step N
++// of 8 — <Name>" progress header, and injects Back/Continue navigation.
++// Nothing about the submission path changes: one POST, same fields, same
++// server validation (which stays authoritative).
++//
++// Runs on both the pristine form (data-apply-page="form") and the
++// validation-error re-render ("form-errors") — error-summary anchor links
++// point at fields inside now-hidden sections, so the stepper starts at the
++// first error's section and routes those clicks through a step switch.
++//
++// F3 seam (save-resume follow-up job): every step CHANGE dispatches
++// `rt:form-step-changed` on document with detail
++//   { step_index (1-based), section_id, total }
++// — that event is the "section change" hook a draft-saver should listen
++// for. The initial show on page load deliberately does NOT dispatch.
++//
++// Testability: the pure internals are exported (CommonJS) for `node --test`;
++// browser wiring runs only when a document is present. Mirrors
++// apply_analytics.js's module pattern.
++
++(function (root) {
++  "use strict";
++
++  var EVENT_STEP_CHANGED = "rt:form-step-changed";
++  var GATING_MESSAGE = "This one's needed before you continue.";
++  // Replaces the review step's scroll-based hint when the stepper is active
++  // (scrolling no longer shows other sections). SSR copy stays for no-JS.
++  var REVIEW_HINT_STEPPER =
++    "Use Back to check any of your answers — nothing is sent until you choose Submit Application.";
++
++  // ---------- Visibility + satisfaction rules ----------
++  // Mirror of apply_analytics.js's isVisibleRequired / controlSatisfied /
++  // cssEscapeName — KEEP IN SYNC. Duplicated because plain static JS has no
++  // module imports and apply_analytics.js must stay untouched (W0 funnel
++  // contract). The gating rule is the completion rule: a step may advance
++  // when all its VISIBLE required controls are filled.
++
++  function isVisibleRequired(el, sectionEl) {
++    if (el.disabled) return false;
++    var node = el;
++    while (node && node !== sectionEl) {
++      if (node.hidden) return false;
++      node = node.parentElement;
++    }
++    return !(sectionEl && sectionEl.hidden);
++  }
++
++  function controlSatisfied(el) {
++    var type = (el.type || "").toLowerCase();
++    if (type === "radio") return el.checked;
++    if (type === "checkbox") return el.checked;
++    if (type === "file") return !!(el.files && el.files.length) || !!el.value;
++    return !!(el.value && String(el.value).trim() !== "");
++  }
++
++  function cssEscapeName(name) {
++    if (root.CSS && typeof root.CSS.escape === "function") {
++      return root.CSS.escape(name);
++    }
++    return String(name).replace(/"/g, '\\"');
++  }
++
++  // findInvalidControls(sectionEl) → ordered list of controls blocking
++  // advance: visible, required, unsatisfied. Radio groups count once per
++  // name — the group is satisfied when any visible member is checked; when
++  // unsatisfied the first visible member represents it (so focus + the
++  // .form-field wrapper land on the group, not on every radio).
++  function findInvalidControls(sectionEl) {
++    var invalid = [];
++    var required = sectionEl.querySelectorAll("[required]");
++    var seenRadioGroups = {};
++    for (var i = 0; i < required.length; i++) {
++      var el = required[i];
++      if (!isVisibleRequired(el, sectionEl)) continue;
++      var type = (el.type || "").toLowerCase();
++      if (type === "radio") {
++        var name = el.name || "";
++        if (seenRadioGroups[name]) continue;
++        seenRadioGroups[name] = true;
++        var group = sectionEl.querySelectorAll(
++          'input[type="radio"][name="' + cssEscapeName(name) + '"]'
++        );
++        var rep = null;
++        var checked = false;
++        for (var j = 0; j < group.length; j++) {
++          if (!isVisibleRequired(group[j], sectionEl)) continue;
++          if (!rep) rep = group[j];
++          if (group[j].checked) {
++            checked = true;
++            break;
++          }
++        }
++        if (!checked && rep) invalid.push(rep);
++        continue;
++      }
++      if (!controlSatisfied(el)) invalid.push(el);
++    }
++    return invalid;
++  }
++
++  // ---------- Step model (DOM-free) ----------
++
++  function clampIndex(count, i) {
++    if (count < 1) return 0;
++    return Math.max(0, Math.min(count - 1, i));
++  }
++
++  // createStepModel({ count, start }) → cursor over the steps. Pure state;
++  // the DOM choreography lives in initBrowser so tests can drive the model
++  // directly.
++  function createStepModel(opts) {
++    var count = opts.count;
++    var current = clampIndex(count, opts.start || 0);
++    return {
++      current: function () {
++        return current;
++      },
++      canBack: function () {
++        return current > 0;
++      },
++      canNext: function () {
++        return current < count - 1;
++      },
++      next: function () {
++        current = clampIndex(count, current + 1);
++        return current;
++      },
++      back: function () {
++        current = clampIndex(count, current - 1);
++        return current;
++      },
++      jump: function (i) {
++        current = clampIndex(count, i);
++        return current;
++      },
++    };
++  }
++
++  // resolveFieldElement(doc, key) → the element a server error key points
++  // at. Mirrors error_summary.anchor_for ("field-<key>") with a testid
++  // fallback: radio groups carry no field-<name> id (their inputs are
++  // field-<name>-<value>), only the wrapper's data-testid.
++  function resolveFieldElement(doc, key) {
++    if (!key) return null;
++    var el = doc.getElementById("field-" + key);
++    if (el) return el;
++    return doc.querySelector(
++      '[data-testid="field-' + cssEscapeName(key) + '"]'
++    );
++  }
++
++  // firstErrorIndex(sectionEls, opts) → index of the section carrying the
++  // first server error on a form-errors re-render, or 0.
++  //   opts.firstErrorField: body's data-first-error-field (the server's own
++  //     ordering) — resolved via resolveFieldElement first.
++  //   Fallbacks: first .has-error inside a section (text/select/radio
++  //     fields), then first non-empty .field-error (upload slots never get
++  //     .has-error — their container class is static SSR).
++  function firstErrorIndex(sectionEls, opts) {
++    opts = opts || {};
++    if (opts.firstErrorField && opts.doc) {
++      var el = resolveFieldElement(opts.doc, opts.firstErrorField);
++      if (el) {
++        for (var i = 0; i < sectionEls.length; i++) {
++          if (sectionEls[i].contains(el)) return i;
++        }
++      }
++    }
++    for (var j = 0; j < sectionEls.length; j++) {
++      if (sectionEls[j].querySelector(".has-error")) return j;
++    }
++    for (var k = 0; k < sectionEls.length; k++) {
++      var errs = sectionEls[k].querySelectorAll(".field-error");
++      for (var m = 0; m < errs.length; m++) {
++        if (errs[m].textContent && errs[m].textContent.trim() !== "") return k;
++      }
++    }
++    return 0;
++  }
++
++  // ---------- Browser wiring ----------
++
++  function initBrowser() {
++    var doc = root.document;
++    var body = doc && doc.body;
++    if (!body) return;
++    var marker = body.getAttribute("data-apply-page");
++    if (marker !== "form" && marker !== "form-errors") return;
++    var form = doc.querySelector('[data-testid="application-form"]');
++    if (!form) return;
++    var sectionEls = Array.prototype.slice.call(
++      form.querySelectorAll("[data-section-id]")
++    );
++    // A one-section "form" needs no stepper (defensive — today there are 8).
++    if (sectionEls.length < 2) return;
++
++    var sections = sectionEls.map(function (el, i) {
++      var legend =
++        el.querySelector("legend.section-title") || el.querySelector("legend");
++      return {
++        el: el,
++        id: el.getAttribute("data-section-id") || "section_" + (i + 1),
++        name: legend ? legend.textContent.trim() : "Section " + (i + 1),
++        legend: legend,
++      };
++    });
++
++    var model = createStepModel({
++      count: sections.length,
++      start:
++        marker === "form-errors"
++          ? firstErrorIndex(sectionEls, {
++              firstErrorField:
++                body.getAttribute("data-first-error-field") || "",
++              doc: doc,
++            })
++          : 0,
++    });
++
++    // ---- Progress chrome (sticky header) ----
++    var progressRoot = doc.createElement("div");
++    progressRoot.className = "stepper-progress";
++    progressRoot.setAttribute("data-testid", "stepper-progress");
++    var status = doc.createElement("p");
++    status.className = "stepper-status";
++    status.setAttribute("data-testid", "stepper-status");
++    status.setAttribute("role", "status");
++    status.setAttribute("aria-live", "polite");
++    var segments = doc.createElement("div");
++    segments.className = "stepper-segments";
++    segments.setAttribute("aria-hidden", "true");
++    var segmentEls = sections.map(function (_, i) {
++      var seg = doc.createElement("span");
++      seg.className = "stepper-segment";
++      seg.setAttribute("data-step", String(i + 1));
++      segments.appendChild(seg);
++      return seg;
++    });
++    progressRoot.appendChild(status);
++    progressRoot.appendChild(segments);
++    form.insertBefore(progressRoot, form.firstChild);
++
++    function updateProgress(i) {
++      status.textContent =
++        "Step " + (i + 1) + " of " + sections.length + " — " + sections[i].name;
++      segmentEls.forEach(function (seg, idx) {
++        seg.className =
++          idx < i
++            ? "stepper-segment stepper-segment-done"
++            : idx === i
++              ? "stepper-segment stepper-segment-active"
++              : "stepper-segment";
++      });
++    }
++
++    function dispatchStepChanged(i) {
++      var detail = {
++        step_index: i + 1,
++        section_id: sections[i].id,
++        total: sections.length,
++      };
++      try {
++        doc.dispatchEvent(
++          new root.CustomEvent(EVENT_STEP_CHANGED, { detail: detail })
++        );
++      } catch (_) {
++        // CustomEvent must never break navigation — ignore.
++      }
++    }
++
++    function show(index, opts) {
++      opts = opts || {};
++      var i = model.jump(index);
++      sections.forEach(function (s, idx) {
++        s.el.hidden = idx !== i;
++      });
++      updateProgress(i);
++      // The initial render is not a "change" — only user-driven moves
++      // announce themselves (this is the F3 draft-save hook).
++      if (!opts.initial) dispatchStepChanged(i);
++      if (opts.focus && sections[i].legend) {
++        var legend = sections[i].legend;
++        legend.setAttribute("tabindex", "-1");
++        try {
++          legend.focus({ preventScroll: true });
++        } catch (_) {
++          legend.focus();
++        }
++      }
++      if (opts.scroll && sections[i].el.scrollIntoView) {
++        sections[i].el.scrollIntoView({ block: "start" });
++      }
++    }
++
++    // ---- Gating ----
++    function markInvalid(controls) {
++      controls.forEach(function (ctl) {
++        var field = ctl.closest ? ctl.closest(".form-field") : null;
++        if (!field) return;
++        field.classList.add("has-error");
++        var errEl = field.querySelector(".field-error");
++        if (!errEl) {
++          // Radio groups only render a .field-error span server-side when a
++          // server error exists — pristine renders have none. Create the
++          // same shape (id-less; the group has no single field-<name>-error
++          // id) so the gating message has somewhere to live.
++          errEl = doc.createElement("span");
++          errEl.className = "field-error";
++          errEl.setAttribute("role", "alert");
++          field.appendChild(errEl);
++        }
++        errEl.textContent = GATING_MESSAGE;
++        errEl.setAttribute("data-stepper-error", "true");
++        // .field-error is display:none by default; the server shows its own
++        // errors via inline display:flex — same mechanism here.
++        errEl.style.display = "flex";
++      });
++    }
++
++    // Clear ONLY stepper-set messages once their field is satisfied again.
++    // Server-rendered messages (no data-stepper-error) are never touched —
++    // they clear on the next submit round-trip, as today.
++    function clearSatisfiedStepperErrors() {
++      var sectionEl = sections[model.current()].el;
++      var marked = sectionEl.querySelectorAll(
++        '.field-error[data-stepper-error="true"]'
++      );
++      Array.prototype.forEach.call(marked, function (errEl) {
++        var field = errEl.closest ? errEl.closest(".form-field") : null;
++        if (!field) return;
++        var controls = field.querySelectorAll("input, select, textarea");
++        var satisfied = false;
++        for (var i = 0; i < controls.length; i++) {
++          if (controlSatisfied(controls[i])) {
++            satisfied = true;
++            break;
++          }
++        }
++        if (!satisfied) return;
++        errEl.textContent = "";
++        errEl.removeAttribute("data-stepper-error");
++        errEl.style.display = "";
++        field.classList.remove("has-error");
++      });
++    }
++
++    function onContinue() {
++      var i = model.current();
++      var invalid = findInvalidControls(sections[i].el);
++      if (invalid.length) {
++        markInvalid(invalid);
++        var first = invalid[0];
++        if (first.focus) {
++          try {
++            first.focus({ preventScroll: false });
++          } catch (_) {
++            first.focus();
++          }
++        }
++        return;
++      }
++      show(i + 1, { focus: true, scroll: true });
++    }
++
++    function onBack() {
++      // Back never gates — the applicant may retreat to fix anything.
++      show(model.current() - 1, { focus: true, scroll: true });
++    }
++
++    // ---- Nav rows ----
++    // Back on every step but the first, Continue on every step but the last
++    // (the last section holds the SSR submit button + consent gate).
++    // Buttons are type="button" — the single POST still comes only from the
++    // submit button. Per-section testids keep bug-hunt targeting unambiguous.
++    sections.forEach(function (s, i) {
++      var nav = doc.createElement("div");
++      nav.className = "stepper-nav";
++      nav.setAttribute("data-testid", "stepper-nav-" + s.id);
++      if (i > 0) {
++        var back = doc.createElement("button");
++        back.type = "button";
++        back.className = "btn-step-back";
++        back.setAttribute("data-testid", "step-back-" + s.id);
++        back.textContent = "Back";
++        back.addEventListener("click", onBack);
++        nav.appendChild(back);
++      }
++      if (i < sections.length - 1) {
++        var cont = doc.createElement("button");
++        cont.type = "button";
++        cont.className = "btn-step-continue";
++        cont.setAttribute("data-testid", "step-continue-" + s.id);
++        cont.textContent = "Continue";
++        cont.addEventListener("click", onContinue);
++        nav.appendChild(cont);
++      }
++      // The last section already has its submit row (.form-nav) — the
++      // stepper's Back row goes directly above it so tab order reads
++      // … consent checkbox → Back → Submit.
++      var submitRow = s.el.querySelector(".form-nav");
++      if (i === sections.length - 1 && submitRow) {
++        s.el.insertBefore(nav, submitRow);
++      } else {
++        s.el.appendChild(nav);
++      }
++    });
++
++    // ---- Review-step hint (stepper-active copy) ----
++    var reviewSection = sections.filter(function (s) {
++      return s.id === "review_consent";
++    })[0];
++    if (reviewSection) {
++      var hint = reviewSection.el.querySelector(".section-hint");
++      if (hint) hint.textContent = REVIEW_HINT_STEPPER;
++    }
++
++    // ---- Error-summary anchor routing ----
++    // The banner links point at fields inside hidden sections; a bare anchor
++    // jump would land nowhere visible. Switch step first, then focus.
++    function indexOfSectionContaining(target) {
++      for (var i = 0; i < sections.length; i++) {
++        if (sections[i].el.contains(target)) return i;
++      }
++      return -1;
++    }
++
++    Array.prototype.forEach.call(
++      doc.querySelectorAll('[data-testid="error-summary"] a[href^="#"]'),
++      function (a) {
++        a.addEventListener("click", function (event) {
++          var href = a.getAttribute("href") || "";
++          var id = href.slice(1);
++          try {
++            id = decodeURIComponent(id);
++          } catch (_) {}
++          var target = resolveFieldElement(doc, id);
++          if (!target) return; // unknown anchor — let the browser try
++          var idx = indexOfSectionContaining(target);
++          if (idx === -1) return;
++          event.preventDefault();
++          show(idx, {});
++          if (target.focus) {
++            try {
++              target.focus({ preventScroll: true });
++            } catch (_) {
++              target.focus();
++            }
++          }
++          if (target.scrollIntoView) {
++            target.scrollIntoView({ block: "center" });
++          }
++        });
++      }
++    );
++
++    // Clear stepper-set messages as the applicant fixes fields.
++    form.addEventListener("input", clearSatisfiedStepperErrors);
++    form.addEventListener("change", clearSatisfiedStepperErrors);
++
++    // Initial paint: quiet — no focus steal (the header/prep block sit above
++    // the form; on the error page the banner owns focus), no event.
++    show(model.current(), { initial: true });
++  }
++
++  // ---------- Exports ----------
++
++  var api = {
++    EVENT_STEP_CHANGED: EVENT_STEP_CHANGED,
++    GATING_MESSAGE: GATING_MESSAGE,
++    REVIEW_HINT_STEPPER: REVIEW_HINT_STEPPER,
++    isVisibleRequired: isVisibleRequired,
++    controlSatisfied: controlSatisfied,
++    findInvalidControls: findInvalidControls,
++    createStepModel: createStepModel,
++    resolveFieldElement: resolveFieldElement,
++    firstErrorIndex: firstErrorIndex,
++  };
++
++  if (typeof module !== "undefined" && module.exports) {
++    module.exports = api;
++  }
++
++  if (
++    typeof root.document !== "undefined" &&
++    root.document &&
++    root.document.body
++  ) {
++    if (root.document.readyState === "loading") {
++      root.document.addEventListener("DOMContentLoaded", initBrowser);
++    } else {
++      initBrowser();
++    }
++  }
++})(typeof window !== "undefined" ? window : this);
++=== NEW FILE: scripts/js-tests/form_stepper.test.js ===
++// Unit tests for server/priv/static/form_stepper.js — run with
++// `node --test scripts/js-tests/` (wired into `make test` as test-js).
++//
++// Covers the F1 acceptance surface: the step model (bounds, jumps), the
++// Continue-gating rules (visible-required only — radio groups, checkboxes,
++// file inputs, hidden conditionals, disabled controls), and the error
++// re-render start-step rule. The DOM-free internals are required directly;
++// browser wiring (progress chrome, nav injection, anchor routing) is
++// covered by the bug-hunt/manual E2E pass.
++
++const { test } = require("node:test");
++const assert = require("node:assert/strict");
++
++const stepper = require("../../server/priv/static/form_stepper.js");
++
++// ---------- Minimal DOM (mirrors apply_analytics.test.js) ----------
++
++let idSeq = 0;
++function el(tag, attrs = {}, children = []) {
++  const node = {
++    _id: ++idSeq,
++    tag,
++    children: [],
++    parentElement: null,
++    hidden: false,
++    disabled: false,
++    ...attrs,
++  };
++  children.forEach((c) => {
++    c.parentElement = node;
++    node.children.push(c);
++  });
++  node.querySelectorAll = (selector) => {
++    const out = [];
++    const walk = (n) => {
++      n.children.forEach((c) => {
++        if (matches(c, selector)) out.push(c);
++        walk(c);
++      });
++    };
++    walk(node);
++    return out;
++  };
++  node.querySelector = (selector) => node.querySelectorAll(selector)[0] || null;
++  node.contains = (target) => {
++    let n = target;
++    while (n) {
++      if (n === node) return true;
++      n = n.parentElement;
++    }
++    return false;
++  };
++  return node;
++}
++
++function matches(node, selector) {
++  if (selector === "[required]") return !!node.required;
++  if (selector === ".has-error") {
++    return (node.className || "").split(" ").indexOf("has-error") !== -1;
++  }
++  if (selector === ".field-error") {
++    return (node.className || "").split(" ").indexOf("field-error") !== -1;
++  }
++  let m = selector.match(/^input\[type="radio"\]\[name="(.*)"\]$/);
++  if (m)
++    return node.tag === "input" && node.type === "radio" && node.name === m[1];
++  m = selector.match(/^\[data-testid="(.*)"\]$/);
++  if (m) return node.testid === m[1];
++  return false;
++}
++
++// Fake document for resolveFieldElement / firstErrorIndex(opts.doc).
++function fakeDoc(roots) {
++  const walkAll = (pred) => {
++    const out = [];
++    const walk = (n) => {
++      if (pred(n)) out.push(n);
++      n.children.forEach(walk);
++    };
++    roots.forEach(walk);
++    return out;
++  };
++  return {
++    getElementById: (id) => walkAll((n) => n.id === id)[0] || null,
++    querySelector: (sel) => walkAll((n) => matches(n, sel))[0] || null,
++  };
++}
++
++function section(children) {
++  return el("fieldset", {}, children);
++}
++
++function textInput(value, extra = {}) {
++  return el("input", { type: "text", value, required: true, ...extra });
++}
++
++// ---------- Step model ----------
++
++test("step model starts at the given step and clamps navigation at bounds", () => {
++  const m = stepper.createStepModel({ count: 8, start: 0 });
++  assert.equal(m.current(), 0);
++  assert.equal(m.canBack(), false);
++  assert.equal(m.canNext(), true);
++  m.back(); // clamped at 0
++  assert.equal(m.current(), 0);
++  for (let i = 0; i < 20; i++) m.next();
++  assert.equal(m.current(), 7, "next clamps at the last step");
++  assert.equal(m.canNext(), false);
++  assert.equal(m.canBack(), true);
++  m.back();
++  assert.equal(m.current(), 6);
++});
++
++test("step model jump clamps out-of-range indices", () => {
++  const m = stepper.createStepModel({ count: 8, start: 2 });
++  assert.equal(m.jump(99), 7);
++  assert.equal(m.jump(-4), 0);
++  assert.equal(m.jump(5), 5);
++});
++
++test("step model honours a non-zero start (error re-render)", () => {
++  const m = stepper.createStepModel({ count: 8, start: 4 });
++  assert.equal(m.current(), 4);
++});
++
++// ---------- Gating: basic satisfaction ----------
++
++test("no invalid controls when every visible required control is filled", () => {
++  const s = section([textInput("Jane"), textInput("Doe")]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("empty visible required control blocks and is returned in order", () => {
++  const a = textInput("Jane");
++  const b = textInput("");
++  const c = textInput("");
++  const s = section([a, b, c]);
++  const invalid = stepper.findInvalidControls(s);
++  assert.deepEqual(invalid, [b, c]);
++});
++
++test("whitespace-only values block advance", () => {
++  const s = section([textInput("   ")]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++});
++
++test("optional (non-required) empty controls never block", () => {
++  const optional = el("input", { type: "text", value: "" });
++  const s = section([textInput("Jane"), optional]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++// ---------- Gating: visibility rules ----------
++
++test("required controls inside a hidden conditional wrapper are skipped", () => {
++  const hiddenWrap = el("div", { hidden: true }, [textInput("")]);
++  const s = section([textInput("Jane"), hiddenWrap]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("disabled required controls are skipped", () => {
++  const s = section([textInput("", { disabled: true })]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("a required control in a visible wrapper still blocks", () => {
++  const visibleWrap = el("div", { hidden: false }, [textInput("")]);
++  const s = section([visibleWrap]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++});
++
++// ---------- Gating: control kinds ----------
++
++test("radio group blocks until any visible member is checked", () => {
++  const group = el("div", { className: "radio-options" }, [
++    el("input", { type: "radio", name: "has_pets", value: "no", required: true }),
++    el("input", { type: "radio", name: "has_pets", value: "yes", required: true }),
++  ]);
++  const s = section([group]);
++  const invalid = stepper.findInvalidControls(s);
++  assert.equal(invalid.length, 1, "unsatisfied group yields ONE representative");
++  assert.equal(invalid[0].name, "has_pets");
++});
++
++test("radio group is satisfied by any checked visible member", () => {
++  const group = el("div", {}, [
++    el("input", { type: "radio", name: "has_pets", value: "no", required: true }),
++    el("input", {
++      type: "radio",
++      name: "has_pets",
++      value: "yes",
++      required: true,
++      checked: true,
++    }),
++  ]);
++  const s = section([group]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("a checked but hidden radio does not satisfy the group", () => {
++  const hiddenWrap = el("div", { hidden: true }, [
++    el("input", {
++      type: "radio",
++      name: "has_pets",
++      value: "yes",
++      required: true,
++      checked: true,
++    }),
++  ]);
++  const visible = el("input", {
++    type: "radio",
++    name: "has_pets",
++    value: "no",
++    required: true,
++  });
++  const s = section([hiddenWrap, visible]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++});
++
++test("required checkbox blocks until ticked", () => {
++  const box = el("input", { type: "checkbox", required: true, checked: false });
++  const s = section([box]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++  box.checked = true;
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("required file input blocks until a file is staged", () => {
++  const file = el("input", { type: "file", required: true, files: [] });
++  const s = section([file]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++  file.files = [{ name: "payslip.pdf" }];
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("required select with the placeholder option selected blocks", () => {
++  const select = el("select", { value: "", required: true });
++  const s = section([select]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++  select.value = "employed";
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++// ---------- Error re-render start step ----------
++
++test("firstErrorIndex finds the first section carrying a server error", () => {
++  const clean = section([textInput("")]);
++  const withError = section([
++    el("div", { className: "form-field has-error" }, [textInput("")]),
++  ]);
++  assert.equal(stepper.firstErrorIndex([clean, withError, clean]), 1);
++  assert.equal(
++    stepper.firstErrorIndex([clean, clean]),
++    0,
++    "no server errors → start at step 1",
++  );
++});
++
++test("firstErrorIndex prefers the server's data-first-error-field resolution", () => {
++  // Upload-slot errors never carry .has-error (container class is static),
++  // so only the server-driven key lands on the right section.
++  const upload = el("input", {
++    type: "file",
++    id: "field-landlord_ref_primary",
++  });
++  const aboutYou = section([textInput("Jane")]);
++  const documents = section([el("div", { className: "form-field" }, [upload])]);
++  const doc = fakeDoc([aboutYou, documents]);
++  assert.equal(
++    stepper.firstErrorIndex([aboutYou, documents], {
++      firstErrorField: "landlord_ref_primary",
++      doc,
++    }),
++    1,
++  );
++});
++
++test("firstErrorIndex falls back to non-empty .field-error (upload slots)", () => {
++  const noKey = section([textInput("")]);
++  const slotWithMessage = section([
++    el("div", { className: "form-field" }, [
++      el("span", { className: "field-error", textContent: "Required." }),
++    ]),
++  ]);
++  assert.equal(stepper.firstErrorIndex([noKey, slotWithMessage]), 1);
++});
++
++test("resolveFieldElement falls back to the wrapper testid for radio groups", () => {
++  // Radio inputs are field-<name>-<value>; only the wrapper carries
++  // data-testid="field-<name>" — the anchor target for radio errors.
++  const wrapper = el("div", {
++    className: "form-field radio-group",
++    testid: "field-has_pets",
++  });
++  const doc = fakeDoc([section([wrapper])]);
++  assert.equal(stepper.resolveFieldElement(doc, "has_pets"), wrapper);
++  assert.equal(
++    stepper.resolveFieldElement(doc, "missing_field"),
++    null,
++    "unknown keys resolve to null so the browser default can try",
++  );
++});
++
++// ---------- Exported constants ----------
++
++test("step-changed event name and gating copy are stable for the F3 seam", () => {
++  assert.equal(stepper.EVENT_STEP_CHANGED, "rt:form-step-changed");
++  assert.ok(stepper.GATING_MESSAGE.length > 0);
++  assert.ok(stepper.REVIEW_HINT_STEPPER.indexOf("Back") !== -1);
++});
+diff --git a/_bmad-output/implementation-artifacts/review-form-stepper-f1/edge-hunter.md b/_bmad-output/implementation-artifacts/review-form-stepper-f1/edge-hunter.md
+new file mode 100644
+index 0000000..1a8bfb5
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/review-form-stepper-f1/edge-hunter.md
+@@ -0,0 +1,46 @@
++# Edge Case Hunter — review-form-stepper-f1
++
++Scope: diff hunks in `review-form-stepper-f1/diff.txt` (F1 stepper + F4 field diet + F5 upload copy), every finding verified against the on-disk source before reporting. Handled paths (visibility-mirror parity with apply_analytics.js, dynamic `required` toggles, radio-group representative focus, co-applicant nested conditions, bfcache state preservation, no-JS SSR, consent submit-gate OR-logic, deletion check on `listing_source` / address quartet / helper literals) were walked and discarded silently.
++
++## Findings
++
++### 1. Error-summary anchor routing double-prefixes `field-` — every link outside the start section is dead
++
++- **Location:** `server/priv/static/form_stepper.js:438-443` (click handler) + `server/src/application/form_pages.gleam:393` + `server/src/application/error_summary.gleam` (`anchor_for`)
++- **Trigger:** Applicant clicks any error-summary link whose field is not in the initially-shown first-error section.
++- **What goes wrong:** The banner hrefs are already full anchors — `anchor_for(key)` returns `"field-" <> key`, so hrefs are `#field-email`. The handler does `id = href.slice(1)` → `"field-email"`, then calls `resolveFieldElement(doc, id)`, which prepends again: `getElementById("field-field-email")` → null; testid fallback `[data-testid="field-field-email"]` → null; `if (!target) return` exits **without** `preventDefault`. The browser's default jump targets `#field-email` inside a `hidden` (`display:none`) section — no scroll, no focus, no step switch. The click appears dead. This is the exact scenario the stepper runs on `form-errors` to fix. Only links into the starting section work (browser default, visible target). The JS tests never exercise the click handler — they call `resolveFieldElement` with raw keys only, which is why the mismatch slips through.
++- **Minimal fix:** Strip the prefix at the call site: `var target = resolveFieldElement(doc, id.replace(/^field-/, ""));` (or make `resolveFieldElement` try `doc.getElementById(key)` as-given before prepending). Add a test that passes a sliced `field-<key>` id, mirroring the real href shape.
++
++### 2. `gdpr_consent` error anchor can never resolve — no element matches `field-gdpr_consent`
++
++- **Location:** `server/priv/static/form_stepper.js:149-156` (`resolveFieldElement`) + `server/src/application/form_sections/review_consent.gleam:14` (consent input `id="gdpr-consent"`) + `server/src/application/application_handler.gleam:501-505`
++- **Trigger:** Server emits the `gdpr_consent` error (consent missing — prepended to the errors list, so it is frequently `data-first-error-field`, and the only error on no-JS/partial-JS posts where the checkbox gate never ran).
++- **What goes wrong:** The anchor is `#field-gdpr_consent`, but the checkbox's id is `gdpr-consent` and its testids are `gdpr-consent-checkbox` / `gdpr-consent-block` — neither the id lookup nor the `[data-testid="field-<key>"]` fallback can ever match, even after finding 1 is fixed. The summary link dead-ends on the browser default (no such id). The start-step logic is saved by the `.has-error` fallback (`.consent-block.has-error` lands in section 8), so the stepper still starts on the right step — but the explicit "summary links switch step + focus the field" contract fails for one of the most common single-error re-renders. Pre-existing dead anchor, but it sits squarely inside the routing surface this diff adds.
++- **Minimal fix:** Map the consent key in `resolveFieldElement`: `if (key === "gdpr_consent") return doc.getElementById("gdpr-consent");` (or add `data-testid="field-gdpr_consent"` to the consent block).
++
++### 3. Server-side upload-slot errors render `display:none` — the routed-to message is invisible
++
++- **Location:** `server/src/application/form_sections/documents.gleam:338-349` (`view_upload_area` error span) vs `server/src/application/form_fields.gleam:300` (`view_error_span` adds `style="display:flex"`) + `server/priv/static/form.css:339` (`.field-error { display: none; }`)
++- **Trigger:** Error re-render carrying a server upload error — `landlord_ref_primary` / `character_ref_primary` / `employer_ref_*` required-miss, or per-file/aggregate rejections from `upload_errors_from_prepare`.
++- **What goes wrong:** The slot's `.field-error` span gets the message text but never the inline `display:flex` that every other field renderer applies — so the inline error the applicant is being routed to is invisible. The stepper's `firstErrorIndex` third fallback exists precisely for these slots ("upload slots never get .has-error — their container class is static SSR"), so the diff routes the applicant to the documents step and focuses a file input with no visible statement of what's wrong. Pre-existing SSR gap, but the diff's error-routing feature is the first thing whose success depends on it, and the fix is one mirrored attribute.
++- **Minimal fix:** In `view_upload_area`, mirror `view_error_span`: add `attribute("style", "display:flex")` to the span's attribute list when `error != ""`.
++
++### 4. Preflight-blocked submit is an invisible dead-end on the final step
++
++- **Location:** `server/priv/static/form_stepper.js:363-385` (`onContinue` — no preflight check) + `server/priv/static/form.js:469,491,518-519` (preflight sets `data-preflight-blocked`, banner lives inside the documents section)
++- **Trigger:** Applicant stages oversized files (per-file >5MB or aggregate >22MB) on the documents step; preflight disables submit via `data-preflight-blocked` and shows the aggregate banner inside section 7. Gating passes (file inputs are "satisfied" — `files.length > 0`), Continue advances to step 8.
++- **What goes wrong:** On step 8 the submit button is disabled by the OR-gate (`data-consent-blocked || data-preflight-blocked`), but the explanation — the aggregate banner, and any inline per-file message — is hidden inside section 7. Ticking/unticking consent never re-enables the button and nothing on the visible step says why. Pre-stepper the banner was always somewhere on the same scrollable page; the stepper's section-hiding creates the dead-end. Recoverable only if the applicant guesses to click Back.
++- **Minimal fix:** In `onContinue`, when the current section contains file inputs and submit carries `data-preflight-blocked`, stay on the step (scroll the preflight banner into view) instead of advancing: `var sub = doc.querySelector('[data-testid="submit-application"]'); if (sections[i].el.querySelector('input[type="file"]') && sub && sub.hasAttribute("data-preflight-blocked")) { return; }`.
++
++### 5. No guard that form.js ran — a failed form.js fetch turns gating into a hard block
++
++- **Location:** `server/priv/static/form_stepper.js:191-196` (`initBrowser` — no dependency check) + SSR-visible conditional wrappers, e.g. `server/src/application/form_sections/guarantor.gleam:101-107` (`guarantor-fields`, `required: True` fields, no SSR `hidden`) and `server/src/application/form_sections/references.gleam` (character-ref trio, `required: True`, no SSR `hidden`)
++- **Trigger:** `form_stepper.js` loads but `form.js` doesn't (independent script fetches on flaky mobile connections — 80% of form traffic) or dies on a runtime error before its condition engine init.
++- **What goes wrong:** SSR renders the conditional wrappers visible (only the condition engine hides them). The stepper's gating rule is "all visible required controls filled", so step 4 demands landlord trio **and** character trio simultaneously, and step 5 demands the full guarantor block (`guarantor_name`, relationship, phone, email, income, employer — all `required: True`) from applicants with no guarantor. The no-JS fallback can't rescue this — JS is on, the stepper owns navigation, and the Continue gate never passes. The stepper converts a partial JS degradation (long form still submittable without form.js: `novalidate`, server authoritative) into a total failure on exactly the cohort the feature targets.
++- **Minimal fix:** Bail to the long form when the condition engine never ran, e.g. at the top of `initBrowser`: `if (typeof root.__rtRecomputeSubmitDisabled !== "function") return;` — no chrome, no gating, form behaves as no-stepper.
++
++## Deletion check (Step 4)
++
++Walked the removed/replaced code: the address quartet is re-established field-for-field inside `view_address_cluster` (same names, types, required-ness, `autocomplete` via `autocomplete_for`); `listing_source` server acceptance is intact (`is_valid_listing_source` keeps `""`, the whitelist const, parity test, `error_summary` label, DB column — verified at `application_handler.gleam:1089`); F5 helper literals are re-established via `copy.gleam` in all seven slots. No orphaned references and no retired contract beyond the spec-mandated UI removal of the select. No deletion findings.
++
++**Total findings: 5**
+diff --git a/_bmad-output/implementation-artifacts/spec-form-stepper-f1.md b/_bmad-output/implementation-artifacts/spec-form-stepper-f1.md
+new file mode 100644
+index 0000000..fc4e26e
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-form-stepper-f1.md
+@@ -0,0 +1,105 @@
++---
++title: 'Application-form stepper (F1) + field diet (F4) + upload copy (F5)'
++type: 'feature'
++created: '2026-08-01'
++status: 'in-review'
++baseline_commit: 'd85a0ed1aebcb582bd43ac0f7c71fc0646ea1ebb'
++review_loop_iteration: 0
++context: []
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** The public `/apply/:code` form renders ~36 controls on one long page (80% mobile) and abandons at ~89%: daunt at first render plus an unguided document wall. Spec of record: `_bmad-output/planning-artifacts/problem-solving-application-form-completion-2026-07-31.md` (F1/F4/F5 rows, Wave 1 build pack).
++
++**Approach:** Progressive-enhancement stepper over the existing 8 SSR sections (named sticky progress, per-step validation gating, single POST, no-JS fallback stays the long form), plus field diet (drop the optional non-scoring `listing_source` select; collapse the optional address cluster into `<details>`) and camera-roll-friendly per-slot upload helper copy.
++
++## Boundaries & Constraints
++
++**Always:**
++- `data-section-id` values + section DOM order unchanged (funnel keys off them); `apply_analytics.js` and `form.js` untouched.
++- Single POST at the end; submit/consent/honeypot/timing machinery untouched.
++- No-JS fallback: SSR renders all 8 sections visible and submittable as today.
++- Scoring inputs untouched — no removing/renaming/re-requiring any field in `ai_client.gleam`'s payload (address cluster + `eircode` stay, only visually collapsed).
++- `view_prep_block()` and its `F3-SEAM` comment byte-untouched (follow-up C seam).
++- Applicant-facing strings live in `server/src/copy.gleam`; brand voice (calm, specific; never "Error/Failed/Retry").
++- `listing_source` stays accepted server-side: DB column, `is_valid_listing_source`, `error_summary` label, and `work_income.listing_source_options` const + parity test remain (cached pages may still post it).
++
++**Ask First:**
++- Reintroducing `listing_source` post-submit (confirmation widget + endpoint) — deferred follow-up, not this PR.
++- Any change to the prep block copy or the one-visit line.
++
++**Never:**
++- Per-section persistence, localStorage drafts, magic continue links (follow-up C's job).
++- Dropping the `listing_source` column or rejecting the field server-side.
++- A JS-generated "review summary" of entered values (rejected: PII-echo + scope; Back navigation covers review).
++- Merging the PR.
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| Advance | Step's visible required filled, Continue | Next section shown, others `hidden`; progress "Step N of 8 — Name"; `rt:form-step-changed` `{step_index, section_id, total}`; focus legend, scroll to top of section | N/A |
++| Gating | Visible required empty, Continue | Stay; `.has-error` + short brand-voice message in the field's `.field-error`; focus first invalid | Clears on input/next pass |
++| Radio group | Required, none checked | Blocks; valid when any visible member checked | Same inline pattern |
++| Conditional hidden | Required control inside `hidden` conditional (guarantor off, pet details…) | Skipped by gating (visibility walk mirrors apply_analytics) | N/A |
++| Dynamic required | `employment_status=employed` (employer fields gain `required`) | Empty visible employer field blocks | Existing toggle supplies `required` |
++| Error re-render | `data-apply-page="form-errors"` | Stepper starts at first `.has-error` section; error-summary anchor clicks switch step + focus target; banner keeps initial focus | Falls back to step 1 |
++| No JS | Script absent/blocked | All 8 sections visible; one POST submits; server validation authoritative | Existing path |
++| Files across steps | Files chosen, then Back/Continue | Inputs keep `FileList`; preflight/submit unchanged | Server caps authoritative |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `server/priv/static/form_stepper.js` — NEW stepper module (CommonJS-testable internals like apply_analytics.js).
++- `server/priv/static/apply_analytics.js` / `form.js` — gating rules to mirror; coexistence. DO NOT EDIT.
++- `server/priv/static/form.css` — stepper chrome, `.optional-cluster`, `.form-section[hidden]` guard, `scroll-margin-top`.
++- `server/src/application/form_view.gleam` + `form_pages.gleam` — add `/static/form_stepper.js` defer script after form.js (pristine + error pages).
++- `server/src/application/form_sections/work_income.gleam` — remove `listing_source` select render; keep + re-comment the const.
++- `server/src/application/form_sections/situation.gleam` — `<details class="optional-cluster">` around the 4 address fields (open when any prefilled).
++- `server/src/application/form_sections/documents.gleam` + `server/src/copy.gleam` — F5 per-slot helpers (proof-of-income + co-applicant slots gain helpers; ref slots extended).
++- `server/src/ai/ai_client.gleam` — reference only: payload surface to keep diff-empty.
++- `scripts/js-tests/form_stepper.test.js` — NEW node tests (`make test-js` globs `*.test.js`).
++- `server/test/application/form_view_test.gleam` — SSR pins.
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `server/priv/static/form_stepper.js` — create: init on `data-apply-page` `form`|`form-errors`; sections from `[data-section-id]`; sticky progress (aria-live text + aria-hidden segments, names from `legend.section-title`); per-section nav (Back steps 2–8, Continue 1–7, `type="button"`); Continue gates on visible-required-filled (radio any-checked, checkbox checked, file `files.length`, else trimmed non-empty; skip hidden/disabled); step change → event + legend focus (`tabindex=-1`) + scrollIntoView; form-errors → start at first-error section, route summary anchors through step switch; rewrite review hint to Back-based copy; no-op cleanly when markers absent.
++- [x] `server/priv/static/form.css` — sticky `.stepper-progress` (mobile-tuned), segments, `.stepper-nav` rows (44px targets), `.form-section[hidden]{display:none}`, `.optional-cluster` styles.
++- [x] `server/src/application/form_view.gleam` + `form_pages.gleam` — script tags.
++- [x] `server/src/application/form_sections/work_income.gleam` — drop the select.
++- [x] `server/src/application/form_sections/situation.gleam` — details-collapse the address cluster.
++- [x] `server/src/copy.gleam` + `form_sections/documents.gleam` — F5 strings wired into every slot.
++- [x] `scripts/js-tests/form_stepper.test.js` — unit-test every I/O-matrix row + no-op guards + event payload.
++- [x] `server/test/application/form_view_test.gleam` — pin: 8 sections visible (no `hidden` on fieldsets), ids in order, details closed pristine/open prefilled, `listing_source` absent, F5 helpers present, script tag present, prep block + F3-SEAM substring intact.
++
++**Acceptance Criteria:**
++- Given JS on, when Continue passes gating, then the next section shows, progress reads "Step N of 8 — <Name>", and `rt:form-step-changed` fires with the new `section_id`.
++- Given a visible required field empty, when Continue is clicked, then navigation blocks with an inline brand-voice message and focus on the first invalid field.
++- Given JS disabled, when the page loads, then all 8 sections render visible and one POST submits the form (existing integration path green).
++- Given an error re-render, when the page loads, then the stepper starts at the first error's section and summary links switch steps + focus the field.
++- Given the stepper active, then `application_form_section_entered/completed/abandoned` still fire with unchanged `section_id`s (observer sees only shown sections).
++- Given F4, then `listing_source` is absent from the pristine HTML while the handler still accepts it (parity test green), and the collapsed address cluster still submits.
++- Given the branch diff, then `server/src/ai/` is unchanged (scoring-input proof in PR).
++
++## Design Notes
++
++- Gating duplicates ~30 lines of apply_analytics' visibility rules with a keep-in-sync comment — plain static JS has no cross-file imports, and apply_analytics.js must stay untouched.
++- `listing_source` dropped (not post-submit): spec grants either; a confirmation widget needs a new public mutation endpoint + application-identity token — large surface for a "small" fold-in. Ops digest degrades to `(unknown)` on new rows; PostHog referrers still show channel. Open follow-up.
++- `rt:form-step-changed` is the documented seam for follow-up C's save-on-section-change.
++- Stepper runs on the error page because anchor links into `hidden` sections are dead ends otherwise; it never steals the banner's first focus.
++
++## Verification
++
++**Commands:**
++- `make format && make test && make build` — all green (test-js runs the new node tests).
++- `make test-db-up && make test-integration` — green (submit path unchanged).
++- `git diff origin/develop -- server/src/ai/` — empty (scoring-input proof).
++- `grep -c 'listing_source' <(curl -s localhost:4000/apply/<code>)` on `make dev` — 0.
++
++**Manual checks (if no CLI):**
++- `make dev` + browser (mobile ~390px + desktop): fill → gate blocks empty required → Back preserves values/files → consent → submit → confirmation; bfcache restore keeps stepper consistent; sticky progress visible on mobile scroll.
+diff --git a/scripts/js-tests/form_stepper.test.js b/scripts/js-tests/form_stepper.test.js
+new file mode 100644
+index 0000000..3d17159
+--- /dev/null
++++ b/scripts/js-tests/form_stepper.test.js
+@@ -0,0 +1,362 @@
++// Unit tests for server/priv/static/form_stepper.js — run with
++// `node --test scripts/js-tests/` (wired into `make test` as test-js).
++//
++// Covers the F1 acceptance surface: the step model (bounds, jumps), the
++// Continue-gating rules (visible-required only — radio groups, checkboxes,
++// file inputs, hidden conditionals, disabled controls), and the error
++// re-render start-step rule. The DOM-free internals are required directly;
++// browser wiring (progress chrome, nav injection, anchor routing) is
++// covered by the bug-hunt/manual E2E pass.
++
++const { test } = require("node:test");
++const assert = require("node:assert/strict");
++
++const stepper = require("../../server/priv/static/form_stepper.js");
++
++// ---------- Minimal DOM (mirrors apply_analytics.test.js) ----------
++
++let idSeq = 0;
++function el(tag, attrs = {}, children = []) {
++  const node = {
++    _id: ++idSeq,
++    tag,
++    children: [],
++    parentElement: null,
++    hidden: false,
++    disabled: false,
++    ...attrs,
++  };
++  children.forEach((c) => {
++    c.parentElement = node;
++    node.children.push(c);
++  });
++  node.querySelectorAll = (selector) => {
++    const out = [];
++    const walk = (n) => {
++      n.children.forEach((c) => {
++        if (matches(c, selector)) out.push(c);
++        walk(c);
++      });
++    };
++    walk(node);
++    return out;
++  };
++  node.querySelector = (selector) => node.querySelectorAll(selector)[0] || null;
++  node.contains = (target) => {
++    let n = target;
++    while (n) {
++      if (n === node) return true;
++      n = n.parentElement;
++    }
++    return false;
++  };
++  return node;
++}
++
++function matches(node, selector) {
++  if (selector === "[required]") return !!node.required;
++  if (selector === ".has-error") {
++    return (node.className || "").split(" ").indexOf("has-error") !== -1;
++  }
++  if (selector === ".field-error") {
++    return (node.className || "").split(" ").indexOf("field-error") !== -1;
++  }
++  let m = selector.match(/^input\[type="radio"\]\[name="(.*)"\]$/);
++  if (m)
++    return node.tag === "input" && node.type === "radio" && node.name === m[1];
++  m = selector.match(/^\[data-testid="(.*)"\]$/);
++  if (m) return node.testid === m[1];
++  return false;
++}
++
++// Fake document for resolveFieldElement / firstErrorIndex(opts.doc).
++function fakeDoc(roots) {
++  const walkAll = (pred) => {
++    const out = [];
++    const walk = (n) => {
++      if (pred(n)) out.push(n);
++      n.children.forEach(walk);
++    };
++    roots.forEach(walk);
++    return out;
++  };
++  return {
++    getElementById: (id) => walkAll((n) => n.id === id)[0] || null,
++    querySelector: (sel) => walkAll((n) => matches(n, sel))[0] || null,
++  };
++}
++
++function section(children) {
++  return el("fieldset", {}, children);
++}
++
++function textInput(value, extra = {}) {
++  return el("input", { type: "text", value, required: true, ...extra });
++}
++
++// ---------- Step model ----------
++
++test("step model starts at the given step and clamps navigation at bounds", () => {
++  const m = stepper.createStepModel({ count: 8, start: 0 });
++  assert.equal(m.current(), 0);
++  assert.equal(m.canBack(), false);
++  assert.equal(m.canNext(), true);
++  m.back(); // clamped at 0
++  assert.equal(m.current(), 0);
++  for (let i = 0; i < 20; i++) m.next();
++  assert.equal(m.current(), 7, "next clamps at the last step");
++  assert.equal(m.canNext(), false);
++  assert.equal(m.canBack(), true);
++  m.back();
++  assert.equal(m.current(), 6);
++});
++
++test("step model jump clamps out-of-range indices", () => {
++  const m = stepper.createStepModel({ count: 8, start: 2 });
++  assert.equal(m.jump(99), 7);
++  assert.equal(m.jump(-4), 0);
++  assert.equal(m.jump(5), 5);
++});
++
++test("step model honours a non-zero start (error re-render)", () => {
++  const m = stepper.createStepModel({ count: 8, start: 4 });
++  assert.equal(m.current(), 4);
++});
++
++// ---------- Gating: basic satisfaction ----------
++
++test("no invalid controls when every visible required control is filled", () => {
++  const s = section([textInput("Jane"), textInput("Doe")]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("empty visible required control blocks and is returned in order", () => {
++  const a = textInput("Jane");
++  const b = textInput("");
++  const c = textInput("");
++  const s = section([a, b, c]);
++  const invalid = stepper.findInvalidControls(s);
++  assert.deepEqual(invalid, [b, c]);
++});
++
++test("whitespace-only values block advance", () => {
++  const s = section([textInput("   ")]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++});
++
++test("optional (non-required) empty controls never block", () => {
++  const optional = el("input", { type: "text", value: "" });
++  const s = section([textInput("Jane"), optional]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++// ---------- Gating: visibility rules ----------
++
++test("required controls inside a hidden conditional wrapper are skipped", () => {
++  const hiddenWrap = el("div", { hidden: true }, [textInput("")]);
++  const s = section([textInput("Jane"), hiddenWrap]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("disabled required controls are skipped", () => {
++  const s = section([textInput("", { disabled: true })]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("a required control in a visible wrapper still blocks", () => {
++  const visibleWrap = el("div", { hidden: false }, [textInput("")]);
++  const s = section([visibleWrap]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++});
++
++// ---------- Gating: control kinds ----------
++
++test("radio group blocks until any visible member is checked", () => {
++  const group = el("div", { className: "radio-options" }, [
++    el("input", { type: "radio", name: "has_pets", value: "no", required: true }),
++    el("input", { type: "radio", name: "has_pets", value: "yes", required: true }),
++  ]);
++  const s = section([group]);
++  const invalid = stepper.findInvalidControls(s);
++  assert.equal(invalid.length, 1, "unsatisfied group yields ONE representative");
++  assert.equal(invalid[0].name, "has_pets");
++});
++
++test("radio group is satisfied by any checked visible member", () => {
++  const group = el("div", {}, [
++    el("input", { type: "radio", name: "has_pets", value: "no", required: true }),
++    el("input", {
++      type: "radio",
++      name: "has_pets",
++      value: "yes",
++      required: true,
++      checked: true,
++    }),
++  ]);
++  const s = section([group]);
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("a checked but hidden radio does not satisfy the group", () => {
++  const hiddenWrap = el("div", { hidden: true }, [
++    el("input", {
++      type: "radio",
++      name: "has_pets",
++      value: "yes",
++      required: true,
++      checked: true,
++    }),
++  ]);
++  const visible = el("input", {
++    type: "radio",
++    name: "has_pets",
++    value: "no",
++    required: true,
++  });
++  const s = section([hiddenWrap, visible]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++});
++
++test("required checkbox blocks until ticked", () => {
++  const box = el("input", { type: "checkbox", required: true, checked: false });
++  const s = section([box]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++  box.checked = true;
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("required file input blocks until a file is staged", () => {
++  const file = el("input", { type: "file", required: true, files: [] });
++  const s = section([file]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++  file.files = [{ name: "payslip.pdf" }];
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++test("required select with the placeholder option selected blocks", () => {
++  const select = el("select", { value: "", required: true });
++  const s = section([select]);
++  assert.equal(stepper.findInvalidControls(s).length, 1);
++  select.value = "employed";
++  assert.deepEqual(stepper.findInvalidControls(s), []);
++});
++
++// ---------- Error re-render start step ----------
++
++test("firstErrorIndex finds the first section carrying a server error", () => {
++  const clean = section([textInput("")]);
++  const withError = section([
++    el("div", { className: "form-field has-error" }, [textInput("")]),
++  ]);
++  assert.equal(stepper.firstErrorIndex([clean, withError, clean]), 1);
++  assert.equal(
++    stepper.firstErrorIndex([clean, clean]),
++    0,
++    "no server errors → start at step 1",
++  );
++});
++
++test("firstErrorIndex prefers the server's data-first-error-field resolution", () => {
++  // Upload-slot errors never carry .has-error (container class is static),
++  // so only the server-driven key lands on the right section.
++  const upload = el("input", {
++    type: "file",
++    id: "field-landlord_ref_primary",
++  });
++  const aboutYou = section([textInput("Jane")]);
++  const documents = section([el("div", { className: "form-field" }, [upload])]);
++  const doc = fakeDoc([aboutYou, documents]);
++  assert.equal(
++    stepper.firstErrorIndex([aboutYou, documents], {
++      firstErrorField: "landlord_ref_primary",
++      doc,
++    }),
++    1,
++  );
++});
++
++test("firstErrorIndex falls back to non-empty .field-error (upload slots)", () => {
++  const noKey = section([textInput("")]);
++  const slotWithMessage = section([
++    el("div", { className: "form-field" }, [
++      el("span", { className: "field-error", textContent: "Required." }),
++    ]),
++  ]);
++  assert.equal(stepper.firstErrorIndex([noKey, slotWithMessage]), 1);
++});
++
++test("resolveFieldElement falls back to the wrapper testid for radio groups", () => {
++  // Radio inputs are field-<name>-<value>; only the wrapper carries
++  // data-testid="field-<name>" — the anchor target for radio errors.
++  const wrapper = el("div", {
++    className: "form-field radio-group",
++    testid: "field-has_pets",
++  });
++  const doc = fakeDoc([section([wrapper])]);
++  assert.equal(stepper.resolveFieldElement(doc, "has_pets"), wrapper);
++  assert.equal(
++    stepper.resolveFieldElement(doc, "missing_field"),
++    null,
++    "unknown keys resolve to null so the browser default can try",
++  );
++});
++
++// ---------- Exported constants ----------
++
++test("step-changed event name and gating copy are stable for the F3 seam", () => {
++  assert.equal(stepper.EVENT_STEP_CHANGED, "rt:form-step-changed");
++  assert.ok(stepper.GATING_MESSAGE.length > 0);
++  assert.ok(stepper.REVIEW_HINT_STEPPER.indexOf("Back") !== -1);
++});
++
++// ---------- Activation gate + event payload ----------
++
++test("shouldActivate enhances only the two form renders", () => {
++  assert.equal(stepper.shouldActivate("form"), true);
++  assert.equal(stepper.shouldActivate("form-errors"), true);
++  // Outcome pages (confirmation/duplicate/spam) and missing markers get no
++  // chrome — the no-JS/no-enhancement guarantee.
++  assert.equal(stepper.shouldActivate("confirmation"), false);
++  assert.equal(stepper.shouldActivate("duplicate"), false);
++  assert.equal(stepper.shouldActivate("spam-confirmation"), false);
++  assert.equal(stepper.shouldActivate(null), false);
++  assert.equal(stepper.shouldActivate(""), false);
++});
++
++test("stepChangeDetail pins the rt:form-step-changed payload shape", () => {
++  assert.deepEqual(stepper.stepChangeDetail(2, "work_income", 8), {
++    step_index: 3,
++    section_id: "work_income",
++    total: 8,
++  });
++});
++
++// ---------- Anchor routing (real error-summary href shapes) ----------
++
++test("resolveAnchorTarget resolves #field-<key> hrefs end to end", () => {
++  const input = el("input", { id: "field-email", name: "email" });
++  const doc = fakeDoc([section([input])]);
++  assert.equal(stepper.resolveAnchorTarget(doc, "#field-email"), input);
++});
++
++test("resolveAnchorTarget percent-decodes co-applicant hrefs", () => {
++  const input = el("input", { id: "field-co_applicant[0][first_name]" });
++  const doc = fakeDoc([section([input])]);
++  assert.equal(
++    stepper.resolveAnchorTarget(doc, "#field-co_applicant%5B0%5D%5Bfirst_name%5D"),
++    input,
++  );
++});
++
++test("resolveAnchorTarget maps the consent key to the compliance-pinned id", () => {
++  const box = el("input", { id: "gdpr-consent", type: "checkbox" });
++  const doc = fakeDoc([section([box])]);
++  assert.equal(stepper.resolveAnchorTarget(doc, "#field-gdpr_consent"), box);
++});
++
++test("resolveAnchorTarget returns null for unknown anchors (browser default)", () => {
++  const doc = fakeDoc([section([textInput("x")])]);
++  assert.equal(stepper.resolveAnchorTarget(doc, "#field-nope"), null);
++  assert.equal(stepper.resolveAnchorTarget(doc, ""), null);
++  assert.equal(stepper.resolveAnchorTarget(doc, null), null);
++});
+diff --git a/server/priv/static/form.css b/server/priv/static/form.css
+index 89de94c..62fa486 100644
+--- a/server/priv/static/form.css
++++ b/server/priv/static/form.css
+@@ -763,6 +763,161 @@ textarea:focus-visible {
+   cursor: not-allowed;
+ }
+ 
++/* ── Stepper (F1 progressive disclosure) ─────────────────────────────────
++   All chrome is JS-built (form_stepper.js) — no-JS renders none of this.
++   The progress header is sticky so mobile applicants keep their bearings
++   while scrolling a section. */
++
++.stepper-progress {
++  position: sticky;
++  top: 0;
++  z-index: 20;
++  background-color: var(--off-white);
++  padding: 0.75rem 0 0.625rem;
++  margin-bottom: 0.75rem;
++  border-bottom: 1px solid var(--border);
++}
++
++.stepper-status {
++  font-family: var(--font-headline);
++  font-size: 0.9375rem;
++  font-weight: 700;
++  letter-spacing: -0.015em;
++  color: var(--navy);
++  margin-bottom: 0.5rem;
++}
++
++.stepper-segments {
++  display: grid;
++  grid-auto-flow: column;
++  gap: 0.25rem;
++}
++
++.stepper-segment {
++  height: 0.25rem;
++  border-radius: 999px;
++  background-color: var(--border);
++  transition: background-color 0.2s ease;
++}
++
++.stepper-segment-done {
++  background-color: var(--teal);
++}
++
++.stepper-segment-active {
++  background-color: var(--amber);
++}
++
++/* Sections clear the sticky bar when scrolled to (step change, anchors). */
++.form-section {
++  scroll-margin-top: 5.5rem;
++}
++
++/* fieldset[hidden] wins over UA display on every modern browser, but the
++   explicit guard keeps the stepper's show/hide unambiguous. */
++.form-section[hidden] {
++  display: none;
++}
++
++.stepper-nav {
++  display: flex;
++  gap: 0.75rem;
++  margin-top: 1.25rem;
++}
++
++.stepper-nav:empty {
++  display: none;
++}
++
++.btn-step-continue,
++.btn-step-back {
++  font-family: var(--font-headline);
++  font-size: 1rem;
++  font-weight: 700;
++  letter-spacing: -0.025em;
++  border-radius: 0.5rem;
++  cursor: pointer;
++  min-height: 2.75rem; /* 44px touch target */
++  padding: 0.625rem 1.25rem;
++  transition: background-color 0.15s ease, transform 0.1s ease;
++}
++
++.btn-step-continue {
++  flex: 1;
++  color: var(--white);
++  background-color: var(--amber);
++  border: none;
++}
++
++.btn-step-continue:hover {
++  background-color: #C08425;
++}
++
++.btn-step-back {
++  color: var(--navy);
++  background-color: var(--white);
++  border: 1px solid var(--border);
++}
++
++.btn-step-back:hover {
++  background-color: var(--off-white);
++}
++
++.btn-step-continue:active,
++.btn-step-back:active {
++  transform: scale(0.98);
++}
++
++/* Only-child nav rows (step 1: Continue alone) stay full-width; with a
++   Back sibling the Continue button takes the remaining space. */
++.stepper-nav .btn-step-continue:first-child:last-child {
++  width: 100%;
++}
++
++/* ── Optional field clusters (F4 field diet) ─────────────────────────────
++   Collapses optional-but-scoring-relevant clusters (e.g. the current
++   address block) behind a native <details> — works with and without JS. */
++
++.optional-cluster {
++  border: 1px solid var(--border);
++  border-radius: var(--radius);
++  padding: 0.875rem 1rem;
++  margin-bottom: 1rem;
++  background-color: var(--white);
++}
++
++.optional-cluster > summary {
++  font-family: var(--font-headline);
++  font-size: 0.9375rem;
++  font-weight: 700;
++  color: var(--navy);
++  cursor: pointer;
++  list-style: none;
++  display: flex;
++  align-items: center;
++  gap: 0.5rem;
++  min-height: 2.75rem; /* 44px touch target */
++}
++
++.optional-cluster > summary::before {
++  content: "+";
++  font-size: 1.125rem;
++  line-height: 1;
++  color: var(--amber);
++}
++
++.optional-cluster[open] > summary::before {
++  content: "\2212"; /* minus */
++}
++
++.optional-cluster > summary::-webkit-details-marker {
++  display: none;
++}
++
++.optional-cluster[open] > summary {
++  margin-bottom: 0.75rem;
++}
++
+ /* ── Footer ────────────────────────────────────────────────────────────── */
+ 
+ .form-footer {
+diff --git a/server/priv/static/form_stepper.js b/server/priv/static/form_stepper.js
+new file mode 100644
+index 0000000..676ddf3
+--- /dev/null
++++ b/server/priv/static/form_stepper.js
+@@ -0,0 +1,575 @@
++// form_stepper.js — F1 progressive-disclosure stepper for the public
++// /apply/:code form (Wave 1 build pack, 2026-07 application-completion
++// problem-solving session).
++//
++// Progressive enhancement ONLY: the SSR page renders all 8 sections visible
++// (the no-JS fallback — a single long form that posts once). When this file
++// loads, it hides every section but the current one, adds a sticky "Step N
++// of 8 — <Name>" progress header, and injects Back/Continue navigation.
++// Nothing about the submission path changes: one POST, same fields, same
++// server validation (which stays authoritative).
++//
++// Runs on both the pristine form (data-apply-page="form") and the
++// validation-error re-render ("form-errors") — error-summary anchor links
++// point at fields inside now-hidden sections, so the stepper starts at the
++// first error's section and routes those clicks through a step switch.
++//
++// F3 seam (save-resume follow-up job): every step CHANGE dispatches
++// `rt:form-step-changed` on document with detail
++//   { step_index (1-based), section_id, total }
++// — that event is the "section change" hook a draft-saver should listen
++// for. The initial show on page load deliberately does NOT dispatch.
++//
++// Testability: the pure internals are exported (CommonJS) for `node --test`;
++// browser wiring runs only when a document is present. Mirrors
++// apply_analytics.js's module pattern.
++
++(function (root) {
++  "use strict";
++
++  var EVENT_STEP_CHANGED = "rt:form-step-changed";
++  var GATING_MESSAGE = "This one's needed before you continue.";
++  // Replaces the review step's scroll-based hint when the stepper is active
++  // (scrolling no longer shows other sections). SSR copy stays for no-JS.
++  var REVIEW_HINT_STEPPER =
++    "Use Back to check any of your answers — nothing is sent until you choose Submit Application.";
++
++  // ---------- Visibility + satisfaction rules ----------
++  // Mirror of apply_analytics.js's isVisibleRequired / controlSatisfied /
++  // cssEscapeName — KEEP IN SYNC. Duplicated because plain static JS has no
++  // module imports and apply_analytics.js must stay untouched (W0 funnel
++  // contract). The gating rule is the completion rule: a step may advance
++  // when all its VISIBLE required controls are filled.
++
++  function isVisibleRequired(el, sectionEl) {
++    if (el.disabled) return false;
++    var node = el;
++    while (node && node !== sectionEl) {
++      if (node.hidden) return false;
++      node = node.parentElement;
++    }
++    return !(sectionEl && sectionEl.hidden);
++  }
++
++  function controlSatisfied(el) {
++    var type = (el.type || "").toLowerCase();
++    if (type === "radio") return el.checked;
++    if (type === "checkbox") return el.checked;
++    if (type === "file") return !!(el.files && el.files.length) || !!el.value;
++    return !!(el.value && String(el.value).trim() !== "");
++  }
++
++  function cssEscapeName(name) {
++    if (root.CSS && typeof root.CSS.escape === "function") {
++      return root.CSS.escape(name);
++    }
++    return String(name).replace(/"/g, '\\"');
++  }
++
++  // findInvalidControls(sectionEl) → ordered list of controls blocking
++  // advance: visible, required, unsatisfied. Radio groups count once per
++  // name — the group is satisfied when any visible member is checked; when
++  // unsatisfied the first visible member represents it (so focus + the
++  // .form-field wrapper land on the group, not on every radio).
++  function findInvalidControls(sectionEl) {
++    var invalid = [];
++    var required = sectionEl.querySelectorAll("[required]");
++    var seenRadioGroups = {};
++    for (var i = 0; i < required.length; i++) {
++      var el = required[i];
++      if (!isVisibleRequired(el, sectionEl)) continue;
++      var type = (el.type || "").toLowerCase();
++      if (type === "radio") {
++        var name = el.name || "";
++        if (seenRadioGroups[name]) continue;
++        seenRadioGroups[name] = true;
++        var group = sectionEl.querySelectorAll(
++          'input[type="radio"][name="' + cssEscapeName(name) + '"]'
++        );
++        var rep = null;
++        var checked = false;
++        for (var j = 0; j < group.length; j++) {
++          if (!isVisibleRequired(group[j], sectionEl)) continue;
++          if (!rep) rep = group[j];
++          if (group[j].checked) {
++            checked = true;
++            break;
++          }
++        }
++        if (!checked && rep) invalid.push(rep);
++        continue;
++      }
++      if (!controlSatisfied(el)) invalid.push(el);
++    }
++    return invalid;
++  }
++
++  // ---------- Step model (DOM-free) ----------
++
++  function clampIndex(count, i) {
++    if (count < 1) return 0;
++    return Math.max(0, Math.min(count - 1, i));
++  }
++
++  // createStepModel({ count, start }) → cursor over the steps. Pure state;
++  // the DOM choreography lives in initBrowser so tests can drive the model
++  // directly.
++  function createStepModel(opts) {
++    var count = opts.count;
++    var current = clampIndex(count, opts.start || 0);
++    return {
++      current: function () {
++        return current;
++      },
++      canBack: function () {
++        return current > 0;
++      },
++      canNext: function () {
++        return current < count - 1;
++      },
++      next: function () {
++        current = clampIndex(count, current + 1);
++        return current;
++      },
++      back: function () {
++        current = clampIndex(count, current - 1);
++        return current;
++      },
++      jump: function (i) {
++        current = clampIndex(count, i);
++        return current;
++      },
++    };
++  }
++
++  // resolveFieldElement(doc, key) → the element a server error key points
++  // at. Mirrors error_summary.anchor_for ("field-<key>") with a testid
++  // fallback: radio groups carry no field-<name> id (their inputs are
++  // field-<name>-<value>), only the wrapper's data-testid.
++  function resolveFieldElement(doc, key) {
++    if (!key) return null;
++    // The consent checkbox breaks the field-<key> id convention
++    // (id="gdpr-consent", a compliance-pinned DOM hook).
++    if (key === "gdpr_consent") return doc.getElementById("gdpr-consent");
++    var el = doc.getElementById("field-" + key);
++    if (el) return el;
++    return doc.querySelector(
++      '[data-testid="field-' + cssEscapeName(key) + '"]'
++    );
++  }
++
++  // resolveAnchorTarget(doc, href) → the element an error-summary link
++  // should route to, or null. hrefs arrive as full anchors (#field-<key>,
++  // per error_summary.anchor_for): try the literal id first (text/select/
++  // file inputs carry it), then the resolver's key semantics with the
++  // prefix stripped (radio wrappers, the consent checkbox).
++  function resolveAnchorTarget(doc, href) {
++    var id = String(href || "").slice(1);
++    try {
++      id = decodeURIComponent(id);
++    } catch (_) {}
++    if (!id) return null;
++    return (
++      doc.getElementById(id) ||
++      resolveFieldElement(doc, id.replace(/^field-/, ""))
++    );
++  }
++
++  // firstErrorIndex(sectionEls, opts) → index of the section carrying the
++  // first server error on a form-errors re-render, or 0.
++  //   opts.firstErrorField: body's data-first-error-field (the server's own
++  //     ordering) — resolved via resolveFieldElement first.
++  //   Fallbacks: first .has-error inside a section (text/select/radio
++  //     fields), then first non-empty .field-error (upload slots never get
++  //     .has-error — their container class is static SSR).
++  function firstErrorIndex(sectionEls, opts) {
++    opts = opts || {};
++    if (opts.firstErrorField && opts.doc) {
++      var el = resolveFieldElement(opts.doc, opts.firstErrorField);
++      if (el) {
++        for (var i = 0; i < sectionEls.length; i++) {
++          if (sectionEls[i].contains(el)) return i;
++        }
++      }
++    }
++    for (var j = 0; j < sectionEls.length; j++) {
++      if (sectionEls[j].querySelector(".has-error")) return j;
++    }
++    for (var k = 0; k < sectionEls.length; k++) {
++      var errs = sectionEls[k].querySelectorAll(".field-error");
++      for (var m = 0; m < errs.length; m++) {
++        if (errs[m].textContent && errs[m].textContent.trim() !== "") return k;
++      }
++    }
++    return 0;
++  }
++
++  // ---------- Browser wiring ----------
++
++  // Activation gate (exported for tests): the stepper only enhances the two
++  // form renders.
++  function shouldActivate(marker) {
++    return marker === "form" || marker === "form-errors";
++  }
++
++  // Detail payload for rt:form-step-changed — the F3 draft-save hook's
++  // contract (exported so tests pin the shape).
++  function stepChangeDetail(index, sectionId, total) {
++    return { step_index: index + 1, section_id: sectionId, total: total };
++  }
++
++  function initBrowser() {
++    var doc = root.document;
++    var body = doc && doc.body;
++    if (!body) return;
++    var marker = body.getAttribute("data-apply-page");
++    if (!shouldActivate(marker)) return;
++    // form.js must have run — its condition engine hides the conditional
++    // wrappers (guarantor block, character-ref trio) that SSR renders
++    // VISIBLE. Without it, gating would demand contradictory fields and
++    // hard-block the form on exactly the flaky-mobile cohort the stepper
++    // targets. Bail to the (submittable) long form instead. The marker is
++    // set at the top of form.js, so its presence proves the file executed.
++    if (typeof root.__rtRecomputeSubmitDisabled !== "function") return;
++    var form = doc.querySelector('[data-testid="application-form"]');
++    if (!form) return;
++    var sectionEls = Array.prototype.slice.call(
++      form.querySelectorAll("[data-section-id]")
++    );
++    // A one-section "form" needs no stepper (defensive — today there are 8).
++    if (sectionEls.length < 2) return;
++
++    var sections = sectionEls.map(function (el, i) {
++      var legend =
++        el.querySelector("legend.section-title") || el.querySelector("legend");
++      return {
++        el: el,
++        id: el.getAttribute("data-section-id") || "section_" + (i + 1),
++        name: legend ? legend.textContent.trim() : "Section " + (i + 1),
++        legend: legend,
++      };
++    });
++
++    var model = createStepModel({
++      count: sections.length,
++      start:
++        marker === "form-errors"
++          ? firstErrorIndex(sectionEls, {
++              firstErrorField:
++                body.getAttribute("data-first-error-field") || "",
++              doc: doc,
++            })
++          : 0,
++    });
++
++    // ---- Progress chrome (sticky header) ----
++    var progressRoot = doc.createElement("div");
++    progressRoot.className = "stepper-progress";
++    progressRoot.setAttribute("data-testid", "stepper-progress");
++    var status = doc.createElement("p");
++    status.className = "stepper-status";
++    status.setAttribute("data-testid", "stepper-status");
++    status.setAttribute("role", "status");
++    status.setAttribute("aria-live", "polite");
++    var segments = doc.createElement("div");
++    segments.className = "stepper-segments";
++    segments.setAttribute("aria-hidden", "true");
++    var segmentEls = sections.map(function (_, i) {
++      var seg = doc.createElement("span");
++      seg.className = "stepper-segment";
++      seg.setAttribute("data-step", String(i + 1));
++      segments.appendChild(seg);
++      return seg;
++    });
++    progressRoot.appendChild(status);
++    progressRoot.appendChild(segments);
++    form.insertBefore(progressRoot, form.firstChild);
++
++    function updateProgress(i) {
++      status.textContent =
++        "Step " + (i + 1) + " of " + sections.length + " — " + sections[i].name;
++      segmentEls.forEach(function (seg, idx) {
++        seg.className =
++          idx === i
++            ? "stepper-segment stepper-segment-active"
++            : visited[idx]
++              ? "stepper-segment stepper-segment-done"
++              : "stepper-segment";
++      });
++    }
++
++    function dispatchStepChanged(i) {
++      var detail = stepChangeDetail(i, sections[i].id, sections.length);
++      try {
++        doc.dispatchEvent(
++          new root.CustomEvent(EVENT_STEP_CHANGED, { detail: detail })
++        );
++      } catch (_) {
++        // CustomEvent must never break navigation — ignore.
++      }
++    }
++
++    // Steps actually visited in this page life. Segments only render
++    // "done" for these — on a form-errors re-render that starts mid-form,
++    // unvisited earlier steps must not glow teal while the banner says
++    // errors need attention.
++    var visited = {};
++    visited[model.current()] = true;
++
++    function show(index, opts) {
++      opts = opts || {};
++      var i = model.jump(index);
++      visited[i] = true;
++      sections.forEach(function (s, idx) {
++        s.el.hidden = idx !== i;
++      });
++      updateProgress(i);
++      // The initial render is not a "change" — only user-driven moves
++      // announce themselves (this is the F3 draft-save hook).
++      if (!opts.initial) dispatchStepChanged(i);
++      if (opts.focus && sections[i].legend) {
++        var legend = sections[i].legend;
++        legend.setAttribute("tabindex", "-1");
++        try {
++          legend.focus({ preventScroll: true });
++        } catch (_) {
++          legend.focus();
++        }
++      }
++      if (opts.scroll && sections[i].el.scrollIntoView) {
++        sections[i].el.scrollIntoView({ block: "start" });
++      }
++    }
++
++    // ---- Gating ----
++    function markInvalid(controls) {
++      controls.forEach(function (ctl) {
++        var field = ctl.closest ? ctl.closest(".form-field") : null;
++        if (!field) return;
++        field.classList.add("has-error");
++        var errEl = field.querySelector(".field-error");
++        if (
++          errEl &&
++          errEl.textContent &&
++          errEl.textContent.trim() !== "" &&
++          !errEl.getAttribute("data-stepper-error")
++        ) {
++          // A server-rendered message already says what's wrong — never
++          // overwrite it (and never tag it, so the clearer can't erase it).
++          return;
++        }
++        if (!errEl) {
++          // Radio groups only render a .field-error span server-side when a
++          // server error exists — pristine renders have none. Create the
++          // same shape (id-less; the group has no single field-<name>-error
++          // id) so the gating message has somewhere to live.
++          errEl = doc.createElement("span");
++          errEl.className = "field-error";
++          errEl.setAttribute("role", "alert");
++          field.appendChild(errEl);
++        }
++        errEl.textContent = GATING_MESSAGE;
++        errEl.setAttribute("data-stepper-error", "true");
++        // .field-error is display:none by default; the server shows its own
++        // errors via inline display:flex — same mechanism here.
++        errEl.style.display = "flex";
++      });
++    }
++
++    // Clear ONLY stepper-set messages once their field is satisfied again.
++    // Server-rendered messages (no data-stepper-error) are never touched —
++    // they clear on the next submit round-trip, as today.
++    function clearSatisfiedStepperErrors() {
++      var sectionEl = sections[model.current()].el;
++      var marked = sectionEl.querySelectorAll(
++        '.field-error[data-stepper-error="true"]'
++      );
++      Array.prototype.forEach.call(marked, function (errEl) {
++        var field = errEl.closest ? errEl.closest(".form-field") : null;
++        if (!field) return;
++        var controls = field.querySelectorAll("input, select, textarea");
++        var satisfied = false;
++        for (var i = 0; i < controls.length; i++) {
++          if (controlSatisfied(controls[i])) {
++            satisfied = true;
++            break;
++          }
++        }
++        if (!satisfied) return;
++        errEl.textContent = "";
++        errEl.removeAttribute("data-stepper-error");
++        errEl.style.display = "";
++        field.classList.remove("has-error");
++      });
++    }
++
++    function onContinue() {
++      var i = model.current();
++      var invalid = findInvalidControls(sections[i].el);
++      if (invalid.length) {
++        markInvalid(invalid);
++        var first = invalid[0];
++        if (first.focus) {
++          try {
++            first.focus({ preventScroll: false });
++          } catch (_) {
++            first.focus();
++          }
++        }
++        return;
++      }
++      // form.js's upload preflight disables submit for oversized files and
++      // shows its banner INSIDE this section — advancing would dead-end the
++      // applicant on the review step with the reason hidden. Hold them here.
++      var submitBtn = doc.querySelector('[data-testid="submit-application"]');
++      if (
++        submitBtn &&
++        submitBtn.hasAttribute("data-preflight-blocked") &&
++        sections[i].el.querySelector('input[type="file"]')
++      ) {
++        var banner = sections[i].el.querySelector(
++          '[data-testid="documents-section-error"]'
++        );
++        if (banner && banner.scrollIntoView) {
++          banner.scrollIntoView({ block: "center" });
++        }
++        return;
++      }
++      // Analytics truth: passing the gate means this section's visible
++      // required controls ARE filled. Mark it interacted so
++      // apply_analytics.js's completion-on-interaction rule fires
++      // section_completed even when the values came from browser restore
++      // (zero keystrokes) — the section hides a tick later, and hidden
++      // sections complete on interaction.
++      sections[i].el.dispatchEvent(new Event("input", { bubbles: true }));
++      show(i + 1, { focus: true, scroll: true });
++    }
++
++    function onBack() {
++      // Back never gates — the applicant may retreat to fix anything.
++      show(model.current() - 1, { focus: true, scroll: true });
++    }
++
++    // ---- Nav rows ----
++    // Back on every step but the first, Continue on every step but the last
++    // (the last section holds the SSR submit button + consent gate).
++    // Buttons are type="button" — the single POST still comes only from the
++    // submit button. Per-section testids keep bug-hunt targeting unambiguous.
++    sections.forEach(function (s, i) {
++      var nav = doc.createElement("div");
++      nav.className = "stepper-nav";
++      nav.setAttribute("data-testid", "stepper-nav-" + s.id);
++      if (i > 0) {
++        var back = doc.createElement("button");
++        back.type = "button";
++        back.className = "btn-step-back";
++        back.setAttribute("data-testid", "step-back-" + s.id);
++        back.textContent = "Back";
++        back.addEventListener("click", onBack);
++        nav.appendChild(back);
++      }
++      if (i < sections.length - 1) {
++        var cont = doc.createElement("button");
++        cont.type = "button";
++        cont.className = "btn-step-continue";
++        cont.setAttribute("data-testid", "step-continue-" + s.id);
++        cont.textContent = "Continue";
++        cont.addEventListener("click", onContinue);
++        nav.appendChild(cont);
++      }
++      // The last section already has its submit row (.form-nav) — the
++      // stepper's Back row goes directly above it so tab order reads
++      // … consent checkbox → Back → Submit.
++      var submitRow = s.el.querySelector(".form-nav");
++      if (i === sections.length - 1 && submitRow) {
++        s.el.insertBefore(nav, submitRow);
++      } else {
++        s.el.appendChild(nav);
++      }
++    });
++
++    // ---- Review-step hint (stepper-active copy) ----
++    var reviewSection = sections.filter(function (s) {
++      return s.id === "review_consent";
++    })[0];
++    if (reviewSection) {
++      var hint = reviewSection.el.querySelector(".section-hint");
++      if (hint) hint.textContent = REVIEW_HINT_STEPPER;
++    }
++
++    // ---- Error-summary anchor routing ----
++    // The banner links point at fields inside hidden sections; a bare anchor
++    // jump would land nowhere visible. Switch step first, then focus.
++    function indexOfSectionContaining(target) {
++      for (var i = 0; i < sections.length; i++) {
++        if (sections[i].el.contains(target)) return i;
++      }
++      return -1;
++    }
++
++    Array.prototype.forEach.call(
++      doc.querySelectorAll('[data-testid="error-summary"] a[href^="#"]'),
++      function (a) {
++        a.addEventListener("click", function (event) {
++          var target = resolveAnchorTarget(doc, a.getAttribute("href"));
++          if (!target) return; // unknown anchor — let the browser try
++          var idx = indexOfSectionContaining(target);
++          if (idx === -1) return;
++          event.preventDefault();
++          show(idx, {});
++          if (target.focus) {
++            try {
++              target.focus({ preventScroll: true });
++            } catch (_) {
++              target.focus();
++            }
++          }
++          if (target.scrollIntoView) {
++            target.scrollIntoView({ block: "center" });
++          }
++        });
++      }
++    );
++
++    // Clear stepper-set messages as the applicant fixes fields.
++    form.addEventListener("input", clearSatisfiedStepperErrors);
++    form.addEventListener("change", clearSatisfiedStepperErrors);
++
++    // Initial paint: quiet — no focus steal (the header/prep block sit above
++    // the form; on the error page the banner owns focus), no event.
++    show(model.current(), { initial: true });
++  }
++
++  // ---------- Exports ----------
++
++  var api = {
++    EVENT_STEP_CHANGED: EVENT_STEP_CHANGED,
++    GATING_MESSAGE: GATING_MESSAGE,
++    REVIEW_HINT_STEPPER: REVIEW_HINT_STEPPER,
++    isVisibleRequired: isVisibleRequired,
++    controlSatisfied: controlSatisfied,
++    findInvalidControls: findInvalidControls,
++    createStepModel: createStepModel,
++    shouldActivate: shouldActivate,
++    stepChangeDetail: stepChangeDetail,
++    resolveFieldElement: resolveFieldElement,
++    resolveAnchorTarget: resolveAnchorTarget,
++    firstErrorIndex: firstErrorIndex,
++  };
++
++  if (typeof module !== "undefined" && module.exports) {
++    module.exports = api;
++  }
++
++  if (
++    typeof root.document !== "undefined" &&
++    root.document &&
++    root.document.body
++  ) {
++    if (root.document.readyState === "loading") {
++      root.document.addEventListener("DOMContentLoaded", initBrowser);
++    } else {
++      initBrowser();
++    }
++  }
++})(typeof window !== "undefined" ? window : this);
+diff --git a/server/src/application/form_pages.gleam b/server/src/application/form_pages.gleam
+index 1e93d49..528891a 100644
+--- a/server/src/application/form_pages.gleam
++++ b/server/src/application/form_pages.gleam
+@@ -341,6 +341,14 @@ pub fn view_form_with_errors(
+           [attribute("src", "/static/form.js"), attribute("defer", "")],
+           [],
+         ),
++        // F1 stepper on the error re-render too — the error-summary anchors
++        // point at fields the stepper would otherwise keep hidden; it starts
++        // at the first error's section and routes those clicks.
++        element.element(
++          "script",
++          [attribute("src", "/static/form_stepper.js"), attribute("defer", "")],
++          [],
++        ),
+         form_view.view_apply_analytics_script(),
+       ],
+     ),
+diff --git a/server/src/application/form_sections/documents.gleam b/server/src/application/form_sections/documents.gleam
+index c39f659..1880a82 100644
+--- a/server/src/application/form_sections/documents.gleam
++++ b/server/src/application/form_sections/documents.gleam
+@@ -107,7 +107,7 @@ pub fn view(
+           hint_id: hint_id,
+           required: False,
+           multiple: False,
+-          helper_text: "",
++          helper_text: copy.proof_of_income_helper(),
+           error: common.get_err(errors, "proof_of_income_primary"),
+           condition_attrs: [],
+         ),
+@@ -130,7 +130,7 @@ pub fn view(
+           hint_id: hint_id,
+           required: True,
+           multiple: False,
+-          helper_text: "A written reference from your current or previous landlord.",
++          helper_text: copy.landlord_ref_helper(),
+           error: common.get_err(errors, "landlord_ref_primary"),
+           condition_attrs: [
+             attribute("data-condition", "never_rented_before"),
+@@ -144,7 +144,7 @@ pub fn view(
+           hint_id: hint_id,
+           required: True,
+           multiple: False,
+-          helper_text: "A written reference from someone who can vouch for you — not family.",
++          helper_text: copy.character_ref_helper(),
+           error: common.get_err(errors, "character_ref_primary"),
+           condition_attrs: [
+             attribute("data-condition", "never_rented_before"),
+@@ -158,7 +158,7 @@ pub fn view(
+           hint_id: hint_id,
+           required: employer_required_primary,
+           multiple: False,
+-          helper_text: "A written reference from your employer, on letterhead if possible.",
++          helper_text: copy.employer_ref_helper(),
+           error: common.get_err(errors, "employer_ref_primary"),
+           condition_attrs: [],
+         ),
+@@ -181,7 +181,7 @@ pub fn view(
+           hint_id: hint_id,
+           required: False,
+           multiple: True,
+-          helper_text: "Anything else that helps your application \u{2014} up to 2 files.",
++          helper_text: copy.additional_docs_helper(),
+           error: common.get_err(errors, "additional_docs"),
+           condition_attrs: [],
+         ),
+@@ -213,7 +213,7 @@ fn view_co_applicant_proof_slot(
+     hint_id: hint_id,
+     required: False,
+     multiple: False,
+-    helper_text: "",
++    helper_text: copy.proof_of_income_helper(),
+     error: common.get_err(errors, field_name),
+     condition_attrs: [
+       attribute("data-condition", "co_applicant_count"),
+@@ -247,7 +247,7 @@ fn view_co_applicant_employer_ref_slot(
+     hint_id: hint_id,
+     required: employer_required,
+     multiple: False,
+-    helper_text: "",
++    helper_text: copy.employer_ref_helper(),
+     error: common.get_err(errors, field_name),
+     condition_attrs: [
+       attribute("data-condition", "co_applicant_count"),
+@@ -341,6 +341,14 @@ fn view_upload_area(
+             attribute.id(error_id),
+             attribute("role", "alert"),
+             attribute("aria-live", "polite"),
++            // Mirror form_fields.view_error_span: .field-error is
++            // display:none by default, so a server-rendered upload error
++            // needs the inline flex or it renders invisibly — and the
++            // stepper's error-page routing lands the applicant here.
++            ..case error {
++              "" -> []
++              _ -> [attribute("style", "display:flex")]
++            }
+           ],
+           case error {
+             "" -> []
+diff --git a/server/src/application/form_sections/situation.gleam b/server/src/application/form_sections/situation.gleam
+index 1ded140..94e0c2e 100644
+--- a/server/src/application/form_sections/situation.gleam
++++ b/server/src/application/form_sections/situation.gleam
+@@ -5,6 +5,7 @@ import application/form_copy
+ import application/form_fields
+ import application/form_sections/common
+ import application/form_sections/guarantor
++import copy
+ import gleam/int
+ import gleam/list
+ import lustre/attribute.{attribute}
+@@ -50,44 +51,7 @@ pub fn view(
+           "A bit about where you are now and what you\u{2019}re looking for.",
+         ),
+       ]),
+-      form_fields.view_text_field(
+-        name: "current_address",
+-        label: "Current address",
+-        input_type: "text",
+-        required: False,
+-        min_val: "",
+-        value: common.get_val(values, "current_address"),
+-        error: "",
+-      ),
+-      html.div([attribute.class("field-row")], [
+-        form_fields.view_text_field(
+-          name: "current_city",
+-          label: "City",
+-          input_type: "text",
+-          required: False,
+-          min_val: "",
+-          value: common.get_val(values, "current_city"),
+-          error: "",
+-        ),
+-        form_fields.view_text_field(
+-          name: "current_county",
+-          label: "County",
+-          input_type: "text",
+-          required: False,
+-          min_val: "",
+-          value: common.get_val(values, "current_county"),
+-          error: "",
+-        ),
+-      ]),
+-      form_fields.view_text_field(
+-        name: "eircode",
+-        label: "Eircode",
+-        input_type: "text",
+-        required: False,
+-        min_val: "",
+-        value: common.get_val(values, "eircode"),
+-        error: "",
+-      ),
++      view_address_cluster(values),
+       form_fields.view_select_field(
+         name: "current_living_situation",
+         label: "Current living situation",
+@@ -166,6 +130,76 @@ pub fn view(
+   )
+ }
+ 
++// -- Optional address cluster (F4) ---------------------------------------------
++
++/// The current-address quartet is optional but feeds the scorer
++/// (`eircode` → location checks), so it stays on the form — collapsed behind
++/// a native `<details>` (F4 field diet) to take four controls off the first
++/// render. Works without JS; renders `open` when a re-render carries values
++/// so the applicant always sees their own input.
++fn view_address_cluster(values: List(#(String, String))) -> element.Element(a) {
++  let prefilled =
++    list.any(
++      ["current_address", "current_city", "current_county", "eircode"],
++      fn(key) { common.get_val(values, key) != "" },
++    )
++  let open_attrs = case prefilled {
++    True -> [attribute("open", "")]
++    False -> []
++  }
++  element.element(
++    "details",
++    [
++      attribute.class("optional-cluster"),
++      attribute("data-testid", "address-cluster"),
++      ..open_attrs
++    ],
++    [
++      element.element("summary", [], [
++        html.text(copy.address_cluster_summary()),
++      ]),
++      form_fields.view_text_field(
++        name: "current_address",
++        label: "Current address",
++        input_type: "text",
++        required: False,
++        min_val: "",
++        value: common.get_val(values, "current_address"),
++        error: "",
++      ),
++      html.div([attribute.class("field-row")], [
++        form_fields.view_text_field(
++          name: "current_city",
++          label: "City",
++          input_type: "text",
++          required: False,
++          min_val: "",
++          value: common.get_val(values, "current_city"),
++          error: "",
++        ),
++        form_fields.view_text_field(
++          name: "current_county",
++          label: "County",
++          input_type: "text",
++          required: False,
++          min_val: "",
++          value: common.get_val(values, "current_county"),
++          error: "",
++        ),
++      ]),
++      form_fields.view_text_field(
++        name: "eircode",
++        label: "Eircode",
++        input_type: "text",
++        required: False,
++        min_val: "",
++        value: common.get_val(values, "eircode"),
++        error: "",
++      ),
++    ],
++  )
++}
++
+ // -- Co-applicant block ------------------------------------------------------
+ 
+ /// Shown only when `num_occupants >= 2`. Mirrors the existing
+diff --git a/server/src/application/form_sections/work_income.gleam b/server/src/application/form_sections/work_income.gleam
+index 8ed2da1..3e717e3 100644
+--- a/server/src/application/form_sections/work_income.gleam
++++ b/server/src/application/form_sections/work_income.gleam
+@@ -28,11 +28,12 @@ const income_source_type_options = [
+   #("other", "Other"),
+ ]
+ 
+-/// Whitelist of listing-source values offered by the `listing_source` select.
+-/// Must stay in sync with `application_handler.is_valid_listing_source` and
+-/// the `application_listing_source_check` DB constraint. Exposed so a parity
+-/// test can pin the form-side mirror against the handler whitelist, matching
+-/// the `guarantor.relationship_options` pattern.
++/// Whitelist of listing-source values accepted by the handler. The form no
++/// longer asks the question (F4 field diet, 2026-08: the self-reported
++/// acquisition signal wasn't scoring-relevant and cost a control on the
++/// longest step) — this const remains as the form-side mirror of
++/// `application_handler.is_valid_listing_source` for the parity test, so a
++/// stale cached page can still post the field without a validation error.
+ pub const listing_source_options = [
+   #("", "Select..."),
+   #("daft", "Daft.ie"),
+@@ -127,14 +128,6 @@ pub fn view(
+       ]),
+       view_student_helper(),
+       view_additional_income_block(values, errors),
+-      form_fields.view_select_field(
+-        name: "listing_source",
+-        label: "Where did you find this listing?",
+-        required: False,
+-        options: listing_source_options,
+-        selected: common.get_val(values, "listing_source"),
+-        error: common.get_err(errors, "listing_source"),
+-      ),
+     ],
+   )
+ }
+diff --git a/server/src/application/form_view.gleam b/server/src/application/form_view.gleam
+index 50c86d9..2537d32 100644
+--- a/server/src/application/form_view.gleam
++++ b/server/src/application/form_view.gleam
+@@ -97,6 +97,14 @@ pub fn view_application_page(
+           [attribute("src", "/static/form.js"), attribute("defer", "")],
+           [],
+         ),
++        // F1 stepper — progressive enhancement only. Loads after form.js so
++        // the condition engine's initial pass has run; without JS the long
++        // form above remains the submission path.
++        element.element(
++          "script",
++          [attribute("src", "/static/form_stepper.js"), attribute("defer", "")],
++          [],
++        ),
+         view_apply_analytics_script(),
+       ],
+     ),
+diff --git a/server/src/copy.gleam b/server/src/copy.gleam
+index fe43a64..6ccb4a3 100644
+--- a/server/src/copy.gleam
++++ b/server/src/copy.gleam
+@@ -60,3 +60,38 @@ pub fn additional_docs_label() -> String {
+ pub fn file_too_large_inline() -> String {
+   "This file's bigger than 5MB. Try a smaller copy, or compress the PDF and upload it again."
+ }
++
++// ── Per-slot upload helpers (F5 mobile upload copy) ──────────────────────
++// Each document slot says WHAT counts as evidence and reassures the
++// applicant that a phone photo is acceptable — 80% of form traffic is
++// mobile, and "written reference" read as "scan a letter" before this.
++
++/// Proof-of-income slot (primary + each co-applicant).
++pub fn proof_of_income_helper() -> String {
++  "A recent payslip works best — or your latest tax summary if you're self-employed. A clear photo from your phone is fine."
++}
++
++/// Previous-landlord reference slot.
++pub fn landlord_ref_helper() -> String {
++  "A signed letter or email from your current or previous landlord. A clear photo or scan from your phone counts."
++}
++
++/// Character-reference slot (first-time renters).
++pub fn character_ref_helper() -> String {
++  "A short letter or email from someone who can vouch for you — not family. A coworker, mentor, coach or family friend works. A clear photo from your phone is fine."
++}
++
++/// Employer-reference slot (primary + each co-applicant).
++pub fn employer_ref_helper() -> String {
++  "A letter or email from your manager or HR confirming you work there — on letterhead if you can get it. A clear photo or PDF from your phone counts."
++}
++
++/// Supporting-documents slot (multi-file, optional).
++pub fn additional_docs_helper() -> String {
++  "Anything else that helps your application — up to 2 files. Photos from your phone are fine."
++}
++
++/// Summary line of the collapsed current-address cluster (F4 field diet).
++pub fn address_cluster_summary() -> String {
++  "Add your current address (optional)"
++}
+diff --git a/server/test/application/application_handler_test.gleam b/server/test/application/application_handler_test.gleam
+index a5d3a20..6adc89d 100644
+--- a/server/test/application/application_handler_test.gleam
++++ b/server/test/application/application_handler_test.gleam
+@@ -896,11 +896,12 @@ pub fn relationship_options_match_validator_whitelist_test() {
+   |> should.be_true
+ }
+ 
+-// Same drift guard for `listing_source`: the form's `<select>` options must
+-// all validate through `is_valid_listing_source`, and (defense-in-depth) the
+-// DB CHECK constraint `application_listing_source_check` mirrors the same
+-// whitelist. A future addition to the dropdown without a corresponding
+-// validator entry would silently slip through here.
++// Same drift guard for `listing_source`: the accepted set mirrored in
++// `work_income_section.listing_source_options` must all validate through
++// `is_valid_listing_source`, and (defense-in-depth) the DB CHECK constraint
++// `application_listing_source_check` mirrors the same whitelist. The form no
++// longer renders the select (F4 field diet, 2026-08) but the handler keeps
++// accepting the field — a stale cached page must never hit a validation wall.
+ pub fn listing_source_options_match_validator_whitelist_test() {
+   let real_options =
+     work_income_section.listing_source_options
+diff --git a/server/test/application/form_view_test.gleam b/server/test/application/form_view_test.gleam
+index f15c015..59322e9 100644
+--- a/server/test/application/form_view_test.gleam
++++ b/server/test/application/form_view_test.gleam
+@@ -403,3 +403,157 @@ pub fn form_renders_all_eight_stable_section_ids_test() {
+     |> should.be_true
+   })
+ }
++
++// -- F1 stepper: progressive enhancement contract -------------------------------
++
++pub fn form_sections_render_in_funnel_dom_order_test() {
++  // The stepper and the analytics funnel both walk [data-section-id] in DOM
++  // order — "Step N of 8" and section_index must agree. Pin the order.
++  let vacancy = test_helpers.test_vacancy_row()
++  let html = form_view.view_application_page(vacancy, "")
++  let ids = [
++    "about_you", "your_situation", "work_income", "references", "guarantor",
++    "tell_us_more", "documents", "review_consent",
++  ]
++  let positions =
++    list.map(ids, fn(id) {
++      let assert Ok(#(before, _)) =
++        string.split_once(html, "data-section-id=\"" <> id <> "\"")
++      string.length(before)
++    })
++  positions
++  |> list.fold(-1, fn(prev, pos) {
++    should.be_true(pos > prev)
++    pos
++  })
++  |> fn(_) { Nil }
++}
++
++pub fn no_js_fallback_all_fieldsets_render_without_hidden_test() {
++  // The no-JS fallback IS the long form: every section fieldset must render
++  // visible (the stepper hides them client-side only). A hidden attribute
++  // sneaking into a fieldset's SSR would strand no-JS applicants. Inner
++  // conditional divs legitimately carry hidden, so we only inspect each
++  // fieldset's own tag — everything up to its closing ">".
++  let vacancy = test_helpers.test_vacancy_row()
++  let html = form_view.view_application_page(vacancy, "")
++  let chunks = string.split(html, "<fieldset") |> list.drop(1)
++  list.length(chunks) |> should.equal(8)
++  list.each(chunks, fn(chunk) {
++    let tag = case string.split_once(chunk, ">") {
++      Ok(#(head, _)) -> head
++      Error(_) -> chunk
++    }
++    tag
++    |> string.contains("hidden")
++    |> should.be_false
++  })
++}
++
++pub fn stepper_script_loads_and_chrome_is_js_built_test() {
++  let vacancy = test_helpers.test_vacancy_row()
++  let pristine = form_view.view_application_page(vacancy, "")
++  pristine
++  |> string.contains("src=\"/static/form_stepper.js\"")
++  |> should.be_true
++  // Progressive enhancement: the SSR HTML carries zero stepper chrome —
++  // progress bar and nav buttons are built by form_stepper.js only.
++  pristine
++  |> string.contains("stepper-progress")
++  |> should.be_false
++  pristine
++  |> string.contains("stepper-nav")
++  |> should.be_false
++  // The error re-render loads the stepper too — its anchor links point at
++  // fields the stepper would otherwise keep hidden.
++  let with_errors =
++    form_pages.view_form_with_errors(vacancy, [#("email", "bad")], [], "")
++  with_errors
++  |> string.contains("src=\"/static/form_stepper.js\"")
++  |> should.be_true
++}
++
++// -- F4 field diet ----------------------------------------------------------------
++
++pub fn pristine_form_omits_listing_source_test() {
++  // F4: the optional, non-scoring acquisition question cost a control on
++  // the longest step. The handler still accepts the field (cached pages may
++  // post it) but the form no longer asks.
++  let vacancy = test_helpers.test_vacancy_row()
++  let html = form_view.view_application_page(vacancy, "")
++  html
++  |> string.contains("name=\"listing_source\"")
++  |> should.be_false
++  // Even a re-render carrying a posted value must not resurrect the field.
++  let with_errors =
++    form_pages.view_form_with_errors(
++      vacancy,
++      [#("email", "bad")],
++      [#("listing_source", "daft")],
++      "",
++    )
++  with_errors
++  |> string.contains("name=\"listing_source\"")
++  |> should.be_false
++}
++
++pub fn address_cluster_collapsed_pristine_open_when_prefilled_test() {
++  // F4: the optional address quartet (all scoring inputs — they stay
++  // submittable) collapses behind a native <details> on first render…
++  let vacancy = test_helpers.test_vacancy_row()
++  let pristine = form_view.view_application_page(vacancy, "")
++  pristine
++  |> string.contains("data-testid=\"address-cluster\"")
++  |> should.be_true
++  pristine
++  |> string.contains("address-cluster\" open")
++  |> should.be_false
++  // …but a re-render carrying the applicant's own values renders it open so
++  // they always see their input.
++  let prefilled =
++    form_pages.view_form_with_errors(
++      vacancy,
++      [#("email", "bad")],
++      [#("current_city", "Gorey")],
++      "",
++    )
++  prefilled
++  |> string.contains("address-cluster\" open")
++  |> should.be_true
++  // Fields themselves unchanged — same names, still optional, still posted.
++  pristine
++  |> string.contains("name=\"current_address\"")
++  |> should.be_true
++  pristine
++  |> string.contains("name=\"eircode\"")
++  |> should.be_true
++}
++
++// -- F5 upload copy -----------------------------------------------------------------
++
++pub fn document_slots_carry_what_counts_helper_copy_test() {
++  let vacancy = test_helpers.test_vacancy_row()
++  let html = form_view.view_application_page(vacancy, "")
++  // Proof of income (previously no helper at all).
++  html
++  |> string.contains("A recent payslip works best")
++  |> should.be_true
++  // Landlord reference — what counts, and that a phone photo is fine.
++  html
++  |> string.contains(
++    "A signed letter or email from your current or previous landlord",
++  )
++  |> should.be_true
++  // Character reference (first-time renters).
++  html
++  |> string.contains("A coworker, mentor, coach or family friend works")
++  |> should.be_true
++  // Employer reference.
++  html
++  |> string.contains("confirming you work there")
++  |> should.be_true
++  // Supporting documents.
++  html
++  |> string.contains("Photos from your phone are fine")
++  |> should.be_true
++}

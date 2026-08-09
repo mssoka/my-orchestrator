@@ -1,0 +1,32 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "rate-limit-bypass",
+    "title": "Continue-link fan-out bound and 10-min cooldown keyed on raw lowercased address — plus/dot aliases defeat the 3/recipient/hour W6 fix",
+    "location": "server/src/application/sql/claim_continue_link_send.sql:14-26",
+    "evidence": "  AND email = lower($2)\n  AND submitted_at IS NULL\n  AND erased_at IS NULL\n  AND (\n    last_link_sent_at IS NULL\n    OR last_link_sent_at < now() - interval '10 minutes'\n  )\n  AND (\n    SELECT count(*) FROM application_draft d2\n    WHERE d2.email = lower($2)\n      AND d2.last_link_sent_at IS NOT NULL\n      AND d2.last_link_sent_at > now() - interval '1 hour'\n  ) < 3",
+    "detail": "Drafts and the hourly count are keyed on the literal lowercased string, and shared/email.gleam is_local_char allows '+' and '.' (verified line 74: is_alphanumeric(c) || c == \".\" || c == \"_\" || c == \"%\" || c == \"+\" || c == \"-\"). victim+1@gmail.com … victim+500@gmail.com are 500 distinct keys delivered to one Gmail inbox: each alias earns 3 branded Resend emails/hour (≈1500/hour from one vacancy, more across vacancies), defeating the round-2 W6 bound's stated intent.",
+    "recommended_fix": "Canonicalise the recipient for the cooldown/fan-out checks (strip +tag from local part; strip dots for gmail.com/googlemail.com) so the 3/hour bound applies per actual mailbox, not per address string."
+  },
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "availability",
+    "title": "500/vacancy draft cap counts tombstoned/submitted rows and cap rejection is silently returned as ok:true — attacker-fillable silent kill of a vacancy's draft feature",
+    "location": "server/src/application/sql/upsert_application_draft.sql:11-19",
+    "evidence": "INSERT INTO application_draft (vacancy_id, email, fields, continue_token)\nSELECT $1::uuid, lower($2), $3::jsonb, $4\nWHERE EXISTS (\n    SELECT 1 FROM application_draft d\n    WHERE d.vacancy_id = $1::uuid AND d.email = lower($2)\n  )\n  OR (\n    SELECT count(*) FROM application_draft d\n    WHERE d.vacancy_id = $1::uuid\n  ) < 500",
+    "detail": "The count has no submitted_at/erased_at filter, and rows persist until the vacancy-close sweep, so 500 lifetime draft-savers (organic or 500 attacker aliases against the unauthenticated endpoint) permanently exhaust the cap. draft_handler.gleam:201 treats Ok(_) — including zero RETURNING rows — as success (wisp.json_response(json_ok(True), 200)), and continue-link's result.replace(Nil) at line ~283 likewise proceeds, so genuine saves/links silently no-op while the UI reports success.",
+    "recommended_fix": "Exclude submitted/erased rows from the cap count (or delete tombstones/stripped rows promptly), and surface cap-reached distinctly (e.g. 429/closed-style JSON) so genuine applicants learn their draft isn't saving instead of a silent ok:true."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "race-condition",
+    "title": "Count-then-write bounds (500-cap and 3/hour fan-out) are evaluated in-statement without locking — concurrent bursts overshoot both caps",
+    "location": "server/src/application/sql/upsert_application_draft.sql:16-19",
+    "evidence": "  OR (\n    SELECT count(*) FROM application_draft d\n    WHERE d.vacancy_id = $1::uuid\n  ) < 500\nON CONFLICT (vacancy_id, email) DO UPDATE",
+    "detail": "Under READ COMMITTED each INSERT...SELECT snapshots at statement start: K concurrent new-pair saves all observe count<500 and all insert, so the W5 cap is a soft bound under burst load. Same pattern in claim_continue_link_send.sql's hourly-count subquery — N concurrent cross-vacancy claims for one recipient can each see count<3 and all send. Bounds hold sequentially, not under concurrency.",
+    "recommended_fix": "If a hard bound matters, take a vacancy-scoped advisory lock (or serialise via a counter table update) around the count check; otherwise document the caps as soft, concurrency-overshootable bounds."
+  }
+]

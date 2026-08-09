@@ -1,0 +1,22 @@
+[
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "api-consistency",
+    "title": "Continue-link upsert-failure abort answers 200 ok:false while the claim DB failure one branch below answers 500 — and the module's own doc only documents the 500",
+    "location": "server/src/application/draft_handler.gleam:279",
+    "evidence": "case upserted {\n                Error(_) -> wisp.json_response(json_ok(False), 200)\n                Ok(_) -> {\n                  // Same re-engagement stamp as the plain save path.\n                  case payload.resume_token {\n                    \"\" -> Nil\n                    token -> {\n                      let _ =\n                        sql.mark_draft_resumed_by_token(\n                          config.db,\n                          token,\n                          vacancy_uuid,\n                        )\n                      Nil\n                    }\n                  }\n                  case\n                    sql.claim_continue_link_send(\n                      config.db,\n                      vacancy_uuid,\n                      applicant_email,\n                      wisp.random_string(48),\n                    )\n                  {\n                    Error(err) -> {\n                      wisp.log_error(\n                        \"continue-link claim failed: \" <> string.inspect(err),\n                      )\n                      wisp.internal_server_error()\n                    }",
+    "detail": "Two server-side DB failures in one handler get different status conventions (200-with-ok:false vs 500), and handle_save_draft's identical upsert failure is also 500 (line 219). The client treats 500 and ok:false identically (catch -> CONTINUE_FAILED), so the 200 buys nothing and hides the failure from status-based monitoring. The no-oracle rationale covers claim outcomes, not DB errors.",
+    "recommended_fix": "Return wisp.internal_server_error() from the upsert-abort arm (matching the claim arm and handle_save_draft), or document why this one DB failure deliberately stays 200."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "convention-drift",
+    "title": "strip_draft_on_submit.sql manually SETs updated_at = now() — dead code the BEFORE UPDATE trigger overwrites, contradicting the migration's stated convention and the four sibling draft UPDATEs",
+    "location": "server/src/application/sql/strip_draft_on_submit.sql:10",
+    "evidence": "UPDATE application_draft\nSET fields = '{}'::jsonb,\n    continue_token = NULL,\n    submitted_at = now(),\n    updated_at = now()\nWHERE vacancy_id = $1::uuid\n  AND email = lower($2)\nRETURNING id::text;\n\n-- migration 20260802120000_create_application_draft.sql states:\n-- updated_at follows the repo's trigger convention (update_updated_at_column\n-- from 20260409000001_add_ai_analysis_updated_at.sql), not manual SETs.",
+    "detail": "The update_application_draft_updated_at trigger fires on every UPDATE and overwrites updated_at, so the manual SET is dead weight. claim/clear/erase/mark_resumed draft UPDATEs all rely on the trigger; strip is the lone outlier, inviting future readers to doubt the trigger covers this table.",
+    "recommended_fix": "Drop the updated_at = now() line from strip_draft_on_submit.sql and regenerate via Squirrel; the trigger owns the stamp."
+  }
+]

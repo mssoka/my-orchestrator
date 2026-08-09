@@ -1,0 +1,1992 @@
+diff --git a/app/audio.odin b/app/audio.odin
+new file mode 100644
+index 0000000..cf55a90
+--- /dev/null
++++ b/app/audio.odin
+@@ -0,0 +1,74 @@
++package main
++
++// audio.odin — the 1-2 juice stings (user ruling 2026-08-08; ODN-15 keeps
++// them on the cosmetic stream). PROTO synthesizes its stings in code (PCM ->
++// WAV in memory): owned audio, zero assets, and nothing to license — the Suno
++// pipeline slots in later without a wiring change.
++
++import rl "vendor:raylib"
++
++init_audio :: proc(app: ^App) -> bool {
++	rl.InitAudioDevice()
++	if !rl.IsAudioDeviceReady() { return false }
++	app.sting_crisis = synth_sting({660, 415}, 0.16, true)
++	app.sting_win = synth_sting({523, 659, 784, 1046}, 0.09, false)
++	return true
++}
++
++// A tiny two/four-tone synth -> PCM16 WAV bytes -> rl.Sound.
++synth_sting :: proc(freqs: []f32, note_seconds: f32, descending_alarm: bool) -> rl.Sound {
++	rate :: 22050
++	per := int(f32(rate) * note_seconds)
++	total := per * len(freqs)
++	samples := make([]i16, total)
++	amp :: 8000
++	for i in 0 ..< total {
++		f := freqs[i / per]
++		phase := f32(i % rate) / f32(rate)
++		// sine approximation via the pinned 16-gon table would be coarse at
++		// audio rates; a triangle wave is clean, buzzy enough for a sting, and
++		// needs no libm
++		cyc := phase * f
++		frac := cyc - f32(int(cyc))
++		tri: f32
++		if frac < 0.5 {
++			tri = 4*frac - 1
++		} else {
++			tri = 3 - 4*frac
++		}
++		// simple decay envelope per note
++		note_pos := f32(i % per) / f32(per)
++		env := 1 - note_pos*note_pos
++		samples[i] = i16(f32(amp) * tri * env * 0.5)
++	}
++	// hand-roll a minimal PCM16 mono WAV
++	data_size := u32(total * 2)
++	buf: [dynamic]u8
++	append_u32 :: proc(b: ^[dynamic]u8, v: u32) {
++		append(b, u8(v), u8(v >> 8), u8(v >> 16), u8(v >> 24))
++	}
++	append_u16 :: proc(b: ^[dynamic]u8, v: u16) {
++		append(b, u8(v), u8(v >> 8))
++	}
++	append(&buf, 'R', 'I', 'F', 'F')
++	append_u32(&buf, 36 + data_size)
++	append(&buf, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ')
++	append_u32(&buf, 16)
++	append_u16(&buf, 1) // PCM
++	append_u16(&buf, 1) // mono
++	append_u32(&buf, rate)
++	append_u32(&buf, rate * 2)
++	append_u16(&buf, 2)
++	append_u16(&buf, 16)
++	append(&buf, 'd', 'a', 't', 'a')
++	append_u32(&buf, data_size)
++	for s in samples {
++		append_u16(&buf, u16(s))
++	}
++	wave := rl.LoadWaveFromMemory(".wav", raw_data(buf), i32(len(buf)))
++	snd := rl.LoadSoundFromWave(wave)
++	rl.UnloadWave(wave)
++	delete(samples)
++	delete(buf)
++	return snd
++}
+diff --git a/app/main.odin b/app/main.odin
+new file mode 100644
+index 0000000..d3d24d7
+--- /dev/null
++++ b/app/main.odin
+@@ -0,0 +1,434 @@
++package main
++
++// app/main.odin - the game executable (architecture §9.3/§9.5): window, raw
++// input -> validated Commands (ODN-12), the App/mode FSM (ODN-13), event
++// drain -> toasts + stings (ODN-14/15). Mouse-only prototype, desktop-first
++// (user rulings 2026-08-08). The sim never sees wall clock; the view never
++// touches the sim.
++
++import "core:crypto"
++import "core:fmt"
++import "core:mem"
++import rl "vendor:raylib"
++import pp "../core"
++import rnd "./render"
++import prun "./run"
++
++App :: struct {
++	mode:       prun.App_Mode,
++	catalogs:   ^pp.Catalogs,
++	palette:    rnd.Palette,
++	view:       rnd.View,
++	rc:         prun.Run_Context,
++	map_gen:    rnd.Map_Gen,
++	seed:       u64,
++	sel:        rnd.Selection,
++	drag:       rnd.Drag_State,
++	press:      rl.Vector2,
++	press_node: u32,
++	press_valid: bool,
++	hint:       string,
++	hint_until: i64,
++	onboarding: bool,
++	autopilot:  bool,
++	autopilot_wired: map[u32]bool,
++	tier:       u16,
++	sting_crisis: rl.Sound,
++	sting_win:    rl.Sound,
++	audio_ok:   bool,
++	cosmetic_rng: pp.Rng, // ODN-15 - cosmetics only, never the sim's
++}
++
++main :: proc() {
++	app: App
++	app.mode = .Boot
++
++	catalogs, cerr := prun.load_catalogs("data")
++	if cerr.file != "" {
++		fmt.eprintln(pp.catalog_error_string(cerr))
++		return
++	}
++	app.catalogs = catalogs
++	app.palette = rnd.palette_load()
++	// packet colors mirror the catalog (cosmetic)
++	for pt, i in catalogs.packet_types {
++		app.palette.packet[i] = {pt.color[0], pt.color[1], pt.color[2], pt.color[3]}
++	}
++
++	rl.SetConfigFlags({.WINDOW_RESIZABLE, .MSAA_4X_HINT})
++	rl.InitWindow(1280, 720, "Packet Plumber - Odin prototype")
++	rl.SetTargetFPS(60)
++	app.view.palette = &app.palette
++	app.view.catalogs = catalogs
++	app.view.font = load_hud_font()
++	pp.rng_seed(&app.cosmetic_rng, fresh_seed() ~ 0xC05E)
++
++	app.audio_ok = init_audio(&app)
++	start_run(&app)
++
++	for !rl.WindowShouldClose() {
++		frame_ms := i64(rl.GetTime() * 1000)
++		free_all(context.temp_allocator) // frame arena discipline (ODN-18)
++		handle_input(&app, frame_ms)
++		dt := rl.GetFrameTime()
++		if app.autopilot && !app.rc.paused && !app.rc.ended {
++			prun.autopilot_tick(&app.rc)
++		}
++		prun.run_update(&app.rc, f64(dt))
++		drain_events(&app, frame_ms)
++		draw_frame(&app, frame_ms)
++	}
++	if app.audio_ok {
++		rl.UnloadSound(app.sting_crisis)
++		rl.UnloadSound(app.sting_win)
++		rl.CloseAudioDevice()
++	}
++	if rl.IsFontValid(app.view.font) && app.view.font.texture.id != rl.GetFontDefault().texture.id {
++		rl.UnloadFont(app.view.font)
++	}
++	prun.run_context_destroy(&app.rc)
++	rl.CloseWindow()
++}
++
++fresh_seed :: proc() -> u64 {
++	// E32: fresh-run seeds from app-layer OS entropy - never the sim rng.
++	b: [8]u8
++	crypto.rand_bytes(b[:])
++	v: u64
++	for i in 0 ..< 8 { v |= u64(b[i]) << (8 * uint(i)) }
++	return v
++}
++
++start_run :: proc(app: ^App) {
++	if app.rc.state != nil {
++		prun.run_context_destroy(&app.rc)
++	}
++	app.seed = fresh_seed()
++	prun.run_context_create(&app.rc, app.seed, app.catalogs)
++	app.map_gen = rnd.map_generate(app.seed, app.view.world_w == 0 ? 1040 : app.view.world_w, app.view.world_h == 0 ? 780 : app.view.world_h)
++	app.sel = {}
++	app.drag = {}
++	app.onboarding = true
++	app.rc.paused = true // the briefing card is up
++	app.autopilot = false
++	clear(&app.autopilot_wired)
++	app.tier = 1 // standard
++	app.mode = .Run
++}
++
++// --- input ---------------------------------------------------------------------
++
++handle_input :: proc(app: ^App, frame_ms: i64) {
++	if rl.IsWindowResized() {
++		rnd.view_compute(&app.view, rl.GetScreenWidth(), rl.GetScreenHeight(), &app.catalogs.balance)
++	}
++	if app.view.scale == 0 {
++		rnd.view_compute(&app.view, rl.GetScreenWidth(), rl.GetScreenHeight(), &app.catalogs.balance)
++	}
++	mouse := rl.GetMousePosition()
++	wx, wy := rnd.from_screen(&app.view, mouse.x, mouse.y)
++
++	// onboarding dismiss consumes the click entirely (Perkins r1: the Godot
++	// prototype let the same click start a phantom drag / draw a pipe)
++	if app.onboarding {
++		if rl.IsMouseButtonPressed(.LEFT) || rl.IsKeyPressed(.SPACE) {
++			app.onboarding = false
++			app.rc.paused = false
++		}
++		return
++	}
++
++	if app.rc.ended {
++		if rl.IsMouseButtonPressed(.LEFT) || rl.IsKeyPressed(.R) {
++			start_run(app)
++		}
++		return
++	}
++
++	if rl.IsKeyPressed(.SPACE) {
++		app.rc.paused = !app.rc.paused
++	}
++	if rl.IsKeyPressed(.R) {
++		start_run(app)
++		return
++	}
++	if rl.IsKeyPressed(.A) {
++		app.autopilot = !app.autopilot
++		if app.autopilot {
++			prun.autopilot_boot(&app.rc)
++			for i in 0 ..< len(app.rc.state.topology.node_alive) {
++				app.autopilot_wired[app.rc.state.topology.node_id[i]] = true
++			}
++			set_hint(app, "autopilot ON - the demo build plays itself", frame_ms)
++		}
++	}
++	if rl.IsKeyPressed(.ONE)   { app.tier = tier_by_name(app, "narrow") }
++	if rl.IsKeyPressed(.TWO)   { app.tier = tier_by_name(app, "standard") }
++	if rl.IsKeyPressed(.THREE) { app.tier = tier_by_name(app, "wide") }
++	if rl.IsKeyPressed(.ESCAPE) {
++		app.sel = {}
++		app.drag.active = false
++	}
++
++	// hover affordance for pipes
++	app.sel.hover_pipe = 0
++	if pid, ok := prun.nearest_pipe(&app.rc, f64(wx), f64(wy), 12); ok {
++		app.sel.hover_pipe = pid
++	}
++
++	// right-click a pipe: cycle its QoS priority (the fast dial)
++	if rl.IsMouseButtonPressed(.RIGHT) {
++		if pid, ok := prun.nearest_pipe(&app.rc, f64(wx), f64(wy), 12); ok {
++			cycle_priority(app, pid, frame_ms)
++		} else if nid, ok2 := prun.snap_node(&app.rc, f64(wx), f64(wy)); ok2 {
++			// right-click a router: same inspect popover (discoverability)
++			slot := app.rc.state.topology.node_by_id[nid]
++			if app.rc.state.topology.node_kind[slot] == .Junction {
++				app.sel = {node = nid}
++				app.drag = {}
++			}
++		}
++	}
++
++	// left press: popover buttons first (they swallow the click)
++	if rl.IsMouseButtonPressed(.LEFT) {
++		app.press = mouse
++		app.press_node = 0
++		app.press_valid = false
++		if popover_click(app, mouse, frame_ms) {
++			return // swallowed
++		}
++		if nid, ok := prun.snap_node(&app.rc, f64(wx), f64(wy)); ok {
++			app.press_node = nid
++			app.press_valid = true
++			app.drag.active = true
++			app.drag.from_node = nid
++		}
++	}
++	if app.drag.active {
++		app.drag.wx = wx
++		app.drag.wy = wy
++		// live ghost validity + cost
++		app.drag.valid = .None
++		app.drag.cost = 0
++		if target, ok := prun.snap_node(&app.rc, f64(wx), f64(wy)); ok && target != app.drag.from_node {
++			cmd := pp.Command{kind = pp.Cmd_Draw_Pipe{a = app.drag.from_node, b = target, tier = app.tier}}
++			app.drag.valid = prun.bus_preview(&app.rc, cmd)
++			if app.drag.valid == .None {
++				sa := app.rc.state.topology.node_by_id[app.drag.from_node]
++				sb := app.rc.state.topology.node_by_id[target]
++				span := pp.span_between(app.rc.state.topology.node_pos[sa], app.rc.state.topology.node_pos[sb])
++				app.drag.cost = pp.draw_cost(span, app.catalogs.pipe_tiers[app.tier].cost_per_tile)
++			}
++		}
++	}
++	if rl.IsMouseButtonReleased(.LEFT) && app.drag.active {
++		app.drag.active = false
++		moved := rl.Vector2Distance(mouse, app.press) > 6
++		if target, ok := prun.snap_node(&app.rc, f64(wx), f64(wy)); ok {
++			if target != app.press_node {
++				cmd := pp.Command{kind = pp.Cmd_Draw_Pipe{a = app.press_node, b = target, tier = app.tier}}
++				if err := prun.bus_submit(&app.rc, cmd); err != .None {
++					set_hint(app, reject_copy(err), frame_ms)
++				}
++				return
++			}
++		}
++		if !moved {
++			// a click, not a drag: select
++			handle_click_select(app, mouse, frame_ms)
++		}
++	}
++}
++
++handle_click_select :: proc(app: ^App, mouse: rl.Vector2, frame_ms: i64) {
++	wx, wy := rnd.from_screen(&app.view, mouse.x, mouse.y)
++	if nid, ok := prun.snap_node(&app.rc, f64(wx), f64(wy)); ok {
++		slot := app.rc.state.topology.node_by_id[nid]
++		if app.rc.state.topology.node_kind[slot] == .Junction {
++			app.sel = {node = nid}
++			app.drag = {}
++			return
++		}
++	}
++	if pid, ok := prun.nearest_pipe(&app.rc, f64(wx), f64(wy), 10); ok {
++		app.sel = {pipe = pid}
++		app.drag = {}
++		return
++	}
++	app.sel = {} // empty ground closes the popover
++}
++
++// popover buttons; returns true when the click was swallowed by a popover
++popover_click :: proc(app: ^App, mouse: rl.Vector2, frame_ms: i64) -> bool {
++	if app.sel.node != 0 {
++		anchor := anchor_of_node(app, app.sel.node)
++		pop := rnd.popover_rect(&app.view, anchor)
++		labels := [3]string{"none", "stream", "email"}
++		for i in 0 ..< 3 {
++			r := rnd.triage_button_rect(pop, i)
++			if rl.CheckCollisionPointRec(mouse, r) {
++				triage := i32(i - 1)
++				err := prun.bus_submit(&app.rc, pp.Command{kind = pp.Cmd_Set_Junction_Triage{
++					junction = app.sel.node, triage = triage}})
++				if err != .None {
++					set_hint(app, reject_copy(err), frame_ms)
++				} else {
++					set_hint(app, "triage set - that class wins contention here", frame_ms)
++				}
++				return true
++			}
++		}
++		if rl.CheckCollisionPointRec(mouse, pop) { return true }
++		return false
++	}
++	if app.sel.pipe != 0 {
++		anchor := anchor_of_pipe(app, app.sel.pipe)
++		pop := rnd.popover_rect(&app.view, anchor)
++		if rl.CheckCollisionPointRec(mouse, rnd.pipe_button_rect(pop, 0)) {
++			cycle_priority(app, app.sel.pipe, frame_ms)
++			return true
++		}
++		if rl.CheckCollisionPointRec(mouse, rnd.pipe_button_rect(pop, 1)) {
++			err := prun.bus_submit(&app.rc, pp.Command{kind = pp.Cmd_Demolish{target = app.sel.pipe, is_node = false}})
++			if err != .None {
++				set_hint(app, reject_copy(err), frame_ms)
++			} else {
++				set_hint(app, "pipe demolished - refund banked", frame_ms)
++			}
++			app.sel = {}
++			return true
++		}
++		if rl.CheckCollisionPointRec(mouse, {pop.x, pop.y, pop.width, rnd.POPOVER_H_PIPE}) { return true }
++		return false
++	}
++	return false
++}
++
++anchor_of_node :: proc(app: ^App, id: u32) -> rl.Vector2 {
++	slot := app.rc.state.topology.node_by_id[id]
++	return rnd.node_screen(&app.view, app.rc.state.topology.node_pos[slot])
++}
++
++anchor_of_pipe :: proc(app: ^App, id: u32) -> rl.Vector2 {
++	slot := app.rc.state.topology.pipe_by_id[id]
++	pa := app.rc.state.topology.node_by_id[app.rc.state.topology.pipe_a[slot]]
++	pb := app.rc.state.topology.node_by_id[app.rc.state.topology.pipe_b[slot]]
++	a := rnd.node_screen(&app.view, app.rc.state.topology.node_pos[pa])
++	b := rnd.node_screen(&app.view, app.rc.state.topology.node_pos[pb])
++	return {(a.x + b.x) / 2, (a.y + b.y) / 2}
++}
++
++cycle_priority :: proc(app: ^App, pipe: u32, frame_ms: i64) {
++	slot, ok := app.rc.state.topology.pipe_by_id[pipe]
++	if !ok { return }
++	cur := app.rc.state.topology.pipe_priority[slot]
++	next: i32 = 0 if cur < 0 else (1 if cur == 0 else -1)
++	err := prun.bus_submit(&app.rc, pp.Command{kind = pp.Cmd_Set_Pipe_Priority{pipe = pipe, priority = next}})
++	if err != .None {
++		set_hint(app, reject_copy(err), frame_ms)
++		return
++	}
++	if next < 0 {
++		set_hint(app, "pipe neutral - everything rides Standard", frame_ms)
++	} else {
++		name := app.catalogs.packet_types[next].display
++		set_hint(app, fmt.tprintf("%s gets the Express lane on this pipe", name), frame_ms)
++	}
++}
++
++tier_by_name :: proc(app: ^App, name: string) -> u16 {
++	idx, _ := pp.tier_index(app.catalogs, name)
++	return idx
++}
++
++// --- events -> toasts + stings (ODN-14/15) ---------------------------------------
++
++drain_events :: proc(app: ^App, frame_ms: i64) {
++	for e in app.rc.state.events {
++		#partial switch k in e.kind {
++		case pp.Ev_Crisis_Triggered:
++			set_hint(app, "YOU_TUNE: 10x SURGE - hold the pipes", frame_ms, 6000)
++			if app.audio_ok { rl.PlaySound(app.sting_crisis) }
++		case pp.Ev_Forecast_Issued:
++			if app.audio_ok { rl.PlaySound(app.sting_crisis) }
++		case pp.Ev_Run_Won:
++			if app.audio_ok { rl.PlaySound(app.sting_win) }
++		case pp.Ev_Run_Lost:
++			if app.audio_ok { rl.PlaySound(app.sting_crisis) }
++		case pp.Ev_Warning_Raised:
++			if k.level == .Critical {
++				set_hint(app, "a router is CRITICAL - reroute or widen its pipes", frame_ms, 3500)
++			}
++		}
++	}
++	clear(&app.rc.state.events)
++}
++
++set_hint :: proc(app: ^App, msg: string, frame_ms: i64, ttl_ms: i64 = 2600) {
++	app.hint = msg
++	app.hint_until = frame_ms + ttl_ms
++}
++
++reject_copy :: proc(err: pp.Edit_Error) -> string {
++	switch err {
++	case .Self_Loop: return "that pipe goes nowhere (literally)"
++	case .Terminal_To_Terminal: return "houses don't talk to houses - go through a router"
++	case .Span_Exceeds_Tier: return "that tier can't reach - upgrade or hop a router"
++	case .Over_Budget: return "budget's dry - demolish something for the refund"
++	case .Router_Ports_Full: return "that router is out of ports - free one or mesh onward"
++	case .Terminal_Demolish: return "you can't demolish a neighborhood"
++	case .Missing_Node, .Missing_Pipe, .Missing_Junction: return "gone already"
++	case .Not_A_Junction: return "triage lives on routers"
++	case .Unknown_Tier, .Unknown_Command: return "unknown hardware"
++	case .Negative_Weight: return "negative bandwidth isn't a thing"
++	case .Invalid_Weights: return "those weights exceed hardware limits"
++	case .Invalid_Triage: return "no such traffic class"
++	case .None: return ""
++	}
++	return "nope."
++}
++
++// --- the frame -------------------------------------------------------------------
++
++draw_frame :: proc(app: ^App, frame_ms: i64) {
++	rl.BeginDrawing()
++	hint := app.hint
++	if frame_ms > app.hint_until { hint = "" }
++	rnd.draw_world(&app.view, &app.rc.snapshot, &app.map_gen, frame_ms, app.sel, app.drag)
++	if app.sel.node != 0 {
++		pop := rnd.popover_rect(&app.view, anchor_of_node(app, app.sel.node))
++		rnd.draw_router_popover(&app.view, &app.rc.snapshot, app.sel.node, pop, {"none", "stream", "email"})
++	}
++	if app.sel.pipe != 0 {
++		pop := rnd.popover_rect(&app.view, anchor_of_pipe(app, app.sel.pipe))
++		rnd.draw_pipe_popover(&app.view, &app.rc.snapshot, app.sel.pipe, pop)
++	}
++	rnd.draw_hud(&app.view, &app.rc.snapshot, rnd.Hud_State{
++		hint = hint, onboarding = app.onboarding, time_ms = frame_ms, seed = app.seed,
++	})
++	rl.EndDrawing()
++}
++
++// the HUD font: raylib's bitmap default is illegible at HUD sizes — load a
++// system TTF (placeholder doctrine allows system fonts; the HARNESS stays on
++// the embedded default so goldens stay bit-exact on every platform).
++load_hud_font :: proc() -> rl.Font {
++	candidates := [?]string{
++		"/System/Library/Fonts/Geneva.ttf",                  // macOS
++		"/System/Library/Fonts/Helvetica.ttc",
++		"/System/Library/Fonts/Menlo.ttc",
++		"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",   // Linux
++		"/usr/share/fonts/dejavu/DejaVuSans.ttf",
++		"C:\\Windows\\Fonts\\segoeui.ttf",               // Windows
++		"C:\\Windows\\Fonts\\arial.ttf",
++	}
++	for path in candidates {
++		f := rl.LoadFontEx(fmt.ctprintf("%s", path), 64, nil, 400)
++		if rl.IsFontValid(f) {
++			rl.SetTextureFilter(f.texture, .BILINEAR)
++			return f
++		}
++	}
++	return rl.GetFontDefault()
++}
+diff --git a/app/render/hud.odin b/app/render/hud.odin
+new file mode 100644
+index 0000000..cbc3180
+--- /dev/null
++++ b/app/render/hud.odin
+@@ -0,0 +1,320 @@
++package render
++
++// hud.odin - the HUD chrome (architecture §9.2, art §8): the map IS the UI;
++// the HUD adds only what the map cannot show at scale - Network Health meter,
++// SLA chips, budget, forecast ("weather report"), alerts, and the win/lose
++// lockups. Screen space; reads only the snapshot + app-provided ui state.
++
++import pp "../../core"
++import rl "vendor:raylib"
++
++Hud_State :: struct {
++	hint:        string,  // transient rejection/UX hint (typed errors -> copy)
++	onboarding:  bool,
++	time_ms:     i64,
++	seed:        u64,
++}
++
++// the satirical-brand alert voice (narrative L2 leads on screen)
++forecast_copy :: proc(sp_name: string) -> string {
++	return "YOU_TUNE TRAFFIC INCOMING"
++}
++
++draw_hud :: proc(v: ^View, snap: ^pp.Snapshot, hud: Hud_State) {
++	p := v.palette
++	draw_health_meter(v, snap)
++	draw_sla_chips(v, snap)
++	// budget, top-right
++	{
++		buf: [64]u8
++		txt := fmt_bprintf(buf[:], "BUDGET %d", int(snap.budget))
++		draw_text_right(v, txt, {f32(v.win_w) - 18, 14}, 17, p.ink)
++	}
++	// era stamp, top-left
++	{
++		buf: [64]u8
++		txt := fmt_bprintf(buf[:], "ERA 3 - THE STREAMING SURGE", 0)
++		draw_text(v, txt, {18, 14}, 15, p.ink_soft)
++	}
++	if snap.surge_active {
++		draw_surge_banner(v, snap)
++	} else if len(snap.forecasts) > 0 {
++		draw_forecast(v, snap)
++	}
++	if len(hud.hint) > 0 {
++		w := measure(v, hud.hint, 16)
++		panel(v, {f32(v.win_w)/2 - w/2 - 14, f32(v.win_h) - 52, w + 28, 32})
++		draw_text(v, hud.hint, {f32(v.win_w)/2 - w/2, f32(v.win_h) - 44}, 16, p.ink)
++	}
++	if snap.won { draw_win_overlay(v, snap) }
++	if snap.lost { draw_lose_overlay(v, snap) }
++	if hud.onboarding { draw_onboarding(v) }
++}
++
++draw_health_meter :: proc(v: ^View, snap: ^pp.Snapshot) {
++	p := v.palette
++	w := f32(320)
++	h := f32(18)
++	x := (f32(v.win_w) - w) / 2
++	y := f32(14)
++	panel(v, {x - 12, y - 6, w + 24, h + 30})
++	label_w := measure(v, "NETWORK HEALTH", 13)
++	draw_text(v, "NETWORK HEALTH", {x + (w - label_w) / 2, y + h + 8}, 13, p.ink_soft)
++	rl.DrawRectangleV({x, y}, {w, h}, rl.Color{210, 198, 170, 255})
++	fill := w * f32(snap.meter_pct) / 100
++	col := p.state_healthy
++	if snap.meter_pct < 35 { col = p.state_critical } else if snap.meter_pct < 70 { col = p.state_strain }
++	rl.DrawRectangleV({x, y}, {fill, h}, col)
++	rl.DrawRectangleLinesEx({x, y, w, h}, 1.5, p.chrome_border)
++	// grace countdown pip
++	if snap.in_grace {
++		buf: [32]u8
++		secs := snap.grace_ticks_left * i32(v.catalogs.balance.logic_hz)
++		_ = secs
++		txt := fmt_bprintf(buf[:], "!", 0)
++		draw_text(v, txt, {x + w + 8, y}, 18, p.state_critical)
++	}
++}
++
++draw_sla_chips :: proc(v: ^View, snap: ^pp.Snapshot) {
++	p := v.palette
++	y := f32(40)
++	for cls, i in snap.classes {
++		pt := v.catalogs.packet_types[i]
++		chip := rl.Rectangle{18, y, 150, 34}
++		panel(v, chip)
++		draw_class_shape(v, i32(i), {chip.x + 16, chip.y + 17}, 6, p.packet[i])
++		up := cls.uptime_pct
++		buf: [48]u8
++		txt: string
++		if up < 0 {
++			txt = fmt_bprintf(buf[:], " idle", 0)
++		} else {
++			txt = fmt_bprintf(buf[:], " %d%% up", int(up))
++		}
++		col := p.state_healthy
++		if up >= 0 && up < 90 { col = p.state_strain }
++		if up >= 0 && up < 70 { col = p.state_critical }
++		draw_text(v, pt.display, {chip.x + 30, chip.y + 4}, 13, p.ink)
++		draw_text(v, txt, {chip.x + 30, chip.y + 18}, 13, col)
++		y += 40
++	}
++}
++
++draw_forecast :: proc(v: ^View, snap: ^pp.Snapshot) {
++	p := v.palette
++	hz := v.catalogs.balance.logic_hz
++	for fc in snap.forecasts {
++		secs := i32(fc.ticks_until) / hz
++		w := f32(300)
++		rect := rl.Rectangle{18, f32(v.win_h) - 96, w, 66}
++		// pulsing amber edge (the warning channel)
++		panel(v, rect)
++		rl.DrawRectangleLinesEx(rect, 2, p.state_strain)
++		draw_text(v, "FORECAST", {rect.x + 12, rect.y + 8}, 12, p.ink_soft)
++		draw_text(v, forecast_copy(""), {rect.x + 12, rect.y + 22}, 15, p.ink)
++		buf: [32]u8
++		txt := fmt_bprintf(buf[:], "~%ds out - build capacity NOW", int(secs))
++		draw_text(v, txt, {rect.x + 12, rect.y + 42}, 14, p.state_strain)
++	}
++}
++
++draw_surge_banner :: proc(v: ^View, snap: ^pp.Snapshot) {
++	p := v.palette
++	hz := v.catalogs.balance.logic_hz
++	w := f32(360)
++	rect := rl.Rectangle{f32(v.win_w)/2 - w/2, 56, w, 40}
++	panel(v, rect)
++	rl.DrawRectangleLinesEx(rect, 2, p.state_critical)
++	draw_text(v, "SURGE ACTIVE - YOU_TUNE IS 10x", {rect.x + 14, rect.y + 7}, 15, p.state_critical)
++	buf: [32]u8
++	txt := fmt_bprintf(buf[:], "ends in %ds", int(snap.surge_ends_in) / int(hz))
++	draw_text(v, txt, {rect.x + 14, rect.y + 24}, 13, p.ink_soft)
++}
++
++draw_win_overlay :: proc(v: ^View, snap: ^pp.Snapshot) {
++	p := v.palette
++	w, h := f32(430), f32(190)
++	rect := rl.Rectangle{f32(v.win_w)/2 - w/2, f32(v.win_h)/2 - h/2, w, h}
++	panel(v, rect)
++	rl.DrawRectangleLinesEx(rect, 2.5, p.state_healthy)
++	title := "THE INTERNET HOLDS"
++	tw := measure(v, title, 24)
++	draw_text(v, title, {rect.x + (w - tw)/2, rect.y + 18}, 24, p.state_healthy)
++	sub := "the surge recedes - gauges swing green"
++	sw := measure(v, sub, 14)
++	draw_text(v, sub, {rect.x + (w - sw)/2, rect.y + 52}, 14, p.ink_soft)
++	buf: [96]u8
++	stats := fmt_bprintf(buf[:], "delivered %d · dropped %d", int(snap.delivered_total), int(snap.dropped_total))
++	stw := measure(v, stats, 15)
++	draw_text(v, stats, {rect.x + (w - stw)/2, rect.y + 86}, 15, p.ink)
++	hint := "press R (or click) for a fresh seed"
++	hw := measure(v, hint, 14)
++	draw_text(v, hint, {rect.x + (w - hw)/2, rect.y + 128}, 14, p.ink_soft)
++}
++
++draw_lose_overlay :: proc(v: ^View, snap: ^pp.Snapshot) {
++	p := v.palette
++	// bleach-to-white (art §8.5): the vivid field washes flat, then the lockup
++	rl.DrawRectangle(0, 0, v.win_w, v.win_h, rl.Color{p.canvas_wash.r, p.canvas_wash.g, p.canvas_wash.b, 215})
++	w, h := f32(430), f32(200)
++	rect := rl.Rectangle{f32(v.win_w)/2 - w/2, f32(v.win_h)/2 - h/2, w, h}
++	panel(v, rect)
++	rl.DrawRectangleLinesEx(rect, 2.5, p.state_critical)
++	title := "ERROR 404"
++	tw := measure(v, title, 34)
++	draw_text(v, title, {rect.x + (w - tw)/2, rect.y + 16}, 34, p.state_critical)
++	sub := "the internet went down on your watch"
++	sw := measure(v, sub, 14)
++	draw_text(v, sub, {rect.x + (w - sw)/2, rect.y + 62}, 14, p.ink_soft)
++	quote := "\"Network's gone down... it happens, engineer.\""
++	qw := measure(v, quote, 13)
++	draw_text(v, quote, {rect.x + (w - qw)/2, rect.y + 92}, 13, p.ink_faint)
++	buf: [96]u8
++	stats := fmt_bprintf(buf[:], "survived %ds · delivered %d", int(snap.tick) / int(v.catalogs.balance.logic_hz), int(snap.delivered_total))
++	stw := measure(v, stats, 15)
++	draw_text(v, stats, {rect.x + (w - stw)/2, rect.y + 122}, 15, p.ink)
++	hint := "press R (or click) to pull it back together"
++	hw := measure(v, hint, 14)
++	draw_text(v, hint, {rect.x + (w - hw)/2, rect.y + 156}, 14, p.ink_soft)
++}
++
++draw_onboarding :: proc(v: ^View) {
++	p := v.palette
++	w, h := f32(520), f32(250)
++	rect := rl.Rectangle{f32(v.win_w)/2 - w/2, f32(v.win_h)/2 - h/2, w, h}
++	panel(v, rect)
++	rl.DrawRectangleLinesEx(rect, 2, p.ink_soft)
++	title := "PACKET PLUMBER - EARLY ODIN PROTOTYPE"
++	tw := measure(v, title, 19)
++	draw_text(v, title, {rect.x + (w - tw)/2, rect.y + 16}, 19, p.ink)
++	lines := [?]string{
++		"Drag house -> router -> host to lay pipes (1/2/3 = tier).",
++		"A streaming surge is coming - watch the forecast.",
++		"One pipe is never enough for 10x. Build wide. Build double.",
++		"Right-click a pipe to give streaming the Express lane.",
++		"Click a router to inspect ports + set triage.",
++		"WIN: hold 90% uptime through the surge.",
++		"LOSE: the Network Health meter empties - Error 404.",
++	}
++	y := rect.y + 52
++	for line, i in lines {
++		col := p.ink_soft
++		if i == 6 { col = p.state_critical }
++		if i == 5 { col = p.state_healthy }
++		draw_text(v, line, {rect.x + 26, y}, 14, col)
++		y += 24
++	}
++	go := "click anywhere to take the shift"
++	gw := measure(v, go, 14)
++	draw_text(v, go, {rect.x + (w - gw)/2, rect.y + h - 26}, 14, p.ink)
++}
++
++// --- popover (progressive disclosure, UX-DR1) -----------------------------------
++// Layout is owned HERE so the app and any capture agree on the rects.
++
++POPOVER_W :: 210
++POPOVER_H_ROUTER :: 148
++POPOVER_H_PIPE :: 118
++
++popover_rect :: proc(v: ^View, anchor: rl.Vector2) -> rl.Rectangle {
++	x := anchor.x + 18
++	y := anchor.y - 20
++	if x + POPOVER_W > f32(v.win_w) { x = anchor.x - POPOVER_W - 18 }
++	if x < 8 { x = 8 }
++	if y + POPOVER_H_ROUTER > f32(v.win_h) { y = f32(v.win_h) - POPOVER_H_ROUTER - 8 }
++	if y < 8 { y = 8 }
++	return {x, y, POPOVER_W, POPOVER_H_ROUTER}
++}
++
++triage_button_rect :: proc(pop: rl.Rectangle, i: int) -> rl.Rectangle {
++	return {pop.x + 10 + f32(i) * 64, pop.y + 104, 60, 26}
++}
++
++pipe_button_rect :: proc(pop: rl.Rectangle, i: int) -> rl.Rectangle {
++	return {pop.x + 10 + f32(i) * 96, pop.y + 76, 90, 26}
++}
++
++// router inspect popover (canon #14): ports, per-class flows, triage buttons
++draw_router_popover :: proc(v: ^View, snap: ^pp.Snapshot, node_id: u32, pop: rl.Rectangle, triage_labels: [3]string) {
++	p := v.palette
++	panel(v, pop)
++	n: ^pp.Snap_Node
++	for i in 0 ..< len(snap.nodes) {
++		if snap.nodes[i].id == node_id { n = &snap.nodes[i]; break }
++	}
++	if n == nil { return }
++	name := v.catalogs.node_types[n.type_idx].display
++	draw_text(v, name, {pop.x + 10, pop.y + 8}, 15, p.ink)
++	buf: [64]u8
++	ports := fmt_bprintf(buf[:], "ports %d/%d used", int(n.ports_used), int(n.ports))
++	draw_text(v, ports, {pop.x + 10, pop.y + 28}, 13, p.ink_soft)
++	// per-class in-flight counts through this router (the flows readout)
++	y := pop.y + 48
++	for pt, i in v.catalogs.packet_types {
++		fbuf: [24]u8
++		count := fmt_bprintf(fbuf[:], "x%d", int(n.flow_counts[i]))
++		draw_class_shape(v, i32(i), {pop.x + 16, y + 6}, 5, p.packet[i])
++		draw_text(v, pt.display, {pop.x + 28, y}, 12, p.ink_soft)
++		draw_text(v, count, {pop.x + 100, y}, 12, p.ink)
++		y += 16
++	}
++	draw_text(v, "triage:", {pop.x + 10, pop.y + 86}, 12, p.ink_soft)
++	// buttons are DRAWN here; the app re-uses triage_button_rect for hit-tests
++	for label, i in triage_labels {
++		r := triage_button_rect(pop, i)
++		active := (i == 0 && n.triage < 0) || (i > 0 && n.triage == i32(i - 1))
++		draw_button(v, r, label, active)
++	}
++}
++
++// pipe popover: the QoS dial (cycle priority) + demolish
++draw_pipe_popover :: proc(v: ^View, snap: ^pp.Snapshot, pipe_id: u32, pop: rl.Rectangle) {
++	p := v.palette
++	panel(v, {pop.x, pop.y, pop.width, POPOVER_H_PIPE})
++	sp: ^pp.Snap_Pipe
++	for i in 0 ..< len(snap.pipes) {
++		if snap.pipes[i].id == pipe_id { sp = &snap.pipes[i]; break }
++	}
++	if sp == nil { return }
++	tier := v.catalogs.pipe_tiers[sp.tier]
++	draw_text(v, tier.display, {pop.x + 10, pop.y + 8}, 15, p.ink)
++	buf: [64]u8
++	info := fmt_bprintf(buf[:], "cap %d u/s · span %d", int(sp.capacity), int(sp.span))
++	draw_text(v, info, {pop.x + 10, pop.y + 28}, 13, p.ink_soft)
++	prio := "priority: none"
++	if sp.priority >= 0 { prio = v.catalogs.packet_types[sp.priority].display }
++	draw_text(v, prio, {pop.x + 10, pop.y + 46}, 13, p.ink)
++	r0 := pipe_button_rect(pop, 0)
++	draw_button(v, r0, "cycle QoS", false)
++	r1 := pipe_button_rect(pop, 1)
++	draw_button(v, r1, "demolish", false)
++}
++
++draw_button :: proc(v: ^View, r: rl.Rectangle, label: string, active: bool) {
++	p := v.palette
++	bg := rl.Color{238, 230, 210, 255}
++	if active { bg = rl.Color{210, 226, 196, 255} }
++	rl.DrawRectangleRec(r, bg)
++	rl.DrawRectangleLinesEx(r, 1, p.chrome_border)
++	lw := measure(v, label, 13)
++	draw_text(v, label, {r.x + (r.width - lw)/2, r.y + 6}, 13, p.ink)
++}
++
++panel :: proc(v: ^View, r: rl.Rectangle) {
++	rl.DrawRectangleRec(r, v.palette.chrome_panel)
++	rl.DrawRectangleLinesEx(r, 1, v.palette.chrome_border)
++}
++
++measure :: proc(v: ^View, txt: string, size: f32) -> f32 {
++	cbuf: [256]u8
++	n := min(len(txt), 250)
++	for i in 0 ..< n { cbuf[i] = txt[i] }
++	cbuf[n] = 0
++	return rl.MeasureTextEx(v.font, cstring(&cbuf[0]), size, 1).x
++}
++
++draw_text_right :: proc(v: ^View, txt: string, pos: rl.Vector2, size: f32, col: rl.Color) {
++	w := measure(v, txt, size)
++	draw_text(v, txt, {pos.x - w, pos.y}, size, col)
++}
+diff --git a/app/render/map.odin b/app/render/map.odin
+new file mode 100644
+index 0000000..38e531a
+--- /dev/null
++++ b/app/render/map.odin
+@@ -0,0 +1,89 @@
++package render
++
++// map.odin — the procedural land/ocean/parks map (art amendment A5). Generated
++// once per run at run creation from a DEDICATED derived stream
++// (splitmix64(run_seed ^ MAP_TAG)) — never state.rng (would perturb the sim),
++// never the cosmetic stream (ODN-15). Geography is cosmetic-only: it never
++// constrains topology (the canon is an abstract map; keeping map-gen out of
++// the core keeps the re-sim story clean).
++//
++// The descriptors are computed once and drawn fresh each frame (~40 draw
++// calls — trivially cheap on both the GPU and rlsw paths; no RenderTexture
++// cache — the memory platform has no FBO readback).
++
++import pp "../../core"
++import rl "vendor:raylib"
++
++MAP_TAG :: 0x5EED5EED5EED  // domain separator for the derived map stream
++
++Blob :: struct { x, y, r: f32 }
++
++Map_Gen :: struct {
++	ocean:    [6]Blob,  // big soft-blue masses off the bottom-left coastline
++	parks:    [3]Blob,  // green park blobs
++	speckles: [24]Blob, // faint city-tint texture
++}
++
++map_generate :: proc(seed: u64, world_w, world_h: f32) -> Map_Gen {
++	m: Map_Gen
++	s := seed ~ u64(MAP_TAG)
++	rnd :: proc(s: ^u64, lo, hi: f32) -> f32 {
++		v := pp.splitmix64(s)
++		f := f32(v >> 40) / f32(u64(1) << 24) // 24 bits of fraction
++		return lo + f * (hi - lo)
++	}
++	// ocean masses entering from the bottom-left corner (a coastline, not a void)
++	// hug the bottom-left corner — a coastline, mostly OFF the playfield
++	m.ocean[0] = {-world_w * 0.28, world_h * 1.22, world_h * 0.66}
++	m.ocean[1] = {world_w * 0.05, world_h * 1.32, world_h * 0.58}
++	m.ocean[2] = {-world_w * 0.30, world_h * 0.72, world_h * 0.40}
++	for i in 3 ..< 6 {
++		m.ocean[i] = {rnd(&s, -0.25, 0.15) * world_w, rnd(&s, 1.05, 1.35) * world_h, rnd(&s, 0.25, 0.45) * world_h}
++	}
++	for i in 0 ..< 3 {
++		m.parks[i] = {rnd(&s, 0.15, 0.9) * world_w, rnd(&s, 0.1, 0.75) * world_h, rnd(&s, 30, 80)}
++	}
++	for i in 0 ..< 24 {
++		m.speckles[i] = {rnd(&s, 0, world_w), rnd(&s, 0, world_h), rnd(&s, 2, 5)}
++	}
++	return m
++}
++
++map_draw :: proc(m: ^Map_Gen, v: ^View) {
++	p := v.palette
++	// cream land base
++	rl.DrawRectangle(0, 0, v.win_w, v.win_h, p.canvas)
++	// the snap lattice (faint)
++	// grid lines blended 55% toward the canvas (the lattice stays subtle)
++	g := p.grid
++	c := p.canvas
++	grid_soft := rl.Color{
++		u8((u16(g.r)*45 + u16(c.r)*55) / 100),
++		u8((u16(g.g)*45 + u16(c.g)*55) / 100),
++		u8((u16(g.b)*45 + u16(c.b)*55) / 100), 255}
++	tile := v.tile_px * v.scale
++	x := v.off_x
++	for x < f32(v.win_w) {
++		rl.DrawLine(i32(x), 0, i32(x), v.win_h, grid_soft)
++		x += tile
++	}
++	y := v.off_y
++	for y < f32(v.win_h) {
++		rl.DrawLine(0, i32(y), v.win_w, i32(y), grid_soft)
++		y += tile
++	}
++	// parks then ocean then speckle (back-to-front, value-only layers)
++	for b in m.parks {
++		c := to_screen(v, b.x, b.y)
++		rl.DrawCircleV(c, b.r * v.scale, p.park)
++	}
++	for b in m.ocean {
++		c := to_screen(v, b.x, b.y)
++		rl.DrawCircleV(c, b.r * v.scale, p.ocean)
++	}
++	speckle := p.grid
++	for b in m.speckles {
++		c := to_screen(v, b.x, b.y)
++		rl.DrawCircleV(c, b.r * v.scale, speckle)
++	}
++}
+diff --git a/app/render/palette.odin b/app/render/palette.odin
+new file mode 100644
+index 0000000..9598eb9
+--- /dev/null
++++ b/app/render/palette.odin
+@@ -0,0 +1,138 @@
++package render
++
++// palette.odin — the light-canvas canon as DATA (look-book v1 / art-direction
++// v1.2). All values cosmetic; loaded from data/palette.json (ODN-5 — art
++// tuning is data; the core never reads it).
++
++import "core:encoding/json"
++import rl "vendor:raylib"
++
++Palette :: struct {
++	canvas:         rl.Color,
++	grid:           rl.Color,
++	ocean:          rl.Color,
++	park:           rl.Color,
++	ink:            rl.Color,
++	ink_soft:       rl.Color,
++	ink_faint:      rl.Color,
++	chrome_panel:   rl.Color,
++	chrome_border:  rl.Color,
++	state_healthy:  rl.Color,
++	state_strain:   rl.Color,
++	state_critical: rl.Color,
++	house_bodies:   [4]rl.Color,
++	house_roofs:    [4]rl.Color,
++	host_body:      rl.Color,
++	host_roof:      rl.Color,
++	router_body:    rl.Color,
++	router_dark:    rl.Color,
++	router_led:     rl.Color,
++	pipe_copper:    rl.Color,
++	pipe_steel:     rl.Color,
++	pipe_fiber:     rl.Color,
++	pipe_core:      rl.Color,
++	pipe_unalloc:   rl.Color,
++	canvas_wash:    rl.Color,
++	packet:         [12]rl.Color, // per class (mirrors packet_types color_rgba; MAX_CLASSES)
++}
++
++DEFAULT_PALETTE_JSON :: #load("../../data/palette.json")
++
++palette_load :: proc(source: []byte = DEFAULT_PALETTE_JSON) -> Palette {
++	p: Palette
++	v, err := json.parse(source, parse_integers = true)
++	if err != nil { return fallback_palette() }
++	obj, okm := v.(json.Object)
++	if !okm { return fallback_palette() }
++	p.canvas = jcol(obj, "canvas", {232, 221, 194, 255})
++	p.grid = jcol(obj, "grid", {194, 182, 148, 255})
++	p.ocean = jcol(obj, "ocean", {168, 197, 216, 255})
++	p.park = jcol(obj, "park", {166, 196, 138, 255})
++	p.ink = jcol(obj, "ink", {51, 65, 79, 255})
++	p.ink_soft = jcol(obj, "ink_soft", {106, 112, 120, 255})
++	p.ink_faint = jcol(obj, "ink_faint", {154, 160, 168, 255})
++	p.chrome_panel = jcol(obj, "chrome_panel", {245, 239, 223, 226})
++	p.chrome_border = jcol(obj, "chrome_border", {194, 182, 148, 255})
++	p.state_healthy = jcol(obj, "state_healthy", {55, 214, 122, 255})
++	p.state_strain = jcol(obj, "state_strain", {242, 181, 68, 255})
++	p.state_critical = jcol(obj, "state_critical", {232, 69, 69, 255})
++	if arr, ok := obj["house_bodies"].(json.Array); ok && len(arr) == 4 {
++		for i in 0 ..< 4 {
++			if q, okq := arr[i].(json.Array); okq { p.house_bodies[i] = jcol_arr(q, {232, 90, 74, 255}) }
++		}
++	}
++	if arr, ok := obj["house_roofs"].(json.Array); ok && len(arr) == 4 {
++		for i in 0 ..< 4 {
++			if q, okq := arr[i].(json.Array); okq { p.house_roofs[i] = jcol_arr(q, {122, 46, 38, 255}) }
++		}
++	}
++	p.host_body = jcol(obj, "host_body", {62, 120, 208, 255})
++	p.host_roof = jcol(obj, "host_roof", {38, 76, 142, 255})
++	p.router_body = jcol(obj, "router_body", {94, 110, 128, 255})
++	p.router_dark = jcol(obj, "router_dark", {62, 74, 92, 255})
++	p.router_led = jcol(obj, "router_led", {46, 139, 87, 255})
++	p.pipe_copper = jcol(obj, "pipe_copper", {142, 94, 46, 255})
++	p.pipe_steel = jcol(obj, "pipe_steel", {120, 128, 140, 255})
++	p.pipe_fiber = jcol(obj, "pipe_fiber", {46, 84, 148, 255})
++	p.pipe_core = jcol(obj, "pipe_core", {122, 168, 230, 255})
++	p.pipe_unalloc = jcol(obj, "pipe_unalloc", {58, 74, 92, 255})
++	p.canvas_wash = jcol(obj, "canvas_wash", {250, 246, 238, 255})
++	p.packet[0] = {90, 98, 112, 255}   // email grey (overridden by packet_types colors at boot)
++	p.packet[1] = {30, 74, 152, 255}   // streaming blue
++	return p
++}
++
++fallback_palette :: proc() -> Palette {
++	return palette_load_from_fallback()
++}
++
++// used when the JSON is somehow unreadable — the look-book hexes, inline
++palette_load_from_fallback :: proc() -> Palette {
++	p: Palette
++	p.canvas = {232, 221, 194, 255}
++	p.grid = {194, 182, 148, 255}
++	p.ocean = {168, 197, 216, 255}
++	p.park = {166, 196, 138, 255}
++	p.ink = {51, 65, 79, 255}
++	p.ink_soft = {106, 112, 120, 255}
++	p.ink_faint = {154, 160, 168, 255}
++	p.chrome_panel = {245, 239, 223, 226}
++	p.chrome_border = {194, 182, 148, 255}
++	p.state_healthy = {55, 214, 122, 255}
++	p.state_strain = {242, 181, 68, 255}
++	p.state_critical = {232, 69, 69, 255}
++	p.house_bodies = {{232, 90, 74, 255}, {242, 201, 76, 255}, {94, 203, 107, 255}, {74, 155, 226, 255}}
++	p.house_roofs = {{122, 46, 38, 255}, {122, 84, 24, 255}, {44, 106, 52, 255}, {38, 80, 126, 255}}
++	p.host_body = {62, 120, 208, 255}
++	p.host_roof = {38, 76, 142, 255}
++	p.router_body = {94, 110, 128, 255}
++	p.router_dark = {62, 74, 92, 255}
++	p.router_led = {46, 139, 87, 255}
++	p.pipe_copper = {142, 94, 46, 255}
++	p.pipe_steel = {120, 128, 140, 255}
++	p.pipe_fiber = {46, 84, 148, 255}
++	p.pipe_core = {122, 168, 230, 255}
++	p.pipe_unalloc = {58, 74, 92, 255}
++	p.canvas_wash = {250, 246, 238, 255}
++	p.packet[0] = {90, 98, 112, 255}
++	p.packet[1] = {30, 74, 152, 255}
++	return p
++}
++
++jcol :: proc(o: json.Object, key: string, def: rl.Color) -> rl.Color {
++	if arr, ok := o[key].(json.Array); ok {
++		return jcol_arr(arr, def)
++	}
++	return def
++}
++
++jcol_arr :: proc(arr: json.Array, def: rl.Color) -> rl.Color {
++	if len(arr) != 4 { return def }
++	c: rl.Color
++	for i in 0 ..< 4 {
++		n, ok := arr[i].(json.Integer)
++		if !ok { return def }
++		c[i] = u8(n)
++	}
++	return c
++}
+diff --git a/app/render/view.odin b/app/render/view.odin
+new file mode 100644
+index 0000000..7b963d5
+--- /dev/null
++++ b/app/render/view.odin
+@@ -0,0 +1,429 @@
++package render
++
++// view.odin — the View layer (architecture §9.1): camera-fit + the light-
++// canvas world pass. Reads ONLY the immutable snapshot (ODN-1). All animation
++// phases derive from the passed-in time_ms (virtual in the harness — render
++// determinism rule §10.4); pulse shapes are a pinned triangle wave (no libm
++// transcendentals anywhere in the render path).
++
++import "core:math"
++import pp "../../core"
++import prun "../run"
++import rl "vendor:raylib"
++
++View :: struct {
++	palette:  ^Palette,
++	catalogs: ^pp.Catalogs,
++	win_w:    i32,
++	win_h:    i32,
++	scale:    f32,
++	off_x:    f32,
++	off_y:    f32,
++	tile_px:  f32,
++	world_w:  f32,
++	world_h:  f32,
++	font:     rl.Font,
++}
++
++// Selection/drag UI state lives in the app; the view only reads it.
++Selection :: struct {
++	node: u32,
++	pipe: u32,
++	hover_pipe: u32, // affordance: the pipe under the cursor gets a soft lift
++}
++
++Drag_State :: struct {
++	active:    bool,
++	from_node: u32,
++	wx, wy:    f32, // current world px
++	valid:     pp.Edit_Error,
++	cost:      i32,
++}
++
++view_compute :: proc(v: ^View, win_w, win_h: i32, bal: ^pp.Balance) {
++	v.win_w = win_w
++	v.win_h = win_h
++	v.tile_px = f32(bal.tile_px)
++	v.world_w = f32(bal.map_w_tiles) * v.tile_px
++	v.world_h = f32(bal.map_h_tiles) * v.tile_px
++	sx := f32(win_w) / v.world_w
++	sy := f32(win_h) / v.world_h
++	v.scale = min(sx, sy)
++	v.off_x = (f32(win_w) - v.world_w * v.scale) / 2
++	v.off_y = (f32(win_h) - v.world_h * v.scale) / 2
++}
++
++to_screen :: proc(v: ^View, wx, wy: f32) -> rl.Vector2 {
++	return {v.off_x + wx * v.scale, v.off_y + wy * v.scale}
++}
++
++from_screen :: proc(v: ^View, sx, sy: f32) -> (f32, f32) {
++	if v.scale <= 0 { return 0, 0 } // minimized window guard
++	return (sx - v.off_x) / v.scale, (sy - v.off_y) / v.scale
++}
++
++node_screen :: proc(v: ^View, pos: [2]i32) -> rl.Vector2 {
++	return to_screen(v, f32(pos[0]) * v.tile_px, f32(pos[1]) * v.tile_px)
++}
++
++// pinned triangle wave in [0,1] with the given period — the pulse shape
++triangle_pulse :: proc(time_ms: i64, period_ms: i64) -> f32 {
++	if period_ms <= 0 { return 0 }
++	phase := time_ms % period_ms
++	half := period_ms / 2
++	if phase < half {
++		return f32(phase) / f32(half)
++	}
++	return f32(period_ms - phase) / f32(half)
++}
++
++// --- the world pass -------------------------------------------------------------
++
++draw_world :: proc(v: ^View, snap: ^pp.Snapshot, mg: ^Map_Gen, time_ms: i64,
++				   sel: Selection, drag: Drag_State) {
++	map_draw(mg, v)
++	draw_pipes(v, snap, sel.hover_pipe)
++	draw_packets(v, snap)
++	draw_nodes(v, snap, time_ms, sel)
++	if drag.active { draw_ghost(v, snap, drag) }
++}
++
++// the control point lives in the run package (shared with the hit-test) —
++// one formula, so pixels and picking can't drift apart
++pipe_control :: proc(a, b: rl.Vector2, pair_idx: int) -> rl.Vector2 {
++	cx, cy := prun.pipe_control_point(a.x, a.y, b.x, b.y, pair_idx)
++	return {cx, cy}
++}
++
++draw_pipes :: proc(v: ^View, snap: ^pp.Snapshot, sel_hover: u32 = 0) {
++	p := v.palette
++	for pipe in snap.pipes {
++		na, oka := snap_node_pos(snap, pipe.a)
++		nb, okb := snap_node_pos(snap, pipe.b)
++		if !oka || !okb { continue }
++		a := node_screen(v, na)
++		b := node_screen(v, nb)
++		// pair index (how many earlier pipes share this unordered pair)
++		pair_idx := 0
++		for other in snap.pipes {
++			if other.id == pipe.id { break }
++			if (other.a == pipe.a && other.b == pipe.b) || (other.a == pipe.b && other.b == pipe.a) {
++				pair_idx += 1
++			}
++		}
++		ctrl := pipe_control(a, b, pair_idx)
++		pts := [3]rl.Vector2{a, ctrl, b}
++		tier_color := tier_pipe_color(v, pipe.tier)
++		width := tier_pipe_width(v, pipe.tier) * v.scale
++		rl.DrawSplineSegmentBezierQuadratic(pts[0], pts[1], pts[2], width, tier_color)
++		// the glowing core on fiber (the modernization read, A4)
++		if v.catalogs.pipe_tiers[pipe.tier].id == "wide" {
++			rl.DrawSplineSegmentBezierQuadratic(pts[0], pts[1], pts[2], width * 0.45, p.pipe_core)
++		}
++		// hover affordance (the pipe is clickable)
++		if sel_hover == pipe.id {
++			rl.DrawSplineSegmentBezierQuadratic(pts[0], pts[1], pts[2], width + 4 * v.scale, rl.Color{255, 252, 240, 110})
++		}
++		// the QoS dial marker at the visual midpoint (the decision, on the pipe)
++		if pipe.priority >= 0 {
++			mid := bezier_point(a, ctrl, b, 0.5)
++			cls := p.packet[pipe.priority]
++			rl.DrawCircleV(mid, 9 * v.scale, rl.Color{245, 239, 223, 240})
++			rl.DrawCircleLinesV(mid, 9 * v.scale, p.ink_soft)
++			draw_class_shape(v, i32(pipe.priority), {mid.x, mid.y - 1}, 5 * v.scale, cls)
++		}
++	}
++}
++
++bezier_point :: proc(a, c, b: rl.Vector2, t: f32) -> rl.Vector2 {
++	u := 1 - t
++	return {
++		u*u*a.x + 2*u*t*c.x + t*t*b.x,
++		u*u*a.y + 2*u*t*c.y + t*t*b.y,
++	}
++}
++
++snap_node_pos :: proc(snap: ^pp.Snapshot, id: u32) -> ([2]i32, bool) {
++	for n in snap.nodes {
++		if n.id == id { return n.pos, true }
++	}
++	return {}, false
++}
++
++tier_pipe_color :: proc(v: ^View, tier: u16) -> rl.Color {
++	id := v.catalogs.pipe_tiers[tier].id
++	switch id {
++	case "narrow": return v.palette.pipe_copper
++	case "standard": return v.palette.pipe_steel
++	case "wide": return v.palette.pipe_fiber
++	}
++	return v.palette.pipe_unalloc
++}
++
++tier_pipe_width :: proc(v: ^View, tier: u16) -> f32 {
++	id := v.catalogs.pipe_tiers[tier].id
++	switch id {
++	case "narrow": return 3.5
++	case "standard": return 5.5
++	case "wide": return 8.5
++	}
++	return 4.5
++}
++
++draw_nodes :: proc(v: ^View, snap: ^pp.Snapshot, time_ms: i64, sel: Selection) {
++	for n in snap.nodes {
++		c := node_screen(v, n.pos)
++		if n.kind == .Junction {
++			draw_router(v, n, c, time_ms, sel.node == n.id)
++		} else {
++			draw_building(v, n, c)
++		}
++		draw_health_ring(v, n, c, time_ms)
++	}
++}
++
++draw_building :: proc(v: ^View, n: pp.Snap_Node, c: rl.Vector2) {
++	p := v.palette
++	s := v.tile_px * v.scale
++	if n.role == .Content_Host {
++		// server/broadcast block + darker roof strip + play glyph (YouTune)
++		w := s * 1.15
++		h := s * 0.95
++		rl.DrawRectangleV({c.x - w/2, c.y - h/2 + s*0.12}, {w, h - s*0.12}, p.host_body)
++		rl.DrawRectangleV({c.x - w/2, c.y - h/2}, {w, s * 0.28}, p.host_roof)
++		// play triangle (brand glyph)
++		g := s * 0.22
++		v1 := rl.Vector2{c.x - g * 0.6, c.y - g * 0.8}
++		v2 := rl.Vector2{c.x - g * 0.6, c.y + g * 0.8}
++		v3 := rl.Vector2{c.x + g, c.y}
++		rl.DrawTriangle(v3, v2, v1, rl.Color{250, 246, 238, 255})
++		return
++	}
++	// residential: peaked-roof house, varied cheerful body + dark roof (A2)
++	variant := int(n.id) % 4
++	body := p.house_bodies[variant]
++	roof := p.house_roofs[variant]
++	w := s * 0.92
++	h := s * 0.62
++	left := c.x - w/2
++	top := c.y - h * 0.15
++	rl.DrawRectangleV({left, top}, {w, h}, body)
++	// roof triangle (ridge toward camera)
++	r1 := rl.Vector2{left - s * 0.06, top}
++	r2 := rl.Vector2{left + w + s * 0.06, top}
++	r3 := rl.Vector2{c.x, top - s * 0.42}
++	rl.DrawTriangle(r1, r3, r2, roof)
++	// door
++	dw := s * 0.16
++	rl.DrawRectangleV({c.x - dw/2, top + h - s * 0.3}, {dw, s * 0.3}, roof)
++}
++
++draw_router :: proc(v: ^View, n: pp.Snap_Node, c: rl.Vector2, time_ms: i64, selected: bool) {
++	p := v.palette
++	// capacity-scaled puck (A3): ports -> size
++	base := v.tile_px * v.scale * 0.5
++	r := base * (0.85 + 0.15 * f32(max(1, n.ports) / 4))
++	if n.ports >= 16 { r = base * 1.35 } else if n.ports >= 8 { r = base * 1.1 }
++	rl.DrawCircleV(c, r, p.router_body)
++	rl.DrawCircleV(c, r * 0.45, p.router_dark) // the glowing core
++	// the LED ring = the ports (lit = free, dim = used) — canon #14 made visible
++	// LED positions on a pinned 16-gon (4/8/16 ports all divide 16) — no
++	// transcendentals in rendered geometry (the §10.4 render rule)
++	leds := max(4, int(n.ports))
++	stride := 16 / leds
++	circle := CIRCLE16
++	for i in 0 ..< leds {
++		k := (i * stride + 12) % 16 // start at the top
++		pos := rl.Vector2{
++			c.x + circle[k][0] * r * 0.78,
++			c.y + circle[k][1] * r * 0.78,
++		}
++		col := p.router_led
++		if i < int(n.ports_used) { col = rl.Color{90, 98, 104, 255} } // used = dim
++		rl.DrawCircleV(pos, max(1.5, r * 0.09), col)
++	}
++	if n.lb_weighted {
++		// smart LB marker: a second inner ring hint
++		rl.DrawRingLines(c, r*0.55, r*0.62, 0, 360, 24, p.router_led)
++	}
++	if n.triage >= 0 {
++		// triage badge: the prioritized class glyph above the puck
++		draw_class_shape(v, n.triage, {c.x, c.y - r - 8 * v.scale}, 5 * v.scale, p.packet[n.triage])
++	}
++	if selected {
++		rl.DrawRingLines(c, r + 2, r + 4, 0, 360, 32, p.ink)
++	}
++}
++
++draw_health_ring :: proc(v: ^View, n: pp.Snap_Node, c: rl.Vector2, time_ms: i64) {
++	if n.health == .Healthy { return }
++	p := v.palette
++	col := p.state_strain
++	period := i64(833) // ~1.2 Hz
++	glyph := "!"
++	if n.health == .Critical {
++		col = p.state_critical
++		period = 400 // ~2.5 Hz
++		glyph = "!!"
++	}
++	pulse := triangle_pulse(time_ms, period)
++	base := v.tile_px * v.scale * 0.75
++	r := base + pulse * 3 * v.scale
++	rl.DrawRingLines(c, r, r + 2.5, 0, 360, 32, col)
++	// the icon channel (never color alone, UX-DR4)
++	buf: [8]u8
++	copy(buf[:], glyph)
++	draw_text(v, string(buf[:len(glyph)]), {c.x + base + 2, c.y - base - 6}, 15 * v.scale, col)
++}
++
++draw_packets :: proc(v: ^View, snap: ^pp.Snapshot) {
++	for pkt in snap.packets {
++		c: rl.Vector2
++		if pkt.pipe == 0 {
++			np, ok := snap_node_pos(snap, pkt.node)
++			if !ok { continue }
++			c = node_screen(v, np)
++		} else {
++			// ride the same bezier the pipe renders as (A4) — dots follow the curve
++			found := false
++			for pipe in snap.pipes {
++				if pipe.id != pkt.pipe { continue }
++				na, oka := snap_node_pos(snap, pipe.a)
++				nb, okb := snap_node_pos(snap, pipe.b)
++				if !oka || !okb { break }
++				a := node_screen(v, na)
++				b := node_screen(v, nb)
++				pair_idx := 0
++				for other in snap.pipes {
++					if other.id == pipe.id { break }
++					if (other.a == pipe.a && other.b == pipe.b) || (other.a == pipe.b && other.b == pipe.a) {
++						pair_idx += 1
++					}
++				}
++				ctrl := pipe_control(a, b, pair_idx)
++				c = bezier_point(a, ctrl, b, f32(pkt.frac_q8) / 256)
++				found = true
++				break
++			}
++			if !found { continue }
++		}
++		col := v.palette.packet[pkt.class]
++		size: f32 = 4.2
++		if pkt.class == 1 { size = 6.4 } // streaming reads as the flood
++		draw_class_shape(v, i32(pkt.class), c, size * v.scale, col)
++	}
++}
++
++// shape + color (never color alone, §5): email = circle, streaming = triangle
++draw_class_shape :: proc(v: ^View, class: i32, c: rl.Vector2, r: f32, col: rl.Color) {
++	// (class shapes beyond the PROTO roster draw as circles — shape system is [LATER])
++	if class == 1 {
++		v1 := rl.Vector2{c.x, c.y - r}
++		v2 := rl.Vector2{c.x - r * 0.9, c.y + r * 0.7}
++		v3 := rl.Vector2{c.x + r * 0.9, c.y + r * 0.7}
++		rl.DrawTriangle(v1, v2, v3, col)
++		return
++	}
++	rl.DrawCircleV(c, r, col)
++}
++
++draw_ghost :: proc(v: ^View, snap: ^pp.Snapshot, drag: Drag_State) {
++	p := v.palette
++	from_pos, ok := snap_node_pos(snap, drag.from_node)
++	if !ok { return }
++	a := node_screen(v, from_pos)
++	b := to_screen(v, drag.wx, drag.wy)
++	ctrl := pipe_control(a, b, 0)
++	col := p.pipe_steel
++	if drag.valid != .None { col = p.state_critical }
++	rl.DrawSplineSegmentBezierQuadratic(a, ctrl, b, 5 * v.scale, {col.r, col.g, col.b, 190})
++	if drag.valid == .None && drag.cost > 0 {
++		buf: [32]u8
++		txt := fmt_bprintf(buf[:], "-%d", drag.cost)
++		draw_text(v, txt, {b.x + 10, b.y - 14}, 14, p.ink_soft)
++	}
++}
++
++draw_text :: proc(v: ^View, txt: string, pos: rl.Vector2, size: f32, col: rl.Color) {
++	cbuf: [256]u8
++	n := min(len(txt), 250)
++	for i in 0 ..< n { cbuf[i] = txt[i] }
++	cbuf[n] = 0
++	rl.DrawTextEx(v.font, cstring(&cbuf[0]), pos, size, 1, col)
++}
++
++fmt_bprintf :: proc(buf: []u8, format: string, args: ..any) -> string {
++	n := 0
++	// minimal: supports %d only (HUD numerals)
++	ai := 0
++	i := 0
++	for i < len(format) {
++		if format[i] == '%' && i + 1 < len(format) && format[i+1] == '%' {
++			buf[n] = '%'
++			n += 1
++			i += 2
++			continue
++		}
++		if format[i] == '%' && i + 1 < len(format) && format[i+1] == 'd' {
++			if ai < len(args) {
++				if val, ok := args[ai].(int); ok {
++					n += write_int(buf[n:], val)
++				} else if val32, ok2 := args[ai].(i32); ok2 {
++					n += write_int(buf[n:], int(val32))
++				} else if valu, ok3 := args[ai].(u64); ok3 {
++					n += write_uint(buf[n:], valu)
++				}
++				ai += 1
++			}
++			i += 2
++		} else {
++			buf[n] = format[i]
++			n += 1
++			i += 1
++		}
++	}
++	return string(buf[:n])
++}
++
++write_int :: proc(buf: []u8, v: int) -> int {
++	if v < 0 {
++		buf[0] = '-'
++		return 1 + write_uint(buf[1:], u64(-v))
++	}
++	return write_uint(buf, u64(v))
++}
++
++write_uint :: proc(buf: []u8, v: u64) -> int {
++	tmp: [20]u8
++	n := 0
++	x := v
++	if x == 0 { tmp[0] = '0'; n = 1 }
++	for x > 0 {
++		tmp[n] = u8('0' + x % 10)
++		x /= 10
++		n += 1
++	}
++	for i in 0 ..< n { buf[i] = tmp[n-1-i] }
++	return n
++}
++
++// unit circle, 16 points (k * 22.5 deg), correctly-rounded decimal constants —
++// identical on every platform (no libm cos/sin anywhere in the render path)
++CIRCLE16 :: [16][2]f32{
++	{ 1.00000000,  0.00000000},
++	{ 0.92387954,  0.38268343},
++	{ 0.70710678,  0.70710678},
++	{ 0.38268343,  0.92387954},
++	{ 0.00000000,  1.00000000},
++	{-0.38268343,  0.92387954},
++	{-0.70710678,  0.70710678},
++	{-0.92387954,  0.38268343},
++	{-1.00000000,  0.00000000},
++	{-0.92387954, -0.38268343},
++	{-0.70710678, -0.70710678},
++	{-0.38268343, -0.92387954},
++	{ 0.00000000, -1.00000000},
++	{ 0.38268343, -0.92387954},
++	{ 0.70710678, -0.70710678},
++	{ 0.92387954, -0.38268343},
++}
+diff --git a/app/run/autopilot.odin b/app/run/autopilot.odin
+new file mode 100644
+index 0000000..5a1d215
+--- /dev/null
++++ b/app/run/autopilot.odin
+@@ -0,0 +1,22 @@
++package run
++
++// autopilot.odin — the demo autopilot (app-side convenience + harness demos):
++// wires the boot network, then meshes each growth spawn (routers first, then
++// houses) through the command bus — the exact player path, so autopilot runs
++// land in the action log and replay bit-for-bit.
++
++import pp "../../core"
++
++App_Mode :: pp.App_Mode
++
++autopilot_boot :: proc(rc: ^Run_Context) {
++	pp.testkit_wire_boot(rc.state, rc.state.tick)
++	for i in 0 ..< len(rc.state.topology.node_alive) {
++		rc.autopilot_wired[rc.state.topology.node_id[i]] = true
++	}
++	resnapshot(rc)
++}
++
++autopilot_tick :: proc(rc: ^Run_Context) {
++	pp.testkit_autowire(rc.state, rc.state.tick, &rc.autopilot_wired)
++}
+diff --git a/app/run/catalogs.odin b/app/run/catalogs.odin
+new file mode 100644
+index 0000000..e7f9b40
+--- /dev/null
++++ b/app/run/catalogs.odin
+@@ -0,0 +1,42 @@
++package run
++
++// catalogs.odin — catalog loading at the APP layer (ODN-5): release builds use
++// the #load-embedded bytes; dev builds prefer data/ on disk when present
++// (edit -> restart -> test). The core only ever sees bytes.
++
++import "core:fmt"
++import "core:os"
++import pp "../../core"
++
++embedded_sources :: proc(src: ^pp.Catalog_Sources) {
++	src.packet_types = #load("../../data/packet_types.json")
++	src.pipe_tiers   = #load("../../data/pipe_tiers.json")
++	src.node_types   = #load("../../data/node_types.json")
++	src.demand       = #load("../../data/demand.json")
++	src.crises       = #load("../../data/crises.json")
++	src.balance      = #load("../../data/balance.json")
++}
++
++DATA_DIR :: "../../data" // resolved at runtime from the executable's cwd in dev
++
++// Load catalogs: data/ files when the directory exists (dev), else embedded.
++// Fail-fast: a catalog error aborts startup with a named error (ODN-5).
++load_catalogs :: proc(data_dir: string = "data") -> (^pp.Catalogs, pp.Catalog_Error) {
++	src: pp.Catalog_Sources
++	embedded_sources(&src)
++	read_or_keep :: proc(dir, name: string, dst: ^[]byte) {
++		path := fmt.tprintf("%s/%s", dir, name)
++		if data, err := os.read_entire_file_from_path(path, context.allocator); err == nil {
++			dst^ = data
++		}
++	}
++	if os.is_dir(data_dir) {
++		read_or_keep(data_dir, "packet_types.json", &src.packet_types)
++		read_or_keep(data_dir, "pipe_tiers.json", &src.pipe_tiers)
++		read_or_keep(data_dir, "node_types.json", &src.node_types)
++		read_or_keep(data_dir, "demand.json", &src.demand)
++		read_or_keep(data_dir, "crises.json", &src.crises)
++		read_or_keep(data_dir, "balance.json", &src.balance)
++	}
++	return pp.catalogs_load(&src)
++}
+diff --git a/app/run/driver_test.odin b/app/run/driver_test.odin
+new file mode 100644
+index 0000000..6a62b13
+--- /dev/null
++++ b/app/run/driver_test.odin
+@@ -0,0 +1,91 @@
++package run
++
++// driver_test.odin — the fixed-timestep accumulator contracts (ODN-2/E21):
++// exact pacing, catch-up capped, bounded debt (slow-mo, never skip), and the
++// paused/ended gates. Plus the E4 snap inclusivity and paused-state edits
++// (pause-and-plan doctrine: edits land while the sim is frozen).
++
++import "core:testing"
++import pp "../../core"
++
++driver_fixture :: proc(t: ^testing.T) -> ^Run_Context {
++	cat, cerr := pp.must_catalogs()
++	if cerr.file != "" { tfail(t, "catalogs") }
++	rc := new(Run_Context)
++	run_context_create(rc, 42, cat)
++	return rc
++}
++
++@(test)
++test_driver_exact_pacing :: proc(t: ^testing.T) {
++	rc := driver_fixture(t)
++	// ten 100ms frames at 10 Hz = exactly 10 ticks
++	for _ in 0 ..< 10 { sim_driver_update(&rc.driver, rc.state, 0.1) }
++	if rc.driver.tick != 10 { tfailf(t, "tick %d, want 10", rc.driver.tick) }
++}
++
++@(test)
++test_driver_catchup_capped_and_bounded :: proc(t: ^testing.T) {
++	rc := driver_fixture(t)
++	// a 0.25s stall (the clamp) = 2.5 ticks of debt; cap is 5 steps — fine
++	sim_driver_update(&rc.driver, rc.state, 0.25)
++	if rc.driver.tick != 2 { tfailf(t, "tick %d, want 2 (clamped)", rc.driver.tick) }
++	// synthetic 10s stall: clamped to 0.25 per call... call directly with a
++	// huge dt to prove the clamp engages
++	sim_driver_update(&rc.driver, rc.state, 10.0)
++	if rc.driver.tick > 2 + 5 { tfailf(t, "catch-up exceeded the cap: %d", rc.driver.tick) }
++	// bounded debt: never more than one tick carried after a capped frame
++	if rc.driver.accumulator > rc.driver.tick_seconds {
++		tfailf(t, "accumulator %f exceeds one tick (slow-mo, never skip)", rc.driver.accumulator)
++	}
++}
++
++@(test)
++test_run_update_gates :: proc(t: ^testing.T) {
++	rc := driver_fixture(t)
++	rc.paused = true
++	run_update(rc, 0.1)
++	if rc.driver.tick != 0 { tfail(t, "paused must not step") }
++	rc.paused = false
++	run_update(rc, 0.1)
++	if rc.driver.tick != 1 { tfail(t, "unpaused steps") }
++	rc.ended = true
++	run_update(rc, 0.1)
++	if rc.driver.tick != 1 { tfail(t, "ended must not step") }
++}
++
++@(test)
++test_snap_inclusive_boundary :: proc(t: ^testing.T) {
++	// E4: the snap radius is INCLUSIVE (<=); ties break to the lower id.
++	rc := driver_fixture(t)
++	tp := &rc.state.topology
++	tile := f64(rc.catalogs.balance.tile_px)
++	radius := f64(rc.catalogs.balance.snap_radius) * 1.6
++	// node id 2 at (8,5): world px (208, 130). Integer metric: radius rounds to 58.
++	nx := f64(tp.node_pos[1][0]) * tile
++	ny := f64(tp.node_pos[1][1]) * tile
++	ri := f64(i64(radius + 0.5))
++	id, ok := snap_node(rc, nx + ri, ny)
++	if !ok || id != 2 { tfailf(t, "boundary must snap (inclusive): got %d %v", id, ok) }
++	_, ok2 := snap_node(rc, nx + ri + 1.0, ny)
++	if ok2 { tfail(t, "past the radius must not snap") }
++}
++
++@(test)
++test_paused_edits_apply_immediately :: proc(t: ^testing.T) {
++	// pause-and-plan: a draw while paused lands NOW (fast-path), is logged
++	// with apply_tick = next tick, and replays identically.
++	rc := driver_fixture(t)
++	rc.paused = true
++	run_update(rc, 0.1) // no step while paused
++	wide, _ := pp.tier_index(rc.catalogs, "wide")
++	cmd := pp.Command{kind = pp.Cmd_Draw_Pipe{a = 1, b = 6, tier = wide}}
++	err := bus_submit(rc, cmd)
++	if err != .None { tfailf(t, "paused draw: %v", err) }
++	if len(rc.state.action_log) != 1 { tfail(t, "logged") }
++	if rc.state.action_log[0].apply_tick != 1 { tfail(t, "apply_tick = next tick") }
++	// visible immediately (sim frozen at tick 0)
++	pipes := 0
++	for a in rc.state.topology.pipe_alive { if a { pipes += 1 } }
++	if pipes != 1 { tfail(t, "the edit must land while paused") }
++}
+diff --git a/app/run/run.odin b/app/run/run.odin
+new file mode 100644
+index 0000000..e2748ee
+--- /dev/null
++++ b/app/run/run.odin
+@@ -0,0 +1,137 @@
++package run
++
++// run.odin — the orchestration layer (architecture §4): owns the Run context
++// (core state + fixed-timestep driver + command bus + action log), the ODN-2
++// edit fast-path, and catalog loading. No raylib imports here — this package
++// is shared by the game (app/) and the golden harness (harness/).
++
++import "core:mem"
++import pp "../../core"
++
++TICK_SECONDS :: 0.1 // derived from balance.logic_hz at boot (catalog is the single source)
++MAX_STEPS_PER_FRAME :: 5
++MAX_FRAME_DELTA :: 0.25
++
++// Sim_Driver — the ONLY code that knows about real time (ODN-2). Fixed-tick
++// accumulator; slow-mo under overload, never tick-skipping (E21).
++Sim_Driver :: struct {
++	accumulator: f64,
++	tick:        u64,
++	tick_seconds: f64,
++}
++
++sim_driver_update :: proc(d: ^Sim_Driver, state: ^pp.Run_State, frame_dt: f64) {
++	dt := min(frame_dt, MAX_FRAME_DELTA)
++	d.accumulator += dt
++	steps := 0
++	for d.accumulator >= d.tick_seconds && steps < MAX_STEPS_PER_FRAME {
++		d.tick += 1
++		pp.step(state, d.tick, {})
++		d.accumulator -= d.tick_seconds
++		steps += 1
++	}
++	// bounded catch-up debt: excess time carries as slow-mo (E21), never
++	// discarded ticks
++	d.accumulator = min(d.accumulator, d.tick_seconds)
++}
++
++// Run_Context — one run's whole world (ODN-13: created per run, destroyed per
++// run; reset is "make a new one").
++Run_Context :: struct {
++	state:    ^pp.Run_State,
++	driver:   Sim_Driver,
++	snapshot: pp.Snapshot,
++	catalogs: ^pp.Catalogs,
++	arena:    mem.Arena,
++	arena_buf: []u8,
++	paused:   bool,
++	ended:    bool, // health.won || health.lost latched
++	autopilot_wired: map[u32]bool,
++}
++
++ARENA_SIZE :: 16 * 1024 * 1024
++
++run_context_create :: proc(rc: ^Run_Context, seed: u64, catalogs: ^pp.Catalogs) {
++	rc.arena_buf = make([]u8, ARENA_SIZE)
++	mem.arena_init(&rc.arena, rc.arena_buf)
++	alloc := mem.arena_allocator(&rc.arena)
++	rc.state = new(pp.Run_State, alloc)
++	pp.run_init(rc.state, seed, catalogs, alloc)
++	rc.catalogs = catalogs
++	rc.driver.tick = 0
++	rc.driver.accumulator = 0
++	rc.driver.tick_seconds = 1.0 / f64(catalogs.balance.logic_hz)
++	rc.paused = false
++	rc.ended = false
++	rc.autopilot_wired = make(map[u32]bool)
++	resnapshot(rc)
++}
++
++// bare fixture (harness demos with `map bare`): no bootstrap map, no growth.
++run_context_create_bare :: proc(rc: ^Run_Context, seed: u64, catalogs: ^pp.Catalogs) {
++	rc.arena_buf = make([]u8, ARENA_SIZE)
++	mem.arena_init(&rc.arena, rc.arena_buf)
++	alloc := mem.arena_allocator(&rc.arena)
++	rc.state = new(pp.Run_State, alloc)
++	pp.run_init_bare(rc.state, seed, catalogs, alloc)
++	rc.catalogs = catalogs
++	rc.driver.tick = 0
++	rc.driver.accumulator = 0
++	rc.driver.tick_seconds = 1.0 / f64(catalogs.balance.logic_hz)
++	rc.paused = false
++	rc.ended = false
++	rc.autopilot_wired = make(map[u32]bool)
++	resnapshot(rc)
++}
++
++run_context_destroy :: proc(rc: ^Run_Context) {
++	delete(rc.snapshot.nodes)
++	delete(rc.snapshot.pipes)
++	delete(rc.snapshot.packets)
++	delete(rc.snapshot.classes)
++	delete(rc.snapshot.forecasts)
++	delete(rc.autopilot_wired)
++	delete(rc.arena_buf)
++	rc.state = nil
++}
++
++resnapshot :: proc(rc: ^Run_Context) {
++	// permanent allocator: the snapshot must survive per-tick temp resets
++	pp.snapshot_write(&rc.snapshot, rc.state, context.allocator)
++}
++
++// Advance by a wall-clock frame (the app's path). Drains nothing; the caller
++// drains events after the frame's steps (ODN-14).
++run_update :: proc(rc: ^Run_Context, frame_dt: f64) {
++	if rc.paused || rc.ended { return }
++	sim_driver_update(&rc.driver, rc.state, frame_dt)
++	if rc.state.health.won || rc.state.health.lost {
++		rc.ended = true
++	}
++	resnapshot(rc)
++}
++
++// --- the command bus (ODN-12 + the ODN-2 edit fast-path) ----------------------
++//
++// THE PINNED CONVENTION (Perkins r1 replay-divergence lesson): a live edit
++// applies IMMEDIATELY (even paused) with apply_tick = state.tick + 1 — the
++// next tick the sim will execute — and is logged with that apply_tick. Replay
++// applies all entries with apply_tick == N before stepping N, so live play
++// and replay see identical state at every step boundary.
++
++bus_submit :: proc(rc: ^Run_Context, cmd: pp.Command) -> pp.Edit_Error {
++	apply_tick := rc.state.tick + 1
++	nb, _, err := pp.topology_apply_edit(&rc.state.topology, cmd, rc.state.catalogs, rc.state.budget, apply_tick)
++	if err != .None { return err }
++	rc.state.budget = nb
++	logged := cmd
++	logged.apply_tick = apply_tick
++	append(&rc.state.action_log, logged)
++	resnapshot(rc) // the player sees the edit land instantly
++	return .None
++}
++
++// Validation preview (UI hints / draw ghost) without mutating.
++bus_preview :: proc(rc: ^Run_Context, cmd: pp.Command) -> pp.Edit_Error {
++	return pp.validate_command(&rc.state.topology, cmd, rc.state.catalogs, rc.state.budget)
++}
+diff --git a/app/run/snap.odin b/app/run/snap.odin
+new file mode 100644
+index 0000000..6f852a9
+--- /dev/null
++++ b/app/run/snap.odin
+@@ -0,0 +1,132 @@
++package run
++
++// snap.odin — the Command_Bus's snap-to-node (ODN-12): pointer positions
++// resolve to node ids HERE (the bus), inclusive at the snap radius (E4), so
++// core commands always carry resolved ids and the action log stores
++// post-snap truth. Integer Euclidean² metric (the pinned distance metric).
++
++import pp "../../core"
++
++// Find the nearest live node to a world-pixel point within the snap radius
++// (INCLUSIVE, E4). The metric is integer-pixel Euclidean^2 (rounded) — exact
++// at the boundary, no float-ulp fragility. Ties break to the lower id.
++snap_node :: proc(rc: ^Run_Context, wx_px, wy_px: f64) -> (u32, bool) {
++	t := &rc.state.topology
++	tile := f64(rc.catalogs.balance.tile_px)
++	// the reference's screen-space generosity factor (1.6x), rounded to int px
++	radius_i := i64(f64(rc.catalogs.balance.snap_radius) * 1.6 + 0.5)
++	r2 := radius_i * radius_i
++	best: u32 = 0
++	best_d2 := r2
++	found := false
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		nx := f64(t.node_pos[i][0]) * tile
++		ny := f64(t.node_pos[i][1]) * tile
++		dx := i64(nx - wx_px + 0.5) if nx >= wx_px else i64(nx - wx_px - 0.5)
++		dy := i64(ny - wy_px + 0.5) if ny >= wy_px else i64(ny - wy_px - 0.5)
++		d2 := dx*dx + dy*dy
++		if d2 <= best_d2 {
++			if d2 == best_d2 && found && t.node_id[i] > best { continue }
++			best = t.node_id[i]
++			best_d2 = d2
++			found = true
++		}
++	}
++	return best, found
++}
++
++// Nearest live pipe to a world-pixel point (for select/priority/demolish).
++// Distance to the RENDERED bezier (sampled polyline), not the straight chord —
++// clicking the visible curve is what hits (the chord can be 30+ px away).
++nearest_pipe :: proc(rc: ^Run_Context, wx_px, wy_px: f64, tolerance_px: f64) -> (u32, bool) {
++	t := &rc.state.topology
++	tile := f64(rc.catalogs.balance.tile_px)
++	best: u32 = 0
++	best_d := tolerance_px
++	found := false
++	for i in 0 ..< len(t.pipe_alive) {
++		if !t.pipe_alive[i] { continue }
++		sa, oka := t.node_by_id[t.pipe_a[i]]
++		sb, okb := t.node_by_id[t.pipe_b[i]]
++		if !oka || !okb { continue }
++		ax := f32(f64(t.node_pos[sa][0]) * tile)
++		ay := f32(f64(t.node_pos[sa][1]) * tile)
++		bx := f32(f64(t.node_pos[sb][0]) * tile)
++		by := f32(f64(t.node_pos[sb][1]) * tile)
++		// pair index (how many earlier live pipes share this unordered pair)
++		pair_idx := 0
++		for j in 0 ..< i {
++			if !t.pipe_alive[j] { continue }
++			if (t.pipe_a[j] == t.pipe_a[i] && t.pipe_b[j] == t.pipe_b[i]) ||
++			   (t.pipe_a[j] == t.pipe_b[i] && t.pipe_b[j] == t.pipe_a[i]) {
++				pair_idx += 1
++			}
++		}
++		cx, cy := pipe_control_point(ax, ay, bx, by, pair_idx)
++		// sample the curve; min distance over the polyline
++		px0, py0 := ax, ay
++		SEG :: 16
++		for s_i in 1 ..= SEG {
++			px1, py1 := bezier_eval(ax, ay, cx, cy, bx, by, f32(s_i) / SEG)
++			d := point_seg_dist(wx_px, wy_px, f64(px0), f64(py0), f64(px1), f64(py1))
++			if d <= best_d {
++				if d == best_d && found && t.pipe_id[i] > best { } else {
++					best = t.pipe_id[i]
++					best_d = d
++					found = true
++				}
++			}
++			px0, py0 = px1, py1
++		}
++	}
++	return best, found
++}
++
++// The bezier control point every pipe renders with (shared with the view —
++// ONE formula, so the hit-test path and the pixel path can't drift apart).
++// Side/magnitude derive from the pair index so parallel pipes curve apart.
++pipe_control_point :: proc(ax, ay, bx, by: f32, pair_idx: int) -> (f32, f32) {
++	mx := (ax + bx) / 2
++	my := (ay + by) / 2
++	dx := bx - ax
++	dy := by - ay
++	length := f32(sqrt_f64(f64(dx*dx + dy*dy)))
++	if length <= 0 { return mx, my }
++	side: f32 = 1 if pair_idx % 2 == 0 else -1
++	mag := length * 0.10 * side * f32(1 + pair_idx / 2)
++	return mx + (-dy / length) * mag, my + (dx / length) * mag
++}
++
++bezier_eval :: proc(ax, ay, cx, cy, bx, by, t: f32) -> (f32, f32) {
++	u := 1 - t
++	return u*u*ax + 2*u*t*cx + t*t*bx, u*u*ay + 2*u*t*cy + t*t*by
++}
++
++point_seg_dist :: proc(px, py, ax, ay, bx, by: f64) -> f64 {
++	dx := bx - ax
++	dy := by - ay
++	l2 := dx*dx + dy*dy
++	if l2 <= 0 { return sqrt_f64((px-ax)*(px-ax) + (py-ay)*(py-ay)) }
++	t := ((px-ax)*dx + (py-ay)*dy) / l2
++	t = clamp_f64(t, 0, 1)
++	cx := ax + t*dx
++	cy := ay + t*dy
++	return sqrt_f64((px-cx)*(px-cx) + (py-cy)*(py-cy))
++}
++
++// View-side float math (never sim state).
++sqrt_f64 :: proc(x: f64) -> f64 {
++	if x <= 0 { return 0 }
++	g := x
++	for _ in 0 ..< 32 {
++		g = (g + x/g) / 2
++	}
++	return g
++}
++
++clamp_f64 :: proc(v, lo, hi: f64) -> f64 {
++	if v < lo { return lo }
++	if v > hi { return hi }
++	return v
++}
+diff --git a/app/run/testutil_test.odin b/app/run/testutil_test.odin
+new file mode 100644
+index 0000000..a3eedbc
+--- /dev/null
++++ b/app/run/testutil_test.odin
+@@ -0,0 +1,12 @@
++package run
++
++import "core:testing"
++
++tfail :: proc(t: ^testing.T, msg: string) -> ! {
++	testing.fail_now(t, msg)
++}
++
++tfailf :: proc(t: ^testing.T, format: string, args: ..any) -> ! {
++	testing.expectf(t, false, format, ..args)
++	testing.fail_now(t)
++}

@@ -1,0 +1,62 @@
+[
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "runtime-crash",
+    "title": "MSAA_4X_HINT causes SIGTRAP in the Metal-GL render pass on macOS — crashes at first EndDrawing",
+    "location": "app/main.odin:58",
+    "evidence": "app/main.odin:58-59:\n\trl.SetConfigFlags({.WINDOW_RESIZABLE, .MSAA_4X_HINT})\n\trl.InitWindow(1280, 720, \"Packet Plumber - Odin prototype\")\nFix commit 2d99afd (4 commits after the reviewed sha on odin-prototype): \"fix: drop MSAA on macOS (SIGTRAP in the Metal-GL render pass); add --soak self-play mode\" / \"The crash stack ran through IOGPU/Metal command-buffer allocation inside EndDrawing — the deprecated macOS OpenGL paths MSAA framebuffer. Removed MSAA_4X_HINT; flat-color vector art barely notices.\"",
+    "detail": "The A/B's desktop target is macOS; the reviewed build traps inside EndDrawing on every frame. The minion fixed it post-review by removing the flag, so the bug is real and verified.",
+    "recommended_fix": "Remove .MSAA_4X_HINT from SetConfigFlags({.WINDOW_RESIZABLE}) — exactly what fix commit 2d99afd does."
+  },
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "runtime-crash",
+    "title": "Dangling hint string — right-clicking a pipe (QoS toast) SIGTRAPs next frame",
+    "location": "app/main.odin:336,369 + app/main.odin:71",
+    "evidence": "app/main.odin:336:\n\t\tset_hint(app, fmt.tprintf(\"%s gets the Express lane on this pipe\", name), frame_ms)\napp/main.odin:368-369:\nset_hint :: proc(app: ^App, msg: string, frame_ms: i64, ttl_ms: i64 = 2600) {\n\tapp.hint = msg\napp/main.odin:71:\n\t\tfree_all(context.temp_allocator) // frame arena discipline (ODN-18)\nFix commit 650683d: \"set_hint stored caller strings directly; the QoS/crisis toasts are fmt.tprintf'd (temp allocator) and the frame arena resets every frame -> the HUD read a dangling string next frame -> SIGTRAP on play (hit on any right-click).\"",
+    "detail": "fmt.tprintf allocates from the temp arena; the next frame's free_all frees the string while app.hint still points at it, so the HUD dereferences freed memory. The core QoS interaction crashes the game.",
+    "recommended_fix": "Copy hint strings into an app-owned buffer (e.g. App.hint_buf [256]u8) in set_hint, as fix commit 650683d does."
+  },
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "runtime-crash",
+    "title": "Restart (R key) aborts with SIGABRT — snapshot arrays arena-allocated, heap-deleted (mixed allocators)",
+    "location": "app/run/run.odin:98-100 + core/run.odin:80,112",
+    "evidence": "app/run/run.odin:98-100:\nresnapshot :: proc(rc: ^Run_Context) {\n\t// permanent allocator: the snapshot must survive per-tick temp resets\n\tpp.snapshot_write(&rc.snapshot, rc.state, context.allocator)\n}\ncore/run.odin:80: \tcontext.allocator = allocator   (run_init_bare)\ncore/run.odin:112: \tcontext.allocator = state.allocator   (step)\nFix commit 6b84abc: \"run_init/step left context.allocator pointing at the run arena; snapshot arrays were then allocated from the arena but deleted with the heap in run_context_destroy ('pointer being freed was not allocated' on restart)\" + regression test test_restart_cycles_clean: \"restart/destroy freed arena-backed snapshot arrays with the heap (mixed allocators -> SIGABRT)\".",
+    "detail": "core.run_init/step mutate the caller's context.allocator to the run arena and never restore; resnapshot then allocates snapshot arrays from the arena while run_context_destroy deletes them via the heap. Every R-restart aborts.",
+    "recommended_fix": "Capture the caller's heap allocator at run_context_create, allocate/delete snapshots against it, and save/restore context.allocator around step — as fix commit 6b84abc does."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "ui",
+    "title": "Junction-triage buttons label the classes swapped: 'stream' sets triage 0 = email, 'email' sets triage 1 = streaming",
+    "location": "app/main.odin:267,271 + app/render/hud.odin:266",
+    "evidence": "app/main.odin:267,271:\n\t\tlabels := [3]string{\"none\", \"stream\", \"email\"}\n\t\t\t\ttriage := i32(i - 1)\napp/render/hud.odin:266:\n\t\tactive := (i == 0 && n.triage < 0) || (i > 0 && n.triage == i32(i - 1))\ndata/packet_types.json entries order: entries[0].id = \"email\", entries[1].id = \"streaming\"\ncore/qos.odin:56-57:\n\tif junction_triage >= 0 {\n\t\treturn .Express if i32(class) == junction_triage else .Best",
+    "detail": "Class 0 is email and class 1 is streaming, so the button labeled 'stream' promotes email (triage 0) and the highlight lights 'stream' when email is triaged. The player cannot actually prioritize streaming through the router.",
+    "recommended_fix": "Swap the labels to {\"none\", \"email\", \"stream\"} in popover_click and draw_frame's draw_router_popover call, or resolve triage by class_index name instead of i-1."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "hygiene",
+    "title": "Committed app.bin — 2MB macOS arm64 build artifact tracked in the repo root",
+    "location": "app.bin (repo root, tracked)",
+    "evidence": "git ls-files -s app.bin → 100755 4aaf130a4825b3b67a49e713b76ee83b9e244843 0 app.bin\nfile app.bin → app.bin: Mach-O 64-bit executable arm64\n.gitignore lists 'bin/' and 'goldens/_reports/' but not app.bin\nPost-review fix commits re-commit it: 'app.bin | Bin 2057480 -> 2058056 bytes' (650683d) — so the artifact is actively re-committed on every build.",
+    "detail": "A platform-specific binary bloats the repo (2MB per commit), cannot run on Linux/Windows checkouts, and drifts from source — the committed app.bin already lacks the crash fixes.",
+    "recommended_fix": "git rm --cached app.bin and add 'app.bin' to .gitignore; builds already output to bin/, which is ignored."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "App struct orphan fields: mode, press_valid, autopilot_wired, cosmetic_rng — written, never read",
+    "location": "app/main.odin:29,34,39,44",
+    "evidence": "app/main.odin:29 press_valid: bool,; :34 autopilot_wired: map[u32]bool,; :39 cosmetic_rng: pp.Rng, // ODN-15 - cosmetics only, never the sim's; :44 mode: prun.App_Mode,\nRepo-wide grep: app.mode only at main.odin:44 (.Boot) and :116 (.Run) — no reads; press_valid only written at :197/:203; app.autopilot_wired only written at :114/:160 (the live autopilot map is rc.autopilot_wired, wired in app/run/autopilot.odin:15); pp.rng_seed(&app.cosmetic_rng, ...) at :64 with no consumer anywhere in app/, core/, harness/.",
+    "detail": "Four App fields carry state nothing reads: the FSM field, the drag-validity flag, a second autopilot wiring map (autopilot_boot already wires rc.autopilot_wired), and an ODN-15 cosmetic RNG no cosmetic system consumes.",
+    "recommended_fix": "Delete the fields plus the redundant wiring loop at main.odin:158-161, or actually route cosmetic effects through cosmetic_rng as the ODN-15 comment claims."
+  }
+]

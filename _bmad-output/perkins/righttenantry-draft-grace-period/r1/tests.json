@@ -1,0 +1,42 @@
+[
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Active-status-but-expired vacancy lost its draft-sweep pin in the test rewrite (documented lifecycle-outage edge untested)",
+    "location": "server/test/integration/draft_integration_test.gleam:599",
+    "evidence": "Removed by the diff: \"-  // Still-active status but closes_at already passed (auto-close window)…\\n-  let assert Ok(past_id) = test_db.seed_vacancy(db, landlord_id, True)\\n-  let _ = seed_draft_with_token(db, past_id, \\\"tok-past\\\")\". In the rewritten suite every expired-closes_at case goes through auto_close_with_closes_at (lines 590-594: \"SET status = 'closed', closed_via = 'auto',\\n         closes_at = now() - interval '\" <> ago <> \"'\"), so status is always 'closed'. The SQL comment documents the untested state (delete_expired_application_drafts.sql:16-19): \"--     closes_at < now()). Edge, accepted: a vacancy that sits\\n--     active-but-expired for >7 days (lifecycle job down AND no landlord\\n--     dashboard visit to trigger the request-time auto-close) loses its\\n--     drafts while still technically extendable\".",
+    "detail": "Old test pinned deletion for a still-active vacancy with closes_at past (request-time auto-close window). The rewrite only exercises pre-closed rows; neither the in-grace survival (expired 3d, status active) nor the documented >7d-outage deletion of an active-but-expired vacancy is pinned.",
+    "recommended_fix": "Add two cases to retention_sweep_grace test: vacancy left status='active' with closes_at 3d past (draft survives) and 8d past (draft swept via time-based branch through the lifecycle-then-sweep pass)."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "Exact 7-day grace threshold unpinned — any constant in (3d, 8d] passes the new tests",
+    "location": "server/src/retention/sql/delete_expired_application_drafts.sql:46",
+    "evidence": "Predicate under test (lines 45-48): \"AND COALESCE(v.closed_notified_at, v.closes_at)\\n          <= now() - interval '7 days'\\n    )\\n    OR v.closes_at <= now() - interval '7 days'\". Test offsets (draft_integration_test.gleam): \"let assert Ok(_) = close_vacancy_manual(db, manual_recent_id, \\\"3 days\\\")\", \"let assert Ok(_) = close_vacancy_manual(db, manual_old_id, \\\"8 days\\\")\", \"let assert Ok(_) = auto_close_with_closes_at(db, time_recent_id, \\\"3 days\\\")\", \"let assert Ok(_) = auto_close_with_closes_at(db, time_old_id, \\\"8 days\\\")\"; the other two new tests use only \\\"1 day\\\".",
+    "detail": "All assertions use 1/3/8-day offsets, so a regression of the constant to 6 or 8 days still satisfies every assertion (3d survives, 8d deletes at equality). The spec's core parameter — exactly 7 days — has no boundary pin on either side.",
+    "recommended_fix": "Add boundary cases bracketing the threshold, e.g. closes_at 6 days 23 hours past (survives) and 7 days 1 hour past (deleted), for at least one branch."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Documented archived-and-long-expired sweep behavior has no test pin",
+    "location": "server/src/retention/sql/delete_expired_application_drafts.sql:34",
+    "evidence": "Comment (lines 33-36): \"-- archived vacancies follow the same rules (auto-close paths exclude\\n-- archived rows, but the time-based branch still sweeps an\\n-- archived-and-long-expired vacancy's drafts). Documented honestly here\". The only archived case seeds a future closes_at (test_db.gleam:541): \"SELECT $1::uuid, 'Archived Property', '789 Main St', 'Dublin', 'Dublin', 150000, 'active', true, code.val, 'apply-' || code.val || '@app.righttenantry.ie', NOW() + INTERVAL '30 days', NOW() - INTERVAL '1 day', 'righttenantry.ie'\", and the test asserts survival: \"draft_field(db, archived_id, \\\"continue_token\\\")\\n  |> should.equal(\\\"tok-archived\\\")\".",
+    "detail": "The amended SQL comment newly documents that an archived vacancy with closes_at >7d past still loses drafts to the time-based branch, but the suite only pins archived+unexpired survival; the archived+expired deletion path is untested (pre-existing behavior, disclosed, but now explicitly documented).",
+    "recommended_fix": "Add one case: archived vacancy with closes_at 8 days past and a seeded draft; assert the sweep deletes it, pinning the documented semantics."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: PASS",
+    "location": "N/A",
+    "evidence": "N/A",
+    "detail": "P0 (deletion predicate: manual branch via closed_notified_at, COALESCE-NULL fallback, time-based branch, in/out-of-grace, active+archived survival, FK cascade) ~100% integration-covered. P1 (in-grace extend → resume → submit round-trip; extend-clears-stamp re-close cycle; erasure flow) ~100%. Residual gaps are P2/P3 only: exact-7d boundary, active-status-expired case, archived+expired pin. Overall ≈90%. Mix is appropriate: DB-predicate change verified at integration level per AGENTS.md; comment-only edits need no tests.",
+    "recommended_fix": "Land the three gap fixes above (boundary-bracket cases, active-but-expired pair, archived+expired case) to bring P2 to full; gate remains PASS either way."
+  }
+]

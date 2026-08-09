@@ -1,0 +1,42 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "rate-limit-race",
+    "title": "Cross-vacancy fan-out bound is racy: concurrent claims each see a pre-burst snapshot and all pass the <3 check",
+    "location": "server/src/application/sql/claim_continue_link_send.sql:21",
+    "evidence": "  AND (\n    SELECT count(*) FROM application_draft d2\n    WHERE d2.email = lower($2)\n      AND d2.last_link_sent_at IS NOT NULL\n      AND d2.last_link_sent_at > now() - interval '1 hour'\n  ) < 3",
+    "detail": "READ COMMITTED evaluates the count subquery on the statement snapshot. N concurrent POSTs /apply/:code/continue-link for the same recipient on different vacancy rows all see the pre-burst count, so all claim and send — the 3/recipient/hour bound (the W6 fix) is exceeded by the concurrency width. Chunk's fan_out_bound_end_to_end_test only claims sequentially.",
+    "recommended_fix": "Serialize per recipient (e.g. pg_advisory_xact_lock on hashtext(lower(email)) before the UPDATE, or a recipient-send ledger table with a unique window key) so concurrent claims queue and re-read committed stamps."
+  },
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "rate-limit-bypass",
+    "title": "Fan-out bound keys on exact lower(email) — plus-addressed/dot-variant aliases each get their own 3/hour while landing in one victim inbox",
+    "location": "server/src/application/sql/claim_continue_link_send.sql:23",
+    "evidence": "    WHERE d2.email = lower($2)\n      AND d2.last_link_sent_at IS NOT NULL\n      AND d2.last_link_sent_at > now() - interval '1 hour'\n  ) < 3  -- and shared/src/shared/email.gleam: `is_alphanumeric(c) || c == \".\" || c == \"_\" || c == \"%\" || c == \"+\" || c == \"-\"`",
+    "detail": "The W6 bound exists to stop an attacker spraying branded Resend email at a victim. But drafts/claims are keyed by the raw lowercased string: victim+1@gmail.com, victim+2@gmail.com (and Gmail dot variants) all pass email.is_valid, each alias gets its own 3 sends/hour, and every message reaches the same real inbox — the bound is trivially scalable.",
+    "recommended_fix": "Canonicalize before keying the bound (strip +tag from the local part; optionally strip dots for known dot-blind providers like gmail.com), or add a second bound keyed on the domain-agnostic mailbox identity."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "toctou",
+    "title": "500/vacancy draft cap is a TOCTOU check — concurrent inserts for distinct emails overshoot it",
+    "location": "server/src/application/sql/upsert_application_draft.sql:16",
+    "evidence": "  OR (\n    SELECT count(*) FROM application_draft d\n    WHERE d.vacancy_id = $1::uuid\n  ) < 500",
+    "detail": "The INSERT...SELECT count(*) < 500 guard reads the statement snapshot; two concurrent inserts for different new (vacancy,email) pairs both see count < 500 and both insert. The unauthenticated write-surface bound (the W5 fix) is therefore approximate, overshootable by one concurrency wave (unbounded width, no edge rate limit on this path).",
+    "recommended_fix": "Accept and document the cap as approximate, or enforce strictly (advisory lock per vacancy_id around the upsert, or a vacancy.draft_count counter maintained under row lock)."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "rate-limit-gap",
+    "title": "New token endpoints /apply/:code/resume/ and /apply/:code/draft-erasure/ lack the Cloudflare per-IP rule their same-model siblings (/erase/, /dsar/) got",
+    "location": "deployment/terraform/cloudflare-rate-limits.tf:58",
+    "evidence": "    expression  = \"(starts_with(http.request.uri.path, \\\"/erase/\\\") or starts_with(http.request.uri.path, \\\"/dsar/\\\"))\"",
+    "detail": "The single http_ratelimit rule covers only /erase/ and /dsar/; the Worker rate-limits only /api/v1/. The F3 capability endpoints share the identical anonymous 288-bit-token model (resume reads applicant PII, draft-erasure destroys data) but have no per-IP edge cap — enumeration is infeasible at 288 bits, but the defense-in-depth/prefetch-absorption parity the siblings received is absent.",
+    "recommended_fix": "Extend the existing rule's expression (single free-tier slot) to also match ^/apply/[^/]+/(resume|draft-erasure)/, or document the accepted divergence from the /erase/ /dsar/ posture."
+  }
+]
