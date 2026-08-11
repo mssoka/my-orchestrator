@@ -45,6 +45,17 @@ findings that keep recurring. One line per entry, dated, with the job id.
   refcheck-rc2-2): regen churns BOTH `application/sql.gleam` AND
   `ai/sql.gleam`; `gleam format` is the canonical arbiter of what stays
   (it reverted a bogus pog.array hunk) — revert ALL churn not yours.
+  2026-08-11 addendum (dream-2026-08-11; refcheck-rc3-4/-rc3-5): two more
+  Squirrel type facets. (a) Squirrel emits its OWN `<Type>` inside each
+  `<module>/sql.gleam`, mirroring the PG enum SEPARATE from `shared.*` —
+  status args to the sql fns must be `sql.<Variant>` (the trigger
+  module's), NOT the shared variants (type mismatch → "Expected
+  sql.<Type>"). (b) When two PG enums SHARE constructor names
+  (`reference_call_status` + `reference_call_outcome` both have
+  `ManualRecorded`/…), Gleam forbids duplicate constructors in one module
+  → pass shared-constructor enum params as STRING +
+  `NULLIF($n,'')::<enum>` cast, NEVER a bare `$n::<enum>` (Squirrel emits
+  the conflicting type → "Duplicate definition").
 - 2026-07-31 (refcheck-rc1-1 ∥ refcheck-rc2-1): test-DB port 54321 is
   contended across sibling worktrees — run your own container
   (`docker run -d --name rt-<job>-test-db -p 5432X:5432 postgres:16-alpine`)
@@ -127,7 +138,17 @@ findings that keep recurring. One line per entry, dated, with the job id.
   tests are blind to browser-runtime semantics — a detached
   `window.setTimeout` debounce passed every Node test (no brand-check) and
   threw `Illegal invocation` in any real browser. Timer/DOM seams get an
-  empirical real-browser verification, not just suite-green.
+  empirical real-browser verification, not just suite-green. 2026-08-11
+  addendum (dream-2026-08-11; refcheck-rc3-4 r1→r2→r3, the "#599 r2
+  lesson" — now a standing Perkins lens-guard on #21/#174/#22): a
+  client-populated hidden field (e.g. `_focus_seconds`) ships in HTML but
+  is NEVER populated unless page-specific JS wires a submit listener; a
+  `simulate.form_body` integration test PASSES while prod stays broken
+  (always 0). Fix = wire a page-specific submit seam + drive the BROWSER
+  path in a node test (not the simulator) + prove it bites (neutralize →
+  red). (`instanceof Node` is blind under node — use
+  `Object.prototype.toString.call(o)` for a host-object guard that needs
+  no browser shim.)
 - 2026-08-03 (dream-2026-08-03; form-stepper-f1, form-funnel-w0,
   refcheck-rc1-1/rc2-1): RightTenantry env traps generalize beyond Squirrel —
   `dot_env.load_default()` overrides the PROCESS env at runtime (to repoint a
@@ -175,7 +196,19 @@ findings that keep recurring. One line per entry, dated, with the job id.
   worktree dispatch — ground truth = your pane's cwd (`pwd` +
   `git branch --show-current` FIRST, before any git or edits; one minion
   hit `fatal: branch already used by worktree` running git against the
-  main checkout).
+  main checkout). 2026-08-11 addendum (dream-2026-08-11;
+  righttenantry-refcheck-rc3-5 + rc3-3/-rc3-4; Gru-named field-note
+  candidate): the bmad tooling (`create-story`/`dev-story`) resolves the
+  repo root to the CANONICAL checkout (`/Users/moses/code/<repo>`) instead
+  of the worktree cwd — a worktree minion's edits to tracker/spec/SOURCE
+  land in the main checkout, not its worktree (rc3-5: `sweep.gleam` + 5
+  `sweep_*.sql` landed entirely in the main checkout; the worktree was
+  clean). After edits, `git status` in YOUR cwd and confirm they landed
+  in your worktree; commit/push/PR from the worktree only. OPS close-out:
+  the main-checkout dirty files block `pull --ff-only` — recover with
+  stash→pull→pop, or (when the merge brings a committed copy) revert to
+  HEAD; sync a misdirected live story byte-identical into the worktree
+  (`cmp`-verified) and commit from there.
 - 2026-08-09 (dream-2026-08-09; orchestrator-docs-ua1-ua2,
   orchestrator-perkins-ops-codify, righttenantry-refcheck-rc3-2 +
   packet-plumber-setup 08-06): `gh pr create --body "$(cat <<'EOF'…)`
@@ -184,6 +217,41 @@ findings that keep recurring. One line per entry, dated, with the job id.
   heavy bodies EOF early (a wrong test count shipped and needed a
   `gh pr edit`). Always `--body-file <file>`; grep-verify any counts the
   body claims before pushing.
+- 2026-08-11 (dream-2026-08-11; righttenantryagents-boundary-gate-state-fix
+  + -slot-clear — 2 jobs, Perkins-verified): ADK `ctx.state` is a per-node
+  SNAPSHOT, not live — a child `output_key` write (via `run_node`) lands on
+  the live `ctx.session.state` but is absent from the node's `ctx.state`
+  snapshot → `ctx.state.get(child_key)` returns `None` right after
+  `run_node`. The RightTenantry convention (`agent.py:263`/:396) is raw
+  `ctx.session.state` for ALL cross-node gate state — when editing ADK
+  Workflow gates, read child output via `ctx.session.state`, NEVER
+  `ctx.state`. The InMemory `_Recorder` harness CAN'T reproduce this
+  (stubs share the live dict) — build a divergent fake ctx (stale
+  `State({},{})` snapshot + live `session.state` dict) and assert the gate
+  reads through `ctx.session.state`. Also: `output_key` write is
+  conditional (skipped on empty-chunk/schema-fail/tool-call-only) but the
+  judge's `after_agent_callback` ALWAYS fires → a clean attempt can leave
+  the PRIOR dirty review in the slot while stamping clean; the per-attempt
+  slot `pop` is necessary hygiene, not paranoia.
+- 2026-08-11 (dream-2026-08-11; packet-plumber-v2-1.2-window-draw-pipe +
+  -1.3-packet-flow — 2 stories): T2 pixel goldens need the rlsw SOFTWARE
+  renderer via `tools/harness.sh` — `odin run harness` links the stock GPU
+  `vendor:raylib` and renders a SOLID BLACK frame headless (no GPU context)
+  — the raylib analog of the 2026-07-31 Godot headless trap. Headless
+  capture path: `rl.InitWindow` + `LoadImageFromScreen` (no display); port
+  the prototype's `goldens.odin` (flip + BGRA→RGBA swizzle) verbatim. The
+  SW raylib build (`tools/build_raylib_sw.sh`) takes ~40s + a github clone
+  — kick it off in the BACKGROUND before coding.
+- 2026-08-11 (dream-2026-08-11; packet-plumber-v2-1.3-packet-flow +
+  -1.1-walking-skeleton — 2 stories): the PP-v2 determinism spine — the
+  replay gate re-creates run-setup (fixture) but NOT flow demand by
+  default; flow demand is run-setup (NOT in the action log), so any new
+  run-setup added to the sim (spawn intents, director plans) must be
+  threaded through `replay_hashes` in BOTH the live (`lower_spawns`) and
+  replay paths, or ODN-11 replay diverges at tick 1. (The spine's `step`
+  is a heartbeat — one owned-RNG draw/tick folded into a `tick_nonce`
+  state field — tying the RNG into the step path so replay-equality is
+  non-vacuous.)
 
 ## Conventions that saved time
 
@@ -213,7 +281,18 @@ findings that keep recurring. One line per entry, dated, with the job id.
   em-dashes "CI-guarded", no such guard on disk), PR/sha citations (#169
   had no r2 to fold in), MCP tool inventory (no `capture_screenshot`).
   Grep any briefing-supplied proper noun against canon BEFORE the first
-  commit.
+  commit. 2026-08-11 addendum (dream-2026-08-11; 4 new claim-types, one
+  job each): (a) STALE-STACK planning doc — a recent DATE ≠ current stack
+  (v1 sprint-plan dated post-Odin-pivot but drafted in Godot/GDScript
+  citing the superseded `architecture-v1.md`, not `odin-architecture-v1.md`);
+  (b) WRONG IDENTIFIER/state-key — briefing named `STATE_FINAL_OUTPUT`
+  (the scrubber payload), not `STATE_FINAL_COMPLIANCE_REVIEW` (the gate's
+  review slot); (c) WRONG MECHANISM — "register each route in ALL three
+  registries" rests on a per-arm model; the registries are PREFIX-matched
+  (one arm covers any depth); (d) NAMESPACE COLLISION + SUPERSEDED-vs-LIVE
+  doc — two "E" namespaces (arch edge-cases E1–E32 vs GDD epics E1–E11).
+  Grep the briefing's named identifier/mechanism/citation against disk
+  BEFORE the first commit.
 - 2026-07-31/08-01 (finlit-bugfix-event-messages, tutor-economy-fix):
   root-cause-first — in PR/ledger notes, name the wrong hypothesis
   explicitly and reject it ("int truncation, NOT a 60s timer bug";
@@ -245,12 +324,25 @@ findings that keep recurring. One line per entry, dated, with the job id.
   register; (c) surface judgment calls + out-of-scope consequences
   explicitly (conservative resolve + one-line flag in the PR's Decisions
   & rationale) — never silently drop, silently expand scope, or silently
-  leave the gap.
+  leave the gap. 2026-08-11 addendum (dream-2026-08-11; routing-canon-amend,
+  gdd-mechanics-amend): (d) ASCII-box edits MUST be width-preserving
+  (`span, LB)`→`span,bndl)` kept 13 chars — a width-shift breaks diagram
+  alignment); (e) pre-emptive NO-OVERLAP placement under an open sibling
+  PR — grep the sibling's hunks, place inserts outside them → clean
+  auto-merge; (f) for an append-only decision-log, a mid-job sibling-merge
+  conflict resolves as DUAL-APPEND (keep both), not pick-a-side; (g)
+  disambiguate same-letter namespaces + superseded-vs-live docs before
+  editing (qualify a bare "E1").
 - 2026-08-09 (dream-2026-08-09; righttenantry-csp-posthog-allowlist 08-06
   + per-applicant-remind 08-08): prove a new test/guard actually BITES —
   negative control: flip one assertion (or inject the violation), confirm
   exactly the expected failure at your path, revert. Terse runners
   (gleeunit's dots) and no-op-via-byte-diff both pass silently otherwise.
+  2026-08-11 addendum (dream-2026-08-11; refcheck-rc3-4 — see the Node-blind
+  addendum above): the negative-control proof now extends to MASKING tests
+  — a fix can be INERT (value ships but JS never populates it) while a
+  `simulate.form_body` test MASKS it (drives the simulator, not the
+  browser); neutralize the fix and confirm the browser-path test goes red.
 
 ## Recurring review findings
 
@@ -317,6 +409,14 @@ findings that keep recurring. One line per entry, dated, with the job id.
   run the repo's CI gates LOCALLY before opening/updating the PR (format
   --check + the gate self-checks), and pin headline ACs per the
   durable-tests convention.
+- 2026-08-11 (dream-2026-08-11; righttenantry refcheck-rc3-2/-rc3-3/-rc3-4
+  — ≥3 sightings): the "registry-omission" blocker class — adding a POST
+  route means registering it in EVERY access-control/observability
+  registry the codebase maintains (RT: `is_public_path`, CSRF allowlist,
+  `redact_token_route`). Missing one is a recurring Perkins blocker (csrf
+  arm absent → route 403s; redact arm absent → token leak in logs). When
+  adding ANY route, enumerate every registry and arm each; the lesson is
+  now baked into RT briefings by name ("the rc3-3 csrf-registry lesson").
 
 ## glm-5.2 bare-label routing bug (2026-08-04, 2 independent sightings)
 

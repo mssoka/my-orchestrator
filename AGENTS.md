@@ -184,7 +184,22 @@ the user at the Gru session in `/Users/moses/code`.
   panes in one 08-08 batch + rc2-3, whose PR opened 17 min later).
   Classify by transcript + pane age BEFORE acting; `continue`-spamming
   these is waste. Distinct from the errored-turn class
-  (stopReason:"error" -> exactly one `continue`).
+  (stopReason:"error" -> exactly one `continue`). 2026-08-11 addendum
+  (the kimi-quota-403 saga): with kimi quota-down all billing cycle,
+  **glm-5.2 is the sanctioned Perkins fallback** — the 08-07 "redirect
+  glm-5.2 → deepseek" doctrine is superseded when KIMI is the down
+  provider (glm-5.2 is then the recovery TARGET, not redirect-away-from).
+  A **first-turn 403** (no lenses/artifacts) recovers via mid-pane `/model
+  zai-coding-cn/glm-5.2` + `continue` — pane recovers to working, NO
+  re-dispatch, NO regenerate (lighter than the mid-work-403
+  sweep+regenerate doctrine, which still applies when partial lens JSONs
+  exist). The "kimi is back up" premise is UNRELIABLE mid-cycle (403
+  recurred within ~12 min of an apparent recovery). A 403-killed round is
+  a RETRY on the SAME row (not rN+1); sweep ALL dead panes, fresh worktree
+  @ same sha, regenerate ALL lens JSONs (discard 3-byte empties — they
+  contaminate the verdict), carry prior findings forward. A pane-watcher
+  `gone->done` echo right after a 403 is the transient pre-recovery
+  flicker — note-only.
 - **Model dispatch & correction ops (2026-08-09).** Only a
   `provider/model` path naming an AUTHED provider works: bare
   `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
@@ -200,6 +215,14 @@ the user at the Gru session in `/Users/moses/code`.
   accept a user mid-run override reversal. pi's defaultProvider is now
   kimi-coding, so UNSET-model dispatches resolve to kimi-coding/k3 (the
   flip side of the `PI_MODEL`-override gotcha: know what "unset" means).
+- **Serialize concurrent glm-5.2 BURSTS (2026-08-11).** A Perkins round =
+  ~8 concurrent glm-5.2 panes; two rounds (or a round + a fanned-out
+  mega-minion wave) concurrently trip an account rate-limit 429 (a
+  13-pane glm-5.2 429 wave 08-09). SERIALIZE the bursts (one fan-out at a
+  time); defer/stagger a job's mega-minions entirely until an in-flight
+  Perkins round closes (trigger = the round's close-out). Sibling to the
+  pane-capacity serialize-hold — same dedup, different gate (model-quota
+  vs pane-count).
 
 ### Watchers, sensors & Perkins rounds
 
@@ -213,7 +236,13 @@ the user at the Gru session in `/Users/moses/code`.
   polls a new pane mid-boot (shell -> pi registration) before the minion
   self-reports working (4 sightings 08-06..08-08: agent-model-flash,
   per-applicant-remind, prototype-iterate-1, rc3-2). A fresh dispatch's
-  first alert is usually the boot, not a problem.
+  first alert is usually the boot, not a problem. 2026-08-11 addendum:
+  Silas now pre-emptively writes a "settle (working->done after clean
+  completion): <summary>" note at close-out to classify the inevitable
+  settle echo BEFORE it fires — the note IS the classification, so the
+  echo that follows is note-only (and doubles as the human-readable
+  completion summary: PR + suite counts + what was proven). Standard,
+  not optional (5 sightings this window).
 - **Review/Perkins/cap sensors re-fire already-acted events — expect one
   stale echo per action (2026-08-01/02).** Silas relays/escalates/
   dispatches at round close-out; the sensor tick lands seconds-to-minutes
@@ -253,7 +282,12 @@ the user at the Gru session in `/Users/moses/code`.
   `dispatched`, full sha in the note) so the Perkins sensor doesn't re-fire
   on the tick, then release when another round's close-out frees panes
   (trigger = the in-flight round's close-out). Now standard ops (≥5
-  sightings 08-03..08-05) but undocumented.
+  sightings 08-03..08-05) but undocumented. 2026-08-11 addendum: now
+  standard CROSS-REPO (RT ↔ PP), not just same-repo pane capacity (≥4
+  fresh sightings). The held round's briefing NAMES the in-flight round
+  it's behind ("SERIALIZE-HELD behind perkins-v2-1.2-window-draw-pipe-r1")
+  and the RELEASE trigger (the in-flight round's close-out); the held pane
+  stays dispatched (sensor dedup'd) until release.
 - **"Moot on merge" is NOT the default for a mid-flight Perkins round
   (2026-08-07).** A normal terminal merge of an APPROVED PR → sweep the
   in-flight round as moot, no re-dispatch. But a DELIBERATE pre-verdict
@@ -289,6 +323,26 @@ the user at the Gru session in `/Users/moses/code`.
   results] -> compliance gap; the deliverable still reached the user via
   Gru's independent check, so no harm, but the signal was missed at the
   source.) No-PR jobs must NEVER rely on pane/PR watchers alone.
+- **A Perkins fix-audit round is HELD on an UNSTABLE review target
+  (2026-08-11).** Deferred when the PR head is still MOVING (minion
+  iterating CI fixes / active A/B) AND/OR CI is RED — the harness
+  verification can't run on a red/unstable CI. Hold for the STABLE sha
+  (CI green + r1 blockers addressed + minion done iterating). The review
+  sensor RE-FIRES on every new commit while the head moves — those are
+  echoes (note-only), not new work. Sibling to serialize-hold (which gates
+  on pane/model capacity); this gates on review-TARGET stability.
+- **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
+  worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
+  DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
+  ledger-ROW-based). Yet `perkins-*` branches appeared as merged debris
+  (3 branches / 2 repos: perkins-odin-prototype-r1/r2 +
+  perkins-refcheck-rc3-3-r1) — a dispatch is using `herdr worktree create
+  --branch` (the regular-minion path) where `--detach` is correct, OR a
+  Perkins minion created the branch. Harmless when caught (merged +
+  recoverable from main; `branch -D`), but a dispatch-mechanics
+  inconsistency. **Root cause inferred, not confirmed** — audit target:
+  grep dispatch history / Perkins round setups for `--branch` where
+  `--detach` was correct.
 
 ### Ledger
 
@@ -319,6 +373,23 @@ the user at the Gru session in `/Users/moses/code`.
   (The packet-plumber crew now runs `ledger pr` itself — the lesson
   propagated. 2026-07-21 was the inverse false-positive: Gru wrote
   redundant `ledger pr` on a field that WAS set, read from the table.)
+  2026-08-11 addendum: the durable fix is in flight — the briefing
+  template now carries an explicit `ledger pr <id> <url>` instruction,
+  and the RT + PP crews are starting to run it themselves (rc3-4 #599,
+  v2-1.1 #21 "minion set the pr field — 2nd job in a row"). BUT it is
+  NOT universal — the RTA crew still produced a NULL `pr` on self-report
+  (#173, #597) this window. Silas still VERIFYs `pr` on every in-review
+  transition (`ledger show`, not the lossy table); don't relax
+  verification just because most crews now self-set it.
+- **Verify merge/deploy state by commit-containment, never by grepping a
+  single file (2026-08-11).** Two false-negative traps: (a) grepping a
+  single file for the change gives a FALSE NEGATIVE if you grep the wrong
+  file (or the change lives elsewhere) — the RTA #172 vetting was safe to
+  re-process but a wrong-file grep said otherwise; (b) checking
+  `--merged`/ancestry BEFORE pulling lies — a stale local base predates
+  the merge. Use `git merge-base --is-ancestor <commit> <branch>` AFTER
+  `pull --ff-only` (or `git fetch origin <base>:<base>` when the tree is
+  held). Commit-containment is immune to both traps.
 
 ### Pane forensics
 
