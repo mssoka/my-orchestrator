@@ -193,8 +193,13 @@ RightTenantry, FinLit, etc.). (User ruling 2026-08-12 — replaced the
   ambiguity matter most), and **Bob** (dream: memory consolidation +
   lesson curation). Low-volume, judgment-heavy roles where the strongest
   model earns its quota. (The kimi account has a usage quota + a billing
-  cycle; if it 403s, glm-5.2 is the interim fallback until the cycle
-  recovers — seen 2026-08-12.)
+  cycle; if it 403s, **`deepseek/deepseek-v4-flash` is the Perkins/reasoning
+  fallback** until the cycle recovers — user ruling 2026-08-12, based on the
+  mini-swe-agent benchmark: k3 69% vs deepseek 53% vs glm-5.2 44%, and
+  deepseek's proven always-live reliability. **glm-5.2 is RETIRED from
+  review/reasoning duty** — it was the 08-11 failover, now superseded; the
+  reviewer also stays a different model family from the deepseek minions
+  whose code it grades, avoiding correlated blind spots.)
 - **Execution — `deepseek/deepseek-v4-flash`**: **Silas** (COO: ops,
   relay, coordination, dispatches), **ALL minions** (every coding minion
   — implementation), and **mega-minions** (well-specified sub-tasks).
@@ -207,7 +212,7 @@ so UNSET-model dispatches would resolve to kimi — which is why minion and
 mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
 (the briefing's 'Model policy' field overrides per-job; the dispatch
 `--model` carries it). Gru / Perkins / Bob launches name `kimi-coding/k3`
-(glm-5.2 while kimi is down). Silas is pinned to deepseek-v4-flash by
+(deepseek-v4-flash while kimi is down). Silas is pinned to deepseek-v4-flash by
 `.pi/extensions/silas.ts` (see 'Silas (COO)').
 
 ## Durable state
