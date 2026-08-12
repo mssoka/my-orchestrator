@@ -92,17 +92,18 @@ export default function silas(pi: ExtensionAPI) {
 		if (ctx.cwd !== GRU_DIR) return;
 		if (process.env.PI_SILAS !== "1") return;
 		if (event.reason === "startup" || event.reason === "new") {
-			// Silas runs on zai-coding-cn/glm-5.2 (user ruling 2026-08-09): the
-			// COO's ops/coordination judgment benefits from a smarter model than
-			// deepseek, and glm-5.2 rides the existing zai subscription — while
-			// still freeing kimi quota for the frontier coding minions. Set it
-			// automatically so no manual /model step is needed.
-			const model = ctx.modelRegistry.find("zai-coding-cn", "glm-5.2");
+			// Silas runs on deepseek/deepseek-v4-flash (user ruling 2026-08-12):
+			// the COO's work (watcher triage, ledger, dispatches, close-outs)
+			// is execution-grade + well-specified — deepseek-v4-flash handles it
+			// fast and reliably, keeping kimi k3 reserved for the reasoning
+			// roles (Gru, Perkins, Bob). Set it automatically so no manual
+			// /model step is needed.
+			const model = ctx.modelRegistry.find("deepseek", "deepseek-v4-flash");
 			if (model) {
 				const ok = await pi.setModel(model);
-				if (!ok) ctx.ui.notify("Silas: no API key for zai-coding-cn/glm-5.2 — staying on the default model", "error");
+				if (!ok) ctx.ui.notify("Silas: no API key for deepseek/deepseek-v4-flash — staying on the default model", "error");
 			} else {
-				ctx.ui.notify("Silas: zai-coding-cn/glm-5.2 not in the model registry — staying on the default model", "error");
+				ctx.ui.notify("Silas: deepseek/deepseek-v4-flash not in the model registry — staying on the default model", "error");
 			}
 			await pi.sendUserMessage(STARTUP_CHECKLIST);
 		}

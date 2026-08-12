@@ -126,15 +126,14 @@ Silas Ramsbottom — Gru's chief operating officer. A long-lived pi session
 standing orders + startup checklist; nefario-watch is gated to
 `PI_SILAS=1`, so ALL sensors alert Silas — Gru's context stays clean.
 
-**Model:** Silas runs on **`zai-coding-cn/glm-5.2`** — set
+**Model:** Silas runs on **`deepseek/deepseek-v4-flash`** — set
 AUTOMATICALLY by `.pi/extensions/silas.ts` at launch (`session_start` ->
 `pi.setModel`), so no manual `/model` step; it notifies if the model is
 missing from the registry or has no API key (a failed auto-set is visible,
-not silent). NOT the kimi default:
-the COO's ops/coordination judgment benefits from a model smarter than
-deepseek, and glm-5.2 rides the existing zai subscription — while still
-freeing kimi quota for the frontier coding minions. (User ruling
-2026-08-09, revised same day: deepseek -> glm-5.2.)
+not silent). The COO's work (watcher triage, ledger, dispatches,
+close-outs) is execution-grade + well-specified — deepseek-v4-flash
+handles it fast and reliably, keeping kimi k3 reserved for the reasoning
+roles (Gru, Perkins, Bob). (User ruling 2026-08-12; replaced glm-5.2.)
 
 **Silas owns (Gru never touches):**
 
@@ -183,36 +182,33 @@ drops the note).
 
 ## Model policy
 
-Three tiers, chosen by the NATURE of the task — NOT by which project it is.
-We work on multiple projects (the game, RightTenantry, FinLit, etc.); the
-tier follows the thinking the task demands.
+Two allocations, by ROLE — the orchestrator's reasoning roles vs its
+execution roles. NOT by project (we work on multiple projects: the game,
+RightTenantry, FinLit, etc.). (User ruling 2026-08-12 — replaced the
+2026-08-09 three-tier framework.)
 
-- **Frontier — `kimi-coding/k3`** (the default for coding minions AND for
-  Perkins code review): any task requiring frontier reasoning — architecture,
-  design, complex/novel coding, AND **code review**. Production code with
-  paying users demands the BEST reviewer: the review is the last line of
-  defense before code ships, so correctness + judgment under ambiguity
-  matter most here. This spans ALL projects, not just game code. (The kimi
-  quota is the constraint — review + the game build both draw on it; if it
-  hard-limits, glm-5.2 is the review fallback.)
-- **Capable — `zai-coding-cn/glm-5.2`** (the COO, Silas, AND mega-minion
-  workers): tasks needing more than mechanical execution but not the
-  frontier reasoning — the COO's ops/relay/coordination, AND a minion's
-  spawned helpers (mega-minions) executing well-specified sub-tasks. A step
-  up from deepseek (smarter triage/execution) and it rides the existing zai
-  subscription, keeping kimi reserved for the frontier work. (Mega-minions
-  on glm-5.2: user ruling 2026-08-09.)
-- **Mechanical — `deepseek/deepseek-v4-flash`**: tasks that DON'T require
-  frontier thinking — text editing, text changes, mechanical/simple edits,
-  straightforward documentation. NOT architecture, NOT design, NOT complex
-  coding — anything needing real design or reasoning goes to kimi.
+- **Reasoning — `kimi-coding/k3`**: **Gru** (CEO: persona, relays,
+  escalations, briefing authorship), **Perkins** (code review — the last
+  line of defense before code ships: correctness + judgment under
+  ambiguity matter most), and **Bob** (dream: memory consolidation +
+  lesson curation). Low-volume, judgment-heavy roles where the strongest
+  model earns its quota. (The kimi account has a usage quota + a billing
+  cycle; if it 403s, glm-5.2 is the interim fallback until the cycle
+  recovers — seen 2026-08-12.)
+- **Execution — `deepseek/deepseek-v4-flash`**: **Silas** (COO: ops,
+  relay, coordination, dispatches), **ALL minions** (every coding minion
+  — implementation), and **mega-minions** (well-specified sub-tasks).
+  The fleet workhorse: fast, reliable, always-live (it carried the fleet
+  during the 2026-08-11/12 glm cap). Everything well-specified —
+  implementation, triage, mechanics — rides deepseek-v4-flash.
 
 The kimi default is the provider default (settings.json `defaultProvider`),
-so unset-model dispatches resolve to kimi; a briefing's 'Model policy'
-field overrides per-job. Silas is pinned to glm-5.2 by
-`.pi/extensions/silas.ts` (see 'Silas (COO)'). The kimi account has a usage
-quota — spending the frontier model only where it earns it keeps quota for
-the work that needs it. (User ruling 2026-08-09.)
+so UNSET-model dispatches would resolve to kimi — which is why minion and
+mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
+(the briefing's 'Model policy' field overrides per-job; the dispatch
+`--model` carries it). Gru / Perkins / Bob launches name `kimi-coding/k3`
+(glm-5.2 while kimi is down). Silas is pinned to deepseek-v4-flash by
+`.pi/extensions/silas.ts` (see 'Silas (COO)').
 
 ## Durable state
 
@@ -441,6 +437,12 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
    ```
    Re-read the new pane id from the JSON response. Rename the pane
    (`herdr pane rename <pane> <job-id>`) and tab (`herdr tab rename`).
+   **Tab labels are DESCRIPTIVE (user ruling 2026-08-10):** short but
+   self-explanatory, never generic (never a bare number). Minion job tabs:
+   `<job-id>`. Perkins round tabs: `perkins-<slug>-r<N>`. Mega-minion tabs:
+   `<job-slug>-<role>` (e.g. `routing-explorer-review`, `rc3-4-lenses`).
+   The tab-bar label must show what's happening at a glance; panes inside
+   keep their own labels (e.g. `mm-<lens>-r<N>`).
 4. **Worktree bootstrap** (worktrees only get git-tracked files):
    - If `<worktree>/_bmad` is missing and `<repo_root>/_bmad` exists:
      `cp -R <repo_root>/_bmad <worktree>/_bmad`
@@ -495,6 +497,14 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
    file (`ls ~/.pi/agent/sessions/ | grep <slug>`) means a dead pi:
    relaunch (`herdr pane run <pane> "pi"`), wait idle, re-hand over.
 
+**Continuous execution (user ruling 2026-08-11):** once a story merges,
+dispatch the NEXT story WITHOUT waiting for a Gru/user greenlight — applies
+to RT (refcheck: rc3-5 → rc3-6 → rc3-7 → RC4 → RC5) and PP (slice 1 →
+slice 2 → …). Gru authors the next briefing + hands it to Silas on each
+merge-relay; Silas executes + keeps the pipeline moving. **Pause ONLY**
+when something is genuinely pending from the user (a lavish clarify, a
+decision, an external gate).
+
 ## Minion standing orders
 
 (Also pasted into every briefing. Formerly "Sub-agent standing orders" —
@@ -527,6 +537,9 @@ older briefings use that name; this is the same section.)
   policy (`pi --model ...` when it names one) and its Skills policy (name
   each mega-minion's skill explicitly — e.g. review swarms use
   `bmad-review-adversarial-general` / `bmad-review-edge-case-hunter`).
+  Name mega-minion TABS descriptively too — `<job-slug>-<role>` (e.g.
+  `routing-explorer-review`, `rc3-4-lenses`) per the 2026-08-10 user
+  ruling: tab labels are visible at a glance, never generic numbers.
   **Max 10 concurrent mega-minion panes** (batch larger swarms). You MUST
   close every pane you create before finishing ("badge out").
 - Treat env files as read-only. If the task genuinely requires changing
@@ -780,7 +793,9 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
    applied); what to flag for verification (e.g. committed binaries, CI
    pins).
 5. Pane into the orchestrator workspace (panes-first rule), label
-   `perkins-<slug>-r<N>`; launch `cd <worktree> && pi` **on `kimi-coding/k3`**
+   `perkins-<slug>-r<N>` — and name the TAB the same
+   (`perkins-<slug>-r<N>`; descriptive-label convention, user ruling
+   2026-08-10; never a bare number); launch `cd <worktree> && pi` **on `kimi-coding/k3`**
    (the frontier reviewer — production code with paying users demands the
    BEST review, so Perkins runs kimi, NOT a cheaper model for quota; user
    ruling 2026-08-09. Pass `--model kimi-coding/k3` at launch or set it in
