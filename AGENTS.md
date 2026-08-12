@@ -193,7 +193,12 @@ the user at the Gru session in `/Users/moses/code`.
   zai-coding-cn/glm-5.2` + `continue` — pane recovers to working, NO
   re-dispatch, NO regenerate (lighter than the mid-work-403
   sweep+regenerate doctrine, which still applies when partial lens JSONs
-  exist). The "kimi is back up" premise is UNRELIABLE mid-cycle (403
+  exist). 2026-08-12 supersede (user ruling, playbook 388fbfb):
+  **glm-5.2 is RETIRED from review/reasoning duty — the Perkins
+  failover is deepseek/deepseek-v4-flash.** kimi k3 403 during a round →
+  first-turn: mid-pane `/model deepseek/deepseek-v4-flash` + `continue`;
+  mid-work: sweep + redispatch on deepseek — NEVER glm-5.2 (benchmark:
+  k3 69 / deepseek 53 / glm 44; deepseek always-live). The "kimi is back up" premise is UNRELIABLE mid-cycle (403
   recurred within ~12 min of an apparent recovery). A 403-killed round is
   a RETRY on the SAME row (not rN+1); sweep ALL dead panes, fresh worktree
   @ same sha, regenerate ALL lens JSONs (discard 3-byte empties — they
@@ -215,8 +220,9 @@ the user at the Gru session in `/Users/moses/code`.
   accept a user mid-run override reversal. pi's defaultProvider is now
   kimi-coding, so UNSET-model dispatches resolve to kimi-coding/k3 (the
   flip side of the `PI_MODEL`-override gotcha: know what "unset" means).
-- **Serialize concurrent glm-5.2 BURSTS (2026-08-11).** A Perkins round =
-  ~8 concurrent glm-5.2 panes; two rounds (or a round + a fanned-out
+- **Serialize concurrent Perkins BURSTS (2026-08-11; models renamed 2026-08-12).** A Perkins round =
+  ~8 concurrent lens panes (glm-5.2 historically; now kimi k3, deepseek-v4-flash fallback); two rounds
+  (or a round + a fanned-out
   mega-minion wave) concurrently trip an account rate-limit 429 (a
   13-pane glm-5.2 429 wave 08-09). SERIALIZE the bursts (one fan-out at a
   time); defer/stagger a job's mega-minions entirely until an in-flight
@@ -450,3 +456,5 @@ the user at the Gru session in `/Users/moses/code`.
   lags a beat (StopIteration) — get tab_id from `herdr tab list` by
   label. And a mangled move-output subshell caused a DUPLICATE worktree
   create — capture once, never re-parse.
+
+- **`pr_review` is a LEDGER KEY, not a note string (2026-08-12, ~11h of sensor blindness).** The Perkins sensor's gate is `job.pr_review === 1` read from the COLUMN. Writing "pr_review 1" into the `ledger add` note leaves the column at its 0 default and the review-sensor silently skips the job — 5 jobs blind (~11h: 3.3/3.4/4.1/rc1-1/rc4-3/rc4-4/4.2, every Perkins round in that window was a manual/held dispatch; only 3.2 fired because its row was SQL-fixed at 12:16Z). ALWAYS pass `pr_review=<n>` as an add-key when the briefing mandates it. VERIFY the column after add (`sqlite3 ... SELECT pr_review`), don't trust the note. Sensor-down fallback: at every minion completion/settle, sweep in-review pr_review=1 jobs — no round row carrying the current head sha + head stable → dispatch manually, never wait on the sensor.

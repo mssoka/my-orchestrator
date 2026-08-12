@@ -644,7 +644,16 @@ see the AGENTS.md no-PR-done-mid-turn gotcha). This board-check is the
      suppresses per-tick re-alerts while a dispatch is pending (re-arms on
      sha change). Cap: 3 automated rounds — a further new sha escalates
      once per sha ("human review needed"). On the dispatch message: run
-     the sequence in 'Perkins (automated PR review)'.
+     the sequence in 'Perkins (automated PR review)'. **Sensor-down
+     fallback (standing rule, user-ruled 2026-08-12): NEVER wait on the
+     sensor.** At every minion completion/settle, Silas sweeps every
+     in-review `pr_review=1` job directly: no round row carrying the
+     current head sha + the head stable → dispatch the round MANUALLY
+     (full dispatch sequence, same briefings/guards). Precondition for
+     the sensor working at all: `pr_review` must be set as a ledger add
+     KEY (the gate reads the COLUMN — a note-only mention leaves it 0
+     and silences the sensor; 2026-08-12 outage: ~11h blind, 5 rows
+     fixed; see AGENTS.md gotcha).
   6. **Conflict sensor (same 5-min tick):** alerts when an OPEN in-review
      PR becomes unmergeable — `mergeable: CONFLICTING` / `mergeStateStatus:
      DIRTY` (the base moved since the branch diverged; e.g. a sibling PR
