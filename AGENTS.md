@@ -198,7 +198,12 @@ the user at the Gru session in `/Users/moses/code`.
   failover is deepseek/deepseek-v4-flash.** kimi k3 403 during a round →
   first-turn: mid-pane `/model deepseek/deepseek-v4-flash` + `continue`;
   mid-work: sweep + redispatch on deepseek — NEVER glm-5.2 (benchmark:
-  k3 69 / deepseek 53 / glm 44; deepseek always-live). The "kimi is back up" premise is UNRELIABLE mid-cycle (403
+  k3 69 / deepseek 53 / glm 44; deepseek always-live). 2026-08-12-late
+  supersede (user ruling, playbook a96d36b): **kimi k3 RETIRED entirely —
+  the reasoning tier is `deepseek/deepseek-v4-pro`** (Gru/Perkins/Bob);
+  flash stays for ops/coding (Silas/minions/mega-minions); interim if
+  v4-pro is unavailable = flash. Perkins round panes AND lenses launch
+  on v4-pro; Bob's dreams route v4-pro. The "kimi is back up" premise is UNRELIABLE mid-cycle (403
   recurred within ~12 min of an apparent recovery). A 403-killed round is
   a RETRY on the SAME row (not rN+1); sweep ALL dead panes, fresh worktree
   @ same sha, regenerate ALL lens JSONs (discard 3-byte empties — they
