@@ -56,10 +56,20 @@ findings that keep recurring. One line per entry, dated, with the job id.
   → pass shared-constructor enum params as STRING +
   `NULLIF($n,'')::<enum>` cast, NEVER a bare `$n::<enum>` (Squirrel emits
   the conflicting type → "Duplicate definition").
+  2026-08-13 addendum (dream-2026-08-13; rc3-7 + rc4-4): regen also churns
+  `application/sql.gleam` formatting hunks unrelated to new columns —
+  VERIFY EACH HUNK before keeping (rc4-4 reverted one); `ai/sql.gleam`
+  whitespace → revert the whole file.
 - 2026-07-31 (refcheck-rc1-1 ∥ refcheck-rc2-1): test-DB port 54321 is
   contended across sibling worktrees — run your own container
   (`docker run -d --name rt-<job>-test-db -p 5432X:5432 postgres:16-alpine`)
   and pass `TEST_DB_PORT` to `scripts/reset-test-db.sh`.
+  2026-08-13 addendum (rc1-1-grapheme-fix + rc4-4): the Makefile
+  HARDCODES 54321; as of 08-13 sibling worktrees owned
+  54321/54326/54327/54332-34 — grab a free port and pass
+  `TEST_DATABASE_URL=postgresql://test:test@localhost:<port>/righttenantry_test`
+  to `gleam test -- --tag integration` (after `TEST_DB_PORT=<port> bash
+  scripts/reset-test-db.sh`).
 - 2026-07-31 (form-funnel-w0, refcheck-rc2-1): Gleam null-handling bites
   twice — `decode.subfield` + `decode.optional` fail the WHOLE decode on a
   missing key (use `decode.optional_field(..., default, ...)` for
@@ -128,12 +138,23 @@ findings that keep recurring. One line per entry, dated, with the job id.
   creates NEW stale texts (`harness//`, misaligned diagrams); for fragile
   multi-site blocks a short python script with unique-substring
   `.replace()` anchors + asserts beats the edit tool.
+  2026-08-13 addendum (dream-2026-08-13; 2.3-demolish): nested-code
+  batches need EXACT tab depth — a 5-edit batch to a 3-level-deep switch
+  was rejected silently (all 5 lost) because one oldText was indented 3
+  tabs, not 4. Re-read the exact depth of nested code before authoring
+  batch oldText.
 - 2026-08-03 (dream-2026-08-03; RightTenantry crew — refcheck-rc1-2,
   form-save-resume-f3, refcheck-privacy-draft): assert Lustre's SERIALIZED
   render, never view-source assumptions — attributes render SORTED BY NAME
   with empty-valued ones bare (`checked`, `required`); apostrophes come back
   as `&#39;` (houdini escape); verbatim page copy can contain your assertion
   substring (pin `checked data-testid="..."`, not a bare `checked`).
+  2026-08-13 addendum (dream-2026-08-13; rc4-2 r1 B2 + rc4-3): the SOURCE
+  side mirrors it — an empty-string attribute VALUE serializes as a
+  PRESENT attribute: writing `attribute("disabled", "")` ships a
+  permanently-disabled button. Omit the attribute instead
+  (`list.append(attrs, case busy {True -> [attribute("disabled","true")]
+  False -> []})`).
 - 2026-08-03 (dream-2026-08-03; form-save-resume-f3 Perkins r2/r3): Node
   tests are blind to browser-runtime semantics — a detached
   `window.setTimeout` debounce passed every Node test (no brand-check) and
@@ -209,6 +230,11 @@ findings that keep recurring. One line per entry, dated, with the job id.
   stash→pull→pop, or (when the merge brings a committed copy) revert to
   HEAD; sync a misdirected live story byte-identical into the worktree
   (`cmp`-verified) and commit from there.
+  2026-08-13 addendum (dream-2026-08-13; 2.2-ecmp — 3rd sighting): the
+  trap extends to the GATES — odin test/lint/harness cd'd to the main
+  checkout too and passed against the WRONG tree (edits AND tests both
+  misdirected). After edits, `git status` from cwd BEFORE trusting a
+  green test run.
 - 2026-08-09 (dream-2026-08-09; orchestrator-docs-ua1-ua2,
   orchestrator-perkins-ops-codify, righttenantry-refcheck-rc3-2 +
   packet-plumber-setup 08-06): `gh pr create --body "$(cat <<'EOF'…)`
@@ -242,6 +268,17 @@ findings that keep recurring. One line per entry, dated, with the job id.
   the prototype's `goldens.odin` (flip + BGRA→RGBA swizzle) verbatim. The
   SW raylib build (`tools/build_raylib_sw.sh`) takes ~40s + a github clone
   — kick it off in the BACKGROUND before coding.
+  2026-08-13 addendum (dream-2026-08-13; 4.2-surge-crisis + 2.2-ecmp +
+  harness-ecmp-demo — 3 jobs): build the harness ONLY via
+  `tools/harness.sh` — a bare `odin build harness` links the stock GPU
+  raylib and produces R/B-SWAPPED golden frames (921600/921600 pixel
+  diffs that look like a render bug, aren't); rlsw is GITIGNORED → ABSENT
+  in a fresh worktree → point the build at the main checkout's shadow
+  (`ODIN_ROOT=<main>/tools/raylib-sw/shadow odin build harness
+  -out:bin/harness`). Odin `fmt.tprintf` uses the TEMP allocator —
+  in-loop strings that must outlive the tick iteration need
+  `fmt.aprintf` (T2 failure strings were blank garbage the first time
+  that path ran), and JSON literals need `{{`/`}}`.
 - 2026-08-11 (dream-2026-08-11; packet-plumber-v2-1.3-packet-flow +
   -1.1-walking-skeleton — 2 stories): the PP-v2 determinism spine — the
   replay gate re-creates run-setup (fixture) but NOT flow demand by
@@ -252,6 +289,57 @@ findings that keep recurring. One line per entry, dated, with the job id.
   is a heartbeat — one owned-RNG draw/tick folded into a `tick_nonce`
   state field — tying the RNG into the step path so replay-equality is
   non-vacuous.)
+- 2026-08-13 (dream-2026-08-13; PP v2 golden discipline — 1.4/2.1/2.2/
+  3.2/3.5/4.1, ×6 sightings): (a) catalog edits are GOLDEN-POISONED —
+  `cat.hash` folds every catalog byte, so any balance.json/node_type
+  change re-blesses ALL `.t1`/`.log.bin` — wire new rules as core consts
+  until a legitimate re-bless; (b) T1-dump additions must be
+  ABSENT-WHEN-EMPTY (a zero count still shifts every default-run hash);
+  (c) a re-bless is deliberate + PROVEN or it's a Perkins finding —
+  byte-verify every `.log.bin` differs ONLY in the version field, splice
+  the OLD catalog_hash into the new state dump (fnv must equal the
+  blessed tick-1 golden), cause-document every shift; (d) prefer DERIVED
+  state (bundles, routing tables) over serialized — derived state keeps
+  all goldens byte-valid.
+- 2026-08-13 (dream-2026-08-13; PP sim-truth traps — 3.4-sla + 4.2-surge,
+  ×3 sightings): (a) `record_run` clears `state.events` EVERY TICK (ODN-14
+  drain) — an end-of-run event scan is vacuous; collect the stream while
+  stepping; (b) breach RATIOS are not monotone — later deliveries dilute
+  the ratio below tolerance, so transition-style exits fire falsely:
+  latches must be sticky-Enter by contract ("monotone" applies to the
+  counter, never the ratio); (c) carry ADMISSION-TIME truth in events
+  (the shed bundle) + resolve hysteresis, or trigger/resolve pairs
+  chatter every few ticks on marginal networks.
+- 2026-08-13 (dream-2026-08-13; rc4-3 + rc4-4 + the rc4-3 r1–r5 B1 saga —
+  ×2 jobs): when a one-cycle correction/retry loop exists, the
+  CORRECTION INSTANT segments everything downstream — reset the attempt
+  counter + capability token on re-queue (a corrected row at count 1
+  dead-ends the co-nudge step forever), gate post-loop failures on
+  `corrected_at` (stale/redelivered pre-correction events must stand
+  down, never fabricate a fraud signal), and segment send batches by the
+  corrected_at boundary (batch index alone mislabels the re-invite as
+  "Reminder N").
+- 2026-08-13 (dream-2026-08-13; rc1-1-grapheme-fix, rc3-7, rc4-4 — ×3
+  flavors): DB-stored text ≠ app text — (a) Gleam `string.slice` counts
+  GRAPHEMES, Postgres `length()` counts CODEPOINTS → codepoint-bounded
+  slicing is the only cut that satisfies a DB CHECK for multi-codepoint
+  headers (ZWJ emoji: 1 grapheme = 7 codepoints); (b) `jsonb::text` adds
+  a space after `:` → substring-contains on STORED fraud_signals fails —
+  parse + decode the field (unit tests pass because they check gleam's
+  compact `json.to_string` output; integration reads Postgres); (c) the
+  timestamp space-vs-T mix (see Recurring review findings) — pin with
+  server-real fixtures.
+- 2026-08-13 (dream-2026-08-13; rc4-2, rc4-3, rc4-4 — ×3 jobs):
+  Gleam/Lustre trap cluster — (a) an EMPTY-STRING attribute value is a
+  PRESENT boolean attribute (`attribute("disabled", "")` ships
+  permanently-disabled buttons — omit when enabled); (b) gleam 1.15.1
+  REJECTS `++ [list-literal]` ("operator has no value on its right
+  side") — use `list.append`/spread; (c) `list.all([])` is vacuously
+  True — check emptiness BEFORE the all-terminal branch; (d) a
+  case-clause body starting with `let` is a parse error unless braced;
+  no function calls in clause guards; no list `..` spread in this Gleam
+  version; (e) `decode.optional_field` is the `use`-callback 4-arg form
+  (the field decoder is Decoder(t) of the DEFAULT's type).
 
 ## Conventions that saved time
 
@@ -292,7 +380,16 @@ findings that keep recurring. One line per entry, dated, with the job id.
   (one arm covers any depth); (d) NAMESPACE COLLISION + SUPERSEDED-vs-LIVE
   doc — two "E" namespaces (arch edge-cases E1–E32 vs GDD epics E1–E11).
   Grep the briefing's named identifier/mechanism/citation against disk
-  BEFORE the first commit.
+  BEFORE the first commit. 2026-08-13 addendum (dream-2026-08-13; rc3-6,
+  rc4-4, 2.2-ecmp, harness-ecmp-demo, rc4-1 — ×5 sightings): three new
+  claim-types — (a) grep the ARCHITECTURE AMENDMENTS REGISTER for
+  amended behaviour before trusting a briefing AC (rc3-6's "inbound
+  STOP→objected" was dead: the 08-08 amendment + shipped stop-link route
+  + Twilio one-way sender); (b) grep DB ENUM MIGRATIONS, not the
+  briefing, for emitted sets (rc4-4: FIVE codec variants live, the
+  briefing named four); (c) CARRY-FORWARD claims about repo state rot
+  within a day ("T2 unverified until the rlsw harness exists" — the
+  harness existed and worked).
 - 2026-07-31/08-01 (finlit-bugfix-event-messages, tutor-economy-fix):
   root-cause-first — in PR/ledger notes, name the wrong hypothesis
   explicitly and reject it ("int truncation, NOT a 60s timer bug";
@@ -311,7 +408,12 @@ findings that keep recurring. One line per entry, dated, with the job id.
   every finding against disk before applying. Budget an R2 / self-review
   pass after applying R1 — R1 fixes introduce their OWN bugs (a defective
   rounding formula written to fix R1; the GDD's own example was the
-  disproof).
+  disproof). 2026-08-13 addendum (dream-2026-08-13; rc4-1 + 3.3-contention,
+  both repos): the pre-PR self-review earns its cost on CODE PRs too —
+  an edge-case-hunter self-review before the PR paid off 4 real fixes on
+  rc4-1 (vacuous strip guard, hooks-vs-wire divergence, non-forward-
+  tolerant decoder, corrupt-row read); the 2-hunter swarm caught the
+  spatial-lane mirroring bug on 3.3 — both before Perkins saw the PR.
 - 2026-08-09 (dream-2026-08-09; packet-plumber art-direction-amend,
   forge6-desktop-first-amend, port-limits-canon + righttenantry
   refcheck-ad5/-ad6 amends — 4+2+3 sightings, 2 repos): canon-doc
@@ -343,6 +445,24 @@ findings that keep recurring. One line per entry, dated, with the job id.
   — a fix can be INERT (value ships but JS never populates it) while a
   `simulate.form_body` test MASKS it (drives the simulator, not the
   browser); neutralize the fix and confirm the browser-path test goes red.
+  2026-08-13 addendum (dream-2026-08-13; rc4-1 + rc1-1): two new failure
+  modes — (a) assert BOTH forms of a JSON-string-embedded payload: the
+  ESCAPED wire form (`\"referee_ip\"`) is what ships, so a
+  `string.contains(body, "\"referee_ip\"")` assertion is vacuously green
+  while the IP is on the wire — assert both forms + neutralize → red;
+  (b) grep the file AFTER a python-replace negative-control revert — an
+  inline-arg call survived the first revert and silently kept the fix.
+- 2026-08-13 (dream-2026-08-13; 3.4-sla, 4.2-surge, 4.1-warning ×2 — ×4
+  sightings, both repos): reported success LIES — verify by OBSERVABLE
+  effect, not return values: a narrow pipe draw is silently REJECTED
+  (max_span 10) → zero events (spawn narrow-tier nodes ≤10 tiles apart);
+  adding pipes to a full router silently rejects (Router_Ports_Full →
+  replay_error latched — swap or size the fixture); Odin
+  `strings.replace` returns replaced=true while the doc holds the old
+  substring (raw-string newline mismatch — pin single-line anchors or
+  byte-verify); test-catalog `Balance` fields must mirror
+  data/balance.json (zeroed thresholds = every node red at tick 1,
+  silently shifting every dump).
 
 ## Recurring review findings
 
@@ -417,6 +537,26 @@ findings that keep recurring. One line per entry, dated, with the job id.
   arm absent → route 403s; redact arm absent → token leak in logs). When
   adding ANY route, enumerate every registry and arm each; the lesson is
   now baked into RT briefings by name ("the rc3-3 csrf-registry lesson").
+  2026-08-13 addendum (dream-2026-08-13; rc3-6): which arms apply is
+  PER-ROUTE-FAMILY — a NEW top-level path family (`/webhooks/*` vs
+  `/api/v1/webhooks/*`) needs its OWN registry arms; the existing
+  `["api","v1","webhooks",..]` CSRF prefix did NOT cover it (a missing
+  arm 403s). Verify each registry against disk per route family.
+- 2026-08-13 (dream-2026-08-13; rc4-2 r2 W4 + rc4-3 r2 W3 + rc4-4 — ×3
+  rounds, ×3 jobs): timestamp FORMAT-MIX — PG `::text` renders
+  timestamps with a SPACE separator, app code stamps RFC3339 `T`; space
+  (0x20) < 'T' (0x54), so string compares/sorts INVERT same-day events
+  (evening before morning). Normalize space→T before comparing/sorting,
+  and pin with a fixture the server ACTUALLY sends (rc4-2's pin fed a
+  never-sent format — Perkins r2 caught the wrong fix).
+- 2026-08-13 (dream-2026-08-13; rc4-3 r4 B1 + #36 r2 B1 — ×2 blockers,
+  both repos): a fix whose regression test is VACUOUS or ABSENT is still
+  a blocker even when the mechanism is real by inspection — fix-audits
+  must verify the test pins the ORIGINAL failure mode and drives the
+  REAL route (rc4-3 r4: the backstop test called the dead SQL directly,
+  never the POST route; #36 r2: the demolish-and-renumber test was
+  absent — every resolve fixture preserved slot order). The passing
+  fix: drive the real route + pin the mechanism + neutralize → red.
 
 ## glm-5.2 bare-label routing bug (2026-08-04, 2 independent sightings)
 

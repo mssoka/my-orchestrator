@@ -141,7 +141,14 @@ the user at the Gru session in `/Users/moses/code`.
   reacts to something concrete at a lavish gate — expect reversals
   there; prefer in-place correction over kill-and-redispatch when the
   reversal is a setting (`/model`, a relayed redirect); every direction
-  reversal needs an explicitly ROUTED cascade job, not an orphan thread.
+  reversal needs an explicitly ROUTED cascade job, not an orphan
+  thread. 2026-08-13 addendum (dream-2026-08-13): the healthy mid-flight
+  path is AMEND the canon docs + RELAY to the in-flight minion so the
+  PR ships the ruling (spatial-lane canon 2e3acab/8ece056 relayed to
+  3.3 pZ8; both PRs carried the canon) — and when GDD/architecture/
+  stories diverge, the prototype's MAIN branch is the ground truth to
+  diff against (the router-placement miss: prototype had
+  Cmd_Place_Router + tray intact; the v2 replan dropped it).
 - **Cross-job impact = flag, never act across the boundary
   (2026-08-07/08, 2 sightings).** A minion that spots ANOTHER job's
   file/decision being wrong flags it in its PR, out of scope
@@ -209,7 +216,21 @@ the user at the Gru session in `/Users/moses/code`.
   @ same sha, regenerate ALL lens JSONs (discard 3-byte empties — they
   contaminate the verdict), carry prior findings forward. A pane-watcher
   `gone->done` echo right after a 403 is the transient pre-recovery
-  flicker — note-only.
+  flicker — note-only. 2026-08-13 addendum (dream-2026-08-13):
+  (a) 429 error CODES matter — 1302 burst (one continue revives) vs
+  1308 5-hour hard cap (account-wide wall, continue = waste; self-heals
+  as panes idle — block + note the reset time, no continue-spam).
+  (b) Dual-provider-down → HOLD regime: no new dispatches,
+  minimum-effort watcher ops, light close-outs — deepseek + openrouter
+  are the always-live spares; the pi probe one-liner clears PI_* env
+  first (`env $(env|grep '^PI_'|sed 's/=.*//;s/^/-u /'|tr '\n' ' ') pi
+  --model <p>/<m> -p --no-session -nt "Reply OK"`); auth.json keys use
+  `{"type":"api_key","key":"sk-..."}` (the field is `key`).
+  (c) NEW CLASS — recurring "Connection error / Retry failed after 3
+  attempts" on deepseek = CHECK NETWORK with the user before provider
+  blame: 2026-08-13's two waves on BOTH v4-pro and v4-flash were the
+  office FIREWALL (user-confirmed; hotspot fixed it). One continue per
+  pane still clears each wave meanwhile; do NOT loop continues.
 - **Model dispatch & correction ops (2026-08-09).** Only a
   `provider/model` path naming an AUTHED provider works: bare
   `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
@@ -225,6 +246,14 @@ the user at the Gru session in `/Users/moses/code`.
   accept a user mid-run override reversal. pi's defaultProvider is now
   kimi-coding, so UNSET-model dispatches resolve to kimi-coding/k3 (the
   flip side of the `PI_MODEL`-override gotcha: know what "unset" means).
+  2026-08-13 addendum (dream-2026-08-13): briefing model lines are
+  LOAD-BEARING for mega-minion spawns — the code-review skill pins NO
+  model on lens launches, and bare `pi` resolves to defaultProvider
+  (kimi-coding — a RETIRED provider since 08-12, so an unset dispatch
+  silently lands on retired kimi/k3). Name the model for minion AND
+  mega-minions explicitly in every briefing; template model lines rot
+  (the dream template's "unset" meant retired-kimi at the 08-13
+  dispatch — override required).
 - **Serialize concurrent Perkins BURSTS (2026-08-11; models renamed 2026-08-12).** A Perkins round =
   ~8 concurrent lens panes (glm-5.2 historically; now kimi k3, deepseek-v4-flash fallback); two rounds
   (or a round + a fanned-out
@@ -298,7 +327,15 @@ the user at the Gru session in `/Users/moses/code`.
   fresh sightings). The held round's briefing NAMES the in-flight round
   it's behind ("SERIALIZE-HELD behind perkins-v2-1.2-window-draw-pipe-r1")
   and the RELEASE trigger (the in-flight round's close-out); the held pane
-  stays dispatched (sensor dedup'd) until release.
+  stays dispatched (sensor dedup'd) until release. 2026-08-13 addendum
+  (dream-2026-08-13): release triggers now span three kinds — (a) the
+  in-flight round's close-out; (b) close-out + CI green; (c)
+  verdict-gate OPEN for a held JOB (3.2 released when #30 r1 APPROVED).
+  Held-row hygiene at release: RE-VERIFY the head — refresh the row sha
+  when the head moved during the hold (3.1 r2: a980194 → abe578b after
+  a rebase) and take the fresh sha at release; a dirty base (sibling
+  merged mid-hold) = rebase via parked-pane relaunch + relay, not a
+  fresh dispatch.
 - **"Moot on merge" is NOT the default for a mid-flight Perkins round
   (2026-08-07).** A normal terminal merge of an APPROVED PR → sweep the
   in-flight round as moot, no re-dispatch. But a DELIBERATE pre-verdict
@@ -342,6 +379,10 @@ the user at the Gru session in `/Users/moses/code`.
   sensor RE-FIRES on every new commit while the head moves — those are
   echoes (note-only), not new work. Sibling to serialize-hold (which gates
   on pane/model capacity); this gates on review-TARGET stability.
+  2026-08-13 addendum (dream-2026-08-13): CI PENDING ≠ CI RED — the
+  hold gates on RED only; a fresh r1 dispatch is OK on 4/5 pass + 1
+  pending ("UNSTABLE=pending, not red" — #36 r1 08-13, #28 08-12).
+  Treating pending as red needlessly blocks fresh rounds.
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
@@ -391,7 +432,12 @@ the user at the Gru session in `/Users/moses/code`.
   NOT universal — the RTA crew still produced a NULL `pr` on self-report
   (#173, #597) this window. Silas still VERIFYs `pr` on every in-review
   transition (`ledger show`, not the lossy table); don't relax
-  verification just because most crews now self-set it.
+  verification just because most crews now self-set it. 2026-08-13
+  addendum (dream-2026-08-13): 3 more sightings 08-12/13 (3.2-lane-qos,
+  rc1-1-grapheme-fix, rc4-4 #609 — Silas: "SELF-REPORT GAP again: pr
+  field NULL on in-review (the RTA-crew pattern)"). The gap is
+  crew-level and persistent — Silas verify-and-set on every in-review
+  transition remains the only reliable guard.
 - **Verify merge/deploy state by commit-containment, never by grepping a
   single file (2026-08-11).** Two false-negative traps: (a) grepping a
   single file for the change gives a FALSE NEGATIVE if you grep the wrong
@@ -460,6 +506,25 @@ the user at the Gru session in `/Users/moses/code`.
   forever). New race: right after a move to a NEW tab, `herdr agent list`
   lags a beat (StopIteration) — get tab_id from `herdr tab list` by
   label. And a mangled move-output subshell caused a DUPLICATE worktree
-  create — capture once, never re-parse.
+  create — capture once, never re-parse. 2026-08-13 addendum
+  (dream-2026-08-13): a workspace MOVE mutates the pane id (w4T:p1 →
+  w1T:pXM — the pre-move id becomes a phantom the watcher chases) —
+  re-capture the id post-move and correct the ledger row (×5 on
+  08-12/13: pXM, pZ8, pZD, p0V, p16W). herdr JSON parse keys: split
+  result = `result.pane` (NOT split_result); move's tab =
+  `move_result.created_tab` — wrong keys leave orphan panes (pWH,
+  08-12).
+
+- **Never guess review-URL anchor ids (2026-08-11, ×2 sightings).** A
+  guessed anchor id writes a WRONG review URL into the permanent ledger
+  (the review-sensor alert gives the id, pane-done alerts don't).
+  Fetch it: `gh api repos/<owner>/<repo>/pulls/<n>/reviews --jq
+  '.[-1].id'` — first, never guess.
 
 - **`pr_review` is a LEDGER KEY, not a note string (2026-08-12, ~11h of sensor blindness).** The Perkins sensor's gate is `job.pr_review === 1` read from the COLUMN. Writing "pr_review 1" into the `ledger add` note leaves the column at its 0 default and the review-sensor silently skips the job — 5 jobs blind (~11h: 3.3/3.4/4.1/rc1-1/rc4-3/rc4-4/4.2, every Perkins round in that window was a manual/held dispatch; only 3.2 fired because its row was SQL-fixed at 12:16Z). ALWAYS pass `pr_review=<n>` as an add-key when the briefing mandates it. VERIFY the column after add (`sqlite3 ... SELECT pr_review`), don't trust the note. Sensor-down fallback: at every minion completion/settle, sweep in-review pr_review=1 jobs — no round row carrying the current head sha + head stable → dispatch manually, never wait on the sensor.
+  2026-08-13 addendum (dream-2026-08-13): manual/held dispatch is what
+  MASKED the ~11h outage (everything ran manually, so the dead sensor
+  was invisible — the only auto-fired round was the one SQL-fixed row).
+  The sweep fallback executed cold on 08-13 (rc4-4 #609 r1 dispatched
+  proactively at 13:50Z: head stable + no round row) — PROVEN; keep
+  sweeping at every completion/settle, never trust the sensor alone.
