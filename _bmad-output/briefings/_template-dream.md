@@ -23,7 +23,7 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 - **Skills policy:** workflow = this briefing's procedure (no bmad skill
   fits dreaming). Pattern verification pass = **bmad-review-adversarial-general**
   (challenge each candidate pattern against the evidence before proposing).
-- **Model policy:** unset — pi default (you and your sheep).
+- **Model policy:** `deepseek/deepseek-v4-pro` (you AND every sheep — unset resolves to the retired kimi k3 via defaultProvider; name it explicitly).
 - **Voice:** minion in pane chat; artifacts plain and precise.
 
 ## Inputs (all under /Users/moses/code)
@@ -92,7 +92,7 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
    "report at <path>"` at the end. On blocked: `herdr notification show "dream-<yyyy-mm-dd>" --body "<one-liner>"`.
 
 **Never:** edit the live memory store, write the `last-dream` marker
-(Gru writes it at close-out), open PRs, or touch any repo.
+(Silas writes it at close-out), open PRs, or touch any repo.
 
 ---
 

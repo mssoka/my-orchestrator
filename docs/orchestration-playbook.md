@@ -385,12 +385,23 @@ store, one reader per source, proposals with reasoning.)
 7. **Perkins opt-in (optional, never blocking).** For large or risky jobs,
    opt in to automated PR review: put `pr_review: true` in the briefing
    and pass `pr_review=1` in `ledger add`. Default stays off — small
-   changes rely on quick-dev's built-in review. See 'Perkins (automated
+   changes rely on quick-dev's built-in review. **Scope guard (user
+   ruling 2026-08-12):** the `pr_review=0` quick-fix shortcut applies to
+   CI/ops-tooling fixes ONLY. Gameplay/canon-surface code (new command
+   kinds, serialization, LOG_VERSION, payload contracts, routing/packet
+   semantics) keeps `pr_review=1` — a wrong `pr_review=0` briefing was
+   caught by the user on 3.5 node-placement. See 'Perkins (automated
    PR review)'.
 8. **Handoff (Silas).** End the briefing with a **Dispatch parameters**
    block (repo, repo_root, slug, base, model?, github_issue?). Gru hands
    the path to Silas (`herdr pane run <silas-pane> "dispatch: <briefing
    path>"`); Silas runs 'Dispatch' steps 2–6 and reports the pane id.
+9. **Follow-up intake + deferred-work sweep (routine, user-ruled
+   2026-08-12).** At every dispatch window: (a) advisory findings from
+   reviews batch into ONE issue per repo (#34 PP, #607 RT — never a
+   spray of one-offs); (b) parse the bmad deferred-work docs and run
+   unblocked items parallel-safe, gate or fold the rest into future
+   briefings (RC2.1 codec folded into RC4.4).
 
 ## Sprint execution (the standing pattern)
 
@@ -918,6 +929,19 @@ A Perkins round = 8 panes (Perkins + 7 lenses). Two concurrent rounds =
 16 panes + Gru — against the ~20 safety valve, so serialize rounds when
 the workspace is crowded (hold the second dispatch and tell the user).
 
+**User ruling 2026-08-12: FULL THROTTLE on deepseek.** The serialize
+suspension applies to Perkins rounds while the active provider is
+deepseek (the glm-429/1308 cap history does not apply); the pane-capacity
+serialize rule binds only on capped providers. The parallel gate is now
+**file-level DISJOINTNESS**: hold a dispatch when `goldens/` or shared
+modules overlap an in-flight job on the same repo; disjoint-by-file →
+parallel. (2026-08-13: routing-bandwidth-cost held on `goldens/` overlap
+with #36's 19-golden-file change; Jobs B+C verified disjoint → parallel.)
+**FULL THROTTLE chain pattern:** pre-author the downstream briefings,
+pre-stage the held worktree (rebase onto fresh `origin/<base>` at
+release), and pre-create the held ledger row with an explicit release
+trigger — zero idle time between links.
+
 ### Re-review semantics
 
 When the review sensor relays Perkins' CHANGES_REQUESTED, the minion's
@@ -966,6 +990,15 @@ for shas that are true merge candidates.
   round close-out; the sensor re-fires the same event seconds-to-minutes
   later. Answer every echo with a same-status `ledger note` ("already
   relayed — no double X"), never a second action.
+- **User cap override (named practice).** The 3-round cap is doctrine,
+  not law: the user can order rounds beyond it (precedent: rc4-3 #606 r4
+  + r5, both user-approved fix-audits; r5 APPROVED). Mechanics: override
+  rounds run as fix-audits with `prior_findings` + verify-don't-reopen —
+  identical to normal rounds. The implementing MINION is unaware of
+  overrides (it believes cap-hit and parks) — Gru/Silas track the budget
+  and escalate AT PUSH TIME ("next sha = rN — beyond the cap/override →
+  user decides: another round or human review"). Cap alerts superseded
+  by a user override = note-only.
 
 ## Close-out (Silas — on the merge alert, or after the user acks via Gru)
 

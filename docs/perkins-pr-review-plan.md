@@ -202,6 +202,11 @@ Updates to `docs/orchestration-playbook.md`:
      - 4+ blockers → `--request-changes`, body leads with "MAJOR REWORK"
      - **Degraded guard:** any lens failed AND zero findings remain → do NOT
        approve; `--comment` instead and flag Gru ("incomplete review").
+     - **Lens-loss tolerance (6/7 judgment):** a round completes at 6/7
+       lenses when the stuck lens's concerns are covered elsewhere —
+       "sufficient, not degraded" (×3 sightings 08-11/12). Recovery for a
+       429'd/stalled lens = a 2-concurrent re-wave of THAT lens only — never
+       a full round re-run.
    - Post as the app (owner parsed from the PR URL):
      `GH_TOKEN=$(/Users/moses/code/bin/perkins-token --owner <owner>) \
        gh pr review <pr> --<event> --body-file <body.md>`
