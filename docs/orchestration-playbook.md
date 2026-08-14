@@ -184,9 +184,21 @@ drops the note).
 
 Two allocations, by ROLE — the orchestrator's reasoning roles vs its
 execution roles. NOT by project (we work on multiple projects: the game,
-RightTenantry, FinLit, etc.). (User ruling 2026-08-12 late — **v4-pro replaces
-kimi k3 for reasoning**; supersedes the earlier same-day two-tier kimi/deepseek
-ruling.)
+RightTenantry, FinLit, etc.). (User ruling 2026-08-14 — **GLM 5.3 returns the
+reasoning tier to ZAI**; supersedes the 2026-08-12 late v4-pro ruling.)
+
+- **Reasoning — `zai-coding-cn/glm-5.3`**: **Gru** (CEO: persona,
+  relays, escalations, briefing authorship), **Perkins** (code review — the
+  last line of defense before code ships: correctness + judgment under
+  ambiguity matter most), and **Bob** (dream: memory consolidation +
+  lesson curation). Low-volume, judgment-heavy roles. glm-5.3 is back on
+  top — the strongest tier; deepseek-v4-pro is the interim fallback until
+  the ZAI account is recharged (VERIFIED 2026-08-14: glm-5.3 registered +
+  key present, but the account returned error 1113 'Insufficient balance'
+  on both endpoints — routing stays on v4-pro until the recharge lands,
+  then flips to glm-5.3; flash is the last-resort interim). Launch label =
+  the FULL path `zai-coding-cn/glm-5.3` (the bare `glm-5.3` label failed
+  in the glm-5.2 era — same shape expected).
 
 - **Reasoning — `deepseek/deepseek-v4-pro`**: **Gru** (CEO: persona,
   relays, escalations, briefing authorship), **Perkins** (code review — the
