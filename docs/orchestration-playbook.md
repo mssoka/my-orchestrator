@@ -192,13 +192,13 @@ reasoning tier to ZAI**; supersedes the 2026-08-12 late v4-pro ruling.)
   last line of defense before code ships: correctness + judgment under
   ambiguity matter most), and **Bob** (dream: memory consolidation +
   lesson curation). Low-volume, judgment-heavy roles. glm-5.3 is back on
-  top — the strongest tier; deepseek-v4-pro is the interim fallback until
-  the ZAI account is recharged (VERIFIED 2026-08-14: glm-5.3 registered +
-  key present, but the account returned error 1113 'Insufficient balance'
-  on both endpoints — routing stays on v4-pro until the recharge lands,
-  then flips to glm-5.3; flash is the last-resort interim). Launch label =
-  the FULL path `zai-coding-cn/glm-5.3` (the bare `glm-5.3` label failed
-  in the glm-5.2 era — same shape expected).
+  top — the strongest tier. VERIFIED 2026-08-14: `zai-coding-cn/glm-5.3`
+  registered + authed + ROUTES end-to-end through pi (env-cleared probe
+  replies; a "glm-4.7" self-identification from the model is a known
+  hallucination, not a misroute). Interim fallback = deepseek-v4-pro;
+  flash last-resort. Launch label = the FULL path `zai-coding-cn/glm-5.3`
+  (the bare `glm-5.3` label misroutes via the resolver's provider table —
+  same shape as the glm-5.2 era).
 
 - **Reasoning — `deepseek/deepseek-v4-pro`**: **Gru** (CEO: persona,
   relays, escalations, briefing authorship), **Perkins** (code review — the
