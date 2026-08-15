@@ -23,7 +23,7 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 - **Skills policy:** workflow = this briefing's procedure (no bmad skill
   fits dreaming). Pattern verification pass = **bmad-review-adversarial-general**
   (challenge each candidate pattern against the evidence before proposing).
-- **Model policy:** `deepseek/deepseek-v4-pro` (you AND every sheep — unset resolves to the retired kimi k3 via defaultProvider; name it explicitly).
+- **Model policy:** `zai-coding-cn/glm-5.3` (you AND every sheep — the reasoning tier per the 2026-08-14 flip; full-path label, a "glm-4.7" self-id is a hallucination not a misroute. Interim fallback if the provider errors: `deepseek/deepseek-v4-pro`. Name the model explicitly at every launch — unset resolves to the retired kimi k3 via defaultProvider).
 - **Voice:** minion in pane chat; artifacts plain and precise.
 
 ## Inputs (all under /Users/moses/code)

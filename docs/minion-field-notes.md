@@ -279,6 +279,14 @@ findings that keep recurring. One line per entry, dated, with the job id.
   in-loop strings that must outlive the tick iteration need
   `fmt.aprintf` (T2 failure strings were blank garbage the first time
   that path ran), and JSON literals need `{{`/`}}`.
+  2026-08-15 addendum (dream-2026-08-15; 5.3-pause-ux + silas 08-14
+  chip-placement — ×2): app-layer UI (overlays, HUD chips) is INVISIBLE
+  to T2 goldens (captures are world+forecast+health+banner only) — zero
+  golden-shift does NOT verify an overlay change; the app's own frame
+  needs a scratch replica (ODIN_ROOT=<main>/tools/raylib-sw/shadow +
+  LoadImageFromScreen) + a PROGRAMMATIC pixel-scan (PIL) for overlap
+  truth — vision models misjudge absolute coordinates; never eyeball a
+  collision claim.
 - 2026-08-11 (dream-2026-08-11; packet-plumber-v2-1.3-packet-flow +
   -1.1-walking-skeleton — 2 stories): the PP-v2 determinism spine — the
   replay gate re-creates run-setup (fixture) but NOT flow demand by
@@ -434,7 +442,12 @@ findings that keep recurring. One line per entry, dated, with the job id.
   auto-merge; (f) for an append-only decision-log, a mid-job sibling-merge
   conflict resolves as DUAL-APPEND (keep both), not pick-a-side; (g)
   disambiguate same-letter namespaces + superseded-vs-live docs before
-  editing (qualify a bare "E1").
+  editing (qualify a bare "E1"). 2026-08-15 addendum (dream-2026-08-15;
+  5.3-pause-ux — 1 sighting, facet completion): (h) a presentation-only
+  ruling still earns a canon amendment in the SAME PR (GDD +
+  art-direction + story-card status line) — grep the ruling's canon line
+  first and STATE THE RULING SOURCE (user ruling date + job id) in the
+  amendment so canon and code can never drift undetected.
 - 2026-08-09 (dream-2026-08-09; righttenantry-csp-posthog-allowlist 08-06
   + per-applicant-remind 08-08): prove a new test/guard actually BITES —
   negative control: flip one assertion (or inject the violation), confirm
