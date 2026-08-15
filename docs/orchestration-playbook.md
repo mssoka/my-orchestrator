@@ -195,19 +195,12 @@ reasoning tier to ZAI**; supersedes the 2026-08-12 late v4-pro ruling.)
   top — the strongest tier. VERIFIED 2026-08-14: `zai-coding-cn/glm-5.3`
   registered + authed + ROUTES end-to-end through pi (env-cleared probe
   replies; a "glm-4.7" self-identification from the model is a known
-  hallucination, not a misroute). Interim fallback = deepseek-v4-pro;
-  flash last-resort. Launch label = the FULL path `zai-coding-cn/glm-5.3`
+  hallucination, not a misroute). Interim fallback = `deepseek/deepseek-v4-pro`
+  (flash last-resort; kimi k3 is retired from active duty). Launch label = the
+  FULL path `zai-coding-cn/glm-5.3`
   (the bare `glm-5.3` label misroutes via the resolver's provider table —
   same shape as the glm-5.2 era).
 
-- **Reasoning — `deepseek/deepseek-v4-pro`**: **Gru** (CEO: persona,
-  relays, escalations, briefing authorship), **Perkins** (code review — the
-  last line of defense before code ships: correctness + judgment under
-  ambiguity matter most), and **Bob** (dream: memory consolidation +
-  lesson curation). Low-volume, judgment-heavy roles. v4-pro is what kimi
-  k3 was for — the strongest tier; kimi k3 is retired from active duty.
-  (Interim fallback if v4-pro is unavailable: `deepseek-v4-flash` — same
-  provider, proven always-live — per the same-day failover ruling.)
 - **Execution — `deepseek/deepseek-v4-flash`**: **Silas** (COO: ops,
   relay, coordination, dispatches), **ALL minions** (every coding minion
   — implementation), and **mega-minions** (well-specified sub-tasks).
@@ -220,7 +213,8 @@ so UNSET-model dispatches would resolve to kimi — which is why minion and
 mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
 (the briefing's 'Model policy' field overrides per-job; the dispatch
 `--model` carries it). Gru / Perkins / Bob launches name
-`deepseek/deepseek-v4-pro` (flash as the interim). Silas is pinned to
+`zai-coding-cn/glm-5.3` (interim fallback: `deepseek/deepseek-v4-pro`, flash
+last-resort). Silas is pinned to
 deepseek-v4-flash by `.pi/extensions/silas.ts` (see 'Silas (COO)').
 
 ## Durable state
