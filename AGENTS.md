@@ -248,7 +248,15 @@ the user at the Gru session in `/Users/moses/code`.
   mandatory). Model flips apply to NEW dispatches only — an in-flight
   round completes on its launched model (5.3-r1 stayed v4-pro,
   sanctioned). 9 glm-5.3 Perkins rounds 08-14/15, all clean; one 1302
-  burst (one continue).
+  burst (one continue). 2026-08-16 supersede (user ruling): **kimi k3 is
+  BACK — the reasoning tier returns to `kimi-coding/k3`** (Gru/Perkins/Bob;
+  supersedes the 08-14 glm-5.3 ruling); interim fallbacks in order:
+  glm-5.3 → deepseek-v4-pro → flash. VERIFIED 08-16 via env-cleared probe
+  + session jsonl (modelId=`k3`, stopReason=`stop`). The 08-12 lesson
+  stands — "kimi is back" is UNRELIABLE mid-cycle (403 recurred ~12 min
+  after an apparent recovery): probe before the first round routes to it;
+  a kimi round 403 mid-work → sweep + redispatch on glm-5.3/v4-pro.
+  Model flips apply to NEW dispatches only (in-flight fleet stays flash).
   (d) 2026-08-14 sibling class — GitHub Actions BILLING block looks like
   CI-red but the runner NEVER started ("recent account payments have
   failed / spending limit"): rerun useless, NOT code instability, NOT a

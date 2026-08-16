@@ -184,22 +184,26 @@ drops the note).
 
 Two allocations, by ROLE — the orchestrator's reasoning roles vs its
 execution roles. NOT by project (we work on multiple projects: the game,
-RightTenantry, FinLit, etc.). (User ruling 2026-08-14 — **GLM 5.3 returns the
-reasoning tier to ZAI**; supersedes the 2026-08-12 late v4-pro ruling.)
+RightTenantry, FinLit, etc.). (User ruling 2026-08-16 — **kimi k3 returns
+to the reasoning tier**; supersedes the 2026-08-14 glm-5.3 ruling.)
 
-- **Reasoning — `zai-coding-cn/glm-5.3`**: **Gru** (CEO: persona,
+- **Reasoning — `kimi-coding/k3`**: **Gru** (CEO: persona,
   relays, escalations, briefing authorship), **Perkins** (code review — the
   last line of defense before code ships: correctness + judgment under
   ambiguity matter most), and **Bob** (dream: memory consolidation +
-  lesson curation). Low-volume, judgment-heavy roles. glm-5.3 is back on
-  top — the strongest tier. VERIFIED 2026-08-14: `zai-coding-cn/glm-5.3`
-  registered + authed + ROUTES end-to-end through pi (env-cleared probe
-  replies; a "glm-4.7" self-identification from the model is a known
-  hallucination, not a misroute). Interim fallback = `deepseek/deepseek-v4-pro`
-  (flash last-resort; kimi k3 is retired from active duty). Launch label = the
-  FULL path `zai-coding-cn/glm-5.3`
-  (the bare `glm-5.3` label misroutes via the resolver's provider table —
-  same shape as the glm-5.2 era).
+  lesson curation). Low-volume, judgment-heavy roles. VERIFIED 2026-08-16:
+  `kimi-coding/k3` registered + authed + ROUTES end-to-end through pi
+  (env-cleared probe replies; session jsonl ground truth modelId=`k3`,
+  stopReason=`stop`). Interim fallbacks, in order:
+  `zai-coding-cn/glm-5.3`, then `deepseek/deepseek-v4-pro`, flash
+  last-resort. Launch label = the FULL path `kimi-coding/k3` (bare `kimi`
+  or provider-only labels misroute — the kimi-coding provider key is `k3`).
+  **The 08-12 lesson stands: "kimi is back" is UNRELIABLE mid-cycle** —
+  403 recurred within ~12 min of an apparent recovery (2026-08-12). The
+  probe + fallback chain is the guard: probe kimi before the first round
+  routes to it; if a kimi round 403s mid-work, sweep + redispatch on the
+  glm-5.3/v4-pro fallback (per the provider-incident doctrine) rather than
+  trusting an apparent recovery.
 
 - **Execution — `deepseek/deepseek-v4-flash`**: **Silas** (COO: ops,
   relay, coordination, dispatches), **ALL minions** (every coding minion
@@ -213,8 +217,8 @@ so UNSET-model dispatches would resolve to kimi — which is why minion and
 mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
 (the briefing's 'Model policy' field overrides per-job; the dispatch
 `--model` carries it). Gru / Perkins / Bob launches name
-`zai-coding-cn/glm-5.3` (interim fallback: `deepseek/deepseek-v4-pro`, flash
-last-resort). Silas is pinned to
+`kimi-coding/k3` (interim fallbacks: `zai-coding-cn/glm-5.3`, then
+`deepseek/deepseek-v4-pro`, flash last-resort). Silas is pinned to
 deepseek-v4-flash by `.pi/extensions/silas.ts` (see 'Silas (COO)').
 
 ## Durable state
