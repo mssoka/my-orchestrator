@@ -264,6 +264,13 @@ the user at the Gru session in `/Users/moses/code`.
   sha = ground truth), ONE escalation to the user, then note-only per PR
   ("same billing block"), and retire the briefing caveat line once
   fixed (×6 PRs 08-13/14; fixed via #618 green checks).
+  2026-08-16 SUPERSEDE (user ruling): billing NO LONGER GATES MERGES —
+  local/integration tests (the local-ci-suite replica) are the merge
+  ground truth; the billing caveat is RETIRED from PR bodies/briefings
+  (note-only if it recurs; no escalation needed per recurrence — the
+  ruling IS the standing answer; minions note it in PR bodies once, not
+  per-PR). Both RT PRs #624/#623 merged same day while billing-blocked,
+  ruling satisfied a posteriori.
 - **Model dispatch & correction ops (2026-08-09).** Only a
   `provider/model` path naming an AUTHED provider works: bare
   `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
