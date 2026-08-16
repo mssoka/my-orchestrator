@@ -939,6 +939,14 @@ A Perkins round = 8 panes (Perkins + 7 lenses). Two concurrent rounds =
 16 panes + Gru — against the ~20 safety valve, so serialize rounds when
 the workspace is crowded (hold the second dispatch and tell the user).
 
+**User ruling 2026-08-16: FULL THROTTLE on all providers — serialize-on-quota SUPERSEDED.**
+Model-quota serialization (the kimi/glm 429/1308 hold chains) is LIFTED: dispatch
+rounds as they're needed, no holding behind in-flight rounds for capacity; a 429
+wave gets standard recovery (one continue per pane) and a note, not a hold.
+Pane-capacity judgment stays Silas' (still keep the workspace under the ~20
+safety valve); review-target stability (08-11) still gates — don't dispatch on a
+sha about to be force-pushed away (rebase in flight = wait for the fresh sha).
+
 **User ruling 2026-08-12: FULL THROTTLE on deepseek.** The serialize
 suspension applies to Perkins rounds while the active provider is
 deepseek (the glm-429/1308 cap history does not apply); the pane-capacity
