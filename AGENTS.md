@@ -287,7 +287,14 @@ the user at the Gru session in `/Users/moses/code`.
   mega-minions explicitly in every briefing; template model lines rot
   (the dream template's "unset" meant retired-kimi at the 08-13
   dispatch — override required).
-- **Serialize concurrent Perkins BURSTS (2026-08-11; models renamed 2026-08-12).** A Perkins round =
+- **Serialize concurrent Perkins BURSTS (2026-08-11; models renamed 2026-08-12; SUPERSEDED 2026-08-16).**
+  **2026-08-16 USER RULING: FULL THROTTLE on all providers — the serialize-on-quota
+  doctrine below is LIFTED.** Dispatch rounds as needed, no holding behind
+  in-flight rounds for capacity; a 429 wave = standard recovery (one continue
+  per pane) + a note, never a hold. Pane-capacity judgment stays Silas'
+  (workspace under the ~20 safety valve); review-target stability (08-11)
+  still gates (don't dispatch a sha about to be force-pushed). Historical
+  context (retained for the record): A Perkins round =
   ~8 concurrent lens panes (glm-5.2 historically; now kimi k3, deepseek-v4-flash fallback); two rounds
   (or a round + a fanned-out
   mega-minion wave) concurrently trip an account rate-limit 429 (a
