@@ -187,6 +187,13 @@ execution roles. NOT by project (we work on multiple projects: the game,
 RightTenantry, FinLit, etc.). (User ruling 2026-08-16 — **kimi k3 returns
 to the reasoning tier**; supersedes the 2026-08-14 glm-5.3 ruling.)
 
+**Capability axis (user ruling 2026-08-17, U3):** VISION jobs —
+look-book canon application, T2 pixel goldens, before/after re-bless
+review — launch on a native-vision model: `kimi-coding/k3` as of
+2026-08-17 (7.1-visual-juice precedent). The override writes the ledger
+row `model` field AND the briefing, and a deferred/held dispatch must
+carry `--model` at release (row + briefing + launch flag, triple-pinned).
+
 - **Reasoning — `kimi-coding/k3`**: **Gru** (CEO: persona,
   relays, escalations, briefing authorship), **Perkins** (code review — the
   last line of defense before code ships: correctness + judgment under
@@ -431,6 +438,12 @@ loop doesn't matter.
 Ownership: Gru writes the briefing (step 1) and makes the decision; Silas
 executes steps 2–6 on Gru's handoff and reports the pane id back.
 
+**Standing authorization (user ruling 2026-08-17 — "dont wait for me..
+keep going"):** Gru briefs and dispatches the queue WITHOUT per-step user
+acks; loop-until-APPROVED extends to every new `pr_review=1` job; the
+MERGE ritual is UNCHANGED — the user merges, always. The authorization
+is countermand-able at any time (a countermand rides the affected rows).
+
 Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
 
 1. Write briefing to `_bmad-output/briefings/<job-id>.md` (template below).
@@ -659,8 +672,10 @@ see the AGENTS.md no-PR-done-mid-turn gotcha). This board-check is the
      carries `sha=<full-sha>`): a round in flight or an already-reviewed
      sha skips silently, surviving Gru restarts. An in-memory map
      suppresses per-tick re-alerts while a dispatch is pending (re-arms on
-     sha change). Cap: 3 automated rounds — a further new sha escalates
-     once per sha ("human review needed"). On the dispatch message: run
+     sha change). Round budget = loop-until-APPROVED (user ruling 2026-08-17;
+     the cap-3 "human review needed" escalation is superseded — a cap
+     alert on a job under the loop is note-only, and every NEW sha on a
+     reviewed PR earns its round). On the dispatch message: run
      the sequence in 'Perkins (automated PR review)'. **Sensor-down
      fallback (standing rule, user-ruled 2026-08-12): NEVER wait on the
      sensor.** At every minion completion/settle, Silas sweeps every
@@ -775,15 +790,25 @@ authenticates as `mssoka`, and GitHub rejects formal reviews on your own
 PRs (422), so Perkins needs its own actor (`perkins-review[bot]`) with
 short-lived installation tokens (`bin/perkins-token`). Approval policy:
 Perkins may APPROVE and REQUEST_CHANGES; the human remains the only
-merger. GitHub only. Cap: **3 automated rounds per PR**, then escalate to
-the human. Full spec: `docs/perkins-pr-review-plan.md`.
+merger. GitHub only. Full spec: `docs/perkins-pr-review-plan.md`.
+
+**Round budget — loop-until-APPROVED (user ruling 2026-08-17, supersedes
+cap-3):** rounds run UNTIL an APPROVED verdict, no cap. Loop: the minion
+pushes the rN-blocker fix → stability gate (settled head + local suite
+green + minion done iterating; billing-blocked CI is NOT a gate) →
+dispatch rN+1 fix-audit on the fresh sha with `prior_findings=rN` →
+repeat until APPROVED. Fix-audit rounds finding DELTA-INTRODUCED
+blockers is the norm, not a failure (the 5.4 arc: r1 2B → r2 2 new
+delta blockers → r3 1 → r4 APPROVED 0B). The human remains the only
+merger — the loop decides readiness, never merges.
 
 ### When Perkins fires (default-armed)
 
 Within a job opted in via `pr_review=1`, Perkins fires on **every** head
 sha by default — every push is a merge candidate until proven otherwise,
-so it earns a round (up to the 3-round cap). Skipping is the exception,
-not the rule, and happens in exactly two ways:
+so it earns a round (rounds continue until APPROVED under the
+loop-until-APPROVED budget — cap-3 is retired, user ruling 2026-08-17).
+Skipping is the exception, not the rule, and happens in exactly two ways:
 
 1. **Briefing Perkins-OFF** — Intake step 7 sets `pr_review=0` for a whole
    job (docs/lavish/script-only deliverables, in-repo commits with no
@@ -969,8 +994,9 @@ back to `in-review`.
 
 ### Round-budget ops (dream-2026-08-03, P13 — user-approved)
 
-Four practices codified from the field; all preserve the 3-round cap
-for shas that are true merge candidates.
+Four practices codified from the field, operating under the
+loop-until-APPROVED budget (user ruling 2026-08-17 — cap-3 is retired;
+rounds run until an APPROVED verdict):
 
 - **Skip-row policy.** The per-sha skip mechanism for 'When Perkins fires
   (default-armed)' above: a known-broken sha (a pending review's blockers
@@ -1008,15 +1034,17 @@ for shas that are true merge candidates.
   round close-out; the sensor re-fires the same event seconds-to-minutes
   later. Answer every echo with a same-status `ledger note` ("already
   relayed — no double X"), never a second action.
-- **User cap override (named practice).** The 3-round cap is doctrine,
-  not law: the user can order rounds beyond it (precedent: rc4-3 #606 r4
-  + r5, both user-approved fix-audits; r5 APPROVED). Mechanics: override
-  rounds run as fix-audits with `prior_findings` + verify-don't-reopen —
-  identical to normal rounds. The implementing MINION is unaware of
-  overrides (it believes cap-hit and parks) — Gru/Silas track the budget
-  and escalate AT PUSH TIME ("next sha = rN — beyond the cap/override →
-  user decides: another round or human review"). Cap alerts superseded
-  by a user override = note-only.
+- **Loop-until-APPROVED (user ruling 2026-08-17 — the standing budget;
+  supersedes the cap-3 doctrine AND its named-override practice).**
+  Rounds run until an APPROVED verdict on every `pr_review=1` job — no
+  cap, no per-job override needed; the old override mechanics
+  (fix-audits with `prior_findings` + verify-don't-reopen) are now the
+  DEFAULT round shape, and the implementing minion always expects the
+  loop (no cap-hit parking under the ruling). Countermand-able: the
+  user can re-impose a cap or stop the loop at any time — that ruling
+  rides the job row. Cap alerts under the loop = note-only.
+  (Precedents: the 5.4 arc r1→r4; rc4-3 #606 r4+r5 under the old
+  override.)
 
 ## Close-out (Silas — on the merge alert, or after the user acks via Gru)
 
