@@ -89,7 +89,10 @@ the user at the Gru session in `/Users/moses/code`.
 - **`herdr pane move` has no `--json` flag** (rejected as unknown option),
   but it prints the full JSON result anyway — parse stdout directly, or
   re-read the new pane id from `herdr agent list`. Same for
-  `herdr tab create` (2026-08-08).
+  `herdr tab create` (2026-08-08) and `herdr pane split`
+  (dream-2026-08-15; verified still true on herdr 0.8.0,
+  dream-2026-08-17 — no `--json` flag, the raw stdout IS the JSON;
+  capture key `result.pane.pane_id`).
 - **Silas: minions never split into identity tabs.** Dispatch step 3:
   the `gru` and `silas` tabs carry their owner only — minion panes go to
   a dedicated minions tab or a new tab labeled `<job-id>`; after any
@@ -270,7 +273,21 @@ the user at the Gru session in `/Users/moses/code`.
   (note-only if it recurs; no escalation needed per recurrence — the
   ruling IS the standing answer; minions note it in PR bodies once, not
   per-PR). Both RT PRs #624/#623 merged same day while billing-blocked,
-  ruling satisfied a posteriori.
+  ruling satisfied a posteriori. 2026-08-17 addenda
+  (dream-2026-08-17): (a) the billing block kills GH-ACTIONS RUNNERS
+  ONLY — Perkins verifies LOCALLY (pi panes + harness at the sha) and
+  is UNAFFECTED; a slow/missing Perkins review is NOT billing
+  evidence (a minion AND Silas both misdiagnosed it on #61 08-17 —
+  the misdiagnosis reached an escalation + PR comment). Verify which
+  substrate a process rides before declaring it blocked. (b) A GitHub
+  PLATFORM outage is its own incident class (08-17 13:40Z–:
+  API/PRs/Issues/Actions MAJOR, webhooks partial, ~20% errors, GIT
+  GREEN) — ONE advisory fanned to all in-flight rows pre-classifying
+  the noise (API flakes / sensor gaps / webhook lag = incident noise,
+  retry beats alert), NO holds, Perkins local verification
+  unaffected; merges stay user-side — when the web merge is down the
+  local-merge+push CLI recipe unblocks (#61 + #60 merged 8s apart;
+  webhook alerts lagged ~4 min).
 - **Model dispatch & correction ops (2026-08-09).** Only a
   `provider/model` path naming an AUTHED provider works: bare
   `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
@@ -316,6 +333,10 @@ the user at the Gru session in `/Users/moses/code`.
   a 1302 burst hit the 5th glm-5.3 round of the day (5.7-r2 08-14
   20:45Z; one continue revived; ~5 rounds/day cumulative is the observed
   burst ceiling — serialize the rest of that day's glm fan-outs).
+  2026-08-17 addendum (dream-2026-08-17): full throttle HELD on kimi
+  k3 — the first 3-concurrent-round k3 burst (08-16 18:40Z) plus a
+  2-round burst (08-17: 5.5-r1 + 7.2-r1) ran with ZERO 429s; don't
+  re-litigate the serialize reflex on k3.
 
 ### Watchers, sensors & Perkins rounds
 
@@ -335,7 +356,19 @@ the user at the Gru session in `/Users/moses/code`.
   settle echo BEFORE it fires — the note IS the classification, so the
   echo that follows is note-only (and doubles as the human-readable
   completion summary: PR + suite counts + what was proven). Standard,
-  not optional (5 sightings this window).
+  not optional (5 sightings this window). 2026-08-17 addendum
+  (dream-2026-08-17): two more noise flavors — (a) a herdr SERVER
+  RESTART (the 0.8.0 upgrade 08-16 09:14Z) makes the watcher fire
+  "pane no longer has a detected agent" for EVERY tracked pane —
+  FALSE ALARM: pane ids survive, pi processes survive (verify via
+  lsof on the pane cwd BEFORE any relaunch; 5 jobs noted, zero action
+  needed); (b) a dead-pi RELAUNCH produces the same gone→idle alert
+  as a fresh dispatch — the classification key is alert-ts ==
+  new-session-file ts (5.4, 08-17 00:52Z). Sibling close-out hygiene
+  from the same census: worktree removal does NOT kill spawned
+  processes — 3 stuck core.bin (removed worktree) spinning ~3.5 cores
+  + 2 orphaned beam.smp dev servers found; sweep orphan processes at
+  census/close-out.
 - **Review/Perkins/cap sensors re-fire already-acted events — expect one
   stale echo per action (2026-08-01/02).** Silas relays/escalates/
   dispatches at round close-out; the sensor tick lands seconds-to-minutes
@@ -346,6 +379,15 @@ the user at the Gru session in `/Users/moses/code`.
   what silences per-tick re-alerts; when two sensors race (review-sensor
   vs pane-watcher), relay on whichever arrives FIRST and note-only the
   twin. (2026-08-02: three races in one day on PR #563 alone.)
+  2026-08-17 addendum (dream-2026-08-17): two new echo flavors —
+  (a) the Perkins sensor re-fires on an ALREADY-APPROVED same sha (a
+  no-op re-review): classify stale, NO round dispatch; only a NEW sha
+  earns a round under the loop ruling (×4 jobs: 5.5 09:13Z, 5.9
+  17:13Z, traffic-model r3, doctrine); (b) a DOC-ONLY head move under
+  an in-flight round earns NO new round — record the skip-row
+  decision at close-out (skip if APPROVED per the #585 precedent;
+  superseded by the fix push if CHANGES_REQUESTED — 7.2 08-17,
+  executed as written across 3 doc-only commits).
 - **Perkins can self-close its round row (2026-08-02).** Closing the
   Perkins pane writes `working -> done` before Silas' close-out
   `set done`, which then no-ops (same-status) and eats the verdict
@@ -369,6 +411,17 @@ the user at the Gru session in `/Users/moses/code`.
   (rc3-2 r1) — fallback-comment posts, but APPROVED-by-comment != formal
   approve (branch-protection/review-count semantics differ); the Perkins
   tooling wants a fix task, not just tolerance.
+  2026-08-17 addendum (dream-2026-08-17): close-sweeps scope to the
+  round's OWN pane ids (from the round row / launch record) — NEVER
+  id-proximity or label. Lens tabs share generic labels (near-miss
+  08-17 09:15Z: the 5.5-r1 close-loop found 7 same-labeled mm-*-r1
+  panes and almost killed the sibling 7.2-r1's 4 IN-FLIGHT lenses —
+  relayed STOP; doctrine-r1 held the same line 10:25Z), and
+  non-Perkins panes created after a round get ADJACENT ids
+  (CONFIRMED KILL 08-17 17:09Z: the 5.9-r1 close-out lens sweep
+  killed dream-2026-08-17's sheep panes p1ZZ/p1Z0 — adjacent to lens
+  panes p1ZQ–p1ZX; one sheep's shard survived by ~8s, the other died
+  mid-turn and was re-dispatched).
 - **Serialize-hold for pane capacity: pre-create the round row to dedup the
   sensor (2026-08-07).** When the valve is near capacity, hold the next
   Perkins round behind an in-flight one: pre-create its ledger row (status
@@ -388,7 +441,17 @@ the user at the Gru session in `/Users/moses/code`.
   when the head moved during the hold (3.1 r2: a980194 → abe578b after
   a rebase) and take the fresh sha at release; a dirty base (sibling
   merged mid-hold) = rebase via parked-pane relaunch + relay, not a
-  fresh dispatch.
+  fresh dispatch. 2026-08-17 addendum (dream-2026-08-17;
+  7.1-visual-juice): the hold mechanics now cover a plain MINION
+  dispatch held behind a merge close-out — PANELESS row (no
+  pane/worktree until release), named release trigger on the row
+  ("release = the 5.5 MERGE CLOSE-OUT; early dispatch = guaranteed
+  rebase collisions on the shared chrome/draw surface"), model field
+  + pr_review carried on the row, release = resolve the fresh head
+  THEN dispatch (7.1 released @ 388e316 post-#59-merge, fired on
+  cue). The 08-16 billing+serialize day also produced a 6-DEEP held
+  round chain (refcheck ← terminology ← … ← local-ci) with position
+  notes on the rows — all released cleanly.
 - **"Moot on merge" is NOT the default for a mid-flight Perkins round
   (2026-08-07).** A normal terminal merge of an APPROVED PR → sweep the
   in-flight round as moot, no re-dispatch. But a DELIBERATE pre-verdict
@@ -524,6 +587,13 @@ the user at the Gru session in `/Users/moses/code`.
   (Silas filled pane/tab/worktree/briefing). When a watcher re-fires on
   a merged PR or a job seems untracked, check for a minion-created
   phantom row — reconcile to ONE canonical id.
+  2026-08-17 addendum (dream-2026-08-17; the 5.5 job row + 5.5-r1
+  round row — ×2): re-dispatching a DONE job id is a row RESET
+  (UNIQUE conflict on add) — NULL the stale `pr` field FIRST (a stale
+  #44 would have tripped the PR watcher at in-review), update
+  worktree/pane/tab/model, clear result, and OVERWRITE the note
+  column — a reset leaves the OLD round's note text
+  ("sha=23e1704… v4-pro") describing the superseded round.
 - **Durable routing lives on ledger rows, not in agent context
   (2026-08-14/15, ×3 + one full fire cycle).** QUEUE / BATCHED /
   RESPAWN-TRIGGER decisions are written as notes on the OWNING row
@@ -550,7 +620,13 @@ the user at the Gru session in `/Users/moses/code`.
   session jsonl even keeps the terminated thinking block). Before acting
   on an idle-mid-task pane: tail its session jsonl for
   `stopReason:"error"` / `errorMessage` — errored-turn → `continue`;
-  no session file/process → relaunch.
+  no session file/process → relaunch. 2026-08-17 addendum
+  (dream-2026-08-17; v2-5.2-node-health, verified 08-15 + 08-16 — ×2
+  days): the INVERSE trap — an 18-20h minion is not automatically a
+  stall: 5.2's ~20h was REAL DESIGN WORK (probed the sim, chose the
+  stuck-pile measure SHARED with 4.1 — coherence over invention).
+  Verify session-file mtime/toolUse GROWTH before classifying; the
+  check precedes any continue/revive reflex.
 - **Ground truth for pane forensics is the session jsonl, not env
   scraping (2026-08-01/03).** The bash tool's env is NOT a proxy for a
   pane's pi process env (PI_GRU/PI_SILAS are invisible to it). Which

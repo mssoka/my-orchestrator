@@ -142,7 +142,13 @@ findings that keep recurring. One line per entry, dated, with the job id.
   batches need EXACT tab depth — a 5-edit batch to a 3-level-deep switch
   was rejected silently (all 5 lost) because one oldText was indented 3
   tabs, not 4. Re-read the exact depth of nested code before authoring
-  batch oldText.
+  batch oldText. 2026-08-17 addendum (dream-2026-08-17;
+  packet-plumber-surge-explainer + v2-5.9-demand-caps — ×2): a
+  DUPLICATE oldText inside one batch fails the WHOLE batch silently —
+  dedupe targets before submitting; after ANY multi-edit, re-grep every
+  hunk to confirm it landed — a silent whole-batch rejection leaves the
+  tree looking edited while nothing applied (5.9 debugged phantom
+  behavior for a round before noticing).
 - 2026-08-03 (dream-2026-08-03; RightTenantry crew — refcheck-rc1-2,
   form-save-resume-f3, refcheck-privacy-draft): assert Lustre's SERIALIZED
   render, never view-source assumptions — attributes render SORTED BY NAME
@@ -234,7 +240,16 @@ findings that keep recurring. One line per entry, dated, with the job id.
   trap extends to the GATES — odin test/lint/harness cd'd to the main
   checkout too and passed against the WRONG tree (edits AND tests both
   misdirected). After edits, `git status` from cwd BEFORE trusting a
-  green test run.
+  green test run. 2026-08-17 addendum (dream-2026-08-17; PP
+  v2-5.4-input-parity + v2-7.2-audio-juice — 4th/5th sightings): the
+  briefing's `repo_root` param ACTIVELY misleads — it names the MAIN
+  checkout (ledger show prints it) and reads like a work path; treat it
+  as repo IDENTITY, never a working path. Pin the worktree path ONCE
+  after the pwd/branch check and use it for EVERY file-tool path AND
+  every bash `cd` (7.2 did the whole job at the main checkout via
+  absolute paths + cds — the expensive one). Recovery: cp changed
+  files byte-identical into the worktree, `cmp`-verify, rebuild + run
+  the gates there, restore main.
 - 2026-08-09 (dream-2026-08-09; orchestrator-docs-ua1-ua2,
   orchestrator-perkins-ops-codify, righttenantry-refcheck-rc3-2 +
   packet-plumber-setup 08-06): `gh pr create --body "$(cat <<'EOF'…)`
@@ -348,6 +363,24 @@ findings that keep recurring. One line per entry, dated, with the job id.
   no function calls in clause guards; no list `..` spread in this Gleam
   version; (e) `decode.optional_field` is the `use`-callback 4-arg form
   (the field decoder is Decoder(t) of the DEFAULT's type).
+- 2026-08-17 (dream-2026-08-17; PP v2-5.4-input-parity,
+  v2-5.5-demolish-input, local-ci-suite — ×3): gate-harness FALSE
+  GREENS — (a) derive gate counts from the list length
+  (`${#GATES[@]}`), never a literal: the 9th local-CI gate was
+  UNREACHABLE for a full review round while run_gates capped at 8;
+  (b) missing-binary/bad-arg paths must exit nonzero under `!`
+  negation (a 127→`!`→0 false-green on the r3-N7 bad-arg leg — guard
+  with `[ -x ]`); (c) success is asserted on the produced ARTIFACT,
+  never just the rc (pinned odin EXITS 0 on a failed windows
+  cross-link); (d) Dockerfile RUN steps default to /bin/sh (dash) —
+  `set -o pipefail` fails hard; bash 3.2 needs the
+  `"${arr[@]+"${arr[@]}"}"` empty-array guard.
+- 2026-08-17 (dream-2026-08-17; packet-plumber-traffic-model-design +
+  righttenantry-refcheck-621-reminder-hint — ×2): briefing source
+  material / test suites can live UNTRACKED in the main checkout or on
+  a SIBLING branch (the reference_checks bughunt scenario suite lives
+  on `origin/rt-refcheck-bughunt2`, NOT develop) — check there before
+  concluding they're missing; copy in untracked, don't commit.
 
 ## Conventions that saved time
 
@@ -397,7 +430,16 @@ findings that keep recurring. One line per entry, dated, with the job id.
   briefing, for emitted sets (rc4-4: FIVE codec variants live, the
   briefing named four); (c) CARRY-FORWARD claims about repo state rot
   within a day ("T2 unverified until the rlsw harness exists" — the
-  harness existed and worked).
+  harness existed and worked). 2026-08-17 addendum (dream-2026-08-17;
+  packet-plumber-traffic-model-design, -surge-explainer,
+  righttenantry-analytics-568-617 — ×3): the rule binds DOC AUTHORING
+  too — a design/spec doc cites the SHIPPED call sites + data files as
+  ground truth, not plan refs or catalog comments (the GDD M1 tier
+  table was STALE vs the shipped catalogs 5/15/40; "Plan §5" had NO
+  plan doc on disk — cite meta/dispatch.gleam:18-22; `bandwidth_demand`
+  loaded into the catalog but NOT consumed by the flow pass — verify
+  per-class transit claims against serve_bundle_lane). Divergence →
+  flag the drift IN the deliverable, never silently follow the doc.
 - 2026-07-31/08-01 (finlit-bugfix-event-messages, tutor-economy-fix):
   root-cause-first — in PR/ledger notes, name the wrong hypothesis
   explicitly and reject it ("int truncation, NOT a 60s timer bug";
@@ -475,7 +517,23 @@ findings that keep recurring. One line per entry, dated, with the job id.
   substring (raw-string newline mismatch — pin single-line anchors or
   byte-verify); test-catalog `Balance` fields must mirror
   data/balance.json (zeroed thresholds = every node red at tick 1,
-  silently shifting every dump).
+  silently shifting every dump). 2026-08-17 addendum (dream-2026-08-17;
+  PP v2-5.2/5.4/5.5/5.9/visibility/local-ci-suite — ×6): any assertion
+  whose PRECONDITION can silently not-happen is vacuous — a draw to a
+  NONEXISTENT node id is silently REJECTED (`replay_error` latched, no
+  test checks it → guard with `!replay_error` + verify ids from spawn
+  returns); Odin `make([dynamic]T, 0, N)` has LENGTH 0 (a
+  `p.class < len(counts)` guard silently writes nothing); a re-shaped
+  pin must be mutation-PROVEN (deleting `&& !esc_cancelled` passed
+  20/20 — a pin that can't fail isn't a pin; verify the mutation flips
+  the scenario red).
+- 2026-08-17 (dream-2026-08-17; PP merge train #55–#62 — ×5 jobs):
+  merge-train hygiene on a multi-PR base — send the rebase relay
+  BEFORE the rework push lands so the fix-audit reviews ONE clean head
+  (7.2: relay sent before the B1 fix push → r2 APPROVED on 1b96bea);
+  grep the sibling PR's hunks for disjointness and expect ZERO
+  conflicts (7.2, 5.4 ×2, visibility, doctrine — all clean); a
+  merge-order ruling (#59 first, #60 rebases) beats a conflict.
 
 ## Recurring review findings
 
