@@ -194,23 +194,24 @@ review — launch on a native-vision model: `kimi-coding/k3` as of
 row `model` field AND the briefing, and a deferred/held dispatch must
 carry `--model` at release (row + briefing + launch flag, triple-pinned).
 
-- **Reasoning — `kimi-coding/k3`**: **Gru** (CEO: persona,
+- **Reasoning — `zai-coding-cn/glm-5.3` while kimi is quota-down (user ruling 2026-08-17 evening; supersedes the 08-16 kimi ruling until the kimi cycle resets)**: **Gru** (CEO: persona,
   relays, escalations, briefing authorship), **Perkins** (code review — the
   last line of defense before code ships: correctness + judgment under
   ambiguity matter most), and **Bob** (dream: memory consolidation +
-  lesson curation). Low-volume, judgment-heavy roles. VERIFIED 2026-08-16:
-  `kimi-coding/k3` registered + authed + ROUTES end-to-end through pi
-  (env-cleared probe replies; session jsonl ground truth modelId=`k3`,
-  stopReason=`stop`). Interim fallbacks, in order:
-  `zai-coding-cn/glm-5.3`, then `deepseek/deepseek-v4-pro`, flash
-  last-resort. Launch label = the FULL path `kimi-coding/k3` (bare `kimi`
-  or provider-only labels misroute — the kimi-coding provider key is `k3`).
-  **The 08-12 lesson stands: "kimi is back" is UNRELIABLE mid-cycle** —
-  403 recurred within ~12 min of an apparent recovery (2026-08-12). The
-  probe + fallback chain is the guard: probe kimi before the first round
-  routes to it; if a kimi round 403s mid-work, sweep + redispatch on the
-  glm-5.3/v4-pro fallback (per the provider-incident doctrine) rather than
-  trusting an apparent recovery.
+  lesson curation). Low-volume, judgment-heavy roles. HISTORY: `kimi-coding/k3` is the primary reasoning tier (VERIFIED 2026-08-16: registered +
+  authed + ROUTES end-to-end — probe reply, session jsonl ground truth
+  modelId=`k3`, stopReason=`stop`), but its CYCLE QUOTA exhausted
+  2026-08-17 evening (403 "usage limit for this billing cycle" — the
+  09:34 + 18:49 probes) — the tier rides glm-5.3 until kimi resets.
+  PROBE-FIRST both ways: probe before ANY reasoning dispatch routes to
+  glm-5.3's slot AND before any switch BACK to kimi (the 08-12/08-16
+  unreliability guard applies — "kimi is back" is UNRELIABLE mid-cycle;
+  a kimi 403 mid-work = sweep + redispatch on glm-5.3). Interim
+  fallbacks, in order: glm-5.3 (current) → `deepseek/deepseek-v4-pro` →
+  flash last-resort. Launch label = the FULL path always (bare labels
+  misroute). The launched-model rule: an in-flight job stays on its
+  launched model (7.1-visual-juice rides v4-pro mid-flight 08-17;
+  model flips apply to NEW dispatches only).
 
 - **Execution — `deepseek/deepseek-v4-flash`**: **Silas** (COO: ops,
   relay, coordination, dispatches), **ALL minions** (every coding minion
