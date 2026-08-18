@@ -184,9 +184,28 @@ drops the note).
 
 Two allocations, by ROLE — the orchestrator's reasoning roles vs its
 execution roles. NOT by project (we work on multiple projects: the game,
-RightTenantry, FinLit, etc.). (User ruling 2026-08-18 — **glm-5.3
-probe-confirmed back, returns to the reasoning tier, FULL THROTTLE**;
-supersedes the 2026-08-18-night v4-pro interim ruling.)
+RightTenantry, FinLit, etc.).
+
+**HOLD REGIME (user ruling 2026-08-18 evening — SUPERSEDES the
+v4-pro-as-reasoning-fallback interim):** the user pauses ALL
+reasoning-tier work until `zai-coding-cn/glm-5.3` OR `kimi-coding/k3` is
+back — they trust glm/kimi over v4-pro for reasoning and will hold their
+proceed until one returns. Doctrine: (1) NO new reasoning-tier dispatches
+(Perkins rounds, lens waves, dream dispatches) until a probe confirms
+glm-5.3 OR kimi k3 OK — probe-first BOTH ways, the quota-regime file
+(`_bmad-output/memory/quota-regime.json`) governs; (2) an in-flight
+reasoning round completes on its launched/recovered model as the current
+record — informational only, NO next round on v4-pro; if the verdict
+needs changes, the minion fix rides flash and the NEXT round waits for
+glm/kimi; (3) merge-gated belt rows stay held (the user holds merges);
+(4) ops + flash-tier execution CONTINUE (close-outs, triage, hygiene);
+(5) when a probe flips glm or kimi back, alert Gru IMMEDIATELY +
+auto-release pending reasoning work per the deferred-registry mechanism
+(Improvement #6 — `ledger deferred` + the DEFERRED READY SET). Context:
+kimi 403 billing-cycle quota, glm 1308 5h-cap reset ~2026-08-19 06:48Z,
+fresh probe at the reset. (Superseded on the flip: the 08-18-13:10
+full-throttle glm ruling's v4-pro fallback-for-new-dispatches line —
+v4-pro remains only an in-flight-completion model under HOLD.)
 
 **Capability axis — VISION (user ruling 2026-08-18 — supersedes U3 08-17):
 image analysis rides `lmstudio/qwen/qwen3.8-27b`** (local LM Studio — the
