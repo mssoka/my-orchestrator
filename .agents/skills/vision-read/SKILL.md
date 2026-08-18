@@ -1,6 +1,6 @@
 ---
 name: vision-read
-description: Read an image with the local vision model (qwen3.8-27b-mlx@4bit via LM Studio) — headless pi with an @file attachment, no mega-minion needed. Use when you need to know what an image shows (screenshots of panes, UI states, game screens, diagrams) and the current model has no vision, or for any image the user asks you to look at.
+description: Read an image with the local vision model (lmstudio/qwen/qwen3.8-27b — the 4-bit qwen via LM Studio) — headless pi with an @file attachment, no mega-minion needed. Use when you need to know what an image shows (screenshots of panes, UI states, game screens, diagrams) and the current model has no vision, or for any image the user asks you to look at.
 ---
 
 # vision-read — local image reading (headless, no mega-minion)
@@ -22,17 +22,17 @@ no mega-minion — one command, stdout answer.
 ## How
 
 ```bash
-# default (qwen3.8-27b-mlx@4bit — accurate, slow)
+# default (lmstudio/qwen/qwen3.8-27b — the 4-bit; the only qwen, accurate, slow)
 /Users/moses/code/bin/vision-read "/absolute/path/to/image.png" "optional prompt"
 
 # fast but coarse (gemma-4-e2b — last-resort fallback only)
 /Users/moses/code/bin/vision-read --fast "/absolute/path/to/image.png"
 
 # explicit model for one call
-/Users/moses/code/bin/vision-read --model lmstudio/qwen3.8-27b-mlx@4bit "/path.png"
+/Users/moses/code/bin/vision-read --model lmstudio/qwen/qwen3.8-27b "/path.png"
 
 # swap the model for a whole session without touching any file
-VISION_MODEL=lmstudio/gemma-4-e2b /Users/moses/code/bin/vision-read "/path.png"
+VISION_MODEL=lmstudio/google/gemma-4-e2b /Users/moses/code/bin/vision-read "/path.png"
 ```
 
 ### Swapping the model
@@ -43,7 +43,7 @@ The wrapper runs (env-cleared, so no PI_* overrides):
 
 ```bash
 pi --print --no-session --no-tools \
-  --model lmstudio/qwen3.8-27b-mlx@4bit \
+  --model lmstudio/qwen/qwen3.8-27b \
   "@/absolute/path/to/image.png" "<prompt>"
 ```
 
@@ -54,12 +54,15 @@ pi --print --no-session --no-tools \
 
 ## Model + patience (doctrine 2026-08-18)
 
-- **Default: `lmstudio/qwen/qwen3.8-27b`** (full-precision) — user ruling
-  2026-08-18: flipped from the 4-bit after the LOW-thinking timing test
-  (full @ LOW = 3 min 28 s on a pane screenshot; 4-bit was the prior
-  default). `lmstudio/qwen3.8-27b-mlx@4bit` remains the fast swap target.
-- **`--fast`: `lmstudio/gemma-4-e2b`** — ~15s/image but coarse and MISREADS
-  verbatim text (missed overlays, hallucinated percentages). Last resort only.
+- **Default: `lmstudio/qwen/qwen3.8-27b`** — the 4-bit quant, and the ONLY
+  qwen in LM Studio (the 8-bit was deleted 2026-08-18). The accuracy pick
+  (user ruling: more accurate wins — decisively beat gemma on the 08-18
+  quality test: verbatim overlay text, node enumeration, honest flagging of
+  garbled overlaps). Measured ~3.5 min/image on a pane screenshot at LOW
+  thinking.
+- **`--fast`: `lmstudio/google/gemma-4-e2b`** — ~15s/image but coarse and
+  MISREADS verbatim text (missed overlays, hallucinated percentages). Last
+  resort only. (Its models.json entry declares image input too.)
 - qwen is a **reasoning model**: expect **2-4+ minutes per image** at
   LOW thinking. An empty or partial reply mid-reasoning is NOT a failure —
   the answer lands when the reasoning block closes. Callers MUST use a

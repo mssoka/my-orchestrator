@@ -189,26 +189,27 @@ probe-confirmed back, returns to the reasoning tier, FULL THROTTLE**;
 supersedes the 2026-08-18-night v4-pro interim ruling.)
 
 **Capability axis — VISION (user ruling 2026-08-18 — supersedes U3 08-17):
-image analysis rides `lmstudio/qwen/qwen3.8-27b`** (local LM Studio
-full-precision — always available, no provider quota; the 4-bit
-`lmstudio/qwen3.8-27b-mlx@4bit` is the fast swap target). Quality-verified
+image analysis rides `lmstudio/qwen/qwen3.8-27b`** (local LM Studio — the
+4-bit quant, and the ONLY qwen (8-bit deleted 2026-08-18); always
+available, no provider quota). Quality-verified
 08-18 vs gemma-4-e2b on the same images/prompts: qwen is decisively MORE
 ACCURATE (verbatim UI text, per-node detail, pixel positions; gemma
 misread key strings). It is REASONING-HEAVY: ~2-4 min/image on this
-Mac at LOW thinking (3 min 28 s measured on a pane screenshot; ~19 min
-at MAX — the 08-18 timing test), with internal reasoning tokens before
+Mac at LOW thinking (3 min 28 s measured on a pane screenshot), with
+internal reasoning tokens before
 the answer — NEVER treat an empty/short reply as a failure
 mid-reasoning: wait for the answer. **THE MECHANISM is the `vision-read`
 skill** (`.agents/skills/vision-read/` + `bin/vision-read`): headless
 `pi --print --no-session --no-tools --model <vision-model> @<image> "<prompt>"`
 — pi's `@file` attachment carries the image (auto-resized 2000x2000). No
 mega-minion pane needed. Model swap: `--model <provider/id>`,
-`VISION_MODEL` env, or `--fast` (gemma-4-e2b — coarse, last resort).
+`VISION_MODEL` env, or `--fast` (lmstudio/google/gemma-4-e2b — coarse,
+last resort).
 **Any swap target MUST declare `"input": ["text", "image"]` in its
 `~/.pi/agent/models.json` entry** or pi bounces the attachment (pi gates
 images on the model's declared input types — the 08-18 fix; both qwen
-entries carry it). **Thinking effort is controlled ONLY by the LM Studio
-per-model UI toggle** (verified 08-18: pi's `--thinking` is not
+and gemma entries carry it). **Thinking effort is controlled ONLY by the
+LM Studio per-model UI toggle** (verified 08-18: pi's `--thinking` is not
 transmitted, and the API ignores thinking:false / {type:disabled} /
 reasoning_effort). Keep the UI at **LOW** for routine forensic reads
 (5.5x faster than MAX, identical substance); bump to **medium/xhigh only
@@ -967,8 +968,8 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
   lens, big-diff chunking, the mandatory verification pass, consolidation,
   and writing `consolidated.json`. Its verdict thresholds are yours below.
   Visual checks (goldens, sprites): verify MECHANICALLY first
-  (byte/hash/capture-diff); when a visual judgment is unavoidable, spawn a
-  vision mega-minion on `lmstudio/qwen3.8-27b-mlx@4bit` — the
+  (byte/hash/capture-diff); when a visual judgment is unavoidable, run the
+  `vision-read` skill on `lmstudio/qwen/qwen3.8-27b` — the
   describe_image
   auto-delegation is retired (user ruling 2026-08-18), never trust a
   text-only model's eye.
