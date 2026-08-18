@@ -184,9 +184,9 @@ drops the note).
 
 Two allocations, by ROLE — the orchestrator's reasoning roles vs its
 execution roles. NOT by project (we work on multiple projects: the game,
-RightTenantry, FinLit, etc.). (User ruling 2026-08-18 night —
-**deepseek-v4-pro is the reasoning tier**; supersedes the 2026-08-17
-glm-5.3 ruling.)
+RightTenantry, FinLit, etc.). (User ruling 2026-08-18 — **glm-5.3
+probe-confirmed back, returns to the reasoning tier, FULL THROTTLE**;
+supersedes the 2026-08-18-night v4-pro interim ruling.)
 
 **Capability axis (user ruling 2026-08-17, U3):** VISION jobs —
 look-book canon application, T2 pixel goldens, before/after re-bless
@@ -194,29 +194,36 @@ review — launch on a native-vision model: `kimi-coding/k3` as of
 2026-08-17 (7.1-visual-juice precedent). The override writes the ledger
 row `model` field AND the briefing, and a deferred/held dispatch must
 carry `--model` at release (row + briefing + launch flag, triple-pinned).
+A `deferred:vision` verdict (e.g. the 7.1 aesthetic pass) waits
+SPECIFICALLY for kimi k3's return — native vision is the gate, not glm
+(user ruling 2026-08-18; the deferred-registry tag map routes vision →
+kimi-coding/k3).
 
-- **Reasoning — `deepseek/deepseek-v4-pro` (user ruling 2026-08-18 night —
-  glm-5.3 is 1308 hard-capped till 17:54:28Z; supersedes the 08-17
-  glm-5.3 ruling)**: **Gru** (CEO: persona, relays, escalations, briefing
-  authorship), **Perkins** (code review — the last line of defense before
-  code ships: correctness + judgment under ambiguity matter most), and
-  **Bob** (dream: memory consolidation + lesson curation). Low-volume,
-  judgment-heavy roles. HISTORY: the tier moved kimi k3 (VERIFIED
-  2026-08-16: registered + authed + ROUTES end-to-end — probe reply,
-  session jsonl ground truth modelId=`k3`, stopReason=`stop`; cycle-quota
-  403 2026-08-17 evening) → glm-5.3 (08-17 ruling) → **v4-pro (08-18,
-  after glm-5.3 hit its own 1308 5-hour hard cap)**. FALLBACKS, in
-  order: `zai-coding-cn/glm-5.3` → `kimi-coding/k3` → flash last-resort.
-  PROBE-FIRST at every reasoning dispatch (bin/quota-probe — the regime
-  file is the record): probe the primary before routing, AND probe before
-  any switch BACK to glm-5.3/k3 when they recover (the 08-12/08-16
-  unreliability guard applies — "X is back" is UNRELIABLE mid-cycle; a
-  mid-work 403/1308 = /model <next-fallback> + continue, NEVER
-  continue-spam on the dead provider). Launch label = the FULL path
-  always (bare labels misroute). The launched-model rule: an in-flight
-  job stays on its launched model (7.1 rode v4-pro mid-flight 08-17;
-  security-audit + the #66 round recovered ONTO v4-pro mid-flight 08-18
-  after the glm wall — cap-recovery IS a sanctioned mid-flight switch;
+- **Reasoning — `zai-coding-cn/glm-5.3` (user ruling 2026-08-18 —
+  probe-confirmed BACK at 12:48Z, FULL THROTTLE; supersedes the 08-18-night
+  v4-pro interim; the full provider-qualified path is MANDATORY — bare
+  glm labels misroute)**: **Gru** (CEO: persona, relays, escalations,
+  briefing authorship), **Perkins** (code review — the last line of
+  defense before code ships: correctness + judgment under ambiguity
+  matter most), and **Bob** (dream: memory consolidation + lesson
+  curation). Low-volume, judgment-heavy roles. HISTORY: the tier moved
+  kimi k3 (VERIFIED 2026-08-16: registered + authed + ROUTES
+  end-to-end — probe reply, session jsonl ground truth modelId=`k3`,
+  stopReason=`stop`; cycle-quota 403 2026-08-17 evening) → glm-5.3
+  (08-17 ruling) → v4-pro (08-18 night, after glm-5.3's 1308 cap) →
+  **glm-5.3 again (08-18, probe-confirmed back — rolling 5h window freed
+  early)**. FALLBACKS, in order: `deepseek/deepseek-v4-pro` →
+  `kimi-coding/k3` → flash last-resort. PROBE-FIRST at every reasoning
+  dispatch (bin/quota-probe — the regime file is the record): probe the
+  primary before routing, AND probe before any switch BACK to
+  v4-pro/k3/glm when they recover (the 08-12/08-16 unreliability guard
+  applies — "X is back" is UNRELIABLE mid-cycle; a mid-work 403/1308 =
+  /model <next-fallback> + continue, NEVER continue-spam on the dead
+  provider). Launch label = the FULL path always (bare labels misroute).
+  The launched-model rule: an in-flight job stays on its launched model
+  (7.1 rode v4-pro mid-flight 08-17; the #66 r1 round posts on v4-pro
+  and finishes there 08-18; security-audit resumed ONTO glm-5.3 at its
+  own deferral lift — cap-recovery IS a sanctioned mid-flight switch;
   model flips otherwise apply to NEW dispatches only).
 
 - **Execution — `deepseek/deepseek-v4-flash`**: **Silas** (COO: ops,
@@ -231,7 +238,7 @@ so UNSET-model dispatches would resolve to kimi — which is why minion and
 mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
 (the briefing's 'Model policy' field overrides per-job; the dispatch
 `--model` carries it). Gru / Perkins / Bob launches name
-`deepseek/deepseek-v4-pro` (fallbacks: `zai-coding-cn/glm-5.3`,
+`zai-coding-cn/glm-5.3` (fallbacks: `deepseek/deepseek-v4-pro`,
 `kimi-coding/k3`, flash last-resort). Silas is pinned to
 deepseek-v4-flash by `.pi/extensions/silas.ts` (see 'Silas (COO)').
 
