@@ -54,22 +54,30 @@ pi --print --no-session --no-tools \
 
 ## Model + patience (doctrine 2026-08-18)
 
-- **Default: `lmstudio/qwen3.8-27b-mlx@4bit`** — user ruling: more accurate
-  wins (decisively beat gemma on the 08-18 quality test: verbatim overlay
-  text, node enumeration, honest flagging of garbled overlaps).
+- **Default: `lmstudio/qwen/qwen3.8-27b`** (full-precision) — user ruling
+  2026-08-18: flipped from the 4-bit after the LOW-thinking timing test
+  (full @ LOW = 3 min 28 s on a pane screenshot; 4-bit was the prior
+  default). `lmstudio/qwen3.8-27b-mlx@4bit` remains the fast swap target.
 - **`--fast`: `lmstudio/gemma-4-e2b`** — ~15s/image but coarse and MISREADS
   verbatim text (missed overlays, hallucinated percentages). Last resort only.
-- qwen is a **reasoning model**: expect **2-5+ minutes per image**. An empty
-  or partial reply mid-reasoning is NOT a failure — the answer lands when the
-  reasoning block closes. Callers MUST use a generous bash timeout (600s+);
-  a 420s timeout killed an otherwise-healthy read (observed 2026-08-18).
-- **Thinking effort: LOW by default** (the wrapper passes
-  `--thinking ${VISION_THINKING:-low}`). Forensic reads are perception, not
-  reasoning — MAX thinking burns ~1600-4000 reasoning tokens/image for no
-  accuracy gain (observed: full-model read ~19 min, almost all reasoning).
-  OFF risks subtle degradation on wrapped/ambiguous text (qwen is
-  reasoning-tuned). Set `VISION_THINKING=max` only for analytic visual
-  tasks (layout causality, golden-diff judgment).
+- qwen is a **reasoning model**: expect **2-4+ minutes per image** at
+  LOW thinking. An empty or partial reply mid-reasoning is NOT a failure —
+  the answer lands when the reasoning block closes. Callers MUST use a
+  generous bash timeout (600s+).
+- **Thinking effort — controlled ONLY by the LM Studio per-model UI toggle
+  (verified 2026-08-18):** pi's `--thinking` flag is NOT transmitted to LM
+  Studio (the request body carries no thinking param), and the API ignores
+  `thinking: false` / `thinking: {type: disabled}` / `reasoning_effort`
+  (reasoning tokens still fire — measured 12-20 on a trivial probe). So:
+  keep the UI toggle at **LOW** for routine forensic reads (measured 5.5x
+  faster than MAX with identical substance; residual glyph misreads on
+  narrow/wrapped regions are caught by a verification pass); set it to
+  **medium/xhigh only for deep-analysis tasks** (layout causality, golden
+  diff judgment). `VISION_THINKING` env remains a passthrough for providers
+  that accept per-request thinking.
+- **max_completion_tokens:** pi sent 16384 for this provider (not the 60000
+  the doctrine once assumed). Long reasoning can truncate — for deep
+  analysis consider raising the model's maxTokens in models.json.
 - If the read must be async, run it with nohup into a log and poll the log.
 
 ## Troubleshooting
