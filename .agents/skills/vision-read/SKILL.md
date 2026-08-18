@@ -63,6 +63,13 @@ pi --print --no-session --no-tools \
   or partial reply mid-reasoning is NOT a failure — the answer lands when the
   reasoning block closes. Callers MUST use a generous bash timeout (600s+);
   a 420s timeout killed an otherwise-healthy read (observed 2026-08-18).
+- **Thinking effort: LOW by default** (the wrapper passes
+  `--thinking ${VISION_THINKING:-low}`). Forensic reads are perception, not
+  reasoning — MAX thinking burns ~1600-4000 reasoning tokens/image for no
+  accuracy gain (observed: full-model read ~19 min, almost all reasoning).
+  OFF risks subtle degradation on wrapped/ambiguous text (qwen is
+  reasoning-tuned). Set `VISION_THINKING=max` only for analytic visual
+  tasks (layout causality, golden-diff judgment).
 - If the read must be async, run it with nohup into a log and poll the log.
 
 ## Troubleshooting

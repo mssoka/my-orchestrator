@@ -194,21 +194,31 @@ MLX, 4-bit quant — always available, no provider quota). Quality-verified
 08-18 vs gemma-4-e2b on the same images/prompts: qwen is decisively MORE
 ACCURATE (verbatim UI text, per-node detail, pixel positions; gemma
 misread key strings). It is REASONING-HEAVY: ~2-3.5 min/image on this
-Mac (127-215s), with internal reasoning tokens before the answer —
-max_tokens HIGH (60000 valid), and NEVER treat an empty/short reply as a
-failure mid-reasoning: wait for the answer. Vision work (look-book canon
-application, T2 pixel goldens, before/after re-bless review,
-sprite/golden judgments) is done by an EXPLICIT **vision mega-minion**:
-headless `pi -p --model lmstudio/qwen3.8-27b-mlx@4bit <briefing> > out.md`
-(or an interactive pane) with a named briefing + output file, the model
-named at spawn (triple-pin: row + briefing + launch flag). The
-describe_image auto-delegation (vision.json — kimi→lmstudio fallback) is
+Mac (127-215s at 4-bit; the full `lmstudio/qwen/qwen3.8-27b` runs
+~19 min/image — verified 08-18, swap target only), with internal
+reasoning tokens before the answer — max_tokens HIGH (60000 valid), and
+NEVER treat an empty/short reply as a failure mid-reasoning: wait for
+the answer. **THE MECHANISM is the `vision-read` skill**
+(`.agents/skills/vision-read/` + `bin/vision-read`): headless
+`pi --print --no-session --no-tools --model <vision-model> @<image> "<prompt>"`
+— pi's `@file` attachment carries the image (auto-resized 2000x2000). No
+mega-minion pane needed. Model swap: `--model <provider/id>`,
+`VISION_MODEL` env, or `--fast` (gemma-4-e2b — coarse, last resort).
+**Any swap target MUST declare `"input": ["text", "image"]` in its
+`~/.pi/agent/models.json` entry** or pi bounces the attachment (pi gates
+images on the model's declared input types — the 08-18 fix; both qwen
+entries carry it). **Thinking effort: LOW (or off) for forensic reads** —
+"what text/pixels are in this image" is perception, not reasoning; MAX
+thinking burns minutes of reasoning tokens (1596 @4bit / 4093 @full per
+image) for no accuracy gain. Keep high/MAX only for analytic visual
+tasks (layout causality, golden diffs). The
+`describe_image` auto-delegation (vision.json — kimi→lmstudio fallback) is
 REMOVED (08-18: it silently fell back to local models with a lying log
 identity). NO vision deferral: the local model is always up —
 `deferred:vision` verdicts are retired (nothing vision-blocked; the tag
 map no longer routes vision). Models with NO native vision (flash,
-glm-5.3, v4-pro) MUST route image analysis through the vision
-mega-minion — never guess or hallucinate image content.
+glm-5.3, v4-pro) MUST route image analysis through `vision-read` — never
+guess or hallucinate image content.
 
 - **Reasoning — `zai-coding-cn/glm-5.3` (user ruling 2026-08-18 —
   probe-confirmed BACK at 12:48Z, FULL THROTTLE; supersedes the 08-18-night
@@ -604,14 +614,16 @@ older briefings use that name; this is the same section.)
   close every pane you create before finishing ("badge out").
 - **No native vision on flash/glm** (flash, glm-5.3, v4-pro are
   text-only): if the task needs image analysis (screenshots, sprites,
-  goldens, style gates, visual verdicts), spawn a **vision mega-minion on
-  `lmstudio/qwen3.8-27b-mlx@4bit`** (headless `pi -p --model
-  lmstudio/qwen3.8-27b-mlx@4bit <briefing> > out.md`, or an interactive
-  pane) with a named briefing + output file. It is REASONING-HEAVY:
-  ~2-3.5 min/image, max_tokens HIGH (60000), and wait for the answer — an
-  empty reply mid-reasoning is NOT a failure. NEVER guess or hallucinate
-  what an image shows. The describe_image auto-delegation (vision.json)
-  is retired (user ruling 2026-08-18).
+  goldens, style gates, visual verdicts), run the **`vision-read` skill**
+  (`bin/vision-read <image> ["prompt"]`) — headless `pi --print
+  --no-session --no-tools --model lmstudio/qwen3.8-27b-mlx@4bit
+  @<image> "<prompt>"` — with the model named explicitly (or
+  `--model`/`VISION_MODEL`/`--fast` to swap). It is REASONING-HEAVY:
+  ~2-3.5 min/image at 4-bit, max_tokens HIGH (60000), and wait for the
+  answer — an empty reply mid-reasoning is NOT a failure. Thinking
+  effort: LOW for forensic reads (perception, not reasoning). NEVER
+  guess or hallucinate what an image shows. The describe_image
+  auto-delegation (vision.json) is retired (user ruling 2026-08-18).
 - Treat env files as read-only. If the task genuinely requires changing
   env values, replace the symlink with a copy first
   (`rm .env && cp <repo_root>/.env .env`), edit the copy, and call the
