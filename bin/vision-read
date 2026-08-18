@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# vision-read — read an image with a LOCAL vision model (default qwen3.8-27b-mlx@4bit via LM Studio)
+#
+# Usage:
+#   vision-read <image-path> ["prompt"]
+#   vision-read --fast <image-path> ["prompt"]          # gemma-4-e2b: quick, coarse (last resort)
+#   vision-read --model <provider/model-id> <image> ...  # explicit model (must declare image input)
+#
+# Model resolution (first match wins):
+#   1. VISION_MODEL env var            (swap without editing anything)
+#   2. --model <provider/model-id>     (per-call)
+#   3. --fast                          (lmstudio/gemma-4-e2b)
+#   4. default                         (lmstudio/qwen3.8-27b-mlx@4bit)
+#
+# Mechanism: pi headless with an @file attachment. pi's `@<path>` argument
+# attaches the image to the request (auto-resized to 2000x2000); the model
+# MUST declare image input in ~/.pi/agent/models.json ("input": ["text","image"])
+# or pi bounces it with "Current model does not support images". Swap targets
+# therefore need that declaration added to their models.json entry too.
+#
+# Patience: qwen is a reasoning model — expect 2-5+ min per image. An empty
+# stdout mid-reasoning is NOT a failure; the final answer lands when the
+# reasoning block closes. Callers: use a generous timeout (600s+).
+#
+# Doctrine (2026-08-18): vision is LOCAL + EXPLICIT — never faked, never
+# delegated to a text model. qwen3.8-27b-mlx@4bit is the accuracy pick (user
+# ruling: more accurate wins); gemma-4-e2b is the fast-but-coarse fallback.
+
+set -euo pipefail
+
+MODEL=""
+FAST=0
+ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --fast) FAST=1; shift ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --model=*) MODEL="${1#--model=}"; shift ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [ "${#ARGS[@]}" -lt 1 ]; then
+  echo "usage: vision-read <image-path> [\"prompt\"] [--fast|--model <provider/model-id>]" >&2
+  exit 2
+fi
+
+IMG="${ARGS[0]}"
+PROMPT="${ARGS[1]:-Describe EXACTLY what this image shows: visible terminal panes or windows, any text you can read verbatim (titles, prompts, errors, status bars), and anything unusual. Be literal and complete — forensic read.}"
+
+# Absolute path required (pi resolves @files against cwd).
+case "$IMG" in
+  /*) ;;
+  *) IMG="$(pwd)/$IMG" ;;
+esac
+if [ ! -f "$IMG" ]; then
+  echo "image not found: $IMG" >&2
+  exit 1
+fi
+
+# Model resolution: VISION_MODEL env > --model flag > --fast > default.
+if [ -n "${VISION_MODEL:-}" ]; then
+  MODEL="$VISION_MODEL"
+elif [ -n "$MODEL" ]; then
+  : # already set via --model
+elif [ "$FAST" = "1" ]; then
+  MODEL="lmstudio/gemma-4-e2b"
+else
+  MODEL="lmstudio/qwen3.8-27b-mlx@4bit"
+fi
+
+# Env-cleared pi probe pattern (PI_* vars would override the launch).
+env $(env | grep '^PI_' | sed 's/=.*//;s/^/-u /' | tr '\n' ' ') \
+  pi --print --no-session --no-tools --model "$MODEL" "@$IMG" "$PROMPT"
