@@ -189,22 +189,26 @@ probe-confirmed back, returns to the reasoning tier, FULL THROTTLE**;
 supersedes the 2026-08-18-night v4-pro interim ruling.)
 
 **Capability axis — VISION (user ruling 2026-08-18 — supersedes U3 08-17):
-image analysis rides `lmstudio/google/gemma-4-e2b`** (local LM Studio MLX —
-always available, no provider quota; quality-verified 08-18 vs
-qwen3.8-27b-mlx, which is a reasoning-heavy model that returns empty at
-normal token budgets). Vision work (look-book canon application, T2 pixel
-goldens, before/after re-bless review, sprite/golden judgments) is done
-by an EXPLICIT **vision mega-minion**: headless `pi -p --model
-lmstudio/google/gemma-4-e2b <briefing> > out.md` (or an interactive
-pane) with a named briefing + output file, the model named at spawn
-(triple-pin: row + briefing + launch flag). The describe_image
-auto-delegation (vision.json — kimi→lmstudio fallback) is REMOVED
-(08-18: it silently fell back to local models with a lying log identity).
-NO vision deferral: the local model is always up — `deferred:vision`
-verdicts are retired (nothing vision-blocked; the tag map no longer
-routes vision). Models with NO native vision (flash, glm-5.3, v4-pro)
-MUST route image analysis through the vision mega-minion — never guess
-or hallucinate image content.
+image analysis rides `lmstudio/qwen3.8-27b-mlx@4bit`** (local LM Studio
+MLX, 4-bit quant — always available, no provider quota). Quality-verified
+08-18 vs gemma-4-e2b on the same images/prompts: qwen is decisively MORE
+ACCURATE (verbatim UI text, per-node detail, pixel positions; gemma
+misread key strings). It is REASONING-HEAVY: ~2-3.5 min/image on this
+Mac (127-215s), with internal reasoning tokens before the answer —
+max_tokens HIGH (60000 valid), and NEVER treat an empty/short reply as a
+failure mid-reasoning: wait for the answer. Vision work (look-book canon
+application, T2 pixel goldens, before/after re-bless review,
+sprite/golden judgments) is done by an EXPLICIT **vision mega-minion**:
+headless `pi -p --model lmstudio/qwen3.8-27b-mlx@4bit <briefing> > out.md`
+(or an interactive pane) with a named briefing + output file, the model
+named at spawn (triple-pin: row + briefing + launch flag). The
+describe_image auto-delegation (vision.json — kimi→lmstudio fallback) is
+REMOVED (08-18: it silently fell back to local models with a lying log
+identity). NO vision deferral: the local model is always up —
+`deferred:vision` verdicts are retired (nothing vision-blocked; the tag
+map no longer routes vision). Models with NO native vision (flash,
+glm-5.3, v4-pro) MUST route image analysis through the vision
+mega-minion — never guess or hallucinate image content.
 
 - **Reasoning — `zai-coding-cn/glm-5.3` (user ruling 2026-08-18 —
   probe-confirmed BACK at 12:48Z, FULL THROTTLE; supersedes the 08-18-night
@@ -601,9 +605,11 @@ older briefings use that name; this is the same section.)
 - **No native vision on flash/glm** (flash, glm-5.3, v4-pro are
   text-only): if the task needs image analysis (screenshots, sprites,
   goldens, style gates, visual verdicts), spawn a **vision mega-minion on
-  `lmstudio/google/gemma-4-e2b`** (headless `pi -p --model
-  lmstudio/google/gemma-4-e2b <briefing> > out.md`, or an interactive
-  pane) with a named briefing + output file. NEVER guess or hallucinate
+  `lmstudio/qwen3.8-27b-mlx@4bit`** (headless `pi -p --model
+  lmstudio/qwen3.8-27b-mlx@4bit <briefing> > out.md`, or an interactive
+  pane) with a named briefing + output file. It is REASONING-HEAVY:
+  ~2-3.5 min/image, max_tokens HIGH (60000), and wait for the answer — an
+  empty reply mid-reasoning is NOT a failure. NEVER guess or hallucinate
   what an image shows. The describe_image auto-delegation (vision.json)
   is retired (user ruling 2026-08-18).
 - Treat env files as read-only. If the task genuinely requires changing
@@ -948,7 +954,7 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
   and writing `consolidated.json`. Its verdict thresholds are yours below.
   Visual checks (goldens, sprites): verify MECHANICALLY first
   (byte/hash/capture-diff); when a visual judgment is unavoidable, spawn a
-  vision mega-minion on `lmstudio/google/gemma-4-e2b` — the
+  vision mega-minion on `lmstudio/qwen3.8-27b-mlx@4bit` — the
   describe_image
   auto-delegation is retired (user ruling 2026-08-18), never trust a
   text-only model's eye.
