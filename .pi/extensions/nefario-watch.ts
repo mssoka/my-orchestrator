@@ -586,7 +586,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 										content:
 											`[nefario-watch · ${stamp()}] QUOTA REGIME FLIP: kimi-coding/k3 ` +
 											`${cur.ok ? "BACK UP" : "DOWN"} (${cur.error ?? ""} — ${cur.ts}). ` +
-											`${cur.ok ? "Probe before routing back; the unreliability guard applies." : "Ride the fallback chain (glm-5.3 → v4-pro) until the cycle resets."}`, 
+											`${cur.ok ? "Probe before routing back; the unreliability guard applies." : "Ride the reasoning primary (deepseek-v4-pro); glm-5.3 + k3 are fallbacks (probe-first per doctrine)."}`, 
 									display: true,
 								},
 								{ deliverAs: "followUp", triggerTurn: true },

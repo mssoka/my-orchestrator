@@ -95,7 +95,7 @@ export default function silas(pi: ExtensionAPI) {
 			// Silas runs on deepseek/deepseek-v4-flash (user ruling 2026-08-12):
 			// the COO's work (watcher triage, ledger, dispatches, close-outs)
 			// is execution-grade + well-specified — deepseek-v4-flash handles it
-			// fast and reliably, keeping kimi k3 reserved for the reasoning
+			// fast and reliably, keeping the reasoning-tier model (deepseek-v4-pro as of 08-18) reserved for the reasoning
 			// roles (Gru, Perkins, Bob). Set it automatically so no manual
 			// /model step is needed.
 			const model = ctx.modelRegistry.find("deepseek", "deepseek-v4-flash");
