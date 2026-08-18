@@ -1049,6 +1049,11 @@ rounds run until an APPROVED verdict):
 
 ## Close-out (Silas — on the merge alert, or after the user acks via Gru)
 
+**Trigger-graph auto-release (P2a, user-approved 2026-08-18):** every
+close-out ends with `bin/ledger queue` — held rows whose `blocked_by` are
+all done are the READY SET; release them (resolve the fresh head, then
+dispatch per their hold notes) BEFORE the close-out's final escalation.
+
 Order matters: ledger FIRST, panes LAST. The pane watcher diffs
 ledger-tracked panes every 30s — if a pane dies while the ledger still
 tracks it, Silas gets a false "pane vanished / Herdr restarted" alert.

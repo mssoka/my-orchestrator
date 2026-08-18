@@ -701,3 +701,35 @@ the user at the Gru session in `/Users/moses/code`.
   The sweep fallback executed cold on 08-13 (rc4-4 #609 r1 dispatched
   proactively at 13:50Z: head stable + no round row) — PROVEN; keep
   sweeping at every completion/settle, never trust the sensor alone.
+
+## Orchestration upgrades (user-approved 2026-08-18)
+
+- **Quota probe (P1):** `bin/quota-probe [model]` — env-cleared pi probe of
+  the reasoning provider, writes `_bmad-output/memory/quota-regime.json`.
+  Silas runs it BEFORE every Perkins-round/dream dispatch + hourly under
+  heavy use (the nefario-watch staged tick does the hourly half); the
+  regime file is the record — no more 403 surprises. Probe-FLIP injects
+  one line.
+- **Lens-spawn rooting (P1):** the code-review skill's headless spawn
+  template pins `--cwd <worktree>` on the lens tab FOREVER (the 08-18
+  mis-rooted-lens class: a wave created without --cwd rooted at the
+  orchestrator root — Gru-contamination + dead panes). A lens pane whose
+  cwd is not the round worktree is mis-rooted: close + relaunch.
+- **GitHub-status sensor (P1):** nefario-watch ticks status.json; on an
+  incident it injects the auto-classification advisory ONCE (API/webhook
+  flakes = incident noise, note-only; git green; merges user-side via the
+  CLI-merge recipe) + a cleared line. Staged in the extension — active
+  after the next Silas relaunch.
+- **Trigger graph (P2):** `blocked_by` (comma-separated, AND semantics) +
+  `coordinate_with` (parallel handshake, never blocks) columns; `ledger
+  queue` shows the hold list + READY SET; auto-release check at EVERY
+  close-out (release = resolve the fresh head, then dispatch).
+- **Sensor-doctrine sync (P2, standing rule):** ANY doctrine amendment
+  task must grep the sensor/watcher configs (`.pi/extensions/*.ts`) for
+  the retired doctrine being amended — the cap-3 echo class lived in
+  nefario-watch.ts after the playbook retired it (fixed 08-18).
+- **Ledger guard (P2):** `ledger set <id> in-review` refuses without a PR
+  URL (in the note or via `ledger pr` first) — kills the NULL-pr
+  self-report class.
+- **Playbook consolidation (P3):** rides the NEXT dream (Model policy +
+  Perkins sections rewrite; supersede history → changelog appendix).

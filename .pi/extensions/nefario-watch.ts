@@ -67,9 +67,11 @@
  * whose note contains the current head sha skips silently — this survives
  * Silas restarts, unlike the in-memory maps. The in-memory perkinsAlerted
  * map (mirrors ciAlerted) only suppresses per-tick re-alerts while a
- * dispatch is pending; it re-arms when the sha changes. Round cap: 3
- * rounds per PR — a further new sha injects a once-per-sha escalation
- * ("human review needed") instead of a dispatch message. Detection-only,
+ * dispatch is pending; it re-arms when the sha changes. ROUND BUDGET =
+ * loop-until-APPROVED (user ruling 2026-08-17 — the cap-3 doctrine is
+ * RETIRED): every new sha on a reviewed PR earns a dispatch message, no
+ * cap escalation (the former "human review needed" alert class is dead).
+ * Detection-only,
  * same contract as above: Silas dispatches per playbook 'Perkins (automated
  * PR review)'. If the ledger predates the pr_review column (no `ledger`
  * run since upgrade), the shared jobs query falls back to a legacy shape
@@ -96,8 +98,6 @@ const POLL_MS = 30_000;
 const PR_POLL_MS = 300_000;
 /** Review bodies are capped in alerts — Silas only relays; the URL has it. */
 const REVIEW_BODY_CAP = 1500;
-/** Perkins: max automated review rounds per PR before escalating. */
-const PERKINS_ROUND_CAP = 3;
 
 // ── Dream sensor ─────────────────────────────────────────────────────
 const MEMORY_DIR = `${GRU_DIR}/_bmad-output/memory`;
@@ -156,6 +156,9 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 	let ticking = false;
 	/** job_id -> last observed agent_status ("gone" when the pane vanished). */
 	const last = new Map<string, string>();
+	/** GitHub-status sensor + quota-probe state (P1c/P1a, user-approved 2026-08-18). */
+	const ghStatusKey = new Map<string, string>();
+	const quotaProbeLast = new Map<string, number | boolean | null>();
 
 	async function trackedJobs(): Promise<TrackedJob[]> {
 		const r = await pi.exec(
@@ -514,6 +517,88 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		if (prTicking) return;
 		prTicking = true;
 		try {
+			// ── P1c: GitHub-status sensor (user-approved 2026-08-18) ──
+			// Tick status.json; on an ACTIVE incident inject ONE advisory (dedup
+			// by incident id); on clear inject a cleared line. Auto-classifies
+			// API/webhook flakes for Silas (note-only, retry beats alert;
+			// merges user-side via the CLI-merge recipe; git ops green).
+			const ghStatus = await pi.exec("curl", ["-s", "--max-time", "10", "https://www.githubstatus.com/api/v2/status.json"], { timeout: 12000 });
+			if (ghStatus.code === 0 && ghStatus.stdout) {
+				try {
+					const st = JSON.parse(ghStatus.stdout);
+					const incident = st?.incidents?.[0] ?? null;
+					const key = incident ? `incident:${incident.id}:${incident.status}` : "clear";
+					if (incident && ghStatusKey.get("s") !== key) {
+						ghStatusKey.set("s", key);
+						pi.sendMessage(
+							{
+								customType: "nefario-watch",
+								content:
+									`[nefario-watch · ${stamp()}] GITHUB INCIDENT live — ${incident.name} ` +
+									`(status: ${incident.status}, impact: ${incident.impact}); status page: ` +
+									`https://www.githubstatus.com (${st.status?.description ?? ""}). ` +
+									`AUTO-CLASSIFICATION: API/PRs/Issues/Actions/webhook flakes and sensor ` +
+									`gaps during the window = incident noise — note-only, retry beats ` +
+									`alert, no reruns/relays/escalations on flakes; git ops GREEN; merges ` +
+									`stay user-side with the CLI-merge recipe (local-merge + push) armed. ` +
+									`ONE FYI relay to Gru; then note-only per recurrence.`, 
+								display: true,
+							},
+							{ deliverAs: "followUp", triggerTurn: true },
+						);
+					} else if (!incident && ghStatusKey.get("s") && ghStatusKey.get("s") !== "clear") {
+						ghStatusKey.set("s", "clear");
+						pi.sendMessage(
+							{
+								customType: "nefario-watch",
+								content:
+									`[nefario-watch · ${stamp()}] GitHub incident CLEARED — normal classification resumes.`,
+								display: true,
+							},
+							{ deliverAs: "followUp", triggerTurn: true },
+						);
+					}
+				} catch {
+					// status.json parse failed — skip this tick (the 08-13 lesson:
+					// don't blame the provider on flaky telemetry)
+				}
+			}
+			// ── P1a: hourly quota probe (user-approved 2026-08-18) ──
+			// Runs bin/quota-probe (env-cleared pi probe of the reasoning
+			// primary) hourly; on a regime FLIP inject one line. The regime
+			// file (_bmad-output/memory/quota-regime.json) is the record Silas
+			// reads at dispatch — no more 403 surprises.
+			const nowMs = Date.now();
+			const lastProbe = quotaProbeLast.get("t");
+			if (typeof lastProbe !== "number" || nowMs - lastProbe > 60 * 60 * 1000) {
+				quotaProbeLast.set("t", nowMs);
+				const probe = await pi.exec("bash", ["-c", "/Users/moses/code/bin/quota-probe kimi-coding/k3 >/dev/null 2>&1; echo $?"], { timeout: 75000 });
+				if (probe.code === 0) {
+					const regime = await pi.exec("bash", ["-c", "cat /Users/moses/code/_bmad-output/memory/quota-regime.json"], { timeout: 5000 });
+					if (regime.code === 0 && regime.stdout) {
+						try {
+							const rj = JSON.parse(regime.stdout);
+							const cur = rj?.["kimi-coding/k3"];
+							if (cur && quotaProbeLast.get("ok") !== undefined && cur.ok !== quotaProbeLast.get("ok")) {
+								pi.sendMessage(
+									{
+										customType: "nefario-watch",
+										content:
+											`[nefario-watch · ${stamp()}] QUOTA REGIME FLIP: kimi-coding/k3 ` +
+											`${cur.ok ? "BACK UP" : "DOWN"} (${cur.error ?? ""} — ${cur.ts}). ` +
+											`${cur.ok ? "Probe before routing back; the unreliability guard applies." : "Ride the fallback chain (glm-5.3 → v4-pro) until the cycle resets."}`, 
+									display: true,
+								},
+								{ deliverAs: "followUp", triggerTurn: true },
+							);
+							}
+							quotaProbeLast.set("ok", cur?.ok ?? null);
+						} catch {
+							// regime json unreadable — silent skip
+						}
+					}
+				}
+			}
 			const jobs = await inReviewJobs();
 			const alerts: string[] = [];
 			for (const job of jobs) {
@@ -631,15 +716,9 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 							const inFlight = rounds.some((r) => r.status !== "done");
 							const shaReviewed = rounds.some((r) => r.note?.includes(sha));
 							if (!inFlight && !shaReviewed) {
-								if (rounds.length >= PERKINS_ROUND_CAP) {
-									if (perkinsEscalated.get(job.id) !== sha) {
-										perkinsEscalated.set(job.id, sha);
-										alerts.push(
-											`- Perkins round cap (${PERKINS_ROUND_CAP}) reached for ` +
-												`${job.id} — human review needed: ${job.pr}`,
-										);
-									}
-								} else if (perkinsAlerted.get(job.id) !== sha) {
+								// loop-until-APPROVED (08-17 ruling): every new sha on a
+								// reviewed PR earns a round dispatch — no cap escalation.
+								if (perkinsAlerted.get(job.id) !== sha) {
 									perkinsAlerted.set(job.id, sha);
 									alerts.push(
 										`- Perkins review pending: ${job.id}: ${job.pr} — head ` +
