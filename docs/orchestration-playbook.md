@@ -188,16 +188,23 @@ RightTenantry, FinLit, etc.). (User ruling 2026-08-18 — **glm-5.3
 probe-confirmed back, returns to the reasoning tier, FULL THROTTLE**;
 supersedes the 2026-08-18-night v4-pro interim ruling.)
 
-**Capability axis (user ruling 2026-08-17, U3):** VISION jobs —
-look-book canon application, T2 pixel goldens, before/after re-bless
-review — launch on a native-vision model: `kimi-coding/k3` as of
-2026-08-17 (7.1-visual-juice precedent). The override writes the ledger
-row `model` field AND the briefing, and a deferred/held dispatch must
-carry `--model` at release (row + briefing + launch flag, triple-pinned).
-A `deferred:vision` verdict (e.g. the 7.1 aesthetic pass) waits
-SPECIFICALLY for kimi k3's return — native vision is the gate, not glm
-(user ruling 2026-08-18; the deferred-registry tag map routes vision →
-kimi-coding/k3).
+**Capability axis — VISION (user ruling 2026-08-18 — supersedes U3 08-17):
+image analysis rides `lmstudio/google/gemma-4-e2b`** (local LM Studio MLX —
+always available, no provider quota; quality-verified 08-18 vs
+qwen3.8-27b-mlx, which is a reasoning-heavy model that returns empty at
+normal token budgets). Vision work (look-book canon application, T2 pixel
+goldens, before/after re-bless review, sprite/golden judgments) is done
+by an EXPLICIT **vision mega-minion**: headless `pi -p --model
+lmstudio/google/gemma-4-e2b <briefing> > out.md` (or an interactive
+pane) with a named briefing + output file, the model named at spawn
+(triple-pin: row + briefing + launch flag). The describe_image
+auto-delegation (vision.json — kimi→lmstudio fallback) is REMOVED
+(08-18: it silently fell back to local models with a lying log identity).
+NO vision deferral: the local model is always up — `deferred:vision`
+verdicts are retired (nothing vision-blocked; the tag map no longer
+routes vision). Models with NO native vision (flash, glm-5.3, v4-pro)
+MUST route image analysis through the vision mega-minion — never guess
+or hallucinate image content.
 
 - **Reasoning — `zai-coding-cn/glm-5.3` (user ruling 2026-08-18 —
   probe-confirmed BACK at 12:48Z, FULL THROTTLE; supersedes the 08-18-night
@@ -591,6 +598,14 @@ older briefings use that name; this is the same section.)
   ruling: tab labels are visible at a glance, never generic numbers.
   **Max 10 concurrent mega-minion panes** (batch larger swarms). You MUST
   close every pane you create before finishing ("badge out").
+- **No native vision on flash/glm** (flash, glm-5.3, v4-pro are
+  text-only): if the task needs image analysis (screenshots, sprites,
+  goldens, style gates, visual verdicts), spawn a **vision mega-minion on
+  `lmstudio/google/gemma-4-e2b`** (headless `pi -p --model
+  lmstudio/google/gemma-4-e2b <briefing> > out.md`, or an interactive
+  pane) with a named briefing + output file. NEVER guess or hallucinate
+  what an image shows. The describe_image auto-delegation (vision.json)
+  is retired (user ruling 2026-08-18).
 - Treat env files as read-only. If the task genuinely requires changing
   env values, replace the symlink with a copy first
   (`rm .env && cp <repo_root>/.env .env`), edit the copy, and call the
@@ -865,11 +880,14 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
 5. Pane into the orchestrator workspace (panes-first rule), label
    `perkins-<slug>-r<N>` — and name the TAB the same
    (`perkins-<slug>-r<N>`; descriptive-label convention, user ruling
-   2026-08-10; never a bare number); launch `cd <worktree> && pi` **on `kimi-coding/k3`**
+   2026-08-10; never a bare number); launch `cd <worktree> && pi` **on `zai-coding-cn/glm-5.3`**
    (the frontier reviewer — production code with paying users demands the
-   BEST review, so Perkins runs kimi, NOT a cheaper model for quota; user
-   ruling 2026-08-09. Pass `--model kimi-coding/k3` at launch or set it in
-   the briefing's Model policy) and hand over:
+   BEST review, so Perkins rides the reasoning tier, NOT a cheaper model
+   for quota; user ruling 2026-08-18 — Perkins = glm-5.3. Probe-first
+   (bin/quota-probe); fallbacks in order v4-pro → k3 → flash per the
+   Model policy; launched-model rule applies (a round recovered mid-flight
+   finishes on its recovery model). Pass `--model zai-coding-cn/glm-5.3`
+   at launch or set it in the briefing's Model policy) and hand over:
    "Read the playbook 'Perkins standing orders' and the briefing at
    `<path>`, then begin."
 6. Record the round:
@@ -928,6 +946,12 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
   `<lens>.json` output contract + existence check, one retry per failed
   lens, big-diff chunking, the mandatory verification pass, consolidation,
   and writing `consolidated.json`. Its verdict thresholds are yours below.
+  Visual checks (goldens, sprites): verify MECHANICALLY first
+  (byte/hash/capture-diff); when a visual judgment is unavoidable, spawn a
+  vision mega-minion on `lmstudio/google/gemma-4-e2b` — the
+  describe_image
+  auto-delegation is retired (user ruling 2026-08-18), never trust a
+  text-only model's eye.
   You MUST close every lens pane before finishing.
 - **Verdict → review event:**
   - 0 blockers → `--approve`
