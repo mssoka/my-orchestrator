@@ -573,6 +573,11 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			if (typeof lastProbe !== "number" || nowMs - lastProbe > 60 * 60 * 1000) {
 				quotaProbeLast.set("t", nowMs);
 				const probe = await pi.exec("bash", ["-c", "/Users/moses/code/bin/quota-probe kimi-coding/k3 >/dev/null 2>&1; echo $?"], { timeout: 75000 });
+				// Improvement #6 (user-approved 2026-08-18): probe the providers
+				// behind deferred:<tag> ledger rows too; when one flips BACK UP,
+				// surface the matching rows to Gru (ledger queue → deferred
+				// section carries the ready list). Nothing rots silently.
+				await pi.exec("bash", ["-c", "/Users/moses/code/bin/quota-probe --deferred >/dev/null 2>&1; echo $?"], { timeout: 90000 });
 				if (probe.code === 0) {
 					const regime = await pi.exec("bash", ["-c", "cat /Users/moses/code/_bmad-output/memory/quota-regime.json"], { timeout: 5000 });
 					if (regime.code === 0 && regime.stdout) {
@@ -593,6 +598,32 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 							);
 							}
 							quotaProbeLast.set("ok", cur?.ok ?? null);
+							// Deferred surfacing: per-provider down→up flips. Only
+							// relay when ledger queue actually lists ready rows
+							// (a bare provider flip with no deferred row is already
+							// covered by the kimi/other flip messages above).
+							for (const [model, st] of Object.entries(rj ?? {})) {
+								if (typeof st !== "object" || st === null || !("ok" in st)) continue;
+								const prev = quotaProbeLast.get("ok:" + model);
+								const isUp = !!st.ok;
+								if (prev === false && isUp) {
+									const q = await pi.exec("bash", ["-c", "/Users/moses/code/bin/ledger queue 2>&1 | grep 'DEFERRED READY SET'"], { timeout: 10000 });
+									const readyLine = (q.stdout ?? "").trim();
+									if (readyLine) {
+										pi.sendMessage(
+											{
+												customType: "nefario-watch",
+												content:
+													`[nefario-watch · ${stamp()}] DEFERRED LIFTED: ${model} probe-confirmed BACK UP — deferred verdicts can now run. ` +
+													readyLine,
+												display: true,
+											},
+											{ deliverAs: "followUp", triggerTurn: true },
+										);
+									}
+								}
+								quotaProbeLast.set("ok:" + model, isUp);
+							}
 						} catch {
 							// regime json unreadable — silent skip
 						}

@@ -14,7 +14,11 @@ Usage:
   ledger add <id> k=v ...    # insert job (keys: repo repo_root slug base model
                              #   worktree pane_id tab_id status started_at
                              #   briefing pr result github_issue parent note
-                             #   pr_review)
+                             #   pr_review deferred)
+  ledger deferred <id> <tag>        # tag a verdict deferred:<provider-or-reason>
+                             #   (Improvement #6; 'none' clears; queue shows
+                             #   the section + LIFTED rows when the provider's
+                             #   quota-regime probe flips back up)
   ledger set <id> <status> [note]   # transition status (+ event row)
   ledger note <id> <text>           # event row without status change
   ledger clear-pane <id>            # null out pane_id/tab_id (close-out)
@@ -29,7 +33,7 @@ BACKUPS = "/Users/moses/code/_bmad-output/backups"
 STATUSES = {"dispatched", "clarifying", "working", "in-review", "blocked", "done"}
 COLUMNS = {"repo", "repo_root", "slug", "base", "model", "worktree", "pane_id",
            "tab_id", "status", "started_at", "briefing", "pr", "result",
-           "github_issue", "parent", "note", "pr_review"}
+           "github_issue", "parent", "note", "pr_review", "deferred"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -41,7 +45,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   started_at TEXT, briefing TEXT, pr TEXT, result TEXT,
   github_issue INTEGER, parent TEXT, note TEXT,
   pr_review INTEGER NOT NULL DEFAULT 0,
-  blocked_by TEXT, coordinate_with TEXT
+  blocked_by TEXT, coordinate_with TEXT,
+  deferred TEXT
 );
 CREATE TABLE IF NOT EXISTS job_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,6 +75,12 @@ def init(c):
     if "pr_review" not in {r[1] for r in c.execute("PRAGMA table_info(jobs)")}:
         try:
             c.execute("ALTER TABLE jobs ADD COLUMN pr_review INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # lost a concurrent-migration race; the column now exists
+    # Migration: deferred-verdict registry (Improvement #6, user-approved 2026-08-18).
+    if "deferred" not in {r[1] for r in c.execute("PRAGMA table_info(jobs)")}:
+        try:
+            c.execute("ALTER TABLE jobs ADD COLUMN deferred TEXT")
         except sqlite3.OperationalError:
             pass  # lost a concurrent-migration race; the column now exists
     # WAL persists in the DB file; set it once (harmless to repeat).
@@ -145,6 +156,48 @@ def main():
                             for b in (r["blocked_by"] or "").split(",") if b.strip())]
         if ready_ids:
             print("READY SET (release at the next close-out): " + ", ".join(ready_ids))
+        # DEFERRED section (Improvement #6, user-approved 2026-08-18): rows
+        # carrying a deferred:<tag> verdict wait on a provider/reason (e.g.
+        # deferred:glm on the parked security-audit). When the quota-regime
+        # file shows the provider BACK, they surface as LIFTED — the
+        # nefario-watch probe tick relays the same list to Gru.
+        import json as _json, os as _os
+        regime = {}
+        rp = "/Users/moses/code/_bmad-output/memory/quota-regime.json"
+        if _os.path.exists(rp):
+            try:
+                regime = _json.load(open(rp))
+            except Exception:
+                regime = {}
+        tag_provider = {
+            "glm": "zai-coding-cn/glm-5.3", "zai": "zai-coding-cn/glm-5.3", "glm-5.3": "zai-coding-cn/glm-5.3",
+            "kimi": "kimi-coding/k3", "k3": "kimi-coding/k3", "vision": "kimi-coding/k3",
+            "v4-pro": "deepseek/deepseek-v4-pro", "deepseek": "deepseek/deepseek-v4-pro", "pro": "deepseek/deepseek-v4-pro",
+            "flash": "deepseek/deepseek-v4-flash",
+        }
+        def prov_state(tag):
+            prov = tag_provider.get(tag.strip().lower())
+            if not prov or prov not in regime:
+                return None, prov
+            return regime[prov].get("ok"), prov
+        drows = c.execute(
+            "SELECT id, status, deferred FROM jobs WHERE deferred IS NOT NULL AND deferred != '' AND status != 'done' ORDER BY started_at"
+        ).fetchall()
+        if drows:
+            print("\nDEFERRED (verdicts gated on a provider/reason — Improvement #6):")
+            lifted = []
+            for r in drows:
+                ok, prov = prov_state(r["deferred"])
+                if ok is None:
+                    print(f"{r['id']:44} {r['status']:11} deferred:{r['deferred']}  "
+                          + (f"(provider unknown: {prov} — not probed yet)" if prov else "(reason-gated — resume per its trigger)"))
+                else:
+                    state = "LIFTED — can run (probe OK)" if ok else f"waiting on {prov} (DOWN)"
+                    print(f"{r['id']:44} {r['status']:11} deferred:{r['deferred']}  {state}")
+                    if ok:
+                        lifted.append(r["id"])
+            if lifted:
+                print("DEFERRED READY SET (probe confirms provider back — relay to Gru): " + ", ".join(lifted))
 
     elif cmd == "events":
         n = int(args[1]) if len(args) > 1 else 20
@@ -217,6 +270,26 @@ def main():
         event(c, job_id, r["status"], r["status"], text)
         c.commit()
         print(f"{job_id}: noted")
+
+    elif cmd == "deferred" and len(args) == 3:
+        # Improvement #6 (user-approved 2026-08-18): tag a row's verdict as
+        # deferred:<provider-or-reason> (e.g. deferred:glm, deferred:vision).
+        # The queue surfaces it; the probe tick relays a relay when the
+        # provider flips back. 'none' clears the tag.
+        r = c.execute("SELECT status FROM jobs WHERE id=?", (args[1],)).fetchone()
+        if not r:
+            sys.exit(f"no such job: {args[1]}")
+        tag = args[2].lower().removeprefix("deferred:").strip()
+        if tag in ("none", "-"):
+            c.execute("UPDATE jobs SET deferred=NULL WHERE id=?", (args[1],))
+            event(c, args[1], r["status"], r["status"], "deferred tag cleared")
+            c.commit()
+            print(f"{args[1]}: deferred cleared")
+        else:
+            c.execute("UPDATE jobs SET deferred=? WHERE id=?", (tag, args[1]))
+            event(c, args[1], r["status"], r["status"], f"deferred:{tag} — verdict gated; auto-surfaces when the provider/reason lifts")
+            c.commit()
+            print(f"{args[1]}: deferred:{tag}")
 
     elif cmd == "clear-pane" and len(args) == 2:
         c.execute("UPDATE jobs SET pane_id=NULL, tab_id=NULL WHERE id=?", (args[1],))

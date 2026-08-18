@@ -1,27 +1,68 @@
 #!/bin/bash
-# quota-probe — env-cleared probe of a provider/model through pi (the 08-13 probe
+# quota-probe — env-cleared probe of provider(s)/model(s) through pi (the 08-13 probe
 # one-liner, scripted + recorded). Silas runs this BEFORE every Perkins-round /
 # dream dispatch and HOURLY under heavy use (the P1 quota-regime practice).
 #
-# Usage: bin/quota-probe [provider/model]   (default: kimi-coding/k3 — the reasoning primary)
+# Usage:
+#   bin/quota-probe [provider/model ...]     (default: kimi-coding/k3 — the kimi-recovery watch)
+#   bin/quota-probe --deferred               (Improvement #6, user-approved 2026-08-18:
+#                                             probe every provider referenced by a
+#                                             deferred:<tag> ledger row; used by the
+#                                             nefario-watch hourly tick to surface
+#                                             LIFTED deferred verdicts)
 # Writes: _bmad-output/memory/quota-regime.json  { provider, model, ok, error, ts }
-# Prints: OK <model> | DOWN <model> (<first-40 chars of the error>)
+# Prints: OK <model> | DOWN <model> (<first-40 chars of the error>) per model.
 
-MODEL="${1:-kimi-coding/k3}"
 OUT=/Users/moses/code/_bmad-output/memory/quota-regime.json
 mkdir -p "$(dirname "$OUT")"
 
-RESP=$(cd /tmp && timeout 60 env $(env|grep '^PI_'|sed 's/=.*//;s/^/-u /'|tr '\n' ' ') pi --model "$MODEL" -p --no-session -nt "Reply OK" 2>&1 | tail -2)
-
-if echo "$RESP" | grep -q "^OK$"; then
-  STATUS=ok; ERR=""
-else
-  STATUS=down
-  ERR=$(echo "$RESP" | tr '\n' ' ' | cut -c1-160)
+MODELS=("$@")
+if [ ${#MODELS[@]} -eq 0 ]; then
+  MODELS=(kimi-coding/k3)
 fi
 
-TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-python3 - "$OUT" "$MODEL" "$STATUS" "$ERR" "$TS" <<'PY'
+if [ "${MODELS[0]}" = "--deferred" ]; then
+  # Resolve the providers behind deferred:<tag> ledger rows (tag map lives here,
+  # single source — bin/ledger queue mirrors it for display only).
+  MODELS=($(python3 - <<'PY'
+import json, subprocess
+try:
+    rows = json.loads(subprocess.run(
+        ["/Users/moses/code/bin/ledger", "json"], capture_output=True, text=True, check=True).stdout)
+except Exception:
+    rows = []
+tag_provider = {
+    "glm": "zai-coding-cn/glm-5.3", "zai": "zai-coding-cn/glm-5.3", "glm-5.3": "zai-coding-cn/glm-5.3",
+    "kimi": "kimi-coding/k3", "k3": "kimi-coding/k3", "vision": "kimi-coding/k3",
+    "v4-pro": "deepseek/deepseek-v4-pro", "deepseek": "deepseek/deepseek-v4-pro", "pro": "deepseek/deepseek-v4-pro",
+    "flash": "deepseek/deepseek-v4-flash",
+}
+provs = set()
+for r in rows:
+    t = (r.get("deferred") or "").strip().lower()
+    if t and r.get("status") != "done" and t in tag_provider:
+        provs.add(tag_provider[t])
+print(" ".join(sorted(provs)))
+PY
+))
+  if [ ${#MODELS[@]} -eq 0 ]; then
+    echo "no deferred rows to probe"
+    exit 0
+  fi
+fi
+
+for MODEL in "${MODELS[@]}"; do
+  RESP=$(cd /tmp && timeout 60 env $(env|grep '^PI_'|sed 's/=.*//;s/^/-u /'|tr '\n' ' ') pi --model "$MODEL" -p --no-session -nt "Reply OK" 2>&1 | tail -2)
+
+  if echo "$RESP" | grep -q "^OK$"; then
+    STATUS=ok; ERR=""
+  else
+    STATUS=down
+    ERR=$(echo "$RESP" | tr '\n' ' ' | cut -c1-160)
+  fi
+
+  TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  python3 - "$OUT" "$MODEL" "$STATUS" "$ERR" "$TS" <<'PY'
 import json, sys
 out, model, status, err, ts = sys.argv[1:]
 regime = {}
@@ -34,9 +75,10 @@ json.dump(regime, open(out, "w"), indent=1)
 print("written", out)
 PY
 
-if [ "$STATUS" = "ok" ]; then
-  echo "OK $MODEL"
-else
-  echo "DOWN $MODEL ($ERR)"
-fi
+  if [ "$STATUS" = "ok" ]; then
+    echo "OK $MODEL"
+  else
+    echo "DOWN $MODEL ($ERR)"
+  fi
+done
 exit 0
