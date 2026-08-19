@@ -200,6 +200,13 @@ releases on #66's merge close-out, and the reasoning rounds that follow
 belt PRs route k3). (Supersedes: the HOLD REGIME block and the
 08-18-13:10 full-throttle glm line's v4-pro fallback-for-new-dispatches
 line — v4-pro remains an in-flight-completion model only.)
+**PROBE ORDER + v4-pro LAST RESORT (user trust preference, 2026-08-19):**
+reasoning dispatches probe in the order `kimi-coding/k3` →
+`zai-coding-cn/glm-5.3` (post-reset) → `deepseek/deepseek-v4-pro` LAST
+RESORT. Until the user rules on the hold-vs-v4-pro question, v4-pro
+carries MECHANICAL FIX-AUDITS ONLY (mutation checks, network-absence
+verification, re-bless partitions) — never a judgment round as the
+record (the user trusts glm/kimi over v4-pro for reasoning).
 
 **Capability axis — VISION (user ruling 2026-08-18 — supersedes U3 08-17):
 image analysis rides `lmstudio/qwen/qwen3.8-27b`** (local LM Studio — the
