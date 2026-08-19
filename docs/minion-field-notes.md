@@ -302,6 +302,16 @@ findings that keep recurring. One line per entry, dated, with the job id.
   LoadImageFromScreen) + a PROGRAMMATIC pixel-scan (PIL) for overlap
   truth — vision models misjudge absolute coordinates; never eyeball a
   collision claim.
+  2026-08-19 addendum (dream-2026-08-19; v2-7.1-visual-juice +
+  v2-5.11-terminal-types — ×2): REBUILD `bin/harness` (and any local
+  binary) BEFORE bless and AFTER any rebase — a stale build silently
+  blesses OLD code (7.1: CI caught a color-only stale bless; 5.11: a
+  pre-rebase harness had no map.odin → background-less frames; rebuilt
+  + amended with force-with-lease). New mechanical proofs: `cmp -l`
+  every `.log.bin` vs HEAD expecting ONLY the version-field bytes
+  (5.10: exactly 8 bytes @ 18..25); `harness fold-check
+  <prev-catalog-hash> <prev-tick1>` proves a fold-only shift
+  (qos-default-standard).
 - 2026-08-11 (dream-2026-08-11; packet-plumber-v2-1.3-packet-flow +
   -1.1-walking-skeleton — 2 stories): the PP-v2 determinism spine — the
   replay gate re-creates run-setup (fixture) but NOT flow demand by
@@ -381,6 +391,26 @@ findings that keep recurring. One line per entry, dated, with the job id.
   a SIBLING branch (the reference_checks bughunt scenario suite lives
   on `origin/rt-refcheck-bughunt2`, NOT develop) — check there before
   concluding they're missing; copy in untracked, don't commit.
+- 2026-08-18/19 (dream-2026-08-19; packet-plumber-background-maps,
+  v2-5.12-aggregation-groups, wire-aesthetics — 3 jobs): Odin lifetime
+  traps — the TEMP ARENA frees wholesale: never per-slice `delete` an
+  arena value (aborts); a `defer` inside an `if` runs at the
+  IF-BLOCK's end, not the proc's — a silent use-after-free that PASSES
+  tests (freed memory not yet reused); `delete()` on a string LITERAL
+  aborts — clone first.
+- 2026-08-19 (dream-2026-08-19; v2-5.11-terminal-types +
+  v2-6.1-era-definition — 2 jobs, 3 facets): serialized STATE is a
+  contract surface — layout/order changes are API changes. Append new
+  catalog entries at the END (node_types.json array order is
+  T1-visible); load new cross-ref catalogs LAST (load order is
+  test-contract); log headers must carry the RUN-SETUP (start) era or
+  replay validates against the wrong era and latches replay_error.
+- 2026-08-18/19 (dream-2026-08-19; v2-5.10-narrow-access +
+  v2-qos-default-standard — ×2): changing a default or catalog value
+  is NEVER one-line — budget the ripple. A tier bump re-times every
+  dependent test (scratch-instrument, print, re-pin — never guess);
+  grep for setups relying on the OLD default (stale lane-only tests
+  sat green at E7-floor rates, testing the wrong premise).
 
 ## Conventions that saved time
 
@@ -527,6 +557,14 @@ findings that keep recurring. One line per entry, dated, with the job id.
   pin must be mutation-PROVEN (deleting `&& !esc_cancelled` passed
   20/20 — a pin that can't fail isn't a pin; verify the mutation flips
   the scenario red).
+  2026-08-19 addendum (dream-2026-08-19; 5.12-aggregation, 6.1-era,
+  5.11-terminal-types — ×3): three new vacuity flavors — a
+  concentration pin needs a CREDIT-RICH fixture (800/800 permille WITH
+  and WITHOUT the weight = a starved gate, vacuous); never HAND-APPEND
+  engine-managed states (`Active_Crisis` auto-resolves — the deferral
+  window silently collapsed on a hand-appended row); window-scoped
+  counts must count inside the SURGE WINDOW only (the bound formula's
+  W, not the whole run).
 - 2026-08-17 (dream-2026-08-17; PP merge train #55–#62 — ×5 jobs):
   merge-train hygiene on a multi-PR base — send the rebase relay
   BEFORE the rework push lands so the fix-audit reviews ONE clean head
@@ -648,4 +686,9 @@ a PROVIDER with a key in auth.json, not a model — the model label is
 instead of the direct kimi-coding provider. Also: pi's defaultProvider is
 now kimi-coding (settings.json), so UNSET-model dispatches resolve to
 kimi-coding/k3 — know what "unset" resolves to before assuming a
-dispatch's model.
+dispatch's model. 2026-08-19 addendum (dream-2026-08-19;
+v2-7.3-accessibility-core): the briefing/ledger model line can also be
+provider-DEAD at dispatch (the `deepseek/deepseek-v4-flash` line was
+402-balance-dead; Silas launched on glm-5.3 despite the ledger's flash
+field). Check `PI_MODEL` + the session jsonl's modelId before trusting
+ANY model attribution — briefing, ledger field, or dispatch label.

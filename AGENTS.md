@@ -86,6 +86,19 @@ the user at the Gru session in `/Users/moses/code`.
   (2026-08-06: cost-analysis minion sat blank ~30s after boot because
   Silas ended the turn after the `wait` instead of chaining straight to
   the handover; user spotted it.)
+  2026-08-19 addendum (dream-2026-08-19; wire-aesthetics-perkins-r1 +
+  this dream's own sheep boots — ×3): herdr 0.8.0 RENAMED the wait —
+  `herdr wait agent-status <pane> --status idle` is GONE ("unknown
+  command: wait"); the 0.8.0 form is `herdr agent wait <pane> --until
+  idle --timeout 90000`, and it RACES pi registration on fresh panes
+  (`agent_not_found` while the agent entry doesn't exist yet) — sleep
+  ~10 BEFORE the wait (the post-idle sleep 3 still stands). And NO
+  PIPES on the wait: `... agent wait ... 2>&1 | tail -1 && ...` masks
+  the wait's failure exit code (tail returns 0), so the `&&` chain
+  CONTINUES into a not-ready pane — the pipe-masked variant is what
+  launched a Perkins round on a bare `pi` mid-chain (→ defaultProvider,
+  wrong model). Corrected chain: sleep 10-12 for registration →
+  un-piped `herdr agent wait` → sleep 3 → handover → verify working.
 - **`herdr pane move` has no `--json` flag** (rejected as unknown option),
   but it prints the full JSON result anyway — parse stdout directly, or
   re-read the new pane id from `herdr agent list`. Same for
@@ -106,6 +119,10 @@ the user at the Gru session in `/Users/moses/code`.
   completed ops task (PRs opened, close-outs, dispatches) ends with that
   one-line message carrying the deliverables (URLs, pane ids). (2026-08-01:
   research PRs #559/#560 went unreported; Gru relayed the URLs himself.)
+  2026-08-19 addendum (dream-2026-08-19; v2-6.1-era-definition
+  close-out): sighting #3 — the close-out executed but the escalation
+  never reached Gru's input (re-escalated 08:13Z). The relay step is
+  still the failure point.
 - **A pi launched with cwd=`/Users/moses/code` IS Gru** — gru.ts guards on
   `ctx.cwd` alone, so the session gets the startup checklist as a user
   message + Gru standing orders every turn, and its session file lands in
@@ -288,6 +305,39 @@ the user at the Gru session in `/Users/moses/code`.
   unaffected; merges stay user-side — when the web merge is down the
   local-merge+push CLI recipe unblocks (#61 + #60 merged 8s apart;
   webhook alerts lagged ~4 min).
+  2026-08-19 supersede (user ruling, morning; playbook 7e889ec):
+  **v4-pro is BANNED from the reasoning tier (cost) — the reasoning
+  chain is kimi k3 → zai-coding-cn/glm-5.3 → HOLD** (park; NO reasoning
+  dispatches while both are down; mid-work rounds PARK until a probe
+  flips a trusted provider back — never a v4-pro continue). Supersedes
+  the 08-12 v4-pro failover, the 08-16 'k3 → glm-5.3 → v4-pro → flash'
+  order, the 08-17 'reasoning = v4-pro' line, and the 08-18
+  'emergency-only' framing. During a both-down HOLD the user holds
+  MERGES too, and any verdict completed on a fallback model mid-hold
+  is an INFORMATIONAL record only — no follow-up round rides it (5.11
+  r4 precedent 08-18; hold lifted 23:23Z on the k3 probe-flip).
+  flash stays ops/coding. 2026-08-19 addendum — NEW incident class:
+  deepseek **402 Insufficient Balance** = an ACCOUNT wall (billing,
+  not quota/rate — a user top-up fixes it; waiting does not). It killed
+  the always-live ops spare midday 08-19 (demo-mode + 7.3 turns errored
+  402; the probe confirmed flash AND v4-pro dead account-wide) → user
+  flipped ALL ops to glm-5.3 (playbook af06ff3), reverted to flash the
+  same evening when the balance returned (playbook b2f51d9; in-flight
+  panes STAY on their launched model — the glm ops interlude is
+  retired). Recovery per errored pane: `/model <ops fallback>` +
+  continue, once. 2026-08-18/19 addendum — probe doctrine hardened
+  (×4): probe at EVERY reasoning dispatch (k3 flickered
+  22:35→01:41→02:41→03:40 in one night — 'back' is never durable); a
+  freed rolling window is NOT headroom (glm's 03:47Z early-reset window
+  re-capped in ~4h under one round's lens load); the cap MESSAGE's
+  stated reset time lies (claimed 17:54Z vs actual 12:48Z); and a
+  single probe-DOWN row with an empty error can be a transient false
+  read — re-probe once before acting on it. 2026-08-19 addendum —
+  1302 CONCENTRATION: with k3 cycle-capped, ALL reasoning rides glm
+  and the account 1302-bursts EPISODICALLY (fleet-wide wave 17:53Z:
+  QoS-r1 + demo-mode-r4 + 7.3-r1 + dream panes together) — one
+  continue per errored pane clears it, hold NEW glm dispatches until
+  the wave settles, escalate only if continues stop clearing.
 - **Model dispatch & correction ops (2026-08-09).** Only a
   `provider/model` path naming an AUTHED provider works: bare
   `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
@@ -311,6 +361,16 @@ the user at the Gru session in `/Users/moses/code`.
   mega-minions explicitly in every briefing; template model lines rot
   (the dream template's "unset" meant retired-kimi at the 08-13
   dispatch — override required).
+  2026-08-19 supersede (user ruling, wire-aesthetics r1 / PR #70):
+  defaultProvider is now deepseek/deepseek-v4-flash — an UNSET or
+  bare-`pi` Perkins ROUND launch now runs the WHOLE round on flash
+  (wire-aesthetics r1 closed APPROVED 0-blockers on flash — the verdict
+  was SANCTIONED on the row as a one-off: it stood on in-tree code
+  verification, no k3 re-review. NOT a precedent). PROVENANCE RULING:
+  pin `--model <provider>/<model>` explicitly at every Perkins
+  round-MAIN launch (the 08-13 lesson covered lens briefings; this
+  extends it to the round pane itself) and verify the session modelId
+  after every launch.
 - **Serialize concurrent Perkins BURSTS (2026-08-11; models renamed 2026-08-12; SUPERSEDED 2026-08-16).**
   **2026-08-16 USER RULING: FULL THROTTLE on all providers — the serialize-on-quota
   doctrine below is LIFTED.** Dispatch rounds as needed, no holding behind
@@ -336,7 +396,15 @@ the user at the Gru session in `/Users/moses/code`.
   2026-08-17 addendum (dream-2026-08-17): full throttle HELD on kimi
   k3 — the first 3-concurrent-round k3 burst (08-16 18:40Z) plus a
   2-round burst (08-17: 5.5-r1 + 7.2-r1) ran with ZERO 429s; don't
-  re-litigate the serialize reflex on k3.
+  re-litigate the serialize reflex on k3. 2026-08-19 addendum (user
+  rulings, wire-aesthetics r1 + demo-mode r3): the ~20-pane VALVE is
+  ADVISORY too — "dont hold... let them all run" (21 panes flew clean;
+  record valve-pressure as a row note and DISPATCH — the valve surfaces
+  pressure, it no longer gates). Real contention resolves by BUSINESS
+  PRIORITY (user ruling 08-19, playbook 0d70ff5): RT first over PP for
+  panes/quota/Perkins/dispatch windows; the PP belt is merge-gated and
+  self-paces at minion speed — batch PP merge relays, no urgency
+  framing.
 
 ### Watchers, sensors & Perkins rounds
 
@@ -467,6 +535,13 @@ the user at the Gru session in `/Users/moses/code`.
   because findings got an explicit routing target (Odin prototype +
   foundation-audit, named follow-up rows). Without a named intake, FYI
   findings evaporate: every FYI/audit close-out names its routing target.
+  2026-08-19 addendum (dream-2026-08-19; righttenantry-security-audit,
+  user ruling 08-18): the named-intake shape for AUDIT findings is
+  ISSUES-FIRST — "create github issues for them first": one fix-now
+  issue (RT #625 = M-1) + one batch issue (RT #626 = M-2..M-8 + Low +
+  Info), and the fix-now job's briefing is SCOPE-GUARDED against the
+  batch items so it cannot eat them (M-1 shipped r1 APPROVED + merged
+  as #627 same day). Generalizes to any audit/heist output.
 - **A no-PR job (analysis / lavish+md+script deliverables / in-repo commits
   with NO merge) falls through BOTH watchers (2026-08-07).** The pane
   watcher only tracks NON-done jobs — the instant the minion runs `ledger
@@ -498,6 +573,11 @@ the user at the Gru session in `/Users/moses/code`.
   the local-test precedent lost untracked artifacts to the sweep; the
   bughunt suite was swept twice and re-created a 3rd time before
   preservation became standard (08-14/15, ×4 sightings).
+  2026-08-19 addendum (dream-2026-08-19; wire-aesthetics): a THIRD gap
+  flavor — `herdr notification show` itself returns `shown:false` when
+  the notification relay is busy (the ledger + watcher caught it).
+  Verify `shown:true` in the result; never assume the fire-and-forget
+  landed.
 - **A Perkins fix-audit round is HELD on an UNSTABLE review target
   (2026-08-11).** Deferred when the PR head is still MOVING (minion
   iterating CI fixes / active A/B) AND/OR CI is RED — the harness
@@ -510,6 +590,21 @@ the user at the Gru session in `/Users/moses/code`.
   hold gates on RED only; a fresh r1 dispatch is OK on 4/5 pass + 1
   pending ("UNSTABLE=pending, not red" — #36 r1 08-13, #28 08-12).
   Treating pending as red needlessly blocks fresh rounds.
+- **Perkins round ops: empty-lens standing trigger, push-hold
+  discipline, vision caveat (2026-08-18/19, dream-2026-08-19).**
+  (a) USER RULING (5.11-terminal-types arc): if acceptance/architecture
+  lenses come back 3-byte-empty a THIRD straight generation → INTERVENE
+  per the empty-lens doctrine (sweep those lens panes + regenerate) —
+  and a g-wave COMPENSATION verdict counts as valid (5.11 r3 delivered
+  a valid 7/7 verdict on 51/71 findings; no sweep needed). (b) While a
+  round is IN FLIGHT the minion folds LOCALLY and HOLDS the push until
+  the verdict posts (5.11 r1-fold 790325a; 7.1 fold d9db462) — the
+  pushed fresh head then re-arms the next round as an explicit DELTA
+  review (5.11 r2 = rebase-delta), never contamination of the in-flight
+  one. (c) On any non-k3 round the briefing carries the VISION CAVEAT
+  verbatim: pixel verification MECHANICAL only (byte/hash/capture-
+  diff), aesthetic verdicts deferred for the k3 re-check, never faked
+  (7.1/5.10/5.11/background-maps briefings, ×6).
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
@@ -594,6 +689,11 @@ the user at the Gru session in `/Users/moses/code`.
   worktree/pane/tab/model, clear result, and OVERWRITE the note
   column — a reset leaves the OLD round's note text
   ("sha=23e1704… v4-pro") describing the superseded round.
+  2026-08-19 addendum (dream-2026-08-19; v2-6.2-advance-trigger-
+  perkins-r1): the self-create class is still live — the round row
+  self-created at `working` with pane/tab/worktree/model/pr EMPTY
+  (Silas filled post-hoc). Verify-and-fill on every round row stays
+  the guard.
 - **Durable routing lives on ledger rows, not in agent context
   (2026-08-14/15, ×3 + one full fire cycle).** QUEUE / BATCHED /
   RESPAWN-TRIGGER decisions are written as notes on the OWNING row
@@ -683,6 +783,13 @@ the user at the Gru session in `/Users/moses/code`.
   do NOT mutate pane ids (08-14 tAX decongestion moved 10 mega-minions
   across tabs, zero ledger corrections needed) — only WORKSPACE moves
   do; don't over-correct after a tab move.
+  2026-08-19 addendum (dream-2026-08-19; demo-mode-perkins-r4 +
+  7.3-perkins-r1 — ×2): herdr 0.8.0 `tab create --cwd <dir>` does NOT
+  pin the workspace — the r4 tab landed in a stray leftover workspace
+  (w6H) and needed a move; the 08-18 "--cwd lands directly in w1T"
+  observation does NOT hold on 0.8.0. Pass `--workspace` EXPLICITLY on
+  tab create; the 0.8.0 tab-create JSON returns the new pane under
+  `root_pane`.
 
 - **Never guess review-URL anchor ids (2026-08-11, ×2 sightings).** A
   guessed anchor id writes a WRONG review URL into the permanent ledger
@@ -701,6 +808,16 @@ the user at the Gru session in `/Users/moses/code`.
   The sweep fallback executed cold on 08-13 (rc4-4 #609 r1 dispatched
   proactively at 13:50Z: head stable + no round row) — PROVEN; keep
   sweeping at every completion/settle, never trust the sensor alone.
+- **Vision is explicit + local by doctrine (2026-08-18,
+  dream-2026-08-19).** NO silent auto-delegation: vision.json's silent
+  lmstudio fallback ran 15+ invisible delegations in one day under a
+  lying log identity (deleted same day). Vision reads route explicitly
+  to `lmstudio/qwen3.8-27b-mlx@4bit` via `bin/vision-read` (user
+  test-ruled: decisively more accurate; ~2-3.5 min/image — an empty
+  reply mid-reasoning ≠ failure). pi gates image attachment on the
+  model's declared `input` types — any local-model registration in
+  models.json needs `input: ["text","image"]` or the tool silently
+  degrades.
 
 ## Orchestration upgrades (user-approved 2026-08-18)
 
@@ -715,6 +832,9 @@ the user at the Gru session in `/Users/moses/code`.
   mis-rooted-lens class: a wave created without --cwd rooted at the
   orchestrator root — Gru-contamination + dead panes). A lens pane whose
   cwd is not the round worktree is mis-rooted: close + relaunch.
+  FIRST FIRE 08-18 (5.11-terminal-types r1): an 8-pane lens wave landed
+  at the orchestrator root — user-flagged; all 8 closed,
+  relaunch-with-`--cwd` relayed, one idle root pi swept, zero harm.
 - **GitHub-status sensor (P1):** nefario-watch ticks status.json; on an
   incident it injects the auto-classification advisory ONCE (API/webhook
   flakes = incident noise, note-only; git green; merges user-side via the
@@ -724,6 +844,14 @@ the user at the Gru session in `/Users/moses/code`.
   `coordinate_with` (parallel handshake, never blocks) columns; `ledger
   queue` shows the hold list + READY SET; auto-release check at EVERY
   close-out (release = resolve the fresh head, then dispatch).
+  Verified in production 08-18/19: `blocked_by` release fired (5.12 ←
+  5.11-types done, 23:26Z); the deferred registry auto-surfaced the
+  parked security-audit at the 12:48Z probe-flip (`deferred:glm` lifted
+  → resumed — the durable RESUME-TRIGGER row note rode the park);
+  `coordinate_with` exercised in the #67 rebase handshake
+  (background-maps ↔ 5.11). Ops: graph keys are NOT `ledger add` keys
+  — set via sqlite3 UPDATE post-add; a `ledger queue` DEFERRED READY
+  SET line can echo stale after a resume (note-only).
 - **Sensor-doctrine sync (P2, standing rule):** ANY doctrine amendment
   task must grep the sensor/watcher configs (`.pi/extensions/*.ts`) for
   the retired doctrine being amended — the cap-3 echo class lived in
