@@ -1034,6 +1034,16 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
 
 ### Concurrency
 
+**BUSINESS PRIORITY (user ruling 2026-08-19 — RT FIRST):** research
+verdict — RightTenantry (SaaS) is the revenue engine; the PP game is a
+passive lottery asset. When capacity forces a choice — pane slots,
+provider quota, Perkins scheduling, dispatch windows — **RT jobs win the
+slot**; PP yields. PP belt runs AUTONOMOUSLY to the fun-test gate (merge
+keystrokes only; no extra PP investment — extra rounds, out-of-scope
+investment — unless the fun-test gate greenlights it). Recorded for
+future conflicts (a tie-break; doesn't block either pipeline on its own
+lane).
+
 A Perkins round = 8 panes (Perkins + 7 lenses). Two concurrent rounds =
 16 panes + Gru — against the ~20 safety valve, so serialize rounds when
 the workspace is crowded (hold the second dispatch and tell the user).
