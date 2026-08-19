@@ -192,21 +192,25 @@ regime file OK) and lifted the evening HOLD REGIME — reasoning resumes
 on `kimi-coding/k3` for ALL future reasoning dispatches (Perkins rounds,
 dreams). Guards armed per the 08-12 lesson (kimi "back" is UNRELIABLE
 mid-cycle — a 403 recurred ~12 min after an apparent recovery):
-probe-first at the FIRST dispatch after a flip; a mid-work 403 -> sweep +
-redispatch on `zai-coding-cn/glm-5.3`/`deepseek/deepseek-v4-pro`. glm-5.3
-is demoted to BACKUP until its 1308 reset (~2026-08-19 06:48Z) probes
-clean. Belt rows stay merge-gated (the user holds merges; the belt
-releases on #66's merge close-out, and the reasoning rounds that follow
-belt PRs route k3). (Supersedes: the HOLD REGIME block and the
-08-18-13:10 full-throttle glm line's v4-pro fallback-for-new-dispatches
-line — v4-pro remains an in-flight-completion model only.)
-**PROBE ORDER + v4-pro LAST RESORT (user trust preference, 2026-08-19):**
-reasoning dispatches probe in the order `kimi-coding/k3` →
-`zai-coding-cn/glm-5.3` (post-reset) → `deepseek/deepseek-v4-pro` LAST
-RESORT. Until the user rules on the hold-vs-v4-pro question, v4-pro
-carries MECHANICAL FIX-AUDITS ONLY (mutation checks, network-absence
-verification, re-bless partitions) — never a judgment round as the
-record (the user trusts glm/kimi over v4-pro for reasoning).
+probe-first at the FIRST dispatch after a flip; a mid-work 403/1308 ->
+/model <the other of k3/glm> + continue, and if BOTH are down -> PARK
+(resume at the probe flip; NO v4-pro continue — v4-pro is BANNED from
+the reasoning tier, user ruling 2026-08-19 morning, zero duties).
+glm-5.3 is the fallback (its 1308 caps re-arm it after the reset; a
+freed rolling window is NOT headroom — glm lens waves re-cap fast).
+Belt rows stay merge-gated (the user holds merges). (Supersedes: the
+HOLD REGIME block, the 08-18-13:10 full-throttle glm line's v4-pro
+fallback-for-new-dispatches line, and the 08-19 03:35Z
+probe-order/v4-pro-mechanical-only block — v4-pro has ZERO reasoning
+duties.)
+**PROBE ORDER + HOLD (user ruling 2026-08-19 morning — v4-pro BANNED
+from the reasoning tier, too expensive):** reasoning dispatches probe in
+the order `kimi-coding/k3` → `zai-coding-cn/glm-5.3` → **HOLD**. If BOTH
+are down: NO reasoning dispatches; a mid-work round PARKS (the pane
+stays, NO v4-pro continue — resume via probe flip + continue when k3 or
+glm returns). v4-pro has ZERO reasoning duties (not even mechanical
+fix-audits — supersedes the 08-19 03:35Z probe-order/mechanical-only
+block); flash is unchanged for ops/coding.
 
 **Capability axis — VISION (user ruling 2026-08-18 — supersedes U3 08-17):
 image analysis rides `lmstudio/qwen/qwen3.8-27b`** (local LM Studio — the
@@ -242,32 +246,30 @@ map no longer routes vision). Models with NO native vision (flash,
 glm-5.3, v4-pro) MUST route image analysis through `vision-read` — never
 guess or hallucinate image content.
 
-- **Reasoning — `zai-coding-cn/glm-5.3` (user ruling 2026-08-18 —
-  probe-confirmed BACK at 12:48Z, FULL THROTTLE; supersedes the 08-18-night
-  v4-pro interim; the full provider-qualified path is MANDATORY — bare
-  glm labels misroute)**: **Gru** (CEO: persona, relays, escalations,
+- **Reasoning — `kimi-coding/k3` (user ruling 2026-08-19 morning: v4-pro
+  BANNED from the reasoning tier — too expensive; the chain is
+  k3 → glm-5.3 → HOLD; the full provider-qualified path is MANDATORY —
+  bare labels misroute)**: **Gru** (CEO: persona, relays, escalations,
   briefing authorship), **Perkins** (code review — the last line of
   defense before code ships: correctness + judgment under ambiguity
   matter most), and **Bob** (dream: memory consolidation + lesson
-  curation). Low-volume, judgment-heavy roles. HISTORY: the tier moved
-  kimi k3 (VERIFIED 2026-08-16: registered + authed + ROUTES
-  end-to-end — probe reply, session jsonl ground truth modelId=`k3`,
-  stopReason=`stop`; cycle-quota 403 2026-08-17 evening) → glm-5.3
-  (08-17 ruling) → v4-pro (08-18 night, after glm-5.3's 1308 cap) →
-  **glm-5.3 again (08-18, probe-confirmed back — rolling 5h window freed
-  early)**. FALLBACKS, in order: `deepseek/deepseek-v4-pro` →
-  `kimi-coding/k3` → flash last-resort. PROBE-FIRST at every reasoning
-  dispatch (bin/quota-probe — the regime file is the record): probe the
-  primary before routing, AND probe before any switch BACK to
-  v4-pro/k3/glm when they recover (the 08-12/08-16 unreliability guard
-  applies — "X is back" is UNRELIABLE mid-cycle; a mid-work 403/1308 =
-  /model <next-fallback> + continue, NEVER continue-spam on the dead
-  provider). Launch label = the FULL path always (bare labels misroute).
-  The launched-model rule: an in-flight job stays on its launched model
-  (7.1 rode v4-pro mid-flight 08-17; the #66 r1 round posts on v4-pro
-  and finishes there 08-18; security-audit resumed ONTO glm-5.3 at its
-  own deferral lift — cap-recovery IS a sanctioned mid-flight switch;
-  model flips otherwise apply to NEW dispatches only).
+  curation). Low-volume, judgment-heavy roles. HISTORY: kimi k3
+  (VERIFIED 2026-08-16 — routes end-to-end; fickle mid-cycle: 403
+  recurred within minutes of apparent recoveries) → glm-5.3 (08-17) →
+  v4-pro (08-18 night interim — **RETIRED 08-19: BANNED from reasoning,
+  too expensive**) → **k3 primary with glm-5.3 as fallback (08-19)**.
+  FALLBACKS, in order: `zai-coding-cn/glm-5.3` → **HOLD** (no
+  reasoning dispatch when both are down; a mid-work 403/1308 PARKS the
+  round — pane stays, NO v4-pro continue; resume via probe flip +
+  continue when k3 or glm returns). PROBE-FIRST at every reasoning
+  dispatch (bin/quota-probe — the regime file is the record): probe
+  before routing, AND probe before any switch BACK to k3/glm when they
+  recover (the 08-12/08-16 unreliability guard applies — "X is back" is
+  UNRELIABLE mid-cycle; NEVER continue-spam on a dead provider).
+  Launch label = the FULL path always (bare labels misroute). The
+  launched-model rule: an in-flight job stays on its launched model;
+  a provider WALL mid-round = /model <the other of k3/glm> + continue,
+  and if BOTH are down = PARK (resume at the probe flip).
 
 - **Execution — `deepseek/deepseek-v4-flash`**: **Silas** (COO: ops,
   relay, coordination, dispatches), **ALL minions** (every coding minion
@@ -281,8 +283,8 @@ so UNSET-model dispatches would resolve to kimi — which is why minion and
 mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
 (the briefing's 'Model policy' field overrides per-job; the dispatch
 `--model` carries it). Gru / Perkins / Bob launches name
-`zai-coding-cn/glm-5.3` (fallbacks: `deepseek/deepseek-v4-pro`,
-`kimi-coding/k3`, flash last-resort). Silas is pinned to
+`kimi-coding/k3` (fallback: `zai-coding-cn/glm-5.3`; HOLD if both down —
+v4-pro is BANNED from reasoning). Silas is pinned to
 deepseek-v4-flash by `.pi/extensions/silas.ts` (see 'Silas (COO)').
 
 ## Durable state
@@ -926,8 +928,9 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
    BEST review, so Perkins rides the reasoning tier, NOT a cheaper model
    for quota; user ruling 2026-08-18 late evening — Perkins = `kimi-coding/k3`
    (the HOLD lift; probe-first at the first dispatch per the 08-12
-   unreliability guard); fallbacks in order glm-5.3 (once its reset probes
-   clean) → v4-pro → flash per the Model policy; launched-model rule
+   unreliability guard); fallback glm-5.3, HOLD if both down (v4-pro is
+   BANNED from the reasoning tier — zero duties) per the Model policy;
+   launched-model rule
    applies (a round recovered mid-flight
    finishes on its recovery model). Pass `--model kimi-coding/k3`
    at launch or set it in the briefing's Model policy) and hand over:
