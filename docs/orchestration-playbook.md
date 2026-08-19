@@ -126,14 +126,17 @@ Silas Ramsbottom — Gru's chief operating officer. A long-lived pi session
 standing orders + startup checklist; nefario-watch is gated to
 `PI_SILAS=1`, so ALL sensors alert Silas — Gru's context stays clean.
 
-**Model:** Silas runs on **`deepseek/deepseek-v4-flash`** — set
-AUTOMATICALLY by `.pi/extensions/silas.ts` at launch (`session_start` ->
-`pi.setModel`), so no manual `/model` step; it notifies if the model is
-missing from the registry or has no API key (a failed auto-set is visible,
-not silent). The COO's work (watcher triage, ledger, dispatches,
-close-outs) is execution-grade + well-specified — deepseek-v4-flash
-handles it fast and reliably, keeping kimi k3 reserved for the reasoning
-roles (Gru, Perkins, Bob). (User ruling 2026-08-12; replaced glm-5.2.)
+**Model:** Silas runs on **`zai-coding-cn/glm-5.3`** (user ruling
+2026-08-19: deepseek is 402-dead — Insufficient Balance — so the ENTIRE
+ops/coding tier moved to glm-5.3; full path mandatory, bare glm labels
+misroute) — set AUTOMATICALLY by `.pi/extensions/silas.ts` at launch
+(`session_start` -> `pi.setModel`), so no manual `/model` step; it notifies
+if the model is missing from the registry or has no API key (a failed
+auto-set is visible, not silent). The COO's work (watcher triage, ledger,
+dispatches, close-outs) is execution-grade + well-specified. Reasoning tier
+is unchanged (kimi k3 for Gru/Perkins/Bob). (Supersedes the 08-12
+deepseek-v4-flash ruling; flip back only on a user ruling if deepseek
+recovers.)
 
 **Silas owns (Gru never touches):**
 
@@ -271,21 +274,29 @@ guess or hallucinate image content.
   a provider WALL mid-round = /model <the other of k3/glm> + continue,
   and if BOTH are down = PARK (resume at the probe flip).
 
-- **Execution — `deepseek/deepseek-v4-flash`**: **Silas** (COO: ops,
-  relay, coordination, dispatches), **ALL minions** (every coding minion
-  — implementation), and **mega-minions** (well-specified sub-tasks).
-  The fleet workhorse: fast, reliable, always-live (it carried the fleet
-  during the 2026-08-11/12 glm cap). Everything well-specified —
-  implementation, triage, mechanics — rides deepseek-v4-flash.
+- **Execution — `zai-coding-cn/glm-5.3`** (user ruling 2026-08-19:
+  deepseek is 402-dead; the FULL path is mandatory — bare glm labels
+  misroute): **Silas** (COO: ops, relay, coordination, dispatches),
+  **ALL minions** (every coding minion — implementation), and
+  **mega-minions** (well-specified sub-tasks). Everything well-specified
+  — implementation, triage, mechanics — rides glm-5.3 while deepseek is
+  402. (Supersedes the 08-12 deepseek-v4-flash workhorse line; flip back
+  only on a user ruling if deepseek recovers. Guard: glm's 1308 cap is a
+  5-hour ROLLING window — heavy ops fleets can re-wall it; watch the
+  regime file before big fan-outs.)
 
 The kimi default is the provider default (settings.json `defaultProvider`),
 so UNSET-model dispatches would resolve to kimi — which is why minion and
-mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
+mega-minion briefings ALWAYS name `zai-coding-cn/glm-5.3` explicitly
 (the briefing's 'Model policy' field overrides per-job; the dispatch
-`--model` carries it). Gru / Perkins / Bob launches name
-`kimi-coding/k3` (fallback: `zai-coding-cn/glm-5.3`; HOLD if both down —
-v4-pro is BANNED from reasoning). Silas is pinned to
-deepseek-v4-flash by `.pi/extensions/silas.ts` (see 'Silas (COO)').
+`--model` carries it — and Perkins rounds MUST pass
+`pi --model kimi-coding/k3` at launch; a bare `pi` resolves to the
+defaultProvider, which put the 08-19 wire-aesthetics r1 on flash —
+sanctioned post-hoc by the user, but the provenance fix is mandatory).
+Gru / Perkins / Bob launches name `kimi-coding/k3` (fallback:
+`zai-coding-cn/glm-5.3`; HOLD if both down — v4-pro is BANNED from
+reasoning). Silas is pinned to zai-coding-cn/glm-5.3 by
+`.pi/extensions/silas.ts` (see 'Silas (COO)').
 
 ## Durable state
 
@@ -581,9 +592,16 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
    in the ledger, otherwise launch plain:
    ```bash
    herdr pane run <pane> "pi --model <model>"   # or plain "pi" when unset
-   herdr wait agent-status <pane> --status idle --timeout 60000
+   herdr agent wait <pane> --until idle --timeout 60000
+   sleep 3
    herdr pane run <pane> "Read /Users/moses/code/docs/orchestration-playbook.md section 'Minion standing orders' and the briefing at <briefing-path>, then begin."
    ```
+   **Chain discipline:** join launch + wait + sleep + handover with `&&`
+   and NO output pipes on the wait (`| head -1` / `| tail -1` mask the
+   exit code — the chain continues even when the wait FAILED, delivering
+   the handover to a still-booting pane; seen 08-19 — the round silently
+   launched on the default provider). `herdr agent wait <pane> --until
+   idle` returns only when the agent is truly ready.
    **Verify delivery** (`pane run` can leave text unsent when pi is
    mid-startup): within ~30s the minion should show `working` —
    `herdr pane read <pane>` if in doubt; a stuck buffer submits with
@@ -777,7 +795,7 @@ see the AGENTS.md no-PR-done-mid-turn gotcha). This board-check is the
   review states, so support is deliberately deferred. Planned mapping when
   the first GitLab-hosted job lands: unresolved diff threads = work,
   approvals = approve.
-- Manual wait/inspect: `herdr wait agent-status <pane> --status done --timeout N`.
+- Manual wait/inspect: `herdr agent wait <pane> --until done --timeout N` (herdr 0.8.0 syntax — `--until`, not the old `--status`; the command is `herdr agent wait`, not `herdr wait`).
   Treat `idle` and `done` as completed; `blocked` needs input.
 - **Clarify relay**: when a minion halts with numbered questions
   (quick-dev step-01), Silas escalates them verbatim to Gru (`herdr pane
