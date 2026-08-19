@@ -408,7 +408,12 @@ store, one reader per source, proposals with reasoning.)
      both) newer than the marker, (c) ledger events
      since the marker (`bin/ledger events 200`, `bin/ledger show` on jobs
      with activity), (d) optional: pane transcripts of jobs that churned
-     (repeated clarify loops, errors). Each sheep writes findings to its
+     (repeated clarify loops, errors). **Backfill caveat (user-approved
+     2026-08-19, U1):** files dated AT/before the marker are tail-read
+     (last ~40 lines), not skipped — the marker/mtime filter silently
+     drops late-written material (the 08-03→08-07 gru-journal backfill;
+     the 08-17 dream recovered the 5.2 20h arc only by tail-reading).
+     Each sheep writes findings to its
      OWN shard in the dream dir — shard-by-writer, same as the live
      memory.
   3. **Bob consolidates:** reads the sheep findings, hunts patterns —

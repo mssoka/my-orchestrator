@@ -861,3 +861,7 @@ the user at the Gru session in `/Users/moses/code`.
   self-report class.
 - **Playbook consolidation (P3):** rides the NEXT dream (Model policy +
   Perkins sections rewrite; supersede history → changelog appendix).
+  Recorded scope (user-approved 2026-08-19, U2): absorb the v4-pro ban
+  chain (7e889ec), the 402-class + ops flip/revert (af06ff3/b2f51d9),
+  probe hardening, 1302-concentration under a capped primary, and the
+  valve-advisory + RT-first business priority (0d70ff5).

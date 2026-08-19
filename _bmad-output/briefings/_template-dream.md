@@ -29,7 +29,13 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 ## Inputs (all under /Users/moses/code)
 
 - Last-dream marker: `/Users/moses/code/_bmad-output/memory/last-dream`
-  (ISO timestamp — everything NEWER than this is undreamed material)
+  (ISO timestamp — everything NEWER than this is undreamed material).
+  **Backfill caveat (user-approved 2026-08-19, U1):** the marker/mtime filter
+  silently drops late-written material — for source files dated AT or BEFORE
+  the marker, TAIL-READ the end (last ~40 lines) rather than skipping them;
+  a plausibly-backfilled file (e.g. a journal whose dates span across the
+  marker) carries undreamed material at its tail. (08-03→08-07 gru-journal
+  backfill; the 08-17 dream recovered the 5.2 20h arc only by tail-reading.)
 - Field-note shards: `/Users/moses/code/_bmad-output/field-notes/*.md`
 - Gru journal: `/Users/moses/code/_bmad-output/gru-journal/*.md`
 - Silas journal: `/Users/moses/code/_bmad-output/silas-journal/*.md`
