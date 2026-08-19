@@ -92,20 +92,18 @@ export default function silas(pi: ExtensionAPI) {
 		if (ctx.cwd !== GRU_DIR) return;
 		if (process.env.PI_SILAS !== "1") return;
 		if (event.reason === "startup" || event.reason === "new") {
-			// Silas runs on zai-coding-cn/glm-5.3 (user ruling 2026-08-19:
-			// deepseek is 402-dead — Insufficient Balance — so the ENTIRE
-			// ops/coding tier moved to glm-5.3; reasoning tier stays kimi k3).
-			// The COO's work (watcher triage, ledger, dispatches, close-outs)
-			// is execution-grade + well-specified. Full path is MANDATORY —
-			// bare glm labels misroute. Set it automatically so no manual
-			// /model step is needed. (Supersedes the 08-12 deepseek-v4-flash
-			// ruling; flip back only on a user ruling if deepseek recovers.)
-			const model = ctx.modelRegistry.find("zai-coding-cn", "glm-5.3");
+			// Silas runs on deepseek/deepseek-v4-flash (user ruling 2026-08-19
+			// evening: balance restored — ops/coding tier returned to flash;
+			// the glm-5.3 ops interlude was the 402-incident fallback, now
+			// resolved; supersedes the 08-19 morning glm ruling). The COO's
+			// work (watcher triage, ledger, dispatches, close-outs) is
+			// execution-grade + well-specified. Reasoning tier stays kimi k3.
+			const model = ctx.modelRegistry.find("deepseek", "deepseek-v4-flash");
 			if (model) {
 				const ok = await pi.setModel(model);
-				if (!ok) ctx.ui.notify("Silas: no API key for zai-coding-cn/glm-5.3 — staying on the current model", "error");
+				if (!ok) ctx.ui.notify("Silas: no API key for deepseek/deepseek-v4-flash — staying on the current model", "error");
 			} else {
-				ctx.ui.notify("Silas: zai-coding-cn/glm-5.3 not in the model registry — staying on the current model", "error");
+				ctx.ui.notify("Silas: deepseek/deepseek-v4-flash not in the model registry — staying on the current model", "error");
 			}
 			await pi.sendUserMessage(STARTUP_CHECKLIST);
 		}

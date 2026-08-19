@@ -126,17 +126,15 @@ Silas Ramsbottom — Gru's chief operating officer. A long-lived pi session
 standing orders + startup checklist; nefario-watch is gated to
 `PI_SILAS=1`, so ALL sensors alert Silas — Gru's context stays clean.
 
-**Model:** Silas runs on **`zai-coding-cn/glm-5.3`** (user ruling
-2026-08-19: deepseek is 402-dead — Insufficient Balance — so the ENTIRE
-ops/coding tier moved to glm-5.3; full path mandatory, bare glm labels
-misroute) — set AUTOMATICALLY by `.pi/extensions/silas.ts` at launch
+**Model:** Silas runs on **`deepseek/deepseek-v4-flash`** (user ruling
+2026-08-19 evening: deepseek balance restored — ops/coding tier returned to
+flash; the glm-5.3 ops interlude was the 402-incident fallback, now
+resolved) — set AUTOMATICALLY by `.pi/extensions/silas.ts` at launch
 (`session_start` -> `pi.setModel`), so no manual `/model` step; it notifies
 if the model is missing from the registry or has no API key (a failed
 auto-set is visible, not silent). The COO's work (watcher triage, ledger,
 dispatches, close-outs) is execution-grade + well-specified. Reasoning tier
-is unchanged (kimi k3 for Gru/Perkins/Bob). (Supersedes the 08-12
-deepseek-v4-flash ruling; flip back only on a user ruling if deepseek
-recovers.)
+is unchanged (kimi k3 for Gru/Perkins/Bob).
 
 **Silas owns (Gru never touches):**
 
@@ -274,20 +272,18 @@ guess or hallucinate image content.
   a provider WALL mid-round = /model <the other of k3/glm> + continue,
   and if BOTH are down = PARK (resume at the probe flip).
 
-- **Execution — `zai-coding-cn/glm-5.3`** (user ruling 2026-08-19:
-  deepseek is 402-dead; the FULL path is mandatory — bare glm labels
-  misroute): **Silas** (COO: ops, relay, coordination, dispatches),
-  **ALL minions** (every coding minion — implementation), and
-  **mega-minions** (well-specified sub-tasks). Everything well-specified
-  — implementation, triage, mechanics — rides glm-5.3 while deepseek is
-  402. (Supersedes the 08-12 deepseek-v4-flash workhorse line; flip back
-  only on a user ruling if deepseek recovers. Guard: glm's 1308 cap is a
-  5-hour ROLLING window — heavy ops fleets can re-wall it; watch the
-  regime file before big fan-outs.)
+- **Execution — `deepseek/deepseek-v4-flash`** (user ruling 2026-08-19
+  evening: balance restored; the glm-5.3 ops interlude — 08-19 morning
+  through evening, the 402-incident fallback — is RETIRED; note the
+  interlude's glm 1308-cap risk if ops ever rides glm again): **Silas**
+  (COO: ops, relay, coordination, dispatches), **ALL minions** (every
+  coding minion — implementation), and **mega-minions** (well-specified
+  sub-tasks). The fleet workhorse: fast, reliable, always-live. Everything
+  well-specified — implementation, triage, mechanics — rides flash.
 
 The kimi default is the provider default (settings.json `defaultProvider`),
 so UNSET-model dispatches would resolve to kimi — which is why minion and
-mega-minion briefings ALWAYS name `zai-coding-cn/glm-5.3` explicitly
+mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
 (the briefing's 'Model policy' field overrides per-job; the dispatch
 `--model` carries it — and Perkins rounds MUST pass
 `pi --model kimi-coding/k3` at launch; a bare `pi` resolves to the
@@ -295,7 +291,7 @@ defaultProvider, which put the 08-19 wire-aesthetics r1 on flash —
 sanctioned post-hoc by the user, but the provenance fix is mandatory).
 Gru / Perkins / Bob launches name `kimi-coding/k3` (fallback:
 `zai-coding-cn/glm-5.3`; HOLD if both down — v4-pro is BANNED from
-reasoning). Silas is pinned to zai-coding-cn/glm-5.3 by
+reasoning). Silas is pinned to deepseek/deepseek-v4-flash by
 `.pi/extensions/silas.ts` (see 'Silas (COO)').
 
 ## Durable state
