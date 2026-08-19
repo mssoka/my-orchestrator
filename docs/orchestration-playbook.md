@@ -247,10 +247,12 @@ map no longer routes vision). Models with NO native vision (flash,
 glm-5.3, v4-pro) MUST route image analysis through `vision-read` — never
 guess or hallucinate image content.
 
-- **Reasoning — `kimi-coding/k3` (user ruling 2026-08-19 morning: v4-pro
-  BANNED from the reasoning tier — too expensive; the chain is
-  k3 → glm-5.3 → HOLD; the full provider-qualified path is MANDATORY —
-  bare labels misroute)**: **Gru** (CEO: persona, relays, escalations,
+- **Reasoning — `zai-coding-cn/glm-5.3` STANDING PRIMARY (user ruling
+  2026-08-19 NIGHT: kimi limit reached — reasoning stays on glm-5.3 until
+  further notice; new reasoning dispatches glm-FIRST; re-probe k3 at
+  dispatch ONLY if glm errors; NO proactive k3 flips mid-cycle — the
+  18:03 reflip re-capped within ~1h; recorded on the regime file
+  `_policy` key)**: **Gru** (CEO: persona, relays, escalations,
   briefing authorship), **Perkins** (code review — the last line of
   defense before code ships: correctness + judgment under ambiguity
   matter most), and **Bob** (dream: memory consolidation + lesson
@@ -258,8 +260,9 @@ guess or hallucinate image content.
   (VERIFIED 2026-08-16 — routes end-to-end; fickle mid-cycle: 403
   recurred within minutes of apparent recoveries) → glm-5.3 (08-17) →
   v4-pro (08-18 night interim — **RETIRED 08-19: BANNED from reasoning,
-  too expensive**) → **k3 primary with glm-5.3 as fallback (08-19)**.
-  FALLBACKS, in order: `zai-coding-cn/glm-5.3` → **HOLD** (no
+  too expensive**) → k3 primary with glm-5.3 as fallback (08-19) →
+  **glm-5.3 standing primary (08-19 night, kimi limit reached)**.
+  FALLBACKS, in order: `kimi-coding/k3` → **HOLD** (no
   reasoning dispatch when both are down; a mid-work 403/1308 PARKS the
   round — pane stays, NO v4-pro continue; resume via probe flip +
   continue when k3 or glm returns). PROBE-FIRST at every reasoning
