@@ -289,7 +289,7 @@ so UNSET-model dispatches would resolve to kimi — which is why minion and
 mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
 (the briefing's 'Model policy' field overrides per-job; the dispatch
 `--model` carries it — and Perkins rounds MUST pass
-`pi --model kimi-coding/k3` at launch; a bare `pi` resolves to the
+`pi --model kimi-coding/k3 --thinking max` at launch; a bare `pi` resolves to the
 defaultProvider, which put the 08-19 wire-aesthetics r1 on flash —
 sanctioned post-hoc by the user, but the provenance fix is mandatory).
 Gru / Perkins / Bob launches name `kimi-coding/k3` (fallback:
@@ -593,9 +593,13 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
      briefing=<briefing-path> github_issue=<n>   # model=<m> if set
    ```
 6. Launch pi and hand over — append `--model <model>` when the job has one
-   in the ledger, otherwise launch plain:
+   in the ledger, otherwise launch plain. **THINKING PIN (user ruling
+   2026-08-20 — thinking = MAX always, on EVERY agent): every launch line
+   carries `--thinking max`** — the global default was unset (pi defaults
+   off) and the user fixed it globally, but we pin it explicitly so it
+   never depends on settings:
    ```bash
-   herdr pane run <pane> "pi --model <model>"   # or plain "pi" when unset
+   herdr pane run <pane> "pi --model <model> --thinking max"   # or plain "pi --thinking max" when unset
    herdr agent wait <pane> --until idle --timeout 60000
    sleep 3
    herdr pane run <pane> "Read /Users/moses/code/docs/orchestration-playbook.md section 'Minion standing orders' and the briefing at <briefing-path>, then begin."
@@ -611,7 +615,7 @@ Slug = kebab-case derived from intent. Job id = `<repo>-<slug>`.
    `herdr pane read <pane>` if in doubt; a stuck buffer submits with
    `herdr pane send-keys <pane> enter`. An `idle` status with NO session
    file (`ls ~/.pi/agent/sessions/ | grep <slug>`) means a dead pi:
-   relaunch (`herdr pane run <pane> "pi"`), wait idle, re-hand over.
+   relaunch (`herdr pane run <pane> "pi --thinking max"`), wait idle, re-hand over.
 
 **Continuous execution (user ruling 2026-08-11):** once a story merges,
 dispatch the NEXT story WITHOUT waiting for a Gru/user greenlight — applies
@@ -650,7 +654,7 @@ older briefings use that name; this is the same section.)
 - Work entirely inside this pane's cwd (the worktree) on branch `<slug>`.
 - You may spawn your own mega-minions with the herdr skill
   (`herdr pane split --current ...`). Launch them per the briefing's Model
-  policy (`pi --model ...` when it names one) and its Skills policy (name
+  policy (`pi --model ... --thinking max` when it names one) and its Skills policy (name
   each mega-minion's skill explicitly — e.g. review swarms use
   `bmad-review-adversarial-general` / `bmad-review-edge-case-hunter`).
   Name mega-minion TABS descriptively too — `<job-slug>-<role>` (e.g.
@@ -945,7 +949,7 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
 5. Pane into the orchestrator workspace (panes-first rule), label
    `perkins-<slug>-r<N>` — and name the TAB the same
    (`perkins-<slug>-r<N>`; descriptive-label convention, user ruling
-   2026-08-10; never a bare number); launch `cd <worktree> && pi` **on `zai-coding-cn/glm-5.3`**
+   2026-08-10; never a bare number); launch `cd <worktree> && pi --thinking max` **on `zai-coding-cn/glm-5.3`**
    (the frontier reviewer — production code with paying users demands the
    BEST review, so Perkins rides the reasoning tier, NOT a cheaper model
    for quota; user ruling 2026-08-18 late evening — Perkins = `kimi-coding/k3`
