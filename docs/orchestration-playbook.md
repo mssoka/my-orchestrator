@@ -226,17 +226,17 @@ the answer — NEVER treat an empty/short reply as a failure
 mid-reasoning: wait for the answer.
 
 **VISION ROUTING (user ruling 2026-08-21 — supersedes the 08-18 local
-lmstudio doctrine):** the vision mega-minion is named **LEFOU**. (a)
+lmstudio doctrine):** the vision mega-minion is named **KYLE**. (a)
 When the active session model is `kimi-coding/k3`, vision is NATIVE —
 k3 sees images itself; attach the image, no spawn. (b) On any blind
 model (glm-5.3, deepseek flash — no image input), ALL agents (Gru,
-Silas, minions, Bob) route image reads through Lefou. Two spawn modes:
+Silas, minions, Bob) route image reads through Kyle. Two spawn modes:
 - **Quick read** ("what does this screenshot show?") — headless
   one-shot: `env $(env|grep '^PI_'|sed 's/=.*//;s/^/-u /'|tr '\n' ' ')
   pi --model zai-coding-cn/glm-4.6v -p --no-session -nt
   @<image> "<question>"`. Batch 3–6 frames per summon, do not spam.
 - **Code-context verification / art-direction analysis** — spawn as a
-  full agent with `--cwd <relevant repo/worktree>` (tools armed): Lefou
+  full agent with `--cwd <relevant repo/worktree>` (tools armed): Kyle
   reads the render code, goldens, and tests around the image, and
   answers WITH file evidence (e.g. a golden-diff verdict naming the
   draw call and file). The summon prompt ALWAYS carries why-it-was-
@@ -248,7 +248,7 @@ session jsonl modelId is ground truth) — never trust self-reported ids.
 The models.json entry (if registering locally) MUST declare
 `"input": ["text", "image"]` or pi bounces the attachment. The old
 `describe_image` auto-delegation stays REMOVED (08-18). NO vision
-deferral: models with NO native vision MUST route through Lefou — never
+deferral: models with NO native vision MUST route through Kyle — never
 guess or hallucinate image content.
 
 - **Reasoning — `zai-coding-cn/glm-5.3` STANDING PRIMARY (user ruling
