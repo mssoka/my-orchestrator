@@ -233,7 +233,7 @@ model (glm-5.3, deepseek flash — no image input), ALL agents (Gru,
 Silas, minions, Bob) route image reads through Lefou. Two spawn modes:
 - **Quick read** ("what does this screenshot show?") — headless
   one-shot: `env $(env|grep '^PI_'|sed 's/=.*//;s/^/-u /'|tr '\n' ' ')
-  pi --model zai-coding-cn/glm-5v-turbo -p --no-session -nt
+  pi --model zai-coding-cn/glm-4.6v -p --no-session -nt
   @<image> "<question>"`. Batch 3–6 frames per summon, do not spam.
 - **Code-context verification / art-direction analysis** — spawn as a
   full agent with `--cwd <relevant repo/worktree>` (tools armed): Lefou
@@ -241,8 +241,9 @@ Silas, minions, Bob) route image reads through Lefou. Two spawn modes:
   answers WITH file evidence (e.g. a golden-diff verdict naming the
   draw call and file). The summon prompt ALWAYS carries why-it-was-
   summoned + pointers.
-Provenance rules: full model path `zai-coding-cn/glm-5v-turbo` always
-pinned; verify through pi (reply must demonstrate it saw the image;
+Provenance rules: full model path `zai-coding-cn/glm-4.6v` always
+pinned (downgrade note: glm-5v-turbo ruled 08-21 but NOT subscription-
+available — glm-4.6v is the standing vision model until it is); verify through pi (reply must demonstrate it saw the image;
 session jsonl modelId is ground truth) — never trust self-reported ids.
 The models.json entry (if registering locally) MUST declare
 `"input": ["text", "image"]` or pi bounces the attachment. The old
