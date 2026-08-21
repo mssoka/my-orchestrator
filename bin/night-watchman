@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────
 # night-watchman — out-of-pi liveness watchdog for the orchestrator staff
 # panes. Full README: docs/night-watchman.md.
@@ -7,27 +6,60 @@
 # When that pi dies silently the whole machine goes deaf until a human
 # notices (twice: 17:59Z reboot + ~00:38Z silent death, 08-20/21). This
 # script runs OUTSIDE the pi processes (launchd, every 5 min) and checks
-# AGENT LIVENESS — herdr agent detection + session-file existence — never
-# pane existence (a dead pi leaves a healthy shell prompt).
+# AGENT LIVENESS — herdr agent detection + session-file existence + the
+# pane's foreground process — never pane existence (a dead pi leaves a
+# healthy shell prompt).
 #
-# Targets are resolved BY TAB LABEL (survives pane-id churn):
+# Targets are resolved BY TAB LABEL fresh every pass (pane ids churn
+# across restarts and workspace moves; nothing is cached between ticks):
 #   silas (tab label `silas`)  → relaunch `env -u PI_GRU PI_SILAS=1 pi`
-#   gru   (tab label `Gru`)    → relaunch `env -u PI_SILAS PI_GRU=1 pi`
+#   gru   (tab label `Gru`)    → relaunch `env -u PI_SILAS PI_GRU=1 pi
+#                                --model <k3|glm-5.3 via probe gate> --thinking max`
 #
-# On a detected death: logs the trail (timestamp, pane, last session file
-# + its mtime), relaunches via the standard dispatch chain (sleep 10 →
-# `herdr agent wait --until idle` → sleep 3 → startup-checklist handover),
-# verifies the handover landed in the new session, and fires a macOS
+# ── SAFETY INVARIANTS (hardened 2026-08-21, incident-day fixes) ─────────
+# 1. NO KILL PATH. This script NEVER signals agent processes. The only
+#    `kill` usage anywhere is `kill -0` — the lockfile liveness probe
+#    (signal 0 = "does this pid exist", nothing is sent). `--self-test`
+#    asserts this statically. Kill tests are human-run, never watchman-run.
+# 2. NEVER create or split panes. The watchman types only into the pane
+#    already inside the identity tab. If the identity tab is missing, or
+#    holds ≠1 pane (a stray split), it NOTIFIES and STOPS — it never
+#    guesses which pane is "the" pane, never creates a replacement.
+# 3. NEVER type into a pane that might have a live pi. Liveness is
+#    classified ALIVE / BOOTING / DEAD; BOOTING (a pi process visible,
+#    session file not yet on disk — the mid-boot window) is treated as
+#    life: zero keystrokes. A suspected death is confirmed across a 60s
+#    grace window before any action, and the pane is re-polled
+#    immediately before the first keystroke (live-agent no-op guard).
+# 4. Gru relaunches pin the reasoning tier via the quota probe gate:
+#    kimi-coding/k3 primary, zai-coding-cn/glm-5.3 fallback. NEVER
+#    deepseek-v4-pro, NEVER flash (user rulings 08-12..08-19). If both
+#    reasoning providers probe DOWN, the watchman NOTIFIES and does NOT
+#    relaunch — a wrong-tier Gru is worse than a notified gap.
+# 5. Handover verification retries ACROSS TICKS (state file) before
+#    flagging — a pi mid-startup-checklist is not a failure.
+#
+# On a confirmed death: logs the trail (timestamp, pane, last session
+# file + its mtime), relaunches via the dispatch chain (sleep 10 →
+# ready poll → sleep 3 → startup-checklist handover), verifies the
+# handover landed (in-pass, then across ticks), and fires a macOS
 # notification. Quiet passes log one `alive` line (the heartbeat).
 #
-# Safety: if an agent IS detected, NEVER type into the pane. Every death
-# is confirmed with a fresh `herdr pane get` before any keystroke.
+# ── TEST HOOKS (sandbox simulations; see docs/night-watchman.md) ────────
+# NIGHT_WATCHMAN_TARGETS   pipe-form target records (6 fields:
+#                          label|key|launch-env|handover|env-marker|tier)
+#                          overriding the real silas/Gru targets — point
+#                          the watchman at a scratch tab for simulations.
+# NIGHT_WATCHMAN_PROBE     path to the quota-probe tool (default
+#                          $ROOT/bin/quota-probe); a stub script lets
+#                          tests force the model-pin decisions.
 #
 # Usage:
 #   night-watchman               loop forever: pass + sleep 300s
 #   night-watchman --once        one pass, exit (launchd StartInterval)
 #   night-watchman --dry-run     one pass, NEVER type into any pane
-#   night-watchman --self-test   verify deps + env mirror + resolution
+#   night-watchman --self-test   verify deps + env mirror + safety
+#                                assertions + model-pin gate + resolution
 #   night-watchman --interval N  loop sleep seconds (default 300)
 #   night-watchman --help
 # ─────────────────────────────────────────────────────────────────────────
@@ -38,21 +70,42 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_DIR="$ROOT/_bmad-output"
 LOG="$LOG_DIR/watchman.log"
 LOCK_DIR="$LOG_DIR/.night-watchman.lock"
+STATE_DIR="$LOG_DIR/.night-watchman.state"
 
 INTERVAL=300
 MODE="loop"
 TYPING=1
 
-# target records: tab-label|key|launch-command|handover|env-marker
-# (env-marker = text the target's extension injects at session start,
-#  gated on the right PI_* env — proves env correctness, see silas.ts/gru.ts)
-TARGETS=(
-  "silas|silas|env -u PI_GRU PI_SILAS=1 pi|Read the playbook section Silas (COO) standing orders and run your startup checklist|Silas startup checklist"
-  "Gru|gru|env -u PI_SILAS PI_GRU=1 pi|Read the playbook section Gru standing orders and run your startup checklist|Gru startup checklist"
+# quota-probe tool for the Gru model-pin gate (env-cleared pi probe, writes
+# _bmad-output/memory/quota-regime.json; prints "OK <model>" / "DOWN <model>").
+PROBE="${NIGHT_WATCHMAN_PROBE:-$ROOT/bin/quota-probe}"
+[ -x "$PROBE" ] || PROBE=""
+
+# reasoning tier for Gru relaunches (user rulings: k3 primary, glm-5.3
+# fallback; v4-pro banned on cost, flash banned for the reasoning tier).
+REASONING_MODELS=(kimi-coding/k3 zai-coding-cn/glm-5.3)
+FORBIDDEN_REASONING="deepseek/deepseek-v4-pro deepseek/deepseek-v4-flash"
+
+# target records: tab-label|key|launch-env|handover|env-marker|tier
+# (launch-env = the ENV PREFIX of the relaunch command (no executable); the
+#  executable + model are appended at relaunch time: ` pi` for the ops tier
+#  (silas.ts auto-sets flash), ` pi --model <k3|glm-5.3> --thinking max` for
+#  the reasoning tier (Gru, via the probe gate).
+#  env-marker = text the target's extension injects at session start,
+#  gated on the right PI_* env — proves env correctness, see silas.ts/gru.ts;
+#  tier = ops | reasoning)
+DEFAULT_TARGETS=(
+  "silas|silas|env -u PI_GRU PI_SILAS=1|Read the playbook section Silas (COO) standing orders and run your startup checklist|Silas startup checklist|ops"
+  "Gru|gru|env -u PI_SILAS PI_GRU=1|Read the playbook section Gru standing orders and run your startup checklist|Gru startup checklist|reasoning"
 )
+if [ -n "${NIGHT_WATCHMAN_TARGETS:-}" ]; then
+  TARGETS=("$NIGHT_WATCHMAN_TARGETS")
+else
+  TARGETS=("${DEFAULT_TARGETS[@]}")
+fi
 
 usage() {
-  sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,110p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -62,37 +115,284 @@ notify() { # $1 = body
   body="$(printf '%s' "$1" | tr -d '"')"
   osascript -e "display notification \"$body\" with title \"Night watchman\"" >/dev/null 2>&1 || true
 }
+notify_once() { # $1=key $2=body — at most one notification per 30 min per key
+  local f="$STATE_DIR/notify-$1" now age
+  now="$(date +%s)"
+  age=$(( now - $(stat -f '%m' "$f" 2>/dev/null || echo 0) ))
+  [ "$age" -lt 1800 ] && return 0
+  notify "$2"
+  mkdir -p "$STATE_DIR" && echo "$(ts)" >"$f"
+}
 
-# ── target resolution (by TAB LABEL, then pane) ─────────────────────────
+# ── tiny state store (cross-tick verification + notification dedup) ────
+
+state_read() { # $1=file — echoes file contents (empty when absent)
+  cat "$STATE_DIR/$1" 2>/dev/null || true
+}
+state_write() { # $1=file $2=content
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$2" >"$STATE_DIR/$1"
+}
+state_rm() { rm -f "$STATE_DIR/$1"; }
+
+# ── target resolution (BY TAB LABEL, fresh every pass) ─────────────────
 
 resolve_tab() { # $1=label; uses $TABS
   jq -r --arg l "$1" '.result.tabs[] | select(.label == $l) | .tab_id' <<<"$TABS" 2>/dev/null
 }
 
-resolve_pane() { # $1=tab_id; uses $PANES — prefer an agent-bearing pane
-  jq -r --arg t "$1" \
-    '[.result.panes[] | select(.tab_id == $t)] | sort_by(.agent != null) | reverse | .[0].pane_id' \
-    <<<"$PANES" 2>/dev/null
+panes_in_tab() { # $1=tab_id; uses $PANES — echoes one pane_id per line
+  jq -r --arg t "$1" '.result.panes[] | select(.tab_id == $t) | .pane_id' <<<"$PANES" 2>/dev/null
 }
 
 # ── liveness ────────────────────────────────────────────────────────────
 
-# check_alive: exit 0 if herdr reports an agent AND the session file exists
-# on disk. Session-file existence is the AGENT LIVENESS check the briefing
-# mandates (the 2026-07-30 class: herdr reported idle while the file was
-# gone — a dead pi).
-check_alive() { # $1=pane_id; uses $PANES
+# pane_has_pi_process: is a pi process in the pane's foreground RIGHT NOW?
+# (live herdr call). Mid-boot panes show `pi` here while the session file
+# is still being written — the boot-race signal.
+pane_has_pi_process() { # $1=pane_id
+  local info
+  info="$(herdr pane process-info --pane "$1" 2>/dev/null)" || return 1
+  jq -e '.result.process_info.foreground_processes[]? | select(.argv0 == "pi")' \
+    <<<"$info" >/dev/null 2>&1
+}
+
+# pane_state: classify a pane from the pass snapshot + a live process check.
+#   ALIVE   — herdr agent detected AND its session file exists on disk
+#             (the 07-30 class: herdr reporting a ghost agent while the
+#              file is gone is NOT alive — the process check catches it)
+#   BOOTING — a pi process is in the pane's foreground (session file may
+#             still be pending — the 08-21 09:16 boot-race window). This
+#             is LIFE: never type into it.
+#   DEAD    — no agent, no session file, no pi process (a shell prompt).
+pane_state() { # $1=pane_id; uses $PANES + live process-info
   local pane="$1" agent session
   agent="$(jq -r --arg p "$pane" '[.result.panes[] | select(.pane_id == $p) | .agent][0] // ""' <<<"$PANES" 2>/dev/null)"
   session="$(jq -r --arg p "$pane" '[.result.panes[] | select(.pane_id == $p) | .agent_session.value][0] // ""' <<<"$PANES" 2>/dev/null)"
-  [ -n "$agent" ] && [ -n "$session" ] && [ -f "$session" ]
+  if [ -n "$agent" ] && [ -n "$session" ] && [ -f "$session" ]; then
+    echo ALIVE
+    return 0
+  fi
+  if pane_has_pi_process "$pane"; then
+    echo BOOTING
+    return 0
+  fi
+  echo DEAD
+}
+
+# fresh_pane_state: live re-check of ONE pane (herdr get + process-info).
+# On herdr failure echoes UNKNOWN — which is NOT dead, and never typed into.
+fresh_pane_state() { # $1=pane_id
+  local get agent session
+  get="$(herdr pane get "$1" 2>/dev/null)" || { echo UNKNOWN; return 0; }
+  agent="$(jq -r '.result.pane.agent // ""' <<<"$get" 2>/dev/null)"
+  session="$(jq -r '.result.pane.agent_session.value // ""' <<<"$get" 2>/dev/null)"
+  if [ -n "$agent" ] && [ -n "$session" ] && [ -f "$session" ]; then
+    echo ALIVE
+    return 0
+  fi
+  if pane_has_pi_process "$1"; then
+    echo BOOTING
+    return 0
+  fi
+  echo DEAD
+}
+
+fresh_session() { # $1=pane_id — current session path (empty when none)
+  herdr pane get "$1" 2>/dev/null | jq -r '.result.pane.agent_session.value // ""' 2>/dev/null
+}
+
+# ── death confirmation (boot-race guard) ────────────────────────────────
+
+# confirm_death: a suspected death must survive a 60s grace window of
+# fresh re-polls (4 × 15s). Any ALIVE/BOOTING/UNKNOWN sighting = the pane
+# is alive (or mid-boot / session-file-pending) → no action. Returns 0
+# (alive, do nothing) unless every poll reads DEAD.
+confirm_death() { # $1=pane_id
+  local i st
+  for i in 1 2 3 4; do
+    sleep 15
+    st="$(fresh_pane_state "$1")"
+    case "$st" in
+      ALIVE|BOOTING)
+        log "  classified $st after grace — boot-race guard: no keystrokes"
+        return 0 ;;
+      UNKNOWN)
+        log "  confirm re-poll UNKNOWN (herdr flake) — holding, no keystrokes"
+        return 0 ;;
+    esac
+  done
+  return 1   # confirmed dead
+}
+
+# ── model gate (Gru relaunch) ───────────────────────────────────────────
+
+probe_ok() { # $1=model → 0 if the provider/model probes OK through pi
+  local out
+  if [ -z "$PROBE" ]; then
+    log "  probe tool missing (NIGHT_WATCHMAN_PROBE unset, $ROOT/bin/quota-probe absent)"
+    return 1
+  fi
+  out="$("$PROBE" "$1" 2>&1 | tail -1)"
+  case "$out" in
+    "OK "*|"OK") return 0 ;;
+  esac
+  log "  probe $1 DOWN: ${out:-<no output>}"
+  return 1
+}
+
+# build_launch: echo the full relaunch command for a target; rc=1 when a
+# reasoning target cannot be launched on an allowed model (BOTH down).
+build_launch() { # $1=key $2=launch-env $3=tier
+  local key="$1" env="$2" tier="$3" m
+  if [ "$tier" != "reasoning" ]; then
+    echo "$env pi"
+    return 0
+  fi
+  for m in "${REASONING_MODELS[@]}"; do
+    if probe_ok "$m"; then
+      log "  model gate: $m OK — pinning (never $FORBIDDEN_REASONING)"
+      echo "$env pi --model $m --thinking max"
+      return 0
+    fi
+  done
+  log "  model gate: ALL reasoning models DOWN — NOT relaunching $key"
+  if [ "$TYPING" -eq 1 ]; then
+    notify_once "both-reasoning-down-$key" "$key pi DEAD but both reasoning providers (k3, glm-5.3) probe DOWN — no relaunch; manual intervention needed"
+  fi
+  return 1
+}
+
+# ── post-launch readiness ───────────────────────────────────────────────
+
+# wait_for_ready: poll pane get for up to ~90s. Echoes:
+#   idle — agent_status idle (TUI ready: safe to send the handover)
+#   up   — a session file exists but the agent is busy (mid-checklist /
+#          working) — pi demonstrably up; the handover is DEFERRED, never
+#          typed into a working pane (the 09:16 keystroke-queue hazard)
+#   down — nothing after 90s
+wait_for_ready() { # $1=pane_id
+  local i get st session
+  i=0
+  while [ $i -lt 18 ]; do
+    get="$(herdr pane get "$1" 2>/dev/null || echo '')"
+    st="$(jq -r '.result.pane.agent_status // ""' <<<"$get" 2>/dev/null)"
+    session="$(jq -r '.result.pane.agent_session.value // ""' <<<"$get" 2>/dev/null)"
+    if [ "$st" = "idle" ]; then echo idle; return 0; fi
+    if [ -n "$session" ] && [ -f "$session" ]; then echo up; return 0; fi
+    sleep 5
+    i=$((i + 1))
+  done
+  case "$(fresh_pane_state "$1")" in
+    ALIVE|BOOTING) echo up ;;
+    *) echo down ;;
+  esac
+}
+
+# ── verification (in-pass + cross-tick) ─────────────────────────────────
+
+# verify_session: echoes the session path (rc=0) if the pane's session
+# file carries the env marker — and, when required, the handover text.
+verify_session() { # $1=pane_id $2=marker $3=require_handover(0|1)
+  local get session
+  get="$(herdr pane get "$1" 2>&1)"
+  session="$(jq -r '.result.pane.agent_session.value // ""' <<<"$get" 2>/dev/null)"
+  if [ -z "$session" ] || [ ! -f "$session" ]; then return 1; fi
+  grep -q "$2" "$session" 2>/dev/null || return 1
+  if [ "$3" = "1" ] && ! grep -q "run your startup checklist" "$session" 2>/dev/null; then
+    return 1
+  fi
+  echo "$session"
+  return 0
+}
+
+# verify_relaunch: in-pass confirm (marker + handover). On failure writes
+# the cross-tick pending record instead of flagging — a pi mid-startup-
+# checklist is pending, not failed.
+verify_relaunch() { # $1=pane $2=key $3=marker $4=require_handover(0|1) $5=rec_session
+  local pane="$1" key="$2" marker="$3" req="$4" rec_session="$5"
+  local attempts=0 session rc=1
+  while [ $attempts -lt 6 ]; do
+    sleep 5
+    attempts=$((attempts + 1))
+    session="$(verify_session "$pane" "$marker" "$req")" && rc=0
+    if [ $rc -eq 0 ]; then
+      log "  verified: session=$session (env marker + handover landed)"
+      state_rm "pending-$key"
+      return 0
+    fi
+  done
+  if [ "$req" = "1" ]; then
+    # env marker may have landed without the handover — a stuck buffer
+    # recovers with one enter (the 08-06 gotcha), then re-verify.
+    if [ -n "$(verify_session "$pane" "$marker" 0)" ]; then
+      log "  warn handover-not-confirmed; sending one enter"
+      herdr pane send-keys "$pane" enter >/dev/null 2>&1 || true
+      attempts=0
+      while [ $attempts -lt 4 ]; do
+        sleep 5
+        attempts=$((attempts + 1))
+        if session="$(verify_session "$pane" "$marker" 1)"; then
+          log "  verified (after enter): session=$session"
+          state_rm "pending-$key"
+          return 0
+        fi
+      done
+    fi
+  fi
+  log "  verify pending: pi up but startup handover unconfirmed — retrying across ticks (mid-checklist ≠ failure)"
+  state_write "pending-$key" "$pane|${rec_session:-}|$req|0|0|$(ts)"
+  return 1
+}
+
+# check_pending_verify: cross-tick retry of an unconfirmed relaunch.
+# Clears on success; escalates (one notification) after 3 ticks/15 min
+# (handover was sent) or 6 ticks/30 min (marker-only — the env marker is
+# the load-bearing proof; the checklist comes from the extension).
+check_pending_verify() { # $1=key $2=marker
+  local key="$1" marker="$2"
+  local rec pane rec_session req attempts notified ts_rec
+  rec="$(state_read "pending-$key")"
+  [ -n "$rec" ] || return 0
+  IFS='|' read -r pane rec_session req attempts notified ts_rec <<<"$rec"
+  attempts="${attempts:-0}"; notified="${notified:-0}"; req="${req:-1}"
+  local get session now ts_epoch age need_ticks need_age
+  get="$(herdr pane get "$pane" 2>/dev/null || echo '')"
+  session="$(jq -r '.result.pane.agent_session.value // ""' <<<"$get" 2>/dev/null)"
+  if [ -n "$rec_session" ] && [ -n "$session" ] && [ "$session" != "$rec_session" ]; then
+    log "  pending-$key stale (session replaced) — cleared"
+    state_rm "pending-$key"
+    return 0
+  fi
+  if session="$(verify_session "$pane" "$marker" "$req")"; then
+    log "  verified (cross-tick): session=$session"
+    state_rm "pending-$key"
+    return 0
+  fi
+  attempts=$((attempts + 1))
+  if [ "$notified" = "0" ]; then
+    now="$(date +%s)"
+    ts_epoch="$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts_rec" +%s 2>/dev/null || echo "$now")"
+    age=$(( now - ts_epoch ))
+    need_ticks=3; need_age=900
+    if [ "$req" = "0" ]; then need_ticks=6; need_age=1800; fi
+    if [ "$attempts" -ge "$need_ticks" ] && [ "$age" -ge "$need_age" ]; then
+      if [ "$req" = "1" ]; then
+        notify "$key pi relaunched but startup handover still unconfirmed — check pane $pane"
+      else
+        notify "$key pi up but env marker not confirmed in session — env may be wrong; check pane $pane"
+      fi
+      notified=1
+    fi
+  fi
+  state_write "pending-$key" "$pane|${rec_session:-}|$req|$attempts|$notified|$ts_rec"
 }
 
 # ── death + relaunch chain ──────────────────────────────────────────────
 
-handle_death() { # $1=label $2=key $3=pane $4=launch $5=handover $6=env-marker
-  local label="$1" key="$2" pane="$3" launch="$4" handover="$5" marker="$6"
-  local session mtime get gagent gsession rc
+handle_death() { # $1=label $2=key $3=pane $4=launch-env $5=handover $6=marker $7=tier
+  local label="$1" key="$2" pane="$3" launch_env="$4" handover="$5" marker="$6" tier="$7"
+  local session mtime st launch rec_session rc tab panes count pane2
 
   session="$(jq -r --arg p "$pane" '[.result.panes[] | select(.pane_id == $p) | .agent_session.value][0] // ""' <<<"$PANES" 2>/dev/null)"
   if [ -n "$session" ] && [ -f "$session" ]; then
@@ -105,23 +405,49 @@ handle_death() { # $1=label $2=key $3=pane $4=launch $5=handover $6=env-marker
   log "  last-session=${session:-none-reported} last-modified=$mtime"
 
   if [ "$TYPING" -eq 0 ]; then
-    log "  dry-run: would relaunch ($launch) + handover"
+    if [ "$tier" = "reasoning" ]; then
+      log "  dry-run: would relaunch ($launch_env pi --model <k3|glm-5.3 via probe gate> --thinking max) + handover"
+    else
+      log "  dry-run: would relaunch ($launch_env pi) + handover"
+    fi
     return 0
   fi
 
-  # confirmation re-read before ANY keystroke (race protection)
-  get="$(herdr pane get "$pane" 2>&1)"
-  gagent="$(jq -r '.result.pane.agent // ""' <<<"$get" 2>/dev/null)"
-  gsession="$(jq -r '.result.pane.agent_session.value // ""' <<<"$get" 2>/dev/null)"
-  if [ -n "$gagent" ] && [ -n "$gsession" ] && [ -f "$gsession" ]; then
-    log "  confirm-get reports alive — skipped (no keystrokes)"
+  # fresh re-resolve BEFORE any action: the tab may have changed during
+  # the grace window. Identity tab missing / holding ≠1 pane → notify +
+  # STOP. Never create, never split, never guess.
+  TABS="$(herdr tab list 2>&1)"
+  tab="$(resolve_tab "$label")"
+  if [ -z "$tab" ]; then
+    log "  ABORT: identity tab '$label' missing — notify + STOP (no split, no new pane)"
+    notify_once "tab-missing-$key" "$label tab is MISSING (watchman cannot relaunch $key) — manual pane setup needed"
+    return 1
+  fi
+  PANES="$(herdr pane list 2>&1)"
+  count="$(panes_in_tab "$tab" | wc -l | tr -d ' ')"
+  if [ "$count" -ne 1 ]; then
+    log "  ABORT: identity tab '$label' holds $count panes — never guess which pane; notify + STOP"
+    notify_once "multi-pane-$key" "$label tab holds $count panes (stray split?) — watchman STOPPED; manual cleanup needed"
+    return 1
+  fi
+  pane2="$(panes_in_tab "$tab")"
+
+  # live-agent no-op guard: anything but a confirmed DEAD pane = zero
+  # keystrokes (the 08-06 pane-run race + the 09:16 keystroke-queue class).
+  st="$(fresh_pane_state "$pane2")"
+  if [ "$st" != "DEAD" ]; then
+    log "  no-op: pane $pane2 now $st — zero keystrokes"
     return 0
   fi
 
-  notify "$label pi DEAD (pane $pane) — relaunching; trail in watchman.log"
+  # model gate for the reasoning tier (probe k3 → glm-5.3; both down →
+  # abort — never v4-pro, never flash).
+  launch="$(build_launch "$key" "$launch_env" "$tier")" || return 1
+
+  notify "$label pi DEAD (pane $pane2) — relaunching ($launch); trail in watchman.log"
   log "  action: relaunch ($launch)"
 
-  herdr pane run "$pane" "$launch"
+  herdr pane run "$pane2" "$launch"
   rc=$?
   if [ $rc -ne 0 ]; then
     log "  FAILED pane-run rc=$rc"
@@ -131,75 +457,35 @@ handle_death() { # $1=label $2=key $3=pane $4=launch $5=handover $6=env-marker
 
   sleep 10   # herdr 0.8.0 races agent registration on a fresh boot
 
-  herdr agent wait "$pane" --until idle --timeout 90000 >/dev/null 2>&1   # no pipes: rc must be real
-  rc=$?
-  if [ $rc -ne 0 ]; then
-    log "  FAILED agent-wait rc=$rc (pi did not come up within 90s)"
-    notify "RELAUNCH FAILED for $label — pi did not come up; manual intervention needed"
-    return 1
-  fi
-  log "  agent-wait: idle (pi booted)"
-
-  sleep 3    # TUI input handler readiness after idle
-
-  herdr pane run "$pane" "$handover"
-  rc=$?
-  if [ $rc -ne 0 ]; then
-    log "  warn handover pane-run rc=$rc (verification continues)"
-  fi
-
-  verify_relaunch "$pane" "$key" "$marker"
-}
-
-# verify_relaunch: new session file exists, the right env extension fired
-# (marker text), and the handover text landed in the session. If the
-# handover text is missing after ~30s, one `send-keys enter` recovers a
-# stuck input buffer (the 08-06 gotcha), then re-verify.
-verify_relaunch() { # $1=pane $2=key $3=env-marker
-  local pane="$1" key="$2" marker="$3"
-  local session get attempts rc=1
-
-  attempts=0
-  while [ $attempts -lt 6 ]; do
-    sleep 5
-    attempts=$((attempts + 1))
-    get="$(herdr pane get "$pane" 2>&1)"
-    session="$(jq -r '.result.pane.agent_session.value // ""' <<<"$get" 2>/dev/null)"
-    if [ -n "$session" ] && [ -f "$session" ] && grep -q "$marker" "$session" 2>/dev/null; then
-      if grep -q "run your startup checklist" "$session" 2>/dev/null; then
-        log "  verified: session=$session (env marker + handover landed)"
-        return 0
+  st="$(wait_for_ready "$pane2")"
+  case "$st" in
+    idle)
+      log "  ready: idle (pi booted)"
+      sleep 3    # TUI input handler readiness after idle
+      herdr pane run "$pane2" "$handover"
+      rc=$?
+      if [ $rc -ne 0 ]; then
+        log "  warn handover pane-run rc=$rc (verification continues)"
       fi
-      rc=0   # pi up + right env; handover text still pending
-    fi
-  done
-
-  if [ $rc -eq 0 ]; then
-    # env marker seen but handover text not yet — likely a stuck buffer
-    log "  warn handover-not-confirmed in session; sending one enter"
-    herdr pane send-keys "$pane" enter >/dev/null 2>&1 || true
-    attempts=0
-    while [ $attempts -lt 4 ]; do
-      sleep 5
-      attempts=$((attempts + 1))
-      get="$(herdr pane get "$pane" 2>&1)"
-      session="$(jq -r '.result.pane.agent_session.value // ""' <<<"$get" 2>/dev/null)"
-      if [ -n "$session" ] && [ -f "$session" ] && grep -q "run your startup checklist" "$session" 2>/dev/null; then
-        log "  verified (after enter): session=$session"
-        return 0
-      fi
-    done
-  fi
-
-  log "  FAILED verify: pi up but startup handover unconfirmed in session"
-  notify "$key pi relaunched but startup handover unconfirmed — check pane $pane"
-  return 1
+      verify_relaunch "$pane2" "$key" "$marker" 1 "$(fresh_session "$pane2")"
+      ;;
+    up)
+      log "  ready: pi up but busy (status != idle) — handover deferred (no typing into a working pane); verify across ticks"
+      verify_relaunch "$pane2" "$key" "$marker" 0 "$(fresh_session "$pane2")"
+      ;;
+    *)
+      log "  FAILED ready-wait: pi did not come up within 90s"
+      notify "RELAUNCH FAILED for $label — pi did not come up; manual intervention needed"
+      return 1
+      ;;
+  esac
 }
 
 # ── one pass ────────────────────────────────────────────────────────────
 
 run_pass() {
-  local rc alive="" failed=0 rec label key launch handover marker tab pane
+  local rc alive="" failed=0 rec label key launch_env handover marker tier tab
+  local panes count pane st boot_age
 
   TABS="$(herdr tab list 2>&1)"
   rc=$?
@@ -216,27 +502,51 @@ run_pass() {
   fi
 
   for rec in "${TARGETS[@]}"; do
-    IFS='|' read -r label key launch handover marker <<<"$rec"
+    IFS='|' read -r label key launch_env handover marker tier <<<"$rec"
 
     tab="$(resolve_tab "$label")"
     if [ -z "$tab" ]; then
       log "warn tab-not-found label=$label (renamed? watchman targets stale)"
+      notify_once "tab-missing-$key" "$label tab is MISSING — watchman cannot watch $key; manual pane setup needed"
       continue
     fi
 
-    pane="$(resolve_pane "$tab")"
-    if [ -z "$pane" ]; then
-      log "warn no-pane-in-tab label=$label tab=$tab"
+    count="$(panes_in_tab "$tab" | wc -l | tr -d ' ')"
+    if [ "$count" -ne 1 ]; then
+      log "warn identity-tab label=$label holds $count panes — skipping (never guess which pane is the identity)"
+      notify_once "multi-pane-$key" "$label tab holds $count panes (stray split?) — watchman PAUSED on $key; manual cleanup needed"
       continue
     fi
+    pane="$(panes_in_tab "$tab")"
 
-    if check_alive "$pane"; then
-      alive="$alive $key"
-      continue
-    fi
-
-    handle_death "$label" "$key" "$pane" "$launch" "$handover" "$marker"
-    [ $? -ne 0 ] && failed=1
+    st="$(pane_state "$pane")"
+    case "$st" in
+      ALIVE)
+        alive="$alive $key"
+        state_rm "boot-$key"
+        check_pending_verify "$key" "$marker"
+        ;;
+      BOOTING)
+        log "boot $key pane=$pane (mid-boot — zero keystrokes)"
+        if [ -f "$STATE_DIR/boot-$key" ]; then
+          boot_age=$(( $(date +%s) - $(stat -f '%m' "$STATE_DIR/boot-$key" 2>/dev/null || echo "$(date +%s)") ))
+          if [ "$boot_age" -gt 600 ]; then
+            notify_once "stuck-boot-$key" "$key pane stuck mid-boot for ${boot_age}s — check pane $pane"
+          fi
+        else
+          state_write "boot-$key" "$(ts)"
+        fi
+        check_pending_verify "$key" "$marker"
+        ;;
+      DEAD)
+        if confirm_death "$pane"; then
+          : # came alive within the grace window — already logged
+        else
+          handle_death "$label" "$key" "$pane" "$launch_env" "$handover" "$marker" "$tier"
+          [ $? -ne 0 ] && failed=1
+        fi
+        ;;
+    esac
   done
 
   log "alive${alive}"
@@ -262,10 +572,10 @@ acquire_lock() {
 
 release_lock() { rm -rf "$LOCK_DIR"; }
 
-# ── self-test (the env-mirror test for the untested Gru relaunch path) ──
+# ── self-test (deps + safety assertions + model gate + live resolution) ─
 
 self_test() {
-  local rc=0 rec label key launch handover marker tab pane dep
+  local rc=0 rec label key launch_env handover marker tier tab pane st dep bad
 
   echo "night-watchman self-test"
   echo "--- dependencies"
@@ -278,17 +588,91 @@ self_test() {
     fi
   done
 
-  echo "--- env mirror (relaunch commands per target)"
+  echo "--- env mirror (relaunch envs per target)"
   for rec in "${TARGETS[@]}"; do
-    IFS='|' read -r label key launch handover marker <<<"$rec"
-    printf '  %-6s %s\n' "$key" "$launch"
+    IFS='|' read -r label key launch_env handover marker tier <<<"$rec"
+    printf '  %-6s %s (tier: %s)\n' "$key" "$launch_env" "$tier"
   done
-  [ "$(printf '%s' "${TARGETS[0]}" | cut -d'|' -f3)" = "env -u PI_GRU PI_SILAS=1 pi" ] \
+  [ "$(printf '%s' "${TARGETS[0]}" | cut -d'|' -f3)" = "env -u PI_GRU PI_SILAS=1" ] \
     || { echo "  FAIL: silas env mirror wrong"; rc=1; }
-  [ "$(printf '%s' "${TARGETS[1]}" | cut -d'|' -f3)" = "env -u PI_SILAS PI_GRU=1 pi" ] \
+  [ "$(printf '%s' "${TARGETS[1]}" | cut -d'|' -f3)" = "env -u PI_SILAS PI_GRU=1" ] \
     || { echo "  FAIL: gru env mirror wrong"; rc=1; }
 
-  echo "--- live resolution (read-only; no keystrokes)"
+  echo "--- NO KILL PATH assertion (only 'kill -0' lock probes allowed)"
+  bad="$(grep -nE 'kill[ ]+-[1-9]|kill[ ]+-SIG|pkil[l]|killa[l]l' "$0" || true)"
+  if [ -n "$bad" ]; then
+    echo "  FAIL: kill code found:"
+    echo "$bad"
+    rc=1
+  else
+    echo "  PASS: no kill path (only the 'kill -0' lock probe)"
+  fi
+
+  echo "--- NO CREATE / NO SPLIT assertion (identity-tab pane only)"
+  bad="$(grep -nE 'pane[ ]split|tab[ ]create|pane[ ]create|worktree[ ]create' "$0" || true)"
+  if [ -n "$bad" ]; then
+    echo "  FAIL: pane-creating code found:"
+    echo "$bad"
+    rc=1
+  else
+    echo "  PASS: no pane/tab/worktree creation calls"
+  fi
+
+  echo "--- model gate (reasoning tier pin; NEVER v4-pro / flash)"
+  if [ "$(printf '%s' "${TARGETS[1]}" | cut -d'|' -f6)" != "reasoning" ]; then
+    echo "  note: TARGETS[1] is not the reasoning tier (test override active) — gate test skipped"
+  elif [ -z "$PROBE" ]; then
+    echo "  note: probe tool missing — gate cannot run (safe: relaunch aborts); rc unaffected"
+  else
+    local stub out m
+    mkdir -p "$STATE_DIR"
+    stub="$STATE_DIR/probe-stub"
+    cat >"$stub" <<'STUB'
+#!/bin/bash
+case "$1" in
+  kimi-coding/k3)        [ "${STUB_K3:-down}" = ok ] && echo "OK kimi-coding/k3" || echo "DOWN kimi-coding/k3 (403 test)" ;;
+  zai-coding-cn/glm-5.3) [ "${STUB_GLM:-down}" = ok ] && echo "OK zai-coding-cn/glm-5.3" || echo "DOWN zai-coding-cn/glm-5.3 (403 test)" ;;
+  *) echo "DOWN $1 (unknown test model)" ;;
+esac
+STUB
+    chmod +x "$stub"
+
+    out="$(STUB_K3=ok STUB_GLM=down NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)"
+    if [ "$(printf '%s' "$out" | grep -c 'kimi-coding/k3 --thinking max')" = "1" ]; then
+      echo "  PASS: k3 up → pinned kimi-coding/k3"
+    else
+      echo "  FAIL: expected k3 pin, got: $out"
+      rc=1
+    fi
+
+    out="$(STUB_K3=down STUB_GLM=ok NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)"
+    if [ "$(printf '%s' "$out" | grep -c 'zai-coding-cn/glm-5.3 --thinking max')" = "1" ]; then
+      echo "  PASS: k3 down, glm up → pinned zai-coding-cn/glm-5.3"
+    else
+      echo "  FAIL: expected glm-5.3 pin, got: $out"
+      rc=1
+    fi
+
+    out="$(STUB_K3=down STUB_GLM=down NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)"
+    if [ -z "$out" ]; then
+      echo "  PASS: both down → no relaunch (abort)"
+    else
+      echo "  FAIL: expected abort (empty), got: $out"
+      rc=1
+    fi
+
+    for m in $FORBIDDEN_REASONING; do
+      if out="$(STUB_K3=ok STUB_GLM=ok NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)" \
+         && [ "$(printf '%s' "$out" | grep -c "$m")" = "1" ]; then
+        echo "  FAIL: launch pins forbidden model $m"
+        rc=1
+      fi
+    done
+    [ $rc -eq 0 ] && echo "  PASS: forbidden models (v4-pro/flash) never emitted"
+    rm -f "$stub"
+  fi
+
+  echo "--- live resolution (read-only; no keystrokes, no probes)"
   if [ -d "$LOG_DIR" ] && [ -w "$LOG_DIR" ]; then
     echo "  log dir: $LOG_DIR (writable)"
   else
@@ -304,22 +688,19 @@ self_test() {
     return 1
   }
   for rec in "${TARGETS[@]}"; do
-    IFS='|' read -r label key launch handover marker <<<"$rec"
+    IFS='|' read -r label key launch_env handover marker tier <<<"$rec"
     tab="$(resolve_tab "$label")"
-    if [ -n "$tab" ]; then
-      pane="$(resolve_pane "$tab")"
-      if [ -n "$pane" ]; then
-        if check_alive "$pane"; then
-          echo "  $key: tab=$tab pane=$pane ALIVE"
-        else
-          echo "  $key: tab=$tab pane=$pane DEAD (would relaunch)"
-        fi
-      else
-        echo "  $key: tab=$tab no pane"
-      fi
-    else
+    if [ -z "$tab" ]; then
       echo "  $key: tab label '$label' not found"
+      continue
     fi
+    count="$(panes_in_tab "$tab" | wc -l | tr -d ' ')"
+    if [ "$count" -ne 1 ]; then
+      echo "  $key: tab=$tab panes=$count (≠1 — watchman would STOP on this)"
+      continue
+    fi
+    pane="$(panes_in_tab "$tab")"
+    echo "  $key: tab=$tab pane=$pane $(pane_state "$pane")"
   done
 
   echo "--- result: $([ $rc -eq 0 ] && echo PASS || echo FAIL)"
@@ -334,6 +715,7 @@ main() {
       --once)      MODE="once"; shift ;;
       --dry-run)   MODE="once"; TYPING=0; shift ;;
       --self-test) MODE="self-test"; shift ;;
+      --_launch-test) MODE="launch-test"; shift ;;
       --interval)  INTERVAL="${2:-}"; shift 2 2>/dev/null || true
                    case "$INTERVAL" in
                      ''|*[!0-9]*)
@@ -348,7 +730,16 @@ main() {
   mkdir -p "$LOG_DIR" || { echo "cannot create $LOG_DIR" >&2; exit 1; }
 
   case "$MODE" in
+    launch-test)
+      # internal: build the reasoning target's launch command with the
+      # current env — used by --self-test's model-gate unit tests.
+      TYPING=0
+      IFS='|' read -r label key launch_env handover marker tier <<<"${TARGETS[1]}"
+      build_launch "$key" "$launch_env" "$tier"
+      exit $?
+      ;;
     self-test)
+      TYPING=0
       self_test
       exit $?
       ;;
