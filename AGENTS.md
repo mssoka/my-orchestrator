@@ -169,6 +169,22 @@ the user at the Gru session in `/Users/moses/code`.
   stories diverge, the prototype's MAIN branch is the ground truth to
   diff against (the router-placement miss: prototype had
   Cmd_Place_Router + tray intact; the v2 replan dropped it).
+  2026-08-20/21 addendum (the HEALTHY reversal form — design the gate
+  so the reversal is cheap): direction bake-offs are USER-PLAYED and
+  pixel-first — the LOOKS-primary ruling (08-20 evening): slice-1
+  MUST carry a visual look-parity target (side-by-side vs the ACTUAL
+  Mini Motorways — palette, roads, shadows, AA, easing; the reference
+  frame stays local, IP guardrail; the MCP screenshot proof doubles
+  as the delivery vehicle). One slice bought the engine verdict: the
+  user played the artifact ("doesn't look as good as I expected out
+  of the box" → "just focus on odin for now") — UE slice-2 PARKED,
+  Odin look-polish dispatched: a designed gate, not a wasted belt.
+  Sibling (wire-aesthetics 08-19): when an aesthetic gate verdict is
+  PENDING, keep the legacy path BYTE-IDENTICAL — structure variants as
+  legacy-inline + path-walk; the flags-off render byte-identical to
+  pre-change is the proof either verdict ships cheap (a shared
+  path-walk that "should be equivalent" drifted 1px; only the
+  fully-green flags-off harness run caught it).
 - **Cross-job impact = flag, never act across the boundary
   (2026-08-07/08, 2 sightings).** A minion that spots ANOTHER job's
   file/decision being wrong flags it in its PR, out of scope
@@ -305,6 +321,14 @@ the user at the Gru session in `/Users/moses/code`.
   unaffected; merges stay user-side — when the web merge is down the
   local-merge+push CLI recipe unblocks (#61 + #60 merged 8s apart;
   webhook alerts lagged ~4 min).
+  2026-08-19/21 addendum: the billing-block CI "log not found" echo
+  is the highest-volume noise class (~15 note-only events/48h across
+  every in-review PR) AND minions still propose useless reruns
+  (demo-polish-1 08-19 21:43Z: "re-run when runners recover" — the
+  standing ruling calls reruns useless) — carry the signature (5s run
+  / zero logs / "payments failed") in minion briefings so they stop
+  proposing reruns; teaching the sensor to auto-note/mute the
+  signature is a Silas config task (sensor-doctrine-sync).
   2026-08-19 supersede (user ruling, morning; playbook 7e889ec):
   **v4-pro is BANNED from the reasoning tier (cost) — the reasoning
   chain is kimi k3 → zai-coding-cn/glm-5.3 → HOLD** (park; NO reasoning
@@ -338,6 +362,25 @@ the user at the Gru session in `/Users/moses/code`.
   QoS-r1 + demo-mode-r4 + 7.3-r1 + dream panes together) — one
   continue per errored pane clears it, hold NEW glm dispatches until
   the wave settles, escalate only if continues stop clearing.
+  2026-08-19-night supersede (user ruling, playbook 39c9574 +
+  quota-regime `_policy`): **glm-5.3 is the STANDING reasoning
+  primary** — kimi limit reached; reasoning stays glm "until further
+  notice"; NEW reasoning dispatches go glm-FIRST, re-probe k3 at
+  dispatch ONLY if glm errors, and NO proactive k3 flips mid-cycle (the
+  18:03 reflip re-capped within ~1h; k3 cap status is unreliable —
+  treat each probe as fresh truth). Probe-at-dispatch is a dispatch-
+  time gate, NOT a round-long guarantee: k3's cap flapped ~5 min after
+  an OK probe (the fickle-k3 class, ≥5 sightings 08-19/20: 6.2-r2,
+  demo-polish-2-r1/r2, 7.3-r2, mobile-layout-1-r1) — round briefings
+  on a capped primary PRE-AUTHORIZE the mid-round flip (`/model
+  zai-coding-cn/glm-5.3` + ONE continue, no re-dispatch; proven ≥5×).
+  Probe false-reads go BOTH directions (k3 false-negative with empty
+  error 08-19 08:10Z; glm false-DOWN 08-20 16:13Z — a chatty "OK —
+  I'm here" reply vs the strict `^OK$` match) — re-probe once before
+  acting on any surprising read. Cap-reset times remain estimates:
+  glm's 1308 rolling window freed ~11h EARLY vs the stated 20:43Z
+  reset (08-20) — never schedule a resume off the provider's stated
+  time; only the probe decides.
 - **Model dispatch & correction ops (2026-08-09).** Only a
   `provider/model` path naming an AUTHED provider works: bare
   `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
@@ -371,6 +414,24 @@ the user at the Gru session in `/Users/moses/code`.
   round-MAIN launch (the 08-13 lesson covered lens briefings; this
   extends it to the round pane itself) and verify the session modelId
   after every launch.
+  2026-08-20 addendum (user ruling, playbook bd2e550): pin the ENTIRE
+  launch envelope — `--thinking max` on EVERY agent launch (the global
+  defaultThinkingLevel was UNSET; pi defaults off — now pinned in the
+  playbook dispatch chain, the dead-pi relaunch line, Perkins step-5,
+  and the code-review lens template next to the --cwd rule). The
+  provenance ruling extends to EVERY spawn surface: lens fleets
+  launched on capped k3 via bare-pi default while round mains rode glm
+  (user-spotted ×2 in one hour 08-20 14:24Z — 6.2-r3 tHM +
+  demo-polish-2-r3 tHP; root cause = the code-review lens template
+  pinned --cwd + --thinking but NOT the model — MODEL PIN now
+  MANDATORY in the skill; verify it holds at the next wave).
+  Relauncher surfaces inherit ALL manual-dispatch rules: the
+  night-watchman relaunched Gru on flash (defaultProvider, wrong tier)
+  before the 08-21 hardening pinned the relaunch model. Also: `/model`
+  typed to a WORKING (not errored) pane ends the current turn cleanly
+  — ALWAYS pair with an explicit continue (6.2-r1 stalled
+  09:25Z→12:49Z on a bare mid-flight /model; one continue recovered a
+  complete verdict).
 - **Serialize concurrent Perkins BURSTS (2026-08-11; models renamed 2026-08-12; SUPERSEDED 2026-08-16).**
   **2026-08-16 USER RULING: FULL THROTTLE on all providers — the serialize-on-quota
   doctrine below is LIFTED.** Dispatch rounds as needed, no holding behind
@@ -490,6 +551,24 @@ the user at the Gru session in `/Users/moses/code`.
   killed dream-2026-08-17's sheep panes p1ZZ/p1Z0 — adjacent to lens
   panes p1ZQ–p1ZX; one sheep's shard survived by ~8s, the other died
   mid-turn and was re-dispatched).
+- **Close-out drift + the W3 spawn-turn stall + catastrophic recovery
+  (2026-08-19/21).** The badge-out step now fails SYSTEMATICALLY: round
+  mains hang post-post (×2 on 08-20: demo-polish-2 r1/r2) and
+  self-close-with-empty-result recovered-at-close-out covers ~2/3 of
+  rounds in this window (UE bootstrap r2, slice-1 r1/r2/r3 — 5
+  recovered-verdict events + 2 badge-hangs in the visible stream) —
+  expect to reconstruct every verdict from review artifacts (the
+  pre-emptive verdict-note + durable lens JSONs save it; the Perkins
+  tooling still owes the badge/token-mint fix task). NEW standing stall
+  class, 3 clean sightings (demo-mode-r5 08-19 19:48Z, 7.3-r3 19:59Z,
+  ue-bootstrap-r1 08-20 17:24Z): the round main's spawn-turn ends
+  mid-lens-wave leaving it at prompt with NO error (toolUse stops only)
+  — classify `main idle + lenses working` → ONE continue-nudge when the
+  wave finishes; don't wait for an alert to force it. Machine-wide
+  death (Mac reboot 17:59Z 08-20) ≠ lost work: durable lens JSONs +
+  diff.patch in `_bmad-output/perkins/<round>/` salvage the round —
+  relaunch SAME row SAME sha, regenerate only the missing lenses (5/7
+  JSONs survived the reboot; the verdict posted intact).
 - **Serialize-hold for pane capacity: pre-create the round row to dedup the
   sensor (2026-08-07).** When the valve is near capacity, hold the next
   Perkins round behind an in-flight one: pre-create its ledger row (status
@@ -694,6 +773,15 @@ the user at the Gru session in `/Users/moses/code`.
   self-created at `working` with pane/tab/worktree/model/pr EMPTY
   (Silas filled post-hoc). Verify-and-fill on every round row stays
   the guard.
+  2026-08-19/21 addendum (two NEW flavors): (a) WRONG-ROW events — the
+  r5 round's self-report (`ledger set <id> working`) landed on the r4
+  ROW (a sibling DONE row flipped done→working, restored; round ids
+  drift by one under edit — read the row id back BEFORE the set);
+  (b) the `model` column stays EMPTY while the note says "provenance
+  verified (modelId=glm-5.3)" — provenance is verified but not
+  WRITTEN; fill the model column at dispatch. The guard extends to:
+  verify-and-fill ROW STATE + `pr` + `model` on every dispatch and
+  completion.
 - **Durable routing lives on ledger rows, not in agent context
   (2026-08-14/15, ×3 + one full fire cycle).** QUEUE / BATCHED /
   RESPAWN-TRIGGER decisions are written as notes on the OWNING row
@@ -741,6 +829,34 @@ the user at the Gru session in `/Users/moses/code`.
   → `kill <pid>` (the `node` pid) from bash → the pane drops to a shell;
   then verify the session-file state before relaunching. (Seen across the
   2026-08-04 quota-403 + glm dead-pane sweep.)
+- **Silent pi deaths + the census/watchman layer (2026-08-20/21).** A
+  pi dies SILENTLY with the pane up: the 6.2 minion's turn froze
+  mid-tool-call (session silent 13.4h, an orphan core.bin spinning
+  99.9% CPU); Gru died silently ~00:38Z 08-21 and again ~10:52Z. The
+  census/startup sweep is the detection layer — 13.4h of dead time was
+  the cost of skipping one. A WEDGED pi (continue + send-keys INERT)
+  recovers only via the kill-pid path above → fresh relaunch + FULL
+  context handover (blockers, rebase state, in-progress edits). Crash
+  recovery must also RE-DELIVER undelivered escalations — Silas' FYIs
+  died in Gru's queue and were re-sent to the relaunched Gru, handover
+  verified against filesystem. The **night-watchman** (launchd, 5-min
+  cadence, PRs #6/#7 08-21) is the standing out-of-pi liveness layer —
+  spawned by the 08-20 incident where ALL sensors lived in-process in
+  Silas' pi, the pi died at a merge, and the alert went unheard ~5h.
+  Kill test PASSED (death detected on the CORRECT pane via TAB-LABEL
+  resolution — never pane existence; relaunch same-pane + correct env;
+  ~3m18s outage vs the 5h silent night). Its first-day misfires
+  (hardened same-day in PR #7) are standing traps: session-file
+  liveness has a BOOT RACE (the file appears up to ~1s after agent
+  registration — absent ≠ dead on a fresh pane; mid-boot,
+  `process-info` argv0 == `pi` is the only reliable signal);
+  `herdr agent wait --until idle` times out rc=1 on an up-but-WORKING
+  agent — poll `pane get` and treat session-exists+busy as up; keys
+  typed into a live booting TUI sit in the buffer and deliver as stray
+  user input ~90 min later; an automated relauncher must NEVER split
+  an identity tab (it split Gru's). Check the tool's own log before
+  blaming the tool — the 08-21 Gru-death kill suspicion was RETIRED
+  by watchman log forensics (zero kill actions, all relaunches).
 
 ### Extensions
 
@@ -852,6 +968,16 @@ the user at the Gru session in `/Users/moses/code`.
   (background-maps ↔ 5.11). Ops: graph keys are NOT `ledger add` keys
   — set via sqlite3 UPDATE post-add; a `ledger queue` DEFERRED READY
   SET line can echo stale after a resume (note-only).
+  Verified at scale 08-19/20: 4/4 held rows released exactly at merge
+  close-outs with fresh heads resolved (6.1→6.2→6.3,
+  ue-architecture-slice-map — the whole PP v2 belt completed through
+  it, zero misfires; the trigger graph is the default belt
+  mechanism). Parked round rows MUST carry the named RESUME TRIGGER +
+  probe cadence — 3/3 parked rounds resumed clean on their triggers;
+  glm's 1308 window freed ~11h EARLY vs the stated reset, so the probe
+  (never the provider's stated time) gates the resume. NEW milestone
+  type: the fun-test gate (user-held — merge ≠ done; the gate is the
+  user's play session; the PP v2 belt is parked on it).
 - **Sensor-doctrine sync (P2, standing rule):** ANY doctrine amendment
   task must grep the sensor/watcher configs (`.pi/extensions/*.ts`) for
   the retired doctrine being amended — the cap-3 echo class lived in

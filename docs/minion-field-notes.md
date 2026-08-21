@@ -302,6 +302,15 @@ findings that keep recurring. One line per entry, dated, with the job id.
   LoadImageFromScreen) + a PROGRAMMATIC pixel-scan (PIL) for overlap
   truth — vision models misjudge absolute coordinates; never eyeball a
   collision claim.
+  2026-08-21 addendum (dream-2026-08-21; packet-plumber-ue-slice-1
+  Perkins r1/r2): EVIDENCE-grade screenshots are claims, not truth — a
+  vision read described a 'mid-traversal' frame whose pixels contained
+  ZERO dot color (a vision hallucination trusted by the minion = the
+  r1 'fabricated evidence' blocker); durable rule: pixel-scan rendered
+  evidence (4 positions × 12 frames) + a COMMITTED mechanical geometry
+  gate with a NEGATIVE CONTROL (verify-capture-geometry.py — the old
+  frame fails it by 37px, re-captured frames pass). Never re-bless
+  evidence on a vision claim alone.
   2026-08-19 addendum (dream-2026-08-19; v2-7.1-visual-juice +
   v2-5.11-terminal-types — ×2): REBUILD `bin/harness` (and any local
   binary) BEFORE bless and AFTER any rebase — a stale build silently
@@ -398,6 +407,15 @@ findings that keep recurring. One line per entry, dated, with the job id.
   IF-BLOCK's end, not the proc's — a silent use-after-free that PASSES
   tests (freed memory not yet reused); `delete()` on a string LITERAL
   aborts — clone first.
+  2026-08-19/21 addendum (dream-2026-08-21; wire-aesthetics badge-out
+  backfill + 6.2-advance-trigger): unused multi-return `X, t, ok := f()`
+  compiles clean (don't chase it as an error); indexing a CONSTANT needs
+  a local copy ('Cannot index a constant'); `#partial switch` for
+  unhandled enum cases; `inc[:]` to pass a dynamic as slice. And a
+  temp-allocated path held across `replay_hashes`' per-tick `free_all`
+  read garbage → `accepted=false` → a VACUOUS 'rejected (OK)' — re-log
+  at the site after frees; treat any 'rejected (OK)' verdict as suspect
+  until re-derived.
 - 2026-08-19 (dream-2026-08-19; v2-5.11-terminal-types +
   v2-6.1-era-definition — 2 jobs, 3 facets): serialized STATE is a
   contract surface — layout/order changes are API changes. Append new
@@ -411,6 +429,81 @@ findings that keep recurring. One line per entry, dated, with the job id.
   dependent test (scratch-instrument, print, re-pin — never guess);
   grep for setups relying on the OLD default (stale lane-only tests
   sat green at E7-floor rates, testing the wrong premise).
+- 2026-08-21 (dream-2026-08-21; packet-plumber-v2-6.3-upgrade-lifecycle +
+  6.2-advance-trigger — 2 jobs): PP fixture traps — (a) MIRROR-FIXTURE
+  rule: a new struct field must land in EVERY fixture builder that
+  constructs the struct (test_catalog's `make_era_row` lacked the decay
+  factor → default 0 → silently zeroed every era-1+ pipe's capacity;
+  the whole suite collapsed) — grep every constructor site when adding
+  a field; (b) a global mechanics change (era-3 decay) silently shifts
+  TUNED fixtures into marginal regimes (attribution chatter) — re-stage
+  engine-mechanic tests on the tier that preserves their staging; at
+  era 3 STANDARD is legacy too; (c) `harness input-parity save` is a
+  SEPARATE verb from `harness save <demo>` — a catalog_hash fold
+  re-bless that skips it fails gate 10 on 'catalog drift' (enumerate
+  the save verbs before any re-bless).
+- 2026-08-20 (dream-2026-08-21; packet-plumber-ue-bootstrap + -slice-1 —
+  the UE repo cluster): ue-mcp bridge ops — `ue-mcp init` is pty-only:
+  deploy via the package's `dist/deploy-cli.js` then REBUILD (a stale
+  editor shows 'Incompatible or missing module'); the bridge port.json
+  goes STALE on editor restarts — rewrite it from
+  `Saved/UE_MCP_Bridge/instances/<pid>.json`; kill old editors by pid
+  (pkill misses them); stale `Binaries/Mac/*.dylib` pile up and the
+  editor loads the HIGHEST version — a full wipe+relink produces an
+  INCOMPATIBLE stamp, so keep at least one old dylib. The editor
+  rewrites DefaultEngine.ini on every boot (AndroidFileServer section)
+  — disable the plugin, don't fight the file. `npx -y ue-mcp <uproject>`
+  boots engine-free (27 tools); a repo-root `.mcp.json` (stdio) is the
+  pi wiring that works.
+- 2026-08-21 (dream-2026-08-21; packet-plumber-ue-slice-1 — Perkins
+  r1/r2 blockers live here): UE widget lifecycle traps — each fails
+  SILENTLY: build a C++-only UUserWidget tree in `RebuildWidget()`
+  (NativeConstruct runs after the Slate widget exists — RootWidget set
+  there renders nothing); the UMG canvas is DPI-SCALED — the widget
+  geometry (e.g. 1896x1081) is the layout truth, NOT the game viewport
+  (1280x730); pre-create widget pools in a layout pass (runtime
+  AddChildToCanvas in NativeTick never paints; every ClearWorld pairs
+  with a pool rebuild); `FSlateRoundedBoxBrush` ImageSize defaults to
+  ZERO (set it explicitly or the brush is invisible); Enhanced Input
+  runtime actions are created in the CONTROLLER CONSTRUCTOR
+  (SetupInputComponent runs before BeginPlay — constructing them
+  elsewhere = dead mouse input, the r1 blocker); test-module headers
+  live in `Public/` with the API macro; qualify `PP::FIntPoint` in
+  engine-side files.
+- 2026-08-20 (dream-2026-08-21; packet-plumber-ue-bootstrap):
+  engine-free verification spine — prove a port BYTE-EXACT against
+  reference vectors BEFORE the engine exists (engine-header-free
+  headers + a standalone test main: spine_check.cpp vs the Odin
+  vectors); engine-gated CI gates SKIP-with-reason, never false-green,
+  with a NAMED LIFT-CONDITION (the r1 exemption lifted at r2 when
+  UE 5.8.1 turned out INSTALLED — real gates ran, 7/7 + the first
+  engine-golden 3-way). Missing heavyweight dependency ≠ blocked
+  verification: isolate the logic, verify what's verifiable, name
+  what isn't.
+- 2026-08-21 (dream-2026-08-21; orchestrator-night-watchman +
+  -hardening — 2 jobs): bmad-build (6.11.0, fresh from the 08-20
+  upstream update 585166c) render FAILS on this install — `ambiguous
+  config token implementation_artifacts` (modules.bmm + modules.gds
+  both define it; the skill's step files consume
+  `{{.implementation_artifacts}}`). No in-repo fix exists (config.toml
+  is installer-managed; a custom override still leaves 2 matches).
+  Sanctioned path (Silas ruling 08-21 06:10Z): skill WAIVED —
+  self-contained briefing + the waiver carried as a canon note in the
+  PR body; avoid naming bmad-build in briefings until upstream
+  dedupes the token.
+- 2026-08-20 (dream-2026-08-21; righttenantry mobile-form-hunt +
+  mobile-layout-1 — 2 jobs): front-end/env traps — (a) debug flex/CSS
+  geometry by walking the ANCESTOR chain in the DOM, never by reading
+  classes (a `min-w-0` on the rail did nothing while its wrapper was a
+  content-sized flex item of an `items-center` column — the fix needed
+  BOTH); `shrink-0` on pills/stops is the root-cause fix for rail
+  truncation (`text-overflow: ellipsis` permanently clips mid-word);
+  (b) agent-browser `eval` returns array-wrapped DOUBLE-encoded JSON
+  (`["<json-string>"]` — parse in a loop, not one json.loads);
+  `set viewport W H 3` gives DPR3; (c) fresh RT worktrees bootstrap
+  only the ROOT `.env` — `server/.env` must be recreated or the server
+  panics 'DATABASE_URL not set' (and `dot_env.load_default()`
+  overrides process env, so env vars alone can't redirect it).
 
 ## Conventions that saved time
 
@@ -470,6 +563,16 @@ findings that keep recurring. One line per entry, dated, with the job id.
   loaded into the catalog but NOT consumed by the flow pass — verify
   per-class transit claims against serve_bundle_lane). Divergence →
   flag the drift IN the deliverable, never silently follow the doc.
+  2026-08-20 addendum (dream-2026-08-21; righttenantry-demo-polish-1/-2
+  + mobile-layout-1): 'real-app twin' comparisons must NAME THE
+  SURFACE — production was 36 commits behind staging and two
+  successive parity verdicts were wrong (component-level parity is
+  blind to a stale deploy; matching the stale prod would have
+  REGRESSED the #615 guarantee) — grep the DEPLOYED bundle: it is the
+  runtime truth. And when a briefing premise claims 'no producer
+  exists', grep BROADER paths (`/server/src/ai/`, not just the named
+  module — `ai_notifications.gleam` outside `notification/` did emit
+  the 'nonexistent' event).
 - 2026-07-31/08-01 (finlit-bugfix-event-messages, tutor-economy-fix):
   root-cause-first — in PR/ledger notes, name the wrong hypothesis
   explicitly and reject it ("int truncation, NOT a 60s timer bug";
@@ -565,6 +668,20 @@ findings that keep recurring. One line per entry, dated, with the job id.
   window silently collapsed on a hand-appended row); window-scoped
   counts must count inside the SURGE WINDOW only (the bound formula's
   W, not the whole run).
+  2026-08-19/21 addendum (dream-2026-08-21; 7.3 r2→r7, 6.2-r2,
+  demo-polish-2-r2, mobile-layout-1 — ≥7 sightings, the #1 Perkins
+  blocker genus): the pin must bite at the WIRING level, not the
+  helper level (7.3-r5: the pin guarded the pure proc; deleting the
+  effect_settings flip passed 16/16) — every fix ships a pin that
+  FAILS when the fix is reverted (briefings now carry the bar
+  verbatim); a `collects` assertion that never asserts is vacuous
+  (6.2-r2 collected the Era_Advanced tick, asserted nothing); a
+  shared-path race closes by KILLING the dependency (pid/atomic/
+  random suffix — macOS returns IDENTICAL nanoseconds back-to-back;
+  7.3's race survived r3→r6 and only r7's ns+crypto-random + ≥5
+  consecutive pristine runs closed it); fix-chains migrate surfaces
+  (a rename fixed in one artifact survived in two others for 2 rounds
+  — grep ALL surfaces, not the reported one).
 - 2026-08-17 (dream-2026-08-17; PP merge train #55–#62 — ×5 jobs):
   merge-train hygiene on a multi-PR base — send the rebase relay
   BEFORE the rework push lands so the fix-audit reviews ONE clean head
