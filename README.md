@@ -38,29 +38,92 @@ redistribution; keep the repo private.)_
 
 ## Architecture at a glance
 
+Two long-lived pi sessions run the show; a launchd guard keeps them
+alive; disposable minions do the work in worktrees. The part people
+get wrong is **who watches whom**, so it comes first:
+
+- **nefario-watch is not a process — it has none.** It is a bundle of
+  sensors living *inside Silas's pi* (gated on `PI_SILAS=1`). It
+  watches minion panes, PRs/reviews/merges, CI, Perkins round triggers,
+  GitHub status, and the provider quota regime — and alerts **Silas
+  only** (Gru's context stays clean). When Silas's pi dies, the sensors
+  die with it, silently — that single-point-of-failure is exactly why
+  the second layer exists.
+- **night-watchman is the opposite layer**: a deliberately dumb shell
+  script under launchd (every 5 min), *outside every pi*. It watches
+  exactly two things — the pi in the `Gru` tab and the pi in the
+  `silas` tab, resolved by tab label and session-file liveness — and on
+  a real death relaunches with the correct env, hands over the startup
+  checklist, and fires a macOS notification. It has no line of sight
+  into nefario or minions; resurrecting Silas is also what re-arms the
+  sensors (his extension re-fires on boot). Resurrection chain, proven
+  live 2026-08-21: pi dies → ≤5 min tick → env-correct relaunch →
+  extension auto-set model + checklist → sensors re-arm → macOS ping.
+
+```mermaid
+flowchart TB
+    USER(("👤 you"))
+
+    subgraph GUARD["🛡️ guardian — launchd, 5-min cadence"]
+        WATCH["night-watchman\nno LLM · log trail"]
+    end
+
+    subgraph ORCH["orchestration — two long-lived pis"]
+        GRU["👑 Gru · CEO — THE USER INTERFACE\nintake · briefings · dispatch decisions"]
+        SILAS["📋 Silas · COO — ALL OPERATIONS\nledger · close-outs · Perkins rounds · dreams"]
+        NEF["👁️ nefario sensors\npanes · PRs · CI · reviews · quota"]
+    end
+
+    subgraph WORK["workforce — disposable"]
+        MINION["⛏️ minions — 1 job · 1 worktree"]
+        LENS["🔬 Perkins lens swarm"]
+        BOB["💤 Bob — dreamer"]
+    end
+
+    LEDGER[("📒 SQLite ledger")]
+    GH["🐙 GitHub"]
+    HERDR["🏗️ herdr\npanes · tabs · worktrees"]
+
+    USER -->|intent & verdicts| GRU
+    GRU -->|reports| USER
+    GRU ==>|dispatch: briefing path| SILAS
+    SILAS -->|escalations| GRU
+    SILAS ---|hosts — dies together| NEF
+
+    NEF -->|ledger-driven alerts| LEDGER
+    NEF -->|merge / review / CI| GH
+    SILAS ==>|owns ALL transitions| LEDGER
+    GRU -.->|boards, read-only| LEDGER
+
+    SILAS ==>|worktree + pane + handover| MINION
+    SILAS ==>|Perkins round dispatch| LENS
+    MINION -->|may spawn| LENS
+    SILAS ==>|dream dispatch| BOB
+    MINION -->|opens PR| GH
+    LENS -->|posts verdict| GH
+    USER -->|merge click| GH
+
+    LAUNCHD["⚙️ launchd"] -->|tick| WATCH
+    WATCH -.->|liveness by tab label| GRU
+    WATCH -.->|liveness by tab label| SILAS
+    WATCH -->|macOS notification| USER
+
+    GRU & SILAS & MINION <-->|"pane run — verify delivery"| HERDR
 ```
- you ──► Gru pi session (cwd = this root)
-         │  .pi/extensions/gru.ts        standing orders + startup checklist
-         │  .pi/extensions/nefario-watch.ts  polls Herdr, wakes Gru on changes
-         │
-         ├──► Herdr  workspaces/tabs/panes + git worktrees
-         │      └──► minion pi sessions (one per job, in a worktree)
-         │             ├── BMAD skills (bmad-quick-dev, Paige, …)
-         │             ├── bin/ledger set …      self-reports status ──┐
-         │             └── gh pr create ──► human reviews & merges   │
-         │                  (opt-in) Perkins reviews the PR first:    │
-         │                  7-lens mega-minion swarm → verdict posted │
-         │                  as perkins-review[bot] → rework / approve │
-         │                                                           ▼
-         └──► _bmad-output/orchestrator.db ◄────────────────── SQLite ledger
-              (jobs + job_events, via bin/ledger)
-```
+
+Every arrow between agents rides `herdr pane run` (typed messages —
+delivery must be verified; a recurring gotcha). The ledger is the
+*durable* brain: job state, trigger graph, and round history survive
+every crash; the pis are replaceable by design.
 
 | Component | Role |
 |---|---|
-| **Gru pi session** | Orchestrator. Runs only in this root; the extensions below are project-local so repo/worktree sessions are unaffected. |
-| **`.pi/extensions/gru.ts`** | Enforces standing orders: injects them into the system prompt every turn, fires the startup checklist, re-grounds after compaction. |
-| **`bin/night-watchman`** | Out-of-pi liveness watchdog (launchd, every 5 min). Checks the `silas` + `Gru` staff panes via herdr agent detection + session-file existence (never pane existence — a dead pi leaves a shell prompt). On a dead pi: logs the trail, relaunches with the correct env, hands over the startup checklist, fires a macOS notification. Quiet passes log one `alive` line. [docs/night-watchman.md](docs/night-watchman.md) |
+| **Gru pi session** | CEO — the user interface. Runs only in this root; owns intake, briefing authorship, dispatch decisions, and escalations. Never touches operations. |
+| **Silas pi session** | COO — all operations: watcher alerts, ledger transitions, dispatch mechanics, close-outs, Perkins rounds, dream dispatches, pane hygiene. Escalates to Gru only what needs the user. |
+| **`.pi/extensions/gru.ts`** | Gru's standing orders: injects them every turn, fires the startup checklist, re-grounds after compaction. Gated on `PI_GRU=1` + cwd. |
+| **`.pi/extensions/silas.ts`** | Silas's standing orders + startup checklist; auto-sets his model (ops tier) on launch. Gated on `PI_SILAS=1`. |
+| **`.pi/extensions/nefario-watch.ts`** | The senses — five sensor bundles (pane watcher, PR watcher, Perkins sensor, GH-status sensor, quota probes). Gated to `PI_SILAS=1`, so all alerts land on Silas. Detects only — Silas owns all ledger transitions. |
+| **`bin/night-watchman`** | The armor — out-of-pi liveness watchdog (launchd, every 5 min). Checks the `silas` + `Gru` staff panes via herdr agent detection + session-file existence (never pane existence — a dead pi leaves a shell prompt). On a dead pi: logs the trail, relaunches with the correct env, hands over the startup checklist, fires a macOS notification. Quiet passes log one `alive` line. [docs/night-watchman.md](docs/night-watchman.md) |
 | **`.pi/extensions/nefario-watch.ts`** | Watcher with five sensors. Every 30s diffs `herdr agent list` against ledger-tracked panes; every 5 min polls `gh` for in-review PRs: merge detection, CI failure sensing, review sensing (approve/changes relay), and the Perkins sensor (dispatches review rounds for `pr_review=1` jobs). Injects a message that wakes Gru. Detects only — Gru owns all ledger transitions. |
 | **Herdr** | Terminal multiplexer + runtime for agents. Provides workspaces/tabs/panes, agent status detection, `herdr wait`, notifications, and git worktree management. |
 | **BMAD skills** | `bmad-*` skills (installer-managed per repo, symlinked into `~/.pi/agent/skills/`). Minions execute with `bmad-quick-dev`; specialist personas (e.g. Paige the tech writer) handle copy/docs. |
@@ -82,12 +145,12 @@ redistribution; keep the repo private.)_
 4. **Work** — minion runs bmad-quick-dev. On every status change it
    self-reports: `bin/ledger set <job-id> <status> "<note>"`.
 5. **Clarify relay** — if it halts with numbered questions, nefario-watch sees
-   the pane go idle and wakes Gru, who pastes the questions to you
-   verbatim and relays your answers back.
+   the pane go idle and wakes Silas, who escalates to Gru, who pastes the
+   questions to you verbatim and relays your answers back.
 6. **Review** — minion pushes, opens a PR, reports `in-review`, fires
    `herdr notification show`. **The Gru never merges.**
 7. **Perkins (opt-in)** — for jobs dispatched with `pr_review=1`, the
-   Perkins sensor wakes Gru, who dispatches a review round: 7 lenses fan
+   Perkins sensor wakes Silas, who dispatches a review round: 7 lenses fan
    out as mega-minions (blind, edge, acceptance, security, architecture,
    codebase, tests), findings are re-verified against the code and
    consolidated, and the verdict posts as a `perkins-review[bot]` GitHub
