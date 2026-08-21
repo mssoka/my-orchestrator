@@ -363,13 +363,13 @@ the user at the Gru session in `/Users/moses/code`.
   continue per errored pane clears it, hold NEW glm dispatches until
   the wave settles, escalate only if continues stop clearing.
   2026-08-19-night supersede (user ruling, playbook 39c9574 +
-  quota-regime `_policy`): **glm-5.3 is the STANDING reasoning
-  primary** — kimi limit reached; reasoning stays glm "until further
-  notice"; NEW reasoning dispatches go glm-FIRST, re-probe k3 at
-  dispatch ONLY if glm errors, and NO proactive k3 flips mid-cycle (the
-  18:03 reflip re-capped within ~1h; k3 cap status is unreliable —
-  treat each probe as fresh truth). Probe-at-dispatch is a dispatch-
-  time gate, NOT a round-long guarantee: k3's cap flapped ~5 min after
+  quota-regime `_policy`): glm-5.3 STANDING — SUPERSEDED 2026-08-21 by
+  the post-#8 single-voice chain: **k3 primary → glm-5.3 fallback →
+  HOLD if both down** (playbook 'Model policy' is canonical; the
+  08-19-night "kimi limit reached" premise was temporary). The
+  probe-at-dispatch + no-proactive-flip discipline STANDS: probe-
+  at-dispatch is a dispatch-time gate, NOT a round-long guarantee:
+  k3's cap flapped ~5 min after
   an OK probe (the fickle-k3 class, ≥5 sightings 08-19/20: 6.2-r2,
   demo-polish-2-r1/r2, 7.3-r2, mobile-layout-1-r1) — round briefings
   on a capped primary PRE-AUTHORIZE the mid-round flip (`/model
@@ -924,16 +924,23 @@ the user at the Gru session in `/Users/moses/code`.
   The sweep fallback executed cold on 08-13 (rc4-4 #609 r1 dispatched
   proactively at 13:50Z: head stable + no round row) — PROVEN; keep
   sweeping at every completion/settle, never trust the sensor alone.
-- **Vision is explicit + local by doctrine (2026-08-18,
-  dream-2026-08-19).** NO silent auto-delegation: vision.json's silent
-  lmstudio fallback ran 15+ invisible delegations in one day under a
-  lying log identity (deleted same day). Vision reads route explicitly
-  to `lmstudio/qwen3.8-27b-mlx@4bit` via `bin/vision-read` (user
-  test-ruled: decisively more accurate; ~2-3.5 min/image — an empty
-  reply mid-reasoning ≠ failure). pi gates image attachment on the
-  model's declared `input` types — any local-model registration in
-  models.json needs `input: ["text","image"]` or the tool silently
-  degrades.
+- **Vision = KYLE, the vision mega-minion (user ruling 2026-08-21;
+  SUPERSEDES the 08-18 local-lmstudio doctrine — qwen3.8-27b@4bit via
+  bin/vision-read is RETIRED; the 08-18 no-silent-auto-delegation lesson
+  stands).** When the active reasoning model is k3 (sees images
+  natively), vision is INLINE — no spawn. Otherwise (glm-5.3 / deepseek
+  are blind) ANY agent (Gru, Silas, minions, Bob) spawns a KYLE
+  mega-minion on `zai-coding-cn/glm-4.6v` (standing vision model,
+  probe-verified; one-line flip to glm-5v-turbo when ZAI trial access
+  lands — 1311 subscription-gated as of 08-21). KYLE gets CODEBASE
+  ACCESS: spawn in the summoning repo/worktree cwd with tools
+  (read/grep/bash); the prompt carries summon-reason + pointers. Two
+  modes: quick-read (headless one-shot, image + question) vs
+  visual-verification (full agent in cwd — reads render code/goldens/
+  tests, answers with evidence). Named for Gru's guard dog — he
+  watches and barks. pi gates image attachment on the model's declared
+  `input` types — models.json registration for vision models needs
+  `input: ["text","image"]`.
 
 ## Orchestration upgrades (user-approved 2026-08-18)
 
