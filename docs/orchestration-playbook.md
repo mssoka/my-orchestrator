@@ -223,28 +223,31 @@ misread key strings). It is REASONING-HEAVY: ~2-4 min/image on this
 Mac at LOW thinking (3 min 28 s measured on a pane screenshot), with
 internal reasoning tokens before
 the answer — NEVER treat an empty/short reply as a failure
-mid-reasoning: wait for the answer. **THE MECHANISM is the `vision-read`
-skill** (`.agents/skills/vision-read/` + `bin/vision-read`): headless
-`pi --print --no-session --no-tools --model <vision-model> @<image> "<prompt>"`
-— pi's `@file` attachment carries the image (auto-resized 2000x2000). No
-mega-minion pane needed. Model swap: `--model <provider/id>`,
-`VISION_MODEL` env, or `--fast` (lmstudio/google/gemma-4-e2b — coarse,
-last resort).
-**Any swap target MUST declare `"input": ["text", "image"]` in its
-`~/.pi/agent/models.json` entry** or pi bounces the attachment (pi gates
-images on the model's declared input types — the 08-18 fix; both qwen
-and gemma entries carry it). **Thinking effort is controlled ONLY by the
-LM Studio per-model UI toggle** (verified 08-18: pi's `--thinking` is not
-transmitted, and the API ignores thinking:false / {type:disabled} /
-reasoning_effort). Keep the UI at **LOW** for routine forensic reads
-(5.5x faster than MAX, identical substance); bump to **medium/xhigh only
-for deep-analysis visual tasks** (layout causality, golden diffs). The
-`describe_image` auto-delegation (vision.json — kimi→lmstudio fallback) is
-REMOVED (08-18: it silently fell back to local models with a lying log
-identity). NO vision deferral: the local model is always up —
-`deferred:vision` verdicts are retired (nothing vision-blocked; the tag
-map no longer routes vision). Models with NO native vision (flash,
-glm-5.3, v4-pro) MUST route image analysis through `vision-read` — never
+mid-reasoning: wait for the answer.
+
+**VISION ROUTING (user ruling 2026-08-21 — supersedes the 08-18 local
+lmstudio doctrine):** the vision mega-minion is named **LEFOU**. (a)
+When the active session model is `kimi-coding/k3`, vision is NATIVE —
+k3 sees images itself; attach the image, no spawn. (b) On any blind
+model (glm-5.3, deepseek flash — no image input), ALL agents (Gru,
+Silas, minions, Bob) route image reads through Lefou. Two spawn modes:
+- **Quick read** ("what does this screenshot show?") — headless
+  one-shot: `env $(env|grep '^PI_'|sed 's/=.*//;s/^/-u /'|tr '\n' ' ')
+  pi --model zai-coding-cn/glm-5v-turbo -p --no-session -nt
+  @<image> "<question>"`. Batch 3–6 frames per summon, do not spam.
+- **Code-context verification / art-direction analysis** — spawn as a
+  full agent with `--cwd <relevant repo/worktree>` (tools armed): Lefou
+  reads the render code, goldens, and tests around the image, and
+  answers WITH file evidence (e.g. a golden-diff verdict naming the
+  draw call and file). The summon prompt ALWAYS carries why-it-was-
+  summoned + pointers.
+Provenance rules: full model path `zai-coding-cn/glm-5v-turbo` always
+pinned; verify through pi (reply must demonstrate it saw the image;
+session jsonl modelId is ground truth) — never trust self-reported ids.
+The models.json entry (if registering locally) MUST declare
+`"input": ["text", "image"]` or pi bounces the attachment. The old
+`describe_image` auto-delegation stays REMOVED (08-18). NO vision
+deferral: models with NO native vision MUST route through Lefou — never
 guess or hallucinate image content.
 
 - **Reasoning — `zai-coding-cn/glm-5.3` STANDING PRIMARY (user ruling
