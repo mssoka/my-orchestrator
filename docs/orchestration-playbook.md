@@ -133,8 +133,9 @@ resolved) — set AUTOMATICALLY by `.pi/extensions/silas.ts` at launch
 (`session_start` -> `pi.setModel`), so no manual `/model` step; it notifies
 if the model is missing from the registry or has no API key (a failed
 auto-set is visible, not silent). The COO's work (watcher triage, ledger,
-dispatches, close-outs) is execution-grade + well-specified. Reasoning tier
-is unchanged (kimi k3 for Gru/Perkins/Bob).
+dispatches, close-outs) is execution-grade + well-specified. The reasoning
+tier (Gru/Perkins/Bob) is k3-primary per 'Model policy' (fallback
+`zai-coding-cn/glm-5.3`; HOLD if both down).
 
 **Silas owns (Gru never touches):**
 
@@ -185,33 +186,51 @@ drops the note).
 
 Two allocations, by ROLE — the orchestrator's reasoning roles vs its
 execution roles. NOT by project (we work on multiple projects: the game,
-RightTenantry, FinLit, etc.).
+RightTenantry, FinLit, etc.). Superseded rulings live in the changelog
+appendix; the body below is the single current truth.
 
-**REASONING TIER — `kimi-coding/k3` (user ruling 2026-08-18 late evening —
-HOLD LIFTED):** the user confirmed kimi k3 back up (probe 22:35:06Z,
-regime file OK) and lifted the evening HOLD REGIME — reasoning resumes
-on `kimi-coding/k3` for ALL future reasoning dispatches (Perkins rounds,
-dreams). Guards armed per the 08-12 lesson (kimi "back" is UNRELIABLE
-mid-cycle — a 403 recurred ~12 min after an apparent recovery):
-probe-first at the FIRST dispatch after a flip; a mid-work 403/1308 ->
-/model <the other of k3/glm> + continue, and if BOTH are down -> PARK
-(resume at the probe flip; NO v4-pro continue — v4-pro is BANNED from
-the reasoning tier, user ruling 2026-08-19 morning, zero duties).
-glm-5.3 is the fallback (its 1308 caps re-arm it after the reset; a
-freed rolling window is NOT headroom — glm lens waves re-cap fast).
-Belt rows stay merge-gated (the user holds merges). (Supersedes: the
-HOLD REGIME block, the 08-18-13:10 full-throttle glm line's v4-pro
-fallback-for-new-dispatches line, and the 08-19 03:35Z
-probe-order/v4-pro-mechanical-only block — v4-pro has ZERO reasoning
-duties.)
-**PROBE ORDER + HOLD (user ruling 2026-08-19 morning — v4-pro BANNED
-from the reasoning tier, too expensive):** reasoning dispatches probe in
-the order `kimi-coding/k3` → `zai-coding-cn/glm-5.3` → **HOLD**. If BOTH
-are down: NO reasoning dispatches; a mid-work round PARKS (the pane
-stays, NO v4-pro continue — resume via probe flip + continue when k3 or
-glm returns). v4-pro has ZERO reasoning duties (not even mechanical
-fix-audits — supersedes the 08-19 03:35Z probe-order/mechanical-only
-block); flash is unchanged for ops/coding.
+**REASONING TIER — `kimi-coding/k3` PRIMARY → `zai-coding-cn/glm-5.3`
+fallback → HOLD (user ruling 2026-08-19 morning — the standing chain,
+7e889ec):** reasoning dispatches probe in the order `kimi-coding/k3` →
+`zai-coding-cn/glm-5.3` → **HOLD**. If BOTH are down: NO reasoning
+dispatches; a mid-work round PARKS (the pane stays; resume via probe
+flip + continue when k3 or glm returns). **`deepseek/deepseek-v4-pro` is
+BANNED from the reasoning tier** (too expensive, user ruling
+2026-08-19) — zero duties, not even mechanical fix-audits;
+**`deepseek/deepseek-v4-flash` is ops/coding ONLY**. Roles on the
+reasoning tier: **Gru** (CEO: persona, relays, escalations, briefing
+authorship), **Perkins** (code review — the last line of defense before
+code ships: correctness + judgment under ambiguity matter most), and
+**Bob** (dream: memory consolidation + lesson curation). Low-volume,
+judgment-heavy roles. Belt rows stay merge-gated (the user holds
+merges).
+
+**PROBE-FIRST at every reasoning dispatch** (`bin/quota-probe` — the
+regime file `_bmad-output/memory/quota-regime.json` is the record):
+probe before routing, AND probe before any switch BACK to k3/glm when
+they recover. The unreliability guard applies — "X is back" is
+UNRELIABLE mid-cycle (a 403 recurred ~12 min after an apparent
+recovery); a freed rolling window is NOT headroom (glm lens waves
+re-cap fast under load); a cap message's stated reset time LIES (glm's
+1308 window freed ~11h early vs the stated reset, 08-20) — only the
+probe decides. A single probe-DOWN row with an empty error can be a
+transient false read — re-probe once before acting on it (probe
+false-reads go BOTH directions).
+
+**LAUNCHED-MODEL RULE — model flips apply to NEW dispatches only:** an
+in-flight job stays on its launched model. A provider WALL mid-round =
+`/model <the other of k3/glm>` + ONE continue (never continue-spam); if
+BOTH are down = PARK the round (resume at the probe flip; NEVER a
+v4-pro continue).
+
+**1302 CONCENTRATION:** with k3 cycle-capped, ALL reasoning rides glm
+and the account 1302-bursts EPISODICALLY (fleet-wide waves) — one
+continue per errored pane clears it, hold NEW glm fan-outs until the
+wave settles, escalate only if continues stop clearing.
+
+**Launch label = the FULL path always** (bare labels misroute — the
+label is `kimi-coding/k3` / `zai-coding-cn/glm-5.3`, never a bare
+`kimi`/`glm`).
 
 **Capability axis — VISION (user ruling 2026-08-18 — supersedes U3 08-17):
 image analysis rides `lmstudio/qwen/qwen3.8-27b`** (local LM Studio — the
@@ -247,55 +266,36 @@ map no longer routes vision). Models with NO native vision (flash,
 glm-5.3, v4-pro) MUST route image analysis through `vision-read` — never
 guess or hallucinate image content.
 
-- **Reasoning — `zai-coding-cn/glm-5.3` STANDING PRIMARY (user ruling
-  2026-08-19 NIGHT: kimi limit reached — reasoning stays on glm-5.3 until
-  further notice; new reasoning dispatches glm-FIRST; re-probe k3 at
-  dispatch ONLY if glm errors; NO proactive k3 flips mid-cycle — the
-  18:03 reflip re-capped within ~1h; recorded on the regime file
-  `_policy` key)**: **Gru** (CEO: persona, relays, escalations,
-  briefing authorship), **Perkins** (code review — the last line of
-  defense before code ships: correctness + judgment under ambiguity
-  matter most), and **Bob** (dream: memory consolidation + lesson
-  curation). Low-volume, judgment-heavy roles. HISTORY: kimi k3
-  (VERIFIED 2026-08-16 — routes end-to-end; fickle mid-cycle: 403
-  recurred within minutes of apparent recoveries) → glm-5.3 (08-17) →
-  v4-pro (08-18 night interim — **RETIRED 08-19: BANNED from reasoning,
-  too expensive**) → k3 primary with glm-5.3 as fallback (08-19) →
-  **glm-5.3 standing primary (08-19 night, kimi limit reached)**.
-  FALLBACKS, in order: `kimi-coding/k3` → **HOLD** (no
-  reasoning dispatch when both are down; a mid-work 403/1308 PARKS the
-  round — pane stays, NO v4-pro continue; resume via probe flip +
-  continue when k3 or glm returns). PROBE-FIRST at every reasoning
-  dispatch (bin/quota-probe — the regime file is the record): probe
-  before routing, AND probe before any switch BACK to k3/glm when they
-  recover (the 08-12/08-16 unreliability guard applies — "X is back" is
-  UNRELIABLE mid-cycle; NEVER continue-spam on a dead provider).
-  Launch label = the FULL path always (bare labels misroute). The
-  launched-model rule: an in-flight job stays on its launched model;
-  a provider WALL mid-round = /model <the other of k3/glm> + continue,
-  and if BOTH are down = PARK (resume at the probe flip).
 
 - **Execution — `deepseek/deepseek-v4-flash`** (user ruling 2026-08-19
   evening: balance restored; the glm-5.3 ops interlude — 08-19 morning
-  through evening, the 402-incident fallback — is RETIRED; note the
-  interlude's glm 1308-cap risk if ops ever rides glm again): **Silas**
-  (COO: ops, relay, coordination, dispatches), **ALL minions** (every
-  coding minion — implementation), and **mega-minions** (well-specified
-  sub-tasks). The fleet workhorse: fast, reliable, always-live. Everything
-  well-specified — implementation, triage, mechanics — rides flash.
+  through evening, the 402-incident fallback — is RETIRED history):
+  **Silas** (COO: ops, relay, coordination, dispatches), **ALL minions**
+  (every coding minion — implementation), and **mega-minions**
+  (well-specified sub-tasks). The fleet workhorse: fast, reliable,
+  always-live. Everything well-specified — implementation, triage,
+  mechanics — rides flash.
+  **The 402 CLASS (2026-08-19):** a deepseek **402 Insufficient Balance**
+  is an ACCOUNT wall (billing, not quota/rate — a user top-up fixes it;
+  waiting does not). Per errored pane: `/model <ops fallback>` +
+  continue, once; the fleet flips back when the balance returns
+  (in-flight panes STAY on their launched model).
 
-The kimi default is the provider default (settings.json `defaultProvider`),
-so UNSET-model dispatches would resolve to kimi — which is why minion and
-mega-minion briefings ALWAYS name `deepseek/deepseek-v4-flash` explicitly
-(the briefing's 'Model policy' field overrides per-job; the dispatch
-`--model` carries it — and Perkins rounds MUST pass
-`pi --model kimi-coding/k3 --thinking max` at launch; a bare `pi` resolves to the
-defaultProvider, which put the 08-19 wire-aesthetics r1 on flash —
-sanctioned post-hoc by the user, but the provenance fix is mandatory).
-Gru / Perkins / Bob launches name `kimi-coding/k3` (fallback:
-`zai-coding-cn/glm-5.3`; HOLD if both down — v4-pro is BANNED from
-reasoning). Silas is pinned to deepseek/deepseek-v4-flash by
-`.pi/extensions/silas.ts` (see 'Silas (COO)').
+
+The provider default is `settings.json` `defaultProvider` = `deepseek`
+(→ v4-flash), so **UNSET-model dispatches land on flash** — which is why
+minion and mega-minion briefings ALWAYS name
+`deepseek/deepseek-v4-flash` explicitly (the briefing's 'Model policy'
+field overrides per-job; the dispatch `--model` carries it — and Perkins
+rounds MUST pass `pi --model kimi-coding/k3 --thinking max` at launch;
+the provenance pin: a bare `pi` put the 08-19 wire-aesthetics r1 on
+flash — sanctioned post-hoc by the user as a one-off, NOT a precedent,
+and the session modelId is verified after every launch). Gru / Perkins /
+Bob launches name `kimi-coding/k3` (fallback: `zai-coding-cn/glm-5.3`;
+HOLD if both down — v4-pro is BANNED from reasoning). Silas is pinned
+to deepseek/deepseek-v4-flash by `.pi/extensions/silas.ts` (see 'Silas
+(COO)').
+
 
 ## Durable state
 
@@ -927,10 +927,16 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
 
 1. Verify: job still `in-review`; PR still OPEN; refresh the head sha
    (`gh pr view <pr> --json state,headRefOid`) — use the freshest sha,
-   not the alerted one.
-2. Round `N` = existing round rows for the job + 1. If N > 3 → escalate
-   to the user instead of dispatching (belt-and-braces; the sensor
-   already enforces the cap).
+   not the alerted one. **Hold on an UNSTABLE target (2026-08-11):** a
+   fix-audit round is HELD while the PR head is still MOVING AND CI is
+   RED (real red only — CI PENDING is NOT red: a fresh round is OK on
+   4/5 pass + 1 pending); the harness verification can't run on a red
+   target. The review sensor re-fires on every new commit while the head
+   moves — those are echoes (note-only), not new work.
+2. Round `N` = existing round rows for the job + 1. Under the
+   loop-until-APPROVED budget there is NO round cap — rounds run until
+   an APPROVED verdict; escalate only on repeated round failures (a
+   crashed/blocked round row needs the user or a same-round retry).
 3. `git -C <repo_root> fetch origin <slug>` then
    `git -C <repo_root> worktree add --detach \
      ~/.herdr/worktrees/<repo>/perkins-<slug>-r<N> <sha>`
@@ -945,21 +951,25 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
    the Odin core) vs what is prototype-rigor (NOT a defect); what NOT to
    re-litigate (user rulings already made, prior-round findings already
    applied); what to flag for verification (e.g. committed binaries, CI
-   pins).
+   pins). On any non-k3 round (glm-5.3 fallback), the briefing ALSO
+   carries the **vision caveat** verbatim: "pixel verification
+   MECHANICAL only (byte/hash/capture-diff); aesthetic verdicts
+   deferred for the k3 re-check; never faked."
 5. Pane into the orchestrator workspace (panes-first rule), label
    `perkins-<slug>-r<N>` — and name the TAB the same
    (`perkins-<slug>-r<N>`; descriptive-label convention, user ruling
-   2026-08-10; never a bare number); launch `cd <worktree> && pi --thinking max` **on `zai-coding-cn/glm-5.3`**
-   (the frontier reviewer — production code with paying users demands the
+
+   2026-08-10; never a bare number); launch `cd <worktree> && pi --thinking max` **on `kimi-coding/k3`**
+   (the reasoning PRIMARY — production code with paying users demands the
+
    BEST review, so Perkins rides the reasoning tier, NOT a cheaper model
-   for quota; user ruling 2026-08-18 late evening — Perkins = `kimi-coding/k3`
-   (the HOLD lift; probe-first at the first dispatch per the 08-12
-   unreliability guard); fallback glm-5.3, HOLD if both down (v4-pro is
-   BANNED from the reasoning tier — zero duties) per the Model policy;
-   launched-model rule
-   applies (a round recovered mid-flight
-   finishes on its recovery model). Pass `--model kimi-coding/k3`
-   at launch or set it in the briefing's Model policy) and hand over:
+   for quota; probe-first at dispatch per the Model policy; fallback
+   glm-5.3, HOLD if both down, v4-pro is BANNED from the reasoning tier
+   — zero duties; launched-model rule applies — a round recovered
+   mid-flight finishes on its recovery model). Pass `--model kimi-coding/k3`
+   at launch or set it in the briefing's Model policy, and after launch
+   VERIFY the session modelId (the provenance pin — the round must ride
+   its launched model). Then hand over:
    "Read the playbook 'Perkins standing orders' and the briefing at
    `<path>`, then begin."
 6. Record the round:
@@ -1018,12 +1028,24 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
   `<lens>.json` output contract + existence check, one retry per failed
   lens, big-diff chunking, the mandatory verification pass, consolidation,
   and writing `consolidated.json`. Its verdict thresholds are yours below.
+  **Lens-spawn rooting (user-approved 2026-08-18):** the headless spawn
+  template pins `--cwd <worktree>` on every lens tab FOREVER — a lens
+  pane whose cwd is not the round worktree is mis-rooted: close +
+  relaunch with `--cwd`.
+  **Empty-lens doctrine (2026-08-18/19):** acceptance/architecture
+  lenses back 3-byte-EMPTY a THIRD straight generation → sweep those
+  lens panes + regenerate (intervene — an empty-lens verdict never
+  ships); a g-wave COMPENSATION verdict (a subset of lenses delivering a
+  valid verdict) counts as valid.
   Visual checks (goldens, sprites): verify MECHANICALLY first
   (byte/hash/capture-diff); when a visual judgment is unavoidable, run the
   `vision-read` skill on `lmstudio/qwen/qwen3.8-27b` — the
   describe_image
   auto-delegation is retired (user ruling 2026-08-18), never trust a
-  text-only model's eye.
+  text-only model's eye. On any non-k3 round, the **vision caveat**
+  applies verbatim: pixel verification MECHANICAL only
+  (byte/hash/capture-diff), aesthetic verdicts deferred for the k3
+  re-check, never faked.
   You MUST close every lens pane before finishing.
 - **Verdict → review event:**
   - 0 blockers → `--approve`
@@ -1049,7 +1071,7 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
      <body.md>`
 - Body format:
   ```
-  ## 🤖 Perkins automated review — round <N> of 3
+  ## 🤖 Perkins automated review — round <N>
   **Job:** <job-id> · **Reviewed sha:** <short> · **Reviewers:** <x>/7 completed
   **Verification:** <confirmed>/<total> findings confirmed against the code — <rejected> discarded as false-positive[, <u> kept as [unverified]]
 
@@ -1058,7 +1080,7 @@ skip-row) mutes a round. (dream-2026-08-07 UA3.)
   **Verdict:** READY TO MERGE | NEEDS CHANGES | MAJOR REWORK NEEDED
 
   _Address findings and push — I re-review automatically on the new sha.
-  After round 3, the human takes over._
+  The loop runs until an APPROVED verdict._
   ```
 - Before posting, re-fetch `headRefOid`. If it moved mid-review, post
   anyway but note "reviewed `<old>`, head now `<new>` — a fresh round
@@ -1088,18 +1110,16 @@ the workspace is crowded (hold the second dispatch and tell the user).
 Model-quota serialization (the kimi/glm 429/1308 hold chains) is LIFTED: dispatch
 rounds as they're needed, no holding behind in-flight rounds for capacity; a 429
 wave gets standard recovery (one continue per pane) and a note, not a hold.
-Pane-capacity judgment stays Silas' (still keep the workspace under the ~20
-safety valve); review-target stability (08-11) still gates — don't dispatch on a
-sha about to be force-pushed away (rebase in flight = wait for the fresh sha).
-
-**User ruling 2026-08-12: FULL THROTTLE on deepseek.** The serialize
-suspension applies to Perkins rounds while the active provider is
-deepseek (the glm-429/1308 cap history does not apply); the pane-capacity
-serialize rule binds only on capped providers. The parallel gate is now
-**file-level DISJOINTNESS**: hold a dispatch when `goldens/` or shared
-modules overlap an in-flight job on the same repo; disjoint-by-file →
-parallel. (2026-08-13: routing-bandwidth-cost held on `goldens/` overlap
-with #36's 19-golden-file change; Jobs B+C verified disjoint → parallel.)
+Pane-capacity judgment stays Silas' — the ~20-pane valve is ADVISORY (user
+ruling 2026-08-19: record valve-pressure as a row note and DISPATCH — the
+valve surfaces pressure, it no longer gates; 21 panes flew clean 08-19).
+The parallel gate is **file-level DISJOINTNESS**: hold a dispatch when
+`goldens/` or shared modules overlap an in-flight job on the same repo;
+disjoint-by-file → parallel. (2026-08-13: routing-bandwidth-cost held on
+`goldens/` overlap with #36's 19-golden-file change; Jobs B+C verified
+disjoint → parallel.) Review-target stability (08-11) still gates —
+don't dispatch on a sha about to be force-pushed away (rebase in flight
+= wait for the fresh sha).
 **FULL THROTTLE chain pattern:** pre-author the downstream briefings,
 pre-stage the held worktree (rebase onto fresh `origin/<base>` at
 release), and pre-create the held ledger row with an explicit release
@@ -1229,8 +1249,11 @@ Two tiers, both policy (Herdr itself enforces no limit):
   per minion** (e.g. the 7-perspective code-review swarm fits in one wave).
   Mega-minion panes do NOT count against the 10-job cap — they are bursty
   and short-lived — but every one must be closed before its minion finishes.
-- **Safety valve:** if total agent panes in the orchestrator workspace
-  exceed ~20, Silas pauses new dispatches and escalates to Gru.
+- **Safety valve (ADVISORY — user ruling 2026-08-19):** total agent panes
+  in the orchestrator workspace near ~20 = record valve-pressure as a row
+  note and DISPATCH — the valve surfaces pressure, it no longer gates;
+  real contention resolves by business priority (RT first over PP, see
+  'Perkins (automated PR review)' → Concurrency), not by a hard pause.
 
 ## Skills availability
 
@@ -1275,3 +1298,36 @@ safe; the flow is manual:
 
 Never hand-edit skill files (clobbered on the next update) — overrides go
 in `_bmad/custom/`.
+
+## Changelog (supersede history)
+
+Dated one-liners for rulings superseded above — the body states CURRENT
+truth; this appendix carries how we got here (absorbed into the U2
+playbook consolidation).
+
+- **2026-08-12** — kimi k3 RETIRED from review/reasoning duty (a96d36b):
+  the reasoning tier moved to `deepseek/deepseek-v4-pro`
+  (Gru/Perkins/Bob); `deepseek-v4-flash` stayed ops/coding.
+- **2026-08-14** — GLM 5.3 released: `zai-coding-cn/glm-5.3` superseded
+  v4-pro as the reasoning primary; v4-pro reduced to interim fallback.
+- **2026-08-16** — kimi k3 verified back up (probe + session jsonl):
+  the reasoning tier returned to `kimi-coding/k3`; fallbacks in order
+  glm-5.3 → v4-pro → flash.
+- **2026-08-18** — HOLD regime (evening: reasoning paused until a
+  glm/k3 probe-flip, 3f21e1e), then HOLD LIFTED the same evening
+  (84a72a9): k3 resumed as the reasoning primary with glm-5.3 fallback.
+- **2026-08-19 (morning)** — **v4-pro BANNED from the reasoning tier**
+  (cost, 7e889ec): the standing chain became `kimi-coding/k3` →
+  `zai-coding-cn/glm-5.3` → HOLD, probe-first at every reasoning
+  dispatch.
+- **2026-08-19** — deepseek **402** (account wall): the ops tier rode
+  glm-5.3 as the 402-incident fallback (af06ff3), restored to
+  `deepseek-v4-flash` the same evening when the balance returned
+  (b2f51d9).
+- **2026-08-19 (night)** — glm-5.3 declared the standing reasoning
+  primary (kimi cycle-cap reached, 39c9574) — superseded by this U2
+  consolidation: the k3 → glm-5.3 → HOLD chain is the single standing
+  truth.
+- **2026-08-20** — launch-envelope pin (bd2e550): `--thinking max` on
+  EVERY agent launch (dispatch + Perkins launch lines) — the global
+  default was unset and pi defaults off.
