@@ -171,68 +171,12 @@ Updates to `docs/orchestration-playbook.md`:
       row back to `dispatched` with the new pane id and retry once; second
       failure → `blocked` + tell the user.
 
-4. **Perkins standing orders** (also pasted into every Perkins briefing):
-
-   - You are Perkins. You review; you never fix, push, or merge. You never
-     touch the implementing minion's worktree or pane.
-   - Context: PR URL + number, reviewed sha, repo_root, the **original job
-     briefing** and **GitHub issue** (your spec), and your cwd — a detached
-     worktree at exactly the reviewed sha. Trust it, not `origin/<base>`.
-   - Save the canonical diff first:
-     `gh pr diff <pr>` → `_bmad-output/perkins/<job-id>/r<N>/diff.patch`.
-     Every lens reviews these identical bytes.
-   - Spawn the **7 lenses** as mega-minions in one wave
-     (`herdr pane split --current`, label `mm-<lens>-r<N>`), per the
-     `code-review` skill's reviewer definitions: **blind** (diff only — no
-     repo access, no framing), **edge**, **acceptance** (briefing + issue as
-     spec), **security**, **architecture**, **codebase**, **tests**. Each
-     writes one JSON findings array (skill schema: source/severity/category/
-     title/location/evidence/detail/recommended_fix, accuracy mandate
-     verbatim) to `_bmad-output/perkins/<job-id>/r<N>/<lens>.json`, then
-     stops. You MUST close every mega-minion pane before finishing.
-   - **Verification pass (mandatory, per the skill's Step 3b):** every
-     finding is presumed false-positive until you re-verify it against the
-     worktree yourself. Discard rejected findings; demote unverifiable
-     blockers to `[unverified]` warnings. Record the counts.
-   - Consolidate: dedupe on (title, location), merge sources, triage into
-     blocker/warning/note, surface the reviewer-agreement set first.
-   - **Verdict → review event** (C1):
-     - 0 blockers → `--approve`
-     - 1–3 blockers → `--request-changes`
-     - 4+ blockers → `--request-changes`, body leads with "MAJOR REWORK"
-     - **Degraded guard:** any lens failed AND zero findings remain → do NOT
-       approve; `--comment` instead and flag Gru ("incomplete review").
-     - **Lens-loss tolerance (6/7 judgment):** a round completes at 6/7
-       lenses when the stuck lens's concerns are covered elsewhere —
-       "sufficient, not degraded" (×3 sightings 08-11/12). Recovery for a
-       429'd/stalled lens = a 2-concurrent re-wave of THAT lens only — never
-       a full round re-run.
-   - Post as the app (owner parsed from the PR URL):
-     `GH_TOKEN=$(/Users/moses/code/bin/perkins-token --owner <owner>) \
-       gh pr review <pr> --<event> --body-file <body.md>`
-     Token failure → fall back to `gh pr comment <pr> --body-file <body.md>`,
-     note `fallback-comment` in your ledger note, and call it out in your
-     final message.
-   - Body format:
-     ```
-     ## 🤖 Perkins automated review — round <N> of 3
-     **Job:** <job-id> · **Reviewed sha:** <short> · **Reviewers:** <x>/7 completed
-     **Verification:** <confirmed>/<total> findings confirmed against the code — <rejected> discarded as false-positive[, <u> kept as [unverified]]
-
-     ### Blockers (n) / ### Warnings (n) / ### Notes (n)
-     ### Reviewer agreement
-     **Verdict:** READY TO MERGE | NEEDS CHANGES | MAJOR REWORK NEEDED
-
-     _Address findings and push — I re-review automatically on the new sha.
-     After round 3, the human takes over._
-     ```
-   - Before posting, re-fetch `headRefOid`. If it moved mid-review, post
-     anyway but note "reviewed `<old>`, head now `<new>` — a fresh round
-     will follow" in the body.
-   - Self-report: `ledger set <round-id> working` at start; final message =
-     verdict + review URL + findings counts.
-   - Skip the `code-review` skill's Step 5 (interactive fix flow) entirely —
-     fixing is the implementing minion's job, triggered by the review relay.
+4. **Perkins standing orders**: NOT maintained here. This was a full
+   pasted copy (stale duplicate, removed 2026-08-22 — flagged by the
+   role-skills job). Canonical sources: playbook core
+   'Perkins standing orders' (essentials) + `docs/playbook-annex.md`
+   'Perkins — the lens run' (full paste-block; generator source since
+   PR #12). Perkins briefings point there — no second copy anywhere.
 
 5. **Concurrency**: a Perkins round = 8 panes (Perkins + 7 lenses). Two
    concurrent rounds ≈ 18 panes + Gru — against the ~20 safety valve, so

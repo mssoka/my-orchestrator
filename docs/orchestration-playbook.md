@@ -278,13 +278,10 @@ escalate only if continues stop clearing.
 **Launch label = the FULL path always** (bare labels misroute — the label
 is `kimi-coding/k3` / `zai-coding-cn/glm-5.3`, never a bare `kimi`/`glm`).
 
-**Capability axis — VISION (user ruling 2026-08-18): image analysis rides
-`lmstudio/qwen/qwen3.8-27b`** (local LM Studio — 4-bit quant, the ONLY
-qwen; always available, no provider quota). Quality-verified 08-18 vs
-gemma-4-e2b: decisively MORE ACCURATE (verbatim UI text, per-node detail,
-pixel positions). REASONING-HEAVY: ~2-4 min/image at LOW thinking, with
-internal reasoning tokens before the answer — NEVER treat an empty/short
-reply as failure mid-reasoning: wait for the answer.
+**Capability axis — VISION:** superseded 2026-08-21 by the KYLE
+routing below (single voice). The 08-18 local-lmstudio doctrine it
+replaced is archived in `docs/playbook-annex.md` ('Vision
+provenance').
 
 **VISION ROUTING (user ruling 2026-08-21 — supersedes the 08-18 local
 lmstudio doctrine):** the vision mega-minion is named **KYLE**. (a)
