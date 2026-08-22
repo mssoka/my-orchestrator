@@ -104,6 +104,14 @@ class FakePi {
 			// dreamCheck: BASELINE — never alerts in tests, never touches disk.
 			return { code: 0, stdout: "BASELINE\n", stderr: "" };
 		}
+		if (cmd === "curl") {
+			// githubstatus sensor: baseline — no incidents, never alerts in tests.
+			return {
+				code: 0,
+				stdout: JSON.stringify({ status: { description: "All Systems Operational" }, incidents: [] }),
+				stderr: "",
+			};
+		}
 		throw new Error("unexpected exec: " + cmd + " " + args.join(" "));
 	}
 
