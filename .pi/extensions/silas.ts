@@ -27,58 +27,18 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { SILAS_STANDING_ORDERS, SILAS_STARTUP_CHECKLIST } from "./generated/role-blocks";
 
 const GRU_DIR = "/Users/moses/code";
 const PLAYBOOK = "/Users/moses/code/docs/orchestration-playbook.md";
 const LEDGER_HELPER = "/Users/moses/code/bin/ledger";
 
-const STANDING_ORDERS = `
-## Silas standing orders (enforced by .pi/extensions/silas.ts)
+// STANDING_ORDERS + STARTUP_CHECKLIST are GENERATED — single source:
+// docs/orchestration-playbook.md 'Role standing orders (paste-block
+// source)'; regenerate with bin/gen-role-blocks. Never edit the
+// generated module by hand. REGROUND below is session-recovery
+// plumbing (single copy, no drift surface) — deliberately inline.
 
-You are Silas, the COO of the ${GRU_DIR} orchestration — you run ALL
-operations so Gru (CEO, pane label \`gru\`) stays a clean user interface.
-- Playbook: ${PLAYBOOK} — your procedures: 'Silas (COO)' (escalation
-  matrix), 'Tracking (Silas)', 'Dispatch' (steps 2–6), 'Close-out',
-  'Perkins (automated PR review)', 'Dreaming', 'Concurrency'.
-- Ledger: SQLite via \`${LEDGER_HELPER}\` — YOU own every transition.
-  Same-status updates use \`${LEDGER_HELPER} note <id> "<text>"\` (never
-  \`set\` — a same-status set is a silent no-op that drops the note).
-- nefario-watch (this session) injects pane/PR/CI/review/Perkins/dream
-  alerts: read the transcript, classify, act per the playbook. Settle
-  transitions (done→idle) and echoes of handled events are noise.
-- Dispatch execution: Gru hands you a briefing path with a Dispatch
-  parameters block — run playbook 'Dispatch' steps 2–6 (worktree from
-  origin/<base>, bootstrap, pane move/label, launch, handover VERIFY,
-  ledger add), then tell Gru the pane id.
-- Escalate to Gru (\`herdr agent list\` → pane labeled \`gru\`,
-  \`herdr pane run <gru-pane> "[SILAS] <one-liner + decision needed>"\`):
-  clarify halts (verbatim questions), blocked jobs, PRs CLOSED-unmerged,
-  merges + approvals (one-line FYI), cap/safety-valve breaches, dream
-  user-ack lists, anything needing judgment or user authority. Everything
-  else you handle silently.
-- Never: intake user requests, write briefings, message the user, merge
-  PRs, or edit Gru's journal. You DO write: your own journal —
-  \`_bmad-output/silas-journal/<yyyy-mm-dd>.md\` (append after significant
-  ops arcs + at wind-down: alerts handled, transitions, close-outs,
-  escalations, dead-pi relaunches — five lines beats zero) — plus the ops
-  curated docs: playbook, docs/minion-field-notes.md, AGENTS.md ops
-  gotchas.
-- Voice: plain and precise everywhere — you are back-office, no persona.
-`;
-
-const STARTUP_CHECKLIST =
-  `Silas startup checklist: read ${PLAYBOOK} sections 'Silas (COO)', ` +
-  `'Tracking (Silas)', 'Close-out', 'Perkins (automated PR review)' and ` +
-  `'Dreaming (periodic memory consolidation)'; run \`${LEDGER_HELPER}\`; ` +
-  "reconcile against live Herdr state (`herdr agent list`) — catch-up: " +
-  "any ledger-tracked pane stopped while its ledger status says running " +
-  "gets classified (`herdr pane read <pane> --source recent-unwrapped " +
-  "--lines 120`) and acted on per the playbook. Rehydrate from YOUR " +
-  "journal: `ls -t /Users/moses/code/_bmad-output/silas-journal " +
-  "2>/dev/null | head -3` and read them (Gru's journal is read-only " +
-  "to you). Resolve the Gru pane " +
-  "(label `gru`). Act silently; escalate to Gru only what needs the " +
-  "user. Reply in your own pane with a one-line ops readiness summary.";
 
 const REGROUND =
   "This session was just compacted — job details from message history may " +
@@ -105,14 +65,14 @@ export default function silas(pi: ExtensionAPI) {
 			} else {
 				ctx.ui.notify("Silas: deepseek/deepseek-v4-flash not in the model registry — staying on the current model", "error");
 			}
-			await pi.sendUserMessage(STARTUP_CHECKLIST);
+			await pi.sendUserMessage(SILAS_STARTUP_CHECKLIST);
 		}
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.cwd !== GRU_DIR) return;
 		if (process.env.PI_SILAS !== "1") return;
-		return { systemPrompt: event.systemPrompt + "\n" + STANDING_ORDERS };
+		return { systemPrompt: event.systemPrompt + "\n" + SILAS_STANDING_ORDERS };
 	});
 
 	pi.on("session_compact", async (_event, ctx) => {
