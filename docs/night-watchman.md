@@ -34,7 +34,9 @@ relaunch rather than boot a wrong-tier Gru.
 
 1. **No kill path.** The watchman never signals agent processes — the
    only `kill` in the script is `kill -0` (the lockfile liveness probe).
-   `--self-test` asserts this statically. Kill tests are human-run.
+   `--self-test` asserts this statically (any `kill` that is not
+   `kill -0`, and any `pane close`/`pane kill`, fails the assertion).
+   Kill tests are human-run.
 2. **Never creates or splits panes.** It types only into the pane already
    inside the identity tab. Identity tab missing, or holding ≠1 pane
    (a stray split) → macOS notification + STOP. It never guesses which
@@ -49,6 +51,21 @@ relaunch rather than boot a wrong-tier Gru.
    `_bmad-output/.night-watchman.state/`) — a pi mid-startup-checklist is
    *pending*, not failed. Escalation only after 3 ticks/15 min (handover
    sent) or 6 ticks/30 min (marker-only, deferred because the pi was busy).
+   A herdr flake during the ready-wait reads UNKNOWN and is treated as
+   *up* (handover deferred) — never as a failed relaunch (the 09:18
+   agent-wait false-failure class).
+5. **Absolute binary resolution (launchd PATH fix).** Every external
+   invocation runs through resolved absolute paths — `herdr`/`jq`/
+   `osascript` in the watchman, `pi` inside `bin/quota-probe`. Resolution
+   chain: plist `EnvironmentVariables` (`PI_BIN`/`HERDR_BIN`/`JQ_BIN`) →
+   fnm well-known paths (`~/.local/share/fnm/aliases/default/bin`, then
+   `node-versions/*/installation/bin` newest-first) → `command -v`.
+   `herdr`+`jq` unresolvable = startup FATAL + self-test FAIL (loud).
+   A broken probe tool is logged + notified as **TOOL-BROKEN**, never
+   misread as providers DOWN (the 23:38Z class: bare `pi` died under
+   launchd PATH, the gate saw "ALL reasoning models DOWN", a real Gru
+   death went unrelaunched). Startup logs the resolved paths once per
+   configuration change.
 
 ## On a confirmed death
 
@@ -85,6 +102,7 @@ launchd's stdout/stderr — the script writes timestamped lines):
 2026-08-21T06:21:10Z   verified: session=... (env marker + handover landed)
 2026-08-21T10:25:36Z   classified BOOTING after grace — boot-race guard: no keystrokes   ← mid-boot, no action
 2026-08-21T10:30:35Z warn identity-tab label=Gru holds 2 panes — skipping (never guess)  ← anomaly, notify+stop
+2026-08-21T23:59:00Z paths: herdr=... jq=/usr/bin/jq osascript=/usr/bin/osascript probe=... pi=...  ← once per config change
 ```
 
 The `last-modified` line is the kill-cause trail — a session file whose
@@ -104,6 +122,11 @@ launchctl kickstart gui/$(id -u)/com.moses.code.night-watchman   # force one run
 launchctl list | grep night-watchman
 ```
 
+The plist carries `PI_BIN` (absolute pi path — the launchd PATH fix).
+When updating the script WITHOUT reinstalling the plist, the fnm-path
+fallback inside the script resolves `pi` anyway — a script-only deploy
+is safe (the loaded plist's env simply stays PI_BIN-less).
+
 Manual run (same logic, no launchd):
 
 ```bash
@@ -112,6 +135,54 @@ bin/night-watchman --self-test   # deps + env mirror + safety assertions +
                                  #   model-gate unit tests + live resolution
 bin/night-watchman --dry-run     # one pass, never types (probe gate skipped)
 ```
+
+**Binary resolution & the launchd PATH fix (2026-08-21 23:38Z exposure).**
+The watchman and `bin/quota-probe` resolve every external binary through
+absolute paths so launchd's minimal PATH can never break them:
+`PI_BIN`/`HERDR_BIN`/`JQ_BIN` (plist `EnvironmentVariables`) → fnm
+well-known paths → `command -v`. The plist ships `PI_BIN` pointing at
+`~/.local/share/fnm/aliases/default/bin/pi`; the fnm fallback covers an
+installed plist that predates it, so a script-only update is safe.
+`bin/quota-probe --paths` prints the probe's resolution (used by
+`--self-test` and the startup log); an unresolvable `pi` exits 2 and
+writes NO regime entry — a PATH error is never a provider verdict.
+The launchd verification recipe (prove the fix under a REAL launchd
+context, without touching the live service):
+
+```bash
+# throwaway LaunchAgent running the probe under launchd's env
+cat >/tmp/nw-probe-test.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.moses.test.nwprobe</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>BIN/quota-probe</string>
+    <string>kimi-coding/k3</string>
+  </array>
+  <key>StandardOutPath</key><string>/tmp/nw-probe-launchd.out</string>
+  <key>StandardErrorPath</key><string>/tmp/nw-probe-launchd.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>ProcessType</key><string>Background</string>
+</dict></plist>
+EOF
+launchctl bootstrap gui/$(id -u) /tmp/nw-probe-test.plist
+launchctl kickstart gui/$(id -u)/com.moses.test.nwprobe
+sleep 70   # probe timeout is 60s
+cat /tmp/nw-probe-launchd.out   # must be a provider verdict ("OK/DOWN <model>"),
+                                # NEVER "env: pi: No such file or directory"
+launchctl bootout gui/$(id -u)/com.moses.test.nwprobe
+```
+
+The same trick runs `bin/night-watchman --self-test` under launchd
+(set `NIGHT_WATCHMAN_LOG`/`NIGHT_WATCHMAN_STATE_DIR` to /tmp paths in the
+job's env) — the whole dependency + safety + resolution surface proven
+in a launchd-spawned context.
 
 ## Simulating the incident classes (sandbox recipe)
 
@@ -122,24 +193,28 @@ The watchman is deliberately testable against a scratch tab — the real
 ```bash
 # scratch tab + a sacrificial pane
 herdr tab create --label watchman-sandbox --workspace w1T
-T='watchman-sandbox|test|cd <worktree> &&|Read the playbook section test standing orders and run your startup checklist|Read the playbook section|ops'
+T='watchman-sandbox|test|cd /tmp/nw-sandbox &&|Read the playbook section test standing orders and run your startup checklist|run your startup checklist|ops'
+
+# isolated log/state/lock keep sandbox runs out of the live service's
+# files (and the lock); NIGHT_WATCHMAN_NOTIFY=0 silences notifications.
+S='NIGHT_WATCHMAN_LOG=/tmp/nw-test.log NIGHT_WATCHMAN_STATE_DIR=/tmp/nw-test.state NIGHT_WATCHMAN_LOCK_DIR=/tmp/nw-test.lock NIGHT_WATCHMAN_NOTIFY=0'
 
 # (a) boot-race: start a pass while a pi boot lands mid-grace →
 #     "classified BOOTING after grace — boot-race guard: no keystrokes"
-NIGHT_WATCHMAN_TARGETS="$T" bin/night-watchman --once &   # pass in bg
-herdr pane run <pane> "cd <worktree> && pi"               # boot lands mid-grace
+NIGHT_WATCHMAN_TARGETS="$T" env $S bin/night-watchman --once &   # pass in bg
+herdr pane run <pane> "cd /tmp/nw-sandbox && pi"               # boot lands mid-grace
 
 # (b) real death: kill the sacrificial pi, then one pass →
 #     DEATH trail → relaunch into the SAME pane (no split) → ready → verified
-NIGHT_WATCHMAN_TARGETS="$T" bin/night-watchman --once
+NIGHT_WATCHMAN_TARGETS="$T" env $S bin/night-watchman --once
 
 # (c) live-agent no-op: pane has a live pi → single "alive test" line,
 #     identical pid + session (zero keystrokes)
-NIGHT_WATCHMAN_TARGETS="$T" bin/night-watchman --once
+NIGHT_WATCHMAN_TARGETS="$T" env $S bin/night-watchman --once
 
 # (d) identity tab missing → warn + notify + no pane created
 NIGHT_WATCHMAN_TARGETS='no-such-tab|ghost|env -u PI_GRU PI_SILAS=1|h|m|ops' \
-  bin/night-watchman --once
+  env $S bin/night-watchman --once
 
 # (d2) stray split: herdr pane split <pane> → pass warns "holds 2 panes",
 #      notifies, and types nothing
@@ -147,7 +222,9 @@ NIGHT_WATCHMAN_TARGETS='no-such-tab|ghost|env -u PI_GRU PI_SILAS=1|h|m|ops' \
 
 For the model gate: `NIGHT_WATCHMAN_PROBE=<stub>` overrides the probe tool
 (`--self-test` uses an internal stub; a live run against the real
-`bin/quota-probe` shows today's pin decision, e.g. k3 403 → glm-5.3).
+`bin/quota-probe` shows today's pin decision, e.g. k3 403 → glm-5.3). A
+reasoning-tier test target (`...|reasoning`) + stub pin verifies the
+relaunch command carries `--model <k3|glm-5.3> --thinking max`.
 
 ## Disable
 
@@ -177,3 +254,8 @@ rm ~/Library/LaunchAgents/com.moses.code.night-watchman.plist
   08-21).
 - **Kill tests remain human-run** — the watchman has no kill path by
   design (asserted in `--self-test`).
+- **Launchd PATH fix verified under a real launchd context** (throwaway
+  LaunchAgent + kickstart, 08-22): the probe prints a provider verdict
+  under launchd's minimal PATH with and without `PI_BIN`; the self-test
+  passes in a launchd-spawned env; the live service was never
+  interrupted (isolated log/state/lock for all sandbox runs).
