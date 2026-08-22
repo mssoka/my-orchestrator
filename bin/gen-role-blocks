@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""gen-role-blocks — generate .pi/extensions/generated/role-blocks.ts from the
+playbook's paste-block sections.
+
+Single-source-of-truth mechanism (orchestrator-role-skills, 2026-08-22):
+the per-role standing-orders + startup-checklist texts consumed by the Gru
+and Silas extensions are hand-maintained in the playbook core
+(docs/orchestration-playbook.md, section 'Role standing orders (paste-block
+source)') and GENERATED from there — never hand-edited in the .ts.
+
+CONDENSATION MAPPING (deterministic, the only mapping in this design):
+the marked playbook blocks ARE the condensed blocks (they mirror the
+doctrine sections they condense — kept in sync at review); this generator
+copies them VERBATIM, applies the constant table below, and emits a TS
+module. The emitted strings are JSON-encoded (double-quoted, escaped) —
+backticks, ${...}, quotes and backslashes inside the text are inert by
+construction (the 2026-08-01 template-literal ParseError class cannot
+recur: no template literal is emitted).
+
+EXTRACTION CONVENTION (documented in the playbook section too):
+  - a block is everything between its `<!-- paste-block:NAME -->` line
+    and its `<!-- /paste-block:NAME -->` line;
+  - exactly ONE trailing newline is stripped from the captured text;
+  - a blank line right after the start marker yields a LEADING newline
+    in the emitted string; a blank line right before the end marker
+    yields a TRAILING newline (the standing-orders blocks have both;
+    the checklists have neither).
+
+Usage:
+  bin/gen-role-blocks            # regenerate the .ts in place
+  bin/gen-role-blocks --check    # drift check: exit 0 if the .ts is current
+  bin/gen-role-blocks --playbook <path> --out <path>   # overrides (tests)
+"""
+
+import json
+import os
+import re
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# --- Constant table ---------------------------------------------------------
+# Values MUST match the same constants at the top of .pi/extensions/gru.ts
+# and .pi/extensions/silas.ts (which keep their own copies for runtime use).
+# ${TOKEN} placeholders inside the marked blocks are replaced with these.
+CONSTANTS = {
+    "GRU_DIR": "/Users/moses/code",
+    "PLAYBOOK": "/Users/moses/code/docs/orchestration-playbook.md",
+    "LEDGER_HELPER": "/Users/moses/code/bin/ledger",
+    "SKILLS_DIR": "/Users/moses/code/.agents/skills",
+}
+
+# --- Block map: playbook marker name -> emitted export name -----------------
+BLOCKS = [
+    ("gru", "GRU_STANDING_ORDERS"),
+    ("gru-startup", "GRU_STARTUP_CHECKLIST"),
+    ("silas", "SILAS_STANDING_ORDERS"),
+    ("silas-startup", "SILAS_STARTUP_CHECKLIST"),
+]
+
+DEFAULT_PLAYBOOK = os.path.join(REPO_ROOT, "docs", "orchestration-playbook.md")
+DEFAULT_OUT = os.path.join(REPO_ROOT, ".pi", "extensions", "generated", "role-blocks.ts")
+
+MARKER_RE = re.compile(
+    r"^<!-- paste-block:([a-z0-9-]+) -->\n([\s\S]*?)^<!-- /paste-block:\1 -->\n?",
+    re.MULTILINE,
+)
+
+
+def extract_block(playbook_text, name):
+    """Capture the marked block verbatim; strip exactly one trailing newline."""
+    start = f"<!-- paste-block:{name} -->"
+    end = f"<!-- /paste-block:{name} -->"
+    starts = playbook_text.count(start)
+    ends = playbook_text.count(end)
+    if starts != 1 or ends != 1:
+        raise SystemExit(
+            f"gen-role-blocks: block '{name}' markers must appear exactly once "
+            f"(start x{starts}, end x{ends}) — playbook section drift."
+        )
+    idx = playbook_text.index(start) + len(start)
+    end_idx = playbook_text.index(end, idx)
+    captured = playbook_text[idx:end_idx]
+    # captured begins with the start marker's own line break
+    if not captured.startswith("\n"):
+        raise SystemExit(
+            f"gen-role-blocks: block '{name}' must start on its own line."
+        )
+    captured = captured[1:]
+    if not captured.endswith("\n"):
+        raise SystemExit(
+            f"gen-role-blocks: block '{name}' must end on its own line "
+            "(end marker on its own line)."
+        )
+    return captured[:-1]  # strip exactly one trailing newline
+
+
+def substitute(text):
+    for token, value in CONSTANTS.items():
+        text = text.replace("${" + token + "}", value)
+    leftover = re.search(r"\$\{", text)
+    if leftover:
+        raise SystemExit(
+            f"gen-role-blocks: unknown placeholder {leftover.group(0)!r} at "
+            f"offset {leftover.start()} — add it to CONSTANTS or fix the block."
+        )
+    return text
+
+
+def render_module(playbook_text):
+    out = []
+    out.append("// GENERATED FILE — DO NOT EDIT BY HAND.")
+    out.append("//")
+    out.append("// Source of truth: docs/orchestration-playbook.md, section")
+    out.append("// 'Role standing orders (paste-block source)' (the marked")
+    out.append("// `<!-- paste-block:... -->` blocks). Regenerate with:")
+    out.append("//")
+    out.append("//     bin/gen-role-blocks")
+    out.append("//")
+    out.append("// Drift check (exit code 0 = in sync):")
+    out.append("//")
+    out.append("//     bin/gen-role-blocks --check")
+    out.append("//")
+    out.append("// Strings are JSON-encoded (double-quoted, escaped) — backticks,")
+    out.append("// ${...}, quotes and backslashes in the text are inert; no")
+    out.append("// template literal is emitted, so unescaped-backtick load")
+    out.append("// failures (the 2026-08-01 ParseError class) cannot recur.")
+    out.append("")
+    for marker_name, export_name in BLOCKS:
+        text = substitute(extract_block(playbook_text, marker_name))
+        out.append(f"export const {export_name} = {json.dumps(text, ensure_ascii=False)};")
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def main():
+    args = sys.argv[1:]
+    check = "--check" in args
+    args = [a for a in args if a != "--check"]
+
+    playbook_path = DEFAULT_PLAYBOOK
+    out_path = DEFAULT_OUT
+    if "--playbook" in args:
+        i = args.index("--playbook")
+        playbook_path = args[i + 1]
+        del args[i : i + 2]
+    if "--out" in args:
+        i = args.index("--out")
+        out_path = args[i + 1]
+        del args[i : i + 2]
+    if args:
+        raise SystemExit(f"gen-role-blocks: unknown arguments: {' '.join(args)}")
+
+    playbook_text = open(playbook_path, encoding="utf-8").read()
+    rendered = render_module(playbook_text)
+
+    if check:
+        if os.path.exists(out_path):
+            current = open(out_path, encoding="utf-8").read()
+        else:
+            current = None
+        if current == rendered:
+            print(f"gen-role-blocks: OK — {os.path.relpath(out_path, REPO_ROOT)} is in sync.")
+            return 0
+        print(f"gen-role-blocks: DRIFT — {os.path.relpath(out_path, REPO_ROOT)} is stale.", file=sys.stderr)
+        print("  run: bin/gen-role-blocks  (then commit the regenerated file)", file=sys.stderr)
+        return 1
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(rendered)
+    print(f"gen-role-blocks: wrote {os.path.relpath(out_path, REPO_ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
