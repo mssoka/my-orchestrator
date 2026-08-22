@@ -1,12 +1,25 @@
 ---
 name: vision-read
-description: Read an image with the local vision model (lmstudio/qwen/qwen3.8-27b — the 4-bit qwen via LM Studio) — headless pi with an @file attachment, no mega-minion needed. Use when you need to know what an image shows (screenshots of panes, UI states, game screens, diagrams) and the current model has no vision, or for any image the user asks you to look at.
+description: Read an image with the KYLE vision model (zai-coding-cn/glm-4.6v — headless pi with an @file attachment, no mega-minion needed) for quick-reads, or spawn a KYLE visual-verification mega-minion for evidence-grade checks. Use when you need to know what an image shows (screenshots of panes, UI states, game screens, diagrams) and the current model has no vision, or for any image the user asks you to look at.
 ---
 
-# vision-read — local image reading (headless, no mega-minion)
+# vision-read — KYLE vision (quick-read + visual-verification)
 
-Reads an image by calling pi directly with the local vision model. No pane,
-no mega-minion — one command, stdout answer.
+KYLE doctrine (2026-08-21 user ruling; the AGENTS.md 'Vision = KYLE' block is
+canon): vision is EXPLICIT — never faked, never delegated to a blind text
+model. Two modes:
+
+- **quick-read** — THIS skill's headless tool (`bin/vision-read`): one
+  command, stdout answer. No pane, no mega-minion.
+- **visual-verification** — a full **KYLE mega-minion** spawned in the
+  summoning repo/worktree cwd with tools (read/grep/bash); it reads the
+  render code / goldens / tests and answers with evidence. Use when a
+  visual claim is evidence-grade (golden diffs, render captures, layout or
+  geometry truth) — a blind quick-read is not enough.
+
+When the active reasoning model is k3 (sees images natively), vision is
+INLINE — no spawn, read the image directly. Otherwise (glm-5.3 / deepseek
+are blind) route through this skill.
 
 ## When to use
 
@@ -16,34 +29,35 @@ no mega-minion — one command, stdout answer.
   lacks vision; use this skill instead).
 - Any forensic image read where the content matters (verbatim text, layout,
   errors, unusual states).
+- Evidence-grade visual verification (goldens, captures, geometry) → Mode 2.
 - Do NOT use for: generating images, image editing, or vision the user
   explicitly wants on another model.
 
-## How
+## Mode 1 — quick-read (headless tool)
 
 ```bash
-# default (lmstudio/qwen/qwen3.8-27b — the 4-bit; the only qwen, accurate, slow)
+# default (zai-coding-cn/glm-4.6v — KYLE, standing)
 /Users/moses/code/bin/vision-read "/absolute/path/to/image.png" "optional prompt"
 
-# fast but coarse (gemma-4-e2b — last-resort fallback only)
+# explicit model for one call
+/Users/moses/code/bin/vision-read --model zai-coding-cn/glm-4.6v "/path.png"
+
+# LOCAL last resort only (lmstudio/google/gemma-4-e2b — coarse, misreads verbatim text)
 /Users/moses/code/bin/vision-read --fast "/absolute/path/to/image.png"
 
-# explicit model for one call
-/Users/moses/code/bin/vision-read --model lmstudio/qwen/qwen3.8-27b "/path.png"
-
 # swap the model for a whole session without touching any file
-VISION_MODEL=lmstudio/google/gemma-4-e2b /Users/moses/code/bin/vision-read "/path.png"
+VISION_MODEL=zai-coding-cn/glm-5v-turbo /Users/moses/code/bin/vision-read "/path.png"
 ```
 
 ### Swapping the model
 
-Resolution order (first match wins): **`VISION_MODEL` env var → `--model` flag → `--fast` → default qwen**. To make a model the permanent default, edit the `MODEL="..."` default line in `bin/vision-read` (or export `VISION_MODEL` in the shell profile). **Any swap target must declare image input** — add `"input": ["text", "image"]` to its entry in `~/.pi/agent/models.json` or pi bounces the attachment (see Troubleshooting).
+Resolution order (first match wins): **`VISION_MODEL` env var → `--model` flag → `--fast` → default glm-4.6v**. To make a model the permanent default, edit the `MODEL="..."` default line in `bin/vision-read` (or export `VISION_MODEL` in the shell profile). **One-line flip target: `zai-coding-cn/glm-5v-turbo`** when ZAI trial access lands (1311 subscription-gated as of 2026-08-21; it declares image input too). **Any swap target must declare image input** — add `"input": ["text", "image"]` to its entry in the models registry (`~/.pi/agent/models.json` overrides / `models-store.json` catalog) or pi bounces the attachment (see Troubleshooting).
 
 The wrapper runs (env-cleared, so no PI_* overrides):
 
 ```bash
 pi --print --no-session --no-tools \
-  --model lmstudio/qwen/qwen3.8-27b \
+  --model zai-coding-cn/glm-4.6v \
   "@/absolute/path/to/image.png" "<prompt>"
 ```
 
@@ -52,58 +66,86 @@ pi --print --no-session --no-tools \
 - `--no-tools` keeps it a pure read (no tool-call detours).
 - The image path must be absolute or relative to the caller's cwd.
 
-## Model + patience (doctrine 2026-08-18)
+## Mode 2 — visual-verification (KYLE mega-minion)
 
-- **Default: `lmstudio/qwen/qwen3.8-27b`** — the 4-bit quant, and the ONLY
-  qwen in LM Studio (the 8-bit was deleted 2026-08-18). The accuracy pick
-  (user ruling: more accurate wins — decisively beat gemma on the 08-18
-  quality test: verbatim overlay text, node enumeration, honest flagging of
-  garbled overlaps). Measured ~3.5 min/image on a pane screenshot at LOW
-  thinking.
-- **`--fast`: `lmstudio/google/gemma-4-e2b`** — ~15s/image but coarse and
-  MISREADS verbatim text (missed overlays, hallucinated percentages). Last
-  resort only. (Its models.json entry declares image input too.)
-- qwen is a **reasoning model**: expect **2-4+ minutes per image** at
-  LOW thinking. An empty or partial reply mid-reasoning is NOT a failure —
-  the answer lands when the reasoning block closes. Callers MUST use a
-  generous bash timeout (600s+).
-- **Thinking effort — controlled ONLY by the LM Studio per-model UI toggle
-  (verified 2026-08-18):** pi's `--thinking` flag is NOT transmitted to LM
-  Studio (the request body carries no thinking param), and the API ignores
-  `thinking: false` / `thinking: {type: disabled}` / `reasoning_effort`
-  (reasoning tokens still fire — measured 12-20 on a trivial probe). So:
-  keep the UI toggle at **LOW** for routine forensic reads (measured 5.5x
-  faster than MAX with identical substance; residual glyph misreads on
-  narrow/wrapped regions are caught by a verification pass); set it to
-  **medium/xhigh only for deep-analysis tasks** (layout causality, golden
-  diff judgment). `VISION_THINKING` env remains a passthrough for providers
-  that accept per-request thinking.
-- **max_completion_tokens:** pi sent 16384 for this provider (not the 60000
-  the doctrine once assumed). Long reasoning can truncate — for deep
-  analysis consider raising the model's maxTokens in models.json.
+Spawn KYLE as a full mega-minion when the visual claim needs evidence:
+
+- **Spawn cwd = the summoning repo/worktree** (codebase access: read/grep/
+  bash on the real render code, goldens, tests). Never a bare cwd.
+- **Model pinned: `zai-coding-cn/glm-4.6v`** (probe first — see below).
+- **Prompt carries summon-reason + pointers**: what to verify, which files
+  render the artifact, where goldens/tests live, what evidence to produce
+  (pixel scans, hashes, diff output) — never "look at this and tell me".
+- **Image attached via @file** (absolute path).
+- Pane naming: `<job-slug>-kyle` in a descriptive tab; close the pane when
+  done.
+
+Prompt skeleton:
+
+```
+You are KYLE, the vision mega-minion. Summon reason: <what must be proven>.
+Image: @<absolute path to capture/png>
+Verify against the codebase in this cwd: <render path>, <golden paths>, <test
+paths>. Answer with EVIDENCE (pixel scans, byte/hash diffs, geometry checks),
+not vibes. Never describe what the image "probably" shows — if the pixels
+don't prove it, say so.
+```
+
+## Probe-first rule
+
+Before ANY vision call on glm-4.6v (quick-read or KYLE spawn), probe the
+model with an env-cleared pi one-liner:
+
+```bash
+env $(env | grep '^PI_' | sed 's/=.*//;s/^/-u /' | tr '\n' ' ') \
+  pi --model zai-coding-cn/glm-4.6v -p --no-session -nt "Reply OK"
+# expect: OK
+```
+
+If 4.6v is DOWN: **stop and escalate** — never proceed on a blind model.
+A text model cannot substitute for vision; reporting a description you
+cannot verify is fabrication. (Same for the `--fast` local fallback: if
+both are down, report "vision unavailable".)
+
+## Model + patience (doctrine 2026-08-21)
+
+- **Default: `zai-coding-cn/glm-4.6v`** — KYLE, the standing vision model
+  (probe-verified; input `["text","image"]` declared). The 08-18
+  local-lmstudio doctrine (qwen3.8-27b@4bit) is RETIRED — qwen is gone
+  from this skill and the tool's default path.
+- **`--fast`: `lmstudio/google/gemma-4-e2b`** — LOCAL last resort (~15s/
+  image but coarse and MISREADS verbatim text: missed overlays,
+  hallucinated percentages). Never default.
+- glm-4.6v is a **reasoning model**: expect **up to a few minutes per
+  image**. An empty or partial reply mid-reasoning is NOT a failure — the
+  answer lands when the reasoning block closes. Callers MUST use a generous
+  bash timeout (600s+).
+- **Thinking effort:** `VISION_THINKING` env passthrough (default low) —
+  routine forensic reads are perception, not reasoning.
 - If the read must be async, run it with nohup into a log and poll the log.
 
 ## Troubleshooting
 
 - **"Current model does not support images"** on the read tool — the ACTIVE
   model lacks vision; route through this skill's headless call instead.
-- **Image bounces even on qwen** — check `~/.pi/agent/models.json`: the
+- **Image bounces even on glm-4.6v** — check the models registry
+  (`~/.pi/agent/models.json` override / `models-store.json` catalog): the
   model entry must declare `"input": ["text", "image"]` (pi gates image
-  attachment on the model's declared input types; the 08-18 fix added it to
-  both qwen entries). The `contextWindow` for qwen is 65000; `max_tokens`
-  60000.
-- **Empty stdout for minutes** — qwen is reasoning; wait. Check the LM Studio
-  API is serving (`curl -s localhost:1234/v1/models`) if it never returns.
-- **Vision must never be faked** — if qwen is down and gemma also fails,
-  report "vision unavailable" rather than describing the image from
-  assumptions. Local vision is always available in this setup (LM Studio).
+  attachment on the model's declared input types).
+- **Empty stdout for minutes** — glm-4.6v is reasoning; wait. If it never
+  returns, re-probe (the model may have gone down mid-flight).
+- **Vision must never be faked** — model down or probe failing → report
+  "vision unavailable" / escalate rather than describing the image from
+  assumptions.
 
 ## Ledger/ops notes
 
 - This is the explicit-vision path replacing the old describe_image
   auto-delegation (removed 2026-08-18: it lied about its identity and
-  silently delegated to text models). Vision is EXPLICIT — an agent asks for
-  it when needed; it is never auto-injected.
-- Perkins lens runs use this mechanism when a lens needs to verify a visual
-  claim (T2 goldens, sprite bboxes) — the lens pane calls `vision-read` on
-  the artifact and quotes the result as evidence.
+  silently delegated to text models). Vision is EXPLICIT — an agent asks
+  for it when needed; it is never auto-injected.
+- Perkins lens runs use quick-read (Mode 1) when a lens needs to verify a
+  visual claim (T2 goldens, sprite bboxes) — the lens pane calls
+  `vision-read` on the artifact and quotes the result as evidence.
+  Evidence-grade verification (render geometry, golden diffs) goes to KYLE
+  (Mode 2).
