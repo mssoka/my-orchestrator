@@ -38,6 +38,15 @@
 #    relaunch — a wrong-tier Gru is worse than a notified gap.
 # 5. Handover verification retries ACROSS TICKS (state file) before
 #    flagging — a pi mid-startup-checklist is not a failure.
+# 6. ABSOLUTE BINARY RESOLUTION (launchd PATH fix, hardening round 2):
+#    every external invocation runs through resolved absolute paths
+#    (herdr/jq/osascript here; `pi` inside bin/quota-probe) — chain:
+#    plist EnvironmentVariables (PI_BIN/HERDR_BIN/JQ_BIN) → fnm
+#    well-known paths → `command -v`. herdr+jq unresolvable = startup
+#    FATAL + self-test FAIL. A BROKEN probe tool is logged + notified
+#    as TOOL-BROKEN, never misread as providers DOWN (the 23:38Z
+#    exposure: bare `pi` died under launchd PATH, the gate saw "ALL
+#    reasoning models DOWN", a real Gru death went unrelaunched).
 #
 # On a confirmed death: logs the trail (timestamp, pane, last session
 # file + its mtime), relaunches via the dispatch chain (sleep 10 →
@@ -53,6 +62,11 @@
 # NIGHT_WATCHMAN_PROBE     path to the quota-probe tool (default
 #                          $ROOT/bin/quota-probe); a stub script lets
 #                          tests force the model-pin decisions.
+# NIGHT_WATCHMAN_LOG / NIGHT_WATCHMAN_STATE_DIR / NIGHT_WATCHMAN_LOCK_DIR
+#                          isolate log/state/lock for sandbox runs
+#                          (defaults = the live _bmad-output paths).
+# NIGHT_WATCHMAN_NOTIFY    set to 0 to suppress macOS notifications
+#                          (sandbox tests; live default 1 = preserved).
 #
 # Usage:
 #   night-watchman               loop forever: pass + sleep 300s
@@ -68,9 +82,9 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_DIR="$ROOT/_bmad-output"
-LOG="$LOG_DIR/watchman.log"
-LOCK_DIR="$LOG_DIR/.night-watchman.lock"
-STATE_DIR="$LOG_DIR/.night-watchman.state"
+LOG="${NIGHT_WATCHMAN_LOG:-$LOG_DIR/watchman.log}"
+LOCK_DIR="${NIGHT_WATCHMAN_LOCK_DIR:-$LOG_DIR/.night-watchman.lock}"
+STATE_DIR="${NIGHT_WATCHMAN_STATE_DIR:-$LOG_DIR/.night-watchman.state}"
 
 INTERVAL=300
 MODE="loop"
@@ -104,8 +118,78 @@ else
   TARGETS=("${DEFAULT_TARGETS[@]}")
 fi
 
+# ── binary resolution (launchd-safe absolute paths) ─────────────────────
+# launchd's minimal PATH cannot resolve `pi` (an fnm-global binary) and
+# may one day miss herdr/jq. Live exposure 2026-08-21 23:38Z: the quota
+# probe died `env: pi: No such file or directory` and the Gru model gate
+# misread it as ALL reasoning providers DOWN — a real Gru death went
+# unrelaunched (Silas relaunched manually). Resolution chain:
+#   plist EnvironmentVariables (PI_BIN/HERDR_BIN/JQ_BIN) → fnm well-known
+#   paths (~/.local/share/fnm/aliases/default/bin — current node — then
+#   node-versions/*/installation/bin, newest first) → `command -v`.
+# herdr + jq are load-bearing: unresolvable = startup FATAL + self-test
+# FAIL. `pi` resolves here too and is EXPORTED so bin/quota-probe
+# inherits it even when the loaded plist predates PI_BIN.
+
+resolve_bin() { # $1=name $2=preferred-abs (may be empty)
+  local name="$1" pref="$2" p sortcmd
+  if [ -n "$pref" ] && [ -x "$pref" ]; then printf '%s\n' "$pref"; return 0; fi
+  if [ -x "$HOME/.local/share/fnm/aliases/default/bin/$name" ]; then
+    printf '%s\n' "$HOME/.local/share/fnm/aliases/default/bin/$name"
+    return 0
+  fi
+  # version globs expand alphabetically (v16 before v22) — newest first.
+  if printf 'a\nb\n' | sort -Vr >/dev/null 2>&1; then sortcmd="sort -Vr"; else sortcmd="sort -r"; fi
+  for p in $(printf '%s\n' "$HOME"/.local/share/fnm/node-versions/*/installation/bin/"$name" 2>/dev/null | $sortcmd); do
+    [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+  done
+  command -v "$name" 2>/dev/null || return 1
+}
+
+HERDR_BIN="$(resolve_bin herdr "${HERDR_BIN:-}" || true)"
+JQ_BIN="$(resolve_bin jq "${JQ_BIN:-}" || true)"
+OSASCRIPT_BIN="$(resolve_bin osascript "${OSASCRIPT_BIN:-}" || true)"
+PI_BIN="$(resolve_bin pi "${PI_BIN:-}" || true)"
+[ -n "$PI_BIN" ] && export PI_BIN
+
+# absolute-binary wrappers — call sites keep their plain names.
+herdr() { command "$HERDR_BIN" "$@"; }
+jq() { command "$JQ_BIN" "$@"; }
+osascript() { command "$OSASCRIPT_BIN" "$@"; }
+
+require_bins() { # herdr+jq are load-bearing — fail loudly, never run blind
+  local missing=""
+  [ -n "$HERDR_BIN" ] || missing="$missing herdr"
+  [ -n "$JQ_BIN" ] || missing="$missing jq"
+  if [ -n "$missing" ]; then
+    log "FATAL unresolvable binaries:$missing (set HERDR_BIN/JQ_BIN or fix PATH) — exiting"
+    echo "night-watchman: FATAL unresolvable binaries:$missing" >&2
+    return 1
+  fi
+  return 0
+}
+
+# log_paths_once: resolved-path heartbeat — logged once per configuration
+# change (state-deduped) so clean ticks stay one line.
+log_paths_once() {
+  local sig pi_line
+  if [ -n "$PROBE" ]; then
+    pi_line="$("$PROBE" --paths 2>/dev/null | grep '^pi=' | head -1 || true)"
+  else
+    pi_line="pi=n/a (probe tool missing)"
+  fi
+  [ -n "$pi_line" ] || pi_line="pi=UNRESOLVED (probe could not resolve)"
+  sig="$HERDR_BIN|$JQ_BIN|$OSASCRIPT_BIN|$PROBE|$pi_line"
+  [ "$(state_read paths)" = "$sig" ] && return 0
+  log "paths: herdr=$HERDR_BIN jq=$JQ_BIN osascript=$OSASCRIPT_BIN probe=$PROBE $pi_line"
+  state_write paths "$sig"
+}
+
 usage() {
-  sed -n '2,110p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # the leading comment block only — never spill into code lines.
+  local end
+  end="$(awk 'NR > 1 && !/^#/ { print NR - 1; exit }' "${BASH_SOURCE[0]}")"
+  sed -n "2,${end}p" "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -116,6 +200,7 @@ notify() { # $1 = body
   osascript -e "display notification \"$body\" with title \"Night watchman\"" >/dev/null 2>&1 || true
 }
 notify_once() { # $1=key $2=body — at most one notification per 30 min per key
+  [ "${NIGHT_WATCHMAN_NOTIFY:-1}" = "0" ] && return 0   # sandbox-test hook
   local f="$STATE_DIR/notify-$1" now age
   now="$(date +%s)"
   age=$(( now - $(stat -f '%m' "$f" 2>/dev/null || echo 0) ))
@@ -228,16 +313,23 @@ confirm_death() { # $1=pane_id
 # ── model gate (Gru relaunch) ───────────────────────────────────────────
 
 probe_ok() { # $1=model → 0 if the provider/model probes OK through pi
-  local out
+  local out rc
   if [ -z "$PROBE" ]; then
     log "  probe tool missing (NIGHT_WATCHMAN_PROBE unset, $ROOT/bin/quota-probe absent)"
     return 1
   fi
-  out="$("$PROBE" "$1" 2>&1 | tail -1)"
-  case "$out" in
+  out="$("$PROBE" "$1" 2>&1)"
+  rc=$?
+  if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qE 'No such file or directory|unresolvable'; then
+    # the 23:38Z class: a BROKEN probe tool is NOT a provider verdict.
+    log "  probe tool BROKEN (rc=$rc, binary resolution failed — NOT a provider verdict): $(printf '%s' "$out" | tail -1 | cut -c1-120)"
+    notify_once "probe-broken" "quota-probe cannot resolve its binaries (PI_BIN/fnm) — Gru relaunch gate is DOWN; manual intervention needed"
+    return 1
+  fi
+  case "$(printf '%s\n' "$out" | tail -1)" in
     "OK "*|"OK") return 0 ;;
   esac
-  log "  probe $1 DOWN: ${out:-<no output>}"
+  log "  probe $1 DOWN: $(printf '%s' "$out" | tail -1 | cut -c1-120)"
   return 1
 }
 
@@ -284,7 +376,10 @@ wait_for_ready() { # $1=pane_id
     i=$((i + 1))
   done
   case "$(fresh_pane_state "$1")" in
-    ALIVE|BOOTING) echo up ;;
+    ALIVE|BOOTING|UNKNOWN) echo up ;;   # UNKNOWN = herdr flake, NOT dead —
+                                        # defer the handover, cross-tick
+                                        # verification decides (the 09:18
+                                        # agent-wait false-failure class)
     *) echo down ;;
   esac
 }
@@ -578,15 +673,24 @@ self_test() {
   local rc=0 rec label key launch_env handover marker tier tab pane st dep bad
 
   echo "night-watchman self-test"
-  echo "--- dependencies"
-  for dep in herdr jq osascript; do
-    if command -v "$dep" >/dev/null 2>&1; then
-      echo "  $dep: $(command -v "$dep")"
+  echo "--- dependencies (resolved absolute paths — FAIL LOUDLY if missing)"
+  printf '  herdr: %s\n' "${HERDR_BIN:-MISSING}"
+  printf '  jq: %s\n' "${JQ_BIN:-MISSING}"
+  printf '  osascript: %s\n' "${OSASCRIPT_BIN:-MISSING}"
+  [ -n "$HERDR_BIN" ] || { echo "  FAIL: herdr unresolvable (set HERDR_BIN or fix PATH)"; rc=1; }
+  [ -n "$JQ_BIN" ] || { echo "  FAIL: jq unresolvable (set JQ_BIN or fix PATH)"; rc=1; }
+  if [ -n "$PROBE" ]; then
+    if out="$("$PROBE" --paths 2>&1)"; then
+      echo "  probe: $PROBE"
+      printf '    %s\n' "$out"
     else
-      echo "  $dep: MISSING"
+      echo "  FAIL: probe tool binary resolution:"
+      printf '    %s\n' "$out" | head -3
       rc=1
     fi
-  done
+  else
+    echo "  probe: MISSING (NIGHT_WATCHMAN_PROBE unset, $ROOT/bin/quota-probe absent)"
+  fi
 
   echo "--- env mirror (relaunch envs per target)"
   for rec in "${TARGETS[@]}"; do
@@ -598,24 +702,24 @@ self_test() {
   [ "$(printf '%s' "${TARGETS[1]}" | cut -d'|' -f3)" = "env -u PI_SILAS PI_GRU=1" ] \
     || { echo "  FAIL: gru env mirror wrong"; rc=1; }
 
-  echo "--- NO KILL PATH assertion (only 'kill -0' lock probes allowed)"
-  bad="$(grep -nE 'kill[ ]+-[1-9]|kill[ ]+-SIG|pkil[l]|killa[l]l' "$0" || true)"
+  echo "--- NO KILL PATH assertion (kill allowed only as the 'kill -0' lock probe)"
+  bad="$(grep -nE '\bkill\b' "$0" | grep -vE '\bkill[ ]+-0\b' || true)"
   if [ -n "$bad" ]; then
-    echo "  FAIL: kill code found:"
+    echo "  FAIL: signal-sending code found:"
     echo "$bad"
     rc=1
   else
     echo "  PASS: no kill path (only the 'kill -0' lock probe)"
   fi
 
-  echo "--- NO CREATE / NO SPLIT assertion (identity-tab pane only)"
-  bad="$(grep -nE 'pane[ ]split|tab[ ]create|pane[ ]create|worktree[ ]create' "$0" || true)"
+  echo "--- NO CREATE / NO SPLIT / NO CLOSE assertion (identity-tab pane only)"
+  bad="$(grep -nE 'pane[ ]split|tab[ ]create|pane[ ]create|worktree[ ]create|pane[ ](close|kil[l])|tab[ ]close' "$0" || true)"
   if [ -n "$bad" ]; then
-    echo "  FAIL: pane-creating code found:"
+    echo "  FAIL: pane-creating/closing code found:"
     echo "$bad"
     rc=1
   else
-    echo "  PASS: no pane/tab/worktree creation calls"
+    echo "  PASS: no pane/tab/worktree creation or close calls"
   fi
 
   echo "--- model gate (reasoning tier pin; NEVER v4-pro / flash)"
@@ -728,6 +832,7 @@ main() {
   done
 
   mkdir -p "$LOG_DIR" || { echo "cannot create $LOG_DIR" >&2; exit 1; }
+  require_bins || exit 1
 
   case "$MODE" in
     launch-test)
@@ -744,6 +849,7 @@ main() {
       exit $?
       ;;
     once)
+      log_paths_once
       if acquire_lock; then
         run_pass
         release_lock
@@ -752,6 +858,7 @@ main() {
       exit 0
       ;;
     loop)
+      log_paths_once
       if ! acquire_lock; then
         exit 0
       fi

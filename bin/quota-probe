@@ -10,15 +10,66 @@
 #                                             deferred:<tag> ledger row; used by the
 #                                             nefario-watch hourly tick to surface
 #                                             LIFTED deferred verdicts)
+#   bin/quota-probe --paths                   resolution report (pi=<abs>, timeout=<abs|none>);
+#                                             used by the night-watchman self-test + startup
+#                                             log. Exits 2 when pi is unresolvable.
 # Writes: _bmad-output/memory/quota-regime.json  { provider, model, ok, error, ts }
 # Prints: OK <model> | DOWN <model> (<first-40 chars of the error>) per model.
 
 OUT=/Users/moses/code/_bmad-output/memory/quota-regime.json
 mkdir -p "$(dirname "$OUT")"
 
+# ── binary resolution (launchd-safe) ─────────────────────────────────────
+# The probe runs under launchd's minimal PATH (plist:
+# /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin) where
+# `pi` — an fnm-global binary — is NOT resolvable. Live exposure
+# 2026-08-21 23:38Z: the probe died with `env: pi: No such file or
+# directory` BEFORE reaching the provider and the night-watchman's gate
+# misread that as ALL reasoning providers DOWN (real Gru death → no
+# auto-relaunch; Silas relaunched manually). Resolution chain:
+#   $PI_BIN (plist EnvironmentVariables) → fnm well-known paths
+#   (~/.local/share/fnm/aliases/default/bin — the current node — then
+#   node-versions/*/installation/bin, newest version first) → `command -v`
+#   (interactive shells keep working unchanged).
+# An unresolvable pi is a HARD failure (exit 2, NO regime write) — a
+# PATH error must never be recorded as a provider verdict.
+
+resolve_bin() { # $1=name $2=preferred-abs (may be empty)
+  local name="$1" pref="$2" p sortcmd
+  if [ -n "$pref" ] && [ -x "$pref" ]; then printf '%s\n' "$pref"; return 0; fi
+  if [ -x "$HOME/.local/share/fnm/aliases/default/bin/$name" ]; then
+    printf '%s\n' "$HOME/.local/share/fnm/aliases/default/bin/$name"
+    return 0
+  fi
+  # version globs expand alphabetically (v16 before v22) — newest first.
+  if printf 'a\nb\n' | sort -Vr >/dev/null 2>&1; then sortcmd="sort -Vr"; else sortcmd="sort -r"; fi
+  for p in $(printf '%s\n' "$HOME"/.local/share/fnm/node-versions/*/installation/bin/"$name" 2>/dev/null | $sortcmd); do
+    [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+  done
+  command -v "$name" 2>/dev/null || return 1
+}
+
+PI_BIN="${PI_BIN:-}"
+PI_BIN="$(resolve_bin pi "$PI_BIN" || true)"
+[ -n "$PI_BIN" ] && export PI_BIN
+TIMEOUT_BIN="${TIMEOUT_BIN:-}"
+TIMEOUT_BIN="$(resolve_bin timeout "$TIMEOUT_BIN" || true)"
+
+if [ -z "$PI_BIN" ]; then
+  echo "quota-probe: FATAL — pi binary unresolvable (set PI_BIN or check the fnm install); no provider verdict, no regime write" >&2
+  exit 2
+fi
+
 MODELS=("$@")
 if [ ${#MODELS[@]} -eq 0 ]; then
   MODELS=(kimi-coding/k3)
+fi
+
+if [ "${MODELS[0]}" = "--paths" ]; then
+  # launchd-friendly resolution report (night-watchman self-test + startup log).
+  echo "pi=$PI_BIN"
+  echo "timeout=${TIMEOUT_BIN:-none}"
+  exit 0
 fi
 
 if [ "${MODELS[0]}" = "--deferred" ]; then
@@ -58,7 +109,12 @@ for MODEL in "${MODELS[@]}"; do
     echo "bad model arg: $MODEL (flag-like args are rejected; use --deferred or a provider/model path)" >&2
     exit 2
   fi
-  RESP=$(cd /tmp && timeout 60 env $(env|grep '^PI_'|sed 's/=.*//;s/^/-u /'|tr '\n' ' ') pi --model "$MODEL" -p --no-session -nt "Reply OK" 2>&1 | tail -2)
+  UNSET_ENV="$(env | grep '^PI_' | sed 's/=.*//;s/^/-u /' | tr '\n' ' ')"
+  if [ -n "$TIMEOUT_BIN" ]; then
+    RESP=$(cd /tmp && "$TIMEOUT_BIN" 60 env $UNSET_ENV "$PI_BIN" --model "$MODEL" -p --no-session -nt "Reply OK" 2>&1 | tail -2)
+  else
+    RESP=$(cd /tmp && env $UNSET_ENV "$PI_BIN" --model "$MODEL" -p --no-session -nt "Reply OK" 2>&1 | tail -2)
+  fi
 
   if echo "$RESP" | grep -q "^OK$"; then
     STATUS=ok; ERR=""
