@@ -87,6 +87,22 @@
  * silently baselined to now. An in-memory copy of the marker mtime
  * suppresses per-tick re-alerts while a dispatch is pending; it re-arms
  * when the marker changes. Detection-only, same contract as above.
+ *
+ * Round-debris sensor (same 5-min tick): Perkins rounds SELF-CLOSE (row →
+ * done, pane → gone) without sweeping their lens panes + worktree — the
+ * close-out sweep only fires at merge close-outs/startup, so dead rounds
+ * accumulate between them (recurring class; 2026-08-23: 18 panes + 11
+ * worktrees from DONE/superseded rounds sat ~a day). Alerts once per
+ * DONE round row whose worktree dir still exists (registered worktree OR
+ * orphan husk — the lens-agent `.unblock-marker`/`.cwd-keep` class) and
+ * once per ORPHAN lens pane (cwd points at a REMOVED worktree with no
+ * live round using it). Safety invariants (the 08-17 lessons, ×2 burns):
+ * only DONE round rows are checked (in-flight rounds' lenses are
+ * legitimately open — never flagged); matching is cwd-EXACT against the
+ * round's OWN worktree path — never id-proximity, never tab labels.
+ * Detection-only, same contract as above: the injected message tells
+ * Silas to verify (row done + review posted) and sweep — this sensor
+ * never closes panes and never removes directories.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -293,6 +309,11 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 	/** Dream: marker mtime (epoch secs, string) already alerted for.
 	 * Re-arms when the marker changes or the pass is no longer due. */
 	let dreamAlertedMarker: string | null = null;
+	/** Round-debris sensor: round row id (or `pane:<pane_id>` for orphan
+	 * lens panes) already alerted for — one alert until RESOLVED (worktree
+	 * dir gone / orphan pane closed), then re-armed. In-memory only (like
+	 * ciAlerted); a cold Silas re-alerts once at the startup digest. */
+	const roundDebrisAlerted = new Map<string, boolean>();
 
 	/** Dream sensor: returns an alert string when a dream pass is due,
 	 * null otherwise. Silently baselines the marker on first sighting. */
@@ -330,6 +351,174 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			"(`_bmad-output/memory/last-dream`) is written on dream COMPLETION, " +
 			"never at dispatch."
 		);
+	}
+
+	interface RoundRow {
+		id: string;
+		worktree: string | null;
+		repo_root: string | null;
+	}
+
+	/** Derive the repo root for a perkins worktree path
+	 * (`~/.herdr/worktrees/<repo>/<slug>`) when the row's repo_root is null. */
+	function repoRootFor(wt: string, rowRepoRoot: string | null): string {
+		if (rowRepoRoot) return rowRepoRoot;
+		const parts = wt.split("/");
+		// ["", "Users", "moses", ".herdr", "worktrees", "<repo>", "<slug>"]
+		return `${GRU_DIR}/${parts[5] ?? ""}`;
+	}
+
+	/** Round-debris sensor: done Perkins round rows whose worktree dir still
+	 * exists (registered OR orphan husk) and/or whose lens panes were left
+	 * open; plus orphan lens panes (cwd points at a REMOVED worktree with no
+	 * live round using it). Detection-only — NEVER closes panes or removes
+	 * dirs (the 08-17 id-proximity/label burns: matching is cwd-EXACT
+	 * against the round's own worktree path, and only DONE rounds qualify).
+	 * Returns alert strings; empty when clean. */
+	async function roundDebrisCheck(): Promise<string[]> {
+		const alerts: string[] = [];
+		const rowsQ = await pi.exec(
+			"sqlite3",
+			[
+				"-json",
+				DB,
+				"SELECT id, worktree, repo_root FROM jobs WHERE id LIKE '%-perkins-r%' AND status = 'done' AND worktree IS NOT NULL AND worktree != ''",
+			],
+			{ timeout: 5000 },
+		);
+		if (rowsQ.code !== 0 || !rowsQ.stdout.trim()) return alerts;
+		let rows: RoundRow[] = [];
+		try {
+			rows = JSON.parse(rowsQ.stdout) as RoundRow[];
+		} catch {
+			return alerts;
+		}
+		// Live round worktree paths — EXEMPT: an in-flight round's lenses are
+		// legitimately open and its worktree must not be touched.
+		const liveQ = await pi.exec(
+			"sqlite3",
+			[
+				"-json",
+				DB,
+				"SELECT DISTINCT worktree FROM jobs WHERE id LIKE '%-perkins-r%' AND status != 'done' AND worktree IS NOT NULL AND worktree != ''",
+			],
+			{ timeout: 5000 },
+		);
+		const livePaths = new Set<string>();
+		if (liveQ.code === 0 && liveQ.stdout.trim()) {
+			try {
+				for (const r of JSON.parse(liveQ.stdout) as { worktree: string }[]) {
+					livePaths.add(r.worktree);
+				}
+			} catch {
+				// unreadable — treat as no live rounds this tick
+			}
+		}
+		// herdr agents: pane_id -> cwd (only panes under a perkins worktree
+		// path matter for this sensor).
+		const agents = await pi.exec("herdr", ["agent", "list"], { timeout: 8000 });
+		const perkinsPanes = new Map<string, string>();
+		if (agents.code === 0) {
+			try {
+				for (const a of JSON.parse(agents.stdout)?.result?.agents ?? []) {
+					if (
+						typeof a?.pane_id === "string" &&
+						typeof a?.cwd === "string" &&
+						a.cwd.includes("/perkins-")
+					)
+						perkinsPanes.set(a.pane_id, a.cwd);
+				}
+			} catch {
+				// herdr output changed shape — skip pane checks this tick
+			}
+		}
+		// Existence of every path of interest in ONE bash call.
+		const allPaths = new Set<string>();
+		for (const r of rows) if (r.worktree) allPaths.add(r.worktree);
+		for (const c of perkinsPanes.values()) allPaths.add(c);
+		const exists = new Map<string, boolean>();
+		if (allPaths.size > 0) {
+			const script =
+				`for p in ${[...allPaths].map((p) => JSON.stringify(p)).join(" ")}; do ` +
+				`[ -d "$p" ] && echo "1 $p" || echo "0 $p"; done`;
+			const ex = await pi.exec("bash", ["-c", script], { timeout: 8000 });
+			for (const line of ex.stdout.split("\n")) {
+				const m = /^([01]) (.*)$/.exec(line.trim());
+				if (m) exists.set(m[2], m[1] === "1");
+			}
+		}
+		// Registered worktree paths per repo (cached for this tick).
+		const registries = new Map<string, Set<string>>();
+		async function registeredPaths(repoRoot: string): Promise<Set<string>> {
+			const hit = registries.get(repoRoot);
+			if (hit) return hit;
+			const s = new Set<string>();
+			const g = await pi.exec(
+				"git",
+				["-C", repoRoot, "worktree", "list", "--porcelain"],
+				{ timeout: 8000 },
+			);
+			if (g.code === 0) {
+				for (const line of g.stdout.split("\n")) {
+					const m = /^worktree (\S+)/.exec(line.trim());
+					if (m) s.add(m[1]);
+				}
+			}
+			registries.set(repoRoot, s);
+			return s;
+		}
+		// 1) Done round rows whose worktree dir still exists.
+		for (const row of rows) {
+			const wt = row.worktree;
+			if (!wt) continue;
+			if (!exists.get(wt)) {
+				roundDebrisAlerted.delete(row.id); // resolved — re-arm
+				continue;
+			}
+			if (roundDebrisAlerted.get(row.id)) continue; // one alert until resolved
+			const repoRoot = repoRootFor(wt, row.repo_root);
+			const registered = await registeredPaths(repoRoot);
+			const isHusk = !registered.has(wt);
+			const panes = [...perkinsPanes.entries()]
+				.filter(([, c]) => c === wt)
+				.map(([p]) => p);
+			roundDebrisAlerted.set(row.id, true);
+			alerts.push(
+				`- PERKINS ROUND DEBRIS — ${row.id}: round is DONE but its worktree ` +
+					`was never swept: ${wt} ` +
+					(isHusk
+						? "[ORPHAN HUSK — not a registered git worktree (lens-agent " +
+							".unblock-marker/.cwd-keep husk class)]"
+						: "[registered worktree]") +
+					(panes.length
+						? `; ${panes.length} pane(s) still open with cwd == the round ` +
+							`worktree: ${panes.join(", ")}`
+						: "") +
+					`. Detection-only — do NOT auto-close (id-proximity / tab-label ` +
+					`matching burned us 08-17 ×2; match ONLY this cwd path): verify the ` +
+					`round row is done + the review posted (\`gh api repos/<owner>/` +
+					`<repo>/pulls/<n>/reviews --jq '.[-1]'\`), then sweep: close the ` +
+					`panes, \`git -C ${repoRoot} worktree remove --force ${wt}\` (or ` +
+					`remove the husk dir), and NULL the row's worktree/pane_id via sqlite.`,
+			);
+		}
+		// 2) Orphan lens panes: cwd under a perkins path, no LIVE round uses
+		// it, and the dir is GONE (the round's sweep removed the worktree but
+		// left the pane — the 2026-08-23 camera-zoom-r1 / font-r2 class).
+		for (const [pid, cwd] of perkinsPanes) {
+			if (livePaths.has(cwd)) continue; // in-flight round — legit
+			if (exists.get(cwd) ?? false) continue; // dir present → row check above
+			if (roundDebrisAlerted.get("pane:" + pid)) continue;
+			roundDebrisAlerted.set("pane:" + pid, true);
+			alerts.push(
+				`- ORPHAN LENS PANE — ${pid}: cwd points at a REMOVED perkins ` +
+					`worktree (${cwd}) and no live round uses it — a round close-out ` +
+					`left the pane behind. Close it: \`herdr pane close ${pid}\`. ` +
+					`(If this pane is a round MAIN whose row is still working, flag ` +
+					`it instead — never close an in-flight round.)`,
+			);
+		}
+		return alerts;
 	}
 
 	async function inReviewJobs(): Promise<ReviewJob[]> {
@@ -785,12 +974,17 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			}
 			const dream = await dreamCheck();
 			if (dream) alerts.push(dream);
+			// Round-debris sensor: done Perkins round rows whose worktree /
+			// lens panes were never swept at close-out. Detection-only — the
+			// injected message carries the verify-then-sweep instruction.
+			const debris = await roundDebrisCheck();
+			if (debris.length) alerts.push(...debris);
 			if (alerts.length === 0) return;
 			pi.sendMessage(
 				{
 					customType: "nefario-watch",
 					content:
-						`[nefario-watch · ${stamp()}] PR/CI/conflict/review/Perkins/dream alert on in-review job(s):\n` +
+						`[nefario-watch · ${stamp()}] PR/CI/conflict/review/Perkins/dream/round-debris alert(s):\n` +
 						alerts.join("\n") +
 						"\nDetection only: nefario-watch never writes the ledger or " +
 						"sends pane input — Silas owns every relay and ledger transition.",
