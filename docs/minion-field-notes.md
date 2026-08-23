@@ -321,6 +321,25 @@ findings that keep recurring. One line per entry, dated, with the job id.
   (5.10: exactly 8 bytes @ 18..25); `harness fold-check
   <prev-catalog-hash> <prev-tick1>` proves a fold-only shift
   (qos-default-standard).
+  2026-08-23 addendum (dream-2026-08-23; look-polish + spawn-feel +
+  font-overhaul + noc-readability-2 — ×4): new dual-render facets —
+  (a) LINE primitives render alpha as OPAQUE in rlsw (fills only — a
+  translucent effect must be fill geometry, never
+  DrawCircleLines/DrawLineEx; ×2: look-polish + spawn-feel); (b)
+  hand-built fans/quads must wind CCW in screen space (rlgl backface
+  culling, front = CCW — renders NOTHING in BOTH renderers
+  otherwise); (c) SW-build app traps: macOS PLATFORM_MEMORY GetTime()
+  returns 0 → a SetTargetFPS busy-wait spins FOREVER in EndDrawing
+  (skip the limiter in SW builds); the raylib-sw shadow has NO raudio
+  (gate app audio behind `when #config(PP_SW_AUDIO,false)`); (d) the
+  GPU app path lies TWICE — the compositor freezes the GL front
+  buffer for occluded windows (TakeScreenshot repeats frames) AND
+  RenderTexture readbacks carry glyph-coverage alpha + atlas-RGB
+  leak — the SW framebuffer (LoadImageFromScreen + flip + r/b
+  swizzle) is the ONLY reliable capture; (e) harness debug verbs: the
+  ms arg needs the suffix (`overlay-check surge 3000ms`, not `3000`)
+  and overlay captures must set the same view flags as the app
+  (`view_set_rail(true)`) or the capture misrepresents it (×2).
 - 2026-08-11 (dream-2026-08-11; packet-plumber-v2-1.3-packet-flow +
   -1.1-walking-skeleton — 2 stories): the PP-v2 determinism spine — the
   replay gate re-creates run-setup (fixture) but NOT flow demand by
@@ -490,7 +509,13 @@ findings that keep recurring. One line per entry, dated, with the job id.
   Sanctioned path (Silas ruling 08-21 06:10Z): skill WAIVED —
   self-contained briefing + the waiver carried as a canon note in the
   PR body; avoid naming bmad-build in briefings until upstream
-  dedupes the token.
+  dedupes the token. 2026-08-22/23 addendum (dream-2026-08-23 — ×4
+  more jobs): SECOND root cause in the PP repo — `_bmad/scripts/` has
+  NO render_skill.py (only memlog.py/resolve_*.py); same waiver path
+  (pace-tuning, motion-readability, camera-zoom, noc-player-toggle).
+  estate-spawning proved it transiently FIXABLE in place (temp
+  disambiguated the bmm/gds dup keys, config restored byte-equal) —
+  but the waiver stays the standing path until a real fix job lands.
 - 2026-08-20 (dream-2026-08-21; righttenantry mobile-form-hunt +
   mobile-layout-1 — 2 jobs): front-end/env traps — (a) debug flex/CSS
   geometry by walking the ANCESTOR chain in the DOM, never by reading
@@ -504,6 +529,27 @@ findings that keep recurring. One line per entry, dated, with the job id.
   only the ROOT `.env` — `server/.env` must be recreated or the server
   panics 'DATABASE_URL not set' (and `dot_env.load_default()`
   overrides process env, so env vars alone can't redirect it).
+- 2026-08-23 (dream-2026-08-23; blender-sculpt + playbook-diet — 2 jobs):
+  a pipe/script wrapper silently no-ops — `blender -b -P … | grep`
+  masked the exit code AND the traceback (two "determinism-proof"
+  runs had crashed on a bad API call while `cmp` compared STALE
+  files) — capture rc UN-PIPED, then prove output FRESHNESS
+  (mtimes/expected new values) before believing a byte-compare;
+  scripted rewrites corrupt invisibly (a `tr '\n' ' '` inside a
+  rewritten heredoc became a literal newline; heredoc + triple-quoted
+  Python with embedded quotes self-terminates) — byte-check the
+  generated artifact (grep the exact token) or use exact-match edit
+  tools. Sibling of the AGENTS.md herdr no-pipes rule — the class is
+  ANY wrapper, not just herdr.
+- 2026-08-23 (dream-2026-08-23; noc-player-toggle + dream-2026-08-21
+  Bob — ×2): edit-tool batches are ATOMIC — one bad oldText rejects
+  every edit in the batch. Special chars are the silent killers: an
+  em-dash in oldText failed a WHOLE batch while the block was
+  verifiably present; store-copy anchors WRAP differently than the
+  in-context rendering. Grep the exact anchor bytes in the TARGET file
+  before authoring the batch (watch for phantom leading spaces on
+  wrapped lines), use minimal ASCII-only anchors, and use a scripted
+  replace for punctuation-heavy regions.
 
 ## Conventions that saved time
 
@@ -689,6 +735,26 @@ findings that keep recurring. One line per entry, dated, with the job id.
   grep the sibling PR's hunks for disjointness and expect ZERO
   conflicts (7.2, 5.4 ×2, visibility, doctrine — all clean); a
   merge-order ruling (#59 first, #60 rebases) beats a conflict.
+- 2026-08-22/23 (dream-2026-08-23; blender-silhouettes +
+  blender-sculpt + look-polish — ×3): determinism evidence — compare
+  DECODED PIXELS, never file bytes (Blender 5.2 re-renders are
+  pixel-deterministic; md5 diffs were PNG-encoder metadata only —
+  strip tEXt/iTXt/zTXt chunks post-render, the wall-clock Date tEXt
+  is the only mover); a no-op re-render is golden-safe (pipeline
+  validation = render + pixel-compare, no re-bless); the per-commit
+  re-bless loop pays when EVERY commit carries the triple-verify
+  (cmp -l every .log.bin/.t1 vs HEAD; diff-bbox pixel scans matching
+  PREDICTED blend colors ±0; palcheck re-pins with measured floors).
+- 2026-08-21/22 (dream-2026-08-23; noc-overlay D-key saga +
+  playbook-diet clarify halt — ×2 arcs): a clarify ruling is the
+  START of the decision, not the end — expect AMENDMENT on first
+  contact with evidence (D-key: Q1-Q4 rulings → root-cause amendment
+  "the D never worked" → FINAL: one key, one panel, zero dead code)
+  and the final ruling often SHRINKS scope while ADDING an acceptance
+  proof ("a render function never called is not a feature" — the E2E
+  key-toggle capture). When the user asks mid-flight "should this be
+  a skill instead", a reasoned keep-as-dispatched recommendation can
+  itself be the ruling (diet clarify halt).
 
 ## Recurring review findings
 
@@ -783,6 +849,24 @@ findings that keep recurring. One line per entry, dated, with the job id.
   never the POST route; #36 r2: the demolish-and-renumber test was
   absent — every resolve fixture preserved slot order). The passing
   fix: drive the real route + pin the mechanism + neutralize → red.
+- 2026-08-23 (dream-2026-08-23; the PP v2 NOC surface r1-r3 + font r3 +
+  sound r2 — ×3 review crafts): (a) ship every pin with its MUTATION
+  LEG unprompted (delete-the-call / flip-the-default /
+  mutate-the-pixels) — Perkins now treats a vacuous gate as a BLOCKER
+  and mutation-verifies fixes independently (noc-toggle r2:
+  delete-dismissal fails, default-flip fails 3 tests, ROW_COUNT->4
+  wraps+fails; font r5: gate-10 rebuilt dual-render, 0px mutated vs
+  54k healthy). (b) fix-folds REGRESS THEMSELVES on shared
+  chrome/input surfaces — each CHANGES_REQUESTED fold was genuinely
+  good yet exposed the adjacent interaction bug (stuck-panel → play_w
+  desync → header collision → tray-chip dead zone); budget multiple
+  rounds for a shared surface and carry the class LINEAGE in the fold
+  briefing so the minion greps the whole surface, not the named lines.
+  (c) the PR body + fold claims are AUDITABLE artifacts — a prose
+  claim the code doesn't back is a BLOCKER (font r3 fictitious N11
+  dead-retries field; font r1 B2 wrong body), a stale body is a note
+  (noc-readability-2 N6': r1 text on the live PR — one `gh pr edit`);
+  re-audit your own PR body against the final head before each round.
 
 ## glm-5.2 bare-label routing bug (2026-08-04, 2 independent sightings)
 

@@ -122,7 +122,18 @@ the user at the Gru session in `/Users/moses/code`.
   2026-08-19 addendum (dream-2026-08-19; v2-6.1-era-definition
   close-out): sighting #3 — the close-out executed but the escalation
   never reached Gru's input (re-escalated 08:13Z). The relay step is
-  still the failure point.
+  still the failure point. 2026-08-22/23 addendum (dream-2026-08-23):
+  delivery verification extends to MID-FLIGHT relays to WORKING panes
+  — a relay can vanish (design-audit AMENDMENT #3 capture-dropped;
+  needed resend + send-keys enter) or QUEUE until turn end (camera-r4
+  escalation queued in Gru's steering buffer; a retry duplicated the
+  queue — harmless). Verify every mid-flight relay by pane read /
+  session grep; a queued relay is deferred, not lost. Mid-flight
+  AMENDMENTS are the healthy change path (×3: look-polish vision-MM
+  scope, design-audit blur-test columns, MM press-kit no-fetch
+  supersede): relay + verify, never kill-and-redispatch — a briefing
+  guardrail yields to a USER RULING via relayed amendment, never to
+  minion initiative.
 - **A pi launched with cwd=`/Users/moses/code` IS Gru** — gru.ts guards on
   `ctx.cwd` alone, so the session gets the startup checklist as a user
   message + Gru standing orders every turn, and its session file lands in
@@ -197,7 +208,27 @@ the user at the Gru session in `/Users/moses/code`.
 - **RT main-checkout worktree bootstrap: `cp -r` cycles on the
   self-referencing `_bmad` symlink — `rsync --exclude='_bmad'` is the
   standard copy (2026-08-13, ×2 same evening; recurs on every RT
-  dispatch from the main checkout).**
+  dispatch from the main checkout).
+- **Lens-tab layout doctrine (user ruling 2026-08-23): MAX 6 panes per
+  tab as 3 rows × 2 cols, built AT CREATION.** Never a split ladder —
+  Gru fumbled one (6 panes at 1/1/2/3/58/7 rows, user-flagged) and
+  Silas evened it post-hoc: resize semantics are empirical (up = top
+  edge up = grow; down = bottom edge down = grow; top/bottom panes
+  clamp → shrink/no-op), ~10 small resizes + layout reads → all even
+  at 12 rows; surgery on a LIVE round is safe if no pane is closed or
+  moved. Playbook + lens-skill-template amendments ride the next docs
+  pass.
+- **_local-refs/ is the intake lane for external reference assets
+  (2026-08-21/22, ×3 drops).** IP-sensitive or user-generated
+  references (MM press kit 9 JPGs, design-video DIRECTION.md, Suno
+  ambience WAV) live in `/Users/moses/code/_local-refs/` — UNTRACKED,
+  outside all repos, each drop with a provenance README (source +
+  date). Minions cite but NEVER copy into a tree; a briefing no-fetch
+  clause yields only to a user ruling (the MM drop superseded
+  design-audit rule-3 by ruling). Lavish cannot serve them (static
+  root 403s symlinks): serve via a loopback pane (`python3 -m
+  http.server 4388 --bind 127.0.0.1` rooted at _local-refs) and
+  reference `http://127.0.0.1:4388/...` in the HTML.**
 
 ### Provider incidents
 
@@ -380,7 +411,25 @@ the user at the Gru session in `/Users/moses/code`.
   acting on any surprising read. Cap-reset times remain estimates:
   glm's 1308 rolling window freed ~11h EARLY vs the stated 20:43Z
   reset (08-20) — never schedule a resume off the provider's stated
-  time; only the probe decides.
+  time; only the probe decides. 2026-08-22/23 addendum (dream-2026-08-23;
+  the PP v2 wave — 2 HOLDs absorbed, zero work lost): (a) the RESUME
+  decision keys on HEAD STALENESS — a parked round whose target sha
+  moved during the park is SWEPT + fresh-dispatched on the current head
+  (motion-r2 3635de0 + estate-r3 be7c0fa stale at the 08-22 19:2xZ
+  lift; spawn-feel/camera/dublin/font swept-and-refreshed ×4), an
+  UNCHANGED head resumes with ONE continue (camera-r4 + font-r5 both
+  continued at the 12:15Z k3 flip) — a round never re-targets.
+  (b) USER RULING 08-23 ~11:0xZ: a parked round with VISUAL evidence
+  WAITS for the vision-capable provider — "WAIT for kimi k3 … do NOT
+  resume on glm" (a glm resume buys a mechanical-only verdict);
+  identical trigger written on 2 rows (font-r5, camera-r4); the hourly
+  probe auto-catches the flip. (c) 1302 burst taxonomy (≥15 sightings
+  08-22/23): launch-bursts on fresh panes (2.9KB sessions — harmless,
+  one continue); a continue landing MID-burst doesn't clear — wait,
+  then one more (never spam); post-1308-reset cycling is expected and
+  clears; probe-verified CONCURRENCY bursts (both providers OK) subside
+  as lens waves complete — no hold. The probe distinguishes burst from
+  wall every time.
 - **Model dispatch & correction ops (2026-08-09).** Only a
   `provider/model` path naming an AUTHED provider works: bare
   `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
@@ -568,7 +617,22 @@ the user at the Gru session in `/Users/moses/code`.
   death (Mac reboot 17:59Z 08-20) ≠ lost work: durable lens JSONs +
   diff.patch in `_bmad-output/perkins/<round>/` salvage the round —
   relaunch SAME row SAME sha, regenerate only the missing lenses (5/7
-  JSONs survived the reboot; the verdict posted intact).
+  JSONs survived the reboot; the verdict posted intact). 2026-08-23
+  addendum (dream-2026-08-23): self-close ≠ SWEPT — round debris (lens
+  panes + worktrees + orphan husks) accumulates SYSTEMATICALLY between
+  merge close-outs: a user-flagged census closed 42 leftover panes
+  (45→3, 06:26Z), the 11:20Z startup sweep closed 14 lens panes + 9
+  worktrees + ORPHAN HUSKS (registration already pruned; lens agents
+  had written .unblock-marker/.cwd-keep placeholder files after a
+  mid-session sweep), and the post-#87 sweep found 7 orphaned r6 lens
+  panes (processes survive worktree removal). Sweep perkins-cwd panes
+  + worktrees at EVERY merge close-out AND every startup/census; NULL
+  pane/tab/worktree fields on done round rows at sweep time. Fix
+  shipped same-day: the 7th nefario-watch sensor (round-debris, PR
+  #14) — DETECTION-ONLY (done-rows only, cwd-EXACT matching, one alert
+  until resolved, NEVER closes/removes — the 08-17 id-proximity/label
+  burns made auto-clean a non-starter); execution stays with Silas.
+  Detection-only is the sanctioned shape for ANY cleanup sensor.
 - **Serialize-hold for pane capacity: pre-create the round row to dedup the
   sensor (2026-08-07).** When the valve is near capacity, hold the next
   Perkins round behind an in-flight one: pre-create its ledger row (status
@@ -621,6 +685,17 @@ the user at the Gru session in `/Users/moses/code`.
   Info), and the fix-now job's briefing is SCOPE-GUARDED against the
   batch items so it cannot eat them (M-1 shipped r1 APPROVED + merged
   as #627 same day). Generalizes to any audit/heist output.
+  2026-08-22/23 addendum (dream-2026-08-23 — moot at scale, ×5):
+  confirmation/delta rounds around an APPROVED substance are DISPOSABLE
+  — sweep without re-dispatch and record the safe-merge qualifier each
+  time (prior APPROVED exists / merged head == reviewed head / zero
+  substance change): noc-toggle r3 (merged ON the reviewed head
+  mid-review), silhouettes r3 (parked under HOLD), sculpt r2 +
+  scale-depth r2 (merged before the confirmation posted), estate r3.
+  Sibling class: the EARLY-WAVE SUPERSEDED sweep — a round still
+  diff-only (no lens outputs) when the head moved and the merge is
+  armed gets swept with NO rN+1 unless the user asks for a pre-merge
+  verdict (font r6 @4688d3d, 08-23 14:45Z).
 - **A no-PR job (analysis / lavish+md+script deliverables / in-repo commits
   with NO merge) falls through BOTH watchers (2026-08-07).** The pane
   watcher only tracks NON-done jobs — the instant the minion runs `ledger
@@ -683,7 +758,23 @@ the user at the Gru session in `/Users/moses/code`.
   one. (c) On any non-k3 round the briefing carries the VISION CAVEAT
   verbatim: pixel verification MECHANICAL only (byte/hash/capture-
   diff), aesthetic verdicts deferred for the k3 re-check, never faked
-  (7.1/5.10/5.11/background-maps briefings, ×6).
+  (7.1/5.10/5.11/background-maps briefings, ×6). 2026-08-22/23 addendum
+  (dream-2026-08-23; the PP v2 wave): (d) VACUOUS pins are the dominant
+  blocker class — a gate that can't be made to FAIL by deleting or
+  mutating the thing it guards is a BLOCKER finding (font r4 gate-10
+  "passes with overlay never drawn, 775>=500 from background"; camera
+  r3 W4 router-before-seed; spawn-feel B2 out-of-span tautology; motion
+  B1 default-param drop). The accepted fix standard = the MUTATION LEG
+  (delete-dismissal fails / default-flip fails 3 tests /
+  ROW_COUNT->4 wraps+fails — noc-toggle r2; gate-10 rebuilt dual-render
+  0px-vs-54k — font r5); Perkins now mutation-verifies fixes
+  independently. (e) 429-degraded lenses: 6/7 is VALID when the lens
+  produced findings before dying OR its coverage is re-proven by
+  direct guard verification — disclosed in the verdict every time
+  (sound r1, silhouettes r2, font r5); never faked, never re-dispatched.
+  (f) A head move mid-round (rebase or fold push) = SWEEP the stale
+  round + dispatch FRESH at the new head carrying prior findings (×4
+  08-22/23) — a round never re-targets; cost is one worktree add.
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
@@ -857,6 +948,17 @@ the user at the Gru session in `/Users/moses/code`.
   an identity tab (it split Gru's). Check the tool's own log before
   blaming the tool — the 08-21 Gru-death kill suspicion was RETIRED
   by watchman log forensics (zero kill actions, all relaunches).
+  2026-08-21-late addendum (dream-2026-08-23): the launchd MINIMAL-PATH
+  class — the watchman's quota-probe failed `env: pi: No such file or
+  directory` under launchd, wrote a bogus both-down regime 23:38Z, and
+  REFUSED to relaunch a genuinely dead Gru (glm was UP; Silas
+  relaunched manually). A PATH error is NEVER a provider verdict.
+  Fixed in PR #11 (scope 8): pi/herdr/jq resolved ABSOLUTELY at
+  install (PI_BIN env → fnm aliases → node-versions newest-first →
+  command -v); a broken probe exits 2 with NO regime write and is
+  logged+notified as TOOL-BROKEN; watchman startup FATALs on
+  unresolvable binaries. Any out-of-shell automation (launchd/cron)
+  that shells out must bake absolute paths in at install time.
 
 ### Extensions
 
@@ -870,7 +972,12 @@ the user at the Gru session in `/Users/moses/code`.
   by bash command substitution — the relay arrives with blank code
   spans and a corrupted recipe. Single-quote the whole payload or drop
   the backticks. (Class promotion: 1 direct sighting + the 08-01
-  template-literal sibling — same hazard, second surface.)
+  template-literal sibling — same hazard, second surface.) 2026-08-22
+  facet (role-skills): GENERATORS sidestep the class structurally —
+  emit strings via JSON.stringify / json.dumps double-quoted
+  (ensure_ascii=False): backticks/${}/quotes/backslashes become inert,
+  no template literal at all (gen-role-blocks.ts + drift-check prove
+  it).
 - **Pane ids: never manually retype or `$(...)` subshell them — pipe the
   move/create output to a variable and use it literally (2026-08-08).** A
   mistyped `pane_id` in `ledger add` (pHE vs pH6, pHK vs pH7) makes the
@@ -940,7 +1047,23 @@ the user at the Gru session in `/Users/moses/code`.
   tests, answers with evidence). Named for Gru's guard dog — he
   watches and barks. pi gates image attachment on the model's declared
   `input` types — models.json registration for vision models needs
-  `input: ["text","image"]`.
+  `input: ["text","image"]`. 2026-08-22/23 addendum (dream-2026-08-23):
+  routing grew a LOCAL fallback — remote glm-4.6v primary →
+  `bin/vision-read --local` (lmstudio glm-4.6v-flash) → gemma coarse
+  `--fast` last resort (wired + verified through pi 08-22). Vision
+  capability is a property of the CURRENT pane model and flips
+  intra-day with HOLDs (Gru flipped glm-5.3 blind mid-morning 08-23 →
+  KYLE reads for him again). TWO craft laws from the wave: (a) a
+  vision verdict is a SCREENING layer, never evidence — pixel-verify
+  before it drives a decision (design-audit pass-1 "3D shading"
+  wrong: sprites measured 90-93% flat; "shapes identical" wrong:
+  aspects 1.01 vs 1.45-1.48; silhouettes: KYLE caught nothing at
+  contact-sheet scale — the bbox geometry table + zoomed per-sprite
+  check caught the stacked port-ring dots); (b) spawn craft — prompts
+  to FILES (shell quoting eats multi-line), absolute OUT paths, verify
+  the session modelId, read findings from DISK (long turns hit 500s /
+  timeouts — nudge "write NOW compactly, do not re-read"; findings
+  land on disk even when the final message errors).
 
 ## Orchestration upgrades (user-approved 2026-08-18)
 
@@ -984,7 +1107,14 @@ the user at the Gru session in `/Users/moses/code`.
   glm's 1308 window freed ~11h EARLY vs the stated reset, so the probe
   (never the provider's stated time) gates the resume. NEW milestone
   type: the fun-test gate (user-held — merge ≠ done; the gate is the
-  user's play session; the PP v2 belt is parked on it).
+  user's play session; the PP v2 belt is parked on it). 2026-08-22/23
+  addendum (dream-2026-08-23 — the 16-PR wave ran end-to-end on it): a
+  whole multi-job WAVE encodes as paneless blocked_by rows + named
+  release triggers (7 wave rows held behind #76; released on cue at
+  its merge close-out, all working within ~7 min), including merge
+  gates keyed on USER actions (Blender launch). Ops fact: create
+  same-repo worktrees STRICTLY SEQUENTIALLY during a mass release (a
+  parallel pair hit an index.lock race once — retried clean).
 - **Sensor-doctrine sync (P2, standing rule):** ANY doctrine amendment
   task must grep the sensor/watcher configs (`.pi/extensions/*.ts`) for
   the retired doctrine being amended — the cap-3 echo class lived in
