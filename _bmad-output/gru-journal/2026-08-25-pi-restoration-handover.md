@@ -69,3 +69,36 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   PLAYBOOK constant in gru.ts + silas.ts AND the AGENTS.md references were
   all dangling. Created `~/code/docs -> my-orchestrator/docs`. One canonical
   copy, zero duplicates.
+
+## Layout inversion executed (user ruling: "the real origin should be in ~/code")
+
+- ~/code IS the my-orchestrator checkout now: killed Silas (state on disk),
+  parked watchman, removed the 4 root symlinks, rsync'd real content in
+  (live wins), moved .git to root, deleted the nested clone. Sync commit
+  5b5de85 pushed. Watchman plist path unchanged (resolves to real file now).
+- Restoration gaps closed by the move: docs/ (this file's earlier symlink fix
+  superseded), managed-repos.txt (intake allow-list), README.md, test/, and
+  Silas's journal re-homed (it had been landing in the clone via symlink
+  resolution — state was splitting).
+- Silas rebooted on real paths (session 16-46-14Z), handover verified in
+  session jsonl. herdr agent-wait false-negatived BOTH boots (registration
+  race) — pane-forensics verification (process + session file) is the
+  reliable check, not the wait.
+
+## DSH dashboard plugin abandoned (user ruling, ~18:0xZ)
+
+- User closed PR #1 (dsh client dashboard plugin) unmerged at 16:22Z; ruling:
+  abandon the plugin work. Silas marks rows done-unmerged, archives briefs,
+  sweeps debris. The DSH interlude is now fully closed — client, plugin, all.
+
+## Night-watchman false alarm fixed (~17:1xZ)
+
+- Symptom: "Gru tab MISSING" notification every 30 min since ~16:10Z. Root
+  cause: config expects tab label `Gru` (capital, the 08-21 setup), live tab
+  is `gru` (lowercase, from the 16:00Z user relaunch) — resolve_tab is
+  case-sensitive jq exact match → permanent miss. silas immune (key==label).
+- Fix (e5838c1): case-insensitive fallback in resolve_tab — exact match
+  first, unique case-insensitive match second, ambiguity (2+ variant tabs)
+  still warns (never guesses). Verified: --self-test PASS incl. live
+  resolution (gru w85:t1 ALIVE), --dry-run pass logs `alive silas gru`.
+  Stale notify state cleared; launchd picks up the fixed script next tick.
