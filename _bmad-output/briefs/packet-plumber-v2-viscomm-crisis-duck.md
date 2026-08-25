@@ -75,6 +75,25 @@ the crisis elements own the saturation budget.
 - Full suite green: `odin test app` (46), `odin test app/render` (83+),
   `odin test core` (crisis suite), palcheck.
 
+## Folded advisories — PR #99 r2 warnings (close the advisory batch issue)
+
+The r2 APPROVED verdict (review 5023624193) left 3 warnings; fold them
+into THIS PR (they share the palette/mirror surface):
+
+- **W3 (the real one):** `palette_load`'s inline jcol default for route_tie
+  (the 3rd ODN-5 mirror site) has ZERO coverage — Perkins mutation-proven
+  (reverting the default to amber leaves 83/83 GREEN, vacuous). Add a
+  stripped-JSON `expect_color` test leg that pins the loaded default.
+- **W1:** the tracked mirror `_pr_body_viscomm_tie.md` documents r1 values
+  contradicting the shipped r2 bytes (`#965EE8`/hue 264°/"≥62°" vs shipped
+  `[186,94,232]` @ 280°, 29.7° from router_tier_high). Refresh the mirror
+  to the shipped values. (The merged PR body itself is history — mirror only.)
+- **W2:** same mirror says the derive-script JSONC bug is "pre-existing,
+  out of scope" while the r2 diff FIXED it (`strip_jsonc_comments`). Refresh
+  that note to reflect the fix.
+
+Reference the batch issue in your PR body (closes-none — it closes at review).
+
 ## PR / ledger
 
 - One PR to base **v2**. Title prefix `viscomm(crisis):`.
