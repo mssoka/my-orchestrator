@@ -113,3 +113,18 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   seeded from Active_Crisis (bundle_lo, bundle_hi) pair (core/crisis.odin).
 - Earlier: PR #99 merged 0b893ee (finding A shipped, r2 APPROVED);
   gauge-telegraph dispatched (w85:pJ) on finding B.
+
+## Gauge PR #100: Perkins r1 APPROVED first-round (review 5024547297)
+
+- 7/7 lenses glm-5.3, 22/22 verified, 0 blockers; mutation leg independently
+  re-run by Perkins (bypass → palcheck ×2 FAIL); 49 goldens byte-identical.
+  CI 4/4, MERGEABLE — user holds merge. On merge: crisis-duck auto-releases
+  (fresh head, issue #101 fold rides it).
+
+## PR #100 merged (23:30:50Z, 0b2aeb9) — trigger-graph release executed
+
+- Finding B shipped. Crisis-duck AUTO-RELEASED at close-out exactly as wired:
+  pane w85:pY (tab tD), glm-5.3 +thinking max, worktree @0b2aeb9 fresh head,
+  issue #101 fold carried. Viscomm wave: A+B shipped, C in flight, D
+  era-gated. The first fully hands-off release through the graph since the
+  pi restoration — brief staged, ruling relayed, graph did the rest.
