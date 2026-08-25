@@ -1,0 +1,3 @@
+- `odin test app` runs only the app package's tests (46); the render pins live under `odin test app/render` (83) — a deliberate-fail probe is the cheap way to confirm a test binary actually executes your new test before trusting a green run.
+- tools/derive_a11y_palettes.py cannot parse palette.json's inline `//` comments (json.load) — run it on a comment-stripped copy; pre-existing breakage worth an issue.
+- The old CVD mode tables remapped route_tie to pale amber RGB-identical to state_congested's remap — a11y overrides can silently reintroduce a base-palette collision you just fixed; always diff the mode tables too.

@@ -1,0 +1,3 @@
+- Out-of-tree host plugins CAN expose browser-callable remotes via SRC/source-mode Typert discovery (typertRemote binding + Remote marker, applied programmatically without decorator syntax); the browser rides ctx.connection.rpc.call("/api", "ns/method") because ctx.remote.* namespaces are a build-time-fixed set.
+- A rejected cordis loader entry is FATAL to dsh-app-boot (exit 1) — host halves must guard every import/registration path and degrade to a log line.
+- sqlite3 CLI cannot open this ledger DB read-only on this machine (rc=14); node:sqlite DatabaseSync {readOnly:true} works and is the sanctioned read path.
