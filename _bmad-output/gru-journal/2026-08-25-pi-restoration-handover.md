@@ -102,3 +102,14 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   still warns (never guesses). Verified: --self-test PASS incl. live
   resolution (gru w85:t1 ALIVE), --dry-run pass logs `alive silas gru`.
   Stale notify state cleared; launchd picks up the fixed script next tick.
+
+## Crisis-duck ruling + viscomm belt state (~20:5xZ)
+
+- USER RULING: crisis-duck approved — desaturate non-involved network during
+  crisis. Briefing staged (crisis-duck.md); serialized behind gauge-telegraph
+  (same render surface precedent), release = its merge close-out. Key
+  contracts: byte-identical-when-inert, mutation-leg on draw path, CVD
+  tables diffed, reduced-motion pins the transition. Involvement predicate
+  seeded from Active_Crisis (bundle_lo, bundle_hi) pair (core/crisis.odin).
+- Earlier: PR #99 merged 0b893ee (finding A shipped, r2 APPROVED);
+  gauge-telegraph dispatched (w85:pJ) on finding B.
