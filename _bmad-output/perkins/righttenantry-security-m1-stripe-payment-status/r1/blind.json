@@ -1,0 +1,52 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "state_machine",
+    "title": "New pending state has a success exit only: a failed async payment leaves the row pending and the vacancy locked forever",
+    "location": "server/src/payment/webhook_handler.gleam (PendingPayment outcome arm, hunk @@ -376,21 +433,53 @@)",
+    "evidence": "+      wisp.log_info(\n+        \"Stripe event \"\n+        <> event_id\n+        <> \" (\"\n+        <> arm\n+        <> \") payment_status='\"\n+        <> payment_status\n+        <> \"' not 'paid' — vacancy stays locked, payment row stays pending; will settle via checkout.session.async_payment_succeeded\",\n---\n+/// M-1 rationale (security audit fix-now): without the restriction Stripe\n+/// shows every payment method enabled on the account (SEPA direct debit,\n+/// Boleto, Klarna), and async methods fire `checkout.session.completed`\n+/// with `payment_status: \"processing\"`/`\"unpaid\"` — funds settle later or\n+/// fail entirely (SEPA chargebacks). Card-only makes `completed` ⇒ `paid`\n+/// for every session we create.",
+    "detail": "Only async_payment_succeeded is wired as the settle exit; the diff acknowledges funds \"fail entirely (SEPA chargebacks)\" but adds no checkout.session.async_payment_failed arm. A failed async payment (SEPA return, Boleto expiry) leaves the row pending and the vacancy locked forever, reachable for pre-deploy in-flight sessions the idempotency-tag bump acknowledges exist.",
+    "recommended_fix": "Handle checkout.session.async_payment_failed: mark the payment row failed, notify the landlord, and add a cleanup/terminal path for parked pending rows."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "zero_total",
+    "title": "Gate permanently parks payment_status \"no_payment_required\": a $0 total (100% promo) never unlocks and no settle event ever arrives",
+    "location": "server/src/payment/webhook_handler.gleam (M-1 gate, hunk @@ -352,22 +398,33 @@); server/src/payment/stripe_client.gleam (allow_promotion_codes)",
+    "evidence": "+          case payment_status {\n+            \"paid\" ->\n+              run_completed_side_effects(\n+                tx,\n+                config,\n+                event_id,\n+                session_id,\n+                payment_intent,\n+                amount_cents,\n+                amount_total_opt,\n+                consent_terms,\n+                vacancy_id_opt,\n+                sku_type_metadata_opt,\n+              )\n+            _ -> Ok(PendingPayment)\n+          }\n---\n     #(\"allow_promotion_codes\", \"true\"),",
+    "detail": "A $0 checkout (100% promo; allow_promotion_codes=true is preserved in the refactored body) completes with payment_status \"no_payment_required\", which the gate treats as pending. Nothing settles, so the vacancy stays locked permanently, acked 200 and claimed with no alert.",
+    "recommended_fix": "Treat \"no_payment_required\" as a valid completed state for $0 totals, or drop promotion-code support, so zero-total sessions unlock instead of parking forever."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "unverified_schema",
+    "title": "New claim arm depends on an unverified schema assumption the field notes themselves flag",
+    "location": "_bmad-output/field-notes/righttenantry-security-m1-stripe-payment-status.md (line 4); server/src/payment/webhook_handler.gleam (hunk @@ -352,22 +398,33 @@)",
+    "evidence": "+- Squirrel NOT needed here (no schema change): the payment_status enum already\n+  had 'pending' as the waiting state; `processed_stripe_event.event_type` is\n+  free-form TEXT, so a new arm needs no migration — verify before assuming.\n---\n-      case sql.claim_stripe_event(tx, event_id, \"checkout.session.completed\") {\n+      case sql.claim_stripe_event(tx, event_id, arm) {",
+    "detail": "The claim insert now stores \"checkout.session.async_payment_succeeded\" in processed_stripe_event.event_type. If that column is constrained, the claim insert fails, the whole tx rolls back, and Stripe retries indefinitely. The diff merges without resolving its own \"verify before assuming\".",
+    "recommended_fix": "Verify processed_stripe_event.event_type is unconstrained before merging; if it is constrained, add a migration or map the arm to an existing value."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "ops_visibility",
+    "title": "Structurally missing payment_status is silently consumed: acked 200, claimed, logged at info only",
+    "location": "server/src/payment/webhook_handler.gleam (decode comment, hunk @@ -239,6 +247,16 @@)",
+    "evidence": "+    // M-1 gate input: `checkout.session.payment_status`. Stripe always\n+    // sends it on Session events, but `optionally_at` keeps a structurally\n+    // missing field from failing the whole decode — an absent value\n+    // decodes to None and the gate treats anything != \"paid\" as pending\n+    // (fail-closed; see handle_checkout_completed).",
+    "detail": "A malformed event (missing payment_status) is parked and permanently claimed with an info-level log: no warning, no Sentry event, no Stripe retry. A Stripe payload-shape change would silently strand every paid landlord with no recovery path.",
+    "recommended_fix": "Log pending-gate trips at warning level and fire a Sentry alert when payment_status is missing (vs. a known pending value like \"unpaid\"), so ops notices stranded sessions."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "fixture_reality",
+    "title": "\"processing\" is not a valid Checkout Session payment_status — the test pins an input Stripe never sends",
+    "location": "server/test/integration/payment_integration_test.gleam (checkout_completed_processing_keeps_vacancy_locked_test, M-1 gate section)",
+    "evidence": "+/// M-1 rationale (security audit fix-now): without the restriction Stripe\n+/// shows every payment method enabled on the account (SEPA direct debit,\n+/// Boleto, Klarna), and async methods fire `checkout.session.completed`\n+/// with `payment_status: \"processing\"`/`\"unpaid\"` — funds settle later or\n+/// fail entirely (SEPA chargebacks).\n---\n+pub fn checkout_completed_processing_keeps_vacancy_locked_test() {",
+    "detail": "Session-level payment_status is paid/unpaid/no_payment_required; \"processing\" exists only on PaymentIntent, and delayed methods complete with \"unpaid\". The processing test exercises an impossible input, giving false confidence; the unpaid test covers reality.",
+    "recommended_fix": "Drop the \"processing\" fixture/test or rename it as a defensive check, and pin the gate's behavior with \"unpaid\", the value delayed methods actually produce."
+  }
+]

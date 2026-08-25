@@ -1,0 +1,52 @@
+[
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "include-hygiene",
+    "title": "PP_SimState.h uses FNV64_OFFSET without including PP_Hash.h — not self-contained (verified standalone compile failure)",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_SimState.h:95",
+    "evidence": "PP_SimState.h:19-27 includes: `#include <cstdint>` / `#include <vector>` / `#include \"PacketPlumberCore/PP_Bundles.h\"` / `#include \"PacketPlumberCore/PP_Flow.h\"` / `#include \"PacketPlumberCore/PP_Rng.h\"` / `#include \"PacketPlumberCore/PP_Routing.h\"` / `#include \"PacketPlumberCore/PP_Topology.h\"` — no PP_Hash.h. Line 95: `\t\tCatalogHash = FNV64_OFFSET; // empty catalog set (no catalogs in slice 1)`. Compiling a TU that includes only PP_SimState.h fails: `Source/PacketPlumberCore/Public/PacketPlumberCore/PP_SimState.h:95:17: error: use of undeclared identifier 'FNV64_OFFSET'` (g++ -std=c++17, verified). It compiles in every current TU only because PP_Sim.h includes PP_Hash.h before PP_SimState.h.",
+    "detail": "Every core header is contracted to compile standalone in both runners (dual-runner discipline). Any TU including PP_SimState.h directly breaks; it currently works only via PP_Sim.h's include order.",
+    "recommended_fix": "Add `#include \"PacketPlumberCore/PP_Hash.h\"` to PP_SimState.h's include block."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "determinism",
+    "title": "StateHash's fixed 4096-byte buffer silently collapses every oversized state to one constant hash (false-green replay gate)",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:246-251",
+    "evidence": "PP_Sim.h:246-251: `inline uint64_t StateHash(const FSimState &State)` / `{` / `\tstd::vector<uint8_t> Buffer(4096);` / `\tconst size_t N = SerializeState(State, Buffer.data(), Buffer.size());` / `\treturn Fnv1a64(Buffer.data(), N);` / `}`. PP_Sim.h:233-236: `\tif (Buf.size() > OutCapacity)` / `\t{` / `\t\treturn 0;`. Empirically verified: golden scenario state = 462 bytes (fits), but a scenario variant with 120 in-flight packets returns `StateHash = cbf29ce484222325 (empty-input FNV = cbf29ce484222325)` — i.e. 0 bytes hashed. Canon read at /Users/moses/code/packet-plumber/data/balance.json: `\"pool_max_packets\": 512` (~24KB of packet bytes alone).",
+    "detail": "States over 4096 serialized bytes all hash to FNV64_OFFSET, so divergent oversized replays compare equal — replay-equality silently false-greens. Canon pool_max_packets=512 guarantees overflow by slice 3.x.",
+    "recommended_fix": "Make StateHash use a growable buffer (serialize into std::vector, hash it) or assert/latch when SerializeState returns 0."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "include-hygiene",
+    "title": "PP_Routing.h calls std::fill without including <algorithm>",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Routing.h:124",
+    "evidence": "PP_Routing.h:34-39 includes are `#include <cstdint>` / `#include <vector>` / `#include \"PacketPlumberCore/PP_Balance.h\"` / `#include \"PacketPlumberCore/PP_Rng.h\" // SplitMix64 (seed expansion primitive)` / `#include \"PacketPlumberCore/PP_Topology.h\"` — no <algorithm>. Uses at lines 124, 125, 185, 190: `\t\tstd::fill(Dist.begin(), Dist.end(), UNREACHABLE);` `\t\tstd::fill(Settled.begin(), Settled.end(), 0);` `\t\t\tstd::fill(Seen.begin(), Seen.end(), 0);` `\t\t\tstd::fill(MinCost.begin(), MinCost.end(), UNREACHABLE);`. Compiles standalone on this toolchain only via <vector>'s transitive includes (verified: clean compile).",
+    "detail": "<vector> does not guarantee std::fill; the dual-runner contract (g++ + MSVC via UE) relies on luck per toolchain. Same class of defect as the PP_SimState.h include gap.",
+    "recommended_fix": "Add `#include <algorithm>` to PP_Routing.h."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "replay",
+    "title": "StepScenario silently drops logged commands beyond 16 sharing one apply_tick",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Scenario.h:79-87",
+    "evidence": "PP_Scenario.h:78-88: `\t\t// small; a per-tick index is [LATER] if a run ever has huge logs).` / `\t\tFCommand Cmds[16];` / `\t\tint32_t N = 0;` / `\t\tfor (const FLoggedCommand &E : State.ActionLog)` / `\t\t{` / `\t\t\tif (E.ApplyTick == Tick && N < 16)` / `\t\t\t{` / `\t\t\t\tCmds[N++] = E.Cmd;` / `\t\t\t}` / `\t\t}` / `\t\tStep(State, Tick, Cmds, N);`",
+    "detail": "A 17th command at one tick is never fed to Step: replay diverges from the live run that applied it, with no ReplayError latch — the silent failure mode the spine forbids. Golden scenario only ever uses 2/tick.",
+    "recommended_fix": "Overflow the cap loudly: assert, latch State.ReplayError, or size the batch from the log scan count."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "replay",
+    "title": "Step re-entered at the current tick re-applies that tick's commands, duplicating pipes with no latch",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:57-75",
+    "evidence": "PP_Sim.h:59-68: `\tif (Tick < State.Tick)` / `\t{` / `\t\tState.ReplayError = true; // the latch arrives with real commands (slice 1)` / `\t\treturn;` / `\t}` / `\tif (State.bTerminal)` / `\t{` / `\t\treturn;` / `\t}` / `\tState.Tick = Tick;` followed by the apply loop (lines 73-75): `\tfor (int32_t I = 0; I < NumCommands; ++I)` / `\t{` / `\t\tFEditResult R = ApplyDraw(State.Topology, Commands[I].A, Commands[I].B, Commands[I].Tier);`. A call Step(S, T) when State.Tick == T passes the guard and re-applies apply_tick==T commands.",
+    "detail": "Re-stepping a tick was harmless in the v1 spine (nonce redraw); now it appends duplicate pipes — legal parallel draws — so ApplyDraw succeeds and nothing latches. Current callers (StepScenario, PPSimDriver) never re-step.",
+    "recommended_fix": "Latch ReplayError (or no-op) when Tick == State.Tick and commands are passed, mirroring the backward-tick guard."
+  }
+]

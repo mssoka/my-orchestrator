@@ -1,0 +1,72 @@
+[
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "demo-reset",
+    "title": "r1 #13 unfixed: resetting the demo from a detail/archived/comparison route still strands a perpetual spinner",
+    "location": "client/src/demo/demo_update.gleam:642",
+    "evidence": "demo_update.gleam reset_demo: `#( Model( ..model, demo_store: Some(store), auth: Success(landlord), vacancies: Success(vacancies), dashboard_stats: Success(stats), vacancy_detail: NotAsked, leaderboard: NotAsked, application_detail: NotAsked, comparison_details: NotAsked, archived_vacancies: NotAsked, awaiting_list: NotAsked, notifications: NotAsked, toasts: [], ), demo_api.fetch_notifications(store, ApiReturnedNotifications), )` — no navigation, no route refetch. pages/vacancy_detail.gleam:26: `NotAsked | Loading -> view_loading()`",
+    "detail": "The banner reset button is global demo chrome, but reset only refetches notifications. On a detail/archived/comparison route the page data goes NotAsked with no fetch and no route change, so the page renders the loading spinner forever. r2 guard expects 'reset navigates home'.",
+    "recommended_fix": "In reset_demo, push routes.Demo (modem.push) alongside the notification fetch, or dispatch the current route's demo fetch via demo_entry_effects."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "demo-boot",
+    "title": "r1 #11 unfixed: demo_entry_effects still has no VacancyEdit arm — deep-linked edit refresh boots an empty form",
+    "location": "client/src/client.gleam:5825",
+    "evidence": "demo_entry_effects case arms: `routes.Demo | routes.Dashboard -> ... routes.VacancyDetail(id) | routes.VacancyHandoff(id) -> ... routes.ApplicationDetail(vid, aid) -> ... routes.ArchivedVacancies -> ... routes.Comparison(vid) -> ... _ -> []` — no VacancyEdit arm. is_demo_route includes `routes.VacancyEdit(id) -> string.starts_with(id, \"v-\")`. Boot comment at client.gleam:230: `modem.init does NOT dispatch at boot (it only installs listeners)`; modem.ffi.mjs do_init only adds a click listener. The only boot-path edit fetch (client.gleam:1059 `vacancy_api.get_for_edit(id, ApiReturnedVacancyForEdit)`) sits inside the ApiReturnedSession arm, which demo never dispatches (demo-guarded at client.gleam:1029).",
+    "detail": "The rework sets vacancy_edit_id in enter_demo ('so the get_for_edit response is accepted and the form can load') but nothing ever dispatches demo_api.get_for_edit at boot — a full-page refresh on /vacancies/v-maples/edit still renders an empty edit form.",
+    "recommended_fix": "Add `routes.VacancyEdit(id) -> [demo_api.get_for_edit(store, id, ApiReturnedVacancyForEdit)]` to demo_entry_effects."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "demo-create",
+    "title": "r1 #23 partially fixed: created demo vacancies still render 'Closes today' / '0d remaining' because days_remaining comes from a hardcoded id map",
+    "location": "client/src/demo/demo_store.gleam:744",
+    "evidence": "demo_days_remaining: `case vacancy_id { \"v-maples\" -> 14 \"v-harbour\" -> 21 _ -> 0 }` (used by both vacancy_with_stats and vacancy_detail). The create path's own comment (demo_store.gleam:1032): `// closes_at = created_at + validity_days — a new vacancy must not render // as closing/closed immediately`. vacancy_card.gleam:54-57: `Active if v.days_remaining <= 0 -> ... [html.text(\"Closes today\")]`; vacancy_card.gleam:181-183 renders `int.to_string(v.days_remaining) <> \"d\"` for the remaining stat. Create submits with status \"active\" (client.gleam:5993 `submit_vacancy(model, \"active\")`).",
+    "detail": "closes_at now honors validity_days, but every rendered 'remaining' surface reads the hardcoded days_remaining map, which returns 0 for any created id — so the r1 symptom (new demo vacancy shows amber 'Closes today' pill, detail shows '0d remaining') persists despite the fix's stated goal.",
+    "recommended_fix": "Derive days_remaining from closes_at minus the demo's fixed 'now' (or compute from validity_days for created vacancies) instead of the id-keyed map."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "dup",
+    "title": "demo_not_in_demo_toast reimplements client.gleam's add_toast with a divergent id convention that collides toast ids",
+    "location": "client/src/demo/demo_update.gleam:611",
+    "evidence": "demo_update.gleam: `let toast_id = model.next_toast_id + 1 ... toasts: list.append(model.toasts, [model.Toast(id: toast_id, message:, level: model.ToastInfo),]), next_toast_id: toast_id,` vs client.gleam add_toast (7045-7058): `let id = model.next_toast_id ... [new_toast, ..model.toasts] ... next_toast_id: id + 1` (prepend, cap 5). AppDismissToast (client.gleam:5037): `list.filter(model.toasts, fn(t) { t.id != id })`. The real add_toast is demo-reachable (e.g. AppTimedOutDownloadReport at 3208 fires it after a demo download timeout).",
+    "detail": "Demo uses id = next+1 and stores next+1, so the next real add_toast reuses the same id — two live toasts share an id and one dismiss removes both. Also drops the 5-toast cap and reverses ordering (append vs prepend).",
+    "recommended_fix": "Hoist add_toast to a shared helper and call it from demo_update, or match its convention exactly (id := next_toast_id; next := id + 1; prepend; cap)."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Orphaned demo exports after the rework: demo_api.check_session and demo_store.notifications have zero callers",
+    "location": "client/src/demo/demo_api.gleam:66",
+    "evidence": "demo_api.gleam:66 `pub fn check_session(` — grep across client/src and client/test finds no call site; client.gleam:1027-1028 comment: `// Demo mode never dispatches check_session (entry seeds auth directly);` (enter_demo builds auth inline at client.gleam:5796-5798). demo_store.gleam:1388 `pub fn notifications(store: DemoStore) -> List(Notification) { store.notifications }` — zero callers; demo_api uses notifications_unread (demo_store.gleam:1420) instead.",
+    "detail": "r1 #28's dead-code class persists in new form: the rework orphaned check_session when AppRequestedSessionRefresh became a no-op, and demo_store.notifications is dead — both duplicate the logic that actually runs.",
+    "recommended_fix": "Delete demo_api.check_session and demo_store.notifications, or route enter_demo's auth seeding through check_session as the single source."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "docs",
+    "title": "r1 #27 unfixed: visibilitychange doc paragraph still sits on handle_browser_change; demo_store repeats the pattern",
+    "location": "client/src/client.gleam:5047",
+    "evidence": "client.gleam:5047-5053: `/// Register a `visibilitychange` listener that silently refreshes /me each /// time a background tab comes back to the foreground. ...` immediately followed by `fn handle_browser_change(` — while `fn listen_visibility_refresh() -> Effect(Msg) {` (client.gleam:5885) has no doc. demo_store.gleam:1469-1473: `/// Stable short id suffix from a property name (lowercase alphanumeric, /// up to 8 chars) so re-created demo vacancies don't collide.` glued onto `fn add_days_iso(...)`; `fn id_suffix(` (1548) is bare.",
+    "detail": "Two doc paragraphs describe functions other than the ones they sit on — the exact r1 #27 class, still present at head plus a new instance in demo_store.",
+    "recommended_fix": "Move the visibilitychange paragraph onto listen_visibility_refresh and the id_suffix paragraph onto id_suffix."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "demo_api.gleam ships a fully-unused import (gleam/option) — compiler warnings on new code",
+    "location": "client/src/demo/demo_api.gleam:27",
+    "evidence": "demo_api.gleam:27 `import gleam/option.{type Option, None, Some}`; `gleam build` reports: `warning: Unused imported type ... demo_api.gleam:27:22`, `warning: Unused imported item ... 27:35`, `warning: Unused imported item ... 27:41` — the module body never references Option/None/Some.",
+    "detail": "A brand-new module in the rework still carries the r1 #29 unused-import class; the build warns on every compile.",
+    "recommended_fix": "Delete the gleam/option import from demo_api.gleam."
+  }
+]

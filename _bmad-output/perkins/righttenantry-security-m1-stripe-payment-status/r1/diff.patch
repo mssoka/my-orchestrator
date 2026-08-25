@@ -1,0 +1,810 @@
+diff --git a/_bmad-output/field-notes/righttenantry-security-m1-stripe-payment-status.md b/_bmad-output/field-notes/righttenantry-security-m1-stripe-payment-status.md
+new file mode 100644
+index 00000000..9b74af00
+--- /dev/null
++++ b/_bmad-output/field-notes/righttenantry-security-m1-stripe-payment-status.md
+@@ -0,0 +1,13 @@
++# Field notes — righttenantry-security-m1-stripe-payment-status (2026-08-18)
++
++- Squirrel NOT needed here (no schema change): the payment_status enum already
++  had 'pending' as the waiting state; `processed_stripe_event.event_type` is
++  free-form TEXT, so a new arm needs no migration — verify before assuming.
++- Stripe settle choice: `checkout.session.async_payment_succeeded` is
++  session-shaped (reuses complete_payment by session id, zero new SQL);
++  `payment_intent.succeeded` is PI-shaped and CANNOT settle pre-existing
++  rows (stripe_payment_intent_id is only written at completion). Pick the
++  session-shaped event.
++- Event-body fixtures default `payment_status` to "paid" or every
++  pre-existing completed-event integration test silently flips to the
++  fail-closed pending path (consent-capture test bit first).
+diff --git a/server/src/payment/stripe_client.gleam b/server/src/payment/stripe_client.gleam
+index a16b5ada..10e7a038 100644
+--- a/server/src/payment/stripe_client.gleam
++++ b/server/src/payment/stripe_client.gleam
+@@ -42,11 +42,16 @@ pub type StripeInvoice {
+ pub const checkout_consent_message: String = "By paying, you confirm that AI analysis will start immediately and that, once analysis results for this vacancy are made available to you, you can no longer cancel under the 14-day right of withdrawal. See our refund policy: https://righttenantry.ie/terms#refunds"
+ 
+ /// Versioned tag mixed into the `Idempotency-Key` hash so that adding /
+-/// changing the consent_collection backstop forces a fresh Stripe
++/// changing the hosted Stripe checkout shape forces a fresh Stripe
+ /// session even when a 24h-cached idempotency reply would otherwise
+-/// replay a session created without the consent fields. Bump when the
++/// replay a session created without the change. Bump when the
+ /// hosted Stripe checkout shape changes.
+-const checkout_consent_idempotency_tag: String = "consent_v2_promo"
++///
++/// v3 (M-1, 2026-08-18): `payment_method_types` restricted to card. The
++/// bump invalidates Stripe's 24h idempotent cache so an in-flight retry
++/// after deploy creates a card-only session instead of replaying a
++/// pre-deploy session that still allowed async methods.
++const checkout_consent_idempotency_tag: String = "consent_v3_card_only"
+ 
+ /// Create a Stripe Checkout Session for a one-time vacancy payment.
+ /// Returns the session ID and hosted checkout URL.
+@@ -84,38 +89,15 @@ pub fn create_checkout_session(
+       sku_label,
+     )
+   let body =
+-    [
+-      #("mode", "payment"),
+-      #("customer", customer_id),
+-      #("invoice_creation[enabled]", "true"),
+-      #("line_items[0][price]", price_id),
+-      #("line_items[0][quantity]", "1"),
+-      #("success_url", success_url),
+-      #("cancel_url", cancel_url),
+-      #("metadata[vacancy_id]", vacancy_id),
+-      #("metadata[sku_type]", sku_label),
+-      #("client_reference_id", user_id),
+-      #("automatic_tax[enabled]", "true"),
+-      #("customer_update[address]", "auto"),
+-      #("allow_promotion_codes", "true"),
+-      // Refund-policy consent backstop (Article 16(m) defence-in-depth).
+-      // Primary consent record lives in `payment_terms_acceptance`; this
+-      // is corroborating Stripe-side evidence captured on the
+-      // checkout.session.completed webhook as `session.consent.terms_of_service`.
+-      //
+-      // DASHBOARD DEPENDENCY: the URL the Stripe-rendered Terms-of-Service
+-      // checkbox points to is set in the Stripe Dashboard under
+-      // Branding → Public details → "Terms of service" (NOT a per-session
+-      // API parameter). It must be set to https://righttenantry.ie/terms#refunds
+-      // for the live and test accounts. See `deployment/deferred-work.md`
+-      // for the deployment-checklist entry.
+-      #("consent_collection[terms_of_service]", "required"),
+-      #(
+-        "custom_text[terms_of_service_acceptance][message]",
+-        checkout_consent_message,
+-      ),
+-    ]
+-    |> form_encode
++    checkout_session_form_body(
++      price_id:,
++      success_url:,
++      cancel_url:,
++      vacancy_id:,
++      user_id:,
++      customer_id:,
++      sku_label:,
++    )
+ 
+   case request.to("https://api.stripe.com/v1/checkout/sessions") {
+     Ok(req) -> {
+@@ -155,6 +137,66 @@ pub fn create_checkout_session(
+   }
+ }
+ 
++/// Build the form-encoded body for `POST /v1/checkout/sessions`. Extracted
++/// from `create_checkout_session` so the M-1 card-only restriction
++/// (`payment_method_types[0]=card`) is pinned by a unit test — a future
++/// refactor that drops the restriction would silently re-open the
++/// async-settlement gap the webhook gate defends.
++///
++/// M-1 rationale (security audit fix-now): without the restriction Stripe
++/// shows every payment method enabled on the account (SEPA direct debit,
++/// Boleto, Klarna), and async methods fire `checkout.session.completed`
++/// with `payment_status: "processing"`/`"unpaid"` — funds settle later or
++/// fail entirely (SEPA chargebacks). Card-only makes `completed` ⇒ `paid`
++/// for every session we create. Apple Pay / Google Pay / Link remain
++/// available (card-based, settle instantly) — only genuine async methods
++/// are excluded.
++@internal
++pub fn checkout_session_form_body(
++  price_id price_id: String,
++  success_url success_url: String,
++  cancel_url cancel_url: String,
++  vacancy_id vacancy_id: String,
++  user_id user_id: String,
++  customer_id customer_id: String,
++  sku_label sku_label: String,
++) -> String {
++  [
++    #("mode", "payment"),
++    #("customer", customer_id),
++    #("invoice_creation[enabled]", "true"),
++    #("line_items[0][price]", price_id),
++    #("line_items[0][quantity]", "1"),
++    #("success_url", success_url),
++    #("cancel_url", cancel_url),
++    #("metadata[vacancy_id]", vacancy_id),
++    #("metadata[sku_type]", sku_label),
++    #("client_reference_id", user_id),
++    #("automatic_tax[enabled]", "true"),
++    #("customer_update[address]", "auto"),
++    #("allow_promotion_codes", "true"),
++    // M-1: card-only restriction — see function doc.
++    #("payment_method_types[0]", "card"),
++    // Refund-policy consent backstop (Article 16(m) defence-in-depth).
++    // Primary consent record lives in `payment_terms_acceptance`; this
++    // is corroborating Stripe-side evidence captured on the
++    // checkout.session.completed webhook as `session.consent.terms_of_service`.
++    //
++    // DASHBOARD DEPENDENCY: the URL the Stripe-rendered Terms-of-Service
++    // checkbox points to is set in the Stripe Dashboard under
++    // Branding → Public details → "Terms of service" (NOT a per-session
++    // API parameter). It must be set to https://righttenantry.ie/terms#refunds
++    // for the live and test accounts. See `deployment/deferred-work.md`
++    // for the deployment-checklist entry.
++    #("consent_collection[terms_of_service]", "required"),
++    #(
++      "custom_text[terms_of_service_acceptance][message]",
++      checkout_consent_message,
++    ),
++  ]
++  |> form_encode
++}
++
+ /// Derive the Stripe `Idempotency-Key` for a checkout request. Exposed for
+ /// unit tests; production callers go through `create_checkout_session`.
+ ///
+diff --git a/server/src/payment/webhook_handler.gleam b/server/src/payment/webhook_handler.gleam
+index cd76f9e8..2e196cd9 100644
+--- a/server/src/payment/webhook_handler.gleam
++++ b/server/src/payment/webhook_handler.gleam
+@@ -1,5 +1,6 @@
+ //// Stripe Webhook Handler
+-//// Processes checkout.session.completed and checkout.session.expired events.
++//// Processes checkout.session.completed, checkout.session.async_payment_succeeded
++//// and checkout.session.expired events.
+ ////
+ //// Idempotency model — Stripe never reuses `event.id` per endpoint
+ //// (https://docs.stripe.com/webhooks#handle-duplicate-events). Each
+@@ -129,8 +130,15 @@ type CompletedSession {
+ /// processed via another path / metadata absent).
+ /// `Processed(None)` is also the universal expired-arm outcome: the failed
+ /// path never has a completion payload to surface.
++/// `PendingPayment` is the M-1 gate outcome: a `checkout.session.completed`
++/// (or `checkout.session.async_payment_succeeded`) event whose
++/// `payment_status` is anything other than `"paid"`. The event is claimed
++/// (so replays short-circuit) but NO state changes — the vacancy stays
++/// locked and the payment row stays `pending` until the async settle event
++/// arrives. Ack 200 so Stripe doesn't retry-storm.
+ type WebhookOutcome {
+   Processed(completion: Option(CompletedSession))
++  PendingPayment
+   Duplicate
+ }
+ 
+@@ -239,6 +247,16 @@ fn process_event(body: String, config: ServerConfig) -> Response {
+       option.None,
+       decode.optional(decode.string),
+     ))
++    // M-1 gate input: `checkout.session.payment_status`. Stripe always
++    // sends it on Session events, but `optionally_at` keeps a structurally
++    // missing field from failing the whole decode — an absent value
++    // decodes to None and the gate treats anything != "paid" as pending
++    // (fail-closed; see handle_checkout_completed).
++    use payment_status <- decode.then(decode.optionally_at(
++      ["data", "object", "payment_status"],
++      option.None,
++      decode.optional(decode.string),
++    ))
+     decode.success(#(
+       event_id,
+       event_type,
+@@ -248,6 +266,7 @@ fn process_event(body: String, config: ServerConfig) -> Response {
+       sku_type_metadata,
+       amount_total,
+       consent_terms,
++      payment_status,
+     ))
+   }
+ 
+@@ -265,6 +284,7 @@ fn process_event(body: String, config: ServerConfig) -> Response {
+       sku_type_metadata,
+       amount_total,
+       consent_terms,
++      payment_status,
+     )) -> {
+       // string.trim catches whitespace-only ids that would otherwise pass
+       // the empty-string check and hit the SQL CHECK constraint as a
+@@ -280,11 +300,21 @@ fn process_event(body: String, config: ServerConfig) -> Response {
+         }
+         _ ->
+           case event_type {
+-            "checkout.session.completed" ->
++            // Both arms share the same handler: async_payment_succeeded is
++            // Stripe's session-shaped settle event for delayed payment
++            // methods (SEPA/Boleto) — its `data.object` IS the Checkout
++            // Session (id, metadata, amount_total, payment_status="paid"),
++            // so the completed machinery (complete_payment by session id,
++            // sku routing, unlock, audit) applies unchanged. The M-1 gate
++            // still runs: anything != "paid" stays pending.
++            "checkout.session.completed"
++            | "checkout.session.async_payment_succeeded" ->
+               handle_checkout_completed(
+                 config,
++                event_type,
+                 event_id,
+                 session_id,
++                option.unwrap(payment_status, ""),
+                 vacancy_id,
+                 sku_type_metadata,
+                 payment_intent,
+@@ -304,11 +334,25 @@ fn process_event(body: String, config: ServerConfig) -> Response {
+   }
+ }
+ 
+-/// Process checkout.session.completed inside one transaction:
++/// Process a session-completion event (`checkout.session.completed` or
++/// `checkout.session.async_payment_succeeded`) inside one transaction:
+ /// claim event id, complete payment, unlock vacancy, audit. If any step
+ /// fails the whole unit rolls back and Stripe retries cleanly. Best-effort
+ /// notification + burst scoring run after commit.
+ ///
++/// M-1 gate: `payment_status` must be exactly "paid" before ANY state
++/// change. Async payment methods (SEPA/Boleto/Klarna) fire `completed`
++/// with `payment_status: "processing"`/`"unpaid"` — the unlock + burst
++/// scoring must NOT fire while funds are unsettled. Anything != "paid"
++/// takes the `PendingPayment` path: the event is claimed (Stripe replays
++/// short-circuit via the Duplicate gate), the vacancy stays locked, the
++/// payment row stays `pending`, and we ack 200 so Stripe doesn't
++/// retry-storm. Settlement then arrives on the succeed path
++/// (`checkout.session.async_payment_succeeded`, which carries
++/// `payment_status: "paid"`).
++///
++/// `arm` labels the claim + error logs with the actual event type.
++///
+ /// `amount_total` is Stripe's actual charged amount in cents. We persist
+ /// it onto the payment row inside the tx so the DB reflects what the
+ /// customer was charged, not what `STRIPE_VACANCY_PRICE_CENTS` was at
+@@ -317,8 +361,10 @@ fn process_event(body: String, config: ServerConfig) -> Response {
+ /// code — so the charged amount, not the env, is the source of truth.
+ fn handle_checkout_completed(
+   config: ServerConfig,
++  arm: String,
+   event_id: String,
+   session_id: String,
++  payment_status: String,
+   vacancy_id_opt: Option(String),
+   sku_type_metadata_opt: Option(String),
+   payment_intent_opt: Option(String),
+@@ -352,22 +398,33 @@ fn handle_checkout_completed(
+   // routing decides.
+   let outcome =
+     pog.transaction(config.db, fn(tx) {
+-      case sql.claim_stripe_event(tx, event_id, "checkout.session.completed") {
++      case sql.claim_stripe_event(tx, event_id, arm) {
+         Error(err) -> Error(WebhookQueryFailed(err))
+         Ok(pog.Returned(_, [])) -> Ok(Duplicate)
+         Ok(pog.Returned(_, _)) ->
+-          run_completed_side_effects(
+-            tx,
+-            config,
+-            event_id,
+-            session_id,
+-            payment_intent,
+-            amount_cents,
+-            amount_total_opt,
+-            consent_terms,
+-            vacancy_id_opt,
+-            sku_type_metadata_opt,
+-          )
++          // M-1 gate. Anything other than "paid" is a payment that hasn't
++          // settled (async method in flight, failed, or a structurally
++          // missing field). Claim the event so a Stripe replay is a
++          // Duplicate, then stop: no complete_payment, no unlock, no
++          // burst scoring, no audit. The row stays `pending` — that IS
++          // the deterministic waiting state — and the vacancy stays
++          // locked. Ack 200 below so Stripe doesn't retry-storm.
++          case payment_status {
++            "paid" ->
++              run_completed_side_effects(
++                tx,
++                config,
++                event_id,
++                session_id,
++                payment_intent,
++                amount_cents,
++                amount_total_opt,
++                consent_terms,
++                vacancy_id_opt,
++                sku_type_metadata_opt,
++              )
++            _ -> Ok(PendingPayment)
++          }
+       }
+     })
+ 
+@@ -376,21 +433,53 @@ fn handle_checkout_completed(
+       wisp.log_info(
+         "Stripe event "
+         <> event_id
+-        <> " already processed — skipping (checkout.session.completed)",
++        <> " already processed — skipping ("
++        <> arm
++        <> ")",
++      )
++      wisp.json_response("{}", 200)
++    }
++    Ok(PendingPayment) -> {
++      // No state change, no audit, no side effects — just the claim row.
++      // Ops visibility: this is the async-payment-in-flight branch; the
++      // vacancy must stay locked until checkout.session.async_payment_succeeded.
++      wisp.log_info(
++        "Stripe event "
++        <> event_id
++        <> " ("
++        <> arm
++        <> ") payment_status='"
++        <> payment_status
++        <> "' not 'paid' — vacancy stays locked, payment row stays pending; will settle via checkout.session.async_payment_succeeded",
+       )
+       wisp.json_response("{}", 200)
+     }
+     Ok(Processed(None)) -> {
+-      capture_consent_terms_absent(config.sentry, event_id, consent_terms_opt)
++      capture_consent_terms_absent(
++        config.sentry,
++        event_id,
++        arm,
++        consent_terms_opt,
++      )
+       wisp.json_response("{}", 200)
+     }
+     Ok(Processed(Some(CompletedUnlock(unlocked)))) -> {
+-      capture_consent_terms_absent(config.sentry, event_id, consent_terms_opt)
++      capture_consent_terms_absent(
++        config.sentry,
++        event_id,
++        arm,
++        consent_terms_opt,
++      )
+       run_post_commit_unlock(config, unlocked)
+       wisp.json_response("{}", 200)
+     }
+     Ok(Processed(Some(CompletedExtension(extended)))) -> {
+-      capture_consent_terms_absent(config.sentry, event_id, consent_terms_opt)
++      capture_consent_terms_absent(
++        config.sentry,
++        event_id,
++        arm,
++        consent_terms_opt,
++      )
+       run_post_commit_extension(config, extended)
+       wisp.json_response("{}", 200)
+     }
+@@ -404,36 +493,22 @@ fn handle_checkout_completed(
+       wisp.json_response("{}", 200)
+     }
+     Error(pog.TransactionRolledBack(WebhookQueryFailed(err))) ->
+-      handle_webhook_error(
+-        err,
+-        event_id,
+-        "checkout.session.completed",
+-        config.sentry,
+-      )
++      handle_webhook_error(err, event_id, arm, config.sentry)
+     Error(pog.TransactionRolledBack(MalformedMetadata(reason))) ->
+-      handle_malformed_metadata(
+-        reason,
+-        event_id,
+-        "checkout.session.completed",
+-        config.sentry,
+-      )
++      handle_malformed_metadata(reason, event_id, arm, config.sentry)
+     Error(pog.TransactionQueryError(err)) ->
+-      handle_webhook_error(
+-        err,
+-        event_id,
+-        "checkout.session.completed",
+-        config.sentry,
+-      )
++      handle_webhook_error(err, event_id, arm, config.sentry)
+   }
+ }
+ 
+ /// The Stripe consent_collection backstop is corroborating evidence — the
+ /// payment_terms_acceptance row is the load-bearing record. Fired only on
+ /// fresh (non-duplicate) events so Stripe redeliveries don't refire the
+-/// info event each time.
++/// info event each time. `arm` labels the event type in the message.
+ fn capture_consent_terms_absent(
+   sentry: sentry_client.Sentry,
+   event_id: String,
++  arm: String,
+   consent_terms_opt: Option(String),
+ ) -> Nil {
+   case consent_terms_opt {
+@@ -442,8 +517,7 @@ fn capture_consent_terms_absent(
+         sentry,
+         sentry_client.BackgroundEvent(
+           event_type: "StripeConsentTermsAbsent",
+-          message: "checkout.session.completed missing consent.terms_of_service for "
+-            <> event_id,
++          message: arm <> " missing consent.terms_of_service for " <> event_id,
+           level: sentry_client.LevelInfo,
+           tags: [#("stripe_event_id", event_id)],
+         ),
+@@ -1244,6 +1318,10 @@ fn handle_checkout_failed(
+       )
+       wisp.json_response("{}", 200)
+     }
++    // Unreachable on this arm — handle_checkout_failed only produces
++    // Duplicate or Processed — but the case must stay exhaustive now that
++    // WebhookOutcome carries PendingPayment.
++    Ok(PendingPayment) -> wisp.json_response("{}", 200)
+     Ok(Processed(_)) -> wisp.json_response("{}", 200)
+     Error(pog.TransactionRolledBack(WebhookQueryFailed(err))) ->
+       handle_webhook_error(
+diff --git a/server/test/integration/payment_integration_test.gleam b/server/test/integration/payment_integration_test.gleam
+index 0b267748..c2c4f565 100644
+--- a/server/test/integration/payment_integration_test.gleam
++++ b/server/test/integration/payment_integration_test.gleam
+@@ -434,6 +434,9 @@ fn build_event_body(
+ /// override `amount_total`. `sku_type = ""` omits the metadata field
+ /// (pre-extension in-flight session shape). `amount_total` lets us pin
+ /// extension webhooks at the correct price or simulate promo-code drift.
++/// `payment_status` defaults to `"paid"` — the M-1 happy path — so the
++/// existing completed-event tests keep exercising the unlock path through
++/// the new gate.
+ fn build_event_body_with_options(
+   event_id: String,
+   event_type: String,
+@@ -441,6 +444,28 @@ fn build_event_body_with_options(
+   vacancy_id: String,
+   sku_type: String,
+   amount_total: Int,
++) -> String {
++  build_event_body_full(
++    event_id,
++    event_type,
++    session_id,
++    vacancy_id,
++    sku_type,
++    amount_total,
++    "paid",
++  )
++}
++
++/// Full builder — adds `payment_status` injection for the M-1 gate tests
++/// (`"processing"` / `"unpaid"` must be refused, `"paid"` must unlock).
++fn build_event_body_full(
++  event_id: String,
++  event_type: String,
++  session_id: String,
++  vacancy_id: String,
++  sku_type: String,
++  amount_total: Int,
++  payment_status: String,
+ ) -> String {
+   let metadata_pairs = case vacancy_id {
+     "" -> []
+@@ -463,6 +488,7 @@ fn build_event_body_with_options(
+             #("payment_intent", json.string("pi_test_" <> session_id)),
+             #("metadata", json.object(metadata_pairs)),
+             #("amount_total", json.int(amount_total)),
++            #("payment_status", json.string(payment_status)),
+           ]),
+         ),
+       ]),
+@@ -562,6 +588,251 @@ pub fn duplicate_stripe_event_is_idempotent_test() {
+   count_payment_notifications(db, vacancy_id) |> should.equal(1)
+ }
+ 
++// ============================================================================
++// M-1 GATE — payment_status must be "paid" before any unlock (audit fix-now)
++// ============================================================================
++
++/// A checkout.session.completed event with payment_status="processing"
++/// (async payment method in flight) must NOT unlock the vacancy, must NOT
++/// touch the payment row (stays pending), must NOT fire audit/burst, and
++/// must still ack 200 so Stripe doesn't retry-storm. The event IS claimed
++/// so a replay short-circuits — deterministic.
++fn run_pending_completed_assertions(
++  db: pog.Connection,
++  cfg: config.ServerConfig,
++  event_id: String,
++  session_id: String,
++  vacancy_id: String,
++  payment_status: String,
++) -> Nil {
++  let body =
++    build_event_body_full(
++      event_id,
++      "checkout.session.completed",
++      session_id,
++      vacancy_id,
++      "vacancy_unlock",
++      29_900,
++      payment_status,
++    )
++  let resp = post_webhook(cfg, body, sign_body(body, test_webhook_secret))
++  resp.status |> should.equal(200)
++
++  // Vacancy stays locked.
++  let assert Ok(is_paid) =
++    test_db.query_int(
++      db,
++      "SELECT is_paid::int FROM vacancy WHERE id = '" <> vacancy_id <> "'::uuid",
++    )
++  is_paid |> should.equal(0)
++
++  // Payment row stays in the deterministic waiting state.
++  let assert Ok(row_status) =
++    test_db.query_text(
++      db,
++      "SELECT status::text FROM payment WHERE stripe_session_id = '"
++        <> session_id
++        <> "'",
++    )
++  row_status |> should.equal("pending")
++
++  // Event claimed (idempotency) but nothing else happened.
++  count_processed_event(db, event_id) |> should.equal(1)
++  let assert Ok(audit_count) =
++    test_db.query_int(
++      db,
++      "SELECT count(*)::int FROM audit_log
++       WHERE event_type = 'payment_completed'",
++    )
++  audit_count |> should.equal(0)
++  count_payment_notifications(db, vacancy_id) |> should.equal(0)
++
++  // No burst scoring: an unscored application stays un-analysed.
++  let assert Ok(analysis_count) =
++    test_db.query_int(db, "SELECT count(*)::int FROM ai_analysis aa
++       JOIN application a ON a.id = aa.application_id
++       WHERE a.vacancy_id = '" <> vacancy_id <> "'::uuid")
++  analysis_count |> should.equal(0)
++}
++
++pub fn checkout_completed_processing_keeps_vacancy_locked_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let cfg = webhook_config(db)
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, False)
++  let assert Ok(_) =
++    test_db.seed_application(db, vacancy_id, "proc@example.com")
++  let session_id = "cs_m1_processing_001"
++  let assert Ok(_) = test_db.seed_payment(db, vacancy_id, session_id, "pending")
++
++  run_pending_completed_assertions(
++    db,
++    cfg,
++    "evt_m1_processing_001",
++    session_id,
++    vacancy_id,
++    "processing",
++  )
++}
++
++pub fn checkout_completed_unpaid_keeps_vacancy_locked_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let cfg = webhook_config(db)
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, False)
++  let assert Ok(_) =
++    test_db.seed_application(db, vacancy_id, "unpaid@example.com")
++  let session_id = "cs_m1_unpaid_001"
++  let assert Ok(_) = test_db.seed_payment(db, vacancy_id, session_id, "pending")
++
++  run_pending_completed_assertions(
++    db,
++    cfg,
++    "evt_m1_unpaid_001",
++    session_id,
++    vacancy_id,
++    "unpaid",
++  )
++}
++
++/// Fail-closed on a structurally missing payment_status field: Stripe always
++/// sends it on Session events, so an absent field means malformed data — the
++/// gate must refuse to unlock rather than assume paid.
++pub fn checkout_completed_missing_payment_status_keeps_vacancy_locked_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let cfg = webhook_config(db)
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, False)
++  let session_id = "cs_m1_missing_001"
++  let assert Ok(_) = test_db.seed_payment(db, vacancy_id, session_id, "pending")
++
++  let event_id = "evt_m1_missing_001"
++  // Hand-built body with NO payment_status key.
++  let body =
++    json.object([
++      #("id", json.string(event_id)),
++      #("type", json.string("checkout.session.completed")),
++      #(
++        "data",
++        json.object([
++          #(
++            "object",
++            json.object([
++              #("id", json.string(session_id)),
++              #("payment_intent", json.string("pi_test_" <> session_id)),
++              #(
++                "metadata",
++                json.object([#("vacancy_id", json.string(vacancy_id))]),
++              ),
++              #("amount_total", json.int(29_900)),
++            ]),
++          ),
++        ]),
++      ),
++    ])
++    |> json.to_string
++  let resp = post_webhook(cfg, body, sign_body(body, test_webhook_secret))
++  resp.status |> should.equal(200)
++
++  let assert Ok(is_paid) =
++    test_db.query_int(
++      db,
++      "SELECT is_paid::int FROM vacancy WHERE id = '" <> vacancy_id <> "'::uuid",
++    )
++  is_paid |> should.equal(0)
++  let assert Ok(row_status) =
++    test_db.query_text(
++      db,
++      "SELECT status::text FROM payment WHERE stripe_session_id = '"
++        <> session_id
++        <> "'",
++    )
++  row_status |> should.equal("pending")
++  count_processed_event(db, event_id) |> should.equal(1)
++}
++
++/// The full pending-state machine: a `processing` completed event leaves the
++/// vacancy locked and the row pending; the succeed path
++/// (`checkout.session.async_payment_succeeded` — Stripe's session-shaped
++/// settle event for delayed methods, carrying payment_status="paid") then
++/// completes the payment, unlocks the vacancy, audits, notifies, and fires
++/// burst scoring. Replays of the settle event short-circuit.
++pub fn async_payment_succeeded_settles_pending_payment_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let cfg = webhook_config(db)
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, False)
++  let assert Ok(_) =
++    test_db.seed_application(db, vacancy_id, "settle@example.com")
++  let session_id = "cs_m1_settle_001"
++  let assert Ok(_) = test_db.seed_payment(db, vacancy_id, session_id, "pending")
++  let pending_event_id = "evt_m1_settle_pending"
++
++  // Phase 1: pending completed event — vacancy stays locked.
++  run_pending_completed_assertions(
++    db,
++    cfg,
++    pending_event_id,
++    session_id,
++    vacancy_id,
++    "processing",
++  )
++
++  // Phase 2: async settle event — funds landed, unlock proceeds.
++  let settle_event_id = "evt_m1_settle_success"
++  let body =
++    build_event_body_full(
++      settle_event_id,
++      "checkout.session.async_payment_succeeded",
++      session_id,
++      vacancy_id,
++      "vacancy_unlock",
++      29_900,
++      "paid",
++    )
++  let resp = post_webhook(cfg, body, sign_body(body, test_webhook_secret))
++  resp.status |> should.equal(200)
++
++  let assert Ok(is_paid) =
++    test_db.query_int(
++      db,
++      "SELECT is_paid::int FROM vacancy WHERE id = '" <> vacancy_id <> "'::uuid",
++    )
++  is_paid |> should.equal(1)
++  let assert Ok(row_status) =
++    test_db.query_text(
++      db,
++      "SELECT status::text FROM payment WHERE stripe_session_id = '"
++        <> session_id
++        <> "'",
++    )
++  row_status |> should.equal("completed")
++  // Audit + notification fired on the settle path, keyed to the settle event.
++  count_audit_for_event(db, settle_event_id) |> should.equal(1)
++  count_payment_notifications(db, vacancy_id) |> should.equal(1)
++  count_processed_event(db, settle_event_id) |> should.equal(1)
++  // The pending completed event remains claimed (it was NOT reprocessed).
++  count_processed_event(db, pending_event_id) |> should.equal(1)
++
++  // Burst scoring fired: the seeded application now has an ai_analysis row.
++  let assert Ok(analysis_count) =
++    test_db.query_int(db, "SELECT count(*)::int FROM ai_analysis aa
++       JOIN application a ON a.id = aa.application_id
++       WHERE a.vacancy_id = '" <> vacancy_id <> "'::uuid")
++  analysis_count |> should.equal(1)
++
++  // Phase 3: replay of the settle event short-circuits (idempotent).
++  let resp2 = post_webhook(cfg, body, sign_body(body, test_webhook_secret))
++  resp2.status |> should.equal(200)
++  count_processed_event(db, settle_event_id) |> should.equal(1)
++  count_audit_for_event(db, settle_event_id) |> should.equal(1)
++  count_payment_notifications(db, vacancy_id) |> should.equal(1)
++}
++
+ pub fn payment_failed_includes_stripe_event_id_test() {
+   use <- unitest.tag("integration")
+   let db = setup()
+@@ -1460,6 +1731,8 @@ fn build_event_with_consent(
+             #("payment_intent", json.string("pi_test_" <> session_id)),
+             #("metadata", metadata),
+             #("amount_total", json.int(29_900)),
++            // M-1 gate: consent capture only happens on the paid path.
++            #("payment_status", json.string("paid")),
+             #("consent", consent),
+           ]),
+         ),
+diff --git a/server/test/payment/stripe_client_test.gleam b/server/test/payment/stripe_client_test.gleam
+index e78d5936..8fd5b348 100644
+--- a/server/test/payment/stripe_client_test.gleam
++++ b/server/test/payment/stripe_client_test.gleam
+@@ -3,6 +3,7 @@
+ //// cover the response-shape logic that turns Stripe JSON into our
+ //// `StripeInvoice` records.
+ 
++import gleam/list
+ import gleam/option
+ import gleam/string
+ import gleeunit/should
+@@ -362,6 +363,37 @@ pub fn idempotency_key_changes_with_sku_label_test() {
+   unlock |> should.not_equal(extension)
+ }
+ 
++// -- checkout_session_form_body (M-1 card-only restriction) -------------------
++
++/// Pins remediation arm 2 of security finding M-1: every checkout session
++/// we create must restrict `payment_method_types` to card so
++/// `checkout.session.completed` ⇒ `payment_status: "paid"`. A future
++/// refactor that drops the restriction silently re-opens the
++/// async-settlement gap the webhook gate defends — this test is the tripwire.
++pub fn checkout_form_body_restricts_payment_methods_to_card_test() {
++  let body =
++    stripe_client.checkout_session_form_body(
++      price_id: "price_abc",
++      success_url: "https://example.com/success",
++      cancel_url: "https://example.com/cancel",
++      vacancy_id: "vac-123",
++      user_id: "user-123",
++      customer_id: "cus_123",
++      sku_label: "vacancy_unlock",
++    )
++  // The card-only restriction must be present, and only once (split on the
++  // key prefix: 2 parts = exactly 1 occurrence).
++  string.contains(body, "payment_method_types%5B0%5D=card")
++  |> should.be_true
++  string.split(body, "payment_method_types%5B")
++  |> list.length
++  |> should.equal(2)
++  // Mode stays one-time payment and the SKU metadata survives the move.
++  string.contains(body, "mode=payment") |> should.be_true
++  string.contains(body, "metadata%5Bsku_type%5D=vacancy_unlock")
++  |> should.be_true
++}
++
+ // -- helpers ------------------------------------------------------------------
+ 
+ fn padding(n: Int, char: String) -> String {

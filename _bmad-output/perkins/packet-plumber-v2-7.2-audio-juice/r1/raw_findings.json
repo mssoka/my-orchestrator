@@ -1,0 +1,212 @@
+[
+ {
+  "source": "blind",
+  "severity": "blocker",
+  "category": "missing-wiring",
+  "title": "Key.M is emitted and Toggle_Mute is handled, but no hunk ever produces the Toggle_Mute intent \u2014 the mute toggle is unreachable",
+  "location": "app/input/poll.odin:hunk + app/input/exec.odin:hunk (Key\u2192Intent translation layer has no hunk in the diff)",
+  "evidence": "+\tif rl.IsKeyPressed(.M) { append(&inp.events, Device_Event(Key_Press{key = .M})) }\n+\tcase Toggle_Mute:\n+\t\t// 7.2: the audio mute toggle \u2014 app effect (cosmetic; captions stay on).\n+\t\tif inp.on_mute != nil { inp.on_mute(inp.user, inp) }",
+  "detail": "Diff adds the M keypress, the Key enum member, the intent variant, and the handler \u2014 but the untouched device-event\u2192Intent translation layer constructs no Toggle_Mute, so on_mute never fires.",
+  "recommended_fix": "Add the Key.M case (or table entry) to the input translation layer mapping Key_Press{.M} to Toggle_Mute, and cover the harness-scripted key path with a test."
+ },
+ {
+  "source": "blind",
+  "severity": "warning",
+  "category": "caption-priority",
+  "title": "Single last-writer-wins caption slot: 'packet delivered' instantly overwrites a crisis caption, breaking the every-alert-captioned claim",
+  "location": "app/audio/audio.odin:consumer_consume hunk",
+  "evidence": "+\t\t\tset_caption(&a.caption, crisis_caption(&a.caption, cat, e), e.tick)\n...\n+\t\t\tset_caption(&a.caption, \"packet delivered\", e.tick)",
+  "detail": "Any unthrottled arrival after a crisis in the same event slice replaces the crisis caption immediately; the 2 s dwell and the 'caption for every alert' a11y claim only hold for the last event.",
+  "recommended_fix": "Give captions priority levels (crisis over arrival) or per-alert caption slots; a lower-priority arrival must not overwrite a live crisis caption."
+ },
+ {
+  "source": "blind",
+  "severity": "warning",
+  "category": "overflow-risk",
+  "title": "u8 pending play counters accumulate unboundedly in the harness mirror, which never calls audio_flush",
+  "location": "app/audio/audio.odin:Pending struct + harness/run.odin:hunk",
+  "evidence": "+\tarrival_plays:  u8,\n+\t\t\ta.pending.arrival_plays += 1\n+\t\t\tif audio_consumer_on {\n+\t\t\t\tau.consumer_consume(&audio_consumer, state.events[before:], cat)\n+\t\t\t}",
+  "detail": "The app resets pending via audio_flush each frame; the harness mirror never flushes, so 256+ unthrottled arrivals across the run overflow the u8 (wrap, or trap on checked builds).",
+  "recommended_fix": "Widen the play counters (u32/uint), or reset/flush pending per tick in the harness mirror so the counters stay bounded."
+ },
+ {
+  "source": "blind",
+  "severity": "note",
+  "category": "dead-code",
+  "title": "SYNTH_RAMP_S is declared but never referenced \u2014 the ramp length 110 is hardcoded separately",
+  "location": "app/audio/audio.odin:99-100",
+  "evidence": "+SYNTH_RAMP_S      :: f32(0.005) // 5 ms attack/release \u2014 no click artifacts\n+SYNTH_RAMP_SAMPLES :: 110       // int(0.005 s * 22050 Hz) \u2014 a constant (110.25 truncates)",
+  "detail": "No reference to SYNTH_RAMP_S anywhere in the diff; even the comment derives 110 from it instead of the code. Dead constant that can silently drift from the hardcoded ramp.",
+  "recommended_fix": "Define SYNTH_RAMP_SAMPLES :: int(SYNTH_RAMP_S * SYNTH_SAMPLE_RATE), or delete SYNTH_RAMP_S."
+ },
+ {
+  "source": "blind",
+  "severity": "note",
+  "category": "stale-comment",
+  "title": "audio.dem header claims Packet_Arrived events flow from tick ~16, but the first explicit spawn is at 2000 ms = tick 40",
+  "location": "demos/audio.dem:header vs spawn schedule",
+  "evidence": "+# 60 s) plus explicit res->host spawns so Packet_Arrived events flow from\n+# tick ~16 on.\n...\n+at 2000ms spawn 0 2",
+  "detail": "At the pinned 20 Hz the first spawn (2000 ms) is tick 40, so spawn-driven arrivals cannot begin at tick 16; the recipe comment is stale or misattributes arrival timing.",
+  "recommended_fix": "Update the comment to match the spawn schedule, or move the first spawn earlier if tick ~16 arrivals were intended."
+ },
+ {
+  "source": "edge",
+  "severity": "blocker",
+  "category": "input-chain",
+  "title": "M keypress is never mapped to the Toggle_Mute intent \u2014 the entire mute path is dead code",
+  "location": "app/input/mouse.odin:315-343",
+  "evidence": "app/input/poll.odin:60: `if rl.IsKeyPressed(.M) { append(&inp.events, Device_Event(Key_Press{key = .M})) }` \u2014 but mouse_map's two key switches have no .M case. Phase-1 (mouse.odin:116-121): `#partial switch keys[i] { case .P, .Space: append(out, Intent(Toggle_Pause{})) case .D: append(out, Intent(Toggle_Overlay{})) case .T: append(out, Intent(Toggle_Assist{}))`. Phase-2 (mouse.odin:315-343): `#partial switch k.key { case .X, .Delete: append(out, Intent(Demolish{})) case .U: append(out, Intent(Arm_Preview{})) case .One, .Two: ... case .E: append(out, Intent(Set_Lane{lane = pp.LANE_EXPRESS})) case .S: append(out, Intent(Set_Lane{lane = pp.LANE_STANDARD})) case .B: append(out, Intent(Set_Lane{lane = pp.LANE_BEST_EFFORT})) case: // phase-1 keys already handled }`. Repo-wide grep: `Toggle_Mute` appears only in app/input/types.odin (definition) and app/input/exec.odin:44-46 (`case Toggle_Mute: if inp.on_mute != nil { inp.on_mute(inp.user, inp) }`) \u2014 no producer appends `Intent(Toggle_Mute{})` anywhere.",
+  "detail": "The chain device-event \u2192 intent \u2192 effect breaks at the mapping link: the M Key_Press falls into the `case:` fallthrough in both switches, so `on_mute`/`effect_mute`/`toggle_mute` never run. Muting is non-functional despite README and PR claims.",
+  "recommended_fix": "Add a `.M` case in mouse_map's phase-1 key switch emitting `append(out, Intent(Toggle_Mute{}))` (phase-2 is suppressed on placement-press frames, unlike T/D)."
+ },
+ {
+  "source": "edge",
+  "severity": "warning",
+  "category": "boundary",
+  "title": "Multiple played alerts in one consume call share one caption slot \u2014 only the last caption is ever rendered",
+  "location": "app/audio/audio.odin:167-180",
+  "evidence": "consumer_consume sets the single Caption per event: `set_caption(&a.caption, crisis_caption(&a.caption, cat, e), e.tick)` ... `a.arrival_last_tick = e.tick` ... `set_caption(&a.caption, \"packet delivered\", e.tick)`. audio_flush plays ALL staged alerts regardless: `for _ in 0..<a.pending.crisis_plays { rl.PlaySound(...) }` / `for _ in 0..<a.pending.arrival_plays { rl.PlaySound(...) }`. Events arrive tick-ordered (app/main.odin feeds `app.state.events[app.audio_mark:]` once per frame, catch-up frames deliver multiple ticks), and flow_step's Packet_Arrived events precede crisis_evaluate's Crisis_Triggered only within the SAME tick \u2014 a later tick's arrival in the same frame overwrites the crisis caption.",
+  "detail": "In a catch-up frame containing a crisis at tick T plus a throttle-passing arrival at T+1/T+2, both alerts play but the rendered caption is only \"packet delivered\" \u2014 the crisis alert's caption is never displayed, breaching the every-alert-captioned contract.",
+  "recommended_fix": "Suppress arrival captions while a crisis caption is within its dwell (or give captions priority), so a played crisis alert always keeps its on-screen caption."
+ },
+ {
+  "source": "edge",
+  "severity": "note",
+  "category": "boundary",
+  "title": "Multiple Crisis_Triggered events in one slice collapse to the last variant \u2014 N stings all play one variant",
+  "location": "app/audio/audio.odin:165-166",
+  "evidence": "`a.pending.crisis_plays += 1` then `a.pending.crisis_variant = variant` (each draw overwrites the stored variant), and audio_flush replays only the survivor: `for _ in 0..<a.pending.crisis_plays { rl.PlaySound(a.crisis[a.pending.crisis_variant]) }`. The core can emit several per tick: core/crisis.odin:425 `for si in 0..<len(de.set_pieces) {` with per-set-piece `crisis_trigger(state, tick, ai, u16(si), ...)` (dedup is per (archetype, set_piece)).",
+  "detail": "Each crisis draws a variant, but only the last is kept; earlier picks are discarded and their stings play the wrong variant. Unreachable with shipped single-set-piece catalogs; latent for multi-set-piece data.",
+  "recommended_fix": "Play each crisis's own variant at consume time (queue one variant per play, e.g. a small fixed ring), or cap pending.crisis_plays to the kept variant."
+ },
+ {
+  "source": "edge",
+  "severity": "note",
+  "category": "boundary",
+  "title": "Caption never expires on Game_Over \u2014 the frozen tick keeps caption_live true indefinitely",
+  "location": "app/audio/audio.odin:218-220",
+  "evidence": "`caption_live :: proc(a: ^Audio, tick: u64) -> (string, bool) { if !a.caption.live || tick > a.caption.until_tick { return \"\", false }` \u2014 expiry requires the tick to advance past until_tick, but a terminal run stops stepping (app/main.odin: `if app.state.terminal { break }` / `if app.state.terminal { app.mode = .Game_Over }`), freezing app.tick. draw_hud calls `draw_audio_caption(app)` (app/main.odin:1011) unconditionally \u2014 no Run/Paused mode gate, unlike `draw_drop_markers` which is gated `if app.mode == .Run || app.mode == .Paused`.",
+  "detail": "The terminal tick's last caption (e.g. \"packet delivered\" or \"crisis alert\") lingers on the game-over screen forever, because the frozen tick never exceeds until_tick; only retry clears it.",
+  "recommended_fix": "Gate draw_audio_caption on mode Run/Paused (mirroring draw_drop_markers) or force-expire the caption when the run goes terminal."
+ },
+ {
+  "source": "acceptance",
+  "severity": "blocker",
+  "category": "missing-implementation",
+  "title": "M-key mute chain broken: Key.M is never translated to Toggle_Mute, so the executor case is unreachable and mute cannot be toggled",
+  "location": "app/input/mouse.odin:314-344",
+  "evidence": "poll emits the key: app/input/poll.odin:60 \u2014 `if rl.IsKeyPressed(.M) { append(&inp.events, Device_Event(Key_Press{key = .M})) }`. But mouse_map's two key switches have no .M case. Phase 1 (mouse.odin:77-88): `case .Esc:` / `if keys_n < len(keys) { keys[keys_n] = .Esc; keys_n += 1 }` / `case: // R/Enter map via the Game_Over early return; phase-2 keys below`. Phase 2 (mouse.odin:314-344): `#partial switch k.key {` ... `case .E:` `append(out, Intent(Set_Lane{lane = pp.LANE_EXPRESS}))` ... `case .B:` `append(out, Intent(Set_Lane{lane = pp.LANE_BEST_EFFORT}))` / `case: // phase-1 keys already handled` / `}`. The executor half exists but nothing produces the intent \u2014 app/input/exec.odin:44-46: `case Toggle_Mute:` / `// 7.2: the audio mute toggle \u2014 app effect (cosmetic; captions stay on).` / `if inp.on_mute != nil { inp.on_mute(inp.user, inp) }`. Repo-wide grep `Toggle_Mute` over *.odin returns only ./app/input/types.odin:147 (struct decl), ./app/input/types.odin:277 (Intent union member), ./app/input/exec.odin:44 (executor case) \u2014 zero construction sites; dispatch_frame only runs mouse_map/touch_map/controller_map, and touch/controller have no mute either.",
+  "detail": "Orchestrator guard: 'M mutes through the intent layer... trace the FULL chain: device poll -> device event -> intent translation -> apply_intent -> on_mute effect -> toggle_mute. Every link must exist.' The intent-translation link is missing, so M does nothing; README's '`M` mutes/unmutes audio' and the PR-body 'Toggle_Mute intent + effect hook' claim are false.",
+  "recommended_fix": "Add `case .M: append(out, Intent(Toggle_Mute{}))` to mouse_map's phase-2 key switch in app/input/mouse.odin (after the .B lane case), matching the E/S/B app-effect pattern."
+ },
+ {
+  "source": "architecture",
+  "severity": "blocker",
+  "category": "input-chain",
+  "title": "M-key mute chain broken: Key_Press .M is never mapped to the Toggle_Mute intent \u2014 mute, effect_mute, on_mute and the README claim are all dead code",
+  "location": "app/input/mouse.odin:79-90,116-123,316-343; app/input/poll.odin:60; app/input/exec.odin:44-46",
+  "evidence": "app/input/poll.odin:60: `if rl.IsKeyPressed(.M) { append(&inp.events, Device_Event(Key_Press{key = .M})) }` \u2014 but input.odin:118 routes ALL Key_Press through `mouse_map(inp, events, &inp.intents)`, whose switches have no .M case. mouse.odin:79-90 (phase-1 collector): `#partial switch e.key {` / `case .P, .Space:` ... `case .D:` ... `case .T:` ... `case .Esc:` / `case: // R/Enter map via the Game_Over early return; phase-2 keys below`. mouse.odin:116-123 (phase-1 emitter): `case .P, .Space:` `append(out, Intent(Toggle_Pause{}))` / `case .D:` `append(out, Intent(Toggle_Overlay{}))` / `case .T:` `append(out, Intent(Toggle_Assist{}))` / `case .Esc:`. mouse.odin:316-343 (phase-2): `case .X, .Delete:` ... `case .U:` ... `case .One, .Two:` ... `case .E:` ... `case .S:` ... `case .B:` / `case: // phase-1 keys already handled`. exec.odin:44-46: `case Toggle_Mute:` / `// 7.2: the audio mute toggle \u2014 app effect (cosmetic; captions stay on).` / `if inp.on_mute != nil { inp.on_mute(inp.user, inp) }` \u2014 unreachable. Repo-wide grep for Toggle_Mute: declared (types.odin:147, union member types.odin:277), consumed (exec.odin:44) \u2014 produced NOWHERE. README.md diff hunk claims: \"`M` mutes/unmutes audio (7.2; captions stay on while muted \u2014 every audio alert is also captioned on screen).\"",
+  "detail": "The diff wired poll, Key enum, Intent union, on_mute, apply_intent case and effect \u2014 but skipped mouse_map, where 5.4 translates every key to an intent. The advertised mute control does nothing; acceptance criterion 'M mutes' fails, silently.",
+  "recommended_fix": "Add `case .M:` to mouse_map's phase-1 collector and emitter emitting `Intent(Toggle_Mute{})`, exactly mirroring the .T/.D pattern; widen the fixed `keys: [4]Key` buffer to [5]."
+ },
+ {
+  "source": "architecture",
+  "severity": "note",
+  "category": "tech-debt",
+  "title": "Pending staging collapses multiple same-frame alerts into N plays of the last-drawn variant \u2014 earlier drawn variants never sound",
+  "location": "app/audio/audio.odin:79-84,166-167,192-197",
+  "evidence": "audio.odin:79-84: `Pending :: struct {` / `crisis_plays:   u8,` / `crisis_variant: i32,` / `arrival_plays:  u8,` / `arrival_variant: i32,` / `}`. Consumer, audio.odin:166-167: `a.pending.crisis_plays += 1` / `a.pending.crisis_variant = variant`. Flush, audio.odin:192-197: `for _ in 0..<a.pending.crisis_plays {` / `rl.PlaySound(a.crisis[a.pending.crisis_variant])` / `}` / `for _ in 0..<a.pending.arrival_plays {` / `rl.PlaySound(a.arrival[a.pending.arrival_variant])`.",
+  "detail": "Two same-kind alerts in one frame (catch-up arrivals passing the tick throttle, dual crises) stage two plays of only the last variant; the first drawn variant consumes a cosmetic draw but never plays. Fidelity only \u2014 determinism unaffected.",
+  "recommended_fix": "Drop the play counters and flush each kind once, or stage a small fixed variant array per kind so every drawn variant plays."
+ },
+ {
+  "source": "codebase",
+  "severity": "blocker",
+  "category": "coverage-gap",
+  "title": "M mute key is dead end-to-end \u2014 no device-event\u2192intent mapping exists for Toggle_Mute",
+  "location": "app/input/mouse.odin:79,315",
+  "evidence": "app/input/poll.odin:60: `if rl.IsKeyPressed(.M) { append(&inp.events, Device_Event(Key_Press{key = .M})) }` \u2014 but mouse_map's two translation switches have no .M case: app/input/mouse.odin:90 `case: // R/Enter map via the Game_Over early return; phase-2 keys below` (phase-1 switch at :79 handles only .P,.Space,.D,.T,.Esc) and app/input/mouse.odin:343 `case: // phase-1 keys already handled` (phase-2 switch at :315 handles only .X,.Delete,.U,.One,.Two,.E,.S,.B). app/input/exec.odin:44-46 `case Toggle_Mute:` / `if inp.on_mute != nil { inp.on_mute(inp.user, inp) }`. grep Toggle_Mute across all .odin: only app/input/types.odin:147 `Toggle_Mute :: struct {}`, app/input/types.odin:277 (Intent union member), app/input/exec.odin:44 \u2014 no site constructs `Intent(Toggle_Mute{})`. app/main.odin:269 `app.input.on_mute = effect_mute`, :655-657 `effect_mute :: proc(...)` / `au.toggle_mute(&app.audio)`. README.md:24 \"`M` mutes/unmutes audio (7.2; captions stay on while muted \u2014 every audio\".",
+  "detail": "poll emits Key_Press{.M}, but both #partial key switches drop it, so no Toggle_Mute intent is ever produced. effect_mute/toggle_mute and the \"audio muted - press M\" caption are unreachable; the README/PR-body M-mute claim is false in the built game.",
+  "recommended_fix": "In mouse_map, map the key: add `case .M: append(out, Intent(Toggle_Mute{}))` to the phase-2 switch (mouse.odin:315), or collect .M with the phase-1 keys after growing `keys: [4]Key` to `[5]`."
+ },
+ {
+  "source": "codebase",
+  "severity": "warning",
+  "category": "doc-contract",
+  "title": "assets/audio/README.md names Suno and omits the terms notes the PR body claims it carries",
+  "location": "assets/audio/README.md:34",
+  "evidence": "assets/audio/README.md:34-35: \"1. Generate in Suno (paid tier \u2014 commercial rights, owned outright) or your / editor of choice.\" \u2014 grep for elevenlabs/sublicens/terms in the file: zero hits. PR body (spec/pr-body.md): \"Terms notes carried in `assets/audio/README.md`: (a) paid-plan ElevenLabs outputs are assigned to the user with **perpetual commercial rights, surviving subscription end**; (b) ElevenLabs SFX outputs are **sublicensed to other ElevenLabs users BY DEFAULT**\" and \"SFX \u2014 the two stings in this contract \u2014 come from **ElevenLabs**\".",
+  "detail": "The PR body claims the README carries the ElevenLabs terms notes; the actual README names Suno as the generator and carries none. The in-repo drop-in contract points users at the wrong source and omits the required sublicensing opt-out note.",
+  "recommended_fix": "Update assets/audio/README.md: name ElevenLabs for SFX (Suno/ElevenLabs Music for ambience only if ever needed) and add the three terms notes from the PR body."
+ },
+ {
+  "source": "tests",
+  "severity": "blocker",
+  "category": "coverage-gap",
+  "title": "P0: M-mute has zero test coverage and the chain is actually broken \u2014 mouse_map never maps Key.M to Toggle_Mute",
+  "location": "app/input/mouse.odin:314-341 (phase-2 switch), app/input/poll.odin:58-60",
+  "evidence": "poll.odin:60: `if rl.IsKeyPressed(.M) { append(&inp.events, Device_Event(Key_Press{key = .M})) }` \u2014 but mouse.odin's ONLY key switches handle: `case .X, .Delete:` (Demolish), `case .U:` (Arm_Preview), `case .One, .Two:` (Set_Class), `case .E:` / `case .S:` / `case .B:` (Set_Lane), `case: // phase-1 keys already handled` \u2014 and phase-1 emits only `Toggle_Pause{}`/`Toggle_Overlay{}`/`Toggle_Assist{}`/`Cancel{}`. `rg \"case \\.M|Mute\" app/input/mouse.odin` \u2192 no matches (exit 1). exec.odin:44: `case Toggle_Mute:` is therefore unreachable dead code; gate 9 (input-parity) has no M scenario.",
+  "detail": "P0 happy-path gap: the only mute control never fires; README and PR claim M works. No gate could catch it \u2014 the missing link proves the missing test.",
+  "recommended_fix": "Add `case .M: append(out, Intent(Toggle_Mute{}))` to mouse_map phase-2, plus an input-parity scenario feeding Key_Press{.M} and asserting the on_mute effect fires."
+ },
+ {
+  "source": "tests",
+  "severity": "blocker",
+  "category": "coverage-gap",
+  "title": "P1 at 0%: captions (text, 40-tick dwell, expiry, live-while-muted, mute pill) have no automated coverage anywhere",
+  "location": "app/main.odin:1301-1321, app/audio/audio.odin:218-227",
+  "evidence": "draw_audio_caption (main.odin:1301) draws `txt = \"audio muted - press M\"` / caption text via `au.caption_live(&app.audio, app.tick)`; but the harness T2 path calls `capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health, state.health_enabled, sim_tick, state.era, prev)` \u2014 no caption/HUD state, so no golden can see captions. `rg -l -F \"@(test)\"` lists only core/*_test.odin + app/render/forecast.odin \u2014 no app/audio tests.",
+  "detail": "Acceptance criterion 1 (\"captions shown\") and the a11y contract are pinned by no test; set_caption/caption_live/crisis_caption are pure and trivially testable.",
+  "recommended_fix": "Add unit tests for set_caption/caption_live (dwell, expiry boundary, overwrite) and crisis_caption text; ideally a parity-style frame asserting caption state after synthetic alert events."
+ },
+ {
+  "source": "tests",
+  "severity": "warning",
+  "category": "coverage-gap",
+  "title": "Golden cannot prove the crisis\u2192sting draw: vacuous-guard counts TOTAL draws, not per-kind",
+  "location": "harness/run.odin:458-463, demos/audio.dem:14-16",
+  "evidence": "The guard is only `if audio_consumer_on && audio_consumer.draws == 0 { append(&fails, \"audio consumer drew nothing \u2014 the golden is vacuous (no alert events?)\") }` \u2014 a single u64 incremented by BOTH branches (`a.draws += 1` after the crisis rng_range and after the arrival rng_range). The demo relies on the 4.2 surge firing at tick 1200 inside the 1400-tick window (`# the surge fires at tick 1200 = 60 s`).",
+  "detail": "P2: if a rebalance ever delays the surge past tick 1400, the crisis branch silently loses all coverage while the guard still passes on arrival draws alone.",
+  "recommended_fix": "Track per-kind counters (crisis_draws, arrival_draws) on Audio and fail the golden unless BOTH are > 0 for the audio demo."
+ },
+ {
+  "source": "tests",
+  "severity": "warning",
+  "category": "coverage-gap",
+  "title": "Arrival throttle (ARRIVAL_MIN_GAP_TICKS=2, e.tick-keyed, suppressed = silent AND uncaptioned) is unasserted by every gate",
+  "location": "app/audio/audio.odin:167-180",
+  "evidence": "`if e.tick < a.arrival_last_tick + ARRIVAL_MIN_GAP_TICKS { continue }` \u2014 the throttle touches only the cosmetic stream and pending/caption state, neither of which enters `pp.state_hash`; the golden's vacuous-guard only needs draws>0. Deleting the throttle check passes all 9 ci gates (hashes and draws unchanged in kind). No @(test) exists in app/audio.",
+  "detail": "P2: the documented throttle policy (\u22641 click/2 ticks, catch-up suppression, suppressed-arrival caption suppression) has zero regression protection; a buzz regression ships silently.",
+  "recommended_fix": "Add a pure consumer_consume test: events at ticks t, t+1, t+2 \u2192 assert pending.arrival_plays and caption behavior at each boundary."
+ },
+ {
+  "source": "tests",
+  "severity": "warning",
+  "category": "coverage-gap",
+  "title": "Asset fallback and placeholder synth path untested: corrupt-file guard, wav_pack RIFF output, device-absent init",
+  "location": "app/audio/audio.odin:230-265, 268+",
+  "evidence": "load_variant: `if s.frameCount > 0 { rl.SetSoundVolume(...); return s }` then falls through to `wave := synth_wav(crisis, idx)` / `rl.LoadWaveFromMemory(cstring(\".wav\"), raw_data(wave), ...)`; wav_pack hand-writes the RIFF header (`put_cstr(buf[0:], \"RIFF\")` ... `put_u32_le(buf[40:], u32(data_len))`). `rg -l -F \"@(test)\"` \u2192 only core/*_test.odin + app/render/forecast.odin; nothing exercises any audio proc.",
+  "detail": "P2: the error paths the brief names (device-absent fallback, corrupt asset file, empty/truncated synth) are happy-path-only; a broken placeholder WAV would surface only as silence at runtime.",
+  "recommended_fix": "Unit-test synth_wav/wav_pack (RIFF header fields, sample count) and load_variant's frameCount<=0 fallback with a fake path; keep tests raylib-free where possible."
+ },
+ {
+  "source": "tests",
+  "severity": "note",
+  "category": "coverage-gap",
+  "title": "P3: per-run freshness (audio_reset_run + audio_mark=0) has no coverage across restarts",
+  "location": "app/main.odin:541-546, app/audio/audio.odin:139-144",
+  "evidence": "start_run does `app.audio_mark = 0; au.audio_reset_run(&app.audio)` and audio_reset_run sets `a.arrival_last_tick = 0; a.caption = {}; a.pending = {}` \u2014 app-side lifecycle exercised by no harness demo (the harness consumer never restarts a run) and no unit test.",
+  "detail": "P3: a stale throttle position or caption leaking across restarts is cosmetic-only (ODN-15-safe by construction) but unpinned.",
+  "recommended_fix": "A two-run unit test: consume events, call audio_reset_run, assert arrival_last_tick/caption/pending cleared and audio_mark semantics re-established."
+ },
+ {
+  "source": "tests",
+  "severity": "blocker",
+  "category": "coverage-gate",
+  "title": "Advisory test gate: FAIL",
+  "location": "N/A",
+  "evidence": "N/A",
+  "detail": "P0 0% (mute chain untested AND broken); P1 \u224862% (captions 0%, crisis-draw unpinned per-kind, arrival-draw/throttle partial; determinism + vacuous-guard 100%); overall \u224845% (3 FULL, 3 PARTIAL, 4 NONE of 10 behaviours). Fails all three thresholds.",
+  "recommended_fix": "Fix + parity-pin the M\u2192Toggle_Mute mapping; add per-kind draw assertions to the harness guard; add pure consumer/caption/throttle/synth unit tests and a restart-freshness test; re-run gates 4 and 9."
+ }
+]

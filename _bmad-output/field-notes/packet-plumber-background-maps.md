@@ -1,0 +1,5 @@
+# packet-plumber-background-maps — field-notes shard
+
+- 2026-08-18 (packet-plumber-background-maps): rlsw/harness process ABORT traps — deleting TEMP-allocator slices (`make(..., context.temp_allocator)` + `delete`) frees an arena interior pointer with the heap allocator ("pointer being freed was not allocated"); the temp arena frees wholesale — never per-slice delete (map.odin note).
+- 2026-08-18 (packet-plumber-background-maps): a map/generator cache reused across demos in ONE harness process must be TOTAL (write every cell per generation) — `else if cell==0` keeps a prior seed's values (park/coast leaked across the juice re-bless); fresh processes hid the bug, the palcheck same-seed pin caught it.
+- 2026-08-18 (packet-plumber-background-maps): pixel-per-pixel value noise (integer hash + smoothstep, no libm) renders MM-organic coastlines at 1 world-px; a wide coast band (radius 2) read as blocky banding — radius 1 + ~50% land reads organic; LAND_LEVEL 0.46 measured only ~40-49% land (value noise skews low) — 0.38 → ~46-52%.

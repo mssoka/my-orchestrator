@@ -1,0 +1,211 @@
+diff --git a/app/input/exec.odin b/app/input/exec.odin
+index d4e1ed9..13a812b 100644
+--- a/app/input/exec.odin
++++ b/app/input/exec.odin
+@@ -45,7 +45,6 @@ apply_intent :: proc(inp: ^Input, intent: Intent) {
+ 		// 7.2: the audio mute toggle — app effect (cosmetic; captions stay on).
+ 		if inp.on_mute != nil { inp.on_mute(inp.user, inp) }
+ 	case Cancel:
+-		if inp.on_cancel != nil { inp.on_cancel(inp.user, inp) } // 7.1: the camera-home exit (fires even when nothing is selected)
+ 		// ESC / right-click-while-placing / pad B: cancel an armed placement
+ 		// (placement mode owns the surface) or deselect (ESC with nothing
+ 		// placing). The swallow latch is always set — the cancel gesture's
+@@ -61,6 +60,9 @@ apply_intent :: proc(inp: ^Input, intent: Intent) {
+ 			inp.sel_node = -1
+ 		}
+ 		inp.press_swallowed = true
++		// 7.1: the camera-home exit fires AFTER the state mutations so the app
++		// sees the settled selection (Perkins r2 N-G ordering).
++		if inp.on_cancel != nil { inp.on_cancel(inp.user, inp) }
+ 	case Cancel_Drag:
+ 		// pad B with a draw in progress: abandon it (no command — the draw was
+ 		// never committed). The release-side swallow prevents a stray select.
+@@ -413,6 +415,7 @@ click_select :: proc(inp: ^Input, mouse: rl.Vector2) {
+ 		if inp.topo.node_kind[slot] == .Junction {
+ 			inp.sel_node = i64(id)
+ 			inp.sel_pipe = -1
++			if inp.on_node_selected != nil { inp.on_node_selected(inp.user, inp) } // 7.1: click = focus
+ 			return
+ 		}
+ 		// a terminal click selects nothing — and never falls through to an
+diff --git a/app/input/input.odin b/app/input/input.odin
+index 7a02755..3a7ec51 100644
+--- a/app/input/input.odin
++++ b/app/input/input.odin
+@@ -73,6 +73,7 @@ Input :: struct {
+ 	on_overlay:      proc(user: rawptr, inp: ^Input),          // D: debug overlay (PP_DEBUG)
+ 	on_mute:         proc(user: rawptr, inp: ^Input),          // M: audio mute toggle (7.2)
+ 	on_cancel:       proc(user: rawptr, inp: ^Input),          // ESC/pad-B cancel (7.1: the nav-zoom's exit)
++	on_node_selected: proc(user: rawptr, inp: ^Input),         // 7.1: a junction was click-selected (fires on EVERY click — the camera's click=focus)
+ 	on_arm_preview:  proc(user: rawptr, inp: ^Input),          // U: R4 upgrade preview
+ 	on_ui_press:     proc(user: rawptr, inp: ^Input, pos: rl.Vector2) -> bool, // popover/QoS left press (swallowed?)
+ 	on_ui_release:   proc(user: rawptr, inp: ^Input, pos: rl.Vector2) -> bool, // release lands in a UI rect?
+diff --git a/app/main.odin b/app/main.odin
+index 25415bb..803499d 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -296,6 +296,7 @@ main :: proc() {
+ 	app.input.on_drag_update = effect_drag_update
+ 	app.input.on_draw_commit = effect_draw_commit
+ 	app.input.on_pipe_selected = effect_pipe_selected
++	app.input.on_node_selected = effect_node_selected
+ 	defer inp.destroy(&app.input)
+ 
+ 	tick_seconds := 1.0 / f64(cat.balance.logic_hz)
+@@ -684,6 +685,9 @@ effect_assist :: proc(user: rawptr, ictx: ^inp.Input) {
+ // effect_cancel — ESC / right-click-cancel / pad B: return the camera home.
+ // The nav-zoom's exit even with NOTHING selected (the selection-diff alone
+ // never fires when the selection was already empty — Perkins r1 W3).
++// (Perkins r2 W-C note: last_sel is NOT invalidated here — the camera may
++// intentionally diverge from the selection during a banner nav; the click
++// hooks below re-target the camera on the next click, re-select included.)
+ effect_cancel :: proc(user: rawptr, ictx: ^inp.Input) {
+ 	app := cast(^App)user
+ 	camera_set_fit(app)
+@@ -798,10 +802,21 @@ effect_draw_commit :: proc(user: rawptr, ictx: ^inp.Input) {
+ }
+ 
+ // effect_pipe_selected — a pipe was click-selected: the QoS panel starts with
+-// the editor closed (a fresh selection).
++// the editor closed (a fresh selection) AND the camera re-targets the pipe
++// (7.1: click = focus — this fires on EVERY pipe click, so a re-click after a
++// banner nav re-homes; Perkins r2 W-C).
+ effect_pipe_selected :: proc(user: rawptr, ictx: ^inp.Input) {
+ 	app := cast(^App)user
+ 	app.input.qos_editing = false
++	camera_set_selection(app)
++}
++
++// effect_node_selected — a junction was click-selected (7.1: click = focus —
++// the node's counterpart of effect_pipe_selected; fires on EVERY junction
++// click so a re-click re-homes the camera).
++effect_node_selected :: proc(user: rawptr, ictx: ^inp.Input) {
++	app := cast(^App)user
++	camera_set_selection(app)
+ }
+ 
+ // --- 5.5: click-select + the demolish surface (the intent layer owns the
+@@ -1161,7 +1176,9 @@ camera_set_selection :: proc(app: ^App) {
+ }
+ 
+ // camera_focus_pair — alerts-as-nav: focus-zoom the (lo, hi) node pair's
+-// midpoint (the crisis banner click's bottleneck bundle).
++// midpoint (the crisis banner click's bottleneck bundle). The camera
++// intentionally diverges from the selection here; a subsequent click
++// re-targets it (the click hooks — Perkins r2 W-C).
+ camera_focus_pair :: proc(app: ^App, lo, hi: u32) {
+ 	sl, ok1 := pp.node_slot(&app.state.topology, lo)
+ 	sh, ok2 := pp.node_slot(&app.state.topology, hi)
+diff --git a/app/render/assist.odin b/app/render/assist.odin
+index 6d3ce5b..cebd417 100644
+--- a/app/render/assist.odin
++++ b/app/render/assist.odin
+@@ -422,8 +422,7 @@ draw_glow_edge :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, u, w:
+ 		}
+ 		a := node_screen(v, topo.node_pos[sa])
+ 		b := node_screen(v, topo.node_pos[sb])
+-		width := (tier_pipe_width(v, bundles.bundle_tier[bi]) + f32(bundles.bundle_count[bi] - 1) * BUNDLE_EXTRA_WIDTH) * v.scale
+-		halo := width + 6.0 * v.scale
++		halo := band_width(v, bundles.bundle_tier[bi], int(bundles.bundle_count[bi])) + 6.0 * v.scale // 7.1: the glow hugs the WIDE band (Perkins r2 W-A)
+ 		rl.DrawLineEx(a, b, halo, col)
+ 		rl.DrawCircleV(a, halo * 0.5, col)
+ 		rl.DrawCircleV(b, halo * 0.5, col)
+@@ -440,7 +439,7 @@ draw_glow_edge :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, u, w:
+ 	a := node_screen(v, topo.node_pos[sa])
+ 	b := node_screen(v, topo.node_pos[sb])
+ 	width := tier_pipe_width(v, cand_tier) * v.scale
+-	halo := width + 6.0 * v.scale
++	halo := width * 2.2 + 6.0 * v.scale // 7.1: the candidate halo matches the band scale (Perkins r2 W-A)
+ 	rl.DrawLineEx(a, b, halo, col)
+ 	rl.DrawCircleV(a, halo * 0.5, col)
+ 	rl.DrawCircleV(b, halo * 0.5, col)
+diff --git a/app/render/view.odin b/app/render/view.odin
+index 0f46140..0e846ba 100644
+--- a/app/render/view.odin
++++ b/app/render/view.odin
+@@ -212,11 +212,10 @@ lane_bands :: proc(caps: [3]u32, width: f32) -> Lane_Bands {
+ 
+ // draw_bundles — Story 2.1: render ONE fat edge per parallel-pipe bundle (cap
+ // = sum). Parallel pipes between a pair pool into a single wider link whose
+-// render width grows with the member count (the pooled-capacity read); a
+-// multi-member bundle also carries a glowing pipe_fiber inner core so it reads
+-// as one unified link, not a stack of overlapping pipes. A single-member
+-// bundle renders at exactly its tier width. The view reads ONLY the derived
+-// bundles + topology (ODN-1).
++// render width grows with the member count (the pooled-capacity read).
++// 7.1: the tier color owns a WIDE band (band_width) with the lane stripes
++// inset. A single-member bundle renders at exactly its tier width. The view
++// reads ONLY the derived bundles + topology (ODN-1).
+ //
+ // 3.3 spatial-lane canon (user ruling 2026-08-12, commit 2e3acab): every
+ // pipe paints THREE lane strokes (Express/Standard/Best-effort) running
+@@ -599,8 +598,9 @@ draw_router :: proc(v: ^View, id: u32, c: rl.Vector2, port_capacity: i32) {
+ // rides IN its lane — laterally offset into its lane's band (the bundle's
+ // stroke layout) — and moves AT LANE SPEED (the palette's per-mille lane
+ // speed scales the along-edge fraction: Express streaks, Standard cruises,
+-// Best-effort crawls). Queued packets (on-edge, progress 0) therefore pile at
+-// the departure node in lane order — the serialization visual.
++// Best-effort crawls). 7.1: queued packets (on-edge, progress ~0) wait at the
++// departure building's DOORSTEP (a deterministic fan — the serialization
++// visual, off the roof).
+ draw_packets :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, focus_class: i32 = -1) {
+ 	bandwidth := u32(v.catalogs.balance.packet_bandwidth)
+ 	for i in 0..<len(flow.packets) {
+diff --git a/harness/palcheck.odin b/harness/palcheck.odin
+index c279860..6fbb4fd 100644
+--- a/harness/palcheck.odin
++++ b/harness/palcheck.odin
+@@ -23,10 +23,11 @@ import rl "vendor:raylib"
+ import pp "../core"
+ import rnd "../app/render"
+ 
+-// the canon §2 hexes (the objective oracle)
+-HOUSE_BODIES := [4]rl.Color{{232, 90, 74, 255}, {242, 201, 76, 255}, {94, 203, 107, 255}, {74, 155, 226, 255}}
++// the canon §2 hexes the sprite family EMITS (the objective oracle). The
++// top-down render shows the ROOFS — the steep camera occludes the wall band,
++// so body hexes never enter the sprites (Perkins r2 W-B: the check must pin
++// what the design emits, not what the palette defines).
+ HOUSE_ROOFS := [4]rl.Color{{122, 46, 38, 255}, {122, 84, 24, 255}, {44, 106, 52, 255}, {38, 80, 126, 255}}
+-HOST_BODY := rl.Color{62, 120, 208, 255}
+ HOST_ROOF := rl.Color{38, 76, 142, 255}
+ LED_GREEN := rl.Color{46, 139, 87, 255}
+ LANE_AMBER := rl.Color{224, 138, 46, 255}
+@@ -132,9 +133,7 @@ run_palcheck :: proc(cat: ^pp.Catalogs) -> int {
+ 	defer rl.UnloadImage(calm)
+ 	defer rl.UnloadImage(surge)
+ 
+-	// 1a. the canon surfaces the sprite family EMITS (the top-down render shows
+-	// the ROOFS + the host roof + the marking + the puck hardware — the steep
+-	// camera occludes the wall band, so the wall tones never enter the sprite).
++	// 1a. the canon roof surfaces (the sprite family emits ROOFS, not bodies).
+ 	// The play-marking check is the B1 canary: the mis-crop cut exactly the
+ 	// sprite's bottom content, where the marking lives.
+ 	roof_names := [4]string{"house roof coral", "house roof gold", "house roof sage", "house roof sky"}
+diff --git a/tools/ci-local.sh b/tools/ci-local.sh
+index d4d764f..7170da9 100755
+--- a/tools/ci-local.sh
++++ b/tools/ci-local.sh
+@@ -1,9 +1,9 @@
+ #!/usr/bin/env bash
+ # tools/ci-local.sh — the GH CI gates, run locally for free.
+ #
+-#   tools/ci-local.sh                 # all 9 gates in a linux container (the ubuntu leg)
++#   tools/ci-local.sh                 # all 10 gates in a linux container (the ubuntu leg)
+ #   tools/ci-local.sh --fast          # gates 1-2 only (lint + unit tests — the 10-second loop)
+-#   tools/ci-local.sh --mac           # the same 9 gates natively on macOS
++#   tools/ci-local.sh --mac           # the same 10 gates natively on macOS
+ #   tools/ci-local.sh --native        # alias for --mac
+ #   tools/ci-local.sh --windows-cross # EXPERIMENTAL: compile-only windows cross-build
+ #
+@@ -25,9 +25,9 @@ usage() {
+   cat <<'EOF'
+ tools/ci-local.sh — the GH CI gates, run locally for free.
+ 
+-  tools/ci-local.sh                 # all 9 gates in a linux container (the ubuntu leg)
++  tools/ci-local.sh                 # all 10 gates in a linux container (the ubuntu leg)
+   tools/ci-local.sh --fast          # gates 1-2 only (lint + unit tests — the 10-second loop)
+-  tools/ci-local.sh --mac           # the same 9 gates natively on macOS
++  tools/ci-local.sh --mac           # the same 10 gates natively on macOS
+   tools/ci-local.sh --native        # alias for --mac
+   tools/ci-local.sh --windows-cross # EXPERIMENTAL: compile-only windows cross-build
+                                     # (probes the LOCAL toolchain; use --in-container for the container's)

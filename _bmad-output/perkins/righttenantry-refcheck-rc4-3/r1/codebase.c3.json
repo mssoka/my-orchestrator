@@ -1,0 +1,72 @@
+[
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "brand-voice-copy",
+    "title": "5 implementer-authored success toasts contain em-dashes (RT em-dash ban); no_em_dash_test does not scan them",
+    "location": "client/src/copy.gleam:874, 878, 880, 882, 884",
+    "evidence": "client/src/copy.gleam:874: pub const refcheck_toast_started: String = \"Reference started — the invite goes out now.\"\nclient/src/copy.gleam:878: pub const refcheck_toast_re_enabled: String = \"Reference re-enabled — it's back in the queue.\"\nclient/src/copy.gleam:880: pub const refcheck_toast_taken_over: String = \"You're handling this one — automated messages stopped.\"\nclient/src/copy.gleam:882: pub const refcheck_toast_corrected: String = \"Details saved — the invitation is on its way again.\"\nclient/src/copy.gleam:884: pub const refcheck_toast_substituted: String = \"Referee substituted — the new invitation is on its way.\"\nAll five are rendered to the landlord via the toast_copy case in client.gleam:3526-3531 (ApiReturnedRefcheckAction Ok branch).",
+    "detail": "Guard 9 + briefing: an em-dash in user-facing copy is a real defect; the UX spec §7.4/§7.7/§8.2/§8.3 fixes no success-toast copy for start/skip/re-enable/take-over/correct/substitute (grep of the spec for \"invite goes out\"/\"back in the queue\"/\"automated messages stopped\"/\"on its way\" returns nothing) — the toasts are implementer-authored brand-voice strings, so the em-dash is added by the implementer, not spec-verbatim. client/test/copy_test.gleam:305-314 no_em_dash_test scans only copy.toast(code, ctx) and copy.page(code, ctx) (for_each_copy, copy_test.gleam:279-286) — these standalone consts are never enumerated, so CI does not catch them. This is exactly the carried RC4.2 r2 warning (no_em_dash_test doesn't scan refcheck copy) recurs in new strings added by this PR.",
+    "recommended_fix": "Drop the em-dashes (e.g. \"Reference started. The invite goes out now.\", \"Details saved. The invitation is on its way again.\"), and extend no_em_dash_test (or a similar pin) to enumerate the refcheck_* copy consts so the ban is enforced."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "brand-voice-copy",
+    "title": "Attempt-log export composes user-facing lines with em-dash joins (new timeline composition site)",
+    "location": "client/src/client.gleam:6772-6789 (fn build_attempt_log_text)",
+    "evidence": "client/src/client.gleam:6776-6783:\n    call.attempts\n    |> list.map(fn(attempt) {\n      attempt.at\n      <> \" — \"\n      <> attempt.channel\n      <> \" — \"\n      <> attempt.outcome\n      <> case attempt.detail {...}\n    })\n    |> string.join(\"\\n\")\n\"Reference: \" <> name <> \"\\n\" <> \"State: \" <> status <> \"\\n\" <> lines\nThe composed text is written to the landlord's clipboard (UserClickedRefcheckExport -> copy_refcheck_export_effect, client.gleam:3485-3493) and the toast \"Attempt log copied\" confirms it.",
+    "detail": "Guard 9 explicitly directs checking 'the timeline composition sites for ` — ` joins' — this PR adds a NEW composition site whose output is user-facing (the landlord pastes it into records/messages per UX §7.6). Mitigating context for triage: the UX spec §7.6's own attempt-log timeline format ships em-dashes ('● Invitation sent — email + SMS'), so this mirrors the spec's format; but the exact joined strings are implementer-composed, and the same-day format-mix carried warning from RC4.2 r2 applies to this site (attempt.at is RFC3339 text from the payload, joined verbatim). No_em_dash_test does not scan this function.",
+    "recommended_fix": "If the em-dash ban is applied strictly to all user-facing output, join with a plain separator (e.g. ' | ' or ' — ' replaced by ' - '); at minimum ensure the attempt-log lines use the same timestamp format as the rest of the panel."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "error-handling",
+    "title": "Failed correct/substitute leaves the §8.3 edit-trio save button permanently disabled — retry requires cancel + re-type",
+    "location": "client/src/client.gleam:3536-3546 (ApiReturnedRefcheckAction Error branch); client/src/components/reference_panel.gleam:994 (saving -> disabled)",
+"evidence": "client.gleam save_refcheck_edit sets saving: True before firing (client.gleam:6723, fn at 6687): Model(..model, refcheck_edit: Some(model.RefcheckEdit(..edit, saving: True, error: None))).\nApiReturnedRefcheckAction Error branch (client.gleam:3536-3546):\n        Error(err) -> {\n          let cleared =\n            Model(..model, refcheck_action_inflight: set.delete(model.refcheck_action_inflight, call_id))\n          let #(m, toast_eff) = add_toast(cleared, error_toast_copy(err, copy.CtxRefcheckAction), ToastError)\n          #(m, toast_eff)\n        }\nrefcheck_edit is NOT touched on error — it stays with saving: True.\nreference_panel.gleam:994: attribute(\"disabled\", case saving { True -> \"disabled\" False -> \"\" })\nSo after a failed Save & resend / Save & send invite, the save button renders disabled=\"disabled\" indefinitely. The only way out is Cancel (UserCancelledRefcheckEdit clears refcheck_edit, losing the typed values), then reopening the form (prefilled from the row's effective contact, not the abandoned edit).",
+    "detail": "The inline test comment says 'A failed action keeps the surfaces (the landlord can retry)' (client/test/client_test.gleam, refcheck_action_failure_toasts_error_test) — but that test only asserts refcheck_action_inflight is cleared and a toast fires; it does not exercise the edit form's saving flag. On a server-side rejection (e.g. Conflict/NotFound), the open edit form is left in a dead state where the primary retry path (press Save again) is impossible without discarding the landlord's typed edits. The Ok branch correctly clears refcheck_edit; the Error branch should reset saving: False (and keep the typed values) instead.",
+    "recommended_fix": "In the Error branch, when the failed action was 'correct'/'substitute' and refcheck_edit targets this call_id, restore saving: False (keep name/email/phone) so the landlord can retry without re-typing; add a client test asserting the save button is re-enabled after an error."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "ui",
+    "title": "Start-now / take-over inline confirms are invisible on collapsed rows — the menu action appears to do nothing in the default (collapsed) state",
+    "location": "client/src/components/reference_panel.gleam:346-412 (view_row: confirm/edit render only inside `case is_expanded`); client/src/client.gleam:3006-3016 (auto-expand only FormCompleted/ManualRecorded/Partial); client/src/client.gleam:3313-3389 (UserChoseRefcheckAction sets confirm/edit but never expands the row)",
+    "evidence": "reference_panel.gleam view_row: the overflow button is a sibling of the expand button and renders regardless of expansion (`case row_actions { [] -> element.none() _ -> view_overflow(call, app, slot, row_actions, menu_open) }`), while the confirm surfaces render only inside the expanded body:\n    case is_expanded {\n      False -> element.none()\n      True -> html.div([...], [row_detail(call, app, confirm, edit, inflight), ...])\n    }\nclient.gleam:3008-3016 auto-expands ONLY FormCompleted | ManualRecorded | Partial rows on first view — a Queued row is collapsed by default. UserChoseRefcheckAction (client.gleam:3313+) closes the menu and sets refcheck_confirm/refcheck_edit but never touches refcheck_expanded.",
+    "detail": "Default flow: a fresh detail load shows queued rows collapsed with the ⋯ menu visible. Clicking 'Start this check now' (or 'Take over manually' on a contact-initiated row) closes the menu and sets the confirm in the model — but with the row collapsed, nothing renders. The landlord sees zero feedback and must discover that expanding the row reveals the confirm. The §7.4 wireframe shows the confirm appearing immediately after the menu choice. The new component tests always render the confirm with expanded: [\"rc-1\"], so the collapsed case is untested. (Immediate actions skip/re-enable toast, so they are unaffected.)",
+    "recommended_fix": "Expand the row when an action that needs an inline surface is chosen (UserChoseRefcheckAction for RefcheckStart/RefcheckTakeOver/RefcheckSubstitute/RefcheckCorrect should also insert the call_id into refcheck_expanded), or render the confirm/edit surface outside the expand gate; add a test for the collapsed-row path."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "refcheck_toast_action_failed const is never referenced (orphan)",
+    "location": "client/src/copy.gleam:890",
+    "evidence": "client/src/copy.gleam:890: pub const refcheck_toast_action_failed: String = \"Couldn't do that. Give it another go.\"\nGrep across client/src (all .gleam) finds no reference to refcheck_toast_action_failed outside copy.gleam itself (the only other hit is the compiled artifact client/build/dev/javascript/client/copy.mjs). The error path in client.gleam:3539 uses error_toast_copy(err, copy.CtxRefcheckAction) -> copy.toast(code, ctx) with the generic wildcard fallback, never this const.",
+    "detail": "Looks like the intended action-failure fallback, but the wiring went through the CtxRefcheckAction context in copy.toast instead, leaving the const dead. Minor: dead copy constant, no user impact, but it violates the no-orphan-code standard.",
+    "recommended_fix": "Either wire it as the fallback (e.g. in copy.toast's wildcard for CtxRefcheckAction) or delete the const."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "comment-vs-code",
+    "title": "Model comment claims the RC4.3 surfaces 'All reset on route change' — the route-change handler does not reset them",
+    "location": "client/src/model.gleam:367-374 (comment); client/src/client.gleam:660-680 (route-change handler)",
+    "evidence": "client/src/model.gleam:373-374: '...`refcheck_action_inflight` is the call_ids with an action request in flight (buttons disable + the panel shows progress). All reset on route change (they are per-application surfaces).'\nThe BrowserChangedUrl handler for routes.ApplicationDetail (client.gleam:660-680) resets refcheck_expanded: set.new() and refcheck_explainer_open: False only — refcheck_menu_open, refcheck_confirm, refcheck_edit, refcheck_action_inflight are untouched.",
+    "detail": "The claim in the comment is false. Impact today is nil because every surface is scoped by reference_call_id (UUID, unique across applications): a stale menu_open/confirm/edit/inflight can never match a row on another application, and a late ApiReturnedRefcheckAction after navigation only triggers a harmless extra detail refetch of the current route. Still, the doc claim should either be implemented (reset the four fields alongside refcheck_expanded) or corrected.",
+    "recommended_fix": "Reset refcheck_menu_open: None, refcheck_confirm: None, refcheck_edit: None, refcheck_action_inflight: set.new() in the ApplicationDetail route-change block, or fix the comment."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "contract",
+    "title": "AR-RC13 pattern: new row-action surfaces derive legality from status, not from the server-computed hooks (can_substitute_referee ignored)",
+    "location": "client/src/components/reference_panel.gleam:395-402 (overflow_actions), 655-700 (view_substitute_surface); server/src/application/application_detail_handler.gleam:1096-1110 (compute_hooks_decoded)",
+    "evidence": "reference_panel.gleam overflow_actions: Queued -> [RefcheckStart, RefcheckSkip]; Skipped -> [RefcheckReEnable]; ContactInitiated -> [RefcheckTakeOver]; Unreachable -> [RefcheckTakeOver, RefcheckSubstitute]; _ -> [].\nview_substitute_surface renders for the Objected and Unreachable row_detail arms regardless of call.hooks.can_substitute_referee. The server ships a hook exactly for this: server/src/application/application_detail_handler.gleam:1102 can_substitute_referee: status == Objected || status == Unreachable.\nThe client never reads call.hooks for any RC4.3 action (grep of reference_panel.gleam shows hooks only used at line 135 for the pre-existing record-manual affordance).",
+    "detail": "The RC4.2 r1 blocker pattern (client re-deriving state rules) does not fully recur here: the refetch-after-every-action contract (AR-RC13) is honored (refetch_refcheck_effect, client.gleam:6570), the server remains authoritative and rejects every illegal action (AD-14), and today the status-derived surfaces agree with the server's hooks on every status (the hooks are themselves pure functions of status). So this is a design-consistency note, not a blocker: the substitute affordance bypasses the shipped can_substitute_referee hook, so any future server-side rule change (e.g. limited substitutes) would leave the client rendering a dead affordance instead of following the hook.",
+    "recommended_fix": "Gate the substitute surface on call.hooks.can_substitute_referee (and take-over/start/skip on hook-driven flags if the API extends hooks), keeping the client a pure renderer of the server payload per AR-RC13."
+  }
+]

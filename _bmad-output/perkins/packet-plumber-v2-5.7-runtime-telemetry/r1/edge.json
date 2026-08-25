@@ -1,0 +1,42 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "input-validation",
+    "title": "App silently ignores --stats-out with a missing path token instead of erroring",
+    "location": "app/main.odin:142-147",
+    "evidence": "stats_path := \"\"\n\tfor i := 1; i < len(os.args); i += 1 {\n\t\tif os.args[i] == \"--stats-out\" && i+1 < len(os.args) {\n\t\t\tstats_path = os.args[i+1]\n\t\t}\n\t}  —  spec matrix: \"| unknown flag position | `--stats-out` in the demo list | parsed out before demo-name resolution | missing path token → usage error |\"",
+    "detail": "`app --stats-out` (flag last, no token) fails the `i+1 < len(os.args)` guard, leaves stats_path empty, and runs with the stream silently off. Spec's I/O matrix requires a usage error; harness main.odin does `usage()`, the app does not.",
+    "recommended_fix": "In the parse loop, when `os.args[i] == \"--stats-out\"` and the path token is absent, eprintln a usage error and os.exit(2), mirroring harness/main.odin's handling."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "error-handling",
+    "title": "App stats-stream write failure prints but exits 0, not exit 1",
+    "location": "app/main.odin:170-176",
+    "evidence": "\tdefer if app.stats_live {\n\t\t// write the accumulated stream at exit (the deterministic artifact).\n\t\tif err := os.write_entire_file(app.stats_path, transmute([]u8)strings.to_string(app.stats_sb)); err != nil {\n\t\t\tfmt.eprintfln(\"app: stats stream write failed %s: %v\", app.stats_path, err)\n\t\t}\n\t\tdelete(strings.to_string(app.stats_sb))\n\t}  —  spec matrix: \"| `app --stats-out <path>` | ... | unwritable path → eprintln + exit 1 |\"",
+    "detail": "On an unwritable path (e.g. missing directory) the defer only eprintlns; main returns normally so the process exit code stays 0. The spec's error contract for the app flag is \"eprintln + exit 1\".",
+    "recommended_fix": "Track write failure in a flag, then os.exit(1) after the defers complete (or set the exit code before returning from main)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "overlay-check exits 0 with an overlay-free PNG when zero sim ticks stepped",
+    "location": "harness/overlay.odin:79-82,112-131",
+    "evidence": "\twall_max := min(u64(max(0, i64(cap_ms) * i64(hz) / 1000)), total_wall)\n\tstats: pp.Stats_Record\n\tstats_valid := false\n\tfor w in u64(1)..=wall_max {  ...  \tif stats_valid {\n\t\trnd.draw_debug_overlay(&rc.view, &state.topology, cat, &stats, state.events[:], -1)\n\t}  ...  \tfmt.printfln(\"overlay-check: %s written (tick %d, %d events)\", out, sim_tick, len(state.events))\n\tdelete(out)\n\tif stats_valid { pp.stats_destroy(&stats) }\n\treturn 0",
+    "detail": "With cap_ms ≤ 0 (parse_ms accepts negatives; max() clamps to 0) or a pause schedule covering all of 1..wall_max, the loop never steps, stats_valid stays false, the overlay is skipped, yet a PNG is exported and the verb returns success 0 — the AC3 verification artifact silently lacks the overlay.",
+    "recommended_fix": "After the loop, if !stats_valid, eprintln \"no stepped tick at <ms>ms — overlay not rendered\" and return 1 instead of writing an overlay-free PNG."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "output-shape",
+    "title": "D rows never aggregate per (pipe,class,reason) — count column is always 1",
+    "location": "core/stats.odin:206-224",
+    "evidence": "core/flow.odin:176 (inside event_emit_drop, called once per shed packet at flow.odin:725/730): \"append(&state.flow.drop_sites, Drop_Site{class = class, reason = reason, bundle = bundle})\"  —  core/stats.odin: \"append(&rec.drops, Stats_Drop_Row{\n\t\t\t\tpipe = state.topology.pipe_id[ps],\n\t\t\t\tclass = site.class,\n\t\t\t\treason = u8(site.reason),\n\t\t\t\tcount = 1,\n\t\t\t})\"  —  spec design note: \"D <tick>,<pipe>,<class>,<reason>,<count> — this tick's drop sites, per (pipe, class, reason)\"",
+    "detail": "drop_sites carries one entry per dropped packet, so a tick shedding N same-class packets on a bundle emits N duplicate D rows per live member pipe; no code path ever produces count > 1, unlike the documented per-key aggregation.",
+    "recommended_fix": "Aggregate D rows by (pipe, class, reason) in stats_compute (accumulate count per key), or state in the header that rows are per-site with count=1."
+  }
+]

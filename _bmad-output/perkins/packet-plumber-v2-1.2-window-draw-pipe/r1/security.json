@@ -1,0 +1,42 @@
+[
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "boundary",
+    "title": "node_slot_raw's slot-0 fallback silently resolves unmatched ids to slot 0 — latent wrong-state/OOB trap if a caller skips validation",
+    "location": "core/topology.odin:166-167,180-185",
+    "evidence": "apply_draw :: proc(t: ^Topology, c: Cmd_Draw_Pipe, cat: ^Catalogs) -> u32 {\n\tsa := node_slot_raw(t, c.a)\n\tsb := node_slot_raw(t, c.b)\n\tspan := span_between(t.node_pos[sa], t.node_pos[sb])\n\n// node_slot_raw — unchecked slot lookup (caller validated). Linear.\nnode_slot_raw :: proc(t: ^Topology, id: u32) -> u32 {\n\tfor i in 0 ..< len(t.node_alive) {\n\t\tif t.node_id[i] == id { return u32(i) }\n\t}\n\treturn 0 // unreachable when called post-validate",
+    "detail": "An unmatched id silently resolves to slot 0: wrong node's span cached, or an OOB node_pos[0] read on an empty topology. Unreachable today only because topology_apply_edit validates first; any future skip-validation caller corrupts state silently.",
+    "recommended_fix": "Return (u32, bool) from node_slot_raw or assert inside apply_draw; the fallback should fail loud (replay_error-style latch), never resolve to slot 0."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "boundary",
+    "title": "W1 truncation mutation underflows on a 0-byte log: unguarded len(src)-1 feeds a negative length to make() → crash instead of rejection",
+    "location": "harness/drift.odin:119-121",
+    "evidence": "\t// truncation — drop the last byte.\n\ttrunc := make([dynamic]u8, len(src)-1, context.temp_allocator)\n\tcopy(trunc[:], src[:len(src)-1])",
+    "detail": "Every other mutation length-guards (len(src) > 24/28/0/4/41); truncation does not. An empty blessed log makes len(src)-1 = -1, a runtime panic in the W1 harness — a crash where the gate should cleanly reject.",
+    "recommended_fix": "Guard truncation like the others: only append when len(src) > 0. An empty log should be skipped or reported, never passed to make() with a negative length."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "path-traversal",
+    "title": "Demo names flow unsanitized into golden/tmp write paths — traversal is CLI-reachable (harness run|save <name>) though not from the CI demos/ listing",
+    "location": "harness/run.odin:16; harness/goldens.odin:75,143; harness/drift.odin:48; harness/main.odin:52,121-135",
+    "evidence": "log_path :: proc(demo: string) -> string {\n\treturn fmt.tprintf(\"goldens/%s.log.bin\", demo)\n}\n\ngolden_path :: proc(demo: string, ms: i64) -> string {\n\treturn fmt.tprintf(\"goldens/%s/%05dms.png\", demo, ms)\n}\n\n\tdir := fmt.tprintf(\"goldens/_reports/%s/latest\", demo)\n\t...\n\t\t\ttmp := fmt.tprintf(\"/tmp/pp-drift-%s-%s.bin\", name, m.label)\n\t...\n\tnames := rest\n\t...\n\tfor e in entries {\n\t\tif strings.has_suffix(e.name, \".dem\") {\n\t\t\tappend(&out, strings.clone(e.name[:len(e.name)-4], context.allocator))",
+    "detail": "os.read_dir basenames cannot contain '/', so CI (drift-check, run) is safe and m.label is hardcoded; but `harness run/save <name>` accepts CLI args, so a crafted name plus a matching demo file writes mkdir/ExportImage output outside goldens/. Developer-tool defense-in-depth only.",
+    "recommended_fix": "Reject demo names containing '/' or '..' at the CLI boundary (and defensively in log_path/golden_path) before any write path."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "silent-acceptance",
+    "title": "jint narrows i64 JSON integers to i32 unchecked — out-of-range catalog values silently wrap into the valid range instead of fail-fast",
+    "location": "core/catalog.odin:238-243",
+    "evidence": "jint :: proc(o: json.Object, key: string, def: i32) -> i32 {\n\tif v, ok := o[key]; ok {\n\t\t#partial switch x in v {\n\t\tcase json.Integer: return i32(x)\n\t\tcase json.Float:   return i32(x)\n\t\t}\n\t}\n\treturn def\n}\n...\n\t\tb.logic_hz = jint(obj, \"logic_hz\", 0)\n\t\tif b.logic_hz <= 0 || b.logic_hz > 1000 {\n\t\t\treturn {\"balance.json\", \"logic_hz\", \"must be in 1..1000 (single source of tick timing)\"}",
+    "detail": "json.Integer is i64; the i32 truncation wraps e.g. 0x100000064 to 100, passing the 1..1000 logic_hz check despite the file's fail-fast contract. Determinism survives (catalog_hash binds raw bytes), but out-of-range data is silently accepted, not rejected.",
+    "recommended_fix": "Range-check before narrowing: validate the i64 in its own domain (e.g. reject when outside i32 range) before assigning to the i32 field."
+  }
+]

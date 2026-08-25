@@ -1,0 +1,5 @@
+# Field notes — packet-plumber-full-game-doctrine (2026-08-17)
+
+- `ledger set <job> <same-status> "note"` is a silent no-op that DROPS the note ("already working") — use `bin/ledger note <job> "..."` for any status-preserving update; the playbook's warning is buried in the review-sensor section, not the self-report bullet.
+- GH Actions account-billing failure masquerades as a CI failure: jobs "fail" in ~4s with NO logs (`--log-failed` → "log not found", zero failed steps) — the truth is in `gh run view`'s ANNOTATIONS ("recent account payments have failed"). It kills GH-ACTIONS RUNNERS ONLY: Perkins runs locally via pi panes and is UNAFFECTED (Silas correction 2026-08-17 — I misdiagnosed a slow r1 as billing-blocked from a timing coincidence; a missing Perkins review is NOT billing evidence, verify the mechanism or ask Silas before escalating).
+- The surgical-hunk rebase relay works exactly as designed: placed stories-v2.md hunks clear of sibling 5.5/7.2 status lines → rebased onto v2@#59 with ZERO conflicts; verified the sibling card byte-identical (`git show origin/v2:<path> | sed` vs worktree) before `--force-with-lease`.

@@ -1,0 +1,5 @@
+Read `/Users/moses/code/_bmad-output/perkins/packet-plumber-v2-2.2-ecmp/r1/_shared_header.md` first — it has your inputs, lens-guards, output contract, accuracy mandate. This file adds only your lens brief + output path.
+
+LENS — ACCEPTANCE AUDITOR: audit the diff against Story 2.2 + the architecture. Verify each AC is actually met by the code (not just by a test): (a) N equal-cost next hops → pick = pure hash splitmix64(src,dst,class,pkt_id) mod N; (b) deterministic per packet / flow affinity / no intra-flow reordering; (c) no sim-rng draw, no map iteration (rule 2); (d) count==1 backward-compat with slice 1/2.1; (e) replay byte-identical [E10]; (f) core engine-free [ODN-1]; (g) the ECMP-determinism test exists + passes. Report: AC violations, deviations from spec intent, missing specified behavior, scope drift. Reference the violated AC in `detail` (quote the spec phrase). Remember guards #6/#7: backward-compat + T2-pixel-gap are NOT defects.
+
+Write your JSON array to `/Users/moses/code/_bmad-output/perkins/packet-plumber-v2-2.2-ecmp/r1/acceptance.json` (source:"acceptance"). Stop after writing.

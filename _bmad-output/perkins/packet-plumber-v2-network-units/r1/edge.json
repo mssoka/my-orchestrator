@@ -1,0 +1,32 @@
+[
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "line_rate_bps maps capacity==0 to the maximum rate (799,920,000 bps -> \"800 Mbps\") instead of 0",
+    "location": "core/units.odin:63-80 (call sites: app/render/node_health.odin:112, app/render/noc_overlay.odin:627-632, app/main.odin:2238)",
+    "evidence": "core/units.odin:63-67: `transit_ticks :: proc(packet_bandwidth, capacity: u32) -> u32 {\n\tif capacity == 0 {\n\t\treturn 1 // defensive — a zero-cap bundle never serves; avoid div-by-0\n\t}\n\treturn (packet_bandwidth + capacity - 1) / capacity\n}` ; core/units.odin:75-80: `line_rate_bps :: proc(packet_bandwidth, capacity: u32, logic_hz: i32) -> u64 {\n\tt := u64(transit_ticks(packet_bandwidth, capacity))\n\tif t == 0 {\n\t\treturn 0\n\t}\n\treturn u64(FRAME_BYTES) * 8 * u64(logic_hz) * SIM_TIME_SCALE / t\n}` ; app/render/node_health.odin:112: `node_rate := pp.format_rate(pp.line_rate_bps(u32(cat.balance.packet_bandwidth), throughput, cat.balance.logic_hz))` ; core/catalog.odin:484: `nt.throughput_units = jint(eo, \"throughput_units\", 0)` (default 0, no >0 validation) ; core/catalog.odin:1283-1284: `if ld < 1 || ld > 1000 {` (permille 1..99 legally floors a raw-10 narrow bundle's effective capacity to 0 via `raw * row.legacy_decay_permille / 1000`)",
+    "detail": "Zero-capacity input takes transit_ticks' div-by-0 branch (returns 1), so the derived rate is the transit-1 maximum — a dead link/node reads \"800 Mbps\". Sibling new procs (util_pct_window, served_to_octets) zero-guard; line_rate_bps and line_rate_bytes_per_tick (returns 1500) do not.",
+    "recommended_fix": "Guard capacity == 0 -> return 0 in line_rate_bps and line_rate_bytes_per_tick (mirroring util_pct_window), and/or validate node_types throughput_units > 0 at catalog load."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Tick-0 sentinel collision: work recorded at tick 0 is never counted by bundle_tx_window (slot key 0 == \"never written\")",
+    "location": "core/bundles.odin:184-216",
+    "evidence": "core/bundles.odin:70: `tx_slot_tick: [dynamic]u64, // per-slot last-write tick (0 = never written)` ; core/bundles.odin:196-199: `if b.tx_slot_tick[s] != tick {\n\t\tb.tx_slot_tick[s] = tick // stale slot: zero + rewrite\n\t\tb.tx_served[s] = 0\n\t}\n\tb.tx_served[s] += served` ; core/bundles.odin:208-216: `lo := u64(0)\n\tif tick > UTIL_WINDOW_TICKS {\n\t\tlo = tick - UTIL_WINDOW_TICKS // (tick-W, tick] — W ticks inclusive\n\t}\n\tsum: u64 = 0\n\tbase := int(bi) * UTIL_WINDOW_TICKS\n\tfor s in 0..<UTIL_WINDOW_TICKS {\n\t\tst := b.tx_slot_tick[base + s]\n\t\tif st > lo && st <= tick {`",
+    "detail": "At tick 0 the record writes tx_served but `0 != 0` is false, so the key stays 0 — the sentinel; the window test `st > lo` (0 > 0) then never counts it. step's guard admits a first step at tick 0 (`tick < state.tick` only latches backward); all current callers start at tick 1.",
+    "recommended_fix": "Store tick+1 as the slot key (0 stays a true \"never\" sentinel), adjusting bundle_tx_record and the window comparison accordingly."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "stale-state",
+    "title": "Same-tick re-step accumulates each execution's served units into one slot, over-reporting tx_octets and pre-clamp utilization",
+    "location": "core/bundles.odin:196-199 (contract: core/step.odin:32-38)",
+    "evidence": "core/bundles.odin:196-199: `if b.tx_slot_tick[s] != tick {\n\t\tb.tx_slot_tick[s] = tick // stale slot: zero + rewrite\n\t\tb.tx_served[s] = 0\n\t}\n\tb.tx_served[s] += served` ; core/step.odin:32-34: `// (§7.1: never silent), never corrupt forward. Same-tick re-steps are\n\t// deliberately allowed (the pre-existing step_once test convention steps\n\t// tick 1 repeatedly): the crisis engine reads the flow's per-tick` ; core/bundles_test.odin:38-40: `step_once :: proc(s: ^Run_State, cat: ^Catalogs) {\n\tstep(s, 1, {}, cat)\n}`",
+    "detail": "step() deliberately permits same-tick re-steps (documented for drop_sites/events); the ring has no per-execution clear, so a re-stepped tick's slot sums both executions' work — tx_octets over-reports and windowed util exceeds the one-tick budget (clamped at 100).",
+    "recommended_fix": "Reset the bundle's current-tick slot at the top of flow_step's serve pass (per-execution), keeping the tick-key rewrite only for stale slots."
+  }
+]

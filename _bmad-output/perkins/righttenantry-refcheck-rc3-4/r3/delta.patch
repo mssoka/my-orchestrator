@@ -1,0 +1,128 @@
+diff --git a/scripts/js-tests/reference_form_wiring.test.js b/scripts/js-tests/reference_form_wiring.test.js
+index b8c3d0f..5af5ca6 100644
+--- a/scripts/js-tests/reference_form_wiring.test.js
++++ b/scripts/js-tests/reference_form_wiring.test.js
+@@ -251,3 +251,71 @@ test("a FormData-less environment keeps the native POST path untouched", () => {
+   referenceForm._initBrowser(env);
+   assert.equal(sections[0].form.listeners.submit, undefined);
+ });
++
++// ---------- RC3.4 review-submit _focus_seconds wiring (Perkins r2 B2) ----------
++// The review page is `reference-review`, where _initBrowser correctly bails
++// (no `reference-form-page`). The submit form's `_focus_seconds` is populated
++// by the narrower _initReviewSubmit seam — without it the field ships inert
++// (always 0 in production). These drive the browser path, NOT simulate.form_body.
++
++function reviewEnv() {
++  const focusField = { name: "_focus_seconds", value: "0" };
++  const reviewForm = {
++    submitPrevented: false,
++    addEventListener(event, fn) {
++      this._onSubmit = fn;
++    },
++    querySelector(sel) {
++      return sel === "[data-focus-seconds]" ? focusField : null;
++    },
++  };
++  let now = 1_700_000_000_000;
++  return {
++    env: {
++      document: {
++        querySelector(sel) {
++          return sel === "[data-testid='reference-review-form']"
++            ? reviewForm
++            : null;
++        },
++      },
++      Date: { now: () => now },
++    },
++    advance(ms) {
++      now += ms;
++    },
++    reviewForm,
++    focusField,
++  };
++}
++
++test("review submit populates _focus_seconds from the page clock", () => {
++  const t = reviewEnv();
++  referenceForm._initReviewSubmit(t.env);
++  // The referee reviews for 8 seconds, then submits.
++  t.advance(8_000);
++  t.reviewForm._onSubmit({ target: t.reviewForm });
++  assert.equal(t.focusField.value, "8");
++});
++
++test("review submit does not prevent the native POST (the form posts on)", () => {
++  const t = reviewEnv();
++  referenceForm._initReviewSubmit(t.env);
++  const event = { target: t.reviewForm, prevented: false, preventDefault() { this.prevented = true; } };
++  t.reviewForm._onSubmit(event);
++  assert.equal(event.prevented, false);
++});
++
++test("initReviewSubmit is a no-op off the review page (the form page path)", () => {
++  // No reference-review-form element -> the seam bails, no listener bound.
++  const env = { document: { querySelector: () => null }, Date: { now: () => 0 } };
++  referenceForm._initReviewSubmit(env); // must not throw
++});
++
++test("review _focus_seconds floors to whole seconds and never goes negative", () => {
++  const t = reviewEnv();
++  referenceForm._initReviewSubmit(t.env);
++  t.advance(5_999); // just under 6s
++  t.reviewForm._onSubmit({ target: t.reviewForm });
++  assert.equal(t.focusField.value, "5");
++});
+diff --git a/server/priv/static/reference_form.js b/server/priv/static/reference_form.js
+index e9020ed..548b368 100644
+--- a/server/priv/static/reference_form.js
++++ b/server/priv/static/reference_form.js
+@@ -205,12 +205,35 @@
+     });
+   }
+ 
++  /// RC3.4 (Perkins r2 B2): the review submit form lives on the
++  /// `reference-review` page, where initBrowser correctly bails (no
++  /// `reference-form-page` element, no per-question autosave). This narrower
++  /// wiring populates the review form's `_focus_seconds` from the same
++  /// page-clock logic so the submit POST carries a real value (without it,
++  /// focus_seconds_reported was always 0 in production — the field shipped
++  /// inert). It does NOT preventDefault: the review submit is a native POST.
++  function initReviewSubmit(env) {
++    env = env || root;
++    var doc = env.document;
++    if (!doc) return;
++    var form = doc.querySelector("[data-testid='reference-review-form']");
++    if (!form) return;
++    var focusField = form.querySelector("[data-focus-seconds]");
++    if (!focusField) return;
++    var initMs = env.Date ? env.Date.now() : Date.now();
++    form.addEventListener("submit", function () {
++      var now = env.Date ? env.Date.now() : Date.now();
++      focusField.value = clampFocusSeconds(now - initMs);
++    });
++  }
++
+   var api = {
+     nextQuestionId: nextQuestionId,
+     clampFocusSeconds: clampFocusSeconds,
+     shouldStep: shouldStep,
+     shouldNavigateToReview: shouldNavigateToReview,
+     _initBrowser: initBrowser,
++    _initReviewSubmit: initReviewSubmit,
+   };
+ 
+   if (typeof module !== "undefined" && module.exports) {
+@@ -225,9 +248,11 @@
+     if (root.document.readyState === "loading") {
+       root.document.addEventListener("DOMContentLoaded", function () {
+         initBrowser(root);
++        initReviewSubmit(root);
+       });
+     } else {
+       initBrowser(root);
++      initReviewSubmit(root);
+     }
+   }
+ })(typeof window !== "undefined" ? window : this);

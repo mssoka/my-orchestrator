@@ -1,0 +1,42 @@
+[
+  {
+    "source": "edge",
+    "severity": "blocker",
+    "category": "input-chain",
+    "title": "M keypress is never mapped to the Toggle_Mute intent — the entire mute path is dead code",
+    "location": "app/input/mouse.odin:315-343",
+    "evidence": "app/input/poll.odin:60: `if rl.IsKeyPressed(.M) { append(&inp.events, Device_Event(Key_Press{key = .M})) }` — but mouse_map's two key switches have no .M case. Phase-1 (mouse.odin:116-121): `#partial switch keys[i] { case .P, .Space: append(out, Intent(Toggle_Pause{})) case .D: append(out, Intent(Toggle_Overlay{})) case .T: append(out, Intent(Toggle_Assist{}))`. Phase-2 (mouse.odin:315-343): `#partial switch k.key { case .X, .Delete: append(out, Intent(Demolish{})) case .U: append(out, Intent(Arm_Preview{})) case .One, .Two: ... case .E: append(out, Intent(Set_Lane{lane = pp.LANE_EXPRESS})) case .S: append(out, Intent(Set_Lane{lane = pp.LANE_STANDARD})) case .B: append(out, Intent(Set_Lane{lane = pp.LANE_BEST_EFFORT})) case: // phase-1 keys already handled }`. Repo-wide grep: `Toggle_Mute` appears only in app/input/types.odin (definition) and app/input/exec.odin:44-46 (`case Toggle_Mute: if inp.on_mute != nil { inp.on_mute(inp.user, inp) }`) — no producer appends `Intent(Toggle_Mute{})` anywhere.",
+    "detail": "The chain device-event → intent → effect breaks at the mapping link: the M Key_Press falls into the `case:` fallthrough in both switches, so `on_mute`/`effect_mute`/`toggle_mute` never run. Muting is non-functional despite README and PR claims.",
+    "recommended_fix": "Add a `.M` case in mouse_map's phase-1 key switch emitting `append(out, Intent(Toggle_Mute{}))` (phase-2 is suppressed on placement-press frames, unlike T/D)."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "Multiple played alerts in one consume call share one caption slot — only the last caption is ever rendered",
+    "location": "app/audio/audio.odin:167-180",
+    "evidence": "consumer_consume sets the single Caption per event: `set_caption(&a.caption, crisis_caption(&a.caption, cat, e), e.tick)` ... `a.arrival_last_tick = e.tick` ... `set_caption(&a.caption, \"packet delivered\", e.tick)`. audio_flush plays ALL staged alerts regardless: `for _ in 0..<a.pending.crisis_plays { rl.PlaySound(...) }` / `for _ in 0..<a.pending.arrival_plays { rl.PlaySound(...) }`. Events arrive tick-ordered (app/main.odin feeds `app.state.events[app.audio_mark:]` once per frame, catch-up frames deliver multiple ticks), and flow_step's Packet_Arrived events precede crisis_evaluate's Crisis_Triggered only within the SAME tick — a later tick's arrival in the same frame overwrites the crisis caption.",
+    "detail": "In a catch-up frame containing a crisis at tick T plus a throttle-passing arrival at T+1/T+2, both alerts play but the rendered caption is only \"packet delivered\" — the crisis alert's caption is never displayed, breaching the every-alert-captioned contract.",
+    "recommended_fix": "Suppress arrival captions while a crisis caption is within its dwell (or give captions priority), so a played crisis alert always keeps its on-screen caption."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Multiple Crisis_Triggered events in one slice collapse to the last variant — N stings all play one variant",
+    "location": "app/audio/audio.odin:165-166",
+    "evidence": "`a.pending.crisis_plays += 1` then `a.pending.crisis_variant = variant` (each draw overwrites the stored variant), and audio_flush replays only the survivor: `for _ in 0..<a.pending.crisis_plays { rl.PlaySound(a.crisis[a.pending.crisis_variant]) }`. The core can emit several per tick: core/crisis.odin:425 `for si in 0..<len(de.set_pieces) {` with per-set-piece `crisis_trigger(state, tick, ai, u16(si), ...)` (dedup is per (archetype, set_piece)).",
+    "detail": "Each crisis draws a variant, but only the last is kept; earlier picks are discarded and their stings play the wrong variant. Unreachable with shipped single-set-piece catalogs; latent for multi-set-piece data.",
+    "recommended_fix": "Play each crisis's own variant at consume time (queue one variant per play, e.g. a small fixed ring), or cap pending.crisis_plays to the kept variant."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Caption never expires on Game_Over — the frozen tick keeps caption_live true indefinitely",
+    "location": "app/audio/audio.odin:218-220",
+    "evidence": "`caption_live :: proc(a: ^Audio, tick: u64) -> (string, bool) { if !a.caption.live || tick > a.caption.until_tick { return \"\", false }` — expiry requires the tick to advance past until_tick, but a terminal run stops stepping (app/main.odin: `if app.state.terminal { break }` / `if app.state.terminal { app.mode = .Game_Over }`), freezing app.tick. draw_hud calls `draw_audio_caption(app)` (app/main.odin:1011) unconditionally — no Run/Paused mode gate, unlike `draw_drop_markers` which is gated `if app.mode == .Run || app.mode == .Paused`.",
+    "detail": "The terminal tick's last caption (e.g. \"packet delivered\" or \"crisis alert\") lingers on the game-over screen forever, because the frozen tick never exceeds until_tick; only retry clears it.",
+    "recommended_fix": "Gate draw_audio_caption on mode Run/Paused (mirroring draw_drop_markers) or force-expire the caption when the run goes terminal."
+  }
+]

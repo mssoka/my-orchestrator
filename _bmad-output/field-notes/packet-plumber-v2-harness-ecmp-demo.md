@@ -1,0 +1,5 @@
+# packet-plumber-v2-harness-ecmp-demo — field notes (badge-out shard)
+
+- **Odin `fmt.tprintf` = temp allocator, `fmt.aprintf` = default** — the harness tick loop's per-tick `free_all` silently frees ANY tprintf string that must outlive the iteration (T2 failure messages + diff-dir paths came back as blank garbage; the T2 failure path had never run before because goldens were deferred). In-loop failure strings must be `fmt.aprintf`. Same trap for strings sliced out of temp-allocated demo text: `spawn_node` type names needed `strings.clone` at parse (the ODN-11 replay gate caught the dangling pointer live — the gate is the trap detector, trust it).
+- **The rlsw harness was ALREADY working** — bundle/flow/draw/win/lose T2 goldens were blessed in slice-1/2.1 and pass bit-exact; the "deferred T2" debt was only ecmp (no demo) + demolish (no captures). Verify the actual repo state before rebuilding infrastructure; the briefing's deferral narrative was stale.
+- **`fmt.tprintf` on a JSON literal needs `{{`/`}}`** — unescaped braces emit `%!(MISSING CLOSE BRACE)` into diff.json (the agent's §10.5 entry point was corrupted on every mismatch).

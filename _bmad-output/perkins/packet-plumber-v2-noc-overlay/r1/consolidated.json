@@ -1,0 +1,306 @@
+{
+ "job": "packet-plumber-v2-noc-overlay",
+ "round": 1,
+ "pr": "https://github.com/solarity-services/Packet-Plumber/pull/85",
+ "reviewed_sha": "f9633991262a46007294b3bed3a81c6217bb5783",
+ "lenses": {
+  "blind": 12,
+  "edge": 6,
+  "acceptance": 4,
+  "security": 1,
+  "architecture": 5,
+  "codebase": 3,
+  "tests": 4
+ },
+ "raw_findings": 35,
+ "added_by_perkins": 1,
+ "verification": {
+  "confirmed": 36,
+  "rejected": 0,
+  "unverifiable_speculative": 0,
+  "note": "every lens finding re-verified against the worktree at the reviewed sha; the perkins-added finding is mechanically measured (pixel-diff + fresh e2e re-run sha256-identical to committed captures)"
+ },
+ "mechanical_proofs": {
+  "t1_byte_identity": "overlay-check qos_contention 12000ms sidecar cmp-equal to goldens/qos_contention.t1 payload (independent re-run)",
+  "golden_harness": "46/46 demos green (plain build, independent re-run)",
+  "e2e_key_toggle": "tools/run-dev.sh --e2e re-run: bin/noc-e2e-{on,off}.png sha256-identical to the committed captures; pixel-diff 236,593 (233,120 in-card + 3,473 game-motion)",
+  "t2_confinement": "overlay run vs blessed 10000ms frame: 233,120 px in-card + 5,855 px heat tints outside \u2014 matches the PR claim exactly",
+  "tests_in_gate": "odin test app/render (26) + app/input (5) green without the define \u2014 the 11 feed + 2 key-chain tests run in gate 2; gate 9 compiles the PP_DEBUG surfaces",
+  "zero_sim_touch": "no core/ files, no goldens/, no data/*.json in the diff"
+ },
+ "failed_layers": [],
+ "counts": {
+  "blockers": 0,
+  "warnings": 8,
+  "notes": 11
+ },
+ "verdict": "READY TO MERGE",
+ "findings": [
+  {
+   "severity": "warning",
+   "category": "scroll-clamp",
+   "title": "Panel row measure undercounts the draw pass by 3 rows \u2014 max scroll can never reach the drop-log tail",
+   "location": "app/render/noc_overlay.odin:383-387 vs draw_noc_panel",
+   "sources": [
+    "blind",
+    "codebase",
+    "edge",
+    "acceptance",
+    "architecture"
+   ],
+   "verification": "confirmed",
+   "evidence": "measure: `rows := i32(2) // header` / `rows += 2 // drops` / `rows += 2 // crisis` \u2014 draw emits 3 header rows (title, glob, hash), 3 drop rows (hdr, counters, ratio), 3 crisis rows (hdr, sat, pool)",
+   "detail": "The scroll clamp clamp(scroll, 0, total-visible) uses the undercount; when content exceeds the 50-row viewport the last 3 rows (bottom of the drop log \u2014 briefing scope item 5, the scrollable alarm feed) are unreachable. Violates the proc's own 'MUST agree row-for-row' invariant.",
+   "fix": "Count the hash row, the ratio line, and the pool_line crisis row in noc_panel_rows (or derive the count from the draw pass); keep the invariant comment honest."
+  },
+  {
+   "severity": "warning",
+   "category": "tooling",
+   "title": "run-dev.sh's documented --stats-out pass-through is dead: ARGS never forwarded to the app; build line gets one empty-string arg when set",
+   "location": "tools/run-dev.sh:23,34,38,41",
+   "sources": [
+    "blind",
+    "edge",
+    "acceptance",
+    "architecture"
+   ],
+   "verification": "confirmed",
+   "evidence": "`odin build app -define:PP_DEBUG=true -out:bin/app-dev \"${ARGS[@]+}\"` then `PP_NOC_E2E=1 ./bin/app-dev` / `./bin/app-dev` \u2014 no \"$@\"/${ARGS[@]} on either run line",
+   "detail": "Header documents '--stats-out <p> # pass-through (the app's telemetry flag)' but flags are dropped from the run; when ARGS is non-empty the build line instead receives a single empty-string argument (verified in bash: argc=1), which odin rejects or misparses.",
+   "fix": "Run `./bin/app-dev \"${ARGS[@]+\"${ARGS[@]}\"}\"` (or plain \"$@\") on both run lines; drop the broken build-line expansion."
+  },
+  {
+   "severity": "warning",
+   "category": "proof-scope",
+   "title": "overlay-check .t1 sidecar only byte-matches the golden for full-length, pause-free captures (paused ticks unhashed; partial captures truncate)",
+   "location": "harness/overlay.odin:85-89",
+   "sources": [
+    "edge",
+    "acceptance",
+    "architecture",
+    "perkins"
+   ],
+   "verification": "confirmed",
+   "evidence": "overlay loop: `if paused_at(...) { free_all(...); continue }` \u2014 run.odin's golden driver instead appends a per-wall-tick hash while paused ('paused state STABLE' pin). Reproduced: `overlay-check pause 100000ms` -> 1810 hashes vs goldens/pause.t1 2000; 10000ms partial capture -> 200 vs 240.",
+   "detail": "The AC3 byte-identity proof holds for the PR's shipped proof (qos_contention 12000ms \u2014 cmp-equal, independently re-verified) but the verb produces non-comparable sidecars for paused demos and partial captures, with no guard or warning.",
+   "fix": "Hash paused wall ticks like run.odin (state-stable pin) and/or compare prefix-wise + fail loud when cap_ms < demo length or pauses exist."
+  },
+  {
+   "severity": "warning",
+   "category": "accounting",
+   "title": "Rejection accounting is lossy: the latch only runs while the panel is ON, and dedups on (tick, kind)",
+   "location": "app/main.odin:488-497",
+   "sources": [
+    "blind",
+    "edge"
+   ],
+   "verification": "confirmed",
+   "evidence": "`if app.overlay_on && app.run_live { rnd.noc_feed_scan(...); if app.input.last_reject != .None && (app.input.reject_tick != app.noc_reject_tick || app.input.last_reject != app.noc_reject_kind) { rnd.noc_feed_reject(...) } }`",
+   "detail": "N rejections made with the panel hidden collapse to <=1 at next reveal (only last_reject/reject_tick persist); two same-kind rejections within one 20Hz tick count once. Drop counters catch up on reveal (events); rejections do not \u2014 the 'REJECTED, not dropped: N' line undercounts.",
+   "fix": "Scan rejections unconditionally in PP_DEBUG builds (drop events already are), or accumulate reject counts at the executor where each rejection is observable."
+  },
+  {
+   "severity": "warning",
+   "category": "accounting",
+   "title": "Out-of-roster class drop is double-counted: reason bucket AND drop_other both increment, inflating total + ratio",
+   "location": "app/render/noc_overlay.odin:136-150",
+   "sources": [
+    "blind",
+    "architecture"
+   ],
+   "verification": "confirmed",
+   "evidence": "reason switch increments drop_e9 (say), then `if u32(e.class) < NOC_MAX_CLASSES { ... } else { f.drop_other += 1 }` \u2014 one event, two counters",
+   "detail": "E9+E22+other can exceed the Packet_Dropped count and the ratio denominator uses that total. Unreachable with the current catalog (roster << 64) and pinned as the anomaly signal by noc_feed_class_beyond_table \u2014 but the panel 'total' line then lies about the very anomaly it surfaces.",
+   "fix": "Count out-of-roster classes in a separate anomaly counter (not drop_other), or exempt them from the total/ratio math."
+  },
+  {
+   "severity": "warning",
+   "category": "stale-data",
+   "title": "'/3s' rolling rate freezes after quiet periods \u2014 the rings only roll when a drop event arrives",
+   "location": "app/render/noc_overlay.odin:noc_feed_fold_drop/noc_feed_ring_roll",
+   "sources": [
+    "blind",
+    "perkins"
+   ],
+   "verification": "confirmed",
+   "evidence": "ring_roll is called only inside noc_feed_fold_drop; after >=60 dropless ticks noc_feed_rate_total still sums the pre-quiet window's slots",
+   "detail": "The spec's I/O matrix says 'rates = last 60 ticks only'; after a quiet period the labeled /3s readout keeps showing the frozen last-drop window \u2014 stale diagnosis data in the exact 'why am I losing NOW' use case.",
+   "fix": "Roll the rings to the current sim tick at draw/scan time (pass stats.tick), zero-filling elapsed slots."
+  },
+  {
+   "severity": "warning",
+   "category": "share-never-fork",
+   "title": "NOC panel forks draw_panel_card's chrome inline with drifted alpha values",
+   "location": "app/render/noc_overlay.odin:438-439 vs app/render/forecast.odin:117-122",
+   "sources": [
+    "blind",
+    "acceptance"
+   ],
+   "verification": "confirmed",
+   "evidence": "fork: `rl.DrawRectangle(..., rl.Color{255,252,244,230})` + border `{51,65,79,60}` \u2014 shared draw_panel_card: card alpha 235, border alpha 40",
+   "detail": "Spec Always-constraint: 'SHARE, never fork: reuse draw_text_c / draw_panel_card'. The copy already drifted (230/60 vs 235/40) \u2014 the exact fork the constraint forbids.",
+   "fix": "Call draw_panel_card(v, NOC_PANEL_X-8, NOC_PANEL_Y-10, NOC_PANEL_W+16, NOC_PANEL_H+20)."
+  },
+  {
+   "severity": "warning",
+   "category": "pr-body-accuracy",
+   "title": "PR-body e2e claim 'differs by exactly the panel rect (233,120 px)' overstates \u2014 3,473 px also differ outside the card",
+   "location": "PR body (proof 3) vs _bmad-output/pr-bodies/v2-noc-overlay/e2e-real-run-panel-{off,on}.png",
+   "sources": [
+    "perkins"
+   ],
+   "verification": "confirmed",
+   "evidence": "Pixel-diff of the committed captures: total 236,593 differing px; in-card (900..1275, 86..705 = the drawn 376x620 card) exactly 233,120; outside 3,473 px across x 49..899 (sim advanced 120 frames between the frame-120 ON and frame-240 OFF captures). Fresh re-run reproduced both captures sha256-identically.",
+   "detail": "The proof itself is solid and reproducible (re-ran tools/run-dev.sh --e2e: byte-identical artifacts), but 'exactly' is false \u2014 normal game motion between captures also differs. Say 'the panel card rect (233,120 px) + ~3.5k px of ordinary 2s game motion'.",
+   "fix": "Correct the wording in the PR body (no code change)."
+  },
+  {
+   "severity": "note",
+   "category": "layout-measure",
+   "title": "Further measure/draw drift on conditional rows: sel_pipe counted +4 but draws 0-4; empty-state placeholder rows uncounted; class-roster filter skipped in measure",
+   "location": "app/render/noc_overlay.odin:395-400,553-556,597,608",
+   "sources": [
+    "blind",
+    "edge"
+   ],
+   "verification": "confirmed",
+   "evidence": "measure `if sel_pipe >= 0 { rows += 4 }` vs draw guards (`pipe_slot` ok, stats-loop break); `if shown_events == 0 { cur = noc_row(... \"(no events yet...\") }` adds an unmeasured row",
+   "detail": "Beyond the constant -3: conditional sections drift the clamp by a row or two depending on state. Dev-tool cosmetic.",
+   "fix": "Fold into the same measure-pass fix as the -3 correction."
+  },
+  {
+   "severity": "note",
+   "category": "stale-comment",
+   "title": "main.odin draw-gate comment says 'the F-key debug surface' \u2014 the shipped toggle is D everywhere else",
+   "location": "app/main.odin:589",
+   "sources": [
+    "blind",
+    "codebase",
+    "architecture"
+   ],
+   "verification": "confirmed",
+   "evidence": "`// v2-noc: the F-key debug surface (the merged 5.7 + NOC overlay) draws` \u2014 poll.odin gates `.D`, panel title reads 'DEBUG OVERLAY (D)', README says D",
+   "detail": "Leftover from the dropped F plan; misdocuments the toggle.",
+   "fix": "s/F-key/D-key/ in the comment."
+  },
+  {
+   "severity": "note",
+   "category": "stale-doc",
+   "title": "Shipped spec artifact still tells the implementer to inject Key_Press{.F} and verify 'F toggles the panel' after the D-only ruling",
+   "location": "_bmad-output/implementation-artifacts/spec-noc-overlay.md:72,109",
+   "sources": [
+    "blind",
+    "codebase"
+   ],
+   "verification": "confirmed",
+   "evidence": "line 72: '...e2e auto-drive (PP_NOC_E2E=1: inject Key_Press{.F} after the polls...' (same line's first half says 'D kept as the overlay key'); line 109: 'expected: compiles; F toggles the panel'",
+   "detail": "The spec contradicts itself and the code; re-running its verification section would test a dead key.",
+   "fix": "Update the two stale lines to D."
+  },
+  {
+   "severity": "note",
+   "category": "labeling",
+   "title": "Drop-log stale bundle slots: out-of-range ids render 'map-wide' (the E22 label) instead of the promised 'gone'; occupied renumbered slots misanchor pipe/endpoints/lane",
+   "location": "app/render/noc_overlay.odin:654-690",
+   "sources": [
+    "blind",
+    "edge"
+   ],
+   "verification": "confirmed",
+   "evidence": "`if e.bundle == pp.NO_BUNDLE || int(e.bundle) >= len(bundles.bundle_lo) { return ... \"map-wide\" }` \u2014 the 'gone' branch only fires for in-range slots with no live pipe; resolution reads the CURRENT bundle table",
+   "detail": "A shrunk bundle array sends stale E9 rows down the map-wide branch; a renumbered occupied slot shows plausible-but-wrong ids. Edge-case mislabels in a diagnostic feed.",
+   "fix": "Separate NO_BUNDLE from out-of-range ('gone'), and consider tick-stamping the roster or flagging renumbered rows."
+  },
+  {
+   "severity": "note",
+   "category": "dead-code",
+   "title": "Noc_Feed.crisis_last_cause is written but never read",
+   "location": "app/render/noc_overlay.odin:129,163",
+   "sources": [
+    "blind"
+   ],
+   "verification": "confirmed",
+   "evidence": "grep: only `f.crisis_last_cause = e.cause` \u2014 the readout prints bundle/pipe/class only; no test reads it",
+   "detail": "Dead field in the feed struct.",
+   "fix": "Print it in the Saturated_Bundle line or drop the field."
+  },
+  {
+   "severity": "note",
+   "category": "input-handling",
+   "title": "Wheel scroll truncates fractional deltas \u2014 trackpad scrolling does nothing",
+   "location": "app/main.odin:596-598",
+   "sources": [
+    "blind"
+   ],
+   "verification": "confirmed",
+   "evidence": "`if w := rl.GetMouseWheelMove(); w != 0 { app.noc_scroll = max(0, app.noc_scroll - i32(w)) }` \u2014 i32(0.5) == 0",
+   "detail": "GetMouseWheelMove is fractional on trackpads/high-res wheels; sub-1.0 deltas pass the !=0 test then truncate to zero. Mouse wheels (\u00b11.0) work.",
+   "fix": "Accumulate a f32 remainder instead of truncating per event."
+  },
+  {
+   "severity": "note",
+   "category": "env-input",
+   "title": "PP_NOC_E2E truthiness: any non-empty value (e.g. PP_NOC_E2E=0) arms the scripted key-injection/auto-exit drive",
+   "location": "app/main.odin:327",
+   "sources": [
+    "security"
+   ],
+   "verification": "confirmed",
+   "evidence": "`app.noc_e2e = os.get_env_alloc(\"PP_NOC_E2E\", context.allocator) != \"\"`",
+   "detail": "Dev-build-only surprise (=0/=false still activates scripted D presses + auto-exit); harmless in release (compiled out).",
+   "fix": "Compare against \"1\"."
+  },
+  {
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "The rejection dedup latch (tick||kind condition) is the feed path's only untested branch logic",
+   "location": "app/main.odin:492",
+   "sources": [
+    "tests"
+   ],
+   "verification": "confirmed",
+   "evidence": "noc_feed_reject counting is unit-pinned; the PP_DEBUG-gated latch deciding WHEN a reject is new has no test",
+   "detail": "A regression double-counts or drops rejections silently. Pairs with the lossy-accounting warning.",
+   "fix": "Extract the latch as a pure helper and pin it (it is untestable inline under gate-2 as-is)."
+  },
+  {
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "Scroll clamp / noc_panel_rows-vs-draw row-agreement invariant has no test (PP_DEBUG-gated, unreachable by gate-2 unit tests)",
+   "location": "app/render/noc_overlay.odin:382,435",
+   "sources": [
+    "tests"
+   ],
+   "verification": "confirmed",
+   "evidence": "nothing verifies the 'MUST agree row-for-row' invariant or the clamp; the drift warnings shipped precisely because of that",
+   "detail": "Measure/draw drift is invisible to the suite. (The ungated feed is well-pinned \u2014 11 tests.)",
+   "fix": "Emit the row count from an ungated pure helper both passes share, and test THAT."
+  },
+  {
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "Rejection-kind label map (17 Edit_Error cases) untested \u2014 taxonomy pins cover Drop_Reason + lanes but not the rejection labels",
+   "location": "app/render/noc_overlay.odin:626-646",
+   "sources": [
+    "tests"
+   ],
+   "verification": "confirmed",
+   "evidence": "noc_feed_taxonomy_labels pins E9/E22/?? + lane letters; noc_edit_error_label sits inside the PP_DEBUG gate with no test",
+   "detail": "A mislabeled rejection kind ships silently.",
+   "fix": "Move the label map ungated (pure string switch) and pin it like the others."
+  },
+  {
+   "severity": "note",
+   "category": "coverage-gate",
+   "title": "Advisory test gate: PASS",
+   "location": "N/A",
+   "sources": [
+    "tests"
+   ],
+   "verification": "confirmed",
+   "evidence": "P0 100%: 11 feed tests + 2 key-chain tests verified passing in gate-2 (non-PP_DEBUG); gates 4/8/9/10 pin stream neutrality + gated compile; PP_DEBUG-only UI code has compile coverage (gate 9) but no run coverage",
+   "detail": "P0 100%, P1 ~90%, overall >80% \u2014 PASS.",
+   "fix": "(advisory) The three coverage-gap notes above would close the remainder."
+  }
+ ]
+}

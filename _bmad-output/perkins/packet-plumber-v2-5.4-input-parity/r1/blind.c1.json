@@ -1,0 +1,52 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "parity",
+    "title": "Same-frame duplicate keys break the old || semantics: P+Space double-flips pause, R+Enter double-restarts",
+    "location": "app/input/poll.odin:hunk (poll_mouse keys) + app/input/mouse.odin:hunk (phase-1 keys, Game_Over retry) + app/input/exec.odin:hunk (Toggle_Pause)",
+    "evidence": "Old: \"-\tif rl.IsKeyPressed(.P) || rl.IsKeyPressed(.SPACE) {\" \"-\t\tapp.mode = .Paused if app.mode == .Run else .Run\". New poll appends each key independently: \"+\tif rl.IsKeyPressed(.P) { append(&inp.events, Device_Event(Key_Press{key = .P})) }\" \"+\tif rl.IsKeyPressed(.SPACE) { append(&inp.events, Device_Event(Key_Press{key = .Space})) }\"; mapping emits one intent per event: \"+\t\t\tcase .P, .Space:\" \"+\t\t\t\tappend(out, Intent(Toggle_Pause{}))\"; executor flips per intent: \"+\t\tinp.mode = .Paused if inp.mode == .Run else .Run\". Retry: old \"-\t\tif rl.IsKeyPressed(.R) || rl.IsKeyPressed(.ENTER) {\" vs new \"+\t\t\t\tif k.key == .R || k.key == .Enter {\" \"+\t\t\t\t\tappend(out, Intent(Retry{}))\".",
+    "detail": "Two key events in one frame now produce two intents: P+Space together toggles pause twice (net no-op) and R+Enter together restarts twice. Old code toggled/restarted once per frame.",
+    "recommended_fix": "Deduplicate per intent kind per frame: emit Toggle_Pause/Retry at most once (a seen-flag in the mapping), preserving the old || semantics."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "input",
+    "title": "Touch presses bypass the app-UI swallow: draws can start/commit through the demolish popover and QoS panel, and the demolish button is touch-dead",
+    "location": "app/input/touch.odin:hunk (Touch_Press, Touch_Release)",
+    "evidence": "Mouse press consults the UI first: \"+\t\tif inp.placing < 0 && inp.on_ui_press != nil {\" \"+\t\t\tui = inp.on_ui_press(inp.user, inp, left_press)\". Touch press has no such gate — it goes straight to Begin_Draw: \"+\t\t\tinp.press = v.pos\" \"+\t\t\tinp.press_swallowed = false\" ... \"+\t\t\t\tif id, ok := snap_node(inp.topo, inp.cat, wx, wy); ok {\" \"+\t\t\t\t\tappend(out, Intent(Begin_Draw{node = id, wx = wx, wy = wy}))\". Touch release commits unconditionally: \"+\t\t\tif inp.drag.active && inp.placing < 0 {\" ... \"+\t\t\t\tappend(out, Intent(Drag_Release{pos = v.pos}))\".",
+    "detail": "A touch press on the popover (anchored at the selected node) starts a draw; a slide onto another node commits it. effect_ui_press (popover_click/qos_panel_click) is only reachable from mouse_map, so the demolish button and QoS controls never fire for touch.",
+    "recommended_fix": "Call on_ui_press from Touch_Press (popover/QoS swallow) and gate the touch Drag_Release commit like the mouse: skip commit when the release lands in a UI rect."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "key_map in poll.odin is defined but never called",
+    "location": "app/input/poll.odin:1074 (key_map)",
+    "evidence": "\"+\tkey_map :: proc(k: rl.KeyboardKey) -> (Key, bool) {\" ... \"+\tcase:\" \"+\t\treturn .Esc, false\" \"+\t}\" — grep of the full diff shows zero call sites; poll_mouse instead hardcodes each key: \"+\tif rl.IsKeyPressed(.R) { append(&inp.events, Device_Event(Key_Press{key = .R})) }\" and so on for all 14 keys.",
+    "detail": "The documented key-translation helper (\"Key translation: raylib's IsKeyPressed → Key_Press (semantic Key)\") is never invoked; poll_mouse duplicates its mapping inline, so the two can drift.",
+    "recommended_fix": "Delete key_map, or route poll_mouse's key checks through it (map the rl.KeyboardKey, append only when mapped)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "stale-state",
+    "title": "Pad cursor can point at a demolished node: Confirm then aims from a dead id via node_slot's ignored ok result",
+    "location": "app/input/exec.odin:431-440 (node_pos/node_world) + exec.odin:Confirm + exec.odin:pad_step",
+    "evidence": "pad_step only ever sets an alive node: \"+\t\tif t.node_alive[j] {\" \"+\t\t\tinp.pad_has = true\" \"+\t\t\tinp.pad_node = t.node_id[j]\". Confirm re-aims with no liveness re-check: \"+\t\t} else if inp.placing < 0 && inp.pad_has {\" \"+\t\t\t\tnx, ny := node_world(inp.topo, inp.cat, inp.pad_node)\" \"+\t\t\t\tbegin_draw(inp, inp.pad_node, nx, ny)\"; node_pos ignores failure: \"+node_pos :: proc(topo: ^pp.Topology, id: u32) -> [2]i32 {\" \"+\tslot, _ := pp.node_slot(topo, id)\" \"+\treturn topo.node_pos[slot]\".",
+    "detail": "Demolishing the cursor node (mouse X/popover) leaves pad_node stale; next A begins a draw from a dead node at a stale/wrong position. The draw cannot commit (validation rejects), but the aim preview is wrong and the drag sticks until pad B.",
+    "recommended_fix": "In Confirm, re-verify the cursor node is alive (node_slot + node_alive); if dead, clear pad_has (and skip) until the next dpad step."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "coupling",
+    "title": "Touch press clears the mouse press's swallow latch mid-frame, letting a later mouse release re-select",
+    "location": "app/input/touch.odin:hunk (Touch_Press) + app/input/input.odin:hunk (dispatch_frame)",
+    "evidence": "Touch press resets the shared latch: \"+\t\t\tinp.press = v.pos\" \"+\t\t\tinp.press_swallowed = false\". Devices run in fixed order in one frame: \"+\tmouse_map(inp, events, &inp.intents)\" \"+\texecute_all(inp, inp.intents[:])\" ... \"+\ttouch_map(inp, events, &inp.intents)\". The mouse release select is gated on the latch: \"+\t\tif !inp.press_swallowed && !moved && !release_ui_hit(inp, v.pos) {\" \"+\t\t\tclick_select(inp, v.pos)\".",
+    "detail": "A mouse press swallowed by the popover (latch=true) plus any touch press in the same frame clears the latch; the mouse's release next frame then click-selects, defeating the swallow contract (\"must never re-select on release\").",
+    "recommended_fix": "Keep the swallow latch per-device (or per-press): touch press should not clear a mouse swallow; restore it when the matching release is consumed."
+  }
+]

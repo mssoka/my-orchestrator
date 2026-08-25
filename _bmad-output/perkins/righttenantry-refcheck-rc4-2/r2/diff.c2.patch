@@ -1,0 +1,1254 @@
+diff --git a/client/test/client_test.gleam b/client/test/client_test.gleam
+index 1fdd6a68..0cd6c1fb 100644
+--- a/client/test/client_test.gleam
++++ b/client/test/client_test.gleam
+@@ -55,6 +55,7 @@ import shared/error_code
+ import shared/landlord
+ import shared/leaderboard
+ import shared/notification
++import shared/reference_call
+ import shared/remote_data
+ import shared/routes
+ import shared/vacancy
+@@ -6132,3 +6133,137 @@ pub fn current_awaiting_response_accepted_test() {
+     client.update(m, msg.ApiReturnedAwaiting("vacancy-a", Ok([])))
+   updated.awaiting_list |> should.equal(remote_data.Success([]))
+ }
++
++// -- Reference panel (RC4.2) handler tests ------------------------------------
++
++fn refcheck_call(
++  id: String,
++  status: reference_call.ReferenceCallStatus,
++) -> reference_call.ReferenceCallDetail {
++  reference_call.ReferenceCallDetail(
++    reference_call_id: id,
++    ref_slot: reference_call.LandlordRef,
++    owner_label: reference_call.Primary,
++    status: status,
++    outcome: option.None,
++    attempt_count: 0,
++    next_attempt_at: option.None,
++    form_opened_at: option.None,
++    submitted_at: option.None,
++    attempts: [],
++    result: option.None,
++    display_disclaimer: option.None,
++    hooks: reference_call.ReferenceCallHooks(
++      can_record_manual: True,
++      can_substitute_referee: False,
++      can_retry: False,
++    ),
++  )
++}
++
++/// Row toggle: expanding adds the call id to the set; collapsing removes it.
++pub fn refcheck_toggle_row_expands_and_collapses_test() {
++  let m = model.Model(..model.initial(), refcheck_expanded: set.new())
++  let #(expanded, _eff) = client.update(m, msg.UserToggledRefcheckRow("rc-1"))
++  expanded.refcheck_expanded |> set.contains("rc-1") |> should.be_true
++  let #(collapsed, _eff2) =
++    client.update(expanded, msg.UserToggledRefcheckRow("rc-1"))
++  collapsed.refcheck_expanded |> set.contains("rc-1") |> should.be_false
++}
++
++/// Collapsing the explainer records the §7.3 per-user dismissed state;
++/// re-opening never un-dismisses.
++pub fn refcheck_explainer_toggle_records_dismissal_test() {
++  let m =
++    model.Model(
++      ..model.initial(),
++      refcheck_explainer_open: True,
++      refcheck_explainer_dismissed: False,
++    )
++  let #(closed, _eff) = client.update(m, msg.UserToggledRefcheckExplainer)
++  closed.refcheck_explainer_open |> should.be_false
++  closed.refcheck_explainer_dismissed |> should.be_true
++  // Re-opening keeps the dismissal on record.
++  let #(reopened, _eff2) =
++    client.update(closed, msg.UserToggledRefcheckExplainer)
++  reopened.refcheck_explainer_open |> should.be_true
++  reopened.refcheck_explainer_dismissed |> should.be_true
++}
++
++/// Hydration of the persisted dismissal lands in the model.
++pub fn refcheck_explainer_hydration_lands_in_model_test() {
++  let m = model.initial()
++  let #(updated, _eff) =
++    client.update(m, msg.UserHydratedRefcheckExplainerDismissed(True))
++  updated.refcheck_explainer_dismissed |> should.be_true
++}
++
++/// First view of an application auto-expands rows carrying a summary
++/// (received / manual-recorded / partial) and marks the application so a
++/// return visit renders collapsed.
++pub fn refcheck_first_view_auto_expands_completed_rows_test() {
++  let detail =
++    application_detail.ApplicationDetail(..test_detail(), reference_calls: [
++      refcheck_call("rc-1", reference_call.FormCompleted),
++      refcheck_call("rc-2", reference_call.Queued),
++    ])
++  let m =
++    model.Model(
++      ..model.initial(),
++      application_detail_request_id: option.Some("uuid-app-1"),
++    )
++  let #(updated, _eff) =
++    client.update(m, msg.ApiReturnedApplicationDetail(Ok(detail)))
++  updated.refcheck_expanded |> set.contains("rc-1") |> should.be_true
++  updated.refcheck_expanded |> set.contains("rc-2") |> should.be_false
++  updated.refcheck_auto_expanded
++  |> set.contains("uuid-app-1")
++  |> should.be_true
++}
++
++/// A first view with NOTHING expandable consumes nothing — a later visit
++/// after a completion still gets the first-view expand (Perkins r1 N8).
++pub fn refcheck_auto_expand_not_consumed_without_summary_rows_test() {
++  let detail =
++    application_detail.ApplicationDetail(..test_detail(), reference_calls: [
++      refcheck_call("rc-1", reference_call.Queued),
++    ])
++  let m =
++    model.Model(
++      ..model.initial(),
++      application_detail_request_id: option.Some("uuid-app-1"),
++    )
++  let #(updated, _eff) =
++    client.update(m, msg.ApiReturnedApplicationDetail(Ok(detail)))
++  updated.refcheck_auto_expanded
++  |> set.contains("uuid-app-1")
++  |> should.be_false
++}
++
++/// Route change to a new applicant resets the expanded set (and the explainer
++/// view state) so rows don't leak across applicants; the auto-expanded marker
++/// survives so a return visit renders collapsed.
++pub fn refcheck_route_change_resets_expanded_rows_test() {
++  let m =
++    model.Model(
++      ..model.initial(),
++      refcheck_expanded: set.from_list(["rc-1"]),
++      refcheck_auto_expanded: set.from_list(["aid-1"]),
++      refcheck_explainer_open: True,
++      route: routes.ApplicationDetail("v1", "aid-1"),
++    )
++  let uri =
++    uri.Uri(
++      scheme: option.Some("http"),
++      userinfo: option.None,
++      host: option.Some("localhost"),
++      port: option.None,
++      path: "/vacancies/v1/applications/aid-2",
++      query: option.None,
++      fragment: option.None,
++    )
++  let #(updated, _eff) = client.update(m, msg.BrowserChangedUrl(uri))
++  updated.refcheck_expanded |> should.equal(set.new())
++  updated.refcheck_explainer_open |> should.be_false
++  updated.refcheck_auto_expanded |> set.contains("aid-1") |> should.be_true
++}
+diff --git a/client/test/components/reference_panel_test.gleam b/client/test/components/reference_panel_test.gleam
+new file mode 100644
+index 00000000..7671f226
+--- /dev/null
++++ b/client/test/components/reference_panel_test.gleam
+@@ -0,0 +1,1098 @@
++//// Reference panel tests (RC4.2) — the 12-state matrix, the §7.4/§7.5 copy
++//// verbatim, the completed-reference summary with honest framing, the Off
++//// state, and the a11y contract (role="region", aria-expanded, status never
++//// colour-only).
++////
++//// Assertion style per the field notes: Lustre's SERIALIZED render — pinned
++//// `data-testid="..."` strings, `&#39;` for apostrophes, attributes sorted.
++
++import components/reference_panel
++import copy
++import gleam/list
++import gleam/option.{type Option, None, Some}
++import gleam/set
++import gleam/string
++import gleeunit/should
++import lustre/element
++import shared/application.{type Application}
++import shared/reference_call.{
++  type ReferenceCallAttempt, type ReferenceCallDetail, type ReferenceCallStatus,
++  AwaitingCorrection, CharacterRef, ContactInitiated, EmployerRef, Failed,
++  FormCompleted, LandlordRef, ManualRecorded, Objected, Partial, Queued, Refused,
++  Skipped, Unreachable,
++}
++
++// -- Fixtures -----------------------------------------------------------------
++
++/// A landlord-slotted row; status/result/attempts vary per test.
++fn row(
++  id id: String,
++  status status: ReferenceCallStatus,
++  result result: Option(String),
++  attempts attempts: List(ReferenceCallAttempt),
++) -> ReferenceCallDetail {
++  reference_call.ReferenceCallDetail(
++    reference_call_id: id,
++    ref_slot: LandlordRef,
++    owner_label: reference_call.Primary,
++    status: status,
++    outcome: None,
++    attempt_count: list.length(attempts),
++    next_attempt_at: None,
++    form_opened_at: None,
++    submitted_at: None,
++    attempts: attempts,
++    result: result,
++    display_disclaimer: None,
++    // Hooks mirror the server's terminal rule (can_record_manual =
++    // !terminal) so the panel's hook-driven terminality reads realistic
++    // fixtures.
++    hooks: reference_call.ReferenceCallHooks(
++      can_record_manual: !is_terminal_status(status),
++      can_substitute_referee: False,
++      can_retry: False,
++    ),
++  )
++}
++
++fn is_terminal_status(status: ReferenceCallStatus) -> Bool {
++  case status {
++    FormCompleted
++    | ManualRecorded
++    | Partial
++    | Unreachable
++    | Refused
++    | Objected
++    | Failed
++    | reference_call.Completed -> True
++    _ -> False
++  }
++}
++
++fn invite_attempt() -> ReferenceCallAttempt {
++  reference_call.ReferenceCallAttempt(
++    at: "2026-08-01T10:04:00Z",
++    channel: "email",
++    outcome: "delivered",
++    detail: "",
++  )
++}
++
++fn sms_attempt() -> ReferenceCallAttempt {
++  reference_call.ReferenceCallAttempt(
++    at: "2026-08-01T10:04:00Z",
++    channel: "sms",
++    outcome: "delivered",
++    detail: "",
++  )
++}
++
++fn reminder_batch(at: String) -> List(ReferenceCallAttempt) {
++  [
++    reference_call.ReferenceCallAttempt(
++      at:,
++      channel: "email",
++      outcome: "delivered",
++      detail: "",
++    ),
++    reference_call.ReferenceCallAttempt(
++      at:,
++      channel: "sms",
++      outcome: "delivered",
++      detail: "",
++    ),
++  ]
++}
++
++/// The stored result for a completed landlord reference: full verification
++/// (the wire values the structurer emits), deterministic ai_summary, honest
++/// fraud_signals, per §6.2 (RC4.1-stripped shape).
++fn completed_result() -> String {
++  "{\"schema_version\":\"refcall-v1\",\"channel\":\"form\",\"outcome\":\"form_completed\",\"attempts\":[{\"at\":\"2026-08-01T10:04:00Z\",\"channel\":\"email\",\"outcome\":\"delivered\",\"detail\":\"\"}],\"verification\":{\"identity_confirmed\":\"yes\",\"relationship_to_applicant\":\"their_landlord\",\"tenancy_confirmed\":\"yes\",\"tenancy_period\":{\"from\":\"2023-01\",\"to\":\"2024-12\"},\"rent_amount_confirmed\":{\"amount_eur\":\"1400\"},\"rent_payment_record\":\"always_on_time\",\"property_condition\":\"good\",\"notice_given_properly\":\"yes\",\"deposit_returned\":\"in_full\",\"would_rent_again\":\"yes\",\"free_text_signals\":[\"They kept the garden lovely.\"]},\"fraud_signals\":{\"contact_reused_within_application\":false,\"contact_duplicate_of_applicant\":false,\"contact_reused_across_applications\":false,\"line_type\":\"mobile\",\"voip_or_burner\":false,\"form_session\":{\"completion_seconds\":95,\"ip_matches_applicant\":false,\"device_fingerprint_match\":false},\"geo_vs_claimed_property\":\"unknown\",\"coached_answer_score\":null},\"ai_summary\":{\"headline\":\"Tenancy confirmed; rent always on time.\",\"summary\":\"Identity confirmed. Payment record: always on time. Property: good.\",\"confidence\":\"high\"}}"
++}
++
++fn test_application() -> Application {
++  application.Application(
++    id: "uuid-app-1",
++    vacancy_id: "uuid-vac-1",
++    first_name: "Jane",
++    last_name: "Doe",
++    email: "jane@example.com",
++    phone: Some("+353851234567"),
++    current_address: Some("42 Oak Lane"),
++    current_city: Some("Dublin"),
++    current_county: Some("Dublin"),
++    eircode: Some("D02 XY45"),
++    current_living_situation: Some("Renting"),
++    reason_for_moving: Some("Closer to work"),
++    employment_status: "employed",
++    employer_name: Some("Acme Corp"),
++    job_title: Some("Software Engineer"),
++    employment_duration: Some("3 years"),
++    monthly_income_cents: 350_000,
++    landlord_ref_name: Some("Colm Byrne"),
++    landlord_ref_phone: Some("+353871111111"),
++    landlord_ref_email: Some("colm@example.com"),
++    employer_ref_name: Some("Sarah Daly"),
++    employer_ref_phone: Some("+353872222222"),
++    employer_ref_email: Some("sarah@example.com"),
++    num_occupants: Some(2),
++    has_pets: "no",
++    pet_details: None,
++    is_smoker: False,
++    has_eviction_history: False,
++    eviction_details: None,
++    has_ccjs: False,
++    desired_move_in_date: Some("2026-05-01"),
++    listing_source: Some("daft.ie"),
++    personal_statement: Some("I am a reliable tenant"),
++    status: application.Viewed,
++    created_at: "2026-03-29T00:00:00Z",
++    never_rented_before: False,
++    character_ref_name: None,
++    character_ref_phone: None,
++    character_ref_email: None,
++    has_guarantor: False,
++    guarantor_name: None,
++    guarantor_relationship: None,
++    guarantor_phone: None,
++    guarantor_email: None,
++    guarantor_monthly_income_cents: None,
++    guarantor_employer: None,
++    reference_contact_choice: Some("attested"),
++    household_monthly_income_cents: 350_000,
++    co_applicant_count: 0,
++  )
++}
++
++fn render(
++  calls calls: List(ReferenceCallDetail),
++  off off: Bool,
++  attestation_on_file attestation_on_file: Bool,
++  expanded expanded: List(String),
++) -> String {
++  reference_panel.view(
++    calls: calls,
++    off: off,
++    attestation_on_file: attestation_on_file,
++    app: test_application(),
++    expanded: set.from_list(expanded),
++    explainer_open: False,
++  )
++  |> element.to_string
++}
++
++fn render_explainer_open(calls: List(ReferenceCallDetail)) -> String {
++  reference_panel.view(
++    calls: calls,
++    off: False,
++    attestation_on_file: True,
++    app: test_application(),
++    expanded: set.new(),
++    explainer_open: True,
++  )
++  |> element.to_string
++}
++
++// -- Card visibility ----------------------------------------------------------
++
++/// Pre-v1 application (no attestation choice, no rows) renders nothing —
++/// the counsel posture for `attestation_on_file: false` (§11 Q5).
++pub fn card_hidden_for_pre_v1_without_rows_test() {
++  let html =
++    render(calls: [], off: False, attestation_on_file: False, expanded: [])
++  html |> string.contains("refcheck-card") |> should.be_false
++}
++
++/// Declined attestation renders the card even with zero rows (the Off block
++/// is the manual-flow surface).
++pub fn card_visible_when_attestation_declined_test() {
++  let html =
++    render(calls: [], off: True, attestation_on_file: False, expanded: [])
++  html |> string.contains("data-testid=\"refcheck-card\"") |> should.be_true
++}
++
++/// Attested + no rows yet = pre-trigger: A5 sub-line + explainer, heading
++/// with the honest count (0).
++pub fn pre_trigger_renders_a5_subline_test() {
++  let html =
++    render(calls: [], off: False, attestation_on_file: True, expanded: [])
++  html |> string.contains("data-testid=\"refcheck-card\"") |> should.be_true
++  html |> string.contains("Reference Checks (0)") |> should.be_true
++  html
++  |> string.contains("Starts automatically when you mark the viewing as done.")
++  |> should.be_true
++  html
++  |> string.contains("We invite, remind, and nudge")
++  |> should.be_false
++}
++
++// -- Panel chrome -------------------------------------------------------------
++
++/// Card is a region with the §12 aria-label; the explainer is collapsed by
++/// default.
++pub fn card_region_and_collapsed_explainer_test() {
++  let html =
++    render(
++      [row("rc-1", Queued, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++    )
++  html |> string.contains("role=\"region\"") |> should.be_true
++  html |> string.contains("aria-label=\"Reference checks\"") |> should.be_true
++  html |> string.contains("What this tells you") |> should.be_true
++  html
++  |> string.contains("A completed reference means the person")
++  |> should.be_false
++}
++
++/// Opening the explainer shows the §7.8 body verbatim (name interpolated).
++pub fn explainer_body_verbatim_when_open_test() {
++  let html = render_explainer_open([row("rc-1", Queued, None, [])])
++  html
++  |> string.contains("A completed reference means the person")
++  |> should.be_true
++  html
++  |> string.contains("the contact details Jane gave confirmed the facts shown")
++  |> should.be_true
++  html
++  |> string.contains("Nobody is called, and nothing is recorded.")
++  |> should.be_true
++}
++
++/// In-flight sub-line once a row exists but nothing is terminal.
++pub fn in_flight_subline_test() {
++  let html =
++    render(
++      [row("rc-1", ContactInitiated, None, [invite_attempt(), sms_attempt()])],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++    )
++  html
++  |> string.contains("We invite, remind, and nudge — you watch it happen.")
++  |> should.be_true
++}
++
++/// All-terminal sub-line.
++pub fn all_terminal_subline_test() {
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(completed_result()), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++    )
++  html
++  |> string.contains("All references closed. Summaries and logs stay here.")
++  |> should.be_true
++}
++
++// -- The 12-state matrix ------------------------------------------------------
++
++/// Queued: slate pill, A5 row line on expand, no timestamp (nothing sent).
++pub fn queued_state_test() {
++  let html =
++    render(
++      [row("rc-1", Queued, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("refcheck-row-landlord_ref") |> should.be_true
++  html |> string.contains("refcheck-status-landlord_ref") |> should.be_true
++  html |> string.contains("refcheck-expand-landlord_ref") |> should.be_true
++  html |> string.contains("Queued") |> should.be_true
++  html |> string.contains("bg-slate/10 text-slate") |> should.be_true
++  html
++  |> string.contains("Starts automatically when you mark the viewing as done.")
++  |> should.be_true
++  // Nothing was sent — no timestamp, no timeline.
++  html |> string.contains("Invitation sent") |> should.be_false
++}
++
++/// Invitation sent: navy pill + invite-batch timestamp (expanded).
++pub fn invitation_sent_state_test() {
++  let html =
++    render(
++      calls: [
++        row("rc-1", ContactInitiated, None, [invite_attempt(), sms_attempt()]),
++      ],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Invitation sent") |> should.be_true
++  html |> string.contains("bg-navy/10 text-navy") |> should.be_true
++  html |> string.contains("01 Aug, 10:04") |> should.be_true
++  // Timeline: the invite batch joined as "email + SMS", then what-happens-next.
++  html |> string.contains("Invitation sent — email + SMS") |> should.be_true
++  html
++  |> string.contains("Next reminder in ~2 days if there&#39;s no reply")
++  |> should.be_true
++}
++
++/// Reminder sent: attempts past the co-nudge (batch 3) flip the pill.
++pub fn reminder_sent_state_test() {
++  let attempts = [
++    invite_attempt(),
++    sms_attempt(),
++    // co-nudge batch (single email)
++    reference_call.ReferenceCallAttempt(
++      at: "2026-08-02T10:00:00Z",
++      channel: "email",
++      outcome: "delivered",
++      detail: "",
++    ),
++    ..reminder_batch("2026-08-03T10:00:00Z")
++  ]
++  let html =
++    render(
++      calls: [row("rc-1", ContactInitiated, None, attempts)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Reminder sent") |> should.be_true
++  html |> string.contains("Reminder 1 sent — email + SMS") |> should.be_true
++  html |> string.contains("Applicant asked to nudge") |> should.be_true
++}
++
++/// Form opened: form_opened_at flips the pill and inserts the timeline line.
++pub fn form_opened_state_test() {
++  let call =
++    reference_call.ReferenceCallDetail(
++      ..row("rc-1", ContactInitiated, None, [invite_attempt(), sms_attempt()]),
++      form_opened_at: Some("2026-08-01T21:12:00Z"),
++    )
++  let html =
++    render(calls: [call], off: False, attestation_on_file: False, expanded: [
++      "rc-1",
++    ])
++  html |> string.contains("Form opened") |> should.be_true
++  html |> string.contains("bg-navy/10 text-navy") |> should.be_true
++  html |> string.contains("01 Aug, 21:12") |> should.be_true
++}
++
++/// Reference received: teal pill + submitted_at timestamp; summary renders
++/// when expanded.
++pub fn reference_received_state_test() {
++  let call =
++    reference_call.ReferenceCallDetail(
++      ..row("rc-1", FormCompleted, Some(completed_result()), []),
++      submitted_at: Some("2026-08-02T09:00:00Z"),
++    )
++  let html =
++    render(calls: [call], off: False, attestation_on_file: False, expanded: [
++      "rc-1",
++    ])
++  html |> string.contains("Reference received") |> should.be_true
++  html |> string.contains("bg-teal/10 text-teal") |> should.be_true
++  html |> string.contains("02 Aug, 09:00") |> should.be_true
++  // Summary: headline pull-quote + key facts in words + confidence verbatim.
++  html
++  |> string.contains("Tenancy confirmed; rent always on time.")
++  |> should.be_true
++  html |> string.contains("Payment record") |> should.be_true
++  html |> string.contains("Always on time") |> should.be_true
++  html |> string.contains("Jan 2023 to Dec 2024") |> should.be_true
++  html |> string.contains("€1,400") |> should.be_true
++  html
++  |> string.contains(
++    "Confidence: high · AI-generated summary — verify before relying on it.",
++  )
++  |> should.be_true
++}
++
++/// Collapsed received row hides the summary; expanded shows it (aria-expanded
++/// toggles with the state).
++pub fn received_row_collapsed_by_default_test() {
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(completed_result()), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++    )
++  html |> string.contains("aria-expanded=\"false\"") |> should.be_true
++  html
++  |> string.contains("Tenancy confirmed; rent always on time.")
++  |> should.be_false
++}
++
++/// Partially completed: amber pill + the §7.4 top line with answered/total
++/// (11 landlord fields, 10 answered here — free text is the missing one).
++pub fn partial_state_test() {
++  let partial_result =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"partial\",\"verification\":{\"identity_confirmed\":\"yes\",\"relationship_to_applicant\":\"their_landlord\",\"tenancy_confirmed\":\"yes\",\"tenancy_period\":{\"from\":\"2023-01\",\"to\":\"2024-12\"},\"rent_amount_confirmed\":{\"amount_eur\":\"1400\"},\"rent_payment_record\":\"always_on_time\",\"property_condition\":\"good\",\"notice_given_properly\":\"yes\",\"deposit_returned\":\"in_full\",\"would_rent_again\":\"yes\",\"free_text_signals\":[]},\"ai_summary\":{\"headline\":\"Tenancy confirmed; rent always on time.\",\"summary\":\"Identity confirmed. Payment record: always on time. Property: good.\",\"confidence\":\"medium\"}}"
++  let html =
++    render(
++      calls: [row("rc-1", Partial, Some(partial_result), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Partially completed") |> should.be_true
++  html |> string.contains("bg-amber/10 text-amber") |> should.be_true
++  html
++  |> string.contains("Colm Byrne answered 10 of 11 questions, then stopped.")
++  |> should.be_true
++}
++
++/// Unanswered verification fields render "Not answered" — never hidden,
++/// never guessed.
++pub fn unanswered_fields_render_not_answered_test() {
++  let sparse =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"form_completed\",\"verification\":{\"identity_confirmed\":\"yes\",\"relationship_to_applicant\":null,\"tenancy_confirmed\":null,\"tenancy_period\":null,\"rent_amount_confirmed\":null,\"rent_payment_record\":null,\"property_condition\":null,\"notice_given_properly\":null,\"deposit_returned\":null,\"would_rent_again\":null,\"free_text_signals\":[]},\"ai_summary\":{\"headline\":\"Tenancy confirmed.\",\"summary\":\"Identity confirmed.\",\"confidence\":\"low\"}}"
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(sparse), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  // 10 unanswered fields -> 10 "Not answered" cells.
++  html |> string.contains("Not answered") |> should.be_true
++  // The answered one is rendered as a word, not guessed.
++  html |> string.contains("Relationship") |> should.be_true
++}
++
++/// Contact details didn't work: amber pill + §7.4 copy verbatim.
++pub fn awaiting_correction_state_test() {
++  let html =
++    render(
++      calls: [row("rc-1", AwaitingCorrection, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Contact details didn&#39;t work") |> should.be_true
++  html |> string.contains("bg-amber/10 text-amber") |> should.be_true
++  html
++  |> string.contains(
++    "We couldn&#39;t reach Colm Byrne at these details. Check with Jane, update them here, and we&#39;ll send the invitation again.",
++  )
++  |> should.be_true
++}
++
++/// Couldn't be reached: amber pill + the honest §7.4 copy (neutral-absence).
++pub fn unreachable_state_test() {
++  let html =
++    render(
++      calls: [row("rc-1", Unreachable, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Couldn&#39;t be reached") |> should.be_true
++  html |> string.contains("bg-amber/10 text-amber") |> should.be_true
++  html
++  |> string.contains("it isn&#39;t a mark against Jane")
++  |> should.be_true
++}
++
++/// Declined to take part: slate (never red) + "tells you nothing" framing.
++pub fn refused_state_test() {
++  let html =
++    render(
++      calls: [row("rc-1", Refused, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Declined to take part") |> should.be_true
++  html |> string.contains("bg-slate/10 text-slate") |> should.be_true
++  html
++  |> string.contains("this tells you nothing about Jane")
++  |> should.be_true
++}
++
++/// Declined contact: slate + the hard-stop copy with NO route-around
++/// suggestion (no "contact Colm directly").
++pub fn objected_state_test() {
++  let html =
++    render(
++      calls: [row("rc-1", Objected, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Declined contact") |> should.be_true
++  html |> string.contains("bg-slate/10 text-slate") |> should.be_true
++  html
++  |> string.contains("All automated contact has stopped.")
++  |> should.be_true
++  html |> string.contains("contact Colm directly") |> should.be_false
++}
++
++/// Skipped by you: slate, no timestamps, the §7.4 one-liner.
++pub fn skipped_state_test() {
++  let html =
++    render(
++      calls: [row("rc-1", Skipped, None, [invite_attempt()])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Skipped by you") |> should.be_true
++  html |> string.contains("bg-slate/10 text-slate") |> should.be_true
++  html |> string.contains("You skipped this reference.") |> should.be_true
++  // No timestamps in the skipped state.
++  html |> string.contains("01 Aug, 10:04") |> should.be_false
++}
++
++/// Something went wrong: amber (needs-attention), never red, the honest
++/// "not Aisling's fault" copy.
++pub fn failed_state_test() {
++  let html =
++    render(
++      calls: [row("rc-1", Failed, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Something went wrong") |> should.be_true
++  html |> string.contains("bg-amber/10 text-amber") |> should.be_true
++  html
++  |> string.contains("The check hit a problem on our side — not Jane&#39;s.")
++  |> should.be_true
++}
++
++/// §13: no status ever renders red.
++pub fn no_status_uses_red_test() {
++  let statuses = [
++    Queued,
++    Skipped,
++    ContactInitiated,
++    FormCompleted,
++    ManualRecorded,
++    Partial,
++    AwaitingCorrection,
++    Unreachable,
++    Refused,
++    Objected,
++    Failed,
++  ]
++  let html =
++    statuses
++    |> list.map(fn(status) {
++      render(
++        [row("rc-1", status, None, [invite_attempt(), sms_attempt()])],
++        off: False,
++        attestation_on_file: False,
++        expanded: [],
++      )
++    })
++    |> string.join("")
++  html |> string.contains("bg-score-red") |> should.be_false
++  html |> string.contains("text-score-red") |> should.be_false
++}
++
++// -- Off state ----------------------------------------------------------------
++
++/// Off: the §7.4 block, referee contact chips, NO re-ask affordance, no rows.
++pub fn off_state_renders_contacts_without_reask_test() {
++  let html =
++    render(calls: [], off: True, attestation_on_file: False, expanded: [])
++  html
++  |> string.contains("Automatic checks are off for this application.")
++  |> should.be_true
++  html
++  |> string.contains("Jane chose not to have referees contacted automatically.")
++  |> should.be_true
++  html |> string.contains("Colm Byrne") |> should.be_true
++  html |> string.contains("refcheck-off-phone-landlord_ref") |> should.be_true
++  html |> string.contains("refcheck-off-email-landlord_ref") |> should.be_true
++  // No re-ask / convince affordance — no way back into automation.
++  html |> string.contains("Start this check") |> should.be_false
++  html |> string.contains("refcheck-row-") |> should.be_false
++}
++
++// -- Completed summary extras -------------------------------------------------
++
++/// "Worth knowing" renders only when a signal exists (AD-10 honesty).
++pub fn worth_knowing_renders_with_signal_test() {
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(completed_result()), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Worth knowing") |> should.be_true
++  html |> string.contains("Signals are clues, not verdicts.") |> should.be_true
++  html
++  |> string.contains("Completed unusually fast (under 2 minutes).")
++  |> should.be_true
++  html |> string.contains("border-amber-400") |> should.be_true
++}
++
++/// No signals -> no "Worth knowing" block (never an invented signal).
++pub fn worth_knowing_absent_without_signals_test() {
++  let clean_result =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"form_completed\",\"verification\":{\"identity_confirmed\":\"yes\",\"free_text_signals\":[]},\"fraud_signals\":{\"contact_reused_within_application\":false,\"contact_duplicate_of_applicant\":false,\"contact_reused_across_applications\":false,\"line_type\":\"mobile\",\"voip_or_burner\":false,\"form_session\":{\"completion_seconds\":320,\"ip_matches_applicant\":false,\"device_fingerprint_match\":false},\"geo_vs_claimed_property\":\"unknown\",\"coached_answer_score\":null},\"ai_summary\":{\"headline\":\"Tenancy confirmed.\",\"summary\":\"Identity confirmed.\",\"confidence\":\"high\"}}"
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(clean_result), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Worth knowing") |> should.be_false
++}
++
++/// The free-text renders with the §9.3 unmoderated flag.
++pub fn free_text_unmoderated_flag_test() {
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(completed_result()), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("They kept the garden lovely.") |> should.be_true
++  html
++  |> string.contains(
++    "Unmoderated referee text: written by the referee, not reviewed by us.",
++  )
++  |> should.be_true
++}
++
++/// The §9.5 display_disclaimer renders under the confidence line when the
++/// server supplies it.
++pub fn display_disclaimer_renders_test() {
++  let call =
++    reference_call.ReferenceCallDetail(
++      ..row("rc-1", FormCompleted, Some(completed_result()), []),
++      display_disclaimer: Some(
++        "Written response, provenance-checked — not verbally confirmed. A quick call to the referee is the strongest final check.",
++      ),
++    )
++  let html =
++    render(calls: [call], off: False, attestation_on_file: False, expanded: [
++      "rc-1",
++    ])
++  html
++  |> string.contains(
++    "A quick call to the referee is the strongest final check.",
++  )
++  |> should.be_true
++}
++
++/// Notable quotes render up to 3 when the payload carries them (RC5.1 manual
++/// records); v1 deterministic summaries carry none -> no section.
++pub fn notable_quotes_render_when_present_test() {
++  let with_quotes =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"form_completed\",\"verification\":{\"identity_confirmed\":\"yes\",\"free_text_signals\":[]},\"ai_summary\":{\"headline\":\"Tenancy confirmed.\",\"summary\":\"Identity confirmed.\",\"confidence\":\"medium\",\"notable_quotes\":[\"Rent was always on time\",\"Left the flat spotless\",\"Would rent again\"]}}"
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(with_quotes), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Rent was always on time") |> should.be_true
++  html |> string.contains("Left the flat spotless") |> should.be_true
++  html |> string.contains("Would rent again") |> should.be_true
++}
++
++/// Manual-recorded rows render exactly like received (same pill, same
++/// summary surface).
++pub fn manual_recorded_renders_as_received_test() {
++  let html =
++    render(
++      calls: [row("rc-1", ManualRecorded, Some(completed_result()), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Reference received") |> should.be_true
++  html
++  |> string.contains("Tenancy confirmed; rent always on time.")
++  |> should.be_true
++}
++
++// -- Overflow + a11y ----------------------------------------------------------
++
++/// The ⋯ overflow control renders (testid) on rows that will carry §7.3
++/// actions, and only on those rows.
++pub fn overflow_testid_present_on_action_rows_test() {
++  let actionable =
++    render(
++      calls: [row("rc-1", Queued, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++    )
++  actionable
++  |> string.contains("refcheck-overflow-landlord_ref")
++  |> should.be_true
++
++  let terminal =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(completed_result()), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++    )
++  terminal
++  |> string.contains("refcheck-overflow-landlord_ref")
++  |> should.be_false
++}
++
++/// Multiple slots render distinct rows with slot-scoped testids.
++pub fn multiple_slots_render_distinct_rows_test() {
++  let employer =
++    reference_call.ReferenceCallDetail(
++      ..row("rc-2", Queued, None, []),
++      ref_slot: EmployerRef,
++    )
++  let html =
++    render(
++      calls: [row("rc-1", Queued, None, []), employer],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++    )
++  html |> string.contains("refcheck-row-landlord_ref") |> should.be_true
++  html |> string.contains("refcheck-row-employer_ref") |> should.be_true
++  html |> string.contains("Reference Checks (2)") |> should.be_true
++  html |> string.contains("Colm Byrne") |> should.be_true
++  html |> string.contains("Sarah Daly") |> should.be_true
++}
++
++// -- Perkins r1 rework tests --------------------------------------------------
++
++/// Total-match word map (the PR's own Verify standard): every wire value the
++/// form can store resolves to a landlord-facing word, never the raw wire.
++pub fn choice_word_map_is_total_test() {
++  let wire_values = [
++    // landlord set (questions.gleam landlord_questions)
++    "landlord", "letting_agent", "other", "yes", "no", "not_sure",
++    "always_on_time", "mostly_on_time", "often_late", "dont_know", "excellent",
++    "good", "fair", "poor", "did_not_see", "ongoing", "in_full", "partly",
++    "withheld", "still_held", "unsure", "prefer_not_to_say",
++    // employer set
++    "manager", "hr", "colleague",
++    // character set
++    "lt_1_year", "y1_3", "y3_10", "gt_10_years",
++  ]
++  wire_values
++  |> list.map(fn(value) {
++    let word = copy.refcheck_choice_word(value)
++    word != value && word != "" && word != "Not answered"
++  })
++  |> list.all(fn(resolved) { resolved })
++  |> should.be_true
++}
++
++/// The relationship wire value is "landlord" (questions.gleam tuple), NOT
++/// "their_landlord" — the word map must resolve it (Perkins r1 W2).
++pub fn choice_word_map_resolves_landlord_relationship_test() {
++  copy.refcheck_choice_word("landlord") |> should.equal("Their landlord")
++}
++
++/// A completed landlord reference with the "other" relationship renders the
++/// referee's verbatim text via the relationship_other row (Perkins r1 W3).
++pub fn relationship_other_renders_verbatim_text_test() {
++  let result =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"form_completed\",\"verification\":{\"identity_confirmed\":\"yes\",\"relationship_to_applicant\":\"other\",\"relationship_other\":\"I was her neighbour and kept the keys\",\"free_text_signals\":[]},\"ai_summary\":{\"headline\":\"Tenancy confirmed.\",\"summary\":\"Identity confirmed.\",\"confidence\":\"medium\"}}"
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(result), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Relationship details") |> should.be_true
++  html
++  |> string.contains("I was her neighbour and kept the keys")
++  |> should.be_true
++}
++
++/// Timeline stays chronological when the form opens after a reminder — the
++/// link stays live, so Form-opened can post-date Reminder 1 (Perkins r1 W4).
++pub fn timeline_orders_form_opened_after_reminder_test() {
++  let attempts = [
++    invite_attempt(),
++    sms_attempt(),
++    reference_call.ReferenceCallAttempt(
++      at: "2026-08-02T10:00:00Z",
++      channel: "email",
++      outcome: "delivered",
++      detail: "",
++    ),
++    ..reminder_batch("2026-08-03T10:00:00Z")
++  ]
++  let call =
++    reference_call.ReferenceCallDetail(
++      ..row("rc-1", ContactInitiated, None, attempts),
++      form_opened_at: Some("2026-08-03T18:00:00Z"),
++    )
++  let html =
++    render(calls: [call], off: False, attestation_on_file: False, expanded: [
++      "rc-1",
++    ])
++  // Named bindings (not a `(`-starting line — Gleam would continue the
++  // `let html =` expression into a call).
++  // Pin the TIMELINE lines (</p>), not the status pill (</span>) — the pill
++  // for this row is also "Form opened" and sits above the timeline in the DOM.
++  let invite = first_index(html, "Invitation sent</p>")
++  let reminder = first_index(html, "Reminder 1 sent — ")
++  let opened = first_index(html, "Form opened</p>")
++  // Bind the comparisons first — a line starting with `(` would continue
++  // the previous let-expression (Gleam line-continuation), and `|>` binds
++  // tighter than `<` in this version.
++  let invite_before_reminder = invite < reminder
++  let reminder_before_opened = reminder < opened
++  invite_before_reminder |> should.be_true
++  reminder_before_opened |> should.be_true
++}
++
++/// A fully-answered character reference reads "6 of 6" — the character form
++/// has no free-text question, so free_text_signals can't be one of the
++/// "questions" (Perkins r1 W7).
++pub fn character_partial_counts_without_free_text_test() {
++  let result =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"partial\",\"verification\":{\"identity_confirmed\":\"yes\",\"relationship\":\"Neighbour\",\"capacity\":\"Watched the house\",\"known_duration\":\"y1_3\",\"character_statement\":\"Always paid on time.\",\"would_stand_again\":\"yes\",\"free_text_signals\":[]},\"ai_summary\":{\"headline\":\"Would stand as referee again.\",\"summary\":\"Identity confirmed. Known for 1 to 3 years.\",\"confidence\":\"medium\"}}"
++  let call =
++    reference_call.ReferenceCallDetail(
++      ..row("rc-1", Partial, Some(result), []),
++      ref_slot: CharacterRef,
++    )
++  let html =
++    render(calls: [call], off: False, attestation_on_file: False, expanded: [
++      "rc-1",
++    ])
++  html |> string.contains("answered 6 of 6 questions") |> should.be_true
++}
++
++/// Objected copy is gender-neutral — names are interpolated (Perkins r1 W5).
++pub fn objected_copy_is_gender_neutral_test() {
++  let html =
++    render(
++      calls: [row("rc-1", Objected, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("asked us not to be contacted.") |> should.be_true
++  html |> string.contains("contact him") |> should.be_false
++}
++
++/// Never-red: no red class token of any flavour in any status render
++/// (Perkins r1 N9 — previously only two tokens were pinned).
++pub fn no_status_uses_any_red_token_test() {
++  let statuses = [
++    Queued,
++    Skipped,
++    ContactInitiated,
++    FormCompleted,
++    ManualRecorded,
++    Partial,
++    AwaitingCorrection,
++    Unreachable,
++    Refused,
++    Objected,
++    Failed,
++  ]
++  let html =
++    statuses
++    |> list.map(fn(status) {
++      render(
++        calls: [row("rc-1", status, None, [invite_attempt(), sms_attempt()])],
++        off: False,
++        attestation_on_file: False,
++        expanded: [],
++      )
++    })
++    |> string.join("")
++  ["bg-red", "text-red", "border-red", "bg-score-red", "text-score-red"]
++  |> list.all(fn(token) { !string.contains(html, token) })
++  |> should.be_true
++}
++
++/// Object-value branches render honestly (Perkins r1 N10): ongoing tenancy,
++/// dont_remember rent, differs/stated as-stated texts, dont_know salary,
++/// different salary amount.
++pub fn verification_object_branches_render_test() {
++  let result =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"form_completed\",\"verification\":{\"identity_confirmed\":\"yes\",\"relationship_to_applicant\":\"landlord\",\"tenancy_confirmed\":\"yes\",\"tenancy_period\":{\"from\":\"2020-06\",\"ongoing\":true},\"rent_amount_confirmed\":{\"dont_remember\":true},\"rent_payment_record\":\"always_on_time\",\"property_condition\":\"good\",\"notice_given_properly\":\"yes\",\"deposit_returned\":\"in_full\",\"would_rent_again\":\"yes\",\"free_text_signals\":[]},\"ai_summary\":{\"headline\":\"Tenancy confirmed.\",\"summary\":\"Identity confirmed.\",\"confidence\":\"medium\"}}"
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(result), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Jun 2020 to ongoing") |> should.be_true
++  html |> string.contains("Don&#39;t remember") |> should.be_true
++
++  let employer_result =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"form_completed\",\"verification\":{\"identity_confirmed\":\"yes\",\"relationship_to_applicant\":\"manager\",\"works_at_confirmed\":\"yes\",\"employment_period\":{\"differs\":\"Since 2022\"},\"role_confirmed\":{\"stated\":\"Senior Engineer\"},\"salary_confirmed\":{\"different_amount_eur\":\"90000\"},\"would_rehire\":\"yes\",\"free_text_signals\":[]},\"ai_summary\":{\"headline\":\"Employment confirmed.\",\"summary\":\"Identity confirmed. Role confirmed: differs.\",\"confidence\":\"high\"}}"
++  let employer_call =
++    reference_call.ReferenceCallDetail(
++      ..row("rc-2", FormCompleted, Some(employer_result), []),
++      ref_slot: EmployerRef,
++    )
++  let html2 =
++    render(
++      calls: [employer_call],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-2"],
++    )
++  html2 |> string.contains("Since 2022") |> should.be_true
++  html2 |> string.contains("Senior Engineer") |> should.be_true
++  html2 |> string.contains("€90,000") |> should.be_true
++
++  let salary_dont_know =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"form_completed\",\"verification\":{\"identity_confirmed\":\"yes\",\"relationship_to_applicant\":\"manager\",\"works_at_confirmed\":\"yes\",\"employment_period\":{\"as_stated\":true},\"role_confirmed\":{\"as_stated\":true},\"salary_confirmed\":{\"dont_know\":true},\"would_rehire\":\"yes\",\"free_text_signals\":[]},\"ai_summary\":{\"headline\":\"Employment confirmed.\",\"summary\":\"Identity confirmed.\",\"confidence\":\"medium\"}}"
++  let html3 =
++    render(
++      calls: [
++        reference_call.ReferenceCallDetail(
++          ..row("rc-3", FormCompleted, Some(salary_dont_know), []),
++          ref_slot: EmployerRef,
++        ),
++      ],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-3"],
++    )
++  html3 |> string.contains("Don&#39;t know") |> should.be_true
++  html3 |> string.contains("As stated") |> should.be_true
++}
++
++/// The remaining signal sentences render from their payload fields
++/// (Perkins r1 N10): same-device, voip, duplicate, within, across.
++pub fn remaining_signal_sentences_render_test() {
++  let result =
++    "{\"schema_version\":\"refcall-v1\",\"outcome\":\"form_completed\",\"verification\":{\"identity_confirmed\":\"yes\",\"free_text_signals\":[]},\"fraud_signals\":{\"contact_reused_within_application\":true,\"contact_duplicate_of_applicant\":true,\"contact_reused_across_applications\":true,\"line_type\":\"voip\",\"voip_or_burner\":true,\"form_session\":{\"completion_seconds\":300,\"ip_matches_applicant\":true,\"device_fingerprint_match\":false},\"geo_vs_claimed_property\":\"unknown\",\"coached_answer_score\":null},\"ai_summary\":{\"headline\":\"Tenancy confirmed.\",\"summary\":\"Identity confirmed.\",\"confidence\":\"high\"}}"
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some(result), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html
++  |> string.contains(
++    "Filled in from the same connection or device as the applicant&#39;s.",
++  )
++  |> should.be_true
++  html |> string.contains("internet (VoIP) number") |> should.be_true
++  html
++  |> string.contains(
++    "The referee&#39;s contact details match the applicant&#39;s own.",
++  )
++  |> should.be_true
++  html
++  |> string.contains("same number appears for two different referees")
++  |> should.be_true
++  html
++  |> string.contains("appeared under a different referee&#39;s name")
++  |> should.be_true
++}
++
++/// v2-reserved voice states degrade honestly (Perkins r1 N12): Scheduled and
++/// Calling render their pills; Completed renders as a received reference.
++pub fn v2_reserved_states_degrade_test() {
++  let scheduled = row("rc-1", reference_call.Scheduled, None, [])
++  let html =
++    render(
++      calls: [scheduled],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++    )
++  html |> string.contains("Scheduled") |> should.be_true
++
++  let calling =
++    reference_call.ReferenceCallDetail(
++      ..row("rc-2", reference_call.Calling, None, []),
++      ref_slot: EmployerRef,
++    )
++  let html2 =
++    render(
++      calls: [calling],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++    )
++  html2 |> string.contains("Calling") |> should.be_true
++
++  let completed =
++    reference_call.ReferenceCallDetail(
++      ..row("rc-3", reference_call.Completed, Some(completed_result()), []),
++      ref_slot: CharacterRef,
++      submitted_at: Some("2026-08-02T09:00:00Z"),
++    )
++  let html3 =
++    render(
++      calls: [completed],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-3"],
++    )
++  html3 |> string.contains("Reference received") |> should.be_true
++}
++
++/// A malformed stored result degrades to the pill without crashing
++/// (Perkins r1 N12).
++pub fn malformed_result_renders_pill_without_crash_test() {
++  let html =
++    render(
++      calls: [row("rc-1", FormCompleted, Some("{not json"), [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("Reference received") |> should.be_true
++}
++
++/// Expanded rows carry aria-expanded="true" (Perkins r1 N12).
++pub fn expanded_row_aria_true_test() {
++  let html =
++    render(
++      calls: [row("rc-1", Queued, None, [])],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("aria-expanded=\"true\"") |> should.be_true
++}
++
++/// The mini timeline renders keyed (Perkins r1 N6).
++pub fn timeline_uses_keyed_list_test() {
++  let html =
++    render(
++      calls: [
++        row("rc-1", ContactInitiated, None, [invite_attempt(), sms_attempt()]),
++      ],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++    )
++  html |> string.contains("data-lustre-key=") |> should.be_true
++}
++
++/// First occurrence of a needle in the serialized HTML (the timeline-ordering
++/// assertion needs positions, not just presence).
++fn first_index(haystack: String, needle: String) -> Int {
++  search_index(haystack, needle, 0)
++}
++
++fn search_index(haystack: String, needle: String, from: Int) -> Int {
++  let h = string.length(haystack)
++  let n = string.length(needle)
++  case from + n > h {
++    True -> -1
++    False ->
++      case string.slice(haystack, from, n) == needle {
++        True -> from
++        False -> search_index(haystack, needle, from + 1)
++      }
++  }
++}

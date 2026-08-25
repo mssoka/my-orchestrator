@@ -1,0 +1,95 @@
+{
+  "job": "righttenantry-refcheck-followup-607",
+  "round": 1,
+  "pr": 610,
+  "reviewed_sha": "955284755d1c64e8884d557a2999fadc2a287db2",
+  "diff_file": "/Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-followup-607/r1/diff.patch",
+  "failed_layers": [],
+  "reviewers_completed": "7/7",
+  "total_findings": 28,
+  "confirmed": 27,
+  "rejected": 1,
+  "unverifiable_speculative": 0,
+  "consolidated_count": 13,
+  "verdict": "NEEDS CHANGES",
+  "blockers": [
+    {
+      "title": "Lockstep pin never reads the production terminal_statuses const — hardcoded test-local copy; the claimed guard cannot bite on const drift",
+      "sources": ["blind", "edge", "acceptance", "architecture", "codebase", "tests"],
+      "severity": "blocker",
+      "category": "guard-integrity",
+      "location": "server/test/application/application_detail_handler_test.gleam:593 vs server/src/application/application_detail_handler.gleam:1286",
+      "evidence": "const terminal_statuses: List(String) = [ \"form_completed\", ... ] (private) at application_detail_handler.gleam:1286; test declares its own `let terminal = [...]` at application_detail_handler_test.gleam:596 — the test imports only application_detail_handler/application/sql and never references the const. Arch doc claim: \"A lockstep unit test pins the timeline's DB-string terminal_statuses list to the shared fn.\"",
+      "detail": "The PR's own spec and the architecture amendment claim the lockstep pin ties the production DB-string list to the shared fn. The test pins its own hardcoded copy instead — editing terminal_statuses (used at line 1454 for timeline terminal entries) fails nothing. This is the exact mirror-drift pattern AR-RC13 names as the bug class.",
+      "recommended_fix": "Export the const (pub) or a pub accessor fn from application_detail_handler, iterate the REAL list in the lockstep test both directions, and make the arch-doc claim match the implementation.",
+      "verification": "confirmed"
+    }
+  ],
+  "warnings": [
+    {
+      "title": "verify_payload_has_no_internal_fields has zero production call sites — item 1 hardening is test-only",
+      "sources": ["security"],
+      "severity": "warning",
+      "category": "guard-wiring",
+      "location": "server/src/application/application_detail_handler.gleam:1165",
+      "evidence": "grep across server/src: callers of verify_payload_has_no_internal_fields exist only in server/test/application/application_detail_handler_test.gleam (407-442) plus the definition. Doc comment claims \"a spoofed/malformed payload can't leak internals\" — true only if the fn runs.",
+      "detail": "Pre-existing wiring gap (RC4.1), but the PR extends this fn and its claim. The §4.2 SQL-boundary strip is the live defense (integration-proven), so no live leak; the belt-and-braces guard never runs in production.",
+      "recommended_fix": "Wire the re-verify into the detail serialization path (fail closed), or correct the doc comment to state the guard is test-enforced-only.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "trigger.gleam keeps a second unpinned server-side terminality list — the 'terminality has ONE home' claim is false while it exists",
+      "sources": ["edge", "tests"],
+      "severity": "warning",
+      "category": "guard-integrity",
+      "location": "server/src/reference_checks/trigger.gleam:1153",
+      "evidence": "fn is_terminal(status: String) -> Bool { list.contains( [ \"form_completed\", \"unreachable\", \"refused\", \"objected\", \"manual_recorded\", \"failed\", \"completed\", \"partial\" ], status ) } — none of the truth-table, lockstep, or lint layers reads it.",
+      "detail": "The AR-RC13 amendment claims terminality has a single shared home. This pre-existing private list drives find_live_row_for_slot; a new terminal status in shared diverges here silently.",
+      "recommended_fix": "Rewrite trigger.is_terminal to consume shared status_from_string + is_terminal_status, or add a pin iterating this list against the shared fn.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Hooks lint evadable by list shape — multiline construction and non-final list position both pass CI (sandbox-verified)",
+      "sources": ["edge", "tests", "architecture"],
+      "severity": "warning",
+      "category": "guard-integrity",
+      "location": "scripts/lint_refcheck_hooks.py:76",
+      "evidence": "marker = action + \"]\"; if marker not in line: continue — sandbox: multiline [RefcheckTakeOver, RefcheckSubstitute,] exits 0; [RefcheckTakeOver, RefcheckSkip] exits 0; the historical single-line shape exits 1 (verified).",
+      "detail": "The guard catches the exact RC4.3-r1 shape but is formatting-dependent: a reordered or reformatted re-derivation ships past lint and format-check. The distinguishing panel tests remain as backstop for the historical statuses.",
+      "recommended_fix": "Match governed identifiers at word boundaries regardless of line/position (keep the pattern-arm `->` exemption), and consider a CI negative-control fixture feeding historical shapes to the lint.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "outcome_from_string is orphaned in production; the optional fn's 15-arm mapping is pinned for only 2 known values — three hand-copied outcome tables with no exhaustive lockstep pin",
+      "sources": ["blind", "architecture", "codebase", "tests"],
+      "severity": "warning",
+      "category": "drift-hazard",
+      "location": "shared/src/shared/reference_call.gleam:219/250",
+      "evidence": "Repo-wide grep: outcome_from_string has zero non-test callers after the encoder switched; its doc claims 'non-wire callers' that do not exist. outcome_from_string_optional duplicates the 15 arms; the new test pins '', one unknown, and two known values only.",
+      "detail": "A future outcome enum addition (expand-then-contract is the norm here) updated in encode_outcome/outcome_from_string but missed in the optional fn silently encodes as null on the wire — the same lockstep-drift class AR-RC13 names, in the codec that pins the unknown-outcome contract.",
+      "recommended_fix": "Derive outcome_from_string from the optional fn (Some -> o; None -> OutcomeUnreachable) so one mapping exists, and add an exhaustive pin: every all_outcomes() entry through encode_outcome |> outcome_from_string_optional == Some(outcome).",
+      "verification": "confirmed"
+    }
+  ],
+  "notes": [
+    {"title": "lint_refcheck_hooks false-positives on a legit non-hook case nested inside a hooks gate", "sources": ["blind", "architecture"], "severity": "note", "category": "lint-robustness", "location": "scripts/lint_refcheck_hooks.py:52", "evidence": "Sandbox-verified: case call.hooks.can_take_over { True -> case call.status { unreachable -> [RefcheckTakeOver] } } exits 1 — the shallower non-hook `case` disconnects the scan despite the outer hook gate holding.", "detail": "A legitimate future refactor (status sub-menu inside a hooks gate — legal under AR-RC13: statuses pick menus, hooks gate content) fails CI and forces restructuring.", "recommended_fix": "Track hook-case open/close depth explicitly instead of bailing on the first shallower non-hook case; document the nesting constraint.", "verification": "confirmed"},
+    {"title": "written_response_disclaimer em-dash sits outside the lint scope with an undocumented exemption", "sources": ["blind"], "severity": "note", "category": "lint-scope", "location": "server/src/application/application_detail_handler.gleam:1061", "evidence": "const written_response_disclaimer = \"Written response, provenance-checked — not verbally confirmed...\" renders to landlords via display_disclaimer (client reference_panel.gleam:1770). The string is spec-verbatim (architecture-reference-checking-v1:1037 defines it), so exempt-by-construction — but the module is not in the lint's SERVER_INCLUDE and no copy test scans it.", "detail": "Exemption is legitimate (spec-verbatim) but undocumented; future implementer-authored em-dashes in this module ship unscanned.", "recommended_fix": "Document the verbatim exemption in the lint's docstring, or add the handler consts to a pinned scan list that whitelists this string.", "verification": "confirmed"},
+    {"title": "lint_em_dash scanner has two false-negative paths: escaped-quote state toggle and whole-line log-call exemption", "sources": ["blind", "edge"], "severity": "note", "category": "lint-robustness", "location": "scripts/lint_em_dash.py:81", "evidence": "string_literal_em_dashes toggles in_str on every `\"` without backslash-escape awareness (unlike strip_comments); LOG_CALL_RE exempts the entire line. Verified: no current line mixes a user-facing em-dash with a log call, so live impact is zero today.", "detail": "An odd number of escaped quotes in a string flips the scan state and hides a later em-dash; any log call sharing a line exempts the whole line. The console.* alternative is dead (only .gleam scanned).", "recommended_fix": "Skip backslash-escaped chars in the in_str toggle (mirror strip_comments); scope the log exemption to the call argument; drop console.*.", "verification": "confirmed"},
+    {"title": "Same-instant mixed-format attempts group into two cadence batches — the new pin covers ordering, not grouping", "sources": ["edge"], "severity": "note", "category": "boundary", "location": "server/src/application/application_detail_handler.gleam:1395 (group_attempts_by_at)", "evidence": "group_attempts_by_at groups on the RAW entry.at (no normalize_at): [#(at, entries), ..rest] if at == entry.at. A space-form and T-form attempt at the same instant become two groups → two send entries → mislabeled batches for one send.", "detail": "Legacy/corrupt rows with mixed formats at the same instant render 'Invitation sent' plus 'co-nudge' for a single send. The new fixture mixes formats at different instants only, so it cannot catch this.", "recommended_fix": "Group on the normalized key (normalize_at inside group_attempts_by_at) or add a same-instant mixed-format fixture asserting one shared batch label.", "verification": "confirmed"},
+    {"title": "copy.gleam em-dash enforcement rests on hand-maintained test lists; the lint exempts the module wholesale", "sources": ["architecture"], "severity": "note", "category": "lint-scope", "location": "scripts/lint_em_dash.py:33 / client/test/copy_test.gleam:310", "evidence": "CLIENT_EXCLUDE = {\"client/src/copy.gleam\"}; inside copy.gleam only refcheck_action_strings() and refcheck_fn_built_labels() (hand-maintained lists) are scanned. The PR correctly added its new fns to the scanned list.", "detail": "A new implementer-authored const with an em-dash ships unless its author remembers to add it to a scan list — the W5 gap pattern, mitigated here but not closed structurally.", "recommended_fix": "Narrow the exemption (scan copy.gleam, whitelist the spec-verbatim strings) or generate the scan lists from the module so new strings are covered by default.", "verification": "confirmed"},
+    {"title": "Amendment register claims §8.2 was amended in place with the unknown-outcome rule, but §8.2 contains no such content", "sources": ["codebase"], "severity": "note", "category": "docs-accuracy", "location": "_bmad-output/planning-artifacts/architecture-reference-checking-v1-2026-07-29.md:153 vs :1043", "evidence": "Register: \"Amended in place: ... §8.2 (hooks contract doc: unknown-outcome rule, #607 item 2).\" §8.2 as it reads describes only the three hook booleans — no unknown-outcome rule. The named rule exists solely in the shared module doc (ReferenceCallHooks).", "detail": "The canon's claimed in-place amendment was never written; future readers following the register will not find the rule where it points.", "recommended_fix": "Add the unknown-outcome rule to §8.2 (hooks from status only; unrecognised outcome encodes absent, never the fallback), or fix the register entry to point at the shared module doc.", "verification": "confirmed"},
+    {"title": "Substitute message-payload construction is shape-exempt from the hooks lint — its gate is code-review-only", "sources": ["security"], "severity": "note", "category": "guard-integrity", "location": "client/src/components/reference_panel.gleam:1052-1058", "evidence": "UserChoseRefcheckAction(call.reference_call_id, RefcheckSubstitute) inside view_substitute_surface_open, which is only reachable through case call.hooks.can_substitute_referee (line 1029). The lint's RefcheckSubstitute] marker never matches this shape (documented exemption).", "detail": "A future body-surface re-derivation via message payload escapes the CI lint; the panel distinguishing tests remain as backstop.", "recommended_fix": "Extend the lint to require UserChoseRefcheckAction take-over/substitute constructions to sit inside the hook-gated render path, or move construction below the gate.", "verification": "confirmed"},
+    {"title": "Advisory test gate: CONCERNS", "sources": ["tests"], "severity": "note", "category": "coverage-gate", "location": "N/A", "evidence": "Shared 118 pass; server 1511 pass (integration tagged, skipped in unit run); client 136 pass; both lints exit 0 on the tree and fail on planted/historical shapes (sandbox-verified). P0 100%; P1 ~85% — the three item-5 guard holes above (lockstep copy, lint shape evasion, trigger list).", "detail": "All five items have green pins; the guard-layer gaps keep P1 below the PASS threshold.", "recommended_fix": "Address the blocker + warnings, rerun the full suite and lints.", "verification": "confirmed"}
+  ],
+  "reviewer_agreement": [
+    {"title": "Lockstep pin never reads the production terminal_statuses const", "sources": ["blind", "edge", "acceptance", "architecture", "codebase", "tests"], "count": 6},
+    {"title": "outcome mapping drift: orphaned fn + unpinned optional mapping", "sources": ["blind", "architecture", "codebase", "tests"], "count": 4},
+    {"title": "Hooks lint evadable by list shape", "sources": ["edge", "tests", "architecture"], "count": 3},
+    {"title": "trigger.gleam unpinned second terminality list", "sources": ["edge", "tests"], "count": 2},
+    {"title": "lint_em_dash scanner false-negative paths", "sources": ["blind", "edge"], "count": 2},
+    {"title": "lint_refcheck_hooks nested-case false positive", "sources": ["blind", "architecture"], "count": 2}
+  ],
+  "rejected_findings": [
+    {"title": "Item 1's escaped markers are subsumed by the plain markers — the fix changes no behavior", "sources": ["blind"], "reason": "Proven false: '\"form_token\"' is NOT a substring of '\\\"form_token\\\"' (Python-verified). The escaped markers genuinely fire — the new test payload has escaped hit: True, plain hit: False. Old markers could not catch that payload."}
+  ]
+}

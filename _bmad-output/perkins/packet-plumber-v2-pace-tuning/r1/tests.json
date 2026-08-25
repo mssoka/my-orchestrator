@@ -1,0 +1,72 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gap",
+    "title": "New catalog knobs' fail-fast error paths have zero negative-row coverage (missing-key / non-integer / zero / negative)",
+    "location": "core/catalog_test.odin:620-711 (bal_rows table); core/catalog.odin:822-831",
+    "evidence": "core/catalog.odin:822-828 adds three rejection branches:\n```\ntsi, okts := jint_strict(obj, \"terminal_spawn_interval_ticks\", -1)\ntms, oktm := jint_strict(obj, \"terminal_min_sep_tiles\", -1)\nif !okts || !oktm {\n\treturn {\"balance.json\", \"terminal_spawn_interval_ticks/terminal_min_sep_tiles\", \"must be integers (no decimals, no wrap)\"}\n}\nif tsi < 1 || tms < 1 {\n\treturn {\"balance.json\", \"terminal_spawn_interval_ticks/terminal_min_sep_tiles\", \"must be >= 1 with all keys present (the growth cadence + the E31 packing floor)\"}\n}\n```\nbut grep over core/catalog_test.odin finds the knob names ONLY as valid values: line 43-44 `\"terminal_spawn_interval_ticks\": 80,` / `\"terminal_min_sep_tiles\": 4,` (BAL_VALID) and lines 625-627 (valid values inside three unrelated preset-error rows). The bal_rows table adds negative rows for every sibling knob, e.g. `{\"cap_fraction missing\", replace1(BAL_VALID, `  \"cap_fraction_permille\": 500,`, ``, 1), \"cap_fraction_permille\"},` / `{\"cap_fraction zero\", replace1(BAL_VALID, `\"cap_fraction_permille\": 500`, `\"cap_fraction_permille\": 0`, 1), \"cap_fraction_permille\"},` and 13 growth_groups rows — none for either new key.",
+    "detail": "Three new loader rejection branches ship with only happy-path coverage. These knobs are the user's fun-test iteration surface — a hand-edit typo must fail fast, and a validation regression now passes CI silently. Violates the every-knob-has-rows convention.",
+    "recommended_fix": "Add bal_rows: interval/sep each missing, zero, negative, decimal; plus radius_tiles == terminal_min_sep_tiles (4) equality — the current 'radius at floor' row uses 3, now strictly below the floor."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Surge window-boundary assertions weakened to four identical <=1 checks — no discriminating power remains",
+    "location": "core/demand_test.odin:330-333 (test_director_surge_amplifies_class)",
+    "evidence": "New (9ab2f02), lines 330-333:\n```\ntesting.expectf(t, tick_class_count(&state.flow, 399, 1) <= 1, \"surge must NOT amplify at tick 399, got %d\", tick_class_count(&state.flow, 399, 1))\ntesting.expectf(t, tick_class_count(&state.flow, 400, 1) <= 1, \"capped burst: tick 400 got %d (≤ 1 = ceil_cap)\", tick_class_count(&state.flow, 400, 1))\ntesting.expectf(t, tick_class_count(&state.flow, 599, 1) <= 1, \"capped burst: tick 599 got %d (≤ 1 = ceil_cap)\", tick_class_count(&state.flow, 599, 1))\ntesting.expectf(t, tick_class_count(&state.flow, 600, 1) <= 1, \"surge must end at tick 600, got %d\", tick_class_count(&state.flow, 600, 1))\n```\nOld (8639d5f): `testing.expectf(t, tick_class_count(&state.flow, 399, 1) == 1, \"surge must NOT be active at tick 399, ...\")`, ceiling `<= 2` in-window, and `testing.expectf(t, tick_class_count(&state.flow, 600, 1) == 1, \"surge must end at tick 600, ...\")`.",
+    "detail": "In-window ceiling and out-window base are both ≤1 at the 4× pace, so all four checks hold in every phase: a director-level window off-by-one or never-ending window passes. Only the pure-function pin (test_set_piece_active_window, demand_test.odin:117) still covers the predicate.",
+    "recommended_fix": "Pin exact credit-timed counts at the boundaries — e.g. cumulative spawns by tick 399 and by tick 600, seed-pinned per the [E10] convention already used for the ==46/==200 aggregate pins."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "weakened-pin",
+    "title": "W6 delivery-side zero-drop contract relaxed to a ratio; staging and assertion comments disagree on the measured drops",
+    "location": "core/crisis_test.odin:1233 (test_groups_surge_aggregation_at_shared_uplink)",
+    "evidence": "Old (8639d5f:1117): `testing.expectf(t, res_drops == 0,\n\t\t\"%d drops landed on a residential sink drop (delivery-side concentration; the estate's sink drops are sized past the inbound bursts)\", res_drops)`. New (1233-1235): `testing.expectf(t, res_drops < uplink_drops,\n\t\t\"%d drops landed on a residential sink drop vs %d at the shared uplink (delivery-side concentration must never dominate the aggregation shed)\", res_drops, uplink_drops)`. Staging comment (line 1138): `measured: 3 sink drops at the 4x pace.)` vs assertion comment (line 1228): `in one tick) make ONE thin (40 u/s) sink shed once across the whole run`.",
+    "detail": "The weakening is pace-forced and documented, but the strict W6 pin is gone: any delivery-side shedding up to (uplink_drops − 1) now passes, and the two comments contradict each other (3 drops vs 1 drop once).",
+    "recommended_fix": "Pin a quantified bound (e.g. res_drops <= a small derived constant), or reconcile the 3-vs-1 comments and record the thin-sink shed as an accepted consequence for the user's fun-test round."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "removed-assertion",
+    "title": "!s.replay_error guard deleted from test_sla_delivery_accounting instead of re-derived",
+    "location": "core/sla_test.odin:132",
+    "evidence": "Parent 8639f5f (test_sla_delivery_accounting): `record_run(&s, 30, cat)` followed by `testing.expect(t, !s.replay_error, \"replay_error latched (a logged command failed)\")`. New file (9ab2f02), lines 132-134: `record_run(&s, 90, cat)` followed directly by `testing.expect_value(t, s.flow.sla[0].delivered, u64(3))` — the guard survives only in sibling tests (lines 275 and 337).",
+    "detail": "Assertion removed, not re-derived; nothing in the pace shift requires dropping it. A rejected fixture draw now surfaces only as confusing downstream count mismatches in this test.",
+    "recommended_fix": "Restore `testing.expect(t, !s.replay_error, \"replay_error latched (a logged command failed)\")` after record_run in test_sla_delivery_accounting."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "pin-derivation",
+    "title": "Re-pinned SLA breach test carries contradictory comments (1750 vs 1300 ms; 8th vs 2nd delivery; window-margin vs cumulative exit)",
+    "location": "core/sla_test.odin:261,265-268 vs 283,288,294 (test_sla_breach_latency_enter_exit)",
+    "evidence": "Line 261: `sla_spawn(&s, tk, 1, res, j3)     // streaming -> 1750 ms each (delivers tk+35)`; lines 265-268: `The 200-tick\n// window average drops under the exit band (tol 1200 − margin 160 =\n// 1040) at the 8th short delivery (window: 2 longs + 8 shorts =\n// (2×1750 + 8×850)/10 = 1030 < 1040)`. But the pins enforce: `testing.expect_value(t, cross_evs[0].tick, u64(27)) // the first streaming long-path delivery (spawn 1 + 26)`, `testing.expect_value(t, cross_evs[1].tick, u64(185)) // the 2nd short delivery (151+17+17) — cumulative avg 1150 <= 1200`, `testing.expect_value(t, s.flow.sla[1].total_latency_ms, u64(4 * 1300 + 20 * 850))`.",
+    "detail": "Two comment blocks contradict the pinned values and each other (1750/35-tick vs 1300/26-tick; windowed exit at the 8th delivery vs cumulative exit at tick 185). The 'measured, never guessed' re-derivation cannot be audited from the file.",
+    "recommended_fix": "Rewrite the phase-1/phase-2 comments to the 1300 ms, cumulative-average, 2nd-short-delivery derivation that the pinned ticks (27/185) and totals actually enforce."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "test-hygiene",
+    "title": "Debug leftovers committed in re-pinned tests: no-op `_ = s` and unused `import \"core:fmt\"`",
+    "location": "core/health_test.odin:403; core/warnings_test.odin:23",
+    "evidence": "core/health_test.odin:402-403 (test_health_grace_refill_gradual): `step_n(&s, 130, cat) // tick 430: past the expiry (428), mid-drain (meter ~96)` then `_ = s`. core/warnings_test.odin:22-24: blank line, `import \"core:fmt\"`, `import \"core:testing\"` — grep for `fmt.` in the file returns 0 usages (parent 8639d5f had no fmt import).",
+    "detail": "Re-pinning debris: a no-op statement inside test_health_grace_refill_gradual and an import with zero call sites in warnings_test.odin.",
+    "recommended_fix": "Delete `_ = s` (health_test.odin:403) and the `import \"core:fmt\"` line (warnings_test.odin:23)."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: CONCERNS",
+    "location": "core/catalog_test.odin:620 (primary gap anchor)",
+    "evidence": "The gate turns on three verified gaps: (1) core/catalog.odin:822-828 adds `jint_strict(obj, \"terminal_spawn_interval_ticks\", -1)` / `if tsi < 1 || tms < 1 { return ... }` rejection branches with zero matching bal_rows; (2) core/demand_test.odin:330-333 four identical `<= 1` window-boundary checks; (3) core/crisis_test.odin:1233 `res_drops < uplink_drops` replacing `res_drops == 0`. Everything else traced FULL: exact re-derived pins in qos/bundles/sla/demand/growth/crisis/health/warnings/win_lose tests, verified against the committed files.",
+    "detail": "P0 100% (determinism/replay/serialization untouched, pins intact). P1 ≈ 81%: loader error branches 0/3 covered, director window-boundary discrimination lost, W6 zero-drop weakened to ratio; all transit/credit/SLA/growth/crisis/health pins FULL and exact. Overall ≈ 85% ≥ 80%.",
+    "recommended_fix": "Add the fail-fast negative rows for both new knobs (plus radius==sep equality boundary) and restore exact window-boundary counts — that lifts P1 to ≥ 90% and the gate to PASS."
+  }
+]

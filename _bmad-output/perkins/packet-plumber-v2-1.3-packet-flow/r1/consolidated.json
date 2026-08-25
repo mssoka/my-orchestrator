@@ -1,0 +1,81 @@
+{
+  "round": 1,
+  "pr": 23,
+  "reviewed_sha": "6265802b5e6c62ca770c212869f15be46248978d",
+  "job": "packet-plumber-v2-1.3-packet-flow",
+  "reviewers_completed": 7,
+  "reviewers_total": 7,
+  "failed_layers_sources": [],
+  "verification": {
+    "total_raw_findings": 7,
+    "confirmed": 5,
+    "rejected": 2,
+    "unverifiable_speculative": 0,
+    "rejected_detail": [
+      {
+        "source": "blind",
+        "title": "load_demo_spawns unused perr = Odin compile error (build-breaking)",
+        "why_rejected": "Empirically false: `odin build harness` (with -debug and -strict-style) exits 0 with no perr/unused/error/warning. Odin permits the unused second value of a multi-return binding. The lenient parse (return empty on missing/unparseable demo) is the documented intent. No issue."
+      },
+      {
+        "source": "blind",
+        "title": "keystone assertion claims a 'serialized tick field' that is absent from the diff",
+        "why_rejected": "False: serialize.odin:73 `w_u64(&w, state.tick)` serializes the tick, and step.odin:28 `state.tick = tick` advances it each tick — so hashes vary tick-to-tick for this exact reason. The comment is accurate; the lens only read the diff hunk and missed the pre-existing serialized tick field above the flow block."
+      }
+    ]
+  },
+  "findings": [
+    {
+      "sources": ["blind", "codebase"],
+      "severity": "note",
+      "category": "orphaned-symbol-duplication",
+      "title": "spawn_tick proc (demo.odin) is dead code; lower_spawns (run.odin) inlines the identical tick formula",
+      "location": "harness/demo.odin:167 (defined) | harness/run.odin:149-154 (duplicated inline)",
+      "evidence": "harness/demo.odin: `spawn_tick :: proc(s: ^Spawn_Intent, logic_hz: i32) -> u64 { return u64(max(0, i64(s.at_ms) * i64(logic_hz) / 1000)) }`\nharness/run.odin lower_spawns: `tick := u64(max(0, i64(s.at_ms) * i64(hz) / 1000)); pp.flow_seed_demand(&state.flow, tick, s.src, s.dst)`\ngrep `spawn_tick(` across harness/app/core: zero callers (only the def + the unrelated Packet.spawn_tick FIELD).",
+      "detail": "The two formulas AGREE (both floor(at_ms*hz/1000), no +1) so there is NO current determinism bug. But spawn_tick is a newly-added orphan and lower_spawns is its only logical consumer, duplicating the formula instead of calling it — a latent divergence hazard on the replay-identical-demand invariant.",
+      "recommended_fix": "In lower_spawns call `tick := spawn_tick(&s, hz)` (de-duplicate), or delete the unused spawn_tick proc.",
+      "verification": "confirmed"
+    },
+    {
+      "sources": ["architecture"],
+      "severity": "note",
+      "category": "dead-branch-misleading-comment",
+      "title": "flow_step's defensive severance branch resets to p.src (original source), not the lost edge's departure node as its comment claims",
+      "location": "core/flow.odin:119-126 (flow_step, on-edge `if !ok` branch)",
+      "evidence": "core/flow.odin:\n```\nps, ok := pipe_slot(&state.topology, p.edge)\nif !ok {\n    // ... Drop back to the departure side of the lost edge + re-forward next tick.\n    p.on_edge = false\n    p.at_node = p.src\n    p.progress_units = 0\n    continue\n}\n```\np.src is never reassigned anywhere in flow_step (grep `\\.src =` -> only this line reads it), so for a multi-hop packet p.src is still the ORIGINAL spawn source.",
+      "detail": "Unreachable in 1.3 (pipes are never removed, so pipe_slot always succeeds) — no functional impact now. But it pre-implements slice-2.3 severance and its reset contradicts the comment: a multi-hop packet mid edge N would teleport back to its origin, not re-forward from the lost edge's departure node (the non-heading endpoint of p.edge).",
+      "recommended_fix": "Drop the branch (unreachable in 1.3; severance is slice 2.3) or reset to the lost edge's departure node: the p.edge endpoint that isn't p.heading.",
+      "verification": "confirmed"
+    },
+    {
+      "sources": ["edge"],
+      "severity": "note",
+      "category": "unvalidated-demand-input",
+      "title": "flow_seed_demand / Spawn_Intent parse accept any src/dst id with no live-node check",
+      "location": "core/flow.odin:72 (flow_seed_demand) | harness/demo.odin:107 (spawn parse)",
+      "evidence": "core/flow.odin: `flow_seed_demand :: proc(f: ^Flow_State, tick: u64, src, dst: u32) { append(&f.demand, Spawn_Req{tick = tick, src = src, dst = dst}) }`\nharness/demo.odin spawn parse: only checks parseability (`if !oka || !okb { return ... }`), not node liveness.",
+      "detail": "No guard rejects a non-live node id. A typo'd id spawns a packet at a non-existent node; routing_next_hop then returns ok=false forever, so it silently never delivers and never visibly renders — a ghost packet. Not triggered by current valid inputs (src==dst IS handled — flow_step marks it delivered at spawn).",
+      "recommended_fix": "Validate src/dst at the lowering boundary (lower_spawns / app seed) where the Topology is available — reject non-live ids with a typed error before flow_seed_demand.",
+      "verification": "confirmed"
+    },
+    {
+      "sources": ["tests"],
+      "severity": "note",
+      "category": "coverage-gate",
+      "title": "Advisory test gate: PASS (8/8 traced behaviours covered)",
+      "location": "core/flow_test.odin (5 @(test)) + demos/flow.dem (T2)",
+      "evidence": "5 new @(test) funcs pin: per-hop source->sink, forwarding-table rebuild on topology change (rule 1), no-cached-route re-forward after rebuild (E29), flow replay byte-identical (E10), unroutable-waits-then-flows (E28). T2 mid-traversal harness golden (demos/flow.dem captures at 2100/2150/2250ms) verified non-black. Packet_Arrived+cull + id-0 transitively exercised.",
+      "detail": "P0 4/4=100%, P1 4/4=100%, overall 8/8=100%. ECMP/QoS/SLA/demolish correctly out of scope for 1.3. Gate green; no gaps.",
+      "recommended_fix": "No action. Optional later: a dedicated id-0 @(test) to pin the on_edge sentinel explicitly (currently transitively covered).",
+      "verification": "confirmed"
+    }
+  ],
+  "verdict": "READY TO MERGE",
+  "verdict_reason": "0 blockers, 0 warnings. The load-bearing invariants all hold and are verified: per-hop forwarding (no route[] field, no compute_route, no BFS-on-packet), 4-rule-spine rule-1 table rebuild gated on Topology.gen, id-0 handled via on_edge flag + +1 id scheme, engine-free core, and replay-determinism over the flow (demand re-created identically in both live + replay paths; standalone harness replay bit-for-bit). odin test (20), lint (4 gates), app build, and the software-renderer harness (boot/flow/draw green) all pass. The 4 notes are non-blocking (dead helper, an unreachable-in-1.3 defensive branch, an unvalidated-input latent gap, and the coverage gate).",
+  "reviewer_agreement": [
+    {
+      "title": "spawn_tick dead code + duplicated tick formula",
+      "sources": ["blind", "codebase"]
+    }
+  ]
+}

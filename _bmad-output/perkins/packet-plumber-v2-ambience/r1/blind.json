@@ -1,0 +1,72 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "edge-case",
+    "title": "Duck triggered while muted freezes mid-envelope and lands as an audible dip right after unmute",
+    "location": "app/audio/audio.odin @@ -322,11 +408,36 @@ (toggle_mute) and @@ -335,6 +446,117 @@ (bed_update/bed_duck_trigger)",
+    "evidence": "+bed_duck_trigger :: proc(a: ^Audio) {\n+\tif !a.bed_on {\n+\t\treturn\n+\t}\n+\ta.bed_duck_t = MUSIC_DUCK_SECS\n+\ta.bed_recovering = false\n+}\n...\n+bed_update :: proc(a: ^Audio, dt: f32, paused: bool) {\n+\tif !a.bed_on || a.muted {\n+\t\treturn\n+\t}\n...\n+\tif a.bed_on {\n+\t\ta.bed_paused = a.muted\n+\t\tif a.muted {\n+\t\t\ta.bed_duck_t = 0\n+\t\t\ta.bed_recovering = false\n+\t\t\ta.bed_recover_t = 0\n+\t\t}\n+\t}",
+    "detail": "Trigger has no muted guard; bed_update skips while muted, freezing the envelope; the reset runs only when muting. A duck staged during mute (flush still fires on pending plays) survives frozen and plays out after unmute, contradicting 'unmute lands at the normal level'.",
+    "recommended_fix": "Guard bed_duck_trigger on a.muted (or skip the flush trigger while muted), or reset the envelope on unmute too, so a during-mute event burst cannot duck the just-resumed bed."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "docs-drift",
+    "title": "PR body claims '17/17 (13 pre-existing + 4 new bed tests)' but the diff adds seven new bed tests",
+    "location": "_pr_body_ambience.md (Verification) vs app/audio/audio_test.odin @@ -233,3 +233,130 @@",
+    "evidence": "+- `odin test app/audio` → 17/17 (13 pre-existing + 4 new bed tests).\n...\n+test_bed_envelope_shape :: proc(t: ^testing.T) {\n...\n+test_bed_duck_retrigger :: proc(t: ^testing.T) {\n...\n+test_bed_off_is_silent_noop :: proc(t: ^testing.T) {\n...\n+test_bed_duck_never_raises :: proc(t: ^testing.T) {\n...\n+test_bed_paused_ducked_level :: proc(t: ^testing.T) {\n...\n+test_bed_retrigger_while_deep :: proc(t: ^testing.T) {\n...\n+test_bed_mute_mirror_flag :: proc(t: ^testing.T) {",
+    "detail": "Seven @(test) procs are added in audio_test.odin; 13+7=20, not 17. The PR body's verification line (and its '17 audio unit tests' decision note) is stale relative to the shipped suite — written before the r1 folds landed.",
+    "recommended_fix": "Regenerate the PR body's test numbers from the final suite (20 total, 7 new) so the verification section matches the diff a reviewer can count."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "broken-invariant",
+    "title": "Device-gate claims for the bed are asserted everywhere but implemented nowhere in the added code",
+    "location": "app/audio/audio.odin @@ -191,6 +243,23 @@ (audio_init bed block)",
+    "evidence": "+\ta.bed = load_bed()\n+\tif a.bed.frameCount > 0 {\n+\t\ta.bed_on = true\n...\n+\t// app-owned duck envelope. `bed_on` mirrors the device/asset gate (no\n+\t// device or an undecodable file = no bed, silently).\n...\n+- **Headless/CI-safe:** bed load + play gate on `IsAudioDeviceReady()` (the #81 silent-fallback precedent); a missing/undecodable OGG prints one stderr note and the game plays exactly as before.",
+    "detail": "audio_init sets bed_on purely on frameCount > 0; no device_on term appears in any added line. The hunk comment, struct comment, spec NO_DEVICE row, and PR body all promise a device gate — true only if deviceless LoadMusicStream happens to yield frameCount 0.",
+    "recommended_fix": "Make the gate explicit: skip load_bed when !a.device_on and set bed_on only under a.device_on, so the headless contract is enforced in code rather than by raylib failure behavior."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "test-gap",
+    "title": "test_bed_duck_never_raises cannot fail at the shipped constants — cap removal goes undetected",
+    "location": "app/audio/audio_test.odin (test_bed_duck_never_raises) + app/audio/audio.odin (bed_duck_multiplier)",
+    "evidence": "+MUSIC_VOLUME :: f32(0.40)\n...\n+MUSIC_DUCK_VOLUME :: f32(0.12)\n...\n+\tduck_ratio := min(MUSIC_DUCK_VOLUME / MUSIC_VOLUME, 1.0)\n...\n+\ttesting.expectf(t, bed_duck_multiplier(&a) <= 1.0,\n+\t\t\"duck multiplier %v exceeds 1.0 (would raise the bed)\", bed_duck_multiplier(&a))",
+    "detail": "At shipped constants the uncapped ratio is 0.3, so both assertions (multiplier ≤ 1.0, ducked level ≤ master) pass with or without the min cap. Deleting the cap keeps every test green until MUSIC_VOLUME is retuned at/below MUSIC_DUCK_VOLUME.",
+    "recommended_fix": "Make the cap load-bearing in a test: parameterize bed_duck_multiplier/bed_level over master and duck volumes (pure inputs) so a test can drive the master-below-duck case directly."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "docs-vs-code",
+    "title": "pending_any_plays comment claims the flush's play loops key off it; they do not",
+    "location": "app/audio/audio.odin (pending_any_plays) + @@ -312,6 +387,17 @@ (audio_flush context)",
+    "evidence": "+// pending_any_plays — the ONE place that knows the play-family list (r1\n+// review note 7): any staged play in the flush's Pending. The duck trigger\n+// and (implicitly) the flush's play loops both key off it.\n...\n \t\tv := (a.pending.spawn_variant + i32(k)) % SPAWN_VARIANTS\n \t\trl.PlaySound(a.spawn[v])",
+    "detail": "The comment's single-source claim is hedged with '(implicitly)' because the play loops still iterate their own per-family counts. A fifth family added later still requires editing both the loops and the helper — the silent-miss hazard the fold claimed to close remains.",
+    "recommended_fix": "Reword the comment to state the helper covers only the duck trigger, or genuinely derive the flush's play iteration from one family table so the single-source claim is true."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "stale-artifact",
+    "title": "Committed review-diff.txt embeds the pre-fold code, contradicting the shipped hunks in the same commit",
+    "location": "_bmad-output/reviews/v2-ambience/review-diff.txt vs app/audio/audio.odin",
+    "evidence": "++\tduck_ratio := MUSIC_DUCK_VOLUME / MUSIC_VOLUME\n...\n++// soft-lower × the duck multiplier. SetMusicVolume clamps at 1.0 in raylib\n++// (the duck floor stays MUSIC_DUCK_VOLUME absolute even when the master\n++// sits below it — the tunable scales the normal level, never the duck's\n++// audibility floor). PURE — unit-tested headless.\n...\n+\tduck_ratio := min(MUSIC_DUCK_VOLUME / MUSIC_VOLUME, 1.0)\n...\n+🔌 MCP: 2 servers enabled",
+    "detail": "review-diff.txt (header: 'Diff vs baseline 339e173 (tracked)') ships the uncapped multiplier and the retracted absolute-floor comment alongside the fixed code in the same commit, and the review .txt files are raw session transcripts with terminal chrome. Only verif-gap.txt's own aside flags the staleness.",
+    "recommended_fix": "Label the artifact explicitly as the pre-r1 review snapshot in its header (or file it under a dated review-round directory) and strip session chrome, so it cannot be mistaken for the current diff."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "repo-hygiene",
+    "title": "PR-body scratch file committed at the repository root",
+    "location": "_pr_body_ambience.md (repo root)",
+    "evidence": "diff --git a/_pr_body_ambience.md b/_pr_body_ambience.md\nnew file mode 100644",
+    "detail": "An underscore-prefixed working artifact lands at the repo root while the same diff's .gitignore excludes comparable scratch (_bmad-output/**/review/_charter-*.md, .pp-settings.bin). The naming pattern signals 'do not commit'; nothing else at root follows it.",
+    "recommended_fix": "Drop the file from the commit (PR bodies live in the PR), or move it under _bmad-output/ if a committed record is wanted; optionally add a _pr_body_*.md ignore rule."
+  }
+]

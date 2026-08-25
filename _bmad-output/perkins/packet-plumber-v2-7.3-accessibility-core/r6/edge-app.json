@@ -1,0 +1,42 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "modal-state-game-over",
+    "title": "Pad Y opens the settings panel at Game_Over, but mouse S, touch, and the draw path all early-return on Game_Over — the open panel is invisible and mouse/touch cannot close it",
+    "location": "app/input/controller.odin:36-53 vs app/input/mouse.odin:36-47 vs app/input/touch.odin:26-29 vs app/main.odin:1050-1069",
+    "evidence": "controller.odin: `if inp.panel_open { ... case .Y, .B: append(out, Intent(Toggle_Settings{})) ... continue } if inp.mode == .Game_Over {`. mouse.odin: `if inp.mode == .Game_Over { ... if k.key == .R || k.key == .Enter { append(out, Intent(Retry{})) ... return`. touch.odin: `if inp.mode == .Game_Over { return }` (before the panel_open block). main.odin draw_hud: `draw_text(app, \"press R or Enter to retry...\" ...); return` (chip/panel draw at lines 1230-1235 unreachable at Game_Over).",
+    "detail": "The controller gates panel_open BEFORE Game_Over, so pad Y toggles the panel at Game_Over; mouse and touch early-return on Game_Over before their panel paths, and draw_hud returns before drawing the panel — an open-but-invisible modal on the game-over screen.",
+    "recommended_fix": "Gate the pad panel block behind `inp.mode != .Game_Over` in controller.odin (matching mouse/touch), so the panel can never open at Game_Over."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "state-not-reset",
+    "title": "start_run never resets panel_open/panel_row — Retry while the panel is open starts a fresh Run with the modal still open and the run never paused",
+    "location": "app/main.odin:528-599 (start_run)",
+    "evidence": "start_run resets `app.input.drag`, `app.input.placing = -1`, `app.input.sel_pipe = -1`, `app.input.sel_node = -1`, `app.input.press_swallowed = false`, `app.input.sel_class = 0`, `app.input.pad_has = false` — no `app.input.panel_open = false` / `panel_row` reset anywhere in the proc.",
+    "detail": "R/Enter Retry at Game_Over is emitted regardless of panel_open (mouse.odin Game_Over loop). The new run enters Run mode with panel_open still true: the sim ticks live while all world input is modal-suppressed, and the pause-on-open effect never fired for this run.",
+    "recommended_fix": "Add `app.input.panel_open = false; app.input.panel_row = 0` to start_run alongside the other input resets."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "multi-event-frame",
+    "title": "Two Touch_Press events in one frame each call on_ui_press — a frame containing two chip taps toggles the panel open then closed",
+    "location": "app/input/touch.odin:31-45",
+    "evidence": "`for ev in events { v, ok := ev.(Touch_Press); if !ok { continue } ... if inp.on_ui_press(inp.user, inp, v.pos) { inp.press_swallowed = true } }` — no same-frame coalescing, unlike the key paths (`if !has_key(...)` for P/Space).",
+    "detail": "settings_press reads live panel_open, so a scripted frame with two chip-position Touch_Press events (parity harness can emit these) toggles the panel twice — end state closed, on_settings fired twice.",
+    "recommended_fix": "Coalesce: process at most one Touch_Press per frame in the panel branch, mirroring the P/Space has_key dedup."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "div-by-zero",
+    "title": "crisis_text_scale divides by hud(v, 440) — a zero-inited View (ui_scale=0, never passed through view_compute) yields 0/0 = NaN fed to an i32 cast",
+    "location": "app/render/crisis.odin:crisis_text_scale",
+    "evidence": "`crisis_text_scale :: proc(v: ^View) -> f32 { return min(1.0, f32(crisis_card_width(v)) / f32(hud(v, 440))) }` and `hud :: proc ... return i32(f32(k) * v.ui_scale + 0.5)` — no ui_scale<=0 guard inside hud; the only guard is in view_compute.",
+    "detail": "hud()/hud_f() themselves have no zero-scale guard; only view_compute clamps. A View constructed without view_compute (the hud_test file hand-notes this trap) makes crisis_text_scale compute 0/0=NaN, whose i32 conversion is undefined.",
+    "recommended_fix": "Clamp in hud()/hud_f() (`if v.ui_scale <= 0 { return k }`) or guard crisis_text_scale's denominator, so the helper is safe on any View."
+  }
+]

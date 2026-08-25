@@ -1,0 +1,72 @@
+[
+  {
+    "source": "edge",
+    "severity": "blocker",
+    "category": "input-dead",
+    "title": "delta-0 activate is a no-op on the palette + scale rows: touch taps, Enter, and pad A can never change palette or UI scale",
+    "location": "app/settings.odin:149-158 + app/main.odin settings_click row tap",
+    "evidence": "cycle_scale :: proc(cur: u8, delta: i32) -> u8 {\n\tn := i32(UI_SCALE_COUNT)\n\treturn u8((i32(cur) + delta + n) % n)\n} ... cycle_palette :: proc(cur: u8, delta: i32) -> u8 {\n\tn := i32(rnd.Palette_Mode.Tritan) + 1\n\treturn u8((i32(cur) + delta + n) % n)\n} ... settings_click row tap: effect_settings_adjust(app.input.user, &app.input, i32(row), 0) ... settings_test.odin:148: testing.expect(t, cycle_scale(0, 0) == 0, \"a zero delta holds the step\")",
+    "detail": "cycle_*(cur, 0) = cur (test-pinned). Every delta-0 path — touch row tap (settings_click), keyboard Enter, pad A — is a no-op on PALETTE and SCALE rows. Touch has no ±1 path, so touch-only players cannot change palette/scale at all; the B2 fix regressed to fully dead, contradicting the intent doc 'delta 0 = cycle/next' and the 'delta-0 tap advances' comment.",
+    "recommended_fix": "Normalize delta 0 to +1 before cycling (step := delta; if step == 0 { step = 1 }) in effect_settings_adjust, and re-pin the cycle_scale(0,0) test to the advance semantic."
+  },
+  {
+    "source": "edge",
+    "severity": "blocker",
+    "category": "scale-legibility",
+    "title": "QoS manual editor: r2 scaled the nudge rects but not the lane label/weight x — the weight value draws ON the minus button at x1.25/x1.50",
+    "location": "app/qos_panel.odin:101 vs 351-362",
+    "evidence": "qos_nudge_rect: \tx := rnd.hud(&app.view, QOS_PANEL_X + 8 + lane * 96) ... draw loop: \tfor lane in 0..<3 {\n\t\tx := QOS_PANEL_X + 8 + lane * 96\n\t\ty := qos_row_y(&app.view, 6 + i32(len(app.cat.packet_types)))\n\t\tdraw_text(app, short[lane], i32(x), y + rnd.hud(&app.view, 4), rnd.hud(&app.view, 14), cols[lane]) ... \t\tdraw_text(app, wv, i32(x + 44), y + 4, 14, p.ink)",
+    "detail": "Born in r2 (B5 rework scaled only the rects). At x1.50 lane 0: minus button spans x 60..90 while the unscaled weight text draws at 64..85, y+4 vs button y+5 — text-on-text. At x1.25 minus spans 50..75, weight at 64..78. Lane 1's weight (160..181) also clips lane 0's plus button (138..168). The value being edited is illegible at both scaled steps.",
+    "recommended_fix": "Scale the draw loop's x and the wv offset/font through hud()/hud_f() (same expression as qos_nudge_rect) so labels, values, and buttons stay column-aligned at every step."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "input-dead",
+    "title": "S is a dead key while the panel is open with a pipe selected (opened via chip tap or pad Y)",
+    "location": "app/input/mouse.odin:101-106",
+    "evidence": "\t\t\tcase .S:\n\t\t\t\t// 7.3: the panel toggle — collected ONLY with no pipe selected\n\t\t\t\t// (with a selection S stays the Standard-lane key; the executor's\n\t\t\t\t// Set_Lane sel_pipe gate keeps the paths exclusive).\n\t\t\t\tif inp.sel_pipe < 0 {\n\t\t\t\t\tif keys_n < len(keys) { keys[keys_n] = .S; keys_n += 1 }\n\t\t\t\t} ... phase2_blocked := has_right || (has_left && (ui || tray_hit || placing_eff >= 0)) || inp.panel_open",
+    "detail": "The sel_pipe<0 collection gate ignores panel_open. Click a pipe, then open the panel via the settings chip or pad Y: S is neither collected (no Toggle_Settings) nor phase-2'd (panel_open blocks it) — the documented 'S / tap chip to close' key silently no-ops. Esc/chip still work, so recoverable.",
+    "recommended_fix": "Collect S when inp.panel_open regardless of sel_pipe (panel-open S can never reach Set_Lane — phase-2 is blocked while open)."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "scale-legibility",
+    "title": "QoS lane-split bar + queue-depth label left unscaled while their rows/labels scale in r2 — draw mismatch inside the scaled panel",
+    "location": "app/qos_panel.odin:311-313, 375",
+    "evidence": "\t\tbw := i32((QOS_PANEL_W - 150) * u64(caps[lane]) / max(1, total))\n\t\tif bw > 0 {\n\t\t\trl.DrawRectangle(QOS_PANEL_X + 118, y + 7, bw, 8, cols[lane]) ... \tdraw_text(app, depth_label, QOS_PANEL_X + 10, qd_y + 3, 14, p.ink_soft)",
+    "detail": "r2 scaled the split label (hud x/offset/font) and the row pitch, but the proportion bar keeps unscaled x=130, 8px height, max 150px width inside a 450px panel at x1.50, overlapping the now-23px label text above it; the queue-depth label keeps unscaled x/offset/font on a scaled row. Same single-source rule the rest of the panel now follows.",
+    "recommended_fix": "Route the bar x/height/width basis (QOS_PANEL_W-150, 118, 7, 8) and the depth-label offsets/font through hud()/hud_f()."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "scale-legibility",
+    "title": "still present since round 1: popover height/text unscaled — at x1.50 the scaled demolish button rides up over the pipe popover's title",
+    "location": "app/render/popover.odin:26, 62-69, 108",
+    "evidence": "POPOVER_H_PIPE :: f32(64) ... popover_rect keeps h raw: \treturn {x, y, w, h} ... demolish_button_rect: \tif v != nil {\n\t\treturn {pop.x + hud_f(v, 10), pop.y + pop.height - hud_f(v, 36), pop.width - hud_f(v, 20), hud_f(v, 26)}\n\t} ... \t\tdraw_text_c(v, cat.pipe_tiers[topo.pipe_tier[ps]].display, i32(pop.x) + 10, i32(pop.y) + 8, 15, p.ink)",
+    "detail": "popover_rect scales width/offsets but takes h raw (64 for pipes); the r2 demolish_button_rect scales its insets, so at x1.50 the button top = pop.y+64-54 = pop.y+10 with height 39, covering the title drawn at pop.y+8..23 (button drawn after). Node popover (h=92) clears. Draw+hit stay consistent; the pixels overlap.",
+    "recommended_fix": "Scale the popover heights (hud_f on POPOVER_H_*) and the popover text sizes, or clamp the button below the title line."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "input-gap",
+    "title": "still present since round 1: panel opened while placement is armed (pad Y) — mouse left-press skips on_ui_press (placing gate), so panel rows/chip are unclickable until Esc",
+    "location": "app/input/mouse.odin:263 + 279-282",
+    "evidence": "\t\tif placing_eff < 0 && inp.on_ui_press != nil {\n\t\t\t...\n\t\t\tui = inp.on_ui_press(inp.user, inp, left_press)\n\t\t} ... \t\tif inp.panel_open {\n\t\t\t// no tray / no drag / no placement while the panel is open\n\t\t} else {",
+    "detail": "With placing_eff >= 0 the ui-press hook never runs, and the new panel-open branch then suppresses everything else — a mouse press on a panel row or the chip evaporates. Touch is unaffected (its panel branch calls on_ui_press directly); keyboard arrows/Esc work. Mixed pad+mouse state only.",
+    "recommended_fix": "While panel_open, call on_ui_press regardless of placing_eff (the modal owns the surface)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "node-health card width scales (hud) but there is still no right-edge x clamp — at x1.50 a right-edge node's card overflows the window",
+    "location": "app/render/node_health.odin:71-84",
+    "evidence": "\ts := v.tile_px * v.scale\n\tx := i32(anchor.x) + i32(s * 0.7)\n\ty := i32(anchor.y) + i32(s * 0.5)\n\th := hud(v, NODE_HEALTH_CARD_H) ... \tif y + h > v.win_h {\n\t\ty = v.win_h - h\n\t} ... \trl.DrawRectangle(x, y, hud(v, NODE_HEALTH_CARD_W), h, card)",
+    "detail": "The diff clamps y only. The card now draws 1.5x wider from the same unclamped anchor x, so nodes near the right map edge push the scaled card off-screen at the knob steps whose AC is chrome legibility. Pre-existing gap, amplified by the r2 width scaling.",
+    "recommended_fix": "Mirror the y clamp: if x + hud(v, NODE_HEALTH_CARD_W) > v.win_w { x = v.win_w - hud(v, NODE_HEALTH_CARD_W) }."
+  }
+]

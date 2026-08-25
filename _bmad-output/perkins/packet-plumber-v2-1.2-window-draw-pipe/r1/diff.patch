@@ -1,0 +1,3368 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index c1a1b80..3a0e1b5 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1,13 +1,9 @@
+ # .github/workflows/ci.yml — the §16.3 gates (ODN-17: the harness is a
+-# release-gated CI citizen). Matrix: linux + macos; T1 goldens are platform-
+-# independent (state hashes — no GPU).
+-#
+-# Story 1.1 scope (headless determinism spine): core purity + grep gates, the
+-# core T1 unit tests, and the golden harness's T1 + replay gate. The app
+-# build, the orchestration tests (app/run), and the T2 software-pixel path
+-# (tools/harness.sh + tools/build_raylib_sw.sh) re-enable in story 1.2+ when
+-# the window + a view land — the spine is proven headless before any window
+-# (lavish choice 2B).
++# release-gated CI citizen). Story 1.2 widens the 1.1 headless spine to the full
++# vertical slice: core purity + grep gates, the core T1 unit tests, the runnable
++# app.bin build, the golden harness (T1 hashes + T2 software pixels + the
++# replay gate), and the W1 drift-rejection negative test. Matrix: linux + macos;
++# goldens are platform-independent because T2 is software-rendered (rlsw).
+ name: ci
+ 
+ on:
+@@ -53,27 +49,44 @@ jobs:
+           xattr -dr com.apple.quarantine "$ODIN_BIN" 2>/dev/null || true
+           "$ODIN_BIN/odin" version
+ 
++      # the stock vendor:raylib desktop build links system X11/GL on linux (the
++      # app.bin GPU build); the harness uses the software renderer (no GPU).
++      - name: Linux GUI link deps
++        if: runner.os == 'Linux'
++        run: |
++          sudo apt-get update -qq
++          sudo apt-get install -y -qq libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libgl1-mesa-dev
++
+       # ODN-1: the core purity + grep gates. lint.sh gate 1 is the structural
+       # purity check (core/ imports whitelisted core:* only — never vendor:*,
+-      # core:os, core:time); a package with zero forbidden imports cannot
+-      # reference the renderer/os/time. (odin build core -build-mode:obj is the
+-      # §16.3 aspiration; the user `package core` collides with Odin's runtime
+-      # `core` for obj-output naming — the import lint is the authoritative
+-      # gate; the obj artifact is reconciled with a later CI-gate design.)
++      # core:os, core:time); the import lint is the authoritative gate.
+       - name: Purity + grep gates (ODN-1)
+         run: tools/lint.sh
+ 
+-      # ODN-9/10/11 + E10: the determinism spine — RNG pinned vectors,
+-      # replay-equality, the binary log round-trip + corrupt-input rejection.
+-      - name: Core unit tests (the determinism contracts)
++      # ODN-9/10/11 + E10 + the 1.2 draw contracts (E3/E4/E11/E26): the RNG
++      # pinned vectors, replay-equality, the binary log round-trip + corrupt-
++      # input rejection, and the topology validation contracts.
++      - name: Core unit tests (the determinism + topology contracts)
+         run: odin test core
+ 
+-      # ODN-17/11: the golden harness — T1 state-hash manifest compare + the
+-      # replay gate (the blessed action log re-sims the manifest bit-for-bit;
+-      # catalog/logic_hz drift is a defined rejection). Headless — no window,
+-      # no GPU, no raylib (the first runnable app.bin + T2 pixels land in 1.2).
+-      - name: Golden harness (T1 hashes + replay gate)
+-        run: odin run harness -- run
++      # Story 1.2: the first runnable app.bin compiles + links (the shipped
++      # artifact — GPU raylib; the playable surface).
++      - name: Game builds (app.bin compiles + links)
++        run: odin build app -out:app.bin
++
++      # ODN-17/11: the golden harness — T1 state-hash manifest compare + T2
++      # software pixels + the replay gate (the blessed action log re-sims the
++      # manifest bit-for-bit; catalog/logic_hz drift is a defined rejection).
++      # tools/harness.sh builds the rlsw software-raylib shadow (no GPU) then
++      # the harness, then runs it.
++      - name: Golden harness (T1 hashes + T2 software pixels + replay gate)
++        run: tools/harness.sh run
++
++      # W1 carry-forward from #21: a deliberately-drifted action log must be
++      # REJECTED by the replay gate — proven in CI, not just locally (the
++      # #599-r2 / verification-gap lesson).
++      - name: W1 drift-rejection negative test
++        run: tools/harness.sh drift-check
+ 
+       - name: Upload diff bundles on failure
+         if: failure()
+diff --git a/app/main.odin b/app/main.odin
+new file mode 100644
+index 0000000..23e9d5b
+--- /dev/null
++++ b/app/main.odin
+@@ -0,0 +1,256 @@
++package main
++
++// app/main.odin — the first runnable app.bin (Story 1.2): a 1280×720 window
++// rendering the hardcoded static map where the player draws one pipe
++// (drag node→node, snap, cost) via the validated Command_Bus + the edit
++// fast-path. The sim steps through the SAME package core as the harness; the
++// view is the SAME package render. NO routing/flow yet (1.3).
++//
++// Run: odin run app   (GPU raylib — the playable surface; the harness uses the
++// software renderer for bit-exact goldens).
++
++import "core:fmt"
++import "core:os"
++import "core:strings"
++import pp "../core"
++import rnd "./render"
++import rl "vendor:raylib"
++
++WIN_W :: 1280
++WIN_H :: 720
++
++App :: struct {
++	cat:       pp.Catalogs,
++	state:     pp.Run_State,
++	view:      rnd.View,
++	palette:   rnd.Palette,
++	drag:      rnd.Drag_State,
++	tick:      u64,
++	accum:     f64, // the fixed-timestep accumulator (ODN-2)
++	std_tier:  u16, // the tier app draws (the workhorse 'standard')
++	res_id:    u32,
++	rt_id:     u32,
++	host_id:   u32,
++	drag_to:   u32, // the node the cursor is currently snapped to (0 = none)
++}
++
++main :: proc() {
++	cat: pp.Catalogs
++	if e := load_catalogs(&cat); e != "" {
++		fmt.eprintfln("app: %s", e)
++		os.exit(1)
++	}
++	defer pp.catalogs_destroy(&cat)
++
++	rl.InitWindow(WIN_W, WIN_H, "Packet Plumber — v2 story 1.2")
++	defer rl.CloseWindow()
++	rl.SetTargetFPS(60)
++
++	app: App
++	app.cat = cat
++	std, _ := pp.pipe_tier_index(&cat, "standard")
++	app.std_tier = std
++
++	// the run + the deterministic fixture (identical to the harness's)
++	pp.run_init(&app.state, 42, cat.hash, cat.balance.logic_hz)
++	app.res_id, app.rt_id, app.host_id = seed_fixture(&app.state, &cat)
++
++	// the view (camera-fit); recomputed on resize
++	app.palette = rnd.palette_load()
++	app.view.palette = &app.palette
++	app.view.catalogs = &cat
++	rnd.view_compute(&app.view, WIN_W, WIN_H, &cat.balance)
++
++	tick_seconds := 1.0 / f64(cat.balance.logic_hz)
++
++	for !rl.WindowShouldClose() {
++		// --- the fixed-timestep sim (ODN-2): step at logic_hz, clamped --------
++		dt := min(f64(rl.GetFrameTime()), 0.25)
++		app.accum += dt
++		max_steps := 5
++		steps := 0
++		for app.accum >= tick_seconds && steps < max_steps {
++			app.tick += 1
++			pp.step(&app.state, app.tick, {}, &cat) // edits land via the fast-path
++			app.accum -= tick_seconds
++			steps += 1
++		}
++		app.accum = min(app.accum, tick_seconds) // bounded catch-up debt
++
++		// re-fit on resize (camera-fit reveals more map on wider/taller windows)
++		if rl.IsWindowResized() {
++			rnd.view_compute(&app.view, rl.GetScreenWidth(), rl.GetScreenHeight(), &cat.balance)
++		}
++
++		handle_input(&app)
++
++		// --- render ----------------------------------------------------------
++		rl.BeginDrawing()
++		defer rl.EndDrawing()
++		rl.ClearBackground(app.palette.canvas)
++		rnd.draw_world(&app.view, &app.state.topology, app.drag)
++		draw_hud(&app)
++	}
++}
++
++// --- input: drag-draw with snap-to-node (ODN-12) ----------------------------
++
++handle_input :: proc(app: ^App) {
++	mx, my := rl.GetMouseX(), rl.GetMouseY()
++	wx, wy := rnd.from_screen(&app.view, f32(mx), f32(my))
++
++	if rl.IsMouseButtonPressed(.LEFT) {
++		// start a drag only if the press lands on a node
++		if id, ok := snap_node(app, wx, wy); ok {
++			app.drag.active = true
++			app.drag.from_node = id
++			app.drag.wx = wx
++			app.drag.wy = wy
++			app.drag.valid = .None
++			app.drag.cost = 0
++			app.drag_to = 0
++		}
++	} else if app.drag.active {
++		app.drag.wx = wx
++		app.drag.wy = wy
++		// re-snap + re-validate the in-progress draw (live preview, READ-ONLY)
++		if id, ok := snap_node(app, wx, wy); ok && id != app.drag.from_node {
++			app.drag_to = id
++			span := pp.span_between(node_pos(app, app.drag.from_node), node_pos(app, id))
++			app.drag.cost = pp.draw_cost(span, app.std_tier, &app.cat)
++			app.drag.valid = pp.validate_draw(&app.state.topology,
++				pp.Cmd_Draw_Pipe{app.drag.from_node, id, app.std_tier}, &app.cat)
++		} else {
++			app.drag_to = 0
++			app.drag.valid = .None
++			app.drag.cost = 0
++		}
++		if rl.IsMouseButtonReleased(.LEFT) {
++			// commit if snapped to a legal target
++			if app.drag_to != 0 && app.drag.valid == .None {
++				cmd := pp.Cmd_Draw_Pipe{app.drag.from_node, app.drag_to, app.std_tier}
++				if _, err := pp.topology_apply_edit(&app.state.topology,
++					pp.Command{1, cmd}, &app.cat); err == .None {
++					// edit fast-path (ODN-2): applied THIS frame, logged at next tick
++					append(&app.state.action_log, pp.Command{
++						apply_tick = app.tick + 1,
++						kind = cmd,
++					})
++				}
++			}
++			app.drag.active = false
++			app.drag_to = 0
++		}
++	}
++}
++
++// snap_node — nearest live node to a world-px point within the snap radius
++// (INCLUSIVE, E4). Integer-Euclidean² metric (the pinned distance). Ties break
++// to the lower id.
++snap_node :: proc(app: ^App, wx, wy: f32) -> (u32, bool) {
++	t := &app.state.topology
++	tile := f32(app.cat.balance.tile_px)
++	radius := f32(app.cat.balance.snap_radius)
++	r2 := f64(radius) * f64(radius)
++	best: u32 = 0
++	best_d2 := r2
++	found := false
++	for i in 0..<len(t.node_alive) {
++		if !t.node_alive[i] {
++			continue
++		}
++		nx := f32(t.node_pos[i][0]) * tile
++		ny := f32(t.node_pos[i][1]) * tile
++		dx := f64(nx - wx)
++		dy := f64(ny - wy)
++		d2 := dx*dx + dy*dy
++		if d2 <= best_d2 {
++			if d2 == best_d2 && found && t.node_id[i] > best {
++				continue
++			}
++			best = t.node_id[i]
++			best_d2 = d2
++			found = true
++		}
++	}
++	return best, found
++}
++
++node_pos :: proc(app: ^App, id: u32) -> [2]i32 {
++	slot, _ := pp.node_slot(&app.state.topology, id)
++	return app.state.topology.node_pos[slot]
++}
++
++draw_hud :: proc(app: ^App) {
++	p := app.palette
++	// title + instructions
++	title := "Packet Plumber — v2 story 1.2"
++	draw_text(app, title, 12, 10, 22, p.ink)
++	draw_text(app, "drag a node onto another node to draw a pipe (standard tier)", 12, 36, 16, p.ink_soft)
++	// the cost readout on the drag ghost
++	if app.drag.active && app.drag_to != 0 {
++		cur := rnd.to_screen(&app.view, app.drag.wx, app.drag.wy)
++		if app.drag.valid == .None {
++			label := fmt.tprintf("cost %d", app.drag.cost)
++			draw_text(app, label, i32(cur.x)+12, i32(cur.y)-14, 16, p.ink)
++		} else {
++			draw_text(app, reject_label(app.drag.valid), 12, 60, 16, rl.Color{200, 60, 60, 255})
++		}
++	}
++}
++
++reject_label :: proc(e: pp.Edit_Error) -> string {
++	#partial switch e {
++	case .Self_Loop: return "can't draw a pipe from a node to itself"
++	case .Terminal_To_Terminal: return "terminals connect via routers only"
++	case .Span_Exceeds_Tier: return "too far for the standard tier"
++	case .Missing_Node: return "no node there"
++	case .Unknown_Tier: return "unknown tier"
++	}
++	return "can't draw there"
++}
++
++draw_text :: proc(app: ^App, txt: string, x, y: i32, size: i32, col: rl.Color) {
++	cbuf := make([dynamic]u8, 0, len(txt)+1, context.temp_allocator)
++	for c in txt {
++		append(&cbuf, u8(c))
++	}
++	append(&cbuf, 0)
++	rl.DrawText(cstring(raw_data(cbuf)), x, y, size, col)
++}
++
++// --- catalog IO + the 1.2 fixture (shared shape with the harness) -----------
++
++load_catalogs :: proc(cat: ^pp.Catalogs) -> string {
++	src: pp.Catalog_Sources
++	nt, e1 := os.read_entire_file_from_path("data/node_types.json", context.temp_allocator)
++	if e1 != nil {
++		return fmt.tprintf("cannot read data/node_types.json: %v", e1)
++	}
++	pt, e2 := os.read_entire_file_from_path("data/pipe_tiers.json", context.temp_allocator)
++	if e2 != nil {
++		return fmt.tprintf("cannot read data/pipe_tiers.json: %v", e2)
++	}
++	bal, e3 := os.read_entire_file_from_path("data/balance.json", context.temp_allocator)
++	if e3 != nil {
++		return fmt.tprintf("cannot read data/balance.json: %v", e3)
++	}
++	src.node_types = nt
++	src.pipe_tiers = pt
++	src.balance = bal
++	cerr := pp.catalogs_load(cat, &src)
++	if cerr.file != "" {
++		return pp.catalog_error_string(cerr)
++	}
++	return ""
++}
++
++seed_fixture :: proc(state: ^pp.Run_State, cat: ^pp.Catalogs) -> (u32, u32, u32) {
++	res_idx, _ := pp.node_type_index(cat, "residential")
++	rt_idx, _ := pp.node_type_index(cat, "router_basic")
++	host_idx, _ := pp.node_type_index(cat, "content_host")
++	r := pp.topology_spawn_node(&state.topology, res_idx, {8, 15}, cat)
++	g := pp.topology_spawn_node(&state.topology, rt_idx, {20, 15}, cat)
++	h := pp.topology_spawn_node(&state.topology, host_idx, {32, 15}, cat)
++	return r, g, h
++}
+diff --git a/app/render/palette.odin b/app/render/palette.odin
+new file mode 100644
+index 0000000..7fe0e40
+--- /dev/null
++++ b/app/render/palette.odin
+@@ -0,0 +1,118 @@
++package render
++
++// palette.odin — the light-canvas canon as DATA (look-book v1 / art-direction
++// v1). All values cosmetic; loaded from data/palette.json (ODN-5 — art tuning
++// is data; the core never reads it). Story 1.2 trims the roster to what the
++// static map + drawn pipes + drag ghost need (no packet/ocean/park colors yet).
++
++import "core:encoding/json"
++import rl "vendor:raylib"
++
++Palette :: struct {
++	canvas:       rl.Color,
++	grid:         rl.Color,
++	ink:          rl.Color,
++	ink_soft:     rl.Color,
++	house_bodies: [4]rl.Color,
++	house_roofs:  [4]rl.Color,
++	host_body:    rl.Color,
++	host_roof:    rl.Color,
++	router_body:  rl.Color,
++	router_dark:  rl.Color,
++	router_led:   rl.Color,
++	pipe_copper:  rl.Color,
++	pipe_steel:   rl.Color,
++	pipe_fiber:   rl.Color,
++	pipe_unalloc: rl.Color,
++	ghost_ok:     rl.Color,
++	ghost_bad:    rl.Color,
++}
++
++DEFAULT_PALETTE_JSON :: #load("../../data/palette.json")
++
++palette_load :: proc(source: []byte = DEFAULT_PALETTE_JSON) -> Palette {
++	p: Palette
++	v, err := json.parse(source, parse_integers = true)
++	if err != nil {
++		return fallback_palette()
++	}
++	obj, okm := v.(json.Object)
++	if !okm {
++		return fallback_palette()
++	}
++	p.canvas = jcol(obj, "canvas", {232, 221, 194, 255})
++	p.grid = jcol(obj, "grid", {194, 182, 148, 255})
++	p.ink = jcol(obj, "ink", {51, 65, 79, 255})
++	p.ink_soft = jcol(obj, "ink_soft", {106, 112, 120, 255})
++	if arr, ok := obj["house_bodies"].(json.Array); ok && len(arr) == 4 {
++		for i in 0..<4 {
++			if q, okq := arr[i].(json.Array); okq { p.house_bodies[i] = jcol_arr(q, {232, 90, 74, 255}) }
++		}
++	} else {
++		p.house_bodies = {{232, 90, 74, 255}, {242, 201, 76, 255}, {94, 203, 107, 255}, {74, 155, 226, 255}}
++	}
++	if arr, ok := obj["house_roofs"].(json.Array); ok && len(arr) == 4 {
++		for i in 0..<4 {
++			if q, okq := arr[i].(json.Array); okq { p.house_roofs[i] = jcol_arr(q, {122, 46, 38, 255}) }
++		}
++	} else {
++		p.house_roofs = {{122, 46, 38, 255}, {122, 84, 24, 255}, {44, 106, 52, 255}, {38, 80, 126, 255}}
++	}
++	p.host_body = jcol(obj, "host_body", {62, 120, 208, 255})
++	p.host_roof = jcol(obj, "host_roof", {38, 76, 142, 255})
++	p.router_body = jcol(obj, "router_body", {94, 110, 128, 255})
++	p.router_dark = jcol(obj, "router_dark", {62, 74, 92, 255})
++	p.router_led = jcol(obj, "router_led", {46, 139, 87, 255})
++	p.pipe_copper = jcol(obj, "pipe_copper", {142, 94, 46, 255})
++	p.pipe_steel = jcol(obj, "pipe_steel", {120, 128, 140, 255})
++	p.pipe_fiber = jcol(obj, "pipe_fiber", {46, 84, 148, 255})
++	p.pipe_unalloc = jcol(obj, "pipe_unalloc", {58, 74, 92, 255})
++	p.ghost_ok = jcol(obj, "ghost_ok", {120, 128, 140, 200})
++	p.ghost_bad = jcol(obj, "ghost_bad", {232, 69, 69, 200})
++	return p
++}
++
++// used when the JSON is somehow unreadable — the look-book hexes, inline.
++fallback_palette :: proc() -> Palette {
++	p: Palette
++	p.canvas = {232, 221, 194, 255}
++	p.grid = {194, 182, 148, 255}
++	p.ink = {51, 65, 79, 255}
++	p.ink_soft = {106, 112, 120, 255}
++	p.house_bodies = {{232, 90, 74, 255}, {242, 201, 76, 255}, {94, 203, 107, 255}, {74, 155, 226, 255}}
++	p.house_roofs = {{122, 46, 38, 255}, {122, 84, 24, 255}, {44, 106, 52, 255}, {38, 80, 126, 255}}
++	p.host_body = {62, 120, 208, 255}
++	p.host_roof = {38, 76, 142, 255}
++	p.router_body = {94, 110, 128, 255}
++	p.router_dark = {62, 74, 92, 255}
++	p.router_led = {46, 139, 87, 255}
++	p.pipe_copper = {142, 94, 46, 255}
++	p.pipe_steel = {120, 128, 140, 255}
++	p.pipe_fiber = {46, 84, 148, 255}
++	p.pipe_unalloc = {58, 74, 92, 255}
++	p.ghost_ok = {120, 128, 140, 200}
++	p.ghost_bad = {232, 69, 69, 200}
++	return p
++}
++
++jcol :: proc(o: json.Object, key: string, def: rl.Color) -> rl.Color {
++	if arr, ok := o[key].(json.Array); ok {
++		return jcol_arr(arr, def)
++	}
++	return def
++}
++
++jcol_arr :: proc(arr: json.Array, def: rl.Color) -> rl.Color {
++	if len(arr) != 4 {
++		return def
++	}
++	c: rl.Color
++	for i in 0..<4 {
++		n, ok := arr[i].(json.Integer)
++		if !ok {
++			return def
++		}
++		c[i] = u8(n)
++	}
++	return c
++}
+diff --git a/app/render/view.odin b/app/render/view.odin
+new file mode 100644
+index 0000000..1837d66
+--- /dev/null
++++ b/app/render/view.odin
+@@ -0,0 +1,260 @@
++package render
++
++// view.odin — the View layer (architecture §9.1): camera-fit + the light-canvas
++// world pass. Reads ONLY the topology (ODN-1: the view never perturbs sim
++// state). All draw math is basic IEEE float (the §10.4 render-determinism rule
++// — no transcendentals anywhere in the rasterized path; the LED ring uses a
++// pinned 16-point table).
++//
++// Story 1.2 scope: a STATIC map (cream canvas + snap lattice — no procedural
++// land/ocean yet), straight thick-line pipes (bezier curves are a later juice
++// step), buildings + the capacity-scaled router puck, and the drag ghost. No
++// packets / health rings / QoS markers (those land with flow, 1.3+).
++
++import pp "../../core"
++import rl "vendor:raylib"
++
++View :: struct {
++	palette:  ^Palette,
++	catalogs: ^pp.Catalogs,
++	win_w:    i32,
++	win_h:    i32,
++	scale:    f32,
++	off_x:    f32,
++	off_y:    f32,
++	tile_px:  f32,
++	world_w:  f32,
++	world_h:  f32,
++}
++
++// Drag_State — the live drag preview state, owned by the app. The view only
++// reads it (ODN-1). `valid` drives the ghost color; `cost` is drawn near the
++// cursor (length × tier — the draw verb's cost, M1).
++Drag_State :: struct {
++	active:    bool,
++	from_node: u32, // the node id the drag started on
++	wx, wy:    f32, // current cursor in world px
++	valid:     pp.Edit_Error,
++	cost:      i32,
++}
++
++// view_compute — camera-fit the world (map_w×map_h tiles) into the window like
++// GL5.2's aspect=expand: wider/taller windows reveal more map. Pure float div.
++view_compute :: proc(v: ^View, win_w, win_h: i32, bal: ^pp.Balance) {
++	v.win_w = win_w
++	v.win_h = win_h
++	v.tile_px = f32(bal.tile_px)
++	v.world_w = f32(bal.map_w_tiles) * v.tile_px
++	v.world_h = f32(bal.map_h_tiles) * v.tile_px
++	sx := f32(win_w) / v.world_w
++	sy := f32(win_h) / v.world_h
++	v.scale = min(sx, sy)
++	v.off_x = (f32(win_w) - v.world_w * v.scale) / 2
++	v.off_y = (f32(win_h) - v.world_h * v.scale) / 2
++}
++
++to_screen :: proc(v: ^View, wx, wy: f32) -> rl.Vector2 {
++	return {v.off_x + wx * v.scale, v.off_y + wy * v.scale}
++}
++
++from_screen :: proc(v: ^View, sx, sy: f32) -> (f32, f32) {
++	if v.scale <= 0 {
++		return 0, 0
++	} // minimized-window guard
++	return (sx - v.off_x) / v.scale, (sy - v.off_y) / v.scale
++}
++
++node_screen :: proc(v: ^View, pos: [2]i32) -> rl.Vector2 {
++	return to_screen(v, f32(pos[0]) * v.tile_px, f32(pos[1]) * v.tile_px)
++}
++
++// --- the world pass ----------------------------------------------------------
++
++draw_world :: proc(v: ^View, topo: ^pp.Topology, drag: Drag_State) {
++	map_draw(v)
++	draw_pipes(v, topo)
++	draw_nodes(v, topo)
++	if drag.active {
++		draw_ghost(v, topo, drag)
++	}
++}
++
++// map_draw — the static 1.2 map: cream canvas + a faint snap lattice. No
++// procedural geography (that's a later art step); the fixture nodes + drawn
++// pipes are the map content.
++map_draw :: proc(v: ^View) {
++	p := v.palette
++	rl.DrawRectangle(0, 0, v.win_w, v.win_h, p.canvas)
++	// the snap lattice, blended toward the canvas so it stays subtle
++	g, c := p.grid, p.canvas
++	grid_soft := rl.Color{
++		u8((u16(g.r)*45 + u16(c.r)*55) / 100),
++		u8((u16(g.g)*45 + u16(c.g)*55) / 100),
++		u8((u16(g.b)*45 + u16(c.b)*55) / 100), 255}
++	tile := v.tile_px * v.scale
++	x := v.off_x
++	for x < f32(v.win_w) {
++		rl.DrawLine(i32(x), 0, i32(x), v.win_h, grid_soft)
++		x += tile
++	}
++	y := v.off_y
++	for y < f32(v.win_h) {
++		rl.DrawLine(0, i32(y), v.win_w, i32(y), grid_soft)
++		y += tile
++	}
++}
++
++draw_pipes :: proc(v: ^View, topo: ^pp.Topology) {
++	for i in 0..<len(topo.pipe_alive) {
++		if !topo.pipe_alive[i] {
++			continue
++		}
++		sa, oka := pp.node_slot(topo, topo.pipe_a[i])
++		sb, okb := pp.node_slot(topo, topo.pipe_b[i])
++		if !oka || !okb {
++			continue
++		}
++		a := node_screen(v, topo.node_pos[sa])
++		b := node_screen(v, topo.node_pos[sb])
++		col := tier_pipe_color(v, topo.pipe_tier[i])
++		width := tier_pipe_width(v, topo.pipe_tier[i]) * v.scale
++		rl.DrawLineEx(a, b, width, col)
++		// rounded caps (a clean look + hides the square line ends)
++		rl.DrawCircleV(a, width * 0.5, col)
++		rl.DrawCircleV(b, width * 0.5, col)
++		// the glowing inner core on fiber (the modernization read, A4)
++		if v.catalogs.pipe_tiers[topo.pipe_tier[i]].id == "wide" {
++			rl.DrawLineEx(a, b, width * 0.45, v.palette.pipe_fiber)
++		}
++	}
++}
++
++draw_nodes :: proc(v: ^View, topo: ^pp.Topology) {
++	for i in 0..<len(topo.node_alive) {
++		if !topo.node_alive[i] {
++			continue
++		}
++		c := node_screen(v, topo.node_pos[i])
++		if topo.node_kind[i] == .Junction {
++			draw_router(v, topo.node_id[i], c)
++		} else {
++			draw_building(v, topo.node_id[i], topo.node_role[i], c)
++		}
++	}
++}
++
++// residential = peaked-roof house (varied cheerful body); content_host = server
++// block with a play glyph (YouTune). Variant keyed by id so it's stable.
++draw_building :: proc(v: ^View, id: u32, role: pp.Terminal_Role, c: rl.Vector2) {
++	p := v.palette
++	s := v.tile_px * v.scale
++	if role == .Content_Host {
++		w := s * 1.15
++		h := s * 0.95
++		rl.DrawRectangleV({c.x - w/2, c.y - h/2 + s*0.12}, {w, h - s*0.12}, p.host_body)
++		rl.DrawRectangleV({c.x - w/2, c.y - h/2}, {w, s * 0.28}, p.host_roof)
++		// play triangle (the YouTune brand glyph)
++		g := s * 0.22
++		v1 := rl.Vector2{c.x - g * 0.6, c.y - g * 0.8}
++		v2 := rl.Vector2{c.x - g * 0.6, c.y + g * 0.8}
++		v3 := rl.Vector2{c.x + g, c.y}
++		rl.DrawTriangle(v3, v2, v1, {250, 246, 238, 255})
++		return
++	}
++	// residential: peaked-roof house
++	variant := int(id) % 4
++	body := p.house_bodies[variant]
++	roof := p.house_roofs[variant]
++	w := s * 0.92
++	h := s * 0.62
++	left := c.x - w/2
++	top := c.y - h * 0.15
++	rl.DrawRectangleV({left, top}, {w, h}, body)
++	r1 := rl.Vector2{left - s * 0.06, top}
++	r2 := rl.Vector2{left + w + s * 0.06, top}
++	r3 := rl.Vector2{c.x, top - s * 0.42}
++	rl.DrawTriangle(r1, r3, r2, roof)
++	// door
++	dw := s * 0.16
++	rl.DrawRectangleV({c.x - dw/2, top + h - s * 0.3}, {dw, s * 0.3}, roof)
++}
++
++// draw_router — the capacity-scaled puck (A3): body disc + dark core + a 4-LED
++// ring (the basic router's ports — canon #14 made visible). LEDs sit on a
++// pinned 16-gon (4 ports divide 16); no transcendentals in the geometry.
++draw_router :: proc(v: ^View, id: u32, c: rl.Vector2) {
++	_ = id
++	p := v.palette
++	base := v.tile_px * v.scale * 0.5
++	r := base * 0.9
++	rl.DrawCircleV(c, r, p.router_body)
++	rl.DrawCircleV(c, r * 0.45, p.router_dark)
++	leds := 4 // basic router: 4 ports
++	stride := 16 / leds
++	circle := CIRCLE16 // local copy — a constant can't be indexed by a runtime index
++	for i in 0..<leds {
++		k := (i*stride + 12) % 16 // start at the top
++		pos := rl.Vector2{
++			c.x + circle[k][0] * r * 0.78,
++			c.y + circle[k][1] * r * 0.78,
++		}
++		rl.DrawCircleV(pos, max(1.5, r*0.11), p.router_led)
++	}
++}
++
++// draw_ghost — the drag preview: a line from the source node to the cursor,
++// green when the in-progress draw would validate, red when it would reject.
++draw_ghost :: proc(v: ^View, topo: ^pp.Topology, drag: Drag_State) {
++	p := v.palette
++	from_pos, ok := pp.node_slot(topo, drag.from_node)
++	if !ok {
++		return
++	}
++	a := node_screen(v, topo.node_pos[from_pos])
++	b := to_screen(v, drag.wx, drag.wy)
++	col := p.ghost_ok
++	if drag.valid != .None {
++		col = p.ghost_bad
++	}
++	rl.DrawLineEx(a, b, 5*v.scale, col)
++	rl.DrawCircleV(b, 4*v.scale, col)
++}
++
++tier_pipe_color :: proc(v: ^View, tier: u16) -> rl.Color {
++	switch v.catalogs.pipe_tiers[tier].id {
++	case "narrow": return v.palette.pipe_copper
++	case "standard": return v.palette.pipe_steel
++	case "wide": return v.palette.pipe_fiber
++	}
++	return v.palette.pipe_unalloc
++}
++
++tier_pipe_width :: proc(v: ^View, tier: u16) -> f32 {
++	switch v.catalogs.pipe_tiers[tier].id {
++	case "narrow": return 3.5
++	case "standard": return 5.5
++	case "wide": return 8.5
++	}
++	return 4.5
++}
++
++// unit circle, 16 points (k * 22.5 deg), correctly-rounded decimal constants —
++// identical on every platform (no libm cos/sin anywhere in the render path).
++CIRCLE16 :: [16][2]f32{
++	{1.00000000, 0.00000000},
++	{0.92387954, 0.38268343},
++	{0.70710678, 0.70710678},
++	{0.38268343, 0.92387954},
++	{0.00000000, 1.00000000},
++	{-0.38268343, 0.92387954},
++	{-0.70710678, 0.70710678},
++	{-0.92387954, 0.38268343},
++	{-1.00000000, 0.00000000},
++	{-0.92387954, -0.38268343},
++	{-0.70710678, -0.70710678},
++	{-0.38268343, -0.92387954},
++	{0.00000000, -1.00000000},
++	{0.38268343, -0.92387954},
++	{0.70710678, -0.70710678},
++	{0.92387954, -0.38268343},
++}
+diff --git a/core/catalog.odin b/core/catalog.odin
+new file mode 100644
+index 0000000..326360f
+--- /dev/null
++++ b/core/catalog.odin
+@@ -0,0 +1,246 @@
++package core
++
++// catalog.odin — data-driven content catalogs (ODN-5). JSON single source,
++// loaded once, fail-fast validated (unknown fields, out-of-range values,
++// missing required content abort with a named error), read-only after load.
++// Sim-relevant values are integers only. The core parses from BYTES — the
++// app/harness own file IO (#load-embedded or disk in dev), so the core never
++// touches core:os (ODN-1).
++//
++// Story 1.2 carries a MINIMAL roster: node_types (residential / content_host /
++// router_basic), pipe_tiers (narrow / standard / wide), balance (logic_hz +
++// snap_radius + map dims). packet_types / demand / crises / QoS land with the
++// flow slice (1.3+); the palette is cosmetic and lives in the render layer.
++
++import "core:encoding/json"
++import "core:fmt"
++
++// --- enums shared across the core --------------------------------------------
++
++Node_Kind :: enum u8 { Terminal, Junction }
++
++Terminal_Role :: enum u8 { None, Residential, Content_Host }
++
++// --- catalog row types -------------------------------------------------------
++
++Node_Type :: struct {
++	id:               string,
++	display:          string,
++	kind:             Node_Kind,
++	terminal_role:    Terminal_Role,
++	throughput_units: i32,
++	port_capacity:    i32, // 0 = unlimited (terminals); 4/8/16 for router tiers
++	era_introduced:   i32,
++}
++
++Pipe_Tier :: struct {
++	id:             string,
++	display:        string,
++	capacity_units: i32,
++	clean_span:     i32,
++	max_span:       i32,   // the hard span cap, enforced at edit (E3 family)
++	cost_per_tile:  i32,   // draw cost factor: cost = span × cost_per_tile
++	era_introduced: i32,
++}
++
++Balance :: struct {
++	logic_hz:    i32,
++	max_ticks:   i32,
++	snap_radius: i32, // inclusive node-snap radius in world px (E4)
++	map_w_tiles: i32,
++	map_h_tiles: i32,
++	tile_px:     i32,
++}
++
++Catalogs :: struct {
++	node_types: [dynamic]Node_Type,
++	pipe_tiers: [dynamic]Pipe_Tier,
++	balance:    Balance,
++	hash:       u64, // FNV-1a-64 over the sim-relevant source bytes (fixed order)
++}
++
++// The bytes the app/harness hand the core (it never opens files). Order is
++// fixed so catalog_hash is stable.
++Catalog_Sources :: struct {
++	node_types: []byte,
++	pipe_tiers: []byte,
++	balance:    []byte,
++}
++
++Catalog_Error :: struct {
++	file:  string,
++	field: string,
++	rule:  string,
++}
++
++catalog_error_string :: proc(err: Catalog_Error, allocator := context.allocator) -> string {
++	return fmt.aprintf("catalog %s: field %s — %s", err.file, err.field, err.rule, allocator = allocator)
++}
++
++// catalogs_load — parse + validate the sim-relevant catalogs from bytes into
++// the CALLER-OWNED cat (stack or field; no pointer allocation → no leak). On
++// any violation returns a named error; the caller surfaces it and aborts
++// (§7.1, never silent). On success cat.node_types / cat.pipe_tiers are made
++// with the context allocator; free them with catalogs_destroy.
++catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := context.allocator) -> Catalog_Error {
++	context.allocator = allocator
++	cat.hash = catalogs_hash_sources(src)
++
++	// node_types
++	{
++		v, e := json.parse(src.node_types, parse_integers = true)
++		if e != nil { return {"node_types.json", "$", "invalid JSON"} }
++		obj, ok := v.(json.Object)
++		if !ok { return {"node_types.json", "$", "root must be an object"} }
++		entries, oke := obj["entries"].(json.Array)
++		if !oke { return {"node_types.json", "entries", "missing array"} }
++		cat.node_types = make([dynamic]Node_Type, 0, 8, allocator)
++		for ev in entries {
++			eo := ev.(json.Object) or_continue
++			nt: Node_Type
++			nt.id = jstr(eo, "id")
++			nt.display = jstr(eo, "display_name")
++			switch jstr(eo, "kind") {
++			case "terminal": nt.kind = .Terminal
++			case "junction": nt.kind = .Junction
++			case: return {"node_types.json", nt.id, "kind must be terminal|junction"}
++			}
++			nt.terminal_role = role_from_name(jstr(eo, "terminal_role"))
++			nt.throughput_units = jint(eo, "throughput_units", 0)
++			nt.port_capacity = jint(eo, "port_capacity", 0)
++			nt.era_introduced = jint(eo, "era_introduced", 1)
++			if nt.id == "" { return {"node_types.json", "id", "empty id"} }
++			if nt.kind == .Terminal && nt.terminal_role == .None {
++				return {"node_types.json", nt.id, "terminal without a role"}
++			}
++			append(&cat.node_types, nt)
++		}
++		if len(cat.node_types) == 0 { return {"node_types.json", "entries", "empty"} }
++	}
++
++	// pipe_tiers
++	{
++		v, e := json.parse(src.pipe_tiers, parse_integers = true)
++		if e != nil { return {"pipe_tiers.json", "$", "invalid JSON"} }
++		obj, ok := v.(json.Object)
++		if !ok { return {"pipe_tiers.json", "$", "root must be an object"} }
++		entries, oke := obj["entries"].(json.Array)
++		if !oke { return {"pipe_tiers.json", "entries", "missing array"} }
++		cat.pipe_tiers = make([dynamic]Pipe_Tier, 0, 8, allocator)
++		for ev in entries {
++			eo := ev.(json.Object) or_continue
++			t: Pipe_Tier
++			t.id = jstr(eo, "id")
++			t.display = jstr(eo, "display_name")
++			t.capacity_units = jint(eo, "capacity_units", 0)
++			t.clean_span = jint(eo, "clean_span", 0)
++			t.max_span = jint(eo, "max_span", 0)
++			t.cost_per_tile = jint(eo, "cost_per_tile", 0)
++			t.era_introduced = jint(eo, "era_introduced", 1)
++			if t.id == "" || t.capacity_units <= 0 || t.max_span <= 0 || t.cost_per_tile < 0 {
++				return {"pipe_tiers.json", t.id, "id/capacity/max_span/cost invalid"}
++			}
++			append(&cat.pipe_tiers, t)
++		}
++		if len(cat.pipe_tiers) == 0 { return {"pipe_tiers.json", "entries", "empty"} }
++	}
++
++	// balance
++	{
++		v, e := json.parse(src.balance, parse_integers = true)
++		if e != nil { return {"balance.json", "$", "invalid JSON"} }
++		obj, ok := v.(json.Object)
++		if !ok { return {"balance.json", "$", "root must be an object"} }
++		b: Balance
++		b.logic_hz = jint(obj, "logic_hz", 0)
++		if b.logic_hz <= 0 || b.logic_hz > 1000 {
++			return {"balance.json", "logic_hz", "must be in 1..1000 (single source of tick timing)"}
++		}
++		b.max_ticks = jint(obj, "max_ticks", 100000)
++		b.snap_radius = jint(obj, "snap_radius", 36)
++		if b.snap_radius <= 0 {
++			return {"balance.json", "snap_radius", "must be > 0"}
++		}
++		if mp, okm := obj["map"].(json.Object); okm {
++			b.map_w_tiles = jint(mp, "w_tiles", 0)
++			b.map_h_tiles = jint(mp, "h_tiles", 0)
++			b.tile_px = jint(mp, "tile_px", 0)
++		}
++		if b.map_w_tiles <= 0 || b.map_h_tiles <= 0 || b.tile_px <= 0 {
++			return {"balance.json", "map", "map w_tiles/h_tiles/tile_px must be > 0"}
++		}
++		cat.balance = b
++	}
++
++	// PROTO required content (fail-fast cross-checks)
++	if _, ok := node_type_index(cat, "residential"); !ok {
++		return {"node_types.json", "residential", "1.2 requires the residential type"}
++	}
++	if _, ok := node_type_index(cat, "router_basic"); !ok {
++		return {"node_types.json", "router_basic", "1.2 requires the router_basic type"}
++	}
++	return {}
++}
++
++// catalogs_destroy — free the catalog's owned dynamic arrays (the Catalogs
++// itself is caller-owned — stack or field — so no pointer free here).
++catalogs_destroy :: proc(cat: ^Catalogs) {
++	delete(cat.node_types)
++	delete(cat.pipe_tiers)
++}
++
++// FNV-1a-64 over the sim-relevant catalog bytes in fixed order (hash.odin).
++// palette is cosmetic and deliberately NOT hashed — it must not bind replay.
++catalogs_hash_sources :: proc(src: ^Catalog_Sources) -> u64 {
++	h := FNV64_OFFSET
++	fold := proc(h: ^u64, bytes: []u8) {
++		for b in bytes {
++			h^ = (h^ ~ u64(b)) * FNV64_PRIME // FNV-1a: xor then multiply
++		}
++	}
++	fold(&h, src.node_types)
++	fold(&h, src.pipe_tiers)
++	fold(&h, src.balance)
++	return h
++}
++
++// --- lookups (linear; core is map-free — ODN-10) ----------------------------
++
++node_type_index :: proc(cat: ^Catalogs, id: string) -> (u16, bool) {
++	for nt, i in cat.node_types {
++		if nt.id == id { return u16(i), true }
++	}
++	return 0, false
++}
++
++pipe_tier_index :: proc(cat: ^Catalogs, id: string) -> (u16, bool) {
++	for t, i in cat.pipe_tiers {
++		if t.id == id { return u16(i), true }
++	}
++	return 0, false
++}
++
++role_from_name :: proc(name: string) -> Terminal_Role {
++	switch name {
++	case "residential":  return .Residential
++	case "content_host": return .Content_Host
++	}
++	return .None
++}
++
++// --- tiny JSON accessors (parse_integers = true => numbers are json.Integer) --
++
++jstr :: proc(o: json.Object, key: string) -> string {
++	if v, ok := o[key].(json.String); ok { return v }
++	return ""
++}
++
++jint :: proc(o: json.Object, key: string, def: i32) -> i32 {
++	if v, ok := o[key]; ok {
++		#partial switch x in v {
++		case json.Integer: return i32(x)
++		case json.Float:   return i32(x)
++		}
++	}
++	return def
++}
+diff --git a/core/determinism_test.odin b/core/determinism_test.odin
+index 1be24c3..cb05566 100644
+--- a/core/determinism_test.odin
++++ b/core/determinism_test.odin
+@@ -10,27 +10,55 @@ package core
+ //   (d) FNV-1a-64 (the T1 + catalog hash primitive) matches the conformance
+ //       basis — the spine's hashes are the canonical algorithm, not a typo.
+ //
+-// The spine has no topology yet (story 1.2); step is a heartbeat + command
+-// recorder, so the keystone exercises the rng + the applied-command record +
+-// the canonical serializer + the binary log end to end — the same plumbing
+-// real sim state will ride once Topology lands.
++// Story 1.2: the placeholder Cmd_Set_Arg is replaced by the real Cmd_Draw_Pipe
++// mutating the real Topology — so the keystone now exercises the rng + the
++// drawn topology + the canonical serializer + the binary log end to end. A
++// drawn pipe changes the hash; replay reproduces it byte-identically.
+ 
+ import "core:testing"
+ 
+-// A stable catalog_hash for the test runs (the spine doesn't load real
+-// catalogs from disk — core is pure, ODN-1; the harness resolves it). The
+-// value just has to be consistent within a run so the log/replay binding is
+-// exercised identically. A literal avoids a context-requiring proc call at
+-// global scope (fnv1a64 is exercised by state_hash + test_fnv1a64_conformance).
+-TEST_CATALOG_HASH :: u64(0x0123456789ABCDEF)
+ TEST_LOGIC_HZ :: i32(20)
+ 
++// A minimal self-contained catalog (mirrors data/*.json values) so the unit
++// tests don't touch the filesystem — core is pure (ODN-1). The hash just has
++// to be consistent within a run so the log/replay binding is exercised.
++TEST_CATALOG_HASH :: u64(0x0123456789ABCDEF)
++
++// test_catalog fills the CALLER-OWNED cat (stack storage — no pointer leak) and
++// returns the same pointer for convenience. Free the arrays with
++// catalogs_destroy.
++test_catalog :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalogs {
++	cat.hash = TEST_CATALOG_HASH
++	cat.node_types = make([dynamic]Node_Type, 0, 8, allocator)
++	append(&cat.node_types, Node_Type{id = "residential", display = "Residential", kind = .Terminal, terminal_role = .Residential, throughput_units = 5, port_capacity = 0, era_introduced = 1})
++	append(&cat.node_types, Node_Type{id = "content_host", display = "Content Host", kind = .Terminal, terminal_role = .Content_Host, throughput_units = 80, port_capacity = 0, era_introduced = 3})
++	append(&cat.node_types, Node_Type{id = "router_basic", display = "Basic Router", kind = .Junction, terminal_role = .None, throughput_units = 40, port_capacity = 4, era_introduced = 1})
++	cat.pipe_tiers = make([dynamic]Pipe_Tier, 0, 8, allocator)
++	append(&cat.pipe_tiers, Pipe_Tier{id = "narrow", display = "Narrow Copper", capacity_units = 5, clean_span = 8, max_span = 10, cost_per_tile = 5, era_introduced = 1})
++	append(&cat.pipe_tiers, Pipe_Tier{id = "standard", display = "Standard Line", capacity_units = 15, clean_span = 10, max_span = 14, cost_per_tile = 12, era_introduced = 1})
++	append(&cat.pipe_tiers, Pipe_Tier{id = "wide", display = "Wide Fiber", capacity_units = 40, clean_span = 14, max_span = 18, cost_per_tile = 30, era_introduced = 3})
++	cat.balance = Balance{logic_hz = TEST_LOGIC_HZ, max_ticks = 100000, snap_radius = 36, map_w_tiles = 40, map_h_tiles = 30, tile_px = 26}
++	return cat
++}
++
++// Seed the static 1.2 fixture: residential(0) ← router(1) → content_host(2),
++// all on row y=15, 12 tiles apart (standard span 12 ≤ max 14 — legal draws).
++// Returns the three node ids in spawn order.
++test_seed_fixture :: proc(state: ^Run_State, cat: ^Catalogs) -> (u32, u32, u32) {
++	res_idx, _ := node_type_index(cat, "residential")
++	rt_idx, _ := node_type_index(cat, "router_basic")
++	host_idx, _ := node_type_index(cat, "content_host")
++	r := topology_spawn_node(&state.topology, res_idx, {8, 15}, cat)
++	g := topology_spawn_node(&state.topology, rt_idx, {20, 15}, cat)
++	h := topology_spawn_node(&state.topology, host_idx, {32, 15}, cat)
++	return r, g, h
++}
++
+ // Step a run from tick 1..ticks, feeding step the commands whose apply_tick
+ // == tick (the pinned replay convention: apply all log entries for tick N
+ // BEFORE stepping N — §11.1). Records the per-tick state hash. The same proc
+-// serves live + replay (the spine has no edit fast-path yet; story 1.2 adds
+-// the bus). Drains the tick's events into the hash (ODN-14).
+-record_run :: proc(state: ^Run_State, ticks: u64, allocator := context.allocator) -> [dynamic]u64 {
++// serves live + replay. Drains the tick's events into the hash (ODN-14).
++record_run :: proc(state: ^Run_State, ticks: u64, cat: ^Catalogs, allocator := context.allocator) -> [dynamic]u64 {
+ 	hashes := make([dynamic]u64, 0, ticks, allocator)
+ 	for tick in u64(1)..=ticks {
+ 		before := len(state.events)
+@@ -40,7 +68,7 @@ record_run :: proc(state: ^Run_State, ticks: u64, allocator := context.allocator
+ 				append(&batch, cmd)
+ 			}
+ 		}
+-		step(state, tick, batch[:])
++		step(state, tick, batch[:], cat)
+ 		h := state_hash(state, state.events[before:], context.temp_allocator)
+ 		append(&hashes, h)
+ 		clear(&state.events)
+@@ -62,7 +90,7 @@ clone_log :: proc(src: [dynamic]Command, allocator := context.allocator) -> [dyn
+ @(test)
+ test_fnv1a64_conformance :: proc(t: ^testing.T) {
+ 	// empty input = the FNV-1a-64 offset basis (the canonical conformance value)
+-	testing.expect_value(t, fnv1a64([]u8{}), FNV64_OFFSET) // empty input == the offset basis
++	testing.expect_value(t, fnv1a64([]u8{}), FNV64_OFFSET)
+ 	// deterministic + nonzero
+ 	testing.expect(t, fnv1a64([]u8{'p', 'p'}) == fnv1a64([]u8{'p', 'p'}), "fnv1a64 must be deterministic")
+ 	testing.expect(t, fnv1a64([]u8{'p', 'p'}) != 0, "fnv1a64(pp) must be nonzero")
+@@ -72,38 +100,44 @@ test_fnv1a64_conformance :: proc(t: ^testing.T) {
+ 
+ @(test)
+ test_replay_byte_identical :: proc(t: ^testing.T) {
+-	live: Run_State
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
+ 	defer {
+-		run_destroy(&live)
++		catalogs_destroy(cat)
+ 	}
+-	run_init(&live, 42, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
+ 
+-	// inject a command-built action log (simulating the Command_Bus, story 1.2)
+-	append(&live.action_log, Command{apply_tick = 1, kind = Cmd_Set_Arg{arg = 7}})
+-	append(&live.action_log, Command{apply_tick = 50, kind = Cmd_Set_Arg{arg = 99}})
+-	append(&live.action_log, Command{apply_tick = 200, kind = Cmd_Set_Arg{arg = 3}})
++	live: Run_State
++	defer run_destroy(&live)
++	run_init(&live, 42, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&live, cat)
++
++	// inject a command-built action log (simulating the Command_Bus)
++	std, _ := pipe_tier_index(cat, "standard")
++	append(&live.action_log, Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = res, b = rt, tier = std}})
++	append(&live.action_log, Command{apply_tick = 50, kind = Cmd_Draw_Pipe{a = rt, b = host, tier = std}})
+ 
+-	live_hashes := record_run(&live, 300)
++	live_hashes := record_run(&live, 300, cat)
+ 	defer delete(live_hashes)
+ 
+ 	// sanity: the keystone must be command-built + the rng heartbeat must
+ 	// actually advance state (a vacuous keystone would pass while broken)
+-	testing.expectf(t, len(live.applied) == 3, "keystone must apply 3 commands, applied %d", len(live.applied))
++	testing.expectf(t, pipe_count(&live.topology) == 2, "keystone must draw 2 pipes, got %d", pipe_count(&live.topology))
+ 	testing.expectf(t, len(live_hashes) == 300, "expected 300 hashes, got %d", len(live_hashes))
+ 	testing.expect(t, live_hashes[0] != live_hashes[1], "per-tick hashes must vary (rng heartbeat)")
++	testing.expect(t, !live.replay_error, "live run must not latch replay_error")
+ 
+ 	// replay: fresh run, same seed, the SAME action-log artifact (ODN-11)
+ 	replayed: Run_State
+-	defer {
+-		run_destroy(&replayed)
+-	}
+-	run_init(&replayed, 42, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
+-	delete(replayed.action_log) // run_init's empty log — replaced by the clone
++	defer run_destroy(&replayed)
++	run_init(&replayed, 42, cat.hash, TEST_LOGIC_HZ)
++	test_seed_fixture(&replayed, cat) // identical fixture (run setup, like the seed)
++	delete(replayed.action_log)       // run_init's empty log — replaced by the clone
+ 	replayed.action_log = clone_log(live.action_log)
+-	replay_hashes := record_run(&replayed, 300)
++	replay_hashes := record_run(&replayed, 300, cat)
+ 	defer delete(replay_hashes)
+ 
+ 	testing.expect(t, !replayed.replay_error, "replay must not latch replay_error (ODN-11 critical)")
++	testing.expectf(t, pipe_count(&replayed.topology) == 2, "replay must reproduce 2 pipes, got %d", pipe_count(&replayed.topology))
+ 	testing.expectf(t, len(live_hashes) == len(replay_hashes),
+ 		"tick count mismatch: live %d vs replay %d", len(live_hashes), len(replay_hashes))
+ 	diverged := false
+@@ -117,71 +151,69 @@ test_replay_byte_identical :: proc(t: ^testing.T) {
+ 
+ @(test)
+ test_seed_reproduces_and_diverges :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
+ 	a: Run_State
+-	defer {
+-		run_destroy(&a)
+-	}
+-	run_init(&a, 99, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
+-	ha := record_run(&a, 300)
++	defer run_destroy(&a)
++	run_init(&a, 99, cat.hash, TEST_LOGIC_HZ)
++	test_seed_fixture(&a, cat)
++	ha := record_run(&a, 300, cat)
+ 	defer delete(ha)
+ 
+ 	b: Run_State
+-	defer {
+-		run_destroy(&b)
+-	}
+-	run_init(&b, 99, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
+-	hb := record_run(&b, 300)
++	defer run_destroy(&b)
++	run_init(&b, 99, cat.hash, TEST_LOGIC_HZ)
++	test_seed_fixture(&b, cat)
++	hb := record_run(&b, 300, cat)
+ 	defer delete(hb)
+ 	same := true
+ 	for i in 0..<len(ha) {
+-		if ha[i] != hb[i] {
+-			same = false
+-		}
++		if ha[i] != hb[i] { same = false }
+ 	}
+ 	testing.expect(t, same, "same seed must reproduce the hash sequence")
+ 
+ 	// a different seed must NOT reproduce the same sequence
+ 	c: Run_State
+-	defer {
+-		run_destroy(&c)
+-	}
+-	run_init(&c, 100, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
+-	hc := record_run(&c, 300)
++	defer run_destroy(&c)
++	run_init(&c, 100, cat.hash, TEST_LOGIC_HZ)
++	test_seed_fixture(&c, cat)
++	hc := record_run(&c, 300, cat)
+ 	defer delete(hc)
+ 	diff_seed := true
+ 	for i in 0..<len(ha) {
+-		if ha[i] == hc[i] {
+-			diff_seed = false
+-		}
++		if ha[i] == hc[i] { diff_seed = false }
+ 	}
+ 	testing.expect(t, diff_seed, "different seeds must diverge")
+ 
+ 	// a different catalog_hash must diverge (the replay gate's binding is real)
+ 	d: Run_State
+-	defer {
+-		run_destroy(&d)
+-	}
+-	run_init(&d, 99, TEST_CATALOG_HASH + 1, TEST_LOGIC_HZ)
+-	hd := record_run(&d, 300)
++	defer run_destroy(&d)
++	run_init(&d, 99, cat.hash + 1, TEST_LOGIC_HZ)
++	test_seed_fixture(&d, cat)
++	hd := record_run(&d, 300, cat)
+ 	defer delete(hd)
+ 	diff_cat := true
+ 	for i in 0..<len(ha) {
+-		if ha[i] == hd[i] {
+-			diff_cat = false
+-		}
++		if ha[i] == hd[i] { diff_cat = false }
+ 	}
+ 	testing.expect(t, diff_cat, "different catalog_hash must diverge")
+ }
+ 
+ @(test)
+ test_action_log_binary_roundtrip :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
+ 	state: Run_State
+-	defer {
+-		run_destroy(&state)
+-	}
+-	run_init(&state, 42, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
+-	append(&state.action_log, Command{apply_tick = 1, kind = Cmd_Set_Arg{arg = 7}})
+-	append(&state.action_log, Command{apply_tick = 50, kind = Cmd_Set_Arg{arg = 99}})
++	defer run_destroy(&state)
++	run_init(&state, 42, cat.hash, TEST_LOGIC_HZ)
++	res, rt, _ := test_seed_fixture(&state, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	append(&state.action_log, Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = res, b = rt, tier = std}})
++	append(&state.action_log, Command{apply_tick = 50, kind = Cmd_Draw_Pipe{a = res, b = rt, tier = std}})
+ 
+ 	bytes := log_write(&state, context.temp_allocator)
+ 
+@@ -189,16 +221,17 @@ test_action_log_binary_roundtrip :: proc(t: ^testing.T) {
+ 	header, cmds, ok := log_read(bytes, context.temp_allocator)
+ 	testing.expect(t, ok, "round-trip must parse")
+ 	testing.expectf(t, header.seed == 42, "header seed: got %d, want 42", header.seed)
+-	testing.expect(t, header.catalog_hash == TEST_CATALOG_HASH, "header catalog_hash mismatch")
++	testing.expect(t, header.catalog_hash == cat.hash, "header catalog_hash mismatch")
+ 	testing.expect(t, header.logic_hz == TEST_LOGIC_HZ, "header logic_hz mismatch")
+ 	testing.expectf(t, len(cmds) == len(state.action_log),
+ 		"command count: got %d, want %d", len(cmds), len(state.action_log))
+ 	for i in 0..<len(cmds) {
+ 		testing.expectf(t, cmds[i].apply_tick == state.action_log[i].apply_tick,
+ 			"cmd %d apply_tick mismatch", i)
+-		ca := cmds[i].kind.(Cmd_Set_Arg)
+-		cb := state.action_log[i].kind.(Cmd_Set_Arg)
+-		testing.expectf(t, ca.arg == cb.arg, "cmd %d arg mismatch: %d != %d", i, ca.arg, cb.arg)
++		ca := cmds[i].kind.(Cmd_Draw_Pipe)
++		cb := state.action_log[i].kind.(Cmd_Draw_Pipe)
++		testing.expectf(t, ca.a == cb.a && ca.b == cb.b && ca.tier == cb.tier,
++			"cmd %d payload mismatch: {%d,%d,%d} vs {%d,%d,%d}", i, ca.a, ca.b, ca.tier, cb.a, cb.b, cb.tier)
+ 	}
+ 
+ 	// defined rejections — never a silent partial parse or a crash (ODN-11)
+@@ -211,11 +244,19 @@ test_action_log_binary_roundtrip :: proc(t: ^testing.T) {
+ 	testing.expect(t, !bad, "garbage must reject")
+ 	_, _, partial_magic := log_read(bytes[:4], context.temp_allocator)
+ 	testing.expect(t, !partial_magic, "partial magic must reject")
+-	// future version field must reject
++	// a future/unknown version field must reject (the 1.1 v1 log is rejected)
+ 	fut := make([]u8, len(bytes), context.temp_allocator)
+ 	copy(fut, bytes)
+ 	fut[4] = 99 // bump the version field (second u32, little-endian)
+ 	fut[5], fut[6], fut[7] = 0, 0, 0
+ 	_, _, future := log_read(fut, context.temp_allocator)
+ 	testing.expect(t, !future, "unknown version must reject")
++	// an unknown command tag must reject. The first record's tag sits at
++	// offset 33 + apply_tick(u64)=8 -> byte 41 (header = magic4 + ver4 + seed8
++	// + era1 + catalog_hash8 + logic_hz4 + count4 = 33).
++	tagbytes := make([]u8, len(bytes), context.temp_allocator)
++	copy(tagbytes, bytes)
++	tagbytes[41] = 0xFF
++	_, _, bad_tag := log_read(tagbytes, context.temp_allocator)
++	testing.expect(t, !bad_tag, "unknown command tag must reject")
+ }
+diff --git a/core/serialize.odin b/core/serialize.odin
+index 01d0020..9e90566 100644
+--- a/core/serialize.odin
++++ b/core/serialize.odin
+@@ -2,15 +2,19 @@ package core
+ 
+ // serialize.odin — the canonical serialized form (ODN-11 / T1). Field-wise
+ // little-endian, lengths-not-capacities, no padding, no pointers — INCLUDING
+-// rng state + the applied-command record + the tick's event stream. FNV-1a-64
+-// over this byte stream is the T1 state hash (hash.odin). "Byte-identical
+-// replay" = identical hashes = identical canonical bytes (E10).
++// rng state + the Topology (nodes + pipes) + the action log + the tick's event
++// stream. FNV-1a-64 over this byte stream is the T1 state hash (hash.odin).
++// "Byte-identical replay" = identical hashes = identical canonical bytes (E10).
+ //
+-// Also the action-log binary format (ODN-11): a versioned little-endian
+-// header (magic, version, seed, era, catalog_hash, logic_hz) +
+-// length-prefixed records of post-validation commands. The replay gate
+-// (harness) reads this back and re-sims; catalog/logic_hz drift is a defined
+-// rejection, never silent divergence.
++// Also the action-log binary format (ODN-11): a versioned little-endian header
++// (magic, version, seed, era, catalog_hash, logic_hz) + length-prefixed records
++// of post-validation commands. The replay gate (harness) reads this back and
++// re-sims; catalog/logic_hz drift is a defined rejection, never silent
++// divergence.
++//
++// Story 1.2 bumps LOG_VERSION to 2: the command record is now Cmd_Draw_Pipe
++// {a, b, tier} (was the 1.1 placeholder Cmd_Set_Arg{arg}). A v1 log is rejected
++// by the v2 reader → every 1.1 golden log is re-blessed with this story.
+ 
+ Writer :: struct {
+ 	buf: [dynamic]u8,
+@@ -41,13 +45,13 @@ w_u64 :: proc(w: ^Writer, v: u64) {
+ w_bool :: proc(w: ^Writer, v: bool) { w_u8(w, 1 if v else 0) }
+ 
+ // Per-variant command tag (stable across the wire; new variants append).
+-CMD_TAG_SET_ARG :: u8(1)
++CMD_TAG_DRAW_PIPE :: u8(1)
+ 
+ // --- the T1 state hash --------------------------------------------------------
+ 
+-// Serialize the full sim state and FNV-1a-64 it. Called per tick by the
+-// harness (and by the replay-equality unit test). `tick_events` is the slice
+-// of state.events produced THIS tick (drained after hashing, ODN-14).
++// Serialize the full sim state and FNV-1a-64 it. Called per tick by the harness
++// (and by the replay-equality unit test). `tick_events` is the slice of
++// state.events produced THIS tick (drained after hashing, ODN-14).
+ state_hash :: proc(state: ^Run_State, tick_events: []Event,
+                    scratch := context.temp_allocator) -> u64 {
+ 	w := state_writer(state, tick_events, scratch)
+@@ -72,24 +76,49 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event,
+ 	w_u8(&w, state.era)
+ 	w_u64(&w, state.catalog_hash)
+ 	w_i32(&w, state.logic_hz)
+-	w_u32(&w, state.tick_nonce) // per-tick rng heartbeat (1.2: real sim state)
++	w_u32(&w, state.tick_nonce) // per-tick rng heartbeat (1.3: real sim state)
++
++	// the Topology — the network commands mutate. Serialized slot-by-slot
++	// (alive flags included so tombstones/id-monotonicity ride in the hash,
++	// E11), in insertion order (stable, ODN-10). THIS is what makes the drawn
++	// topology part of replay-equality (a drawn pipe changes the hash).
++	t := &state.topology
++	w_u32(&w, u32(len(t.node_alive)))
++	for i in 0 ..< len(t.node_alive) {
++		w_bool(&w, t.node_alive[i])
++		w_u32(&w, t.node_id[i])
++		w_u8(&w, u8(t.node_kind[i]))
++		w_u8(&w, u8(t.node_role[i]))
++		w_u16(&w, t.node_type[i])
++		w_i32(&w, t.node_pos[i][0])
++		w_i32(&w, t.node_pos[i][1])
++	}
++	w_u32(&w, t.next_node_id)
++
++	w_u32(&w, u32(len(t.pipe_alive)))
++	for i in 0 ..< len(t.pipe_alive) {
++		w_bool(&w, t.pipe_alive[i])
++		w_u32(&w, t.pipe_id[i])
++		w_u32(&w, t.pipe_a[i])
++		w_u32(&w, t.pipe_b[i])
++		w_u16(&w, t.pipe_tier[i])
++		w_i32(&w, t.pipe_span[i])
++	}
++	w_u32(&w, t.next_pipe_id)
+ 
+ 	// the replay artifact (the action log) — lengths-not-capacities, in order
+ 	w_u32(&w, u32(len(state.action_log)))
+ 	for cmd in state.action_log {
+ 		w_u64(&w, cmd.apply_tick)
+ 		switch c in cmd.kind {
+-		case Cmd_Set_Arg: w_u8(&w, CMD_TAG_SET_ARG); w_u32(&w, c.arg)
++		case Cmd_Draw_Pipe:
++			w_u8(&w, CMD_TAG_DRAW_PIPE)
++			w_u32(&w, c.a)
++			w_u32(&w, c.b)
++			w_u16(&w, c.tier)
+ 		}
+ 	}
+ 
+-	// applied commands — the spine's "topology" (replaces with real state 1.2)
+-	w_u32(&w, u32(len(state.applied)))
+-	for a in state.applied {
+-		w_u64(&w, a.tick)
+-		w_u32(&w, a.arg)
+-	}
+-
+ 	// the tick's event stream (ODN-14) — part of the hash so event divergence
+ 	// is caught without a single pixel
+ 	w_u32(&w, u32(len(tick_events)))
+@@ -104,7 +133,7 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event,
+ // --- the action log (ODN-11 binary) -------------------------------------------
+ 
+ LOG_MAGIC :: u32(0x314C5050) // "PPL1" little-endian
+-LOG_VERSION :: u32(1)
++LOG_VERSION :: u32(2)        // 1.2: Cmd_Draw_Pipe payload
+ 
+ // Write the run's action log: versioned header + length-prefixed command
+ // records. catalog_hash + logic_hz ride in the header so the replay gate can
+@@ -121,7 +150,11 @@ log_write :: proc(state: ^Run_State, scratch := context.temp_allocator) -> []u8
+ 	for cmd in state.action_log {
+ 		w_u64(&w, cmd.apply_tick)
+ 		switch c in cmd.kind {
+-		case Cmd_Set_Arg: w_u8(&w, CMD_TAG_SET_ARG); w_u32(&w, c.arg)
++		case Cmd_Draw_Pipe:
++			w_u8(&w, CMD_TAG_DRAW_PIPE)
++			w_u32(&w, c.a)
++			w_u32(&w, c.b)
++			w_u16(&w, c.tier)
+ 		}
+ 	}
+ 	return w.buf[:]
+@@ -189,8 +222,8 @@ log_read :: proc(data: []u8, allocator := context.allocator) -> (Log_Header, []C
+ 		cmd: Command
+ 		cmd.apply_tick = r_u64(&r)
+ 		switch r_u8(&r) {
+-		case CMD_TAG_SET_ARG:
+-			cmd.kind = Cmd_Set_Arg{arg = r_u32(&r)}
++		case CMD_TAG_DRAW_PIPE:
++			cmd.kind = Cmd_Draw_Pipe{a = r_u32(&r), b = r_u32(&r), tier = r_u16(&r)}
+ 		case:
+ 			return {}, nil, false
+ 		}
+diff --git a/core/step.odin b/core/step.odin
+index f88fd45..b4f7ba7 100644
+--- a/core/step.odin
++++ b/core/step.odin
+@@ -2,35 +2,43 @@ package core
+ 
+ // step.odin — the ONLY entry point that advances the simulation (ODN-1).
+ //
+-// Story 1.1 spine: step is a no-op heartbeat. It (a) applies the tick's
+-// replay commands to `applied` (the spine's topology stand-in) and (b) draws
+-// the owned RNG once per tick — the thinnest sim activity that makes the
++// Story 1.2: step (a) applies the tick's replay commands to the real Topology
++// (validate-then-apply, the same path the live edit fast-path uses) and (b)
++// draws the owned RNG once per tick — the thinnest sim activity that keeps the
+ // determinism plumbing (rng → serialize → hash → replay) real and testable.
+-// There is no topology / flow / crisis / health yet (later slices); nothing
+-// here reads a clock, a file, or a device (ODN-1), and all math is integer
+-// (ODN-10).
++// There is no flow / crisis / health yet (later slices); nothing here reads a
++// clock, a file, or a device (ODN-1), and all math is integer (ODN-10).
+ //
+ // The command-application convention (pinned, arch §11.1): live edits apply
+-// immediately via the edit fast-path (story 1.2's Command_Bus) and are logged
++// immediately via the edit fast-path (the app's Command_Bus) and are logged
+ // with apply_tick = the next tick; replay applies every log entry with
+ // apply_tick == N BEFORE stepping N — so live and replay see identical state
+-// at every step boundary (E10). For the spine the harness/test feeds step the
+-// matching commands directly (no bus yet); the convention still holds.
+-step :: proc(state: ^Run_State, tick: u64, commands: []Command) {
++// at every step boundary (E10). For 1.2 the harness plays the action log
++// through step directly (the canonical path); the app's fast-path passes {} to
++// step (the command is already applied + logged).
++//
++// step needs the Catalogs to validate draws (span tier cap, node kinds). The
++// harness/app pass the already-loaded Catalogs pointer; core stays pure (no
++// file I/O — ODN-1).
++step :: proc(state: ^Run_State, tick: u64, commands: []Command, cat: ^Catalogs) {
+ 	state.tick = tick
+ 
+-	// apply this tick's commands (spine: record them; 1.2 mutates Topology)
++	// apply this tick's commands to the Topology (the same validate-then-apply
++	// the edit fast-path uses — one legality path, so replay can't diverge).
+ 	for cmd in commands {
+-		switch c in cmd.kind {
+-		case Cmd_Set_Arg:
+-			append(&state.applied, Applied_Cmd{tick = tick, arg = c.arg})
++		_, err := topology_apply_edit(&state.topology, cmd, cat)
++		if err != .None {
++			// a replayed command that fails validation is a CRITICAL divergence
++			// (the log stores post-validation truth — this should never happen
++			// for a honestly-recorded log). Latch + let the gate reject.
++			state.replay_error = true
+ 		}
+ 	}
+ 
+-	// heartbeat: one owned-RNG draw folded into a per-tick state field. This
+-	// is the thinnest sim activity that ties the RNG into the step path
+-	// (different seed → different nonce sequence → different hashes; replay
+-	// reproduces it exactly). Story 1.2+ replaces tick_nonce with real
+-	// rng-derived sim state (demand, spawn, ECMP, …).
++	// heartbeat: one owned-RNG draw folded into a per-tick state field. This is
++	// the thinnest sim activity that ties the RNG into the step path (different
++	// seed → different nonce sequence → different hashes; replay reproduces it
++	// exactly). Story 1.3+ replaces tick_nonce with real rng-derived sim state
++	// (demand spawn, ECMP, …).
+ 	state.tick_nonce = rng_next(&state.rng)
+ }
+diff --git a/core/topology.odin b/core/topology.odin
+new file mode 100644
+index 0000000..d4d808f
+--- /dev/null
++++ b/core/topology.odin
+@@ -0,0 +1,204 @@
++package core
++
++// topology.odin — S1 Topology Graph (ODN-1, architecture §6.1), minimal for
++// Story 1.2: nodes (terminal/junction) + pipes, the edit authority (validate
++// + apply), and the pinned integer distance metric. NO routing/flow here
++// (that's 1.3); NO QoS/inventory/health yet (later slices).
++//
++// Data layout: parallel arrays indexed by slot (insertion-ordered — core
++// iterates ARRAYS only, ODN-10); there are NO maps anywhere. Ids are monotonic
++// per run, never recycled (E11): next_node_id/next_pipe_id only climb, and a
++// demolished entity's slot is tombstoned (alive=false), its id never reused.
++//
++// The topology terminals-via-routers canon (E26, art amendment A6): terminals
++// connect via routers only — never terminal-to-terminal. validate_draw rejects
++// a terminal↔terminal drag with .Terminal_To_Terminal.
++
++Topology :: struct {
++	// nodes (parallel arrays; index = slot)
++	node_alive:   [dynamic]bool,
++	node_id:      [dynamic]u32,     // monotonic, never recycled (E11)
++	node_kind:    [dynamic]Node_Kind,
++	node_role:    [dynamic]Terminal_Role,
++	node_type:    [dynamic]u16,     // index into Catalogs.node_types
++	node_pos:     [dynamic][2]i32,  // integer grid (ODN-10)
++	next_node_id: u32,
++
++	// pipes (parallel arrays; index = slot)
++	pipe_alive:   [dynamic]bool,
++	pipe_id:      [dynamic]u32,
++	pipe_a:       [dynamic]u32, // node ids (resolved, post-snap)
++	pipe_b:       [dynamic]u32,
++	pipe_tier:    [dynamic]u16, // index into Catalogs.pipe_tiers
++	pipe_span:    [dynamic]i32, // cached integer Euclidean (rounded)
++	next_pipe_id: u32,
++}
++
++topology_make :: proc(t: ^Topology, allocator := context.allocator) {
++	t^ = {}
++	t.node_alive = make([dynamic]bool, 0, 8, allocator)
++	t.node_id = make([dynamic]u32, 0, 8, allocator)
++	t.node_kind = make([dynamic]Node_Kind, 0, 8, allocator)
++	t.node_role = make([dynamic]Terminal_Role, 0, 8, allocator)
++	t.node_type = make([dynamic]u16, 0, 8, allocator)
++	t.node_pos = make([dynamic][2]i32, 0, 8, allocator)
++	t.pipe_alive = make([dynamic]bool, 0, 8, allocator)
++	t.pipe_id = make([dynamic]u32, 0, 8, allocator)
++	t.pipe_a = make([dynamic]u32, 0, 8, allocator)
++	t.pipe_b = make([dynamic]u32, 0, 8, allocator)
++	t.pipe_tier = make([dynamic]u16, 0, 8, allocator)
++	t.pipe_span = make([dynamic]i32, 0, 8, allocator)
++}
++
++topology_destroy :: proc(t: ^Topology) {
++	delete(t.node_alive)
++	delete(t.node_id)
++	delete(t.node_kind)
++	delete(t.node_role)
++	delete(t.node_type)
++	delete(t.node_pos)
++	delete(t.pipe_alive)
++	delete(t.pipe_id)
++	delete(t.pipe_a)
++	delete(t.pipe_b)
++	delete(t.pipe_tier)
++	delete(t.pipe_span)
++}
++
++node_count :: proc(t: ^Topology) -> int {
++	n := 0
++	for alive in t.node_alive { if alive { n += 1 } }
++	return n
++}
++
++pipe_count :: proc(t: ^Topology) -> int {
++	n := 0
++	for alive in t.pipe_alive { if alive { n += 1 } }
++	return n
++}
++
++// id -> slot, only for LIVE nodes (linear; core is map-free — ODN-10).
++node_slot :: proc(t: ^Topology, id: u32) -> (u32, bool) {
++	for i in 0 ..< len(t.node_alive) {
++		if t.node_alive[i] && t.node_id[i] == id { return u32(i), true }
++	}
++	return 0, false
++}
++
++// --- the pinned integer distance metric (arch §6.1) -------------------------
++// All span/cost/snap math uses integer Euclidean; no sqrt in the comparison
++// path (compare squares), and an integer Newton isqrt for the length. Exact,
++// cheap, identical on every target (ODN-10).
++
++dist2 :: proc(a, b: [2]i32) -> i64 {
++	dx := i64(a[0] - b[0])
++	dy := i64(a[1] - b[1])
++	return dx*dx + dy*dy
++}
++
++isqrt :: proc(x: i64) -> i64 {
++	if x <= 0 { return 0 }
++	r := x
++	y := (r + 1) / 2
++	for y < r {
++		r = y
++		y = (r + x / r) / 2
++	}
++	return r
++}
++
++// Rounded Euclidean distance between two grid points (matches round(sqrt(d²)),
++// computed integer-only). One metric serves span validation, draw cost, and
++// the snap radius (E4).
++span_between :: proc(a, b: [2]i32) -> i32 {
++	d2 := dist2(a, b)
++	r := isqrt(d2)
++	// round half up: isqrt floors; bump when the fractional part ≥ .5
++	if d2 - r*r > r { r += 1 }
++	return i32(r)
++}
++
++// --- node spawning (the harness/app seed the fixture; core is the authority) -
++
++// topology_spawn_node — append a node from its catalog type. Returns the new
++// monotonic id. The fixture is deterministic by construction (the caller passes
++// fixed positions); it is NOT part of the action log — like the seed, it is
++// run setup, re-created identically on every replay.
++topology_spawn_node :: proc(t: ^Topology, type_idx: u16, pos: [2]i32, cat: ^Catalogs) -> u32 {
++	nt := cat.node_types[type_idx]
++	id := t.next_node_id
++	t.next_node_id += 1
++	append(&t.node_alive, true)
++	append(&t.node_id, id)
++	append(&t.node_kind, nt.kind)
++	append(&t.node_role, nt.terminal_role)
++	append(&t.node_type, type_idx)
++	append(&t.node_pos, pos)
++	return id
++}
++
++is_terminal :: proc(t: ^Topology, slot: u32) -> bool {
++	return t.node_kind[slot] == .Terminal
++}
++
++// --- the edit authority: validate-then-apply (single source of truth) -------
++// The Command_Bus merely resolves a pointer to a node id (snap); the core's
++// validate_draw is the ONLY legality check, so live edits and replay can never
++// diverge on legality (the action log stores post-snap, post-validation truth).
++
++validate_draw :: proc(t: ^Topology, c: Cmd_Draw_Pipe, cat: ^Catalogs) -> Edit_Error {
++	if c.a == c.b { return .Self_Loop } // E3
++	sa, oka := node_slot(t, c.a)
++	sb, okb := node_slot(t, c.b)
++	if !oka || !okb { return .Missing_Node }
++	if is_terminal(t, sa) && is_terminal(t, sb) { return .Terminal_To_Terminal } // E26
++	if u32(c.tier) >= u32(len(cat.pipe_tiers)) { return .Unknown_Tier }
++	span := span_between(t.node_pos[sa], t.node_pos[sb])
++	if span > cat.pipe_tiers[c.tier].max_span { return .Span_Exceeds_Tier }
++	return .None
++}
++
++// apply_draw — assumes validate_draw returned .None. Appends a pipe, caching its
++// integer span. The new pipe is live this tick (edit fast-path) and recorded in
++// the action log with apply_tick = next (ODN-2); replay re-applies it at that
++// tick before stepping.
++apply_draw :: proc(t: ^Topology, c: Cmd_Draw_Pipe, cat: ^Catalogs) -> u32 {
++	sa := node_slot_raw(t, c.a)
++	sb := node_slot_raw(t, c.b)
++	span := span_between(t.node_pos[sa], t.node_pos[sb])
++	id := t.next_pipe_id
++	t.next_pipe_id += 1
++	append(&t.pipe_alive, true)
++	append(&t.pipe_id, id)
++	append(&t.pipe_a, c.a)
++	append(&t.pipe_b, c.b)
++	append(&t.pipe_tier, c.tier)
++	append(&t.pipe_span, span)
++	return id
++}
++
++// node_slot_raw — unchecked slot lookup (caller validated). Linear.
++node_slot_raw :: proc(t: ^Topology, id: u32) -> u32 {
++	for i in 0 ..< len(t.node_alive) {
++		if t.node_id[i] == id { return u32(i) }
++	}
++	return 0 // unreachable when called post-validate
++}
++
++// topology_apply_edit — the single validate-then-apply entry. Returns the new
++// pipe id on success, or the typed rejection. The app fast-path calls this on
++// mouse-release; the harness/step path calls this from the replayed log.
++topology_apply_edit :: proc(t: ^Topology, cmd: Command, cat: ^Catalogs) -> (Edit_Result, Edit_Error) {
++	#partial switch c in cmd.kind {
++	case Cmd_Draw_Pipe:
++		if e := validate_draw(t, c, cat); e != .None { return {}, e }
++		id := apply_draw(t, c, cat)
++		return {ok = true, id = id}, .None
++	}
++	return {}, .Unknown_Command
++}
++
++// draw_cost — length × tier cost factor (the cost the ghost displays). Integer.
++draw_cost :: proc(span: i32, tier_idx: u16, cat: ^Catalogs) -> i32 {
++	return span * cat.pipe_tiers[tier_idx].cost_per_tile
++}
+diff --git a/core/topology_test.odin b/core/topology_test.odin
+new file mode 100644
+index 0000000..1ad64dc
+--- /dev/null
++++ b/core/topology_test.odin
+@@ -0,0 +1,124 @@
++package core
++
++// topology_test.odin — the Story 1.2 edge-case contracts as durable tests (arch
++// §11.7): the snap-inclusive radius (E4), monotonic ids (E11), and the draw
++// rejections (E3 self-loop, E26 terminal↔terminal, span-exceeds-tier). Pinned
++// at the lowest layer so they survive review rounds, refactors, and Perkins.
++
++import "core:testing"
++
++// A fresh fixture-backed topology for each validation case.
++topo_setup :: proc(t: ^testing.T, cat: ^Catalogs) -> (Run_State, u32, u32, u32) {
++	s: Run_State
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&s, cat)
++	return s, res, rt, host
++}
++
++@(test)
++test_draw_rejects_self_loop :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, _, _ := topo_setup(t, cat)
++	defer run_destroy(&s)
++	std, _ := pipe_tier_index(cat, "standard")
++	cmd := Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = res, b = res, tier = std}}
++	_, err := topology_apply_edit(&s.topology, cmd, cat)
++	testing.expect(t, err == .Self_Loop, "node→itself must reject with .Self_Loop (E3)")
++	testing.expectf(t, pipe_count(&s.topology) == 0, "a rejected draw must mutate nothing, got %d pipes", pipe_count(&s.topology))
++}
++
++@(test)
++test_draw_rejects_terminal_to_terminal :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, _, host := topo_setup(t, cat)
++	defer run_destroy(&s)
++	std, _ := pipe_tier_index(cat, "standard")
++	cmd := Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = res, b = host, tier = std}}
++	_, err := topology_apply_edit(&s.topology, cmd, cat)
++	testing.expect(t, err == .Terminal_To_Terminal, "terminal↔terminal must reject with .Terminal_To_Terminal (E26)")
++	testing.expectf(t, pipe_count(&s.topology) == 0, "a rejected draw must mutate nothing, got %d pipes", pipe_count(&s.topology))
++}
++
++@(test)
++test_draw_rejects_span_exceeds_tier :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := topo_setup(t, cat)
++	defer run_destroy(&s)
++	// narrow max_span=10; residential{8,15}→router{20,15} span=12 > 10 → reject
++	narrow, _ := pipe_tier_index(cat, "narrow")
++	cmd := Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = res, b = rt, tier = narrow}}
++	_, err := topology_apply_edit(&s.topology, cmd, cat)
++	testing.expect(t, err == .Span_Exceeds_Tier, "over-span draw must reject with .Span_Exceeds_Tier")
++	testing.expectf(t, pipe_count(&s.topology) == 0, "a rejected draw must mutate nothing, got %d pipes", pipe_count(&s.topology))
++}
++
++@(test)
++test_draw_rejects_unknown_tier_and_missing_node :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := topo_setup(t, cat)
++	defer run_destroy(&s)
++	// unknown tier index (out of catalog range)
++	cmd_bad_tier := Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = res, b = rt, tier = 99}}
++	_, err := topology_apply_edit(&s.topology, cmd_bad_tier, cat)
++	testing.expect(t, err == .Unknown_Tier, "out-of-range tier must reject with .Unknown_Tier")
++	// a node id that was never spawned
++	cmd_missing := Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = res, b = 9999, tier = 0}}
++	_, err2 := topology_apply_edit(&s.topology, cmd_missing, cat)
++	testing.expect(t, err2 == .Missing_Node, "unknown node must reject with .Missing_Node")
++}
++
++@(test)
++test_draw_legal_pipe_applies :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, host := topo_setup(t, cat)
++	defer run_destroy(&s)
++	std, _ := pipe_tier_index(cat, "standard")
++	// residential→router (span 12 ≤ 14) and router→content_host (span 12 ≤ 14)
++	r1, e1 := topology_apply_edit(&s.topology, Command{1, Cmd_Draw_Pipe{res, rt, std}}, cat)
++	testing.expectf(t, e1 == .None, "legal draw 1 must apply, got %v", e1)
++	testing.expect(t, r1.ok, "legal draw 1 returns ok")
++	r2, e2 := topology_apply_edit(&s.topology, Command{1, Cmd_Draw_Pipe{rt, host, std}}, cat)
++	testing.expectf(t, e2 == .None, "legal draw 2 must apply, got %v", e2)
++	testing.expect(t, r2.ok, "legal draw 2 returns ok")
++	testing.expectf(t, pipe_count(&s.topology) == 2, "two legal draws = 2 pipes, got %d", pipe_count(&s.topology))
++	// the cached span matches the metric
++	testing.expectf(t, s.topology.pipe_span[0] == 12, "cached span must be 12, got %d", s.topology.pipe_span[0])
++}
++
++@(test)
++test_node_ids_monotonic_never_recycled :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	rt_idx, _ := node_type_index(cat, "router_basic")
++	a := topology_spawn_node(&s.topology, rt_idx, {5, 5}, cat)
++	b := topology_spawn_node(&s.topology, rt_idx, {6, 6}, cat)
++	c := topology_spawn_node(&s.topology, rt_idx, {7, 7}, cat)
++	testing.expectf(t, a == 0 && b == 1 && c == 2, "ids must be 0,1,2 got %d,%d,%d (E11 monotonic)", a, b, c)
++	testing.expectf(t, s.topology.next_node_id == 3, "next_node_id must advance to 3, got %d", s.topology.next_node_id)
++}
++
++@(test)
++test_distance_metric_pinned :: proc(t: ^testing.T) {
++	// integer Euclidean, rounded — the pinned span/cost/snap metric (arch §6.1).
++	testing.expect_value(t, span_between({0, 0}, {0, 0}), 0)
++	testing.expect_value(t, span_between({0, 0}, {3, 4}), 5)         // 3-4-5
++	testing.expect_value(t, span_between({0, 0}, {12, 0}), 12)       // residential→router
++	testing.expect_value(t, span_between({8, 15}, {20, 15}), 12)     // the fixture span
++	// E4 snap radius inclusive: dist² at the boundary must compare <= radius²
++	testing.expect(t, dist2({0, 0}, {36, 0}) <= 36*36, "snap must be inclusive at the radius boundary (E4)")
++	testing.expect(t, dist2({0, 0}, {37, 0}) > 36*36, "snap must exclude just past the radius (E4)")
++}
+diff --git a/core/types.odin b/core/types.odin
+index d15cc0e..8c22d64 100644
+--- a/core/types.odin
++++ b/core/types.odin
+@@ -1,75 +1,86 @@
+ package core
+ 
+-// types.odin — the spine state model. A deliberate SUBSET of the full game
+-// state (arch §8.2): no Topology / Flow / Crisis / Health yet (those are
+-// later slices — story 1.2 onward). Everything here is integer (ODN-10) and
+-// the RNG is owned (ODN-9). The determinism spine needs only:
+-//   - the seed + rng (the owned PRNG),
+-//   - the tick counter,
+-//   - the action log (ODN-11 — the replay artifact),
+-//   - the per-tick event buffer (ODN-14),
+-//   - the catalog_hash + logic_hz the replay gate binds to (ODN-11).
++// types.odin — the spine state model (architecture §8.2). The deterministic
++// core: one Run_State per run, created fresh per run (reset = make a new one),
++// passed by pointer. No globals (ODN-13); no maps anywhere (ODN-10); all state
++// is integer (ODN-10) and the RNG is owned (ODN-9).
+ //
+-// `applied` is the spine's stand-in for "the topology that commands mutate":
+-// step records each applied command here so the state hash reflects command
+-// application (replay-equality is real, not vacuous). Story 1.2 replaces it
+-// with the real Topology SOA; the serialize/step/hash plumbing is unchanged.
++// Story 1.1 shipped the spine (rng, step heartbeat, action log, the binary log
++// round-trip + replay gate) with a PLACEHOLDER command/applied record. Story
++// 1.2 REPLACES that placeholder with the real Topology SOA (topology.odin) +
++// the real Cmd_Draw_Pipe command — the serialize/step/hash plumbing is
++// unchanged in mechanism (arch §11.1). Later stories add Demolish,
++// Set_Lane_Weights, … as new union variants behind the same switch.
+ 
+-// Command — the post-validation action-log entry (ODN-11). Tagged union; the
+-// spine carries one placeholder variant so the binary log round-trips a
+-// payload and replay-equality is exercised. Later stories add Draw_Pipe,
+-// Demolish, Set_Lane_Weights, … as new variants behind the same `switch`.
++// Edit_Error — typed rejections (§7.1: never strings). The Command_Bus surfaces
++// these; the app maps each to a satirical hint. Pinned by topology_test.odin.
++Edit_Error :: enum u8 {
++	None,
++	Unknown_Command,
++	Self_Loop,            // E3 — a == b
++	Missing_Node,         // a or b is not a live node id
++	Terminal_To_Terminal, // E26 — both endpoints are terminals (canon A6)
++	Unknown_Tier,         // tier index out of catalog range
++	Span_Exceeds_Tier,    // span > tier.max_span (M1 distance rule)
++}
++
++Edit_Result :: struct {
++	ok: bool,
++	id: u32, // the new pipe id on a successful draw
++}
++
++// Command — the post-validation, post-snap action-log entry (ODN-11). Tagged
++// union; 1.2 carries the single Draw_Pipe variant. The action log stores these
++// (the replay artifact); replay re-applies them through the same
++// topology_apply_edit path, so live and replay see identical state at every
++// step boundary (E10).
+ Command_Kind :: union {
+-	Cmd_Set_Arg,
++	Cmd_Draw_Pipe,
+ }
+ 
+-// Spine placeholder command: carries a u32 the run records in `applied`.
+-// Real commands (Draw_Pipe{a, b, tier}, …) land in story 1.2+.
+-Cmd_Set_Arg :: struct {
+-	arg: u32,
++// Cmd_Draw_Pipe — draw a pipe between two resolved node ids at a tier. The
++// Command_Bus resolves pointer→node id (snap, E4) before building this; the
++// action log stores post-snap truth, so replay never drifts on snap.
++Cmd_Draw_Pipe :: struct {
++	a:    u32,   // node id (resolved, post-snap)
++	b:    u32,   // node id (resolved, post-snap)
++	tier: u16,   // Catalogs.pipe_tiers index
+ }
+ 
+ Command :: struct {
+-	apply_tick: u64,
++	apply_tick: u64, // replay applies this before stepping apply_tick (ODN-2)
+ 	kind:       Command_Kind,
+ }
+ 
+-// The spine's deterministic record of command application (replaces with the
+-// real Topology in story 1.2). Serialized into the state hash so replay
+-// divergence is caught (E10).
+-Applied_Cmd :: struct {
+-	tick: u64,
+-	arg:  u32,
+-}
+-
+-// Event — the per-tick event buffer entry (ODN-14). The spine emits none
+-// (step is a no-op heartbeat); later stories add Packet_Arrived,
+-// Crisis_Triggered, … The tag byte is the serialized discriminator.
++// Event — the per-tick event buffer entry (ODN-14). The spine emits none (step
++// is a heartbeat); later stories add Packet_Arrived, Crisis_Triggered, … The
++// tag byte is the serialized discriminator.
+ Event :: struct {
+ 	tick: u64,
+ 	tag:  u8, // 0 = (none); spine reserves 1.. for future variants
+ }
+ 
+ // Run_State — the authoritative sim state (ODN-1/13). One value per run,
+-// created fresh per run (reset = make a new one), passed by pointer. No
+-// globals (ODN-13); no maps anywhere (ODN-10).
++// created fresh per run (reset = make a new one), passed by pointer. No globals
++// (ODN-13); no maps anywhere (ODN-10).
+ Run_State :: struct {
+ 	seed:         u64,
+ 	tick:         u64,
+ 	rng:          Rng,
+-	era:          u8,           // [LATER] Era FSM; spine pins 0
+-	catalog_hash: u64,          // ODN-11 — binds the run to its catalogs
+-	logic_hz:     i32,          // ODN-11 — binds the run to its tick rate
+-	action_log:   [dynamic]Command, // the replay artifact (ODN-11)
+-	applied:      [dynamic]Applied_Cmd,
+-	events:       [dynamic]Event,   // per-tick buffer (ODN-14)
+-	tick_nonce:   u32,           // per-tick rng-derived value (heartbeat; 1.2 replaces with real sim state)
+-	replay_error: bool,         // latched if a replayed command fails (critical)
++	era:          u8,                  // [LATER] Era FSM; 1.2 pins 0
++	catalog_hash: u64,                 // ODN-11 — binds the run to its catalogs
++	logic_hz:     i32,                 // ODN-11 — binds the run to its tick rate
++	topology:     Topology,            // S1 — the network the commands mutate (1.2)
++	action_log:   [dynamic]Command,    // the replay artifact (ODN-11)
++	events:       [dynamic]Event,      // per-tick buffer (ODN-14)
++	tick_nonce:   u32,                 // per-tick rng-derived heartbeat (1.3 replaces with real sim state)
++	replay_error: bool,                // latched if a replayed command fails (critical)
+ }
+ 
+-// run_init — create a fresh run context (ODN-13: reset = make a new one).
+-// The caller (harness/app) resolves catalog_hash + logic_hz from data/*.json
+-// (core is pure — no file I/O, ODN-1) and seeds the owned RNG.
++// run_init — create a fresh run context (ODN-13: reset = make a new one). The
++// caller (harness/app) resolves catalog_hash + logic_hz from data/*.json (core
++// is pure — no file I/O, ODN-1) and seeds the owned RNG. The topology is made
++// empty here; the caller seeds the fixture (topology_spawn_node) AFTER this.
+ run_init :: proc(state: ^Run_State, seed: u64, catalog_hash: u64, logic_hz: i32,
+                  allocator := context.allocator) {
+ 	state^ = {} // zero everything (no stale state across runs)
+@@ -78,15 +89,15 @@ run_init :: proc(state: ^Run_State, seed: u64, catalog_hash: u64, logic_hz: i32,
+ 	state.logic_hz = logic_hz
+ 	state.era = 0
+ 	state.action_log = make([dynamic]Command, allocator)
+-	state.applied = make([dynamic]Applied_Cmd, allocator)
+ 	state.events = make([dynamic]Event, allocator)
++	topology_make(&state.topology, allocator)
+ 	rng_seed(&state.rng, seed)
+ }
+ 
+-// run_destroy — free the run's owned buffers (mirrors run_init; ODN-18
+-// arena discipline lands later, but explicit frees are correct now).
++// run_destroy — free the run's owned buffers (mirrors run_init; ODN-18 arena
++// discipline lands later, but explicit frees are correct now).
+ run_destroy :: proc(state: ^Run_State) {
+ 	delete(state.action_log)
+-	delete(state.applied)
+ 	delete(state.events)
++	topology_destroy(&state.topology)
+ }
+diff --git a/data/balance.json b/data/balance.json
+index fe2b0d9..1599153 100644
+--- a/data/balance.json
++++ b/data/balance.json
+@@ -1,4 +1,11 @@
+ {
++  "_comment": "Balance catalog (GDD § Numerical Design, ODN-5). Single source for every tunable number. All state-affecting values are int (ODN-10). logic_hz=20 is the fixed-timestep tick rate (ODN-2). snap_radius = inclusive node-snap radius in world px (E4). map.* = the design-grid world the camera fits into the 1280x720 window.",
+   "logic_hz": 20,
+-  "max_ticks": 100000
++  "max_ticks": 100000,
++  "snap_radius": 36,
++  "map": {
++    "w_tiles": 40,
++    "h_tiles": 30,
++    "tile_px": 26
++  }
+ }
+diff --git a/data/node_types.json b/data/node_types.json
+new file mode 100644
+index 0000000..865e88d
+--- /dev/null
++++ b/data/node_types.json
+@@ -0,0 +1,35 @@
++{
++  "_comment": "Node-type catalog (GDD § M3, ODN-5). Story 1.2 ships a minimal roster: residential (terminal source), content_host (terminal sink), router_basic (junction). kind: terminal | junction. terminal_role: residential | content_host | none. throughput_units = node throughput ceiling. port_capacity 0 = unlimited (terminals); routers are port-scaled (canon #14).",
++  "entries": [
++    {
++      "id": "residential",
++      "display_name": "Residential",
++      "kind": "terminal",
++      "terminal_role": "residential",
++      "throughput_units": 5,
++      "lb_mode_capable": false,
++      "era_introduced": 1,
++      "port_capacity": 0
++    },
++    {
++      "id": "content_host",
++      "display_name": "Content Host",
++      "kind": "terminal",
++      "terminal_role": "content_host",
++      "throughput_units": 80,
++      "lb_mode_capable": false,
++      "era_introduced": 3,
++      "port_capacity": 0
++    },
++    {
++      "id": "router_basic",
++      "display_name": "Basic Router",
++      "kind": "junction",
++      "terminal_role": "none",
++      "throughput_units": 40,
++      "lb_mode_capable": false,
++      "era_introduced": 1,
++      "port_capacity": 4
++    }
++  ]
++}
+diff --git a/data/palette.json b/data/palette.json
+new file mode 100644
+index 0000000..d2dd96c
+--- /dev/null
++++ b/data/palette.json
+@@ -0,0 +1,25 @@
++{
++  "_comment": "Palette catalog (look-book v1, art-direction v1.2 — the light-canvas canon). ALL values cosmetic (RGBA quads 0-255); the core never reads this file. The render layer loads it so art tuning is data (ODN-5).",
++  "canvas":        [232, 221, 194, 255],
++  "grid":          [194, 182, 148, 255],
++  "ink":           [51, 65, 79, 255],
++  "ink_soft":      [106, 112, 120, 255],
++  "ink_faint":     [154, 160, 168, 255],
++  "state_healthy": [55, 214, 122, 255],
++  "state_strain":  [242, 181, 68, 255],
++  "state_critical":[232, 69, 69, 255],
++  "house_bodies":  [[232, 90, 74, 255], [242, 201, 76, 255], [94, 203, 107, 255], [74, 155, 226, 255]],
++  "house_roofs":   [[122, 46, 38, 255], [122, 84, 24, 255], [44, 106, 52, 255], [38, 80, 126, 255]],
++  "host_body":     [62, 120, 208, 255],
++  "host_roof":     [38, 76, 142, 255],
++  "router_body":   [94, 110, 128, 255],
++  "router_dark":   [62, 74, 92, 255],
++  "router_led":    [46, 139, 87, 255],
++  "pipe_copper":   [142, 94, 46, 255],
++  "pipe_steel":    [120, 128, 140, 255],
++  "pipe_fiber":    [46, 84, 148, 255],
++  "pipe_core":     [122, 168, 230, 255],
++  "pipe_unalloc":  [58, 74, 92, 255],
++  "ghost_ok":      [120, 128, 140, 200],
++  "ghost_bad":     [232, 69, 69, 200]
++}
+diff --git a/data/pipe_tiers.json b/data/pipe_tiers.json
+new file mode 100644
+index 0000000..a40afc1
+--- /dev/null
++++ b/data/pipe_tiers.json
+@@ -0,0 +1,32 @@
++{
++  "_comment": "Pipe-tier catalog (GDD § M1, ODN-5). capacity_units = u/s throughput (integer, ODN-10). max_span = grid-unit hard cap (enforced at edit — the span rule, E3 family). cost_per_tile = draw cost factor (cost = length × cost_per_tile). Values are the Godot prototype's tuned set (prototype-fun-gate). Story 1.2 draws the 'standard' tier; the catalog carries all three for the span/cost math.",
++  "entries": [
++    {
++      "id": "narrow",
++      "display_name": "Narrow Copper",
++      "capacity_units": 5,
++      "clean_span": 8,
++      "max_span": 10,
++      "cost_per_tile": 5,
++      "era_introduced": 1
++    },
++    {
++      "id": "standard",
++      "display_name": "Standard Line",
++      "capacity_units": 15,
++      "clean_span": 10,
++      "max_span": 14,
++      "cost_per_tile": 12,
++      "era_introduced": 1
++    },
++    {
++      "id": "wide",
++      "display_name": "Wide Fiber",
++      "capacity_units": 40,
++      "clean_span": 14,
++      "max_span": 18,
++      "cost_per_tile": 30,
++      "era_introduced": 3
++    }
++  ]
++}
+diff --git a/demos/draw.dem b/demos/draw.dem
+new file mode 100644
+index 0000000..a043d49
+--- /dev/null
++++ b/demos/draw.dem
+@@ -0,0 +1,10 @@
++# draw.dem — Story 1.2: the first drawn pipes. The 1.2 fixture is
++# residential(0) ← router(1) → content_host(2), 12 tiles apart on row y=15.
++# Draw source→router then router→sink at the 'standard' tier (span 12 ≤ max 14);
++# capture the settled two-pipe frame for the T2 pixel golden.
++seed 42
++run 3000ms
++at 500ms draw 0 1 standard
++at 1500ms draw 1 2 standard
++capture at 2500ms
++expect hash stable
+diff --git a/goldens/boot.log.bin b/goldens/boot.log.bin
+index 8df6db7..4de62b5 100644
+Binary files a/goldens/boot.log.bin and b/goldens/boot.log.bin differ
+diff --git a/goldens/boot.t1 b/goldens/boot.t1
+index 6be863b..051ec7c 100644
+--- a/goldens/boot.t1
++++ b/goldens/boot.t1
+@@ -3,105 +3,105 @@ t1 1
+ demo boot
+ seed 42
+ logic_hz 20
+-catalog_hash 52075c6ea4c9f1b2
++catalog_hash 84bee62d4822d70b
+ ticks 100
+-1 6103b02cb7372d23
+-2 b33f67a17a4a204b
+-3 7bc73e7ea474f4bc
+-4 6f06ea4449d45c06
+-5 755f3ecc19172f12
+-6 4a255a73efe5297c
+-7 af8a200cc1b81b8d
+-8 37cf7a3d305a7ae7
+-9 6e06bdfff5894547
+-10 39006c481bf23b65
+-11 3a63f66867184789
+-12 fca0e8cd99a29096
+-13 5e4dce44e3f562d7
+-14 abd5903ca0b15d7a
+-15 5159a8536d59e5dd
+-16 d1f3f8d51de37932
+-17 3839403f23fa8b93
+-18 fca97cbeed0ae32f
+-19 9ab86cd2d1a9c44f
+-20 82b485e00548ae28
+-21 20a98d1cc122f652
+-22 b618bf67b32fdde2
+-23 7e3de01de4af0f70
+-24 ce8d5215c522f312
+-25 04119dadb2d3da13
+-26 305e0166719a7f8f
+-27 d40314c8457c56b2
+-28 af12bcba469a869c
+-29 d258f743edc6ac6c
+-30 b462e41704fc47ea
+-31 44676c826a5f74c4
+-32 327b6873323c6048
+-33 d98d284274579eb6
+-34 138cf2fb3309ae20
+-35 aaaa71388c9c3290
+-36 995d8022f4318c02
+-37 851eac5d55ff71fe
+-38 5049eb603fc28def
+-39 4cccef5f6495ff26
+-40 85280ee936da15a3
+-41 f276f592bc5002ed
+-42 4d6f2f61be2e6451
+-43 488f153cc91868ab
+-44 f1e485a526b3c86f
+-45 3a65dc3095db213f
+-46 9124edfa94c4d482
+-47 b175e6fe8fc7bb9c
+-48 b12b0ca3c8381522
+-49 90791f0949dd5f47
+-50 96fb16c1935af966
+-51 2922f5c0a33cc6c9
+-52 a30cf9cfd3b73409
+-53 6ef3f568b4172f78
+-54 88615621769030dd
+-55 dd7a6d5cb3399abe
+-56 f5c12955a0bdcd2c
+-57 792403f9e7c252f7
+-58 22f64549d5e95b49
+-59 de3a4edad829a820
+-60 86d4f9f70589829d
+-61 24e3370b8c42b3e3
+-62 07f2dd85004ddbe8
+-63 6cc5dd34b7817e97
+-64 1b0ab708a5a74f8f
+-65 935d971cd1a66ad7
+-66 1bc6b37e5e34efe0
+-67 0fa5f9e241a351e7
+-68 4e7cf3717fa2a774
+-69 9a2a1a5784ce9282
+-70 04676d40a541fe7f
+-71 1e37cd4b658c402e
+-72 df8b46ed72eba367
+-73 16d345e2120f3810
+-74 64af4e862604c009
+-75 1fd019c7b7258d37
+-76 9074028b63a35033
+-77 9b7d8d0df9e0978f
+-78 931b50be95cdf8ce
+-79 21db5624db5a1c6b
+-80 7787b777d22c3101
+-81 c7c3bda95245a0ac
+-82 60088029e31d2243
+-83 05dff24b581da880
+-84 4b06d2bd89ca0784
+-85 2e121e7b4a72c600
+-86 d8f4d019ed4f5319
+-87 b73ae0c70b9a65bf
+-88 e14a2dbb139c3314
+-89 adfef9d0b7922669
+-90 138751deecb76e98
+-91 21a3d726f05995d1
+-92 ee6dee823a434d1e
+-93 1d66244c69dfdb99
+-94 568dd2449d444c20
+-95 18297b83acbd7c13
+-96 2d5aeaa2a48827a1
+-97 55dcee8ae6fe9927
+-98 153bd37b09477d9f
+-99 9939725bf4e11e29
+-100 8d3c7eebbeb06093
++1 64f303e1f5b357c9
++2 31f0daba58b12741
++3 d968df386c4d0300
++4 0569f6d3e6b23182
++5 93d0a713ab3cb7a6
++6 948008e8ef4643cc
++7 1fa76f325879e267
++8 c11ccdb36c8faead
++9 fa57d81afe470c39
++10 a387cd4ed7bd3e77
++11 a65c053126b832e7
++12 8ac8f7d54e67fd56
++13 ad0b50b8f3470f91
++14 97650d1218767e52
++15 40d98baacf3d88fb
++16 28d3d30a6a287f1a
++17 ade95efd39f7a4a9
++18 36eb7bfe730be94d
++19 1d257223c7559781
++20 e72a36dd040d3d80
++21 e7b3951fa3e4867a
++22 8ff0b31c8220574a
++23 c5eb5d845b0683d8
++24 e1f091ac7076a64e
++25 f7ab6c7fe2290a25
++26 7674a98245fb5e11
++27 485fff93af1138de
++28 f2b787815d800894
++29 6a181f488ed08ff0
++30 ba4a5ee99d17c9f2
++31 91c6f5d442bb8624
++32 53b3a33856b19980
++33 2b610fae2c3f5356
++34 81457f4111bac7f4
++35 09da06c71b505014
++36 29012cade0c6351e
++37 602579d081495e16
++38 7b8b513e6440ed95
++39 eca5e2ed89c5a0d2
++40 2481b9bbe39e7831
++41 5e2cc6a68e5472ef
++42 cfd2c1019271ea8b
++43 8560da15755012b9
++44 dfbfe43e7838a699
++45 6ee10b381fac3fe5
++46 20c533c43c6432b2
++47 b303548825b87174
++48 63c31c387a36afd2
++49 8512940c80b2ee39
++50 55359eaffbcd543e
++51 eac3ea81936044b3
++52 aee09f4214430873
++53 054635828c20fd04
++54 1e05ab2366413d57
++55 e33fb91071f58ad2
++56 9c1e80191298b67c
++57 b74c816f4fb7c6bd
++58 76076ef6b115f057
++59 87db648ddb81ce90
++60 8c12d5e330217343
++61 7b5374c7a77d9445
++62 2ba7dc9773af13d8
++63 fc7688458559eef9
++64 104343965655e89d
++65 5e09566435554345
++66 f343633c6a90860c
++67 338bb8a481659739
++68 acbfc9a880ffa060
++69 add240606f6aac0e
++70 aefb8495947287f9
++71 e158b978a7e1d8c2
++72 717fcb17b8da2d19
++73 74970c1049a2c354
++74 1a9c36d568ab4147
++75 58e0eacd6aae1791
++76 2364dcfa4c2b281d
++77 2f3b61e806928b4d
++78 bd7efe059c4e2cea
++79 c35e76bdbd9e60a9
++80 13503f4f5ec66687
++81 a1f8d9f5eac60690
++82 7c6fd88ae6a11039
++83 aa3d735e6468e2d0
++84 568c53acb0eb9fe4
++85 262bad055a95ce18
++86 697a924632179a7b
++87 b89eed52f9ce4a45
++88 7e83a5ace68cccc4
++89 5d9feceef93c2d3f
++90 5f79ca5012098c9c
++91 8bef6c5115cdc413
++92 06c97fe570b4ed6a
++93 b833d12baef52b93
++94 00e21e1d7756c32c
++95 690e2d8c1e5743c5
++96 a594177b3b8d044b
++97 466a692948c785d1
++98 9267a1e0a85cdc1d
++99 abbdc6324e8b77e3
++100 b178e4110a9cfe51
+diff --git a/goldens/draw.log.bin b/goldens/draw.log.bin
+new file mode 100644
+index 0000000..b3d1a56
+Binary files /dev/null and b/goldens/draw.log.bin differ
+diff --git a/goldens/draw.t1 b/goldens/draw.t1
+new file mode 100644
+index 0000000..ef46410
+--- /dev/null
++++ b/goldens/draw.t1
+@@ -0,0 +1,67 @@
++# t1 manifest — per-tick FNV-1a-64 state hashes (full sim state)
++t1 1
++demo draw
++seed 42
++logic_hz 20
++catalog_hash 84bee62d4822d70b
++ticks 60
++1 6236a81988230145
++2 3884a893d32d653d
++3 b5a238a100511da0
++4 5e3e33d3972acbd2
++5 6ffb2720217d440e
++6 0345e261af7cdc44
++7 58961b89ae8c3e2b
++8 d63d8be91b0a6d81
++9 115c495e7e4512d5
++10 d8e7af06b681b25b
++11 337d85396330b850
++12 267875553574d433
++13 d3dc5861fec6050e
++14 72934b0c602d2147
++15 231b71d045b418cc
++16 c95c731f85d4856f
++17 361fd1eb2c2fb886
++18 b0d54db4a5ce1862
++19 e2fca1eda743247e
++20 b3ffaeb3bea65831
++21 e56f2ec1ee47698f
++22 9a0cab001616105f
++23 86f489c729cfd6a9
++24 76d143350bcd334b
++25 4c89ec77c11e1b1a
++26 9014197d96d9788e
++27 6de7738828cd449b
++28 502adf7fa593c1bd
++29 a2be6874dbaf1f21
++30 5fb98b6c92002627
++31 9831509cfd260ba9
++32 fc598bee058462cd
++33 c5996459134fa8f7
++34 2ed2f0519e470fd9
++35 7fc14763ec674df9
++36 a334ef6494b6fe5f
++37 4c272a619f99d7b7
++38 c7819fb47b597930
++39 7217808a8852670b
++40 d3071513e03be064
++41 4b47ad58abd3318e
++42 d85f6255ecee8fd2
++43 308a5df46268194c
++44 a4b51b01fbf5372c
++45 60eb608e559665e0
++46 f2cff50bd56222eb
++47 0346891af00ec159
++48 e84716dde264c60b
++49 8ad56e06cd295ccc
++50 d0320d76a00fa37f
++51 272721be3b394eba
++52 be302824a97c667a
++53 516fc38ec9e71c89
++54 2e3bb7be58764396
++55 ce1f7bb178ed310b
++56 280cff5231c65e61
++57 bb8090edaa71e4b8
++58 0ad165bb34b10696
++59 74d50b783f72d63d
++60 ad9afb6b70f55cea
+diff --git a/goldens/draw/02500ms.png b/goldens/draw/02500ms.png
+new file mode 100644
+index 0000000..6195c76
+Binary files /dev/null and b/goldens/draw/02500ms.png differ
+diff --git a/harness/catalogs.odin b/harness/catalogs.odin
+new file mode 100644
+index 0000000..371ae14
+--- /dev/null
++++ b/harness/catalogs.odin
+@@ -0,0 +1,53 @@
++package main
++
++// catalogs.odin — the harness's file-IO + fixture setup. Core is pure (no file
++// I/O — ODN-1), so the harness owns reading data/*.json into bytes and handing
++// them to core's catalogs_load. It also owns seeding the static 1.2 fixture
++// (the hardcoded 3-node map) — run setup that, like the seed, is re-created
++// identically on every replay (NOT part of the action log).
++
++import "core:fmt"
++import "core:os"
++import pp "../core"
++
++// load_catalogs — read the sim-relevant catalogs from data/ and parse them into
++// the caller-owned cat. Returns "" on success, a one-line error otherwise.
++// (palette.json is cosmetic — the render layer loads it, not core.)
++load_catalogs :: proc(cat: ^pp.Catalogs) -> string {
++	src: pp.Catalog_Sources
++	nt, e1 := os.read_entire_file_from_path("data/node_types.json", context.temp_allocator)
++	if e1 != nil { return fmt.tprintf("cannot read data/node_types.json: %v", e1) }
++	pt, e2 := os.read_entire_file_from_path("data/pipe_tiers.json", context.temp_allocator)
++	if e2 != nil { return fmt.tprintf("cannot read data/pipe_tiers.json: %v", e2) }
++	bal, e3 := os.read_entire_file_from_path("data/balance.json", context.temp_allocator)
++	if e3 != nil { return fmt.tprintf("cannot read data/balance.json: %v", e3) }
++	src.node_types = nt
++	src.pipe_tiers = pt
++	src.balance = bal
++	cerr := pp.catalogs_load(cat, &src)
++	if cerr.file != "" {
++		return pp.catalog_error_string(cerr)
++	}
++	return ""
++}
++
++// The 1.2 static fixture: residential(0) ← router(1) → content_host(2), on row
++// y=15, 12 tiles apart. Both spans fit the 'standard' tier (max 14). The player
++// (or demo) draws residential→router then router→content_host. The fixture is
++// DETERMINISTIC — identical positions every replay — so it never needs to ride
++// in the action log (run setup, like the seed).
++//
++// Returns the three node ids in spawn order.
++FIXTURE_RES_POS :: [2]i32{8, 15}
++FIXTURE_RT_POS :: [2]i32{20, 15}
++FIXTURE_HOST_POS :: [2]i32{32, 15}
++
++seed_fixture :: proc(state: ^pp.Run_State, cat: ^pp.Catalogs) -> (u32, u32, u32) {
++	res_idx, _ := pp.node_type_index(cat, "residential")
++	rt_idx, _ := pp.node_type_index(cat, "router_basic")
++	host_idx, _ := pp.node_type_index(cat, "content_host")
++	r := pp.topology_spawn_node(&state.topology, res_idx, FIXTURE_RES_POS, cat)
++	g := pp.topology_spawn_node(&state.topology, rt_idx, FIXTURE_RT_POS, cat)
++	h := pp.topology_spawn_node(&state.topology, host_idx, FIXTURE_HOST_POS, cat)
++	return r, g, h
++}
+diff --git a/harness/demo.odin b/harness/demo.odin
+index c8b8f89..d94929b 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -1,30 +1,44 @@
+ package main
+ 
+-// demo.odin — the scripted-demo model + parser (arch §10.3). A demo is a
+-// header (seed) + a run length (ms) + expectations; it lowers to an action
+-// log through the real core path (the harness plays intents through the
+-// Command_Bus in 1.2; for the 1.1 spine boot.dem has no commands).
++// demo.odin — the scripted-demo model + parser (arch §10.3). A demo is a header
++// (seed) + a run length (ms) + expectations + draw intents (lowered to the
++// action log through the real core path) + T2 capture times. It lowers to an
++// action log via the SAME Input→Command_Bus→core path a mouse drives (the
++// harness resolves the intent to a post-validation Command); the resulting log
++// IS the replay artifact (ODN-11).
+ //
+-// Time: demo `run` is authored in ms and converted to ticks by
+-// floor(ticks = run_ms * logic_hz / 1000) — the spine ticks directly (no
+-// frame loop / no rendering); the 1/60s virtual clock + floor-to-frame
+-// capture quantization lands with T2 (story 1.2+).
++// Time: demo `run` is authored in ms; apply_tick = floor(at_ms × logic_hz /
++// 1000) + 1 (the edit fast-path convention: apply at the NEXT tick boundary so
++// live and replay converge). The 1/60s virtual-clock frame loop lands with the
++// full render path; 1.2 ticks the harness directly from the intent times.
+ 
+ import "core:fmt"
+ import "core:strconv"
+ import "core:strings"
+ 
++Draw_Intent :: struct {
++	at_ms: i64,
++	a:     u32, // fixture node id (0=residential, 1=router, 2=content_host)
++	b:     u32,
++	tier:  string, // pipe_tiers id (narrow/standard/wide); default "standard"
++}
++
+ Demo :: struct {
+-	name:             string,
+-	seed:             u64,
+-	run_ms:           i64,
++	name:               string,
++	seed:               u64,
++	run_ms:             i64,
+ 	expect_hash_stable: bool,
++	draws:              [dynamic]Draw_Intent,
++	captures:           [dynamic]i64, // T2 capture times (ms)
+ }
+ 
+-// parse_demo — line-based; `seed <n>`, `run <n>ms`, `expect hash stable`.
+-// Returns "" on success, a one-line error otherwise.
++// parse_demo — line-based; `seed <n>`, `run <n>ms`, `expect hash stable`,
++// `at <n>ms draw <from> <to> <tier>`, `capture at <n>ms`. Returns "" on
++// success, a one-line error otherwise.
+ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 	d := Demo{name = name}
++	d.draws = make([dynamic]Draw_Intent, 0, 8, context.allocator)
++	d.captures = make([dynamic]i64, 0, 8, context.allocator)
+ 	for raw in strings.split(text, "\n", context.temp_allocator) {
+ 		line := strings.trim_space(raw)
+ 		if len(line) == 0 || line[0] == '#' {
+@@ -59,9 +73,34 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 			} else {
+ 				return {}, fmt.tprintf("unknown expect: %s", line)
+ 			}
++		case "at":
++			// at <n>ms draw <from> <to> <tier>
++			if len(fields) < 6 || fields[2] != "draw" {
++				return {}, fmt.tprintf("bad at-line (want: at <n>ms draw <from> <to> <tier>): %s", line)
++			}
++			ms, ok := parse_ms(fields[1])
++			if !ok {
++				return {}, fmt.tprintf("bad at-time: %q", fields[1])
++			}
++			fa, oka := strconv.parse_uint(fields[3], 10)
++			fb, okb := strconv.parse_uint(fields[4], 10)
++			if !oka || !okb {
++				return {}, fmt.tprintf("bad draw endpoints: %s", line)
++			}
++			append(&d.draws, Draw_Intent{at_ms = ms, a = u32(fa), b = u32(fb), tier = fields[5]})
++		case "capture":
++			// capture at <n>ms
++			if len(fields) < 3 || fields[1] != "at" {
++				return {}, fmt.tprintf("bad capture (want: capture at <n>ms): %s", line)
++			}
++			ms, ok := parse_ms(fields[2])
++			if !ok {
++				return {}, fmt.tprintf("bad capture time: %q", fields[2])
++			}
++			append(&d.captures, ms)
+ 		case:
+-			// forward-compat: silently skip future verbs (map, capture, at, …)
+-			// so a 1.2+ demo doesn't hard-fail the 1.1 harness. T1 is the spine.
++			// forward-compat: silently skip future verbs so a later demo doesn't
++			// hard-fail the harness.
+ 		}
+ 	}
+ 	if d.run_ms <= 0 {
+@@ -86,3 +125,9 @@ parse_ms :: proc(s: string) -> (i64, bool) {
+ demo_run_ticks :: proc(d: ^Demo, logic_hz: i32) -> u64 {
+ 	return u64(max(0, i64(d.run_ms) * i64(logic_hz) / 1000))
+ }
++
++// intent_apply_tick — the edit fast-path convention: a draw fired at at_ms
++// applies at the NEXT tick boundary (floor(at_ms*hz/1000) + 1).
++intent_apply_tick :: proc(d: ^Draw_Intent, logic_hz: i32) -> u64 {
++	return u64(max(0, i64(d.at_ms) * i64(logic_hz) / 1000)) + 1
++}
+diff --git a/harness/drift.odin b/harness/drift.odin
+new file mode 100644
+index 0000000..67f8bfe
+--- /dev/null
++++ b/harness/drift.odin
+@@ -0,0 +1,124 @@
++package main
++
++// drift.odin — the W1 carry-forward from #21: a CI-exercised NEGATIVE test that
++// a deliberately-drifted action log is REJECTED by the replay gate (the #599-r2
++// / verification-gap lesson — the gate's "rejects drift" must be PROVEN in CI,
++// not just asserted locally). For each drift mutation we write the mutated
++// bytes to a temp file and run the REAL replay gate (replay_hashes) against it;
++// every mutation MUST be rejected. If any drift is accepted, the gate is broken
++// and drift_check returns non-zero.
++
++import "core:fmt"
++import "core:os"
++import pp "../core"
++
++// drift_check — for every demo with a blessed log, mutate the log bytes six
++// ways and assert the replay gate rejects each. Returns 0 if every drift was
++// rejected, 1 otherwise.
++drift_check :: proc(cat: ^pp.Catalogs) -> i32 {
++	names, ok := list_demos()
++	if !ok {
++		fmt.eprintln("drift-check: no demos/ directory")
++		return 2
++	}
++	bad := 0
++	checked := 0
++	for name in names {
++		lpath := log_path(name)
++		if !os.exists(lpath) {
++			continue
++		} // skip demos without a blessed log
++		data, err := os.read_entire_file_from_path(lpath, context.allocator)
++		if err != nil {
++			fmt.eprintfln("drift-check: %s: cannot read log: %v", name, err)
++			bad += 1
++			continue
++		}
++		man, okm := read_manifest(manifest_path(name))
++		if !okm {
++			fmt.eprintfln("drift-check: %s: no manifest (bless first)", name)
++			bad += 1
++			continue
++		}
++		ticks := u64(man.ticks)
++
++		mutations := make_drift_mutations(data)
++		for m in mutations {
++			checked += 1
++			tmp := fmt.tprintf("/tmp/pp-drift-%s-%s.bin", name, m.label)
++			if werr := os.write_entire_file(tmp, m.bytes); werr != nil {
++				fmt.eprintfln("drift-check: %s: cannot write %s: %v", name, tmp, werr)
++				bad += 1
++				continue
++			}
++			fails := make([dynamic]string, context.temp_allocator)
++			_, accepted := replay_hashes(tmp, cat, ticks, &fails)
++			delete(fails)
++			if accepted {
++				// the gate ACCEPTED a drifted log — this is the failure we're
++				// here to catch (the gate must REJECT every one of these).
++				fmt.eprintfln("drift-check: %s: FAIL — gate ACCEPTED drifted log (%s)", name, m.label)
++				bad += 1
++			} else {
++				fmt.printf("  drift %-14s %-16s rejected (OK)\n", name, m.label)
++			}
++			os.remove(tmp)
++		}
++		free_all(context.temp_allocator)
++	}
++	if checked == 0 {
++		fmt.eprintln("drift-check: no blessed logs found to mutate (run `harness save` first)")
++		return 2
++	}
++	if bad > 0 {
++		fmt.eprintfln("drift-check: %d/%d mutation(s) NOT rejected — the replay gate is broken", bad, checked)
++		return 1
++	}
++	fmt.eprintfln("drift-check: %d mutation(s) across %d demo(s) all rejected — gate bites (ODN-11)", checked, len(names))
++	return 0
++}
++
++Mutation :: struct {
++	label: string,
++	bytes: []u8,
++}
++
++// mutated — clone src into a new []u8, apply the mutation, return it wrapped.
++// (Module-level so the mutation proc literal doesn't need to capture src —
++// Odin nested procs are non-capturing.)
++mutated :: proc(src: []u8, label: string, mutate: proc(b: []u8)) -> Mutation {
++	c := make([dynamic]u8, len(src), context.temp_allocator)
++	copy(c[:], src)
++	mutate(c[:])
++	return {label = label, bytes = c[:]}
++}
++
++// make_drift_mutations — the six drift classes the replay gate must reject:
++//   catalog_hash / logic_hz header drift (the ODN-11 binding), magic + version
++//   + unknown-tag corruption (log_read rejects), and truncation.
++make_drift_mutations :: proc(src: []u8) -> [dynamic]Mutation {
++	out := make([dynamic]Mutation, 0, 6, context.temp_allocator)
++	// catalog_hash occupies bytes 17..24 (after magic4 + ver4 + seed8 + era1).
++	if len(src) > 24 {
++		append(&out, mutated(src, "catalog_hash", proc(b: []u8) { b[17] ~= 0xFF }))
++	}
++	// logic_hz occupies bytes 25..28.
++	if len(src) > 28 {
++		append(&out, mutated(src, "logic_hz", proc(b: []u8) { b[25] ~= 0x01 }))
++	}
++	if len(src) > 0 {
++		append(&out, mutated(src, "bad_magic", proc(b: []u8) { b[0] ~= 0xFF }))
++	}
++	if len(src) > 4 {
++		append(&out, mutated(src, "bad_version", proc(b: []u8) { b[4] = 99 }))
++	}
++	// unknown command tag (byte 41 = header 33 + apply_tick 8).
++	if len(src) > 41 {
++		append(&out, mutated(src, "bad_tag", proc(b: []u8) { b[41] = 0xFF }))
++	}
++	// truncation — drop the last byte.
++	trunc := make([dynamic]u8, len(src)-1, context.temp_allocator)
++	copy(trunc[:], src[:len(src)-1])
++	append(&out, Mutation{label = "truncated", bytes = trunc[:]})
++	return out
++}
+diff --git a/harness/goldens.odin b/harness/goldens.odin
+new file mode 100644
+index 0000000..f490734
+--- /dev/null
++++ b/harness/goldens.odin
+@@ -0,0 +1,213 @@
++package main
++
++// goldens.odin — T2 pixel-golden capture + compare + bless + agent-readable
++// diff bundles (arch §10.2/§10.4/§10.5). Zero-tolerance compare on DECODED
++// pixels (never file bytes); the rlsw readback is normalized (vertical flip +
++// BGRA→RGBA swizzle) before compare/export so the compare is byte-exact.
++//
++// T1 (state-hash manifests) lives in manifest.odin. T2 here renders the world
++// pass to the rlsw memory framebuffer (no GPU/display), reads it back, and
++// compares against the blessed PNG.
++
++import "core:fmt"
++import "core:os"
++import "core:strings"
++import rl "vendor:raylib"
++import pp "../core"
++import rnd "../app/render"
++
++Report :: struct {
++	demo:      string,
++	diff_dirs: [dynamic]string,
++}
++
++// Render_Ctx — the harness's render setup: the palette + camera-fit view +
++// whether the rlsw window was initialized. Owned by main, passed to run_demo.
++Render_Ctx :: struct {
++	palette: rnd.Palette,
++	view:    rnd.View,
++	ready:   bool,
++}
++
++// render_setup — load the palette + compute the camera-fit view. Does NOT init
++// raylib (the caller inits the window once for the whole harness run).
++render_setup :: proc(rc: ^Render_Ctx, cat: ^pp.Catalogs) {
++	rc.palette = rnd.palette_load()
++	rc.view.palette = &rc.palette
++	rc.view.catalogs = cat
++	rnd.view_compute(&rc.view, 1280, 720, &cat.balance)
++	rc.ready = true
++}
++
++// --- T2 capture -----------------------------------------------------------------
++
++// Render the world pass headless and read back normalized RGBA pixels. The
++// drag state defaults to {} (no active drag) — the golden frame is a settled
++// drawn-pipe state, not a mid-drag preview (so no HUD text is captured).
++capture_frame :: proc(rc: ^Render_Ctx, topo: ^pp.Topology) -> rl.Image {
++	rl.BeginDrawing()
++	rnd.draw_world(&rc.view, topo, {})
++	rl.EndDrawing()
++	img := rl.LoadImageFromScreen()
++	rl.ImageFlipVertical(&img) // framebuffer readback is bottom-up
++	swizzle_rb(&img)           // rlsw framebuffer is BGRA
++	return img
++}
++
++swizzle_rb :: proc(img: ^rl.Image) {
++	px := rl.LoadImageColors(img^)
++	n := int(img.width) * int(img.height)
++	for i in 0..<n {
++		px[i].r, px[i].b = px[i].b, px[i].r
++	}
++	// build the normalized image struct around the swizzled pixels
++	new_img: rl.Image
++	new_img.data = raw_data(px)
++	new_img.width = img.width
++	new_img.height = img.height
++	new_img.mipmaps = 1
++	new_img.format = .UNCOMPRESSED_R8G8B8A8
++	rl.UnloadImage(img^) // frees the old buffer only (we keep px)
++	img^ = new_img
++}
++
++golden_path :: proc(demo: string, ms: i64) -> string {
++	return fmt.tprintf("goldens/%s/%05dms.png", demo, ms)
++}
++
++write_golden :: proc(demo: string, ms: i64, img: rl.Image) {
++	dir := fmt.tprintf("goldens/%s", demo)
++	mkdir_p(dir)
++	path := golden_path(demo, ms)
++	cpath := strings.clone_to_cstring(path, context.temp_allocator)
++	ok := rl.ExportImage(img, cpath)
++	if !ok {
++		fmt.eprintfln("harness: failed to write %s", path)
++	}
++	rl.UnloadImage(img)
++}
++
++check_golden :: proc(demo: string, ms: i64, img: rl.Image, report: ^Report, fails: ^[dynamic]string) {
++	path := golden_path(demo, ms)
++	if !os.exists(path) {
++		append(fails, fmt.tprintf("T2 %dms: no golden (run `harness save %s` to bless)", ms, demo))
++		append(&report.diff_dirs, save_diff_bundle(demo, ms, img, {}))
++		rl.UnloadImage(img)
++		return
++	}
++	golden := rl.LoadImage(strings.clone_to_cstring(path, context.temp_allocator))
++	mismatch, total, bbox := compare_images(golden, img)
++	if mismatch < 0 {
++		// undecodable or dimension-drifted golden — the pixel tier must fail
++		// loudly, never pass on nothing (review r1 blocker).
++		dir := save_diff_bundle(demo, ms, img, {})
++		append(&report.diff_dirs, dir)
++		append(fails, fmt.tprintf("T2 %dms: golden corrupt or wrong size — cannot compare (re-bless deliberately)", ms))
++	} else if mismatch > 0 {
++		dir := save_diff_bundle(demo, ms, img, golden)
++		append(&report.diff_dirs, dir)
++		append(fails, fmt.tprintf("T2 %dms: %d/%d pixels differ (bbox %v) — diff bundle at %s",
++			ms, mismatch, total, bbox, dir))
++	} else {
++		rl.UnloadImage(img)
++	}
++	rl.UnloadImage(golden)
++}
++
++compare_images :: proc(a, b: rl.Image) -> (mismatched: int, total: int, bbox: [4]int) {
++	if a.width != b.width || a.height != b.height {
++		return -1, 0, {}
++	}
++	pa := rl.LoadImageColors(a)
++	pb := rl.LoadImageColors(b)
++	defer rl.UnloadImageColors(pa)
++	defer rl.UnloadImageColors(pb)
++	total = int(a.width) * int(a.height)
++	bbox = {1 << 30, 1 << 30, -1, -1}
++	for i in 0..<total {
++		if pa[i] != pb[i] {
++			mismatched += 1
++			x := i % int(a.width)
++			y := i / int(a.width)
++			bbox[0] = min(bbox[0], x)
++			bbox[1] = min(bbox[1], y)
++			bbox[2] = max(bbox[2], x)
++			bbox[3] = max(bbox[3], y)
++		}
++	}
++	return mismatched, total, bbox
++}
++
++// expected/actual/diff + diff.json (§10.5 — the agent's entry point on mismatch)
++save_diff_bundle :: proc(demo: string, ms: i64, actual: rl.Image, expected: rl.Image) -> string {
++	dir := fmt.tprintf("goldens/_reports/%s/latest", demo)
++	mkdir_p(dir)
++	base := fmt.tprintf("%05dms", ms)
++	mkdir_p(fmt.tprintf("%s/%s", dir, base))
++	rl.ExportImage(actual, strings.clone_to_cstring(fmt.tprintf("%s/%s/actual.png", dir, base), context.temp_allocator))
++	if expected.width > 0 {
++		rl.ExportImage(expected, strings.clone_to_cstring(fmt.tprintf("%s/%s/expected.png", dir, base), context.temp_allocator))
++		pa := rl.LoadImageColors(expected)
++		pb := rl.LoadImageColors(actual)
++		n := int(expected.width) * int(expected.height)
++		out := make([]rl.Color, n, context.temp_allocator)
++		mismatch, total, bbox := compare_images(expected, actual)
++		for i in 0..<n {
++			if pa[i] != pb[i] {
++				out[i] = {255, 0, 0, 255} // red overlay on change
++			} else {
++				out[i] = {u8(u16(pa[i].r)/3), u8(u16(pa[i].g)/3), u8(u16(pa[i].b)/3), 255}
++			}
++		}
++		dimg: rl.Image
++		dimg.data = raw_data(out)
++		dimg.width = expected.width
++		dimg.height = expected.height
++		dimg.mipmaps = 1
++		dimg.format = .UNCOMPRESSED_R8G8B8A8
++		rl.ExportImage(dimg, strings.clone_to_cstring(fmt.tprintf("%s/%s/diff.png", dir, base), context.temp_allocator))
++		// NOTE: never UnloadImage(dimg) — dimg.data is the Odin temp arena's,
++		// not raylib's; unloading would free a non-raylib pointer.
++		rl.UnloadImageColors(pa)
++		rl.UnloadImageColors(pb)
++		js := fmt.tprintf(`{"frame_ms": %d, "mismatched_pixels": %d, "total_pixels": %d, "bounding_box": [%d, %d, %d, %d]}`,
++			ms, mismatch, total, bbox[0], bbox[1], bbox[2], bbox[3])
++		write_file(fmt.tprintf("%s/%s/diff.json", dir, base), transmute([]u8)js)
++	} else {
++		js := fmt.tprintf(`{"frame_ms": %d, "note": "no golden existed"}`, ms)
++		write_file(fmt.tprintf("%s/%s/diff.json", dir, base), transmute([]u8)js)
++	}
++	return fmt.tprintf("%s/%s", dir, base)
++}
++
++write_report :: proc(report: ^Report, fails: [dynamic]string) {
++	if len(report.diff_dirs) == 0 && len(fails) == 0 {
++		return
++	}
++	dir := fmt.tprintf("goldens/_reports/%s", report.demo)
++	mkdir_p(dir)
++	sb := strings.builder_make(context.temp_allocator)
++	strings.write_string(&sb, "# harness report\n")
++	for f in fails {
++		strings.write_string(&sb, "- ")
++		strings.write_string(&sb, f)
++		strings.write_string(&sb, "\n")
++	}
++	write_file(fmt.tprintf("%s/REPORT.txt", dir), transmute([]u8)strings.to_string(sb))
++}
++
++// recursive mkdir (os.make_directory is single-level)
++mkdir_p :: proc(path: string) {
++	parts := strings.split(path, "/", context.temp_allocator)
++	cur: [dynamic]u8
++	for part, i in parts {
++		if i > 0 {
++			append(&cur, '/')
++		}
++		for c in part {
++			append(&cur, u8(c))
++		}
++		os.make_directory(string(cur[:]))
++	}
++	delete(cur)
++}
+diff --git a/harness/main.odin b/harness/main.odin
+index 1c0494e..4009e5f 100644
+--- a/harness/main.odin
++++ b/harness/main.odin
+@@ -1,19 +1,22 @@
+ package main
+ 
+-// main.odin — the golden-image harness CLI (ODN-17). Headless for Story 1.1
+-// (no window, no raylib — the determinism spine is proven before any view;
+-// lavish choice 2B). The first runnable app.bin + T2 pixel goldens land in
+-// 1.2; this harness already links the SAME package core and exercises T1 +
+-// the replay gate.
++// main.odin — the golden-image harness CLI (ODN-17). Story 1.2 widens it from
++// the 1.1 headless T1-only spine to the full T1+T2 + W1 drift-rejection path:
++// it links the SAME package core + the SAME render package as the game, inits
++// the rlsw software renderer headless (no GPU/display), and exercises T1 state
++// hashes, the replay gate, T2 pixel goldens, and the W1 drift negative test.
+ //
+ // Usage:
+-//   odin run harness -- run [demo...]    replay demos; T1 + replay gate; non-zero on failure
+-//   odin run harness -- save [demo...]   re-bless goldens (deliberate; PR-reviewed)
+-//   odin run harness -- replay <demo> <log.bin>  re-run from an action log; manifest must match
++//   odin run harness -- run [demo...]           T1 + replay gate + T2; non-zero on failure
++//   odin run harness -- save [demo...]          re-bless goldens (deliberate; PR-reviewed)
++//   odin run harness -- replay <demo> <log.bin> re-run from an action log; manifest must match
++//   odin run harness -- drift-check             W1: deliberately-drifted logs must be REJECTED
+ 
+ import "core:fmt"
+ import "core:os"
+ import "core:strings"
++import rl "vendor:raylib"
++import pp "../core"
+ 
+ main :: proc() {
+ 	args := os.args[1:]
+@@ -27,7 +30,24 @@ main :: proc() {
+ 		if len(rest) != 2 {
+ 			usage()
+ 		}
+-		os.exit(int(run_replay(rest[0], rest[1])))
++		cat: pp.Catalogs
++		if e := load_catalogs(&cat); e != "" {
++			fmt.eprintfln("harness replay: %s", e)
++			os.exit(2)
++		}
++		code := run_replay(rest[0], rest[1], &cat)
++		pp.catalogs_destroy(&cat)
++		os.exit(int(code))
++	}
++	if verb == "drift-check" {
++		cat: pp.Catalogs
++		if e := load_catalogs(&cat); e != "" {
++			fmt.eprintfln("drift-check: %s", e)
++			os.exit(2)
++		}
++		code := drift_check(&cat)
++		pp.catalogs_destroy(&cat)
++		os.exit(int(code))
+ 	}
+ 	if verb != "run" && verb != "save" {
+ 		usage()
+@@ -37,8 +57,8 @@ main :: proc() {
+ 	collected: [dynamic]string
+ 	defer delete(collected)
+ 	if len(names) == 0 {
+-		entries, err := list_demos()
+-		if err != nil {
++		entries, ok := list_demos()
++		if !ok {
+ 			fmt.eprintln("harness: no demos/ directory")
+ 			os.exit(2)
+ 		}
+@@ -52,15 +72,31 @@ main :: proc() {
+ 		names = collected[:]
+ 	}
+ 
++	// load catalogs once (catalog_hash + logic_hz bind the replay gate — ODN-11)
++	cat: pp.Catalogs
++	if e := load_catalogs(&cat); e != "" {
++		fmt.eprintfln("harness: %s", e)
++		os.exit(2)
++	}
++	defer pp.catalogs_destroy(&cat)
++
++	// headless software renderer, once for the whole run (rlsw + PLATFORM_MEMORY
++	// — bit-exact pixels on every machine, no GPU/display).
++	rl.SetTraceLogLevel(.ERROR)
++	rl.InitWindow(1280, 720, "pp-harness")
++	defer rl.CloseWindow()
++
++	rc: Render_Ctx
++	render_setup(&rc, &cat)
++
+ 	failures := 0
+ 	for name in names {
+-		ok := run_demo(name, verb == "save")
++		ok := run_demo(name, verb == "save", &cat, &rc)
+ 		if !ok {
+ 			failures += 1
+ 		}
+ 		free_all(context.temp_allocator)
+ 	}
+-
+ 	if verb == "save" {
+ 		if failures > 0 {
+ 			fmt.printf("harness: %d demo(s) FAILED during bless\n", failures)
+@@ -77,26 +113,26 @@ main :: proc() {
+ }
+ 
+ usage :: proc() {
+-	fmt.eprintln("usage: harness run|save [demo...] | replay <demo> <log.bin>")
++	fmt.eprintln("usage: harness run|save [demo...] | replay <demo> <log.bin> | drift-check")
+ 	os.exit(2)
+ }
+ 
+ // list_demos — names (without .dem) of every demo in demos/.
+-list_demos :: proc() -> ([]string, os.Error) {
++list_demos :: proc() -> ([]string, bool) {
+ 	out: [dynamic]string
+ 	f, err := os.open("demos")
+ 	if err != nil {
+-		return {}, err
++		return {}, false
+ 	}
+ 	entries, derr := os.read_dir(f, -1, context.temp_allocator)
+ 	os.close(f)
+ 	if derr != nil {
+-		return {}, derr
++		return {}, false
+ 	}
+ 	for e in entries {
+ 		if strings.has_suffix(e.name, ".dem") {
+ 			append(&out, strings.clone(e.name[:len(e.name)-4], context.allocator))
+ 		}
+ 	}
+-	return out[:], nil
++	return out[:], true
+ }
+diff --git a/harness/run.odin b/harness/run.odin
+index c745190..c21807a 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -1,55 +1,45 @@
+ package main
+ 
+-// run.odin — the harness run/replay engine (arch §10, ODN-17). Headless for
+-// Story 1.1: no window, no raylib, T1 only. Loads the catalogs (resolving the
+-// catalog_hash + logic_hz the replay gate binds to — ODN-11), plays a demo
+-// through the real core, records per-tick T1 state hashes, compares to the
+-// blessed manifest (run) / blesses it (save), and runs the replay gate (the
+-// blessed action log must re-sim the manifest bit-for-bit; catalog/logic_hz
+-// drift is a defined rejection).
+-
+-import "core:encoding/json"
++// run.odin — the harness run/replay engine (arch §10, ODN-17). Loads the
++// catalogs once (the catalog_hash + logic_hz the replay gate binds to —
++// ODN-11), plays a demo through the real core (seeding the static fixture,
++// lowering draw intents to the action log), records per-tick T1 state hashes,
++// compares to the blessed manifest (run) / blesses it (save), and runs the
++// replay gate (the blessed action log must re-sim the manifest bit-for-bit;
++// catalog/logic_hz drift is a defined rejection).
++
+ import "core:fmt"
+ import "core:os"
+ import pp "../core"
+ 
+-Catalogs :: struct {
+-	hash:     u64,
+-	logic_hz: i32,
+-}
+-
+-// The subset of data/balance.json the spine parses (ODN-5: JSON single
+-// source, integer-only sim values). Other fields ride in catalog_hash.
+-Balance_File :: struct {
+-	logic_hz: i32,
++log_path :: proc(demo: string) -> string {
++	return fmt.tprintf("goldens/%s.log.bin", demo)
+ }
+ 
+-// load_catalogs — read data/balance.json, FNV-1a-64 its bytes (catalog_hash),
+-// parse logic_hz. Core is pure (no file I/O — ODN-1), so the harness resolves
+-// both and hands them to run_init.
+-load_catalogs :: proc() -> (Catalogs, string) {
+-	data, err := os.read_entire_file_from_path("data/balance.json", context.temp_allocator)
+-	if err != nil {
+-		return {}, fmt.tprintf("cannot read data/balance.json: %v", err)
+-	}
+-	bal: Balance_File
+-	if jerr := json.unmarshal(data, &bal); jerr != nil {
+-		return {}, fmt.tprintf("bad data/balance.json: %v", jerr)
+-	}
+-	if bal.logic_hz <= 0 || bal.logic_hz > 1000 {
+-		return {}, fmt.tprintf("logic_hz %d out of range (1..1000)", bal.logic_hz)
++// lower_intents — convert a demo's draw intents to validated Commands appended
++// to the run's action log. The tier name resolves against the catalog; an
++// unknown tier is a demo-authoring error (fail loud, never silent).
++lower_intents :: proc(state: ^pp.Run_State, demo: ^Demo, cat: ^pp.Catalogs) -> string {
++	for i in 0..<len(demo.draws) {
++		d := &demo.draws[i]
++		tier_idx, ok := pp.pipe_tier_index(cat, d.tier)
++		if !ok {
++			return fmt.tprintf("demo %s: unknown pipe tier %q", demo.name, d.tier)
++		}
++		apply_tick := intent_apply_tick(d, cat.balance.logic_hz)
++		append(&state.action_log, pp.Command{
++			apply_tick = apply_tick,
++			kind = pp.Cmd_Draw_Pipe{a = d.a, b = d.b, tier = tier_idx},
++		})
+ 	}
+-	return Catalogs{hash = pp.fnv1a64(data), logic_hz = bal.logic_hz}, ""
+-}
+-
+-log_path :: proc(demo: string) -> string {
+-	return fmt.tprintf("goldens/%s.log.bin", demo)
++	return ""
+ }
+ 
+ // run_demo — play a demo through the real core, record per-tick T1 hashes,
+-// compare to the blessed manifest (run) or bless it (save), and run the
+-// replay gate (the blessed log must reproduce the manifest bit-for-bit).
+-run_demo :: proc(name: string, save: bool) -> bool {
++// compare to the blessed manifest (run) or bless it (save), run the replay
++// gate (the blessed log must reproduce the manifest bit-for-bit), and capture
++// T2 pixel goldens at each `capture at <ms>` (rendered via the rlsw link).
++run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -> bool {
+ 	path := fmt.tprintf("demos/%s.dem", name)
+ 	text_bytes, rerr := os.read_entire_file_from_path(path, context.temp_allocator)
+ 	if rerr != nil {
+@@ -61,58 +51,80 @@ run_demo :: proc(name: string, save: bool) -> bool {
+ 		fmt.eprintfln("harness: %s: parse error: %s", path, perr)
+ 		return false
+ 	}
+-	catalogs, cerr := load_catalogs()
+-	if cerr != "" {
+-		fmt.eprintfln("harness: %s", cerr)
+-		return false
++	defer {
++		delete(demo.draws)
++		delete(demo.captures)
+ 	}
+ 
+ 	state: pp.Run_State
+ 	defer pp.run_destroy(&state)
+-	pp.run_init(&state, demo.seed, catalogs.hash, catalogs.logic_hz)
++	pp.run_init(&state, demo.seed, cat.hash, cat.balance.logic_hz)
++	seed_fixture(&state, cat)
++	if e := lower_intents(&state, &demo, cat); e != "" {
++		fmt.eprintfln("harness: %s", e)
++		return false
++	}
+ 
+-	ticks := demo_run_ticks(&demo, catalogs.logic_hz)
++	report := Report{demo = name}
++	fails: [dynamic]string
++	defer delete(fails)
++
++	hz := cat.balance.logic_hz
++	ticks := demo_run_ticks(&demo, hz)
+ 	hashes := make([dynamic]u64, 0, ticks)
+ 	defer delete(hashes)
+ 	for tick in u64(1)..=ticks {
+ 		before := len(state.events)
+-		// gather this tick's replay commands (empty for boot.dem — no intents)
+ 		batch := make([dynamic]pp.Command, 0, 4, context.temp_allocator)
+ 		for cmd in state.action_log {
+ 			if cmd.apply_tick == tick {
+ 				append(&batch, cmd)
+ 			}
+ 		}
+-		pp.step(&state, tick, batch[:])
++		pp.step(&state, tick, batch[:], cat)
+ 		append(&hashes, pp.state_hash(&state, state.events[before:], context.temp_allocator))
+ 		clear(&state.events)
++
++		// T2 pixel goldens — render the settled topology at each capture tick
++		if rc.ready {
++			for cap_ms in demo.captures {
++				cap_tick := u64(max(0, i64(cap_ms) * i64(hz) / 1000))
++				if cap_tick == tick {
++					img := capture_frame(rc, &state.topology)
++					if save {
++						write_golden(name, cap_ms, img)
++					} else {
++						check_golden(name, cap_ms, img, &report, &fails)
++					}
++				}
++			}
++		}
++
+ 		free_all(context.temp_allocator)
+ 	}
+-
+-	fails: [dynamic]string
+-	defer delete(fails)
++	if state.replay_error {
++		fmt.eprintfln("harness: %s: replay_error latched during the run (ODN-11 critical)", name)
++		return false
++	}
+ 
+ 	if save {
+-		write_manifest(name, &demo, catalogs.hash, catalogs.logic_hz, hashes[:])
++		write_manifest(name, &demo, cat.hash, hz, hashes[:])
+ 		write_file(log_path(name), pp.log_write(&state, context.temp_allocator))
+-		fmt.printf("  save %-20s ticks=%d\n", name, len(hashes))
++		fmt.printf("  save %-20s ticks=%d captures=%d\n", name, len(hashes), len(demo.captures))
+ 		return true
+ 	}
+ 
+-	check_manifest(name, &demo, catalogs.hash, catalogs.logic_hz, hashes[:], &fails)
++	check_manifest(name, &demo, cat.hash, hz, hashes[:], &fails)
+ 
+ 	// replay gate: the blessed log must re-sim the live hashes bit-for-bit
+ 	if len(fails) == 0 {
+ 		if !os.exists(log_path(name)) {
+ 			append(&fails, fmt.tprintf("no blessed log at %s (bless with `harness save %s`)",
+ 				log_path(name), name))
+-		} else if !verify_replay(name, &catalogs, hashes[:]) {
++		} else if !verify_replay(name, cat, hashes[:]) {
+ 			append(&fails, "replay of the blessed log diverges from the manifest")
+ 		}
+ 	}
+-	if state.replay_error {
+-		append(&fails, "replay_error latched during the run (ODN-11 critical)")
+-	}
+ 
+ 	if len(fails) == 0 {
+ 		fmt.printf("  PASS %-20s ticks=%d\n", name, len(hashes))
+@@ -122,14 +134,16 @@ run_demo :: proc(name: string, save: bool) -> bool {
+ 	for m in fails {
+ 		fmt.printf("    - %s\n", m)
+ 	}
++	write_report(&report, fails)
+ 	return false
+ }
+ 
+-// replay_hashes — re-run from an action log alone. The ODN-11 replay gate:
+-// the header's catalog_hash + logic_hz must match the current catalogs (else a
+-// defined rejection, never silent divergence), then re-sim tick 1..ticks.
+-replay_hashes :: proc(lpath: string, catalogs: ^Catalogs, ticks: u64,
+-                       fails: ^[dynamic]string) -> ([dynamic]u64, bool) {
++// replay_hashes — re-run from an action log alone. The ODN-11 replay gate: the
++// header's catalog_hash + logic_hz must match the current catalogs (else a
++// defined rejection, never silent divergence), then re-sim tick 1..ticks with
++// the SAME fixture seeded.
++replay_hashes :: proc(lpath: string, cat: ^pp.Catalogs, ticks: u64,
++                      fails: ^[dynamic]string) -> ([dynamic]u64, bool) {
+ 	out := make([dynamic]u64)
+ 	data, err := os.read_entire_file_from_path(lpath, context.temp_allocator)
+ 	if err != nil {
+@@ -142,20 +156,21 @@ replay_hashes :: proc(lpath: string, catalogs: ^Catalogs, ticks: u64,
+ 		return out, false
+ 	}
+ 	defer delete(cmds)
+-	if header.catalog_hash != catalogs.hash {
++	if header.catalog_hash != cat.hash {
+ 		append(fails, fmt.tprintf("replay: catalog drift — log %016x vs current %016x (defined rejection, ODN-11)",
+-			header.catalog_hash, catalogs.hash))
++			header.catalog_hash, cat.hash))
+ 		return out, false
+ 	}
+-	if header.logic_hz != catalogs.logic_hz {
++	if header.logic_hz != cat.balance.logic_hz {
+ 		append(fails, fmt.tprintf("replay: logic_hz drift — log %d vs current %d (defined rejection, ODN-11)",
+-			header.logic_hz, catalogs.logic_hz))
++			header.logic_hz, cat.balance.logic_hz))
+ 		return out, false
+ 	}
+ 
+ 	state: pp.Run_State
+ 	defer pp.run_destroy(&state)
+-	pp.run_init(&state, header.seed, catalogs.hash, catalogs.logic_hz)
++	pp.run_init(&state, header.seed, cat.hash, cat.balance.logic_hz)
++	seed_fixture(&state, cat) // identical fixture (run setup, re-created on every replay)
+ 	for cmd in cmds {
+ 		append(&state.action_log, cmd)
+ 	}
+@@ -167,7 +182,7 @@ replay_hashes :: proc(lpath: string, catalogs: ^Catalogs, ticks: u64,
+ 				append(&batch, cmd)
+ 			}
+ 		}
+-		pp.step(&state, tick, batch[:])
++		pp.step(&state, tick, batch[:], cat)
+ 		append(&out, pp.state_hash(&state, state.events[before:], context.temp_allocator))
+ 		clear(&state.events)
+ 		free_all(context.temp_allocator)
+@@ -180,10 +195,10 @@ replay_hashes :: proc(lpath: string, catalogs: ^Catalogs, ticks: u64,
+ }
+ 
+ // verify_replay — the in-run gate: the blessed log reproduces the live hashes.
+-verify_replay :: proc(demo_name: string, catalogs: ^Catalogs, live_hashes: []u64) -> bool {
++verify_replay :: proc(demo_name: string, cat: ^pp.Catalogs, live_hashes: []u64) -> bool {
+ 	fails := make([dynamic]string, context.temp_allocator)
+ 	defer delete(fails)
+-	replayed, ok := replay_hashes(log_path(demo_name), catalogs, u64(len(live_hashes)), &fails)
++	replayed, ok := replay_hashes(log_path(demo_name), cat, u64(len(live_hashes)), &fails)
+ 	defer delete(replayed)
+ 	if !ok {
+ 		for f in fails {
+@@ -207,12 +222,7 @@ verify_replay :: proc(demo_name: string, catalogs: ^Catalogs, live_hashes: []u64
+ 
+ // run_replay — standalone: `harness replay <demo> <log.bin>`. Manifest-driven,
+ // full length; the bit-for-bit ODN-11 check.
+-run_replay :: proc(demo_name, lpath: string) -> i32 {
+-	catalogs, cerr := load_catalogs()
+-	if cerr != "" {
+-		fmt.eprintfln("harness replay: %s", cerr)
+-		return 2
+-	}
++run_replay :: proc(demo_name, lpath: string, cat: ^pp.Catalogs) -> i32 {
+ 	man, okm := read_manifest(manifest_path(demo_name))
+ 	if !okm {
+ 		fmt.eprintfln("harness replay: no manifest for %s (nothing to verify against)", demo_name)
+@@ -225,7 +235,7 @@ run_replay :: proc(demo_name, lpath: string) -> i32 {
+ 	}
+ 	fails := make([dynamic]string, context.temp_allocator)
+ 	defer delete(fails)
+-	replayed, ok := replay_hashes(lpath, &catalogs, u64(man.ticks), &fails)
++	replayed, ok := replay_hashes(lpath, cat, u64(man.ticks), &fails)
+ 	defer delete(replayed)
+ 	if !ok {
+ 		for f in fails {

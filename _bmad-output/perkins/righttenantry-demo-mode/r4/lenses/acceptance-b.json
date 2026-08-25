@@ -1,0 +1,122 @@
+[
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "demo-data",
+    "title": "still present since round 3: send_reminder / remind_applicant / send_bulk_invite mutate nothing and return canned counts that contradict the seeded awaiting list",
+    "location": "client/src/demo/demo_api.gleam:109-141; client/src/demo/demo_store.gleam:1396-1420",
+    "evidence": "demo_store.gleam: 'pub fn send_reminder(\n  store: DemoStore,\n  _vacancy_id: String,\n) -> #(DemoStore, #(Int, Int)) {\n  #(store, #(2, 1))\n}' and '#(store, #(1, 0))' (remind_applicant) and 'BulkInviteResult(\n      sent: 2,\n      invalid: 1,\n      invalid_emails: [\"bad@example.ie\"],' (send_bulk_invite); demo_api.gleam: 'let #(next, result) = demo_store.send_reminder(store, vacancy_id)\n  let _ = next'. static_awaiting(\"v-maples\") has exactly one row with 'reminded: False' (emma.doyle) and one with 'followup_due: True' (peter.lyons), so remindable_count is 1 while the canned response claims 2 sent.",
+    "detail": "Store functions now return the store unchanged plus hardcoded counts; demo_api still discards 'next'. The canned (2,1) contradicts the r4-derived remindable_count=1/followup_count=1, and the awaiting list never reflects a sent reminder.",
+    "recommended_fix": "Parse the submitted emails, flip reminded/followed_up on static_awaiting rows, compute the result counts from the actual mutation, and thread the mutated store."
+  },
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "error-channel",
+    "title": "still present since round 3: vacancy/status mutations return Ok unconditionally - nonexistent ids report success; the Result error channel is dead",
+    "location": "client/src/demo/demo_store.gleam:1234-1275 (archive/restore/close), 1345 (change_status)",
+    "evidence": "'#(DemoStore(..store, vacancies: updated), Ok(vacancy_id))' (archive_vacancy, restore_vacancy, close_vacancy) and '#(DemoStore(..store, vacancies: updated), Ok(slug))' (change_status)",
+    "detail": "The list.map no-ops when no vacancy/application matches yet Ok is returned; callers cannot distinguish a miss from a mutation, so the demo reports success for ids that do not exist.",
+    "recommended_fix": "Check the match after the map and return Error on miss, or drop the Result and simplify the call chain."
+  },
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "demo-data",
+    "title": "still present since round 3: mark_opened doc claims an idempotent Submitted->UnderReview transition but applies it to any status",
+    "location": "client/src/demo/demo_store.gleam:1278-1290",
+    "evidence": "'/// POST /open - idempotently moves a Submitted application to UnderReview\n/// and returns the post-transition status slug.\npub fn mark_opened(\n  store: DemoStore,\n  vacancy_id: String,\n  application_id: String,\n) -> #(DemoStore, Result(String, Nil)) {\n  change_status(\n    store,\n    vacancy_id,\n    application_id,\n    \"under_review\",\n    \"status_auto_changed\",\n  )\n}'",
+    "detail": "No status guard in the store: mark_opened transitions an application of ANY status (e.g. Approved) to UnderReview and appends an audit entry; idempotency rests entirely on the dispatch-layer open_dispatched set.",
+    "recommended_fix": "Transition only when the current status is Submitted; otherwise leave the store unchanged."
+  },
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "id-uniqueness",
+    "title": "still present since round 3: create_vacancy derives the id from an 8-char-truncated name slug with no uniqueness check",
+    "location": "client/src/demo/demo_store.gleam:1125, 1674-1685",
+    "evidence": "'let id = \"v-demo-\" <> suffix' and 'fn id_suffix(value: String) -> String {\n  let cleaned =\n    value\n    |> string.lowercase\n    |> string.replace(each: \" \", with: \"-\")\n    |> string.replace(each: \"'\", with: \"\")\n    |> string.replace(each: \".\", with: \"\")\n  case string.length(cleaned) {\n    n if n <= 8 -> cleaned\n    n -> string.drop_end(cleaned, n - 8)\n  }\n}'",
+    "detail": "Two demo-created vacancies whose property names share an 8-char cleaned prefix (and the same short_code 'RTDEMO'<>suffix) collide; the second silently overwrites the first in store lookups.",
+    "recommended_fix": "Append a disambiguator (sequence or vacancy count) or extend the suffix until unique within the store."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "r3 B4 fix partial: refcheck pins landed at store level only - the demo_update refcheck threading arms (and single mark-read) still have no dispatch-level pin",
+    "location": "client/test/demo/demo_flow_test.gleam:463-540; client/src/demo/demo_update.gleam (fire_demo_refcheck / fire_demo_refcheck_substitute / UserClickedNotification arms)",
+    "evidence": "demo_flow_test.gleam: 'let #(after_skip, _) =\n    demo_store.refcheck_action(\n      store,\n      \"v-maples\",\n      \"a-tom\",\n      \"rc-tom-employer\",\n      \"skip\",\n    )' (calls demo_store directly). grep over client/test/demo/ for UserChoseRefcheckAction/UserSavedRefcheckEdit/UserConfirmedRefcheckAction/UserClickedNotification returns NONE - the only dispatch-level refcheck tests are real-path tests in client_test.gleam:6402-6723.",
+    "detail": "The r4 claim was 'refcheck dispatch pins'; the landed pins bypass client.update, so reverting fire_demo_refcheck's 'demo_store: Some(next)' threading (the r2-B5 regression class) stays green. Mutation logic itself is pinned at store level.",
+    "recommended_fix": "Add one dispatch-level test per refcheck arm (client.update with UserChoseRefcheckAction skip / UserSavedRefcheckEdit substitute) asserting the store on the model changed."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "latent",
+    "title": "still present since round 3: fetch_leaderboard_page ignores its page parameter",
+    "location": "client/src/demo/demo_api.gleam:217-227",
+    "evidence": "'pub fn fetch_leaderboard_page(\n  store: DemoStore,\n  vacancy_id: String,\n  _page: Int,\n  on_response: fn(Result(LeaderboardResponse, ApiError)) -> msg,\n) -> Effect(msg) {\n  case demo_store.leaderboard(store, vacancy_id) {'",
+    "detail": "The page parameter is discarded; latent today (load-more hidden in demo) but a silent wrong result if load-more ever shows.",
+    "recommended_fix": "Slice by page or drop the parameter."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "duplication",
+    "title": "still present since round 3 (partially): download_timeout still duplicated between client.gleam and demo_update.gleam with divergent signatures (store_of half is fixed)",
+    "location": "client/src/demo/demo_update.gleam:838-845; client/src/client.gleam:6890-6897",
+    "evidence": "demo_update.gleam: 'fn download_timeout(id: String) -> Effect(Msg) {\n  effect.from(fn(dispatch) {\n    global.set_timeout(90_000, fn() {\n      dispatch(msg.AppTimedOutDownloadReport(id))\n    })\n    Nil\n  })\n}' vs client.gleam: 'fn download_timeout(analysis_id: String, delay_ms: Int) -> Effect(Msg) {'. store_of is now deduplicated: client.gleam:5919 'fn demo_store_of(model: Model) -> DemoStore {\n  demo_update.store_of(model)\n}'.",
+    "detail": "Two download_timeout variants persist with different arities (one hardcodes 90_000); the r3 note covered both helper pairs and only store_of was lifted.",
+    "recommended_fix": "Lift download_timeout into a shared demo helper (or call client.gleam's two-arg variant) and delete the duplicate."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "toast-ids",
+    "title": "still present since round 3: demo_not_in_demo_toast diverges from add_toast's id convention - ids can collide and one timeout dismisses both",
+    "location": "client/src/demo/demo_update.gleam:638-645; client/src/client.gleam:7115-7129",
+    "evidence": "demo_update.gleam: 'let toast_id = model.next_toast_id + 1' then 'next_toast_id: toast_id'; client.gleam add_toast: 'let id = model.next_toast_id' then '#(Model(..model, toasts: capped_toasts, next_toast_id: id + 1), dismiss_eff)'",
+    "detail": "Sequence verified: add_toast (id=N, next=N+1) -> demo toast (id=N+2, next=N+2) -> next add_toast uses id=N+2, colliding with the outstanding demo toast; a single AppDismissToast(N+2) dismisses both.",
+    "recommended_fix": "Reuse add_toast (or its id allocation) for the demo info toasts."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "still present since round 3: zero-caller export demo_store.notifications shipped",
+    "location": "client/src/demo/demo_store.gleam:1521",
+    "evidence": "'pub fn notifications(store: DemoStore) -> List(Notification) {' - grep over client/src for 'demo_store.notifications' / 'notifications(store' finds only notifications_unread callers (client.gleam:5862, demo_update.gleam:543,716 use demo_api.fetch_notifications).",
+    "detail": "No caller for the export; dead public surface on the new module.",
+    "recommended_fix": "Delete or wire it."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "demo-data",
+    "title": "still present since round 3: status_from_slug silently coerces any unknown status slug to Submitted",
+    "location": "client/src/demo/demo_store.gleam:182-191",
+    "evidence": "'fn status_from_slug(slug: String) -> ApplicationStatus {\n  case slug {\n    \"submitted\" -> Submitted\n    \"under_review\" -> UnderReview\n    \"shortlisted\" -> Shortlisted\n    \"viewed\" -> Viewed\n    \"approved\" -> Approved\n    \"rejected\" -> Rejected\n    _ -> Submitted\n  }'",
+    "detail": "A typo in any demo action wire silently lands as Submitted instead of failing loudly.",
+    "recommended_fix": "Return a Result or panic on unknown slugs in the demo store."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "still present since round 3: report_download_test pins the id mapping but not baked-asset presence - a deleted or misnamed PDF 404s silently",
+    "location": "client/test/demo/report_download_test.gleam:11-31",
+    "evidence": "The file contains only analysis_id_maps_to_baked_key_test and every_baked_report_has_a_matching_analysis_test (id-mapping assertions like 'demo_api.application_id_from_analysis(\"an-aoife\") |> should.equal(\"a-aoife\")'); no test reads server/priv/static/demo/.",
+    "detail": "The mapping is pinned but the existence of the baked PDFs on disk is not; a missing asset only surfaces as a demo download failure.",
+    "recommended_fix": "Assert every report_filenames entry has a baked asset on disk (build-time check)."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "test-honesty",
+    "title": "still present since round 3: demo_flow_test header claims bug-hunt E2E coverage that does not exist; demo_requests_are_intercepted_test cannot distinguish demo from real dispatch",
+    "location": "client/test/demo/demo_flow_test.gleam:13, 173-190",
+    "evidence": "Header: '//// resolves it. The browser E2E (bug-hunt) covers the effect execution.' - but ls .pi/skills/bug-hunt/scenarios/ shows analytics/applications/auth/billing/comparison/dashboard/errors/landing/notifications/settings (no demo scenario; grep for 'demo' matches only seed workflows). demo_requests_are_intercepted_test asserts only 'Loading -> Nil' transitions, which pass identically if the real arm runs and fails.",
+    "detail": "The header's E2E claim is false and the interception pin is vacuous as written; the lint + bite-tests are the real no-network guard.",
+    "recommended_fix": "Rewrite the header; assert the demo store produced the data (or add the bug-hunt scenario)."
+  }
+]

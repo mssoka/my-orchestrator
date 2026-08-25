@@ -1,0 +1,2743 @@
+diff --git a/_bmad-output/implementation-artifacts/epic-RC4-context.md b/_bmad-output/implementation-artifacts/epic-RC4-context.md
+new file mode 100644
+index 00000000..9ab8e78e
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/epic-RC4-context.md
+@@ -0,0 +1,51 @@
++# Epic RC4 Context: Landlord Reference Panel & Workflow
++
++<!-- Compiled from planning artifacts. Edit freely. Regenerate with compile-epic-context if planning docs change. -->
++
++## Goal
++
++Give the landlord a per-application reference-checking control surface: a panel that shows every reference's lifecycle state with honest framing, the completed-reference summary, and row actions (start early, skip, take over manually, correct contact details, substitute a referee) so automation never traps the landlord and a dead end always has a next step. RC4.1 shipped the payload contract, RC4.2 rendered it, RC4.3 wires the row actions, RC4.4 completes the attempt-log timeline + notification coverage.
++
++## Stories
++
++- RC4.1: Detail payload extension (`reference_calls[]` + hooks + disclaimers) — done (#604)
++- RC4.2: Reference panel (status & summary) — done (#605)
++- RC4.3: Row actions — start, skip, take over, correct, substitute (THIS story)
++- RC4.4: Attempt log, export & notification completeness
++
++## Requirements & Constraints
++
++- Row actions are hidden entirely in the Off (attestation declined) state; the feature is off for that application.
++- "Start this check now" asks once inline (never a modal) and starts via the RC2.3 start API (optional `?slot=` variant pre-declared for when the per-row UI demands it).
++- "Take over manually" (waiting states + unreachable): inline confirmation; on confirm the row gets `taken_over_at`, the sweep stops sending, referee chips + attempt-log export render inline, label "You're handling this one"; the form link stays live and a late completion still transitions to `form_completed`, updates the panel, and notifies (§8.6).
++- Correction (awaiting_correction rows): inline edit-trio, "Save & resend" is audit-logged, writes corrected_email/corrected_phone (snapshot immutable), updates the application trio, sets correction_cycles = 1, re-queues (queued, next_attempt_at = now()). Second failure → unreachable + referee_contact_invalid fraud signal (stamped only on exhaustion — never fabricated).
++- Substitution (terminal objected/unreachable, can_substitute_referee): same inline edit captures the NEW trio; a NEW reference_call row for the slot (prior row retained as history); audit entry carries old + new row ids.
++- Every action endpoint is ownership-checked and guarded on the row's expected pre-state (AD-14 single-UPDATE guards, 0-row = stand down).
++
++## Technical Decisions
++
++- One live row per (application, slot, owner) via partial unique index — terminal rows don't occupy the slot, so substitution inserts freely; a skipped row does occupy it until re-enabled.
++- The sweep (RC3.5) owns every send; creation (incl. substitution rows) sets next_attempt_at = now() and sends nothing. Sweep SELECT already excludes taken_over_at IS NOT NULL rows (A7).
++- Effective contact (W4): BEFORE any correction, corrected ?? snapshot; AFTER a correction
++  (correction_cycles >= 1) the snapshot is PROVEN DEAD — the corrected values ARE the
++  contact and a cleared channel stays absent (AD-7 never-re-contact). The same rule applies
++  in the sweep, the webhook's send-ref fallback, the expired-link resend, and the client
++  prefill.
++- AD-7 correction is landlord-driven (A1): no correction_token, no applicant self-serve; the landlord contacts the applicant and edits the trio inline.
++- All transitions obey guarded updates + sticky terminals (AD-14); lifecycle events write audit_log rows (AD-16) — substitution audit carries old + new row ids.
++- rc3-7 provides the referee_contact_invalid stamp mechanism; the LIVE second-failure terminal (awaiting_correction → unreachable) is RC4.3's delivery.
++- Notifications: awaiting_correction is in-app only (rc3-6); unreachable/completed notifications exist; RC4.3's landlord-initiated actions need no new notifications (RC4.4 covers completeness).
++- Additive payload keys only (expand-only, back-compat decoders) — the RC line's contract discipline.
++
++## UX & Interaction Patterns
++
++- Brand pattern: inline confirmations, never modals (§7.4, §7.7).
++- Per-row `⋯` overflow menu: Start this check now / Skip this reference (queued), Start this check (skipped = re-enable), Take over manually (waiting + unreachable), Substitute referee (objected/unreachable per hooks).
++- §8.3 inline edit-trio wireframe (Name/Email/Phone + Save & resend) with the applicant's contact chips below.
++- State label after takeover: "You're handling this one".
++- All copy verbatim from the cited UX sections — no rewriting.
++
++## Cross-Story Dependencies
++
++- Needs RC2.3's start/skip/re-enable APIs (merged), RC3.5's sweep (taken_over_at-aware), rc3-7's stamp_referee_contact_invalid, RC4.1's payload + hooks (can_substitute_referee), RC4.2's panel.
++- RC4.4 inherits the takeover surface (export affordance renders inline here; the full timeline + OQ-5 clipboard toast are RC4.4).
+diff --git a/_bmad-output/implementation-artifacts/spec-rc4-3-row-actions.md b/_bmad-output/implementation-artifacts/spec-rc4-3-row-actions.md
+new file mode 100644
+index 00000000..c1741593
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-rc4-3-row-actions.md
+@@ -0,0 +1,407 @@
++---
++baseline_commit: 96746ec474b6c383db5db1e09f804a56b4fd98dc
++story_key: rc4-3-row-actions
++---
++
++# Story RC4.3: Row Actions — Start, Skip, Take Over, Correct, Substitute
++
++**Status:** in-progress (briefing pre-approved — epic ACs are canonical)
++**Epic:** RC4 (Landlord Reference Panel & Workflow). Depends on RC4.2 (merged, #605).
++**Model:** `deepseek/deepseek-v4-flash` (briefing policy — execution role).
++**Perkins:** ON.
++**GitHub issue:** (none)
++
++## Story
++
++> As a landlord,
++> I want to control each check — start early, skip, take over, fix details, swap referees,
++> So that automation never traps me and a dead end always has a next step.
++
++RC4.2 rendered the panel display-only; the `⋯` overflow control ships with its testid but no
++menu (documented there as RC4.3's delivery). RC4.3 wires the landlord's control surface: the
++pre-trigger start/skip (RC2.3 APIs + the pre-declared `?slot=` per-row variant), the warm-handoff
++takeover (A7 `taken_over_at` — the sweep already skips taken-over rows; the form link stays live,
++RC3.4 already notifies on late completion), the one-cycle correction flow (AD-7/A1 landlord-driven,
++including the rc3-7-stamped second-failure terminal), and referee substitution after
++`objected`/`unreachable` (new row per slot, prior retained as history, AD-16 old+new ids).
++
++**The load-bearing rules:** (1) guarded single-UPDATE transitions on the expected pre-state
++(AD-14 — 0-row = stand down); (2) the `contact_*` snapshot is immutable — corrections land in
++`corrected_*` columns, the effective contact is `corrected ?? snapshot`; (3) every action is
++hidden entirely in the Off (declined) state (no rows exist there — server suppression + the
++panel's Off branch); (4) inline confirmations and inline edits, never a modal (§7.4/§7.7/§8.3).
++
++## Scope
++
++### OWNS
++1. **`server/src/reference_checks/actions_handler.gleam`** (NEW) — four landlord action
++   handlers following the `trigger.gleam` handler pattern (three-UUID parse, ownership +
++   archived-vacancy prechecks, branded errors, json responses):
++   - **Take over** `POST /api/v1/vacancies/:vid/applications/:aid/reference-checks/:call_id/take-over`
++     — guarded `UPDATE ... SET taken_over_at = now(), next_attempt_at = NULL WHERE id = $1 AND
++     taken_over_at IS NULL AND status IN ('queued','contact_initiated','unreachable')`
++     (waiting states + unreachable per §7.7; `unreachable` is terminal-sticky for every writer
++     BUT takeover is the one landlord-side un-stick — a deliberate, pre-declared exception: it
++     only writes `taken_over_at`/`next_attempt_at`, never status). Audit `reference_call_taken_over`.
++   - **Correct** `POST .../reference-checks/:call_id/correct` — body `{name, email, phone}`;
++     guarded `awaiting_correction → queued` with `corrected_name/email/phone = $n`
++     (empty string = NULL), `correction_cycles = correction_cycles + 1`, `next_attempt_at = now()`,
++     `terminal_reason = NULL`; ALSO updates the application trio for the slot (A1: the landlord
++     edits the slot's trio inline); audit `reference_call_corrected`. Max 1 cycle is enforced by
++     the guard: a second `correct` on a row that is no longer `awaiting_correction` 409s.
++   - **Substitute** `POST .../reference-checks/:call_id/substitute` — body `{name, email, phone}`;
++     guarded on `status IN ('objected','unreachable')` (the `can_substitute_referee` set);
++     idempotent insert of a NEW `queued` row for the same `(application_id, ref_slot,
++     owner_label)` via the existing `insert_reference_call_if_absent` (partial unique index —
++     the prior terminal row doesn't occupy the slot; a double-click conflicts → no-op, 200);
++     new row carries the new trio as its immutable snapshot; the application trio is also
++     updated; audit `reference_call_substituted` carries `old_id` + `new_id` (AD-16).
++   - **Exhaustion hook** — in `webhooks.gleam` and the wrong-person route (form_handler.gleam):
++     when the guarded failure transition finds `correction_cycles >= 1`, the row does NOT go to
++     `awaiting_correction` again — it terminalizes `→ unreachable` (guarded, `terminal_reason`
++     kept) + `stamp_referee_contact_invalid` (rc3-7 mechanism — this makes it LIVE) + audit +
++     the existing unreachable notification. The two SQL reads feeding these sites gain
++     `correction_cycles` (expand-only).
++2. **`server/src/reference_checks/trigger.gleam`** — `handle_start` gains an optional
++   `?slot=` query param (validated against the three slots; invalid → 400). Present: create
++   checks for that slot only (per-row §7.4 start). Absent: whole-application (today's
++   behaviour — expand-only). The core creation function gains an optional slot filter.
++3. **`server/src/router.gleam`** — three new POST arms (take-over / correct / substitute),
++   `require_session`-wrapped, slot-param passthrough on the start arm.
++4. **`server/src/reference_checks/sql/`** (NEW queries, squirrel):
++   `take_over_reference_call.sql`, `correct_reference_call.sql` (guard + corrected_* +
++   cycle bump + re-arm in ONE update), `substitute_reference_call.sql` (reads the old row's
++   slot/owner + verifies the pre-state guard) — plus expand-only column additions to
++   `list_reference_calls_for_detail.sql` (`taken_over_at`, `contact_name/email/phone`,
++   `corrected_name/email/phone`, `correction_cycles` — COALESCE convention), and
++   `correction_cycles` on `find_reference_call_by_send_ref.sql` +
++   `get_form_context_by_form_token.sql` (exhaustion check).
++5. **`supabase/migrations/`** (expand-only): `corrected_name TEXT` (the §8.3 edit-trio's
++   Name field; A1's corrected-* pattern extended) + `corrected_at TIMESTAMPTZ` (the
++   exhaustion gate's correction instant — r1 W3). Everything else exists since rc2-1.
++6. **`shared/src/shared/reference_call.gleam`** — additive detail keys: `taken_over_at`,
++   `contact_name`, `contact_email`, `contact_phone`, `corrected_name`, `corrected_email`,
++   `corrected_phone`, `correction_cycles` (Option/Int, back-compat `optional_field`
++   decoders) + `hooks.can_take_over`. Encoder nullable.
++7. **`server/src/application/application_detail_handler.gleam`** — map the new row fields;
++   the trio-update helper for correct/substitute lives in the actions handler (application
++   SQL: UPDATE the slot's trio columns by slot name).
++8. **`server/src/audit/event_type.gleam`** — three new variants + wire strings:
++   `reference_call_taken_over` / `reference_call_corrected` / `reference_call_substituted`.
++9. **`client/src/api/reference_checks_api.gleam`** (NEW) — `start_check(vid, aid, slot?)`,
++   `skip_reference`, `re_enable_reference`, `take_over_reference`, `correct_reference`,
++   `substitute_reference` — `api_helpers.post_json` + `csrf_token` + `api_error.map_rsvp`,
++   the `application_api.gleam` pattern.
++10. **`client/src/components/reference_panel.gleam`** — the control surface:
++    - overflow `⋯` menu (per-row open state): Queued → Start this check now / Skip this
++      reference; Skipped → Start this check (re-enable); ContactInitiated → Take over
++      manually; Unreachable → Take over manually / Substitute referee; Objected → Substitute
++      referee. AwaitingCorrection → no menu, the row detail IS the correction UI (§8.3).
++    - Start: inline one-time confirm (§7.4 verbatim confirm copy) → POST → refetch detail.
++    - Take over: inline confirm (§7.7 verbatim) → POST → row label "You're handling this one",
++      effective-contact chips render inline (from the payload's corrected??snapshot trio),
++      attempt-log export affordance renders beside them.
++    - Correct: §8.3 inline edit-trio (Name/Email/Phone, prefilled with the effective trio),
++      applicant contact chips below, "Save & resend" → POST → audit-logged server-side; error
++      states stay inline (brand copy).
++    - Substitute: same inline edit-trio (heading per §8.2) → POST → refetch; both rows render
++      (prior retained as history).
++    - The row's referee name reads from the payload `contact_name` (fall back to the app
++      trio — post-substitution rows carry their own snapshot).
++11. **`client/src/msg.gleam` + `client/src/model.gleam` + `client/src/client.gleam`** —
++    messages per action (`UserClickedRefcheckStart(Slot)`-family, `ApiReturnedRefcheckAction(Result)`
++    with a `(call_id)` match guard, menu/confirm/edit-form state, in-flight per row); refetch
++    the application detail after each successful action; reset menu/form state on route change.
++12. **`client/src/copy.gleam`** — all new strings verbatim from §7.4 (start confirm, skipped
++    state action), §7.7 (take-over confirm), §8.3 (correction copy, Save & resend), §8.2
++    (substitute), plus menu labels and the "You're handling this one" label. No inline strings.
++13. **Tests** — server unit/integration per transition: takeover guard matrix (queued/
++    contact_initiated/unreachable ok; awaiting_correction/skipped/terminals 409/404; sweep
++    exclusion + late-completion still completes — integration), correction (guarded on
++    awaiting_correction, corrected_* written + snapshot untouched, app trio updated,
++    correction_cycles = 1, re-queued next_attempt_at = now(), audit), second-failure
++    exhaustion (webhook + wrong-person: awaiting_correction→unreachable + stamp +
++    notification + audit), substitution (new row + old retained, history, audit old+new ids,
++    idempotent double-submit, guard on objected/unreachable only), per-slot start (slot param
++    creates only that slot; invalid slot 400), ownership/archived prechecks, CSRF. Client
++    tests: menu open/action wiring, inline confirms, edit-trio render/save, takeover chips +
++    label, hidden in Off, testids.
++
++### Does NOT own (deferred / sibling stories)
++- **"Ask Aisling to nudge"** — not in RC4.3's ACs (present in §7.3's overflow table but absent
++  from the story ACs and the briefing); deferred with RC4.4's notification work.
++- **Full attempt-log timeline + OQ-5 clipboard toast** — RC4.4. RC4.3 renders the export
++  affordance on the takeover surface (AC-mandated) wired to a plain clipboard copy of the
++  attempt log (no dead control; RC4.4 upgrades the text + verbatim toast + timeline).
++- **Notification completeness / preference matrix** — RC4.4.
++- **WoZ record-manual UI** — RC5.
++- **Applicant self-serve correction/substitution links** — v2 (A1).
++
++## Acceptance Criteria (BDD — from epic RC4.3 + UX §7.4/§7.7/§8.2/§8.3/§8.6 + A1/A7/AD-7/AD-14/AD-16)
++
++**AC1 — Pre-trigger row actions**
++> **Given** a `queued` row, when the landlord opens its `⋯` overflow and chooses "Start this
++> check now", then an inline one-time confirm renders (§7.4 verbatim copy), and confirming
++> starts that slot's check via the RC2.3 start API (`?slot=` — other slots untouched); "Skip
++> this reference" excludes the row (`queued → skipped`, re-enable-able via the Skipped row's
++> "Start this check").
++
++**AC2 — Take over manually**
++> **Given** an in-flight (`queued`/`contact_initiated`) or `unreachable` row, when "Take over
++> manually" is chosen, then the §7.7 inline confirmation renders (never a modal); on confirm
++> the row gets `taken_over_at` — the sweep stops sending (already wired, A7), the referee's
++> effective-contact chips + the attempt-log export render inline, the label reads "You're
++> handling this one" — and the form link stays live: a late completion still transitions to
++> `form_completed`, updates the panel, and notifies (§8.6).
++
++**AC3 — Correction (one cycle)**
++> **Given** an `awaiting_correction` row, when the landlord edits the trio inline (§8.3,
++> applicant contact chips below) and saves, then the change is audit-logged, writes
++> `corrected_email`/`corrected_phone` (+ `corrected_name`; snapshot immutable — A1), updates
++> the application trio, sets `correction_cycles = 1`, and re-queues (`queued`,
++> `next_attempt_at = now()`).
++> **And** a second failure (bounce / SMS failure / wrong-person) converts the row to
++> `unreachable` with the `referee_contact_invalid` signal stamped (AD-7 — the rc3-7 mechanism
++> goes live here).
++
++**AC4 — Substitute referee**
++> **Given** a terminal `objected` or `unreachable` row (`can_substitute_referee`), when the
++> landlord substitutes via the inline edit-trio, then a NEW `reference_call` row is created
++> for the slot (`queued`, `next_attempt_at = now()`, new trio as snapshot) with the prior row
++> retained as history, and the audit entry carries old + new row ids (AD-16).
++
++**AC5 — Guard rails**
++> **Given** any action endpoint, when it runs, then it is ownership-checked (three-UUID +
++> `verify_application_ownership` + archived-vacancy prechecks) and guarded on the row's
++> expected pre-state (AD-14 single-UPDATE; 0-row → branded 409/404, no mutation), and manual
++> actions are hidden entirely in the Off (declined) state (no rows — server suppression +
++> the panel's Off branch).
++
++## Verify
++- `make test-server` green (unit + integration incl. the new transition tests; the RC4.3
++  suite follows `reference_checks_trigger_integration_test.gleam`'s shape).
++- `make test-client` green (panel action tests).
++- `make test-shared` green (new detail keys round-trip + absent-key back-compat).
++- `make format && make build` green (pre-PR discipline); `gleam format --check` clean.
++- Copy verbatim from the cited UX sections — grep-check key strings.
++
++## Files
++- **EDIT:** `server/src/reference_checks/trigger.gleam` (slot param + re-arm) · `server/src/reference_checks/webhooks.gleam` (exhaustion + stale-bounce gate) · `server/src/reference_checks/form_handler.gleam` (wrong-person exhaustion + resend effective contact) · `server/src/reference_checks/sweep.gleam` (effective contact) · `server/src/router.gleam` · `server/src/audit/event_type.gleam` · `server/src/application/application_detail_handler.gleam` (payload map + hooks) · `server/src/reference_checks/sql/list_reference_calls_for_detail.sql` + `find_reference_call_by_send_ref.sql` + `get_form_context_by_form_token.sql` + `sweep_due_reference_calls.sql` + `mark_awaiting_correction.sql` + `exhaust_reference_call.sql` + `sweep_claim_t0.sql` + `sweep_advance.sql` + `get_reference_call_by_id.sql` · `shared/src/shared/reference_call.gleam` · `client/src/msg.gleam` · `client/src/model.gleam` · `client/src/client.gleam` · `client/src/copy.gleam` · `client/src/pages/application_detail.gleam`
++- **NEW:** `server/src/reference_checks/actions_handler.gleam` · `server/src/reference_checks/sql/take_over_reference_call.sql` · `server/src/reference_checks/sql/correct_reference_call.sql` · `server/src/reference_checks/sql/exhaust_reference_call.sql` · `server/src/reference_checks/sql/mark_awaiting_correction_wrong_person.sql` · `server/src/reference_checks/sql/rearm_queued_reference_calls.sql` · `server/src/reference_checks/sql/verify_application_in_vacancy.sql` · `server/src/reference_checks/sql/update_application_referee_trio_{landlord,character,employer}.sql` · `supabase/migrations/20260812140000_reference_call_corrected_name.sql` · `client/src/api/reference_checks_api.gleam` · `client/test/api/reference_checks_api_test.gleam` · `client/test/components/reference_panel_test.gleam` · `server/test/reference_checks/sweep_test.gleam` · `server/test/integration/reference_checks_actions_integration_test.gleam`
++- **Substitution reuses the shared idempotent insert** (`insert_reference_call_if_absent` — the live-slot ON CONFLICT predicate lives in ONE query; r2 N3).
++
++## Dev Notes
++
++### Source tree map (verified on disk at baseline)
++- `server/src/reference_checks/trigger.gleam` — `handle_start` (395), `run_create_checks` (109,
++  takes app/landlord/vacancy uuids), `create_eligible_slots` (142), `run_action_with_prechecks`
++  (881), `parse_app_uuids` (912), `write_lifecycle_audit` (1048), `json_ok` (1042). The slot
++  filter threads into `create_eligible_slots`.
++- `server/src/reference_checks/webhooks.gleam:280` — `mark_awaiting_correction` call site
++  (guarded, sticky); exhaustion branches here on `row.correction_cycles >= 1`.
++- `server/src/reference_checks/form_handler.gleam:1164-1235` — wrong-person route
++  (`apply_wrong_person` → `update_reference_call_status(..., AwaitingCorrection, ...)`); same
++  exhaustion branch. The form-context row type gains `correction_cycles`.
++- `server/src/reference_checks/sql/` — `mark_awaiting_correction.sql` (guarded to
++  queued/contact_initiated; correction_cycles NOT bumped there — RC4.3 owns it), the existing
++  `sweep_claim_t0.sql`/`sweep_advance.sql` (effective-contact join `corrected ?? snapshot`),
++  `insert_reference_call_if_absent.sql` (idempotent, ON CONFLICT DO NOTHING), `update_reference_call_status.sql`
++  (its `next_attempt_at` CASE clears/preserves, never re-arms → correction needs its own query).
++- `server/src/router.gleam:364-430` — the three RC2.3 POST arms (the pattern for the three new
++  arms); `:call_id` is a new path segment (the UI has it from the payload).
++- `shared/src/shared/reference_call.gleam:474` — `ReferenceCallDetail`; additive keys after
++  `submitted_at`. Decoder uses `decode.optional_field(..., None, ...)` (absent-key back-compat).
++- `client/src/components/reference_panel.gleam` — `view_row` (255): the overflow button (331)
++  renders but has no `on_click` (RC4.3 wires it); `row_has_overflow` (383) already returns the
++  action-row set; `referee_name` (362) reads the app trio (switch to payload snapshot +
++  fallback); `row_detail` (467) per-status body (AwaitingCorrection/Unreachable/Objected arms
++  get the action surfaces).
++- `client/src/api/application_api.gleam` + `client/src/api/api_helpers.gleam` — the POST +
++  CSRF pattern (`api_helpers.post_json(url, body, csrf_token, handler)`).
++- `client/src/msg.gleam:247` / `model.gleam:311` / `client.gleam:3253,3736` — the RC4.2
++  refcheck state + handlers to extend; `UserCopiedContact` shows the toast pattern.
++- `client/src/components/contact_chip.gleam` — the chip component (reuse for the takeover +
++  edit surfaces).
++- `supabase/migrations/20260731222000_create_reference_call.sql` — the table; everything the
++  actions need except `corrected_name` already exists (A1/A7 columns live since rc2-1).
++
++### Decisions & rationale (for the PR)
++- **`?slot=` on start (not a new route):** pre-declared by RC2.3 ("can be added in RC4.3 if the
++  UI demands it"); the §7.4 wireframe is per-row; absent = whole-application (back-compat).
++- **`corrected_name` column (expand-only):** the §8.3 edit-trio has a Name field; A1's
++  corrected-* pattern (snapshot immutable) extends naturally; the sweep + payload read the
++  effective name. One additive column, nothing destructive.
++- **Takeover only writes `taken_over_at`/`next_attempt_at` (never status):** `unreachable` is
++  terminal-sticky for every writer (AD-14), but §7.7 explicitly offers takeover from
++  unreachable — the takeover marker is not a status change, so stickiness is untouched and
++  the row can still late-complete (§8.6).
++- **Exhaustion at the failure sites (webhook + wrong-person), not the sweep:** AD-7's second
++  failure is a delivery/identity failure — it arrives via those routes; the sweep never sends
++  to awaiting_correction rows (NULL next_attempt_at) so it cannot observe the failure.
++- **Correction clears `terminal_reason` + the previous referee's session state
++  (`form_opened_at`/`draft_answers`, r2 W2); substitution keeps the old row untouched:** the
++  attempts log carries the history; the old row remains terminal evidence.
++- **Effective contact (r1 W4 / r2 W4):** once a correction ran (`correction_cycles >= 1`)
++  the snapshot is PROVEN DEAD — the corrected values ARE the contact and a cleared channel
++  stays absent (AD-7 never-re-contact). The rule applies in the sweep, the webhook's
++  send-ref fallback, the expired-link resend (form_handler), and the client prefill.
++- **Substitution guard rails (r2 W5/W7):** an unchanged save of the terminal referee's own
++  trio is a 400 (Art 21 route-around); re-substituting the HISTORY row with different
++  details is a 409 — the typed referee is never silently dropped.
++- **App trio updated by both correct and substitute:** A1's "edits the slot's trio inline"
++  (the Off-state chips + future slots then read the current referee); the row snapshot stays
++  immutable.
++
++### Testing standards
++- Integration tests run against the isolated test DB (`make test-db-up` + `make test-db-reset`
++  convention; sibling-worktree port contention — own container + `TEST_DB_PORT` if needed).
++- Guard-matrix tests: each endpoint's happy path + wrong-pre-state (0-row → 409/404) +
++  cross-tenant 404 + archived 422 + malformed body 400.
++- Correction-cycle counting: `correction_cycles = 1` after save; second failure → unreachable
++  + `fraud_signals.referee_contact_invalid = true` (negative control: first failure does NOT
++  stamp it).
++- Substitution history: new row id ≠ old, old row status untouched (terminal), audit carries
++  both ids.
++- Client tests assert Lustre's serialized render (sorted attributes, `&#39;`, pinned
++  `data-testid` strings) per the 2026-08-03 field note.
++
++### References
++- [Source: `_bmad-output/planning-artifacts/epics-reference-checking-v1-2026-07-30.md` — Story RC4.3 (line ~659), amendments A1/A7, FR-RC4]
++- [Source: `_bmad-output/planning-artifacts/ux-reference-checking-v1-2026-07-29.md` — §7.3, §7.4, §7.7, §8.2, §8.3, §8.6]
++- [Source: `_bmad-output/planning-artifacts/architecture-reference-checking-v1-2026-07-29.md` — AD-7, AD-11 (hook semantics), AD-14, AD-16]
++- [Source: RC2.3 spec (`spec-rc2-3-trigger-on-viewed-manual-start-skip-apis.md`) — start/skip/re-enable + the `?slot=` pre-declaration]
++- [Source: RC3.7 spec — `stamp_referee_contact_invalid.sql` mechanism]
++
++## Dev Agent Record
++
++### Perkins r1 rework (review 4919278443, sha ace27b1 — 3 blockers + 12 warnings + 18 notes)
++
++- **B1 (correction cadence dead-end):** `correct_reference_call.sql` now resets
++  `attempt_count = 0` + clears `form_token`/`form_token_expires_at` (the sweep
++  re-runs the T0 claim: fresh ~288-bit token, invite to the corrected contact).
++  Pinned by a sweep-after-correct integration test (row advances + fresh token)
++  + a negative control (the pre-fix shape stands down every tick — the
++  perpetual co-nudge mis-send Perkins described).
++- **B2 (buttons always disabled):** the three action buttons now OMIT the
++  `disabled` attribute when enabled (`list.append(attrs, disabled_attr)` — the
++  empty-string-value-is-a-present-attribute trap). New test pins the enabled
++  render via the serialized adjacency (`testid" disabled` absent).
++- **B3 (AR-RC13):** the substitute affordance + the overflow entry are gated
++  on `hooks.can_substitute_referee`; take-over gained a server hook
++  (`can_take_over` — queued/contact_initiated/unreachable, refined per-row by
++  `taken_over_at`), so no action legality is re-derived client-side. The
++  unreachable-row menu builds from the hooks via `list.append`.
++- W1: em-dash ban — implementer-authored toasts + export joins de-dashed; the
++  copy test's scan extended with the RC4.3 implementer-authored strings (the
++  spec-verbatim copy is excluded by construction).
++- W2: the exhaustion notification names the EFFECTIVE referee (corrected ??
++  snapshot in both failure-site reads).
++- W3: the exhaustion gate compares the failing send's `at` against a new
++  `corrected_at` column (expand-only, same migration) — a stale/redelivered
++  pre-correction bounce stands down instead of fabricating
++  `referee_contact_invalid`.
++- W4: the effective-contact rule switches to corrected-only once a correction
++  ran (`correction_cycles >= 1`) — a cleared channel never falls back to the
++  proven-dead snapshot (sweep helpers + webhook fallback CASE + client
++  prefill helpers).
++- W5: a failed correct/substitute re-enables the save button (saving: False).
++- W6: "Start this check now" re-arms existing queued rows (new
++  `rearm_queued_reference_calls.sql` — never a silent no-op); pinned by test.
++- W7: choosing an action (or typing in the trio) expands the row — the
++  confirm/edit surfaces are never swallowed by a collapsed row.
++- W8: `ApiReturnedRefcheckAction` drops late responses (call no longer in the
++  detail) instead of toasting/refetching on the wrong page.
++- W9: the four RC4.3 model fields reset on route change (pending typed PII
++  never leaks across applicants).
++- W10: `verify_application_in_vacancy` precheck binds the path vacancy to the
++  application — a same-owner cross-vacancy id 404s before the trio UPDATE can
++  silently 0-row (pinned by test).
++- W11: `OldReferenceCallId`/`NewReferenceCallId` registered in `all_non_pii`.
++- W12: the live exhaustion branches are now handler-tested — the delivery
++  webhook branch via the exported `apply_delivery_failure` (genuine exhausts,
++  stale stands down) and the wrong-person route end-to-end via the router.
++- N1: substituted rows get the trigger's creation-time fraud screening
++  (`stamp_creation_fraud_for`).
++- N2: the takeover audit reuses `trigger.write_lifecycle_audit` (the canonical
++  Tier-2 helper); N4: terminal_reason fixture set before the clearing
++  assertion; N5: unused const removed; N6: `RefcheckCorrect` dropped from the
++  action type; N7: export-error copy is a const; N13: invalid-slot 400 pinned;
++  N14: payload wire assertions for the RC4.3 keys; N15: schema test covers
++  corrected_name/corrected_at; N16: correction_cycles decodes null-tolerantly;
++  N17: the wrong-person stamp failure Sentry-captures; N18: the take-over
++  confirm interpolates the referee's name.
++- N10/N11: substitution still uses the self-contained guarded CTE (atomic);
++  the concurrent double-submit returns the existing successor (the 
++  `how='existing'` path) — documented.
++
++### Agent Model Used
++
++deepseek/deepseek-v4-flash
++
++### Implementation notes (2026-08-12)
++
++- **Server:** `actions_handler.gleam` (take-over / correct / substitute) with the
++  trigger-test pattern's ownership + archived prechecks and AD-14 guarded
++  transitions; `?slot=` per-row start on the RC2.3 endpoint; the AD-7
++  exhaustion path went LIVE at BOTH failure sites (resend/SMS webhook +
++  wrong-person route) — terminalize to `unreachable` + stamp
++  `referee_contact_invalid` (rc3-7's mechanism) + audit + in-app notify;
++  three new audit events; three new POST arms; the detail payload gained the
++  row's effective-contact trio + `taken_over_at` + `correction_cycles`
++  (additive, back-compat decoders). One expand-only migration:
++  `corrected_name TEXT` (the §8.3 edit-trio's Name field follows A1's
++  corrected-* pattern; the sweep + payload read the effective name).
++- **Substitution idempotency:** the SQL's CTE returns the EXISTING live
++  successor (`how = 'existing'`) on conflict — a double-submit or
++  re-substituting the old terminal row (kept as history) is a 200 no-op with
++  no duplicate audit; the trio rewrite + audit fire only on a real insert.
++- **Take-over:** writes ONLY `taken_over_at` + clears `next_attempt_at` —
++  never status, so `unreachable`'s terminal stickiness is untouched and a
++  late completion still transitions (§8.6). The sweep's due-SELECT already
++  excluded taken-over rows (A7) — pinned by an integration test.
++- **Client:** the panel's `⋯` menu (per-row open state), inline start/take-over
++  confirms (never modals), the §8.3 edit-trio (correct prefill + substitute
++  surface), the §7.7 taken-over block (label + chips + attempt-log export to
++  clipboard), per-action toasts; every success refetches the detail payload
++  (AR-RC13). All copy verbatim from §7.4/§7.7/§8.2/§8.3 (start-confirm is
++  gender-neutral per the rc4-2 W5 ruling).
++- **Tests:** 10 new server integration tests (takeover matrix + sweep
++  exclusion + late completion, correction cycle counting + guard, exhaustion
++  with the signal stamp, substitution history + old/new audit ids +
++  idempotency, per-slot start), 11 panel action tests, 8 client handler
++  tests, 2 shared round-trip/back-compat tests. The rc4-1 payload negative
++  control moved its marker to `form_token_internal_sentinel` (the referee
++  contact snapshot now legitimately rides the payload — the §7.7 chips need
++  it; form_token is still never selected).
++
++### Debug Log References
++
++- Gleam parser rejects a case-clause body that STARTS with `let` unless
++  wrapped in `{ }` — "I was expecting an expression after this" at the NEXT
++  `->` (probe-verified in isolation; the codebase's clause bodies start with
++  `#(` / calls / braced blocks).
++- Function calls are banned in clause GUARDS (`if row.application_id != …`)
++  — nest a `case` instead.
++- `decode.optional_field` in this gleam_stdlib is the `use`-callback form
++  (4 args) — no standalone 3-arg call.
++- Multi-subject `case` with a qualified constructor pattern + a nested case
++  body failed to parse in one shape but compiled in a nearly-identical one —
++  bisected to the `let`-first body rule above.
++- `list.find` returns `Result`, not `Option` (no `result.to_option`);
++  `decode.list` on a row array gives `List(String)` per row (no tuple
++  decoders in this stdlib).
++
++## Completion Notes List
++
++- Built the RC4.3 landlord control surface end to end: pre-trigger start
++  (per-slot) / skip / re-enable, warm-handoff take-over (A7), one-cycle
++  correction (AD-7/A1) with the LIVE second-failure exhaustion, and referee
++  substitution (AD-11 semantics, AD-16 old+new ids).
++- Server: `actions_handler.gleam` + 7 new SQL queries + 3 new audit events +
++  3 router arms + the exhaustion wiring at both failure sites; the detail
++  payload grew the row trio + takeover/cycle keys (additive).
++- Client: overflow menu, inline confirms, §8.3 edit-trio, taken-over surface
++  with chips + attempt-log export, per-action toasts + detail refetch.
++- Migration: `corrected_name` (expand-only).
++- Tests: 512 integration / 540 client / 110 shared / 1476 server unit — all
++  green; `make format && make test && make build` clean.
+diff --git a/client/src/api/reference_checks_api.gleam b/client/src/api/reference_checks_api.gleam
+new file mode 100644
+index 00000000..6ea578b9
+--- /dev/null
++++ b/client/src/api/reference_checks_api.gleam
+@@ -0,0 +1,202 @@
++//// RC4.3 reference-check row-action API — the landlord panel's control
++//// surface. Every call is a CSRF-protected POST (`api_helpers.post_json`),
++//// ownership + pre-state guarded server-side (AD-14); the panel refetches
++//// the application detail after a success (the payload is the contract,
++//// AR-RC13). The `on_response` carries the reference_call_id (substitution
++//// returns the new row id; the other actions return "").
++
++import api/api_error.{type ApiError}
++import api/api_helpers
++import gleam/dynamic/decode
++import gleam/json
++import gleam/option.{type Option, None, Some}
++import lustre/effect.{type Effect}
++import rsvp
++
++fn post_action(
++  url: String,
++  body: json.Json,
++  csrf_token: String,
++  on_response: fn(Result(String, ApiError)) -> msg,
++) -> Effect(msg) {
++  api_helpers.post_json(
++    url,
++    body,
++    csrf_token,
++    rsvp.expect_json(action_result_decoder(), fn(result) {
++      on_response(api_error.map_rsvp(result))
++    }),
++  )
++}
++
++/// The actions' responses are `{...}` objects without a shared shape; the
++/// only payload the client needs is the substitution's new row id (absent
++/// -> ""). A successful HTTP round-trip is the signal; the detail refetch
++/// carries the real state.
++fn action_result_decoder() -> decode.Decoder(String) {
++  use id <- decode.optional_field(
++    "reference_call_id",
++    None,
++    decode.optional(decode.string),
++  )
++  decode.success(option.unwrap(id, ""))
++}
++
++/// The start endpoint's wire URL — `Some(slot)` renders the per-row
++/// `?slot=` variant (r3 N1: the client wire format is pinned by test).
++pub fn start_check_url(
++  vacancy_id: String,
++  application_id: String,
++  slot: Option(String),
++) -> String {
++  let base = base_url(vacancy_id, application_id) <> "/start"
++  case slot {
++    Some(s) -> base <> "?slot=" <> s
++    None -> base
++  }
++}
++
++/// A slot-scoped action URL (skip / re-enable).
++pub fn slot_action_url(
++  vacancy_id: String,
++  application_id: String,
++  slot: String,
++  action: String,
++) -> String {
++  base_url(vacancy_id, application_id) <> "/" <> slot <> "/" <> action
++}
++
++/// A call-scoped action URL (take-over / correct / substitute).
++pub fn call_action_url(
++  vacancy_id: String,
++  application_id: String,
++  call_id: String,
++  action: String,
++) -> String {
++  base_url(vacancy_id, application_id) <> "/" <> call_id <> "/" <> action
++}
++
++fn base_url(vacancy_id: String, application_id: String) -> String {
++  "/api/v1/vacancies/"
++  <> vacancy_id
++  <> "/applications/"
++  <> application_id
++  <> "/reference-checks"
++}
++
++/// POST .../reference-checks/start?slot=<slot> — RC4.3 per-row start (the
++/// RC2.3 endpoint with the pre-declared slot variant). `slot: None` is the
++/// whole-application start.
++pub fn start_check(
++  vacancy_id vacancy_id: String,
++  application_id application_id: String,
++  slot slot: Option(String),
++  csrf_token csrf_token: String,
++  on_response on_response: fn(Result(String, ApiError)) -> msg,
++) -> Effect(msg) {
++  post_action(
++    start_check_url(vacancy_id, application_id, slot),
++    json.object([]),
++    csrf_token,
++    on_response,
++  )
++}
++
++/// POST .../reference-checks/:slot/skip — exclude a queued reference.
++pub fn skip_reference(
++  vacancy_id vacancy_id: String,
++  application_id application_id: String,
++  slot slot: String,
++  csrf_token csrf_token: String,
++  on_response on_response: fn(Result(String, ApiError)) -> msg,
++) -> Effect(msg) {
++  post_action(
++    slot_action_url(vacancy_id, application_id, slot, "skip"),
++    json.object([]),
++    csrf_token,
++    on_response,
++  )
++}
++
++/// POST .../reference-checks/:slot/re-enable — bring a skipped reference
++/// back into the cadence.
++pub fn re_enable_reference(
++  vacancy_id vacancy_id: String,
++  application_id application_id: String,
++  slot slot: String,
++  csrf_token csrf_token: String,
++  on_response on_response: fn(Result(String, ApiError)) -> msg,
++) -> Effect(msg) {
++  post_action(
++    slot_action_url(vacancy_id, application_id, slot, "re-enable"),
++    json.object([]),
++    csrf_token,
++    on_response,
++  )
++}
++
++/// POST .../reference-checks/:call_id/take-over — A7 warm handoff. The sweep
++/// stops sending; the form link stays live (§8.6).
++pub fn take_over_reference(
++  vacancy_id vacancy_id: String,
++  application_id application_id: String,
++  call_id call_id: String,
++  csrf_token csrf_token: String,
++  on_response on_response: fn(Result(String, ApiError)) -> msg,
++) -> Effect(msg) {
++  post_action(
++    call_action_url(vacancy_id, application_id, call_id, "take-over"),
++    json.object([]),
++    csrf_token,
++    on_response,
++  )
++}
++
++/// POST .../reference-checks/:call_id/correct — AD-7 landlord-driven
++/// correction (one cycle). Body is the §8.3 edit-trio.
++pub fn correct_reference(
++  vacancy_id vacancy_id: String,
++  application_id application_id: String,
++  call_id call_id: String,
++  name name: String,
++  email email: String,
++  phone phone: String,
++  csrf_token csrf_token: String,
++  on_response on_response: fn(Result(String, ApiError)) -> msg,
++) -> Effect(msg) {
++  post_action(
++    call_action_url(vacancy_id, application_id, call_id, "correct"),
++    json.object([
++      #("name", json.string(name)),
++      #("email", json.string(email)),
++      #("phone", json.string(phone)),
++    ]),
++    csrf_token,
++    on_response,
++  )
++}
++
++/// POST .../reference-checks/:call_id/substitute — a NEW reference_call row
++/// for the slot (the prior row is retained as history; AD-16 carries both
++/// ids in the audit).
++pub fn substitute_reference(
++  vacancy_id vacancy_id: String,
++  application_id application_id: String,
++  call_id call_id: String,
++  name name: String,
++  email email: String,
++  phone phone: String,
++  csrf_token csrf_token: String,
++  on_response on_response: fn(Result(String, ApiError)) -> msg,
++) -> Effect(msg) {
++  post_action(
++    call_action_url(vacancy_id, application_id, call_id, "substitute"),
++    json.object([
++      #("name", json.string(name)),
++      #("email", json.string(email)),
++      #("phone", json.string(phone)),
++    ]),
++    csrf_token,
++    on_response,
++  )
++}
+diff --git a/client/src/client.gleam b/client/src/client.gleam
+index c1722f53..18d14d40 100644
+--- a/client/src/client.gleam
++++ b/client/src/client.gleam
+@@ -6,6 +6,7 @@ import api/application_api
+ import api/auth_api
+ import api/notification_api
+ import api/payment_api
++import api/reference_checks_api
+ import api/report_api
+ import api/scoring_api
+ import api/settings_api
+@@ -16,6 +17,7 @@ import components/google_ads
+ import components/meta_pixel
+ import components/policy_reaccept_modal
+ import components/policy_reaccept_modal_focus
++import components/reference_panel
+ import components/shell
+ import components/skeleton
+ import components/status_stepper
+@@ -50,8 +52,11 @@ import model.{
+   type Model, ArchiveVacancy, CloseVacancy, ConfirmPassword, CurrentPassword,
+   LoadingArchive, LoadingBulkInvite, LoadingClose, LoadingPublish,
+   LoadingReminder, LoadingResendConfirmation, LoadingRestore,
+-  LoadingStatusUpdate, LoginPassword, Model, NewPassword, ResetConfirmPassword,
+-  ResetNewPassword, SignupPassword, Toast, ToastError, ToastSuccess,
++  LoadingStatusUpdate, LoginPassword, Model, NewPassword, RefcheckConfirmStart,
++  RefcheckConfirmTakeOver, RefcheckCorrect, RefcheckEditCorrect,
++  RefcheckEditSubstitute, RefcheckReEnable, RefcheckSkip, RefcheckStart,
++  RefcheckSubstitute, RefcheckTakeOver, ResetConfirmPassword, ResetNewPassword,
++  SignupPassword, Toast, ToastError, ToastSuccess,
+ }
+ import modem
+ import msg.{
+@@ -67,29 +72,30 @@ import msg.{
+   ApiReturnedMarkAllRead, ApiReturnedMarkRead, ApiReturnedNotificationPreference,
+   ApiReturnedNotifications, ApiReturnedNotificationsRefresh,
+   ApiReturnedPasswordChange, ApiReturnedPaymentStatus, ApiReturnedPolicyRefresh,
+-  ApiReturnedProfileUpdate, ApiReturnedPublishVacancy, ApiReturnedReminder,
+-  ApiReturnedReportPdf, ApiReturnedResendConfirmation, ApiReturnedReset,
+-  ApiReturnedRestoreVacancy, ApiReturnedScoringStatus, ApiReturnedSession,
+-  ApiReturnedSignup, ApiReturnedSignupConfirmation, ApiReturnedStatusUpdate,
+-  ApiReturnedVacancyCreate, ApiReturnedVacancyDetail,
++  ApiReturnedProfileUpdate, ApiReturnedPublishVacancy, ApiReturnedRefcheckAction,
++  ApiReturnedReminder, ApiReturnedReportPdf, ApiReturnedResendConfirmation,
++  ApiReturnedReset, ApiReturnedRestoreVacancy, ApiReturnedScoringStatus,
++  ApiReturnedSession, ApiReturnedSignup, ApiReturnedSignupConfirmation,
++  ApiReturnedStatusUpdate, ApiReturnedVacancyCreate, ApiReturnedVacancyDetail,
+   ApiReturnedVacancyDetailRefresh, ApiReturnedVacancyForEdit,
+   ApiReturnedVacancyUpdate, AppClearedClipboardStatus, AppCompletedClipboardCopy,
+-  AppCompletedContactCopy, AppCompletedViewingCopy, AppDismissToast, AppNoOp,
+-  AppPolledData, AppRequestedApplicationDetail, AppRequestedArchivedVacancies,
+-  AppRequestedBillingHistory, AppRequestedComparisonDetails,
+-  AppRequestedDashboardData, AppRequestedLeaderboard, AppRequestedNotifications,
+-  AppRequestedSessionRefresh, AppRequestedVacancyDetail,
+-  AppRetriedApplicationOpen, AppShowToast, AppTimedOutDownloadReport,
+-  BrowserChangedUrl, UserAcceptedPolicy, UserBlurredForgotEmail,
+-  UserBlurredLoginEmail, UserBlurredLoginPassword, UserBlurredResetPassword,
+-  UserBlurredResetPasswordConfirm, UserBlurredSignupEmail, UserBlurredSignupName,
+-  UserBlurredSignupPassword, UserBlurredVacancyAddressLine1,
+-  UserBlurredVacancyAvailableFrom, UserBlurredVacancyBedrooms,
+-  UserBlurredVacancyMonthlyRent, UserBlurredVacancyPropertyName,
+-  UserBlurredVacancyPropertyType, UserBlurredVacancyValidityDays,
+-  UserCancelledApproval, UserCancelledArchiveVacancy,
+-  UserCancelledBackwardTransition, UserCancelledCloseVacancy,
+-  UserCancelledRejection, UserCancelledSelectMode, UserChangedApplicationStatus,
++  AppCompletedContactCopy, AppCompletedRefcheckExport, AppCompletedViewingCopy,
++  AppDismissToast, AppNoOp, AppPolledData, AppRequestedApplicationDetail,
++  AppRequestedArchivedVacancies, AppRequestedBillingHistory,
++  AppRequestedComparisonDetails, AppRequestedDashboardData,
++  AppRequestedLeaderboard, AppRequestedNotifications, AppRequestedSessionRefresh,
++  AppRequestedVacancyDetail, AppRetriedApplicationOpen, AppShowToast,
++  AppTimedOutDownloadReport, BrowserChangedUrl, UserAcceptedPolicy,
++  UserBlurredForgotEmail, UserBlurredLoginEmail, UserBlurredLoginPassword,
++  UserBlurredResetPassword, UserBlurredResetPasswordConfirm,
++  UserBlurredSignupEmail, UserBlurredSignupName, UserBlurredSignupPassword,
++  UserBlurredVacancyAddressLine1, UserBlurredVacancyAvailableFrom,
++  UserBlurredVacancyBedrooms, UserBlurredVacancyMonthlyRent,
++  UserBlurredVacancyPropertyName, UserBlurredVacancyPropertyType,
++  UserBlurredVacancyValidityDays, UserCancelledApproval,
++  UserCancelledArchiveVacancy, UserCancelledBackwardTransition,
++  UserCancelledCloseVacancy, UserCancelledRefcheckEdit, UserCancelledRejection,
++  UserCancelledSelectMode, UserChangedApplicationStatus,
+   UserChangedBulkInviteEmails, UserChangedDeleteConfirmEmail,
+   UserChangedForgotEmail, UserChangedLeaderboardFilter,
+   UserChangedLeaderboardSort, UserChangedLoginEmail, UserChangedLoginPassword,
+@@ -106,7 +112,7 @@ import msg.{
+   UserChangedVacancyMonthlyRent, UserChangedVacancyPetsPolicy,
+   UserChangedVacancyPropertyName, UserChangedVacancyPropertyType,
+   UserChangedVacancyRequirements, UserChangedVacancySmokingPolicy,
+-  UserChangedVacancyValidityDays, UserClearedComparison,
++  UserChangedVacancyValidityDays, UserChoseRefcheckAction, UserClearedComparison,
+   UserClickedArchiveVacancy, UserClickedCloseVacancy, UserClickedCompareTop3,
+   UserClickedCookieSettings, UserClickedCopyApplicationLink,
+   UserClickedCopyInboundEmail, UserClickedCreateVacancy,
+@@ -115,28 +121,30 @@ import msg.{
+   UserClickedLoadMoreApplications, UserClickedLogout, UserClickedMarkAllRead,
+   UserClickedMarkAllRejected, UserClickedMarkSelectedRejected,
+   UserClickedNotification, UserClickedPlayLandingIntro,
+-  UserClickedPublishVacancy, UserClickedRemindApplicant,
+-  UserClickedResendConfirmation, UserClickedRestoreVacancy,
+-  UserClickedSaveVacancyDraft, UserClickedSaveVacancyDraftUpdate,
+-  UserClickedScrollTo, UserClickedSendReminder, UserClickedSettingsSection,
++  UserClickedPublishVacancy, UserClickedRefcheckExport,
++  UserClickedRemindApplicant, UserClickedResendConfirmation,
++  UserClickedRestoreVacancy, UserClickedSaveVacancyDraft,
++  UserClickedSaveVacancyDraftUpdate, UserClickedScrollTo,
++  UserClickedSendReminder, UserClickedSettingsSection,
+   UserClickedShowMoreAwaiting, UserClickedViewComparison, UserClosedDeleteModal,
+   UserConfirmedAccountDeletion, UserConfirmedApproval,
+   UserConfirmedArchiveVacancy, UserConfirmedBackwardTransition,
+-  UserConfirmedCloseVacancy, UserConfirmedLeaveEdit, UserConfirmedRejection,
+-  UserConfirmedVacancyUpdate, UserCopiedContact, UserCopiedViewingMessage,
+-  UserDismissedEditWarningModal, UserDismissedLeaveEdit, UserDismissedSweepNudge,
+-  UserFocusedStepperStop, UserHydratedDismissedNudges,
++  UserConfirmedCloseVacancy, UserConfirmedLeaveEdit, UserConfirmedRefcheckAction,
++  UserConfirmedRejection, UserConfirmedVacancyUpdate, UserCopiedContact,
++  UserCopiedViewingMessage, UserDismissedEditWarningModal,
++  UserDismissedLeaveEdit, UserDismissedRefcheckAction, UserDismissedSweepNudge,
++  UserEditedRefcheckTrio, UserFocusedStepperStop, UserHydratedDismissedNudges,
+   UserHydratedRefcheckExplainerDismissed, UserRequestedForgotRetry,
+-  UserSubmittedBulkInvite, UserSubmittedForgot, UserSubmittedLogin,
+-  UserSubmittedPasswordChange, UserSubmittedProfile, UserSubmittedReset,
+-  UserSubmittedSignup, UserSubmittedVacancyCreate, UserSubmittedVacancyUpdate,
+-  UserToggledAllDetails, UserToggledAuditTrail, UserToggledAvatarDropdown,
+-  UserToggledAwaitingSection, UserToggledComparison,
++  UserSavedRefcheckEdit, UserSubmittedBulkInvite, UserSubmittedForgot,
++  UserSubmittedLogin, UserSubmittedPasswordChange, UserSubmittedProfile,
++  UserSubmittedReset, UserSubmittedSignup, UserSubmittedVacancyCreate,
++  UserSubmittedVacancyUpdate, UserToggledAllDetails, UserToggledAuditTrail,
++  UserToggledAvatarDropdown, UserToggledAwaitingSection, UserToggledComparison,
+   UserToggledComparisonInsight, UserToggledDocuments, UserToggledHelpMenu,
+   UserToggledInsight, UserToggledMobileMenu, UserToggledNotificationDropdown,
+   UserToggledPasswordVisibility, UserToggledRefcheckExplainer,
+-  UserToggledRefcheckRow, UserToggledSelectModeApplicant,
+-  UserToggledViewingPopover,
++  UserToggledRefcheckMenu, UserToggledRefcheckRow,
++  UserToggledSelectModeApplicant, UserToggledViewingPopover,
+ }
+ import pages/application_detail as application_detail_page
+ import pages/archived_vacancies
+@@ -657,6 +665,14 @@ fn update_inner(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+             // expands only on the first view of an applicant.
+             refcheck_expanded: set.new(),
+             refcheck_explainer_open: False,
++            // Reference panel (RC4.3) row-action state: the overflow menu,
++            // inline confirms, and edit-trios are per-application surfaces —
++            // reset on route change so nothing leaks across applicants (r1
++            // W9: a pending edit carries the landlord's typed referee PII).
++            refcheck_menu_open: None,
++            refcheck_confirm: None,
++            refcheck_edit: None,
++            refcheck_action_inflight: set.new(),
+             // Drop any in-flight report download — late responses are
+             // dropped via the id-mismatch guard in ApiReturnedReportPdf, but
+             // clearing the flag here keeps the spinner from following the
+@@ -3288,6 +3304,311 @@ fn update_inner(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+       effect.none(),
+     )
+ 
++    // -- Reference panel (RC4.3) row actions --------------------------------
++    // The control surface: the `⋯` overflow menu, the inline confirms
++    // (§7.4 start / §7.7 take-over — never modals), the §8.3 edit-trio
++    // (correct / substitute), and the takeover surface's attempt-log
++    // export. Every successful action refetches the application detail —
++    // the payload is the contract (AR-RC13).
++    UserToggledRefcheckMenu(call_id) -> #(
++      Model(..model, refcheck_menu_open: case model.refcheck_menu_open {
++        Some(open) if open == call_id -> None
++        _ -> Some(call_id)
++      }),
++      effect.none(),
++    )
++
++    UserChoseRefcheckAction(call_id, action) -> {
++      // r1 (W7): the confirm/edit surfaces render inside the row detail —
++      // expand the row so a menu choice on a collapsed row is never
++      // invisible.
++      let menu_closed =
++        Model(
++          ..model,
++          refcheck_menu_open: None,
++          refcheck_expanded: set.insert(model.refcheck_expanded, call_id),
++        )
++      case action {
++        // Immediate actions — fire and let the refetch carry the state.
++        RefcheckSkip ->
++          fire_refcheck_slot_action(
++            menu_closed,
++            call_id,
++            "skip",
++            fn(vid, aid, slot, csrf, on_response) {
++              reference_checks_api.skip_reference(
++                vid,
++                aid,
++                slot,
++                csrf,
++                on_response,
++              )
++            },
++          )
++        RefcheckReEnable ->
++          fire_refcheck_slot_action(
++            menu_closed,
++            call_id,
++            "re-enable",
++            fn(vid, aid, slot, csrf, on_response) {
++              reference_checks_api.re_enable_reference(
++                vid,
++                aid,
++                slot,
++                csrf,
++                on_response,
++              )
++            },
++          )
++        RefcheckStart -> #(
++          Model(
++            ..menu_closed,
++            refcheck_confirm: Some(model.RefcheckConfirm(
++              call_id: call_id,
++              kind: RefcheckConfirmStart,
++            )),
++          ),
++          effect.none(),
++        )
++        RefcheckTakeOver -> #(
++          Model(
++            ..menu_closed,
++            refcheck_confirm: Some(model.RefcheckConfirm(
++              call_id: call_id,
++              kind: RefcheckConfirmTakeOver,
++            )),
++          ),
++          effect.none(),
++        )
++        RefcheckSubstitute -> #(
++          Model(
++            ..menu_closed,
++            refcheck_edit: Some(prefill_refcheck_edit(
++              model,
++              call_id,
++              RefcheckEditSubstitute,
++            )),
++          ),
++          effect.none(),
++        )
++        RefcheckCorrect -> #(
++          Model(
++            ..menu_closed,
++            refcheck_edit: Some(prefill_refcheck_edit(
++              model,
++              call_id,
++              RefcheckEditCorrect,
++            )),
++          ),
++          effect.none(),
++        )
++      }
++    }
++
++    UserConfirmedRefcheckAction(call_id) ->
++      case model.refcheck_confirm {
++        Some(confirm) if confirm.call_id == call_id ->
++          case confirm.kind {
++            RefcheckConfirmStart ->
++              fire_refcheck_slot_action(
++                Model(
++                  ..model,
++                  refcheck_confirm: None,
++                  refcheck_action_inflight: set.insert(
++                    model.refcheck_action_inflight,
++                    call_id,
++                  ),
++                ),
++                call_id,
++                "start",
++                fn(vid, aid, slot, csrf, on_response) {
++                  reference_checks_api.start_check(
++                    vid,
++                    aid,
++                    Some(slot),
++                    csrf,
++                    on_response,
++                  )
++                },
++              )
++            RefcheckConfirmTakeOver ->
++              fire_refcheck_call_action(
++                Model(
++                  ..model,
++                  refcheck_confirm: None,
++                  refcheck_action_inflight: set.insert(
++                    model.refcheck_action_inflight,
++                    call_id,
++                  ),
++                ),
++                call_id,
++                "take-over",
++                fn(vid, aid, call, csrf, on_response) {
++                  reference_checks_api.take_over_reference(
++                    vid,
++                    aid,
++                    call,
++                    csrf,
++                    on_response,
++                  )
++                },
++              )
++          }
++        _ -> #(model, effect.none())
++      }
++
++    UserDismissedRefcheckAction(_call_id) -> #(
++      Model(..model, refcheck_confirm: None),
++      effect.none(),
++    )
++
++    UserEditedRefcheckTrio(call_id, field, value) -> {
++      let model =
++        Model(
++          ..model,
++          refcheck_expanded: set.insert(model.refcheck_expanded, call_id),
++        )
++      let edit = case model.refcheck_edit {
++        Some(e) if e.call_id == call_id -> e
++        _ ->
++          prefill_refcheck_edit(
++            model,
++            call_id,
++            refcheck_edit_kind_for(model, call_id),
++          )
++      }
++      let updated = case field {
++        "name" -> model.RefcheckEdit(..edit, name: value, error: None)
++        "email" -> model.RefcheckEdit(..edit, email: value, error: None)
++        "phone" -> model.RefcheckEdit(..edit, phone: value, error: None)
++        _ -> edit
++      }
++      #(Model(..model, refcheck_edit: Some(updated)), effect.none())
++    }
++
++    UserSavedRefcheckEdit(call_id) ->
++      case model.refcheck_edit {
++        Some(edit) if edit.call_id == call_id -> save_refcheck_edit(model, edit)
++        _ ->
++          save_refcheck_edit(
++            model,
++            prefill_refcheck_edit(
++              model,
++              call_id,
++              refcheck_edit_kind_for(model, call_id),
++            ),
++          )
++      }
++
++    UserCancelledRefcheckEdit(_call_id) -> #(
++      Model(..model, refcheck_edit: None),
++      effect.none(),
++    )
++
++    UserClickedRefcheckExport(call_id) ->
++      case find_refcheck_call(model, call_id) {
++        None -> #(model, effect.none())
++        Some(call) -> #(
++          Model(..model, clipboard_copied: Some("refcheck_export")),
++          copy_refcheck_export_effect(call_id, build_attempt_log_text(call)),
++        )
++      }
++
++    AppCompletedRefcheckExport(call_id, result) ->
++      // r3 (N11): a clipboard result settling after navigation must not
++      // toast on an unrelated page — same route+call guard as the actions.
++      case refcheck_response_is_current(model, call_id), result {
++        False, _ -> #(Model(..model, clipboard_copied: None), effect.none())
++        True, Ok(_) ->
++          add_toast(
++            Model(..model, clipboard_copied: None),
++            copy.refcheck_toast_exported,
++            ToastSuccess,
++          )
++        True, Error(_) ->
++          add_toast(
++            Model(..model, clipboard_copied: None),
++            copy.refcheck_toast_export_failed,
++            ToastError,
++          )
++      }
++
++    ApiReturnedRefcheckAction(call_id, action, result) ->
++      // r1 (W8) / r2 (W8): the late-response guard — a stale answer after
++      // the landlord navigated away is dropped. The retained detail alone
++      // is not enough (it survives non-detail navigation): the CURRENT
++      // route must still be the same ApplicationDetail AND still show the
++      // call.
++      case refcheck_response_is_current(model, call_id) {
++        False -> #(
++          Model(
++            ..model,
++            refcheck_action_inflight: set.delete(
++              model.refcheck_action_inflight,
++              call_id,
++            ),
++          ),
++          effect.none(),
++        )
++        True ->
++          case result {
++            Ok(_) -> {
++              // r3 (N2): only the MATCHING row's edit closes — another
++              // row's in-progress typed trio survives the refetch.
++              let edit_kept = case model.refcheck_edit {
++                Some(edit) if edit.call_id == call_id -> None
++                other -> other
++              }
++              let cleared =
++                Model(
++                  ..model,
++                  refcheck_edit: edit_kept,
++                  refcheck_confirm: None,
++                  refcheck_action_inflight: set.delete(
++                    model.refcheck_action_inflight,
++                    call_id,
++                  ),
++                )
++              let toast_copy = case action {
++                "start" -> copy.refcheck_toast_started
++                "skip" -> copy.refcheck_toast_skipped
++                "re-enable" -> copy.refcheck_toast_re_enabled
++                "take-over" -> copy.refcheck_toast_taken_over
++                "correct" -> copy.refcheck_toast_corrected
++                _ -> copy.refcheck_toast_substituted
++              }
++              let #(m, toast_eff) = add_toast(cleared, toast_copy, ToastSuccess)
++              #(m, effect.batch([refetch_refcheck_effect(model), toast_eff]))
++            }
++            Error(err) -> {
++              // r1 (W5): a failed action re-enables the edit-trio save button —
++              // the form stays open with the landlord's values so they can fix
++              // and retry without retyping.
++              let edit_reenabled = case model.refcheck_edit {
++                Some(edit) if edit.call_id == call_id ->
++                  Some(model.RefcheckEdit(..edit, saving: False))
++                other -> other
++              }
++              let cleared =
++                Model(
++                  ..model,
++                  refcheck_edit: edit_reenabled,
++                  refcheck_action_inflight: set.delete(
++                    model.refcheck_action_inflight,
++                    call_id,
++                  ),
++                )
++              let #(m, toast_eff) =
++                add_toast(
++                  cleared,
++                  error_toast_copy(err, copy.CtxRefcheckAction),
++                  ToastError,
++                )
++              #(m, toast_eff)
++            }
++          }
++      }
++
+     // -- PDF Report Download ---------------------------------------------------
+     // Drives the spinner + brand-voice toast UX over a synchronous endpoint
+     // that can take ~60s in the worst case. The id-mismatch guard in
+@@ -6279,6 +6600,277 @@ fn copy_contact_to_clipboard(kind: String, value: String) -> Effect(Msg) {
+   })
+ }
+ 
++// -- Reference panel (RC4.3) action plumbing ---------------------------------
++
++/// The reference_call row for a call id from the loaded detail, if any.
++fn find_refcheck_call(
++  model: Model,
++  call_id: String,
++) -> Option(reference_call.ReferenceCallDetail) {
++  case model.application_detail {
++    Success(detail) ->
++      case
++        list.find(detail.reference_calls, fn(c) {
++          c.reference_call_id == call_id
++        })
++      {
++        Ok(call) -> Some(call)
++        Error(_) -> None
++      }
++    _ -> None
++  }
++}
++
++/// r2 (W8): whether a row-action response is still relevant — the current
++/// route is the application-detail page AND the detail still shows the call.
++fn refcheck_response_is_current(model: Model, call_id: String) -> Bool {
++  case model.route {
++    routes.ApplicationDetail(_, _) -> find_refcheck_call(model, call_id) != None
++    _ -> False
++  }
++}
++
++/// Refetch the application detail after a successful row action — the
++/// payload is the contract the panel renders (AR-RC13). No-op off the
++/// detail route.
++fn refetch_refcheck_effect(model: Model) -> Effect(Msg) {
++  case model.route {
++    routes.ApplicationDetail(vid, aid) ->
++      application_api.fetch_application_detail(
++        vid,
++        aid,
++        ApiReturnedApplicationDetail,
++      )
++    _ -> effect.none()
++  }
++}
++
++/// Fire a slot-scoped action (skip / re-enable / start). The slot comes
++/// from the row itself; the response rides `ApiReturnedRefcheckAction` with
++/// the call id + action name so a late answer after navigation is dropped
++/// by the id-match guard.
++fn fire_refcheck_slot_action(
++  model: Model,
++  call_id: String,
++  action: String,
++  fire: fn(String, String, String, String, fn(Result(String, ApiError)) -> Msg) ->
++    Effect(Msg),
++) -> #(Model, Effect(Msg)) {
++  case find_refcheck_call(model, call_id) {
++    None -> #(model, effect.none())
++    Some(call) ->
++      case model.route {
++        routes.ApplicationDetail(vid, aid) -> {
++          let slot = reference_call.encode_ref_slot(call.ref_slot)
++          #(
++            Model(
++              ..model,
++              refcheck_action_inflight: set.insert(
++                model.refcheck_action_inflight,
++                call_id,
++              ),
++            ),
++            fire(vid, aid, slot, model.csrf_token, fn(result) {
++              ApiReturnedRefcheckAction(call_id, action, result)
++            }),
++          )
++        }
++        _ -> #(model, effect.none())
++      }
++  }
++}
++
++/// Fire a call-scoped action (take-over / correct / substitute) — the
++/// endpoint takes the row id directly.
++fn fire_refcheck_call_action(
++  model: Model,
++  call_id: String,
++  action: String,
++  fire: fn(String, String, String, String, fn(Result(String, ApiError)) -> Msg) ->
++    Effect(Msg),
++) -> #(Model, Effect(Msg)) {
++  case model.route {
++    routes.ApplicationDetail(vid, aid) -> #(
++      Model(
++        ..model,
++        refcheck_action_inflight: set.insert(
++          model.refcheck_action_inflight,
++          call_id,
++        ),
++      ),
++      fire(vid, aid, call_id, model.csrf_token, fn(result) {
++        ApiReturnedRefcheckAction(call_id, action, result)
++      }),
++    )
++    _ -> #(model, effect.none())
++  }
++}
++
++/// The edit-trio prefill. Correct prefills from the row's effective contact
++/// (corrected ?? snapshot); substitute starts EMPTY — §8.2 is "ask the
++/// applicant for ANOTHER referee", never the terminal referee's own details
++/// (r2 W5).
++fn prefill_refcheck_edit(
++  model: Model,
++  call_id: String,
++  kind: model.RefcheckEditKind,
++) -> model.RefcheckEdit {
++  let #(name, email, phone) = case kind {
++    model.RefcheckEditSubstitute -> #("", "", "")
++    model.RefcheckEditCorrect ->
++      case find_refcheck_call(model, call_id) {
++        Some(call) -> #(
++          reference_panel.effective_name_value(call),
++          reference_panel.effective_email_value(call),
++          reference_panel.effective_phone_value(call),
++        )
++        None -> #("", "", "")
++      }
++  }
++  model.RefcheckEdit(
++    call_id: call_id,
++    kind: kind,
++    name: name,
++    email: email,
++    phone: phone,
++    saving: False,
++    error: None,
++  )
++}
++
++/// The edit kind for a call: awaiting-correction rows correct; every other
++/// row substitutes.
++fn refcheck_edit_kind_for(
++  model: Model,
++  call_id: String,
++) -> model.RefcheckEditKind {
++  case find_refcheck_call(model, call_id) {
++    Some(call) ->
++      case call.status {
++        reference_call.AwaitingCorrection -> model.RefcheckEditCorrect
++        _ -> model.RefcheckEditSubstitute
++      }
++    None -> model.RefcheckEditSubstitute
++  }
++}
++
++/// Validate the §8.3 trio client-side (mirror of the server rule — a
++/// referee needs a name AND a reachable channel) and fire the endpoint.
++fn save_refcheck_edit(
++  model: Model,
++  edit: model.RefcheckEdit,
++) -> #(Model, Effect(Msg)) {
++  let name = string.trim(edit.name)
++  let email = string.trim(edit.email)
++  let phone = string.trim(edit.phone)
++  case name {
++    "" -> #(
++      Model(
++        ..model,
++        refcheck_edit: Some(
++          model.RefcheckEdit(..edit, error: Some(copy.refcheck_edit_need_name)),
++        ),
++      ),
++      effect.none(),
++    )
++    _ ->
++      case email, phone {
++        "", "" -> #(
++          Model(
++            ..model,
++            refcheck_edit: Some(
++              model.RefcheckEdit(
++                ..edit,
++                error: Some(copy.refcheck_edit_need_channel),
++              ),
++            ),
++          ),
++          effect.none(),
++        )
++        _, _ -> {
++          let saving =
++            Model(
++              ..model,
++              refcheck_edit: Some(
++                model.RefcheckEdit(..edit, saving: True, error: None),
++              ),
++            )
++          case edit.kind {
++            model.RefcheckEditCorrect ->
++              fire_refcheck_call_action(
++                saving,
++                edit.call_id,
++                "correct",
++                fn(vid, aid, call, csrf, on_response) {
++                  reference_checks_api.correct_reference(
++                    vid,
++                    aid,
++                    call,
++                    name,
++                    email,
++                    phone,
++                    csrf,
++                    on_response,
++                  )
++                },
++              )
++            model.RefcheckEditSubstitute ->
++              fire_refcheck_call_action(
++                saving,
++                edit.call_id,
++                "substitute",
++                fn(vid, aid, call, csrf, on_response) {
++                  reference_checks_api.substitute_reference(
++                    vid,
++                    aid,
++                    call,
++                    name,
++                    email,
++                    phone,
++                    csrf,
++                    on_response,
++                  )
++                },
++              )
++          }
++        }
++      }
++  }
++}
++
++/// The plain-text attempt-log export (the takeover surface's affordance).
++/// RC4.4 owns the full timeline + the verbatim OQ-5 toast; this is the
++/// honest v1 text: the reference, each attempt line, and the current state.
++fn build_attempt_log_text(call: reference_call.ReferenceCallDetail) -> String {
++  let name = reference_panel.effective_name_value(call)
++  let status = reference_call.encode_status(call.status)
++  let lines =
++    call.attempts
++    |> list.map(fn(attempt) {
++      attempt.at
++      <> " - "
++      <> attempt.channel
++      <> " - "
++      <> attempt.outcome
++      <> case attempt.detail {
++        "" -> ""
++        detail -> " (" <> detail <> ")"
++      }
++    })
++    |> string.join("\n")
++  "Reference: " <> name <> "\n" <> "State: " <> status <> "\n" <> lines
++}
++
++fn copy_refcheck_export_effect(call_id: String, text: String) -> Effect(Msg) {
++  effect.from(fn(dispatch) {
++    clipboard.write_text(text)
++    |> promise.tap(fn(result) {
++      dispatch(AppCompletedRefcheckExport(call_id, result))
++    })
++    Nil
++  })
++}
++
+ /// Copy the Next Step templated viewing message and dispatch
+ /// `AppCompletedViewingCopy` when the promise resolves. The toast copy
+ /// differs from the contact-chip toast ("Message copied — paste it into…"),
+diff --git a/client/src/components/reference_panel.gleam b/client/src/components/reference_panel.gleam
+index f540b3ed..4ad1019c 100644
+--- a/client/src/components/reference_panel.gleam
++++ b/client/src/components/reference_panel.gleam
+@@ -31,14 +31,19 @@ import lustre/element.{type Element}
+ import lustre/element/html
+ import lustre/element/keyed
+ import lustre/event
++import model.{
++  type RefcheckAction, type RefcheckConfirm, type RefcheckEdit,
++  type RefcheckEditKind, RefcheckConfirmStart, RefcheckConfirmTakeOver,
++  RefcheckCorrect, RefcheckEditCorrect, RefcheckEditSubstitute, RefcheckReEnable,
++  RefcheckSkip, RefcheckStart, RefcheckSubstitute, RefcheckTakeOver,
++}
+ import msg.{type Msg}
+ import shared/application.{type Application}
+ import shared/reference_call.{
+-  type RefSlot, type ReferenceCallAttempt, type ReferenceCallDetail,
+-  type ReferenceCallStatus, AwaitingCorrection, Calling, CharacterRef, Completed,
+-  ContactInitiated, EmployerRef, Failed, FormCompleted, LandlordRef,
+-  ManualRecorded, Objected, Partial, Queued, Refused, Scheduled, Skipped,
+-  Unreachable,
++  type ReferenceCallAttempt, type ReferenceCallDetail, type ReferenceCallStatus,
++  AwaitingCorrection, Calling, CharacterRef, Completed, ContactInitiated,
++  EmployerRef, Failed, FormCompleted, LandlordRef, ManualRecorded, Objected,
++  Partial, Queued, Refused, Scheduled, Skipped, Unreachable,
+ }
+ 
+ // -- Public API ---------------------------------------------------------------
+@@ -59,6 +64,10 @@ pub fn view(
+   app app: Application,
+   expanded expanded: Set(String),
+   explainer_open explainer_open: Bool,
++  menu_open menu_open: Option(String),
++  confirm confirm: Option(RefcheckConfirm),
++  edit edit: Option(RefcheckEdit),
++  inflight inflight: Set(String),
+ ) -> Element(Msg) {
+   case off || attestation_on_file || !list.is_empty(calls) {
+     False -> element.none()
+@@ -84,7 +93,16 @@ pub fn view(
+           view_explainer(explainer_open, app.first_name),
+           case off {
+             True -> view_off(app)
+-            False -> view_rows(calls, app, expanded)
++            False ->
++              view_rows(
++                calls,
++                app,
++                expanded,
++                menu_open,
++                confirm,
++                edit,
++                inflight,
++              )
+           },
+         ],
+       )
+@@ -247,11 +265,18 @@ fn view_rows(
+   calls: List(ReferenceCallDetail),
+   app: Application,
+   expanded: Set(String),
++  menu_open: Option(String),
++  confirm: Option(RefcheckConfirm),
++  edit: Option(RefcheckEdit),
++  inflight: Set(String),
+ ) -> Element(Msg) {
+   keyed.ul(
+     [attribute("role", "list"), class("divide-y divide-slate-100")],
+     list.map(calls, fn(call) {
+-      #(call.reference_call_id, view_row(call, app, expanded))
++      #(
++        call.reference_call_id,
++        view_row(call, app, expanded, menu_open, confirm, edit, inflight),
++      )
+     }),
+   )
+ }
+@@ -260,11 +285,20 @@ fn view_row(
+   call: ReferenceCallDetail,
+   app: Application,
+   expanded: Set(String),
++  menu_open: Option(String),
++  confirm: Option(RefcheckConfirm),
++  edit: Option(RefcheckEdit),
++  inflight: Set(String),
+ ) -> Element(Msg) {
+   let slot = reference_call.encode_ref_slot(call.ref_slot)
+-  let name = referee_name(app, call.ref_slot)
++  let name = referee_name(app, call)
+   let is_expanded = set.contains(expanded, call.reference_call_id)
+   let #(pill_label, pill_class) = status_pill(call)
++  let is_taken_over = taken_over(call)
++  let row_actions = case is_taken_over {
++    True -> []
++    False -> overflow_actions(call)
++  }
+   html.li([attribute("data-testid", "refcheck-row-" <> slot), class("py-4")], [
+     html.div([class("flex items-start gap-3")], [
+       // The row's main interactive surface (§12: rows are buttons with
+@@ -313,6 +347,19 @@ fn view_row(
+               ],
+               [html.text(pill_label)],
+             ),
++            case is_taken_over {
++              True ->
++                html.span(
++                  [
++                    attribute("data-testid", "refcheck-taken-over-" <> slot),
++                    class(
++                      "px-2.5 py-0.5 rounded-full text-xs font-semibold bg-navy/10 text-navy",
++                    ),
++                  ],
++                  [html.text(copy.refcheck_taken_over_label)],
++                )
++              False -> element.none()
++            },
+             case status_timestamp(call) {
+               Some(ts) ->
+                 html.span([class("text-xs text-slate")], [html.text(ts)])
+@@ -321,24 +368,9 @@ fn view_row(
+           ]),
+         ],
+       ),
+-      case row_has_overflow(call.status) {
+-        True ->
+-          html.button(
+-            [
+-              attribute("data-testid", "refcheck-overflow-" <> slot),
+-              attribute("type", "button"),
+-              attribute("aria-haspopup", "menu"),
+-              attribute("aria-label", copy.refcheck_overflow_label(name)),
+-              class(
+-                "text-slate/40 hover:text-slate p-1 rounded flex-shrink-0 self-start focus:outline-none focus:ring-2 focus:ring-navy/40",
+-              ),
+-            ],
+-            // RC4.3 (Row Actions) opens the menu and wires the actions;
+-            // the control exists here because the RC4.2 acceptance matrix
+-            // pins the testid. Deliberately no on_click yet.
+-            [html.text("⋯")],
+-          )
+-        False -> element.none()
++      case row_actions {
++        [] -> element.none()
++        _ -> view_overflow(call, app, slot, row_actions, menu_open)
+       },
+     ]),
+     case is_expanded {
+@@ -349,46 +381,137 @@ fn view_row(
+             attribute("id", "refcheck-detail-" <> call.reference_call_id),
+             class("mt-3 space-y-3"),
+           ],
+-          [row_detail(call, app)],
++          [
++            row_detail(call, app, confirm, edit, inflight),
++            // RC4.3 takeover surface: the label + chips + export live in the
++            // row body alongside whatever state copy the row still shows.
++            case is_taken_over {
++              True -> view_taken_over_surface(call, slot)
++              False -> element.none()
++            },
++          ],
+         )
+     },
+   ])
+ }
+ 
+-/// The referee's display name — from the application's referee trio for the
+-/// row's slot (the RC4.1 payload carries no contact snapshot; the trio is the
+-/// honest v1 source — substitution, which diverges the two, is RC4.3's).
+-fn referee_name(app: Application, slot: RefSlot) -> String {
+-  case slot {
+-    LandlordRef ->
+-      option.unwrap(
+-        app.landlord_ref_name,
+-        copy.refcheck_slot_label("landlord_ref"),
+-      )
+-    CharacterRef ->
+-      option.unwrap(
+-        app.character_ref_name,
+-        copy.refcheck_slot_label("character_ref"),
+-      )
+-    EmployerRef ->
+-      option.unwrap(
+-        app.employer_ref_name,
+-        copy.refcheck_slot_label("employer_ref"),
+-      )
++/// The referee's display name — the row's OWN effective snapshot (corrected
++/// ?? contact; RC4.3 — substitution diverges the row from the application
++/// trio), falling back to the application trio for pre-RC4.3 payloads.
++fn referee_name(app: Application, call: ReferenceCallDetail) -> String {
++  let snapshot = effective_name(call)
++  case snapshot {
++    Some(n) if n != "" -> n
++    _ ->
++      case call.ref_slot {
++        LandlordRef ->
++          option.unwrap(
++            app.landlord_ref_name,
++            copy.refcheck_slot_label("landlord_ref"),
++          )
++        CharacterRef ->
++          option.unwrap(
++            app.character_ref_name,
++            copy.refcheck_slot_label("character_ref"),
++          )
++        EmployerRef ->
++          option.unwrap(
++            app.employer_ref_name,
++            copy.refcheck_slot_label("employer_ref"),
++          )
++      }
++  }
++}
++
++/// The row's effective name (A1, r1 W4): once a correction ran the snapshot
++/// is PROVEN DEAD — the corrected value IS the name, and a cleared field
++/// stays absent (never falling back to the failed contact). Before any
++/// correction, corrected ?? snapshot.
++fn effective_name(call: ReferenceCallDetail) -> Option(String) {
++  case call.correction_cycles >= 1 {
++    True -> call.corrected_name
++    False ->
++      case call.corrected_name {
++        Some(n) if n != "" -> Some(n)
++        _ -> call.contact_name
++      }
++  }
++}
++
++/// The effective trio values as plain strings (the §8.3 prefill + the
++/// take-over chips): corrected ?? snapshot, A1. Exported for the client
++/// handler that opens a prefilled edit form.
++pub fn effective_name_value(call: ReferenceCallDetail) -> String {
++  option.unwrap(effective_name(call), "")
++}
++
++pub fn effective_email_value(call: ReferenceCallDetail) -> String {
++  case call.correction_cycles >= 1 {
++    True -> option.unwrap(call.corrected_email, "")
++    False ->
++      case call.corrected_email {
++        Some(e) if e != "" -> e
++        _ -> option.unwrap(call.contact_email, "")
++      }
++  }
++}
++
++pub fn effective_phone_value(call: ReferenceCallDetail) -> String {
++  case call.correction_cycles >= 1 {
++    True -> option.unwrap(call.corrected_phone, "")
++    False ->
++      case call.corrected_phone {
++        Some(p) if p != "" -> p
++        _ -> option.unwrap(call.contact_phone, "")
++      }
+   }
+ }
+ 
+-/// Which rows carry §7.3 overflow actions (start/skip/nudge/take-over/export/
+-/// correct/substitute). Terminals without actions (received/partial/refused/
+-/// objected/failed) render no overflow control.
+-fn row_has_overflow(status: ReferenceCallStatus) -> Bool {
+-  case status {
+-    Queued | Skipped | ContactInitiated | AwaitingCorrection | Unreachable ->
+-      True
++/// Whether the landlord already took this row over (A7 marker present).
++fn taken_over(call: ReferenceCallDetail) -> Bool {
++  case call.taken_over_at {
++    Some(ts) if ts != "" -> True
+     _ -> False
+   }
+ }
+ 
++/// Which rows carry §7.3 overflow actions. The awaiting-correction row's
++/// action surface is its OWN body (§8.3 edit-trio — no menu, no dead
++/// entries); taken-over rows lose the menu too (their surface is the
++/// takeover block). The take-over and substitute entries are gated on the
++/// server-computed hooks (r1 B3 — AR-RC13: the panel never re-derives the
++/// legality rules; the statuses only pick the MENU, the hooks decide what
++/// it may contain).
++fn overflow_actions(call: ReferenceCallDetail) -> List(RefcheckAction) {
++  case call.status {
++    // r2 (W6): queued rows offer take-over too — §7.7's waiting states
++    // include queued and the server hook says so; one contract.
++    Queued ->
++      list.append([RefcheckStart, RefcheckSkip], case call.hooks.can_take_over {
++        True -> [RefcheckTakeOver]
++        False -> []
++      })
++    Skipped -> [RefcheckReEnable]
++    ContactInitiated ->
++      case call.hooks.can_take_over {
++        True -> [RefcheckTakeOver]
++        False -> []
++      }
++    Unreachable ->
++      list.append(
++        case call.hooks.can_take_over {
++          True -> [RefcheckTakeOver]
++          False -> []
++        },
++        case call.hooks.can_substitute_referee {
++          True -> [RefcheckSubstitute]
++          False -> []
++        },
++      )
++    _ -> []
++  }
++}
++
+ /// The status pill: label per UX §4.2 + colour per §13 — received teal,
+ /// waiting/queued slate, reminder/opened navy, needs-attention amber,
+ /// declined/objected slate. Never red.
+@@ -463,50 +586,101 @@ const pill_amber: String = "bg-amber/10 text-amber"
+ 
+ // -- Row detail ---------------------------------------------------------------
+ 
+-fn row_detail(call: ReferenceCallDetail, app: Application) -> Element(Msg) {
++fn row_detail(
++  call: ReferenceCallDetail,
++  app: Application,
++  confirm: Option(RefcheckConfirm),
++  edit: Option(RefcheckEdit),
++  inflight: Set(String),
++) -> Element(Msg) {
+   let first_name = app.first_name
++  let slot = reference_call.encode_ref_slot(call.ref_slot)
+   case call.status {
+     Queued ->
+-      html.p([class("text-sm text-slate leading-relaxed")], [
+-        html.text(copy.refcheck_state_queued),
++      html.div([class("space-y-3")], [
++        html.p([class("text-sm text-slate leading-relaxed")], [
++          html.text(copy.refcheck_state_queued),
++        ]),
++        case
++          pending_confirm(call.reference_call_id, RefcheckConfirmStart, confirm)
++        {
++          True -> view_start_confirm(call, app, slot, inflight)
++          False -> element.none()
++        },
++        // r3 (W1): the menu offers take-over on queued rows (the hook says
++        // so) — the confirm surface must render here too, never a dead
++        // control.
++        case
++          pending_confirm(
++            call.reference_call_id,
++            RefcheckConfirmTakeOver,
++            confirm,
++          )
++        {
++          True -> view_take_over_confirm(call, app, slot, inflight)
++          False -> element.none()
++        },
+       ])
+     Skipped ->
+       html.p([class("text-sm text-slate leading-relaxed")], [
+         html.text(copy.refcheck_state_skipped),
+       ])
+-    AwaitingCorrection ->
+-      html.p([class("text-sm text-amber leading-relaxed")], [
+-        html.text(copy.refcheck_state_awaiting_correction(
+-          referee_name(app, call.ref_slot),
+-          first_name,
+-        )),
+-      ])
++    AwaitingCorrection -> view_correction_surface(call, app, slot, edit)
+     Unreachable ->
+-      html.p([class("text-sm text-charcoal leading-relaxed")], [
+-        html.text(copy.refcheck_state_unreachable(
+-          referee_name(app, call.ref_slot),
+-          first_name,
+-        )),
++      html.div([class("space-y-3")], [
++        html.p([class("text-sm text-charcoal leading-relaxed")], [
++          html.text(copy.refcheck_state_unreachable(
++            referee_name(app, call),
++            first_name,
++          )),
++        ]),
++        case
++          pending_confirm(
++            call.reference_call_id,
++            RefcheckConfirmTakeOver,
++            confirm,
++          )
++        {
++          True -> view_take_over_confirm(call, app, slot, inflight)
++          False -> element.none()
++        },
++        view_substitute_surface(call, app, slot, edit),
+       ])
+     Refused ->
+       html.p([class("text-sm text-charcoal leading-relaxed")], [
+         html.text(copy.refcheck_state_refused(
+-          referee_name(app, call.ref_slot),
++          referee_name(app, call),
+           first_name,
+         )),
+       ])
+     Objected ->
+-      html.p([class("text-sm text-charcoal leading-relaxed")], [
+-        html.text(copy.refcheck_state_objected(
+-          referee_name(app, call.ref_slot),
+-          first_name,
+-        )),
++      html.div([class("space-y-3")], [
++        html.p([class("text-sm text-charcoal leading-relaxed")], [
++          html.text(copy.refcheck_state_objected(
++            referee_name(app, call),
++            first_name,
++          )),
++        ]),
++        view_substitute_surface(call, app, slot, edit),
+       ])
+     Failed ->
+       html.p([class("text-sm text-charcoal leading-relaxed")], [
+         html.text(copy.refcheck_state_failed(first_name)),
+       ])
+-    ContactInitiated -> view_attempt_summary(call)
++    ContactInitiated ->
++      html.div([class("space-y-3")], [
++        view_attempt_summary(call),
++        case
++          pending_confirm(
++            call.reference_call_id,
++            RefcheckConfirmTakeOver,
++            confirm,
++          )
++        {
++          True -> view_take_over_confirm(call, app, slot, inflight)
++          False -> element.none()
++        },
++      ])
+     FormCompleted | ManualRecorded | Partial | Completed ->
+       view_completed(call, app)
+     // v2-reserved pre-result voice states: nothing to show until a result
+@@ -515,6 +689,566 @@ fn row_detail(call: ReferenceCallDetail, app: Application) -> Element(Msg) {
+   }
+ }
+ 
++/// Whether the pending inline confirm targets this call + kind.
++fn pending_confirm(
++  call_id: String,
++  kind: model.RefcheckConfirmKind,
++  confirm: Option(RefcheckConfirm),
++) -> Bool {
++  case confirm {
++    Some(c) -> c.call_id == call_id && c.kind == kind
++    None -> False
++  }
++}
++
++// -- RC4.3 overflow menu ------------------------------------------------------
++
++/// The `⋯` control + its menu. The menu renders as an absolutely-positioned
++/// card under the button (the row header is the positioning context); one
++/// menu open at a time (model state). Entries fire immediately (skip /
++/// re-enable) or open the inline confirm / edit-trio (start / take-over /
++/// substitute).
++fn view_overflow(
++  call: ReferenceCallDetail,
++  app: Application,
++  slot: String,
++  actions: List(RefcheckAction),
++  menu_open: Option(String),
++) -> Element(Msg) {
++  let name = referee_name(app, call)
++  let open = menu_open == Some(call.reference_call_id)
++  html.div([class("relative flex-shrink-0 self-start")], [
++    html.button(
++      [
++        attribute("data-testid", "refcheck-overflow-" <> slot),
++        attribute("type", "button"),
++        attribute("aria-haspopup", "menu"),
++        attribute("aria-expanded", case open {
++          True -> "true"
++          False -> "false"
++        }),
++        attribute("aria-label", copy.refcheck_overflow_label(name)),
++        event.on_click(msg.UserToggledRefcheckMenu(call.reference_call_id)),
++        class(
++          "text-slate/40 hover:text-slate p-1 rounded flex-shrink-0 self-start focus:outline-none focus:ring-2 focus:ring-navy/40",
++        ),
++      ],
++      [html.text("⋯")],
++    ),
++    case open {
++      False -> element.none()
++      True ->
++        html.div(
++          [
++            attribute("data-testid", "refcheck-menu-" <> slot),
++            attribute("role", "menu"),
++            // r2 (N14): Escape closes the menu (the confirm_modal pattern).
++            event.on(
++              "keydown",
++              menu_escape_decoder(msg.UserToggledRefcheckMenu(
++                call.reference_call_id,
++              )),
++            ),
++            class(
++              "absolute right-0 top-full mt-1 z-20 w-56 bg-white rounded-lg shadow-xl shadow-navy/10 border border-slate-100 py-1",
++            ),
++          ],
++          actions
++            |> list.map(fn(action) {
++              let #(label, testid) = case action {
++                RefcheckStart -> #(copy.refcheck_action_start_now, "start")
++                RefcheckSkip -> #(copy.refcheck_action_skip, "skip")
++                RefcheckReEnable -> #(
++                  copy.refcheck_action_re_enable,
++                  "re-enable",
++                )
++                RefcheckTakeOver -> #(
++                  copy.refcheck_action_take_over,
++                  "take-over",
++                )
++                RefcheckSubstitute -> #(
++                  copy.refcheck_action_substitute,
++                  "substitute",
++                )
++                // Unreachable from the overflow menu (the awaiting-correction
++                // row's surface is its own body); keeps the case total.
++                RefcheckCorrect -> #(
++                  copy.refcheck_action_correct_details,
++                  "correct",
++                )
++              }
++              html.button(
++                [
++                  attribute(
++                    "data-testid",
++                    "refcheck-action-" <> testid <> "-" <> slot,
++                  ),
++                  attribute("type", "button"),
++                  attribute("role", "menuitem"),
++                  event.on_click(msg.UserChoseRefcheckAction(
++                    call.reference_call_id,
++                    action,
++                  )),
++                  class(
++                    "w-full text-left px-3 py-2 text-sm text-charcoal hover:bg-slate-50 disabled:opacity-50",
++                  ),
++                ],
++                [html.text(label)],
++              )
++            }),
++        )
++    },
++  ])
++}
++
++/// Escape-to-close decoder for the overflow menu (the confirm_modal
++/// pattern) — r2 N14's keyboard contract.
++fn menu_escape_decoder(on_escape: Msg) -> decode.Decoder(Msg) {
++  use key <- decode.field("key", decode.string)
++  case key {
++    "Escape" -> decode.success(on_escape)
++    _ -> decode.failure(on_escape, "Not Escape")
++  }
++}
++
++// -- RC4.3 inline confirmations (never modals — §7.4/§7.7) -------------------
++
++/// §7.4 one-time start confirm.
++fn view_start_confirm(
++  call: ReferenceCallDetail,
++  app: Application,
++  slot: String,
++  inflight: Set(String),
++) -> Element(Msg) {
++  let busy = set.contains(inflight, call.reference_call_id)
++  let name = referee_name(app, call)
++  // r1 (B2): an empty-string attribute value is a PRESENT boolean attribute
++  // in Lustre — the enabled state must OMIT `disabled` entirely (the
++  // codebase pattern: `attribute.none()` / empty list).
++  let disabled_attr = case busy {
++    True -> [attribute("disabled", "true")]
++    False -> []
++  }
++  html.div(
++    [
++      attribute("data-testid", "refcheck-confirm-start-" <> slot),
++      class("bg-slate-50 rounded-lg p-3 space-y-2"),
++    ],
++    [
++      html.p([class("text-sm text-charcoal leading-relaxed")], [
++        html.text(copy.refcheck_start_confirm(name)),
++      ]),
++      html.div([class("flex items-center gap-2")], [
++        html.button(
++          list.append(
++            [
++              attribute("data-testid", "refcheck-confirm-start-yes-" <> slot),
++              attribute("type", "button"),
++              event.on_click(msg.UserConfirmedRefcheckAction(
++                call.reference_call_id,
++              )),
++              class(
++                "px-3 py-1.5 rounded-lg bg-navy text-white text-sm font-medium hover:bg-navy/90 disabled:opacity-50",
++              ),
++            ],
++            disabled_attr,
++          ),
++          [html.text(copy.refcheck_start_confirm_yes)],
++        ),
++        html.button(
++          [
++            attribute("data-testid", "refcheck-confirm-start-no-" <> slot),
++            attribute("type", "button"),
++            event.on_click(msg.UserDismissedRefcheckAction(
++              call.reference_call_id,
++            )),
++            class(
++              "px-3 py-1.5 rounded-lg text-sm text-slate hover:bg-slate-100",
++            ),
++          ],
++          [html.text(copy.refcheck_start_confirm_no)],
++        ),
++      ]),
++    ],
++  )
++}
++
++/// §7.7 take-over confirm.
++fn view_take_over_confirm(
++  call: ReferenceCallDetail,
++  app: Application,
++  slot: String,
++  inflight: Set(String),
++) -> Element(Msg) {
++  let busy = set.contains(inflight, call.reference_call_id)
++  let name = referee_name(app, call)
++  let disabled_attr = case busy {
++    True -> [attribute("disabled", "true")]
++    False -> []
++  }
++  html.div(
++    [
++      attribute("data-testid", "refcheck-confirm-take-over-" <> slot),
++      class("bg-slate-50 rounded-lg p-3 space-y-2"),
++    ],
++    [
++      html.p([class("text-sm font-semibold text-charcoal")], [
++        html.text(copy.refcheck_take_over_confirm_title),
++      ]),
++      html.p([class("text-sm text-slate leading-relaxed")], [
++        html.text(copy.refcheck_take_over_confirm_body(name)),
++      ]),
++      html.div([class("flex items-center gap-2")], [
++        html.button(
++          list.append(
++            [
++              attribute(
++                "data-testid",
++                "refcheck-confirm-take-over-yes-" <> slot,
++              ),
++              attribute("type", "button"),
++              event.on_click(msg.UserConfirmedRefcheckAction(
++                call.reference_call_id,
++              )),
++              class(
++                "px-3 py-1.5 rounded-lg bg-navy text-white text-sm font-medium hover:bg-navy/90 disabled:opacity-50",
++              ),
++            ],
++            disabled_attr,
++          ),
++          [html.text(copy.refcheck_take_over_confirm_yes)],
++        ),
++        html.button(
++          [
++            attribute("data-testid", "refcheck-confirm-take-over-no-" <> slot),
++            attribute("type", "button"),
++            event.on_click(msg.UserDismissedRefcheckAction(
++              call.reference_call_id,
++            )),
++            class(
++              "px-3 py-1.5 rounded-lg text-sm text-slate hover:bg-slate-100",
++            ),
++          ],
++          [html.text(copy.refcheck_take_over_confirm_no)],
++        ),
++      ]),
++    ],
++  )
++}
++
++// -- RC4.3 correction surface (§8.3) -----------------------------------------
++
++/// The awaiting-correction row body: state line verbatim + the inline
++/// edit-trio + Save & resend + the applicant's contact chips (§8.3
++/// wireframe). The trio prefills from the row's effective contact; live
++/// values live in the model edit state once the landlord types.
++fn view_correction_surface(
++  call: ReferenceCallDetail,
++  app: Application,
++  slot: String,
++  edit: Option(RefcheckEdit),
++) -> Element(Msg) {
++  let name = referee_name(app, call)
++  let edit_open = case edit {
++    Some(e) ->
++      e.call_id == call.reference_call_id && e.kind == RefcheckEditCorrect
++    None -> False
++  }
++  html.div([class("space-y-3")], [
++    html.p([class("text-sm text-amber leading-relaxed")], [
++      html.text(copy.refcheck_state_awaiting_correction(name, app.first_name)),
++    ]),
++    // r2 (N5): the §8.3 edit opens behind a button — the form is never
++    // silently always-open (Cancel is meaningful; a second row's edit is
++    // never overwritten by an unrelated render).
++    case edit_open {
++      False ->
++        html.button(
++          [
++            attribute("data-testid", "refcheck-correct-open-" <> slot),
++            attribute("type", "button"),
++            event.on_click(msg.UserChoseRefcheckAction(
++              call.reference_call_id,
++              RefcheckCorrect,
++            )),
++            class(
++              "px-3 py-1.5 rounded-lg border border-navy/20 text-sm text-navy font-medium hover:bg-navy/5",
++            ),
++          ],
++          [html.text(copy.refcheck_action_correct_details)],
++        )
++      True ->
++        html.div([class("bg-slate-50 rounded-lg p-3 space-y-2")], [
++          html.p([class("text-sm text-charcoal leading-relaxed")], [
++            html.text(copy.refcheck_correction_heading(name)),
++          ]),
++          html.p([class("text-xs text-slate leading-relaxed")], [
++            html.text(copy.refcheck_correction_body(app.first_name)),
++          ]),
++          view_edit_trio(call, slot, edit, RefcheckEditCorrect),
++          view_applicant_chips(app),
++        ])
++    },
++  ])
++}
++
++/// The objected/unreachable substitute affordance: §8.2's "ask the applicant
++/// for another referee" — a button that opens the SAME §8.3 edit-trio,
++/// capturing the NEW referee.
++fn view_substitute_surface(
++  call: ReferenceCallDetail,
++  app: Application,
++  slot: String,
++  edit: Option(RefcheckEdit),
++) -> Element(Msg) {
++  // r1 (B3): the affordance exists only when the server hook says so —
++  // the status arm alone would re-derive the rule client-side (AR-RC13).
++  case call.hooks.can_substitute_referee {
++    False -> element.none()
++    True -> view_substitute_surface_open(call, app, slot, edit)
++  }
++}
++
++fn view_substitute_surface_open(
++  call: ReferenceCallDetail,
++  app: Application,
++  slot: String,
++  edit: Option(RefcheckEdit),
++) -> Element(Msg) {
++  let edit_open = case edit {
++    Some(e) ->
++      e.call_id == call.reference_call_id && e.kind == RefcheckEditSubstitute
++    None -> False
++  }
++  html.div([class("space-y-3")], [
++    case edit_open {
++      False ->
++        html.button(
++          [
++            attribute("data-testid", "refcheck-substitute-open-" <> slot),
++            attribute("type", "button"),
++            event.on_click(msg.UserChoseRefcheckAction(
++              call.reference_call_id,
++              RefcheckSubstitute,
++            )),
++            class(
++              "px-3 py-1.5 rounded-lg border border-navy/20 text-sm text-navy font-medium hover:bg-navy/5",
++            ),
++          ],
++          [html.text(copy.refcheck_action_substitute)],
++        )
++      True ->
++        html.div([class("bg-slate-50 rounded-lg p-3 space-y-2")], [
++          html.p([class("text-sm font-semibold text-charcoal")], [
++            html.text(copy.refcheck_substitute_heading),
++          ]),
++          html.p([class("text-xs text-slate leading-relaxed")], [
++            html.text(copy.refcheck_substitute_body),
++          ]),
++          view_edit_trio(call, slot, edit, RefcheckEditSubstitute),
++          view_applicant_chips(app),
++        ])
++    },
++  ])
++}
++
++/// The §8.3 edit-trio form. Values come from the model edit state when it
++/// targets this call, else the row's effective contact (prefill).
++fn view_edit_trio(
++  call: ReferenceCallDetail,
++  slot: String,
++  edit: Option(RefcheckEdit),
++  kind: RefcheckEditKind,
++) -> Element(Msg) {
++  let #(name, email, phone, saving, error) = case edit {
++    Some(e) if e.call_id == call.reference_call_id && e.kind == kind -> #(
++      e.name,
++      e.email,
++      e.phone,
++      e.saving,
++      e.error,
++    )
++    _ -> #(
++      effective_name_value(call),
++      effective_email_value(call),
++      effective_phone_value(call),
++      False,
++      None,
++    )
++  }
++  let disabled_attr = case saving {
++    True -> [attribute("disabled", "true")]
++    False -> []
++  }
++  html.div([class("space-y-2")], [
++    html.div([class("grid grid-cols-1 sm:grid-cols-3 gap-2")], [
++      text_input(
++        slot,
++        "name",
++        copy.refcheck_field_name,
++        name,
++        "refcheck-edit-name-" <> slot,
++      ),
++      text_input(
++        slot,
++        "email",
++        copy.refcheck_field_email,
++        email,
++        "refcheck-edit-email-" <> slot,
++      ),
++      text_input(
++        slot,
++        "phone",
++        copy.refcheck_field_phone,
++        phone,
++        "refcheck-edit-phone-" <> slot,
++      ),
++    ]),
++    case error {
++      Some(message) ->
++        html.p([class("text-xs text-amber")], [html.text(message)])
++      None -> element.none()
++    },
++    html.div([class("flex items-center gap-2")], [
++      html.button(
++        list.append(
++          [
++            attribute("data-testid", "refcheck-edit-save-" <> slot),
++            attribute("type", "button"),
++            event.on_click(msg.UserSavedRefcheckEdit(call.reference_call_id)),
++            class(
++              "px-3 py-1.5 rounded-lg bg-navy text-white text-sm font-medium hover:bg-navy/90 disabled:opacity-50",
++            ),
++          ],
++          disabled_attr,
++        ),
++        [
++          html.text(case kind {
++            RefcheckEditCorrect -> copy.refcheck_save_resend
++            RefcheckEditSubstitute -> copy.refcheck_substitute_save
++          }),
++        ],
++      ),
++      html.button(
++        [
++          attribute("data-testid", "refcheck-edit-cancel-" <> slot),
++          attribute("type", "button"),
++          event.on_click(msg.UserCancelledRefcheckEdit(call.reference_call_id)),
++          class("px-3 py-1.5 rounded-lg text-sm text-slate hover:bg-slate-100"),
++        ],
++        [html.text("Cancel")],
++      ),
++    ]),
++  ])
++}
++
++fn text_input(
++  call_id: String,
++  field: String,
++  label: String,
++  value: String,
++  testid: String,
++) -> Element(Msg) {
++  html.label([class("block")], [
++    html.span(
++      [class("text-[10px] font-bold uppercase tracking-widest text-slate")],
++      [
++        html.text(label),
++      ],
++    ),
++    html.input([
++      attribute("data-testid", testid),
++      attribute("type", "text"),
++      attribute("value", value),
++      attribute("aria-label", label),
++      event.on_input(msg.UserEditedRefcheckTrio(call_id, field, _)),
++      class(
++        "mt-1 w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-sm text-charcoal focus:outline-none focus:ring-2 focus:ring-navy/40",
++      ),
++    ]),
++  ])
++}
++
++/// The §8.3 applicant-contact chips (the landlord checks the right details
++/// with the applicant directly).
++fn view_applicant_chips(app: Application) -> Element(Msg) {
++  html.div([class("flex flex-wrap items-center gap-2")], [
++    html.span([class("text-xs text-slate")], [
++      html.text(copy.refcheck_contact_applicant(app.first_name)),
++    ]),
++    case app.phone {
++      Some(phone) ->
++        contact_chip.view(
++          icon: contact_chip.phone_icon(),
++          value: phone,
++          kind: "phone",
++          on_copy: msg.UserCopiedContact,
++          testid: "refcheck-applicant-phone",
++        )
++      None -> element.none()
++    },
++    case app.email {
++      email if email != "" ->
++        contact_chip.view(
++          icon: contact_chip.email_icon(),
++          value: email,
++          kind: "email",
++          on_copy: msg.UserCopiedContact,
++          testid: "refcheck-applicant-email",
++        )
++      _ -> element.none()
++    },
++  ])
++}
++
++// -- RC4.3 taken-over surface (A7 / §7.7) ------------------------------------
++
++/// The post-takeover block: the referee's effective-contact chips + the
++/// attempt-log export affordance, per §7.7 ("the referee's contact chips
++/// render inline, and the attempt-log export sits beside them").
++fn view_taken_over_surface(
++  call: ReferenceCallDetail,
++  slot: String,
++) -> Element(Msg) {
++  html.div([class("space-y-2")], [
++    html.div([class("flex flex-wrap gap-2")], [
++      case effective_phone_value(call) {
++        phone if phone != "" ->
++          contact_chip.view(
++            icon: contact_chip.phone_icon(),
++            value: phone,
++            kind: "phone",
++            on_copy: msg.UserCopiedContact,
++            testid: "refcheck-taken-over-phone-" <> slot,
++          )
++        _ -> element.none()
++      },
++      case effective_email_value(call) {
++        email if email != "" ->
++          contact_chip.view(
++            icon: contact_chip.email_icon(),
++            value: email,
++            kind: "email",
++            on_copy: msg.UserCopiedContact,
++            testid: "refcheck-taken-over-email-" <> slot,
++          )
++        _ -> element.none()
++      },
++      html.button(
++        [
++          attribute("data-testid", "refcheck-export-" <> slot),
++          attribute("type", "button"),
++          event.on_click(msg.UserClickedRefcheckExport(call.reference_call_id)),
++          class(
++            "inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-50 hover:bg-slate-100 transition-colors text-sm text-charcoal",
++          ),
++        ],
++        [html.text(copy.refcheck_export_log)],
++      ),
++    ]),
++  ])
++}
++
+ // -- Mini timeline (in-flight rows) -------------------------------------------
+ 
+ /// What has happened so far (§7.4): the attempt batches (invite, co-nudge,
+@@ -690,7 +1424,7 @@ fn view_parsed_summary(
+   parsed: ParsedResult,
+ ) -> Element(Msg) {
+   let slot = reference_call.encode_ref_slot(call.ref_slot)
+-  let name = referee_name(app, call.ref_slot)
++  let name = referee_name(app, call)
+   // The free-text renders as its own §9.3-flagged block below the table, so
+   // it stays OUT of the key-facts rows (§7.4's list doesn't include it) — but
+   // it still counts toward the partial line's answered/total.
+diff --git a/client/src/copy.gleam b/client/src/copy.gleam
+index cedb7492..c8eb8755 100644
+--- a/client/src/copy.gleam
++++ b/client/src/copy.gleam
+@@ -44,6 +44,7 @@ pub type ActionContext {
+   CtxApplicationsLoadList
+   CtxApplicationCompare
+   CtxApplicationStatusUpdate
++  CtxRefcheckAction
+   CtxBulkInvite
+   CtxAwaitingLoad
+   CtxReminder
+@@ -171,11 +172,15 @@ pub fn toast(code: ErrorCode, context: ActionContext) -> String {
+     error_code.NotFound, CtxAiJobPoll ->
+       "Couldn't find that analysis. It may still be starting."
+     error_code.NotFound, CtxAiReport -> "Couldn't find that report."
++    error_code.NotFound, CtxRefcheckAction ->
++      "That reference check isn't there anymore. Refresh and try again."
+     error_code.NotFound, _ ->
+       "Couldn't find that. Refresh and give it another go."
+ 
+     error_code.Conflict, CtxApplicationStatusUpdate ->
+       "Another applicant is already approved on this vacancy. Move them back to Shortlisted first."
++    error_code.Conflict, CtxRefcheckAction ->
++      "That reference has moved on since you looked. Refresh to see the latest."
+     error_code.Conflict, CtxVacancyClose ->
+       "This vacancy is already closed. Refresh to see the latest."
+     error_code.Conflict, CtxVacancyArchive ->
+@@ -200,6 +205,8 @@ pub fn toast(code: ErrorCode, context: ActionContext) -> String {
+       "This vacancy can't be extended right now."
+     error_code.VacancyUnavailable, CtxApplicationStatusUpdate ->
+       "This vacancy is archived. Restore it before changing applicants."
++    error_code.VacancyUnavailable, CtxRefcheckAction ->
++      "This vacancy is archived. Restore it before changing references."
+     error_code.VacancyUnavailable, _ ->
+       "This vacancy isn't available right now."
+ 
+@@ -783,6 +790,120 @@ pub fn refcheck_overflow_label(name: String) -> String {
+   "More actions for " <> name
+ }
+ 
++// -- RC4.3 row actions (UX §7.3/§7.4/§7.7/§8.2/§8.3 verbatim where the UX
++//    fixes copy; brand voice otherwise) -------------------------------------
++
++/// Overflow menu entries (§7.3/§7.4 wireframe).
++pub const refcheck_action_start_now: String = "Start this check now"
++
++pub const refcheck_action_skip: String = "Skip this reference"
++
++/// The skipped row's re-enable entry (§7.4: "Skipped by you … Overflow:
++/// Start this check (re-enable)").
++pub const refcheck_action_re_enable: String = "Start this check"
++
++pub const refcheck_action_take_over: String = "Take over manually"
++
++pub const refcheck_action_substitute: String = "Substitute referee"
++
++/// The awaiting-correction row's §8.3 edit opener (r2 N5).
++pub const refcheck_action_correct_details: String = "Correct details"
++
++/// §7.4 one-time inline confirm for a per-reference start (verbatim shape;
++/// gender-neutral per the rc4-2 W5 ruling).
++pub fn refcheck_start_confirm(name name: String) -> String {
++  "Start the reference check for "
++  <> name
++  <> "? We'll email and text them the form now."
++}
++
++pub const refcheck_start_confirm_yes: String = "Start check"
++
++pub const refcheck_start_confirm_no: String = "Never mind"
++
++/// §7.7 take-over inline confirm (verbatim heading + body).
++pub const refcheck_take_over_confirm_title: String = "Take over this reference yourself?"
++
++/// §7.7 verbatim shape with the referee's name interpolated (r1 N18) —
++/// gender-neutral per the rc4-2 W5 ruling.
++pub fn refcheck_take_over_confirm_body(name name: String) -> String {
++  "Automated messages stop, and "
++  <> name
++  <> "'s details + the attempt log are yours. If they complete the form anyway, it still shows up here."
++}
++
++pub const refcheck_take_over_confirm_yes: String = "Take over"
++
++pub const refcheck_take_over_confirm_no: String = "Never mind"
++
++/// The §7.7 state label after a confirmed takeover.
++pub const refcheck_taken_over_label: String = "You're handling this one"
++
++/// §8.3 correction surface (verbatim state line + wireframe button).
++pub fn refcheck_correction_heading(name name: String) -> String {
++  "We couldn't reach " <> name <> " at these details."
++}
++
++/// §8.3 verbatim (with the wireframe's example name interpolated — r3 N14).
++pub fn refcheck_correction_body(
++  applicant_first_name applicant_first_name: String,
++) -> String {
++  "Check with "
++  <> applicant_first_name
++  <> ", update them here, and we'll try again."
++}
++
++pub const refcheck_save_resend: String = "Save & resend"
++
++/// The applicant-contact line under the §8.3 wireframe.
++pub fn refcheck_contact_applicant(name name: String) -> String {
++  "Contact " <> name <> ":"
++}
++
++/// §8.2 substitute surface — the same inline edit-trio captures the NEW
++/// referee (the UX fixes no verbatim substitute copy; brand voice, calm +
++/// specific).
++pub const refcheck_substitute_heading: String = "Substitute referee"
++
++pub const refcheck_substitute_body: String = "Ask the applicant for another referee and add their details here. We'll send the invitation to them instead."
++
++pub const refcheck_substitute_save: String = "Save & send invite"
++
++/// Edit-trio field labels + placeholder copy.
++pub const refcheck_field_name: String = "Name"
++
++pub const refcheck_field_email: String = "Email"
++
++pub const refcheck_field_phone: String = "Phone"
++
++/// Client-side trio validation (mirrors the server rule — a referee needs a
++/// name AND a reachable channel).
++pub const refcheck_edit_need_name: String = "Add the referee's name to save these details."
++
++pub const refcheck_edit_need_channel: String = "Add an email or phone number to save these details."
++
++/// The attempt-log export affordance (RC4.3 renders it on the takeover
++/// surface; RC4.4 owns the full timeline + verbatim OQ-5 toast).
++pub const refcheck_export_log: String = "Export attempt log"
++
++/// Success toasts (one sentence, brand voice).
++pub const refcheck_toast_started: String = "Reference started - the invite goes out now."
++
++pub const refcheck_toast_skipped: String = "Reference skipped. You can start it again anytime."
++
++pub const refcheck_toast_re_enabled: String = "Reference re-enabled - it's back in the queue."
++
++pub const refcheck_toast_taken_over: String = "You're handling this one - automated messages stopped."
++
++pub const refcheck_toast_corrected: String = "Details saved - the invitation is on its way again."
++
++pub const refcheck_toast_substituted: String = "Referee substituted - the new invitation is on its way."
++
++pub const refcheck_toast_exported: String = "Attempt log copied"
++
++/// The export clipboard failure (r1 N7 — a const, never an inline string).
++pub const refcheck_toast_export_failed: String = "Couldn't copy the attempt log. Try long-pressing to copy manually"
++
+ /// Status-pill labels (§4.2 — the landlord-facing lifecycle labels).
+ pub const refcheck_pill_queued: String = "Queued"
+ 
+diff --git a/client/src/model.gleam b/client/src/model.gleam
+index b725690b..07344ff6 100644
+--- a/client/src/model.gleam
++++ b/client/src/model.gleam
+@@ -123,6 +123,49 @@ pub type ScoringStatusResponse {
+   )
+ }
+ 
++/// RC4.3 reference-panel action kinds (the `⋯` overflow menu's entries).
++/// The panel renders the right surface per kind; the server guards the
++/// pre-states (AD-14).
++pub type RefcheckAction {
++  RefcheckStart
++  RefcheckSkip
++  RefcheckReEnable
++  RefcheckTakeOver
++  RefcheckCorrect
++  RefcheckSubstitute
++}
++
++/// The pending inline confirmation (§7.4 start-now / §7.7 take-over —
++/// brand pattern: inline, never a modal).
++pub type RefcheckConfirm {
++  RefcheckConfirm(call_id: String, kind: RefcheckConfirmKind)
++}
++
++pub type RefcheckConfirmKind {
++  RefcheckConfirmStart
++  RefcheckConfirmTakeOver
++}
++
++/// The open §8.3 edit-trio form (correct / substitute) with its live field
++/// values and any inline validation error. `saving` disables the buttons
++/// while the request is in flight.
++pub type RefcheckEdit {
++  RefcheckEdit(
++    call_id: String,
++    kind: RefcheckEditKind,
++    name: String,
++    email: String,
++    phone: String,
++    saving: Bool,
++    error: Option(String),
++  )
++}
++
++pub type RefcheckEditKind {
++  RefcheckEditCorrect
++  RefcheckEditSubstitute
++}
++
+ pub type Model {
+   Model(
+     route: Route,
+@@ -321,6 +364,18 @@ pub type Model {
+     // (`rt_refcheck_explainer_dismissed`), hydrated at boot. Written when the
+     // landlord collapses the explainer.
+     refcheck_explainer_dismissed: Bool,
++    // RC4.3 row actions — the control-surface state. `refcheck_menu_open` is
++    // the call_id whose `⋯` overflow menu is open (one at a time);
++    // `refcheck_confirm` is the pending inline confirmation (start now /
++    // take over — §7.4/§7.7, never a modal); `refcheck_edit` is the open
++    // §8.3 edit-trio form (correct / substitute) with its live field values;
++    // `refcheck_action_inflight` is the call_ids with an action request in
++    // flight (buttons disable + the panel shows progress). All reset on
++    // route change (they are per-application surfaces).
++    refcheck_menu_open: Option(String),
++    refcheck_confirm: Option(RefcheckConfirm),
++    refcheck_edit: Option(RefcheckEdit),
++    refcheck_action_inflight: Set(String),
+     // PDF report download — Some(analysis_id) while a fetch is in flight so
+     // the button can render a disabled spinner pill, double-clicks are
+     // dropped, and a late response that arrives after the user navigated
+@@ -593,6 +648,10 @@ pub fn initial() -> Model {
+     refcheck_auto_expanded: set.new(),
+     refcheck_explainer_open: False,
+     refcheck_explainer_dismissed: False,
++    refcheck_menu_open: None,
++    refcheck_confirm: None,
++    refcheck_edit: None,
++    refcheck_action_inflight: set.new(),
+     report_download_loading: None,
+     viewing_popover_open: False,
+     comparison_ids: [],
+diff --git a/client/src/msg.gleam b/client/src/msg.gleam
+index 37d2086e..e728a0c4 100644
+--- a/client/src/msg.gleam
++++ b/client/src/msg.gleam
+@@ -6,8 +6,8 @@ import gleam/option.{type Option}
+ import gleam/uri.{type Uri}
+ import model.{
+   type InvoiceRecord, type LeaderboardFilter, type LeaderboardSort,
+-  type PasswordField, type PaymentRecord, type ScoringStatusResponse,
+-  type SettingsSection, type ToastLevel,
++  type PasswordField, type PaymentRecord, type RefcheckAction,
++  type ScoringStatusResponse, type SettingsSection, type ToastLevel,
+ }
+ import shared/application_detail.{type ApplicationDetail}
+ import shared/bulk_invite.{type BulkInviteResult}
+@@ -250,6 +250,32 @@ pub type Msg {
+   /// Reference panel — hydration of the §7.3 per-user explainer dismissal
+   /// from localStorage at boot (`rt_refcheck_explainer_dismissed`).
+   UserHydratedRefcheckExplainerDismissed(Bool)
++  // Reference panel (RC4.3) — row actions. The String is the
++  // reference_call_id (the panel's payload key).
++  // Open/close the `⋯` overflow menu for a row (one menu at a time).
++  UserToggledRefcheckMenu(String)
++  // The landlord picked an entry in the overflow menu. Immediate actions
++  // (skip / re-enable) fire straight away; start/take-over open the inline
++  // confirm; correct/substitute open the §8.3 edit-trio.
++  UserChoseRefcheckAction(String, RefcheckAction)
++  // Confirm the pending inline confirmation (start now / take over).
++  UserConfirmedRefcheckAction(String)
++  // Dismiss the pending inline confirmation.
++  UserDismissedRefcheckAction(String)
++  // Live keystrokes in the §8.3 edit-trio (field: name | email | phone).
++  UserEditedRefcheckTrio(String, String, String)
++  // Save & resend (correct) / save (substitute) on the open edit form.
++  UserSavedRefcheckEdit(String)
++  // Close the edit form without saving.
++  UserCancelledRefcheckEdit(String)
++  // Copy the plain-text attempt log to the clipboard (take-over surface).
++  UserClickedRefcheckExport(String)
++  /// The API answered a row action. The `action` names the endpoint so the
++  /// response handler can restore the right surface; a late response after
++  /// navigation is dropped by the call_id match.
++  ApiReturnedRefcheckAction(String, String, Result(String, ApiError))
++  /// The clipboard write for the attempt-log export settled.
++  AppCompletedRefcheckExport(String, Result(Nil, String))
+   // PDF report download. The analysis_id is carried on both the click and
+   // the response so a late response after the landlord has navigated away
+   // (or to a different applicant) can be matched against the in-flight id
+diff --git a/client/src/pages/application_detail.gleam b/client/src/pages/application_detail.gleam
+index 1b5c434d..c4ca15cf 100644
+--- a/client/src/pages/application_detail.gleam
++++ b/client/src/pages/application_detail.gleam
+@@ -300,6 +300,10 @@ fn view_reference_panel(detail: ApplicationDetail, model: Model) -> Element(Msg)
+     app: detail.application,
+     expanded: model.refcheck_expanded,
+     explainer_open: model.refcheck_explainer_open,
++    menu_open: model.refcheck_menu_open,
++    confirm: model.refcheck_confirm,
++    edit: model.refcheck_edit,
++    inflight: model.refcheck_action_inflight,
+   )
+ }
+ 

@@ -1,0 +1,5 @@
+# Field notes — packet-plumber-bundle-reprice-pin (2026-08-13, W1 pin)
+
+- W1 pin job: the mixed-tier bundle re-pricing branch (`else if c < min_cost[ns]`, routing_rebuild pass 1) is now pinned by test_cost_mixed_tier_bundle_min_member_pricing. Bite-toggled: disabling re-pricing makes the (res,host) route VANISH (count 0) — dist is relaxed per-pipe in the Dijkstra but pass-1 min_cost feeds the pass-2 equality, so a broken pass 1 erases the hop entirely. Useful failure signature for future toggles.
+- Recurring main-checkout trap (3rd sighting): an `edit` with the MAIN checkout's absolute path lands in the canonical checkout even when cwd is the worktree — after any edit, `git status` in cwd + grep the target file's test count before trusting a green run. Worktree-absolute paths only.
+- Fresh worktrees lack `tools/raylib-sw` (gitignored): symlink it from the main checkout for harness runs (`ln -s /Users/moses/code/packet-plumber/tools/raylib-sw tools/raylib-sw`), and DELETE the symlink before commit — the ignore pattern `tools/raylib-sw/` (trailing slash) does NOT match a symlink, so it shows up untracked.

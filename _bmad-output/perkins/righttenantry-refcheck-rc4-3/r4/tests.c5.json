@@ -1,0 +1,62 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "race-pin",
+    "title": "STILL PRESENT (r3): wrong-person TOCTOU backstop unwired + race pin vacuous — the executed awaiting UPDATE still has no taken_over_at guard",
+    "location": "server/src/reference_checks/form_handler.gleam:1249-1258 (apply_wrong_person); server/test/integration/reference_checks_actions_integration_test.gleam:1744-1760",
+    "evidence": "form_handler.gleam:1249-1258: `False ->\n              case\n                sql.update_reference_call_status(\n                  config.db,\n                  id_uuid,\n                  sql.AwaitingCorrection,\n                  \"\",\n                  \"contact_invalid\",\n                  sql.ContactInitiated,\n                )` — update_reference_call_status.sql WHERE is `WHERE id = $1\n  AND status = $5::reference_call_status` (no taken_over_at clause). mark_awaiting_correction_wrong_person.sql (`AND taken_over_at IS NULL`) is called ONLY by the test (grep: sql.gleam wrapper + test lines 1746/1758), never by production code. Test: `let assert Ok(returned) =\n    rc_sql.mark_awaiting_correction_wrong_person(db, call)\n  list.length(returned.rows) |> should.equal(0)`",
+    "detail": "Handler still executes the unguarded status-only UPDATE for the wrong-person awaiting transition; the guarded SQL has zero production callers and the test calls it directly, so an unwired backstop stays green. Both round-4 conditions unmet — take-over racing the POST still yanks the row.",
+    "recommended_fix": "Wire mark_awaiting_correction_wrong_person into apply_wrong_person; rewrite the race test to drive POST /reference/:token/wrong-person with a take-over between token read and UPDATE, and neutralize the SQL backstop to prove it bites."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "test-quality",
+    "title": "STILL PRESENT (r3): co_nudge_bounce_stands_down_test is a vacuous pin — the fixture timestamp, not the kind-exclusion, stands the bounce down",
+    "location": "server/test/integration/reference_checks_actions_integration_test.gleam:1835-1861",
+    "evidence": "`attempts = '[{\"at\":\"2026-08-01T08:00:00Z\",\"channel\":\"email\",\"outcome\":\"delivered\",\"detail\":\"ref_send_1\"},{\"at\":\"2026-08-01T09:00:00Z\",\"channel\":\"email\",\"outcome\":\"delivered\",\"detail\":\"co_nudge_send_1\",\"kind\":\"co_nudge\"}]'::jsonb` then do_correct (corrected_at=now()); the co-nudge entry's fixed 2026-08-01T09:00:00Z predates corrected_at, so send_is_post_correction=false and the webhook's `case row.matched_send_at == \"\" || row.send_is_post_correction` stands down WITHOUT the `NOT (e ? 'kind')` exclusion. Sibling tests use now()-relative fixtures (lines 958/1043/1880).",
+    "detail": "The exclusion is wired in find_reference_call_by_send_ref.sql (verified), but this test would stay green if it regressed: the typed stale gate alone produces the asserted stand-down. Real co-nudges post-date the correction (T+24h sweep step), so only the exclusion protects the row.",
+    "recommended_fix": "Timestamp the co-nudge entry after the correction (to_char(now() + interval '30 seconds', ...) like the genuine-failure fixture) so send_is_post_correction=true and the kind-exclusion is the deciding factor; control already exists."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage",
+    "title": "r3 W4 pin covers only sweep_terminal — sweep_mark_failed's taken-over guard is unpinned",
+    "location": "server/test/integration/reference_checks_actions_integration_test.gleam:1903-1930",
+    "evidence": "Test body calls only `rc_sql.sweep_terminal(\n      db,\n      call,\n      rc_sql.Unreachable,` — grep confirms sweep_mark_failed appears in no test file; sweep_mark_failed.sql carries the guard (`AND taken_over_at IS NULL`, line 58) and is a live path (server/src/reference_checks/sweep.gleam:655 `let _ = sql.sweep_mark_failed(db, row_uuid, reason)`).",
+    "detail": "The r3 W4 finding named both terminal writers; the guard is present in both SQL files (verified) but the regression pin covers only sweep_terminal. A future guard drop on sweep_mark_failed would go unnoticed.",
+    "recommended_fix": "Extend sweep_terminal_writers_respect_taken_over_test (or add a sibling) asserting rc_sql.sweep_mark_failed 0-rows on a taken-over row."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage",
+    "title": "r3 N14sql malformed-'at' stand-down is untested — the regex-guarded cast has no pin",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:52-58 (no test fixture in server/test/integration/reference_checks_actions_integration_test.gleam)",
+    "evidence": "Guard: `CASE WHEN e->>'at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}' THEN (e->>'at')::timestamptz >= rc.corrected_at ELSE false END`; grep of the integration suite found no malformed-'at' fixture — every attempts entry is well-formed, so the ELSE-false stand-down path is never exercised.",
+    "detail": "The N14sql fix is in place (verified), but the delivery-failure find's malformed-timestamp branch has zero coverage; a future cast regression would raise and drop the whole webhook event undetected by this suite.",
+    "recommended_fix": "Add an integration case feeding a malformed 'at' entry (e.g. \"not-a-date\") and assert the delivery failure stands down (no audit, no stamp) instead of erroring."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "test-quality",
+    "title": "Detail payload negative control weakened to an inert sentinel — form_token containment is effectively unpinned",
+    "location": "server/test/integration/reference_detail_payload_integration_test.gleam:171-172",
+    "evidence": "`string.contains(body, \"form_token_internal_sentinel\") |> should.be_false` (replacing the prior `string.contains(body, \"larry@example.com\") |> should.be_false`). No code path can emit the literal sentinel, so if the detail read ever started selecting form_token the assertion still passes; list_reference_calls_for_detail.sql's containment is load-bearing but no longer verified by a real value.",
+    "detail": "The old control checked a real sensitive value; the replacement asserts a string that cannot occur. The §4.2 containment claim (form_token never rides the detail payload) now rests on code reading alone.",
+    "recommended_fix": "Assert a value the detail read actually could leak, e.g. fetch a row with a known form_token and assert the token string (or \"form_token\") is absent from the detail payload."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "Traceability at df0ea22: take-over (5 integration tests incl. 409 guards, hooks matrix 13-status, sweep exclusion, §8.6 late completion), correct (one-cycle, 400s, cross-app 404), exhaustion (SQL + webhook + wrong-person route, audit+notification), substitute (idempotence, history 409, identical-trio 400, fraud stamp), per-slot start (400/re-arm/declined), authz negatives, sweep + resend effective-contact units. r3 pins N4/N11/N15/N18/N8-client/N12 fixed; W2 pin bites; W3 pin vacuous; W4 half-pinned.",
+    "detail": "P1 coverage is strong (≈90%+), but P0 is incomplete: the wrong-person race pin is vacuous and the executed UPDATE carries no backstop (separate blocker). Per round-4 rules a vacuous race pin is P0 territory — gate cannot be PASS.",
+    "recommended_fix": "Close the TOCTOU blocker (wire the guarded SQL into apply_wrong_person, make the race test drive the POST route), then re-evaluate; also timestamp the co-nudge fixture post-correction."
+  }
+]

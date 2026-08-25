@@ -1,0 +1,3018 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-rc3-5-the-sweep-cadence-engine-cloud-run-job.md b/_bmad-output/implementation-artifacts/spec-rc3-5-the-sweep-cadence-engine-cloud-run-job.md
+new file mode 100644
+index 00000000..f826b998
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-rc3-5-the-sweep-cadence-engine-cloud-run-job.md
+@@ -0,0 +1,119 @@
++# Story RC3.5: The Sweep — Cadence Engine + Cloud Run Job
++
++**Status:** ready-for-dev
++**Epic:** RC3 (the referee collection funnel). Depends on rc3-1…rc3-4 (merged; #599 was the last).
++**Model:** `zai-coding-cn/glm-5.2` (kimi quota down this cycle; glm-5.2 proven capable).
++**Perkins:** ON (production server code + Terraform; round runs on glm-5.2 fallback while kimi is down).
++**GitHub issue:** #548
++
++## Story
++
++> As the platform,
++> I want a 15-minute sweep that owns every send and transition,
++> So that chasing is humane, exactly-once, self-healing after downtime — and never silently dead.
++
++rc3-1…rc3-4 shipped the pieces: the `reference_call` schema (rc2-1), the SMS client + send helpers/templates (rc3-1/rc3-2), the referee form session + autosave (rc3-3), and the submit/decline/stop/wrong-person exit routes + terminals (rc3-4). rc3-5 ships the **engine that actually fires the cadence** — the 15-minute Cloud Run Job that owns every send (including T0) and every transition, computes the due step from the attempt log, and never silently dies.
++
++## Scope (what THIS story owns — and what it does NOT)
++
++### OWNS
++1. **`server/src/reference_checks/sweep.gleam`** (NEW) — the cadence engine. `main/0` bootstraps env+DB (the retention_job pattern); `run/...` is the pure-ish worker (DB + deps + a pinned `now` ISO string for fake-clock tests). Per due row (`next_attempt_at <= now()` AND `taken_over_at IS NULL` AND `status IN ('queued','contact_initiated')`): compute the step from `attempt_count`, send via the rc3-2 helpers, and apply transition + atomic attempt-append + next-step as ONE guarded update (AD-4, AD-14). Liveness log per tick (AD-15); Sentry on any job failure.
++2. **The cadence steps** (AD-4 table):
++   - `attempt_count=0` (status `queued`) → **T0 invite** (email+SMS via `send.send_invite`); guarded `queued → contact_initiated` + append + `next_attempt_at = created_at + 24h`.
++   - `attempt_count=1` → **T+24h applicant co-nudge** (`send.send_co_nudge`) — **gated**: fires only when `form_opened_at IS NULL` AND no draft (`draft_answers` empty/null, A2). Gate fail → advance the cadence without sending (append a `skipped` attempt entry). `next_attempt_at = created_at + 48h`.
++   - `attempt_count=2` → **T+48h reminder 1** (`send.send_reminder(ReminderOne)`). `next_attempt_at = created_at + 96h`.
++   - `attempt_count=3` → **T+96h reminder 2** (`send.send_reminder(ReminderTwo)`) + the **landlord warm-handoff** (`notify_reference_unreachable`, §8.3 — the warm-handoff IS the `reference_unreachable` notification). `next_attempt_at = created_at + 144h`. The notification fires AFTER the guarded append (exactly-once for the notification — §8.3 no-duplicate-terminal).
++   - `attempt_count=4` → **T+144h silent terminal**: guarded transition to `partial` (if a draft exists) or `unreachable` (no draft). `next_attempt_at = NULL`. **Silent** — no notification (the warm handoff already landed at T+96h, §8.3).
++3. **`server/src/notification/notification_dispatch.gleam`** (MODIFY) — add `notify_reference_unreachable`: in-app notification (`reference_unreachable` type) via the shared `dispatch()`, + a preference-gated rich email that renders the attempt log (§8.3). Mirrors the `notify_reference_completed/declined/objected` siblings. (See Decisions.)
++4. **`server/src/reference_checks/result.gleam`** (MODIFY) — add `partial_result`: the abandoned-with-draft terminal — verification block structured from `draft_answers` (unanswered null), `outcome:"partial"`, `confidence` capped at medium (briefing AC5). Reuses the per-slot `verification_block` + `ai_summary`; unreachable uses the existing `minimal_terminal_result`.
++5. **`server/src/reference_checks/send.gleam`** (MODIFY) — remove `send_warm_handoff` (superseded by `notify_reference_unreachable`, which owns the warm-handoff end-to-end per §8.3). Its HTML builder (`messages.build_warm_handoff_email_html`) is reused inside `notify_reference_unreachable`.
++6. **SQL** (NEW, Squirrel-generated):
++   - `sql/sweep_due_reference_calls.sql` — the cadence SELECT (joins rc+application+vacancy+landlord; returns the context sends + notifications need).
++   - `sql/sweep_claim_t0.sql` — guarded T0: `queued → contact_initiated` + atomic append + advance, `WHERE status='queued' AND attempt_count=0`.
++   - `sql/sweep_advance.sql` — guarded append + advance for T+24/T+48/T+96, `WHERE status='contact_initiated' AND attempt_count=$n`.
++   - `sql/sweep_terminal.sql` — guarded silent terminalize at T+144, `WHERE status='contact_initiated' AND attempt_count=4`.
++7. **Internal manual-fire route** — `POST /api/v1/internal/reference-checks` (`response_helpers.require_internal_secret`, the digest/verification-reminders precedent). Handler threads `sentry_client.Disabled` (manual runs don't escalate). Wired in `router.gleam`.
++8. **`docker-entrypoint.sh`** (MODIFY) — add the `reference-checks` arm dispatching `reference_checks@sweep:main/0` (the retention/digest arm pattern).
++9. **Terraform** (NEW + MODIFY):
++   - `deployment/terraform/reference-checks-job.tf` (NEW) — `google_cloud_run_v2_job.reference_checks` + its runtime SA + per-secret IAM (the retention-job house pattern). 15-min cadence → small/cheap.
++   - `deployment/terraform/scheduler.tf` (MODIFY) — `google_cloud_scheduler_job.reference_checks_fifteen_minutes` (`*/15 * * * *`) + its scheduler SA + IAM bindings (the retention_daily house pattern). Same env-gating as retention/digest.
++   - `deployment/terraform/config.tf` (MODIFY) — `local.reference_checks_secret_env_vars` (DB + RESEND + TWILIO_* + SENTRY_DSN; the narrow-secret posture).
++
++### Does NOT own (deferred / sibling stories)
++- **Correction-exhaustion terminal** (`awaiting_correction → unreachable`) → **rc3-6 / RC4.3** with the correction flow. rc3-4's wrong-person route NULLs `next_attempt_at`, so the cadence query excludes `awaiting_correction` rows naturally; no correction-timeout duration is specified in the arch, so building one here would be a guessed SLA. The sweep RESPECTS `awaiting_correction` (skips it). (See Decisions.)
++- **Verified webhooks** (bounce/delivery-failure → AD-7; STOP via stop-link is rc3-4) → **rc3-6**.
++- **Fraud-signal computation** (line-type/DB-reuse, AD-10) → **rc3-7**.
++- **Landlord reference-panel display** (`reference_calls[]` contract) → **RC4**.
++- **Applicant correction email + re-queue** → RC3.6 / RC4.3.
++
++## Acceptance Criteria (BDD — from epic RC3.5 + arch AD-4/14/15, A2/A7, §4.6/§8.3)
++
++**AC1 — Infra (Cloud Run Job + 15-min Scheduler + manual-fire route)**
++> **Given** the infrastructure
++> **When** it deploys
++> **Then** a `reference-checks` Cloud Run Job exists (`docker-entrypoint.sh` arm + `reference-checks-job.tf`), a 15-min Cloud Scheduler entry exists in `scheduler.tf` (house pattern, same env-gating as retention/digest), and `POST /api/v1/internal/reference-checks` is a shared-secret manual-fire route
++> **And** `make tf-plan-staging` is clean (the infra applies)
++
++**AC2 — The tick computes the step from the attempt log (AD-4/AD-14)**
++> **Given** rows with `next_attempt_at <= now()` AND `taken_over_at IS NULL` AND `status IN ('queued','contact_initiated')`
++> **When** a tick processes a row
++> **Then** it computes the due step from `attempt_count` (T0 / T+24 / T+48 / T+96 / T+144), sends via the rc3-2 helpers, and applies transition + atomic attempt-append + next-step as ONE guarded update (`WHERE id AND status AND attempt_count=$n`); a 0-row result means someone else transitioned first and the writer stands down (AD-14)
++
++**AC3 — Exactly-once + idempotent (the hard requirement, self-healing after downtime)**
++> **Given** the sweep runs, advances a row (T0 sent + appended, `next_attempt_at` now future), then runs AGAIN immediately (a retry / double-fire / recovery after downtime)
++> **When** the second run queries due rows
++> **Then** the advanced row is NOT re-selected (`next_attempt_at` is future) → T0 is NOT re-sent (no-duplicate-T0 — REQUIRED TEST)
++> **And** re-runs after downtime process only genuinely-due rows; the `attempt_count` guard in every guarded update makes state transitions exactly-once even under concurrent writers
++
++**AC4 — Co-nudge gate (A2) + taken-over skip (A7)**
++> **Given** a row at `attempt_count=1`
++> **When** the tick evaluates the co-nudge
++> **Then** the co-nudge fires ONLY when `form_opened_at IS NULL` AND `draft_answers` is empty/null (form never opened, no draft); otherwise the cadence advances without sending
++> **And** a row with `taken_over_at IS NOT NULL` is skipped entirely (never selected)
++
++**AC5 — T+96 warm handoff + T+144 silent terminal (§8.3)**
++> **Given** the cadence reaches `attempt_count=3` (T+96h)
++> **When** reminder 2 sends
++> **Then** the `reference_unreachable` warm-handoff notification fires with the attempt log rendered (in-app + preference-gated rich email); the notification fires AFTER the guarded append (no duplicate on retry)
++> **Given** the cadence reaches `attempt_count=4` (T+144h)
++> **When** the tick terminalizes the row
++> **Then** it becomes `partial` (draft exists; result structured from `draft_answers`, unanswered null, confidence capped medium) or `unreachable` (no draft; minimal §4.6 result), `next_attempt_at = NULL`, and the transition is SILENT (no notification — §8.3)
++
++**AC6 — Terminals respected (AD-6/AD-14, rc3-4 carry-forward)**
++> **Given** a row already in a terminal (`form_completed`/`unreachable`/`refused`/`objected`/`manual_recorded`/`failed`/`partial`) or `awaiting_correction` (NULL `next_attempt_at`) or `skipped`
++> **When** a tick runs
++> **Then** the row is never selected/re-sent (status guard + the live-row semantics); an `objected` row is sticky — a late sweep tick leaves it untouched (AD-6)
++
++**AC7 — Failure path + liveness (AD-15, §4.6)**
++> **Given** a row that cannot be processed (a DB/decode failure mid-tick)
++> **When** the tick hits it
++> **Then** the row terminates `failed` (`outcome` NULL + `terminal_reason`), Sentry captures it, and NO landlord notification fires (§4.6)
++> **And** every tick emits a per-tick completion log; any job failure hits Sentry (AD-15)
++
++**AC8 — No-op without Twilio/Resend keys (rc3-2 posture)**
++> **Given** the sweep runs without `TWILIO_*` / `RESEND_API_KEY` provisioned
++> **When** a tick processes due rows
++> **Then** the sweep still runs + transitions (state advances); SMS/email sends come back `skipped` (rc3-2 helpers' no-op doctrine) — never a crash, never a Sentry capture (expected config state)
++
++## Dev Notes (load-bearing decisions — also the PR's "Decisions & rationale")
++
++1. **Warm-handoff routing (§8.3 vs rc3-2's `send_warm_handoff`).** §8.3 is explicit: `reference_unreachable` is a `notification_type` dispatched via the existing dispatcher (in-app + preference-gated email), with the attempt log rendered. rc3-2 built `send_warm_handoff` as a direct email (no in-app row, no preference). **Decision: route the warm-handoff through a new `notify_reference_unreachable` in `notification_dispatch`** (in-app always; email gated on realtime preference, rendered with the attempt log). `send.send_warm_handoff` is removed (superseded); its HTML builder (`messages.build_warm_handoff_email_html`) is reused. Rejected: direct-send (ignores §8.3 preference + skips the in-app notification row the panel/bell relies on).
++
++2. **Correction-exhaustion terminal DEFERRED.** The briefing lists "failed correction cycle → unreachable" but (a) rc3-4's wrong-person route NULLs `next_attempt_at` (so the cadence query excludes `awaiting_correction`), (b) no correction-timeout duration is specified anywhere in the arch, (c) the correction FLOW itself (applicant email + re-queue) is explicitly RC3.6/RC4.3 per the rc3-4 spec. Building a guessed-timeout here is technical debt. **Decision: the sweep respects `awaiting_correction` (skips via NULL `next_attempt_at`); the correction-exhaustion terminal belongs with the correction flow in RC3.6/RC4.3.** Flagged for that story.
++
++3. **Exactly-once mechanism.** Cadence = `next_attempt_at` advancement (after each step, `next_attempt_at` moves to the NEXT step's horizon → a retry doesn't re-select). State transitions = guarded atomic UPDATE with `WHERE attempt_count=$n` (concurrent writers: only one's UPDATE returns a row). Messages are send-then-claim (worst case under a crash-mid-tick is a duplicate MESSAGE, never a missing one, never a duplicate STATE transition) — the standard at-least-once-delivery / exactly-once-state tradeoff for email/SMS sweeps. The no-duplicate-T0 test pins the `next_attempt_at` advancement.
++
++4. **`attempt_count` semantics.** `attempt_count` is the cadence step counter (bumps every step, including a gate-failed co-nudge that sends nothing); `attempts[]` is the send log (an entry per actual send; a gate-failed co-nudge logs a `skipped` entry so the warm-handoff render shows the full cadence). They are intentionally decoupled (email+sms steps already produce 1–2 entries).
++
++5. **T+144 terminal detection** = `draft_answers` non-empty (`!= '' AND != 'null'`) → `partial`; else `unreachable`. Built via `result.partial_result` / `result.minimal_terminal_result`.
++
++6. **Terraform** follows the retention-job + retention-daily house pattern exactly (count-gated on production; dedicated runtime + scheduler SAs; per-secret IAM; oauth_token scheduler auth). Staging gets the manual-fire route only (no scheduler) — same gating as retention.
++
++## Files
++- NEW: `server/src/reference_checks/sweep.gleam` · `server/src/reference_checks/sweep_handler.gleam` · `sql/sweep_*.sql` (4) · `deployment/terraform/reference-checks-job.tf`
++- MODIFY: `server/src/reference_checks/result.gleam` · `send.gleam` · `sql.gleam` (regen) · `server/src/notification/notification_dispatch.gleam` · `server/src/router.gleam` · `docker-entrypoint.sh` · `deployment/terraform/scheduler.tf` · `deployment/terraform/config.tf`
++
++## Verify
++- Fake-clock server tests per cadence step (T0/T+24/T+48/T+96/T+144); guarded-update race test; **no-duplicate-T0 across retry**; terminal-state respect (objected/taken-over/awaiting_correction skipped); partial vs unreachable from drafts; failed-row path; co-nudge gate (form-opened suppresses).
++- `make format && make test && make build` green; `make tf-plan-staging` clean.
++- After approval: commit, push, open PR targeting `develop`. **Never merge.** Set the ledger pr field.
+diff --git a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+index 8ccfaa5d..ef6e3932 100644
+--- a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
++++ b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+@@ -47,7 +47,7 @@
+ # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
+ 
+ generated: 2026-07-31
+-last_updated: 2026-08-08
++last_updated: "2026-08-11"
+ project: RightTenantry
+ project_key: NOKEY
+ tracking_system: file-system
+@@ -75,7 +75,7 @@ development_status:
+   rc3-2-message-templates-send-helpers: review
+   rc3-3-referee-form-session-open-answer-autosave: done
+   rc3-4-form-completion-exit-routes-submit-decline-objection-wrong-person: review
+-  rc3-5-the-sweep-cadence-engine-cloud-run-job: backlog
++  rc3-5-the-sweep-cadence-engine-cloud-run-job: review
+   rc3-6-verified-webhooks-resend-events-twilio-sms: backlog
+   rc3-7-fraud-signals-module: backlog
+   epic-rc3-retrospective: optional
+diff --git a/deployment/terraform/config.tf b/deployment/terraform/config.tf
+index 49c00220..eee5ee0d 100644
+--- a/deployment/terraform/config.tf
++++ b/deployment/terraform/config.tf
+@@ -102,4 +102,17 @@ locals {
+     RESEND_API_KEY            = "rt-resend-api-key"
+     SUPABASE_SERVICE_ROLE_KEY = "rt-supabase-service-role-key"
+   }
++
++  # Secret Manager-backed env vars needed by the reference-checks cadence
++  # sweep (RC3.5). It reads the reference_call/application/vacancy/landlord
++  # tables and posts referee emails (Resend) + the landlord warm-handoff.
++  # SENTRY_DSN is a plain env var (local.env_vars) so sweep failures
++  # escalate. TWILIO_* is deliberately NOT mounted: the Alpha Sender ID is
++  # an external provisioning dependency (Q1) not yet in Secret Manager, so
++  # SMS sends no-op until a separate task provisions + mounts the Twilio
++  # secrets (the briefed "no-op without Twilio keys" posture).
++  reference_checks_secret_env_vars = {
++    DATABASE_URL   = "rt-database-url"
++    RESEND_API_KEY = "rt-resend-api-key"
++  }
+ }
+diff --git a/deployment/terraform/reference-checks-job.tf b/deployment/terraform/reference-checks-job.tf
+new file mode 100644
+index 00000000..394e13dc
+--- /dev/null
++++ b/deployment/terraform/reference-checks-job.tf
+@@ -0,0 +1,125 @@
++# Cloud Run Job — 15-minute reference-check cadence sweep (RC3.5).
++#
++# Owns every reference-check send + transition: T0 invite / T+24h applicant
++# co-nudge / T+48h reminder 1 / T+96h reminder 2 + landlord warm-handoff /
++# T+144h silent terminal. Implementation: server/src/reference_checks/sweep.gleam
++# (entry `reference_checks@sweep:main/0`, dispatched by docker-entrypoint.sh).
++# Scheduler is the `reference_checks_fifteen_minutes` entry in scheduler.tf.
++#
++# Production-only — mirrors the retention / digest job gating. Staging fires
++# the sweep on demand via the shared-secret POST /api/v1/internal/reference-
++# checks route (the web service deploys to every env). The job reuses the same
++# container image as the Cloud Run service; the command override runs the
++# sweep module instead of the web server.
++#
++# GitHub Actions deploys by: terraform apply -var="image=<tag>".
++
++# Dedicated runtime SA for the reference-checks job. Gets only the two secrets
++# the sweep actually needs (DATABASE_URL + RESEND_API_KEY), via per-secret IAM
++# bindings below — the narrow-secret posture from retention-job.tf. TWILIO_* is
++# deliberately NOT mounted: the Alpha Sender ID is an external provisioning
++# dependency (Q1) not yet in Secret Manager, so sms_client.init() returns
++# Disabled and SMS sends no-op until a separate task provisions + mounts the
++# Twilio secrets (the briefed "no-op without Twilio keys" posture). SENTRY_DSN
++# is a plain env var (already in local.env_vars) so failures escalate.
++resource "google_service_account" "reference_checks_runtime" {
++  count        = var.environment == "production" ? 1 : 0
++  account_id   = "rt-reference-checks-runtime-${var.environment == "production" ? "prod" : "staging"}"
++  display_name = "RightTenant Reference Checks Runtime (${var.environment})"
++  description  = "Runtime SA for the reference_checks sweep Cloud Run Job — DB + Resend only"
++}
++
++resource "google_secret_manager_secret_iam_member" "reference_checks_database_url" {
++  count     = var.environment == "production" ? 1 : 0
++  project   = var.project_id
++  secret_id = google_secret_manager_secret.app_secrets[local.reference_checks_secret_env_vars["DATABASE_URL"]].secret_id
++  role      = "roles/secretmanager.secretAccessor"
++  member    = "serviceAccount:${google_service_account.reference_checks_runtime[0].email}"
++}
++
++resource "google_secret_manager_secret_iam_member" "reference_checks_resend_api_key" {
++  count     = var.environment == "production" ? 1 : 0
++  project   = var.project_id
++  secret_id = google_secret_manager_secret.app_secrets[local.reference_checks_secret_env_vars["RESEND_API_KEY"]].secret_id
++  role      = "roles/secretmanager.secretAccessor"
++  member    = "serviceAccount:${google_service_account.reference_checks_runtime[0].email}"
++}
++
++# Deploy SA must be able to act as the reference-checks runtime SA so
++# `gcloud run jobs update` can attach it (same pattern as retention/digest).
++resource "google_service_account_iam_member" "deploy_acts_as_reference_checks_runtime" {
++  count              = var.environment == "production" ? 1 : 0
++  service_account_id = google_service_account.reference_checks_runtime[0].name
++  role               = "roles/iam.serviceAccountUser"
++  member             = "serviceAccount:${google_service_account.deploy.email}"
++}
++
++resource "google_cloud_run_v2_job" "reference_checks" {
++  count    = var.environment == "production" ? 1 : 0
++  name     = "righttenantry-reference-checks"
++  location = var.region
++
++  template {
++    template {
++      service_account = google_service_account.reference_checks_runtime[0].email
++      # 15-min cadence: a tick processes a bounded batch (default 500) and
++      # usually finishes in seconds; 900s is generous headroom for a backlog
++      # drain after downtime.
++      timeout = "900s"
++      # One retry covers a transient DB/pool hiccup; the 15-min cadence is
++      # the steady-state retry otherwise. Re-runs are idempotent (the guarded
++      # updates' attempt_count pins make double-advances impossible).
++      max_retries = 1
++
++      containers {
++        image = var.image
++
++        # Override the container entrypoint to run the sweep module instead
++        # of the web server. Dispatched by docker-entrypoint.sh which invokes
++        # `reference_checks@sweep:main/0` via erl.
++        command = ["/app/docker-entrypoint.sh", "reference-checks"]
++
++        resources {
++          limits = {
++            cpu    = "1"
++            memory = "512Mi"
++          }
++        }
++
++        # Plain env vars (same shape as the service so shared modules find
++        # their config). SENTRY_DSN lands here so sweep failures escalate.
++        dynamic "env" {
++          for_each = local.env_vars
++          content {
++            name  = env.key
++            value = env.value
++          }
++        }
++
++        # Secret Manager-backed env vars — DB + RESEND only (the narrow set).
++        # Adding another secret the sweep needs means (1) adding it to
++        # local.reference_checks_secret_env_vars, and (2) adding a matching
++        # per-secret IAM binding above. When TWILIO_* is provisioned, add it
++        # here too (and to the web service secret_env_vars + secrets.tf first).
++        dynamic "env" {
++          for_each = local.reference_checks_secret_env_vars
++          content {
++            name = env.key
++            value_source {
++              secret_key_ref {
++                secret  = env.value
++                version = "latest"
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++
++  depends_on = [
++    google_secret_manager_secret.app_secrets,
++    google_secret_manager_secret_iam_member.reference_checks_database_url,
++    google_secret_manager_secret_iam_member.reference_checks_resend_api_key,
++  ]
++}
+diff --git a/deployment/terraform/scheduler.tf b/deployment/terraform/scheduler.tf
+index 92bc64c3..f44f2483 100644
+--- a/deployment/terraform/scheduler.tf
++++ b/deployment/terraform/scheduler.tf
+@@ -355,3 +355,87 @@ resource "google_cloud_scheduler_job" "verification_reminders_hourly" {
+     google_cloud_run_v2_job_iam_member.scheduler_can_invoke_verification_reminders,
+   ]
+ }
++
++# --- Reference-checks cadence scheduler (RC3.5) -------------------------
++# Production-only — mirrors the retention / digest gating. Staging fires the
++# sweep on demand via the shared-secret POST /api/v1/internal/reference-checks
++# route. The 15-min cadence drives the whole reference chase: T0 invite /
++# T+24h co-nudge / T+48h reminder 1 / T+96h reminder 2 + warm-handoff /
++# T+144h silent terminal.
++
++resource "google_service_account" "reference_checks_scheduler" {
++  count        = var.environment == "production" ? 1 : 0
++  account_id   = "rt-reference-checks-scheduler-${var.environment == "production" ? "prod" : "staging"}"
++  display_name = "RightTenant Reference Checks Scheduler (${var.environment})"
++  description  = "Invokes the reference_checks Cloud Run Job every 15 min — ${var.environment}"
++}
++
++# Bind the scheduler SA to the reference-checks job as invoker (and only that).
++resource "google_cloud_run_v2_job_iam_member" "scheduler_can_invoke_reference_checks" {
++  count    = var.environment == "production" ? 1 : 0
++  project  = google_cloud_run_v2_job.reference_checks[0].project
++  location = google_cloud_run_v2_job.reference_checks[0].location
++  name     = google_cloud_run_v2_job.reference_checks[0].name
++  role     = "roles/run.invoker"
++  member   = "serviceAccount:${google_service_account.reference_checks_scheduler[0].email}"
++}
++
++# Deploy SA must be able to act as the reference-checks scheduler SA so
++# terraform can attach it to google_cloud_scheduler_job.reference_checks_fifteen_minutes
++# (mirrors deploy_acts_as_retention_scheduler above).
++resource "google_service_account_iam_member" "deploy_acts_as_reference_checks_scheduler" {
++  count              = var.environment == "production" ? 1 : 0
++  service_account_id = google_service_account.reference_checks_scheduler[0].name
++  role               = "roles/iam.serviceAccountUser"
++  member             = "serviceAccount:${google_service_account.deploy.email}"
++}
++
++# Cloud Scheduler service agent must be able to mint OIDC tokens as this
++# scheduler SA — without it the 15-min fire returns UNAUTHENTICATED and the
++# job never runs (silent cadence death, exactly what AD-15's liveness
++# posture exists to prevent).
++resource "google_service_account_iam_member" "cloudscheduler_creates_tokens_for_reference_checks_scheduler" {
++  count              = var.environment == "production" ? 1 : 0
++  service_account_id = google_service_account.reference_checks_scheduler[0].name
++  role               = "roles/iam.serviceAccountTokenCreator"
++  member             = local.cloudscheduler_service_agent
++}
++
++resource "google_cloud_scheduler_job" "reference_checks_fifteen_minutes" {
++  count       = var.environment == "production" ? 1 : 0
++  name        = "righttenantry-reference-checks-fifteen-minutes"
++  description = "15-min reference-check cadence sweep — invites, co-nudge, reminders, warm-handoff, silent terminal"
++  schedule    = "*/15 * * * *"
++  time_zone   = "Etc/UTC"
++  # Async-acking :run; the 900s on the job itself governs the tick runtime.
++  attempt_deadline = "300s"
++  region           = var.region
++
++  retry_config {
++    # Let the Cloud Run Job's own max_retries handle transient failures so
++    # we don't stack two retry layers. Re-runs are idempotent (the guarded
++    # updates' attempt_count pins make double-advances impossible), but a
++    # flood of parallel 15-min invocations during an outage is still waste.
++    retry_count          = 0
++    min_backoff_duration = "60s"
++    max_backoff_duration = "600s"
++  }
++
++  http_target {
++    http_method = "POST"
++    # OAuth (not OIDC) at the admin :run surface — same rationale as
++    # retention_daily above.
++    uri = "https://run.googleapis.com/v2/projects/${var.project_id}/locations/${google_cloud_run_v2_job.reference_checks[0].location}/jobs/${google_cloud_run_v2_job.reference_checks[0].name}:run"
++
++    oauth_token {
++      service_account_email = google_service_account.reference_checks_scheduler[0].email
++      scope                 = "https://www.googleapis.com/auth/cloud-platform"
++    }
++  }
++
++  depends_on = [
++    google_project_service.cloudscheduler,
++    google_cloud_run_v2_job.reference_checks,
++    google_cloud_run_v2_job_iam_member.scheduler_can_invoke_reference_checks,
++  ]
++}
+diff --git a/docker-entrypoint.sh b/docker-entrypoint.sh
+index a793c7dc..ffb7a53c 100755
+--- a/docker-entrypoint.sh
++++ b/docker-entrypoint.sh
+@@ -153,6 +153,14 @@ case "$1" in
+     exec erl -noshell -pa /app/*/ebin \
+       -eval "application:ensure_all_started(inets), application:ensure_all_started(ssl), application:ensure_all_started(pog), case catch lifecycle@verification_reminder_job:main() of nil -> erlang:halt(0); Other -> io:format(standard_error, \"FATAL lifecycle@verification_reminder_job:main exited with: ~p~n\", [Other]), erlang:halt(1) end"
+     ;;
++  reference-checks)
++    # The 15-min reference-check cadence sweep (RC3.5): sends invites /
++    # co-nudges / reminders / the T+96h warm handoff + the silent T+144h
++    # terminal. Scheduled by Cloud Scheduler; also fireable via the
++    # shared-secret POST /api/v1/internal/reference-checks route.
++    exec erl -noshell -pa /app/*/ebin \
++      -eval "application:ensure_all_started(inets), application:ensure_all_started(ssl), application:ensure_all_started(pog), case catch reference_checks@sweep:main() of nil -> erlang:halt(0); Other -> io:format(standard_error, \"FATAL reference_checks@sweep:main exited with: ~p~n\", [Other]), erlang:halt(1) end"
++    ;;
+   *)
+     exec /app/entrypoint.sh "$@"
+     ;;
+diff --git a/server/src/notification/notification_dispatch.gleam b/server/src/notification/notification_dispatch.gleam
+index 4ce6b071..e491a6cd 100644
+--- a/server/src/notification/notification_dispatch.gleam
++++ b/server/src/notification/notification_dispatch.gleam
+@@ -12,6 +12,11 @@ import shared/landlord
+ import wisp
+ import youid/uuid.{type Uuid}
+ 
++/// The established transactional identity landlord-facing mail uses
++/// (the same `noreply@app.righttenantry.ie` the application-invite and
++/// notification emails send from). Used by the rich warm-handoff email.
++const standard_sender: String = "RightTenantry <noreply@app.righttenantry.ie>"
++
+ /// Create an in-app notification when an application's AI analysis completes.
+ /// Email respects the landlord's notification preference (realtime/daily/off).
+ /// Daily digest users get a summary email instead of per-analysis emails.
+@@ -441,6 +446,56 @@ pub fn notify_reference_objected(
+   )
+ }
+ 
++/// The T+96h landlord warm-handoff (§8.3): in-app notification
++/// (`reference_unreachable` — always fires, shows in the panel/bell
++/// regardless of preference) + a preference-gated rich email rendering the
++/// attempt log ("we're struggling to reach X — you may want to call them
++/// yourself"). This IS the unreachable-path notification — the T+144h
++/// terminal is SILENT (§8.3's no-duplicate-terminal rule), so this fires
++/// exactly once, AFTER the sweep's guarded append (a retry never duplicates).
++///
++/// `email_subject` + `email_html` are pre-rendered by the sweep (the only
++/// warm-handoff-specific content); this function owns the in-app row + the
++/// preference gate + the send, keeping the notification layer decoupled
++/// from the reference_checks message builders.
++pub fn notify_reference_unreachable(
++  db db: pog.Connection,
++  landlord_id landlord_id: Uuid,
++  reference_call_id reference_call_id: Uuid,
++  referee_name referee_name: String,
++  applicant_full_name applicant_full_name: String,
++  email_subject email_subject: String,
++  email_html email_html: String,
++  resend_api_key resend_api_key: String,
++) -> Result(String, String) {
++  let title = "Couldn't reach this reference"
++  let body =
++    referee_name
++    <> " couldn't be reached for "
++    <> applicant_full_name
++    <> "'s reference. You may want to call them yourself."
++  let notif_result =
++    dispatch(
++      db,
++      landlord_id,
++      sql.ReferenceUnreachable,
++      title,
++      body,
++      "reference_call",
++      reference_call_id,
++    )
++  // Preference-gated rich email (the attempt-log render). Realtime only;
++  // the in-app notification above already landed regardless of preference.
++  maybe_send_rich_email(
++    db:,
++    landlord_id:,
++    resend_api_key:,
++    subject: email_subject,
++    html: email_html,
++  )
++  notif_result
++}
++
+ /// Shared dispatch for the three reference events: in-app notification on the
+ /// reference_call entity + a best-effort realtime email linking the landlord
+ /// to the application detail (where the reference panel renders).
+@@ -534,6 +589,50 @@ fn maybe_send_email(
+   }
+ }
+ 
++/// Preference-gated send for the warm-handoff rich email (the attempt-log
++/// render). Mirrors `maybe_send_email` but sends a caller-built HTML body
++/// via the raw-HTML sender (the warm-handoff carries its own layout/CTA),
++/// realtime preference only. Best-effort: email failures are logged, never
++/// propagated (the in-app notification already landed).
++fn maybe_send_rich_email(
++  db db: pog.Connection,
++  landlord_id landlord_id: Uuid,
++  resend_api_key resend_api_key: String,
++  subject subject: String,
++  html html: String,
++) -> Nil {
++  case resend_api_key {
++    "" -> Nil
++    _ ->
++      case sql.get_landlord_email_prefs(db, landlord_id) {
++        Ok(pog.Returned(_, [row])) ->
++          case
++            landlord.parse_notification_preference(row.notification_preference)
++          {
++            landlord.Realtime ->
++              case
++                email_client.send_email_with_tags(
++                  resend_api_key,
++                  standard_sender,
++                  row.email,
++                  subject,
++                  html,
++                  [#("template", "reference_warm_handoff")],
++                )
++              {
++                Ok(_) -> Nil
++                Error(err) ->
++                  wisp.log_warning(
++                    "Reference unreachable warm-handoff email failed: " <> err,
++                  )
++              }
++            _ -> Nil
++          }
++        _ -> Nil
++      }
++  }
++}
++
+ fn dispatch(
+   db: pog.Connection,
+   landlord_id: Uuid,
+diff --git a/server/src/reference_checks/result.gleam b/server/src/reference_checks/result.gleam
+index e775ccf7..01a54354 100644
+--- a/server/src/reference_checks/result.gleam
++++ b/server/src/reference_checks/result.gleam
+@@ -82,10 +82,49 @@ pub fn structure_form_result(
+   #(result, fraud_signals)
+ }
+ 
+-/// The §4.6 minimal terminal result (decline / objection): schema_version,
+-/// outcome, attempts, and a null `verification` (no form answers structured).
+-/// `note` carries the optional free-text decline reason (persisted in the
+-/// result JSONB for the landlord's context; objection passes None).
++/// The abandoned-with-draft terminal (A2, §4.6): the referee opened the
++/// form and saved answers but never submitted, and the cadence reached
++/// T+144h. Structured from `draft_answers` like a completed form, but
++/// `outcome:"partial"` and `confidence` CAPPED at medium (an abandoned
++/// draft is never "high" confidence, however complete). channel "form";
++/// no `fraud_signals` (no submission, no form_session). The §10 uniform-
++/// read rule wants every non-`failed` terminal to emit one entry.
++pub fn partial_result(
++  slot slot: RefSlot,
++  draft draft: Draft,
++  ctx ctx: StructureContext,
++) -> json.Json {
++  let verification = verification_block(slot, draft)
++  let completeness = required_completeness(slot, draft)
++  let attempts = parse_attempts(ctx.attempts)
++  json.object([
++    #("schema_version", json.string("refcall-v1")),
++    #("reference_call_id", json.string(ctx.reference_call_id)),
++    #("application_id", json.string(ctx.application_id)),
++    #("ref_slot", json.string(ctx.ref_slot)),
++    #("owner_label", json.string(ctx.owner_label)),
++    #("channel", json.string("form")),
++    #("outcome", json.string("partial")),
++    #("attempts", attempts),
++    #("verification", verification),
++    #("ai_summary", ai_summary_capped(slot, draft, completeness)),
++    #(
++      "compliance",
++      json.object([
++        #("gdpr_notice_given", json.bool(True)),
++        #("referee_channel_preference", json.null()),
++        #("recording_consent", json.string("not_recorded")),
++      ]),
++    ),
++    // transcript is v2-reserved (voice) — absent, never placeholder.
++  ])
++}
++
++/// The §4.6 minimal terminal result (decline / objection / unreachable):
++/// schema_version, outcome, attempts, and a null `verification` (no form
++/// answers structured). `note` carries the optional free-text decline
++/// reason (persisted in the result JSONB for the landlord's context;
++/// objection + unreachable pass None).
+ pub fn minimal_terminal_result(
+   outcome outcome: String,
+   attempts attempts: String,
+@@ -214,6 +253,29 @@ fn confidence_label(completeness: Float) -> String {
+   }
+ }
+ 
++/// Confidence capped at medium — the partial terminal (abandoned draft)
++/// is never "high", however complete the saved answers are. medium stays
++/// medium, low stays low.
++fn capped_confidence(completeness: Float) -> String {
++  case confidence_label(completeness) {
++    "high" -> "medium"
++    other -> other
++  }
++}
++
++/// ai_summary whose confidence is capped at medium (partial terminals).
++fn ai_summary_capped(
++  slot: RefSlot,
++  draft: Draft,
++  completeness: Float,
++) -> json.Json {
++  json.object([
++    #("headline", json.string(headline(slot, draft))),
++    #("summary", json.string(summary(slot, draft))),
++    #("confidence", json.string(capped_confidence(completeness))),
++  ])
++}
++
+ /// One-line templated headline from the slot's headline answers.
+ fn headline(slot: RefSlot, draft: Draft) -> String {
+   case slot {
+diff --git a/server/src/reference_checks/send.gleam b/server/src/reference_checks/send.gleam
+index 77e94485..1dcec630 100644
+--- a/server/src/reference_checks/send.gleam
++++ b/server/src/reference_checks/send.gleam
+@@ -138,44 +138,6 @@ pub fn send_co_nudge(
+   }
+ }
+ 
+-// ---------------------------------------------------------------------------
+-// T+96h landlord warm-handoff (email to the landlord with the attempt log)
+-// ---------------------------------------------------------------------------
+-
+-/// Send the landlord warm-handoff email (the T+96h "we're struggling to
+-/// reach them" handoff with the attempt log rendered, architecture §8.3).
+-/// `attempts` is the row's attempt log as plain entries (the sweep decodes /
+-/// accumulates them). Single channel.
+-pub fn send_warm_handoff(
+-  deps deps: SendDeps,
+-  to_email to_email: String,
+-  landlord_name landlord_name: String,
+-  referee_name referee_name: String,
+-  applicant_full_name applicant_full_name: String,
+-  attempts attempts: List(messages.AttemptEntry),
+-  application_url application_url: String,
+-) -> ChannelOutcome {
+-  case deps.resend_api_key {
+-    "" -> skip_email_no_key("warm handoff")
+-    api_key ->
+-      email_client.send_email_with_tags(
+-        api_key,
+-        standard_sender,
+-        to_email,
+-        messages.warm_handoff_email_subject(referee_name, applicant_full_name),
+-        messages.build_warm_handoff_email_html(
+-          landlord_name:,
+-          referee_name:,
+-          applicant_full_name:,
+-          attempts:,
+-          application_url:,
+-        ),
+-        [#("template", "reference_warm_handoff")],
+-      )
+-      |> email_outcome
+-  }
+-}
+-
+ // ---------------------------------------------------------------------------
+ // Channel plumbing
+ // ---------------------------------------------------------------------------
+diff --git a/server/src/reference_checks/sql.gleam b/server/src/reference_checks/sql.gleam
+index d0181514..e647aab6 100644
+--- a/server/src/reference_checks/sql.gleam
++++ b/server/src/reference_checks/sql.gleam
+@@ -1475,6 +1475,505 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `sweep_advance` query
++/// defined in `./src/reference_checks/sql/sweep_advance.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type SweepAdvanceRow {
++  SweepAdvanceRow(id: String)
++}
++
++/// Guarded cadence advance (AD-14): atomic attempt append + next-step for
++/// the co-nudge (T+24h) / reminder 1 (T+48h) / reminder 2 + warm-handoff
++/// (T+96h) steps. No status change — 'contact_initiated' is the in-flight
++/// referee-form state for the whole chase. The attempt_count guard pins
++/// exactly-once: a concurrent writer or a retry that already advanced this
++/// step returns 0 rows and the caller stands down.
++/// 
++/// `increment_hours` is the gap to the NEXT step (24 for T+24/T+48, 48 for
++/// T+96), added to the row's CURRENT next_attempt_at. Computing from the
++/// current horizon (not created_at) follows a re-enabled row's re-armed
++/// clock (rc2-3) and keeps the cadence self-healing after downtime. The
++/// sweep passes the exact increment per step.
++/// 
++/// `expected_attempt_count` is the step the caller computed (1, 2, or 3);
++/// the WHERE pins it so a row that silently jumped ahead (a manual fix, a
++/// re-run) cannot be double-advanced.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn sweep_advance(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Json,
++  arg_3: Float,
++  arg_4: Int,
++) -> Result(pog.Returned(SweepAdvanceRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(SweepAdvanceRow(id:))
++  }
++
++  "-- Guarded cadence advance (AD-14): atomic attempt append + next-step for
++-- the co-nudge (T+24h) / reminder 1 (T+48h) / reminder 2 + warm-handoff
++-- (T+96h) steps. No status change — 'contact_initiated' is the in-flight
++-- referee-form state for the whole chase. The attempt_count guard pins
++-- exactly-once: a concurrent writer or a retry that already advanced this
++-- step returns 0 rows and the caller stands down.
++--
++-- `increment_hours` is the gap to the NEXT step (24 for T+24/T+48, 48 for
++-- T+96), added to the row's CURRENT next_attempt_at. Computing from the
++-- current horizon (not created_at) follows a re-enabled row's re-armed
++-- clock (rc2-3) and keeps the cadence self-healing after downtime. The
++-- sweep passes the exact increment per step.
++--
++-- `expected_attempt_count` is the step the caller computed (1, 2, or 3);
++-- the WHERE pins it so a row that silently jumped ahead (a manual fix, a
++-- re-run) cannot be double-advanced.
++UPDATE reference_call
++SET attempts        = attempts || $2::jsonb,
++    attempt_count   = attempt_count + 1,
++    next_attempt_at = next_attempt_at + ($3 * interval '1 hour'),
++    updated_at      = now()
++WHERE id = $1
++  AND status = 'contact_initiated'
++  AND attempt_count = $4
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(json.to_string(arg_2)))
++  |> pog.parameter(pog.float(arg_3))
++  |> pog.parameter(pog.int(arg_4))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `sweep_claim_t0` query
++/// defined in `./src/reference_checks/sql/sweep_claim_t0.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type SweepClaimT0Row {
++  SweepClaimT0Row(id: String)
++}
++
++/// Guarded T0 claim (AD-14): the cadence's first step. Atomic status
++/// transition (queued -> contact_initiated) + form-token mint + attempt
++/// append + next-step, in ONE statement. Only fires when the row is still
++/// queued at attempt_count 0; a concurrent writer or a retry that already
++/// advanced returns 0 rows and the caller stands down (no duplicate T0 —
++/// the no-duplicate-T0 test pins the next_attempt_at advance).
++/// 
++/// The form_token is minted here (rc3-5 owns the T0 mint — creation stamps
++/// none, form_handler:101). The sweep mints a ~288-bit token
++/// (wisp.random_string(48), the insert_erasure_token precedent), SENDS the
++/// invite carrying it, then claims — stamping the token + a 10-day TTL (A3,
++/// covers the 6-day cadence) in the same guarded write. Send-then-claim
++/// ordering: worst case under a concurrent T0 is a duplicate invite (one
++/// with a dead token), never a missing one — preferable to claim-first,
++/// where a crash after claim but before send would skip the invite entirely.
++/// 
++/// The next horizon is computed from the row's CURRENT next_attempt_at +
++/// the step increment (not created_at): a re-enabled row re-arms
++/// next_attempt_at = now(), so the cadence follows that anchor, and adding
++/// to next_attempt_at keeps the cadence self-healing after downtime.
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn sweep_claim_t0(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: String,
++  arg_3: Json,
++  arg_4: Float,
++) -> Result(pog.Returned(SweepClaimT0Row), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(SweepClaimT0Row(id:))
++  }
++
++  "-- Guarded T0 claim (AD-14): the cadence's first step. Atomic status
++-- transition (queued -> contact_initiated) + form-token mint + attempt
++-- append + next-step, in ONE statement. Only fires when the row is still
++-- queued at attempt_count 0; a concurrent writer or a retry that already
++-- advanced returns 0 rows and the caller stands down (no duplicate T0 —
++-- the no-duplicate-T0 test pins the next_attempt_at advance).
++--
++-- The form_token is minted here (rc3-5 owns the T0 mint — creation stamps
++-- none, form_handler:101). The sweep mints a ~288-bit token
++-- (wisp.random_string(48), the insert_erasure_token precedent), SENDS the
++-- invite carrying it, then claims — stamping the token + a 10-day TTL (A3,
++-- covers the 6-day cadence) in the same guarded write. Send-then-claim
++-- ordering: worst case under a concurrent T0 is a duplicate invite (one
++-- with a dead token), never a missing one — preferable to claim-first,
++-- where a crash after claim but before send would skip the invite entirely.
++--
++-- The next horizon is computed from the row's CURRENT next_attempt_at +
++-- the step increment (not created_at): a re-enabled row re-arms
++-- next_attempt_at = now(), so the cadence follows that anchor, and adding
++-- to next_attempt_at keeps the cadence self-healing after downtime.
++UPDATE reference_call
++SET status                 = 'contact_initiated',
++    form_token             = $2,
++    form_token_expires_at  = now() + interval '10 days',
++    attempts               = attempts || $3::jsonb,
++    attempt_count          = attempt_count + 1,
++    next_attempt_at        = next_attempt_at + ($4 * interval '1 hour'),
++    updated_at             = now()
++WHERE id = $1
++  AND status = 'queued'
++  AND attempt_count = 0
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(arg_2))
++  |> pog.parameter(pog.text(json.to_string(arg_3)))
++  |> pog.parameter(pog.float(arg_4))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `sweep_due_reference_calls` query
++/// defined in `./src/reference_checks/sql/sweep_due_reference_calls.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type SweepDueReferenceCallsRow {
++  SweepDueReferenceCallsRow(
++    id: String,
++    application_id: String,
++    ref_slot: String,
++    status: String,
++    attempt_count: Int,
++    contact_name: String,
++    contact_email: Option(String),
++    contact_phone: Option(String),
++    corrected_email: Option(String),
++    corrected_phone: Option(String),
++    form_token: Option(String),
++    form_opened_at: String,
++    draft_answers: String,
++    attempts: String,
++    created_at: String,
++    vacancy_id: String,
++    applicant_first_name: String,
++    applicant_last_name: String,
++    applicant_email: String,
++    retention_due_at: String,
++    landlord_id: String,
++    origin_domain: String,
++    landlord_display_name: String,
++  )
++}
++
++/// The cadence SELECT (AD-4): every row the sweep owns this tick. Due =
++/// next_attempt_at <= now (pinned for tests), taken_over_at IS NULL (A7 — a
++/// landlord-taken-over row is skipped entirely; the form link stays live),
++/// and status IN ('queued','contact_initiated') — the two v1-active states
++/// the cadence drives. Every terminal (form_completed/unreachable/refused/
++/// objected/manual_recorded/failed/partial), 'skipped', and
++/// 'awaiting_correction' (NULL next_attempt_at — rc3-4's wrong-person route)
++/// is excluded by construction, so the sweep can never re-send a row that
++/// already reached its end state (AD-14 stickiness + the live-row index).
++/// 
++/// One join carries everything a step needs: the referee's effective
++/// contacts (corrected ?? snapshot, AD-7), the form-token + draft/session
++/// fields (A2 co-nudge gate + partial terminal), the attempt log + cadence
++/// position, the applicant's name + email (co-nudge), and the landlord +
++/// vacancy context the warm-handoff notification needs (§8.3). Nullable
++/// non-text columns use COALESCE(x::text, '') — squirrel types cast
++/// expressions non-optional and cannot codegen timestamptz, so '' is the
++/// absent marker, mirroring the NULLIF($n,'') input convention.
++/// 
++/// `now` is a TEXT param ('' = let Postgres default to now()) so tests pin
++/// the clock; `limit` bounds a single tick (a backlog after downtime drains
++/// across ticks rather than blowing the job timeout).
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn sweep_due_reference_calls(
++  db: pog.Connection,
++  arg_1: String,
++  arg_2: Int,
++) -> Result(pog.Returned(SweepDueReferenceCallsRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    use application_id <- decode.field(1, decode.string)
++    use ref_slot <- decode.field(2, decode.string)
++    use status <- decode.field(3, decode.string)
++    use attempt_count <- decode.field(4, decode.int)
++    use contact_name <- decode.field(5, decode.string)
++    use contact_email <- decode.field(6, decode.optional(decode.string))
++    use contact_phone <- decode.field(7, decode.optional(decode.string))
++    use corrected_email <- decode.field(8, decode.optional(decode.string))
++    use corrected_phone <- decode.field(9, decode.optional(decode.string))
++    use form_token <- decode.field(10, decode.optional(decode.string))
++    use form_opened_at <- decode.field(11, decode.string)
++    use draft_answers <- decode.field(12, decode.string)
++    use attempts <- decode.field(13, decode.string)
++    use created_at <- decode.field(14, decode.string)
++    use vacancy_id <- decode.field(15, decode.string)
++    use applicant_first_name <- decode.field(16, decode.string)
++    use applicant_last_name <- decode.field(17, decode.string)
++    use applicant_email <- decode.field(18, decode.string)
++    use retention_due_at <- decode.field(19, decode.string)
++    use landlord_id <- decode.field(20, decode.string)
++    use origin_domain <- decode.field(21, decode.string)
++    use landlord_display_name <- decode.field(22, decode.string)
++    decode.success(SweepDueReferenceCallsRow(
++      id:,
++      application_id:,
++      ref_slot:,
++      status:,
++      attempt_count:,
++      contact_name:,
++      contact_email:,
++      contact_phone:,
++      corrected_email:,
++      corrected_phone:,
++      form_token:,
++      form_opened_at:,
++      draft_answers:,
++      attempts:,
++      created_at:,
++      vacancy_id:,
++      applicant_first_name:,
++      applicant_last_name:,
++      applicant_email:,
++      retention_due_at:,
++      landlord_id:,
++      origin_domain:,
++      landlord_display_name:,
++    ))
++  }
++
++  "-- The cadence SELECT (AD-4): every row the sweep owns this tick. Due =
++-- next_attempt_at <= now (pinned for tests), taken_over_at IS NULL (A7 — a
++-- landlord-taken-over row is skipped entirely; the form link stays live),
++-- and status IN ('queued','contact_initiated') — the two v1-active states
++-- the cadence drives. Every terminal (form_completed/unreachable/refused/
++-- objected/manual_recorded/failed/partial), 'skipped', and
++-- 'awaiting_correction' (NULL next_attempt_at — rc3-4's wrong-person route)
++-- is excluded by construction, so the sweep can never re-send a row that
++-- already reached its end state (AD-14 stickiness + the live-row index).
++--
++-- One join carries everything a step needs: the referee's effective
++-- contacts (corrected ?? snapshot, AD-7), the form-token + draft/session
++-- fields (A2 co-nudge gate + partial terminal), the attempt log + cadence
++-- position, the applicant's name + email (co-nudge), and the landlord +
++-- vacancy context the warm-handoff notification needs (§8.3). Nullable
++-- non-text columns use COALESCE(x::text, '') — squirrel types cast
++-- expressions non-optional and cannot codegen timestamptz, so '' is the
++-- absent marker, mirroring the NULLIF($n,'') input convention.
++--
++-- `now` is a TEXT param ('' = let Postgres default to now()) so tests pin
++-- the clock; `limit` bounds a single tick (a backlog after downtime drains
++-- across ticks rather than blowing the job timeout).
++SELECT rc.id::text,
++       rc.application_id::text,
++       rc.ref_slot,
++       rc.status::text                     AS status,
++       rc.attempt_count,
++       rc.contact_name,
++       rc.contact_email,
++       rc.contact_phone,
++       rc.corrected_email,
++       rc.corrected_phone,
++       rc.form_token,
++       COALESCE(rc.form_opened_at::text, '') AS form_opened_at,
++       COALESCE(rc.draft_answers::text, '')  AS draft_answers,
++       COALESCE(rc.attempts::text, '[]')     AS attempts,
++       COALESCE(rc.created_at::text, '')     AS created_at,
++       a.vacancy_id::text                   AS vacancy_id,
++       a.first_name                         AS applicant_first_name,
++       a.last_name                          AS applicant_last_name,
++       a.email                              AS applicant_email,
++       COALESCE(a.retention_due_at::text, '') AS retention_due_at,
++       v.user_id::text                      AS landlord_id,
++       v.origin_domain,
++       l.name                               AS landlord_display_name
++FROM reference_call rc
++JOIN application a ON a.id = rc.application_id
++JOIN vacancy v ON v.id = a.vacancy_id
++JOIN landlord l ON l.id = v.user_id
++WHERE rc.next_attempt_at <= COALESCE(NULLIF($1, '')::timestamptz, now())
++  AND rc.taken_over_at IS NULL
++  AND rc.status IN ('queued', 'contact_initiated')
++ORDER BY rc.next_attempt_at
++LIMIT $2;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(arg_1))
++  |> pog.parameter(pog.int(arg_2))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `sweep_mark_failed` query
++/// defined in `./src/reference_checks/sql/sweep_mark_failed.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type SweepMarkFailedRow {
++  SweepMarkFailedRow(id: String)
++}
++
++/// Mark a row failed (§4.6, AD-15): a row the sweep could not process (a
++/// DB/decode error mid-tick — NOT a provider send failure, which the rc3-2
++/// helpers log as a `failed` attempt outcome and the cadence continues past).
++/// Outcome is forced NULL (no referee contact occurred) and NO result is
++/// written (the §10 uniform-read rule: failed rows emit no result entry).
++/// next_attempt_at is cleared (terminal). Sentry captures the cause; NO
++/// landlord notification fires (§4.6).
++/// 
++/// Guarded on the two sweep-active statuses so a row that already
++/// terminalized (a concurrent writer) is not clobbered; a 0-row result is a
++/// harmless no-op (the failure is still Sentry-captured by the caller).
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn sweep_mark_failed(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: String,
++) -> Result(pog.Returned(SweepMarkFailedRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(SweepMarkFailedRow(id:))
++  }
++
++  "-- Mark a row failed (§4.6, AD-15): a row the sweep could not process (a
++-- DB/decode error mid-tick — NOT a provider send failure, which the rc3-2
++-- helpers log as a `failed` attempt outcome and the cadence continues past).
++-- Outcome is forced NULL (no referee contact occurred) and NO result is
++-- written (the §10 uniform-read rule: failed rows emit no result entry).
++-- next_attempt_at is cleared (terminal). Sentry captures the cause; NO
++-- landlord notification fires (§4.6).
++--
++-- Guarded on the two sweep-active statuses so a row that already
++-- terminalized (a concurrent writer) is not clobbered; a 0-row result is a
++-- harmless no-op (the failure is still Sentry-captured by the caller).
++UPDATE reference_call
++SET status          = 'failed',
++    outcome         = NULL,
++    terminal_reason = $2,
++    next_attempt_at = NULL,
++    updated_at      = now()
++WHERE id = $1
++  AND status IN ('queued', 'contact_initiated')
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(arg_2))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `sweep_terminal` query
++/// defined in `./src/reference_checks/sql/sweep_terminal.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type SweepTerminalRow {
++  SweepTerminalRow(id: String)
++}
++
++/// Guarded silent terminal at T+144h (AD-14, §8.3): the cadence's last
++/// step. No message, no notification — the warm handoff already landed at
++/// T+96h, so the §8.3 no-duplicate-terminal rule makes this silent.
++/// 
++/// The caller picks the branch from draft_answers (A2): a saved draft ->
++/// 'partial' (result structured from the draft, unanswered null,
++/// confidence capped medium); no draft -> 'unreachable' (the minimal §4.6
++/// result: outcome + attempts, null verification). The pre-built result
++/// JSON is passed in; outcome + status follow it. next_attempt_at is
++/// cleared (terminal), and purge_after is stamped from the application's
++/// retention_due_at when set (§9.3: referee data follows the application's
++/// retention schedule — the same stamp complete_reference_call applies).
++/// 
++/// attempt_count = 4 pins the T+144 step (only a row that ran the full
++/// cadence terminalizes here); the status guard makes the terminal sticky.
++/// `outcome` is passed as TEXT and NULLIF-cast (the repo convention —
++/// reference_call_status and reference_call_outcome share constructor
++/// names, so Squirrel must not emit a second Gleam type for the outcome
++/// enum; the NULLIF forces a String inference, matching every other
++/// outcome-bearing query).
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn sweep_terminal(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: ReferenceCallStatus,
++  arg_3: String,
++  arg_4: String,
++  arg_5: Json,
++  arg_6: String,
++) -> Result(pog.Returned(SweepTerminalRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(SweepTerminalRow(id:))
++  }
++
++  "-- Guarded silent terminal at T+144h (AD-14, §8.3): the cadence's last
++-- step. No message, no notification — the warm handoff already landed at
++-- T+96h, so the §8.3 no-duplicate-terminal rule makes this silent.
++--
++-- The caller picks the branch from draft_answers (A2): a saved draft ->
++-- 'partial' (result structured from the draft, unanswered null,
++-- confidence capped medium); no draft -> 'unreachable' (the minimal §4.6
++-- result: outcome + attempts, null verification). The pre-built result
++-- JSON is passed in; outcome + status follow it. next_attempt_at is
++-- cleared (terminal), and purge_after is stamped from the application's
++-- retention_due_at when set (§9.3: referee data follows the application's
++-- retention schedule — the same stamp complete_reference_call applies).
++--
++-- attempt_count = 4 pins the T+144 step (only a row that ran the full
++-- cadence terminalizes here); the status guard makes the terminal sticky.
++-- `outcome` is passed as TEXT and NULLIF-cast (the repo convention —
++-- reference_call_status and reference_call_outcome share constructor
++-- names, so Squirrel must not emit a second Gleam type for the outcome
++-- enum; the NULLIF forces a String inference, matching every other
++-- outcome-bearing query).
++UPDATE reference_call
++SET status          = $2::reference_call_status,
++    outcome         = NULLIF($3, '')::reference_call_outcome,
++    terminal_reason = $4,
++    result          = $5::jsonb,
++    next_attempt_at = NULL,
++    purge_after     = CASE WHEN $6 = '' THEN purge_after
++                           ELSE $6::timestamptz END,
++    updated_at      = now()
++WHERE id = $1
++  AND status = 'contact_initiated'
++  AND attempt_count = 4
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(reference_call_status_encoder(arg_2))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.parameter(pog.text(json.to_string(arg_5)))
++  |> pog.parameter(pog.text(arg_6))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `terminalize_reference_call` query
+ /// defined in `./src/reference_checks/sql/terminalize_reference_call.sql`.
+ ///
+diff --git a/server/src/reference_checks/sql/sweep_advance.sql b/server/src/reference_checks/sql/sweep_advance.sql
+new file mode 100644
+index 00000000..a5c45d3d
+--- /dev/null
++++ b/server/src/reference_checks/sql/sweep_advance.sql
+@@ -0,0 +1,25 @@
++-- Guarded cadence advance (AD-14): atomic attempt append + next-step for
++-- the co-nudge (T+24h) / reminder 1 (T+48h) / reminder 2 + warm-handoff
++-- (T+96h) steps. No status change — 'contact_initiated' is the in-flight
++-- referee-form state for the whole chase. The attempt_count guard pins
++-- exactly-once: a concurrent writer or a retry that already advanced this
++-- step returns 0 rows and the caller stands down.
++--
++-- `increment_hours` is the gap to the NEXT step (24 for T+24/T+48, 48 for
++-- T+96), added to the row's CURRENT next_attempt_at. Computing from the
++-- current horizon (not created_at) follows a re-enabled row's re-armed
++-- clock (rc2-3) and keeps the cadence self-healing after downtime. The
++-- sweep passes the exact increment per step.
++--
++-- `expected_attempt_count` is the step the caller computed (1, 2, or 3);
++-- the WHERE pins it so a row that silently jumped ahead (a manual fix, a
++-- re-run) cannot be double-advanced.
++UPDATE reference_call
++SET attempts        = attempts || $2::jsonb,
++    attempt_count   = attempt_count + 1,
++    next_attempt_at = next_attempt_at + ($3 * interval '1 hour'),
++    updated_at      = now()
++WHERE id = $1
++  AND status = 'contact_initiated'
++  AND attempt_count = $4
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/sweep_claim_t0.sql b/server/src/reference_checks/sql/sweep_claim_t0.sql
+new file mode 100644
+index 00000000..00408bbf
+--- /dev/null
++++ b/server/src/reference_checks/sql/sweep_claim_t0.sql
+@@ -0,0 +1,32 @@
++-- Guarded T0 claim (AD-14): the cadence's first step. Atomic status
++-- transition (queued -> contact_initiated) + form-token mint + attempt
++-- append + next-step, in ONE statement. Only fires when the row is still
++-- queued at attempt_count 0; a concurrent writer or a retry that already
++-- advanced returns 0 rows and the caller stands down (no duplicate T0 —
++-- the no-duplicate-T0 test pins the next_attempt_at advance).
++--
++-- The form_token is minted here (rc3-5 owns the T0 mint — creation stamps
++-- none, form_handler:101). The sweep mints a ~288-bit token
++-- (wisp.random_string(48), the insert_erasure_token precedent), SENDS the
++-- invite carrying it, then claims — stamping the token + a 10-day TTL (A3,
++-- covers the 6-day cadence) in the same guarded write. Send-then-claim
++-- ordering: worst case under a concurrent T0 is a duplicate invite (one
++-- with a dead token), never a missing one — preferable to claim-first,
++-- where a crash after claim but before send would skip the invite entirely.
++--
++-- The next horizon is computed from the row's CURRENT next_attempt_at +
++-- the step increment (not created_at): a re-enabled row re-arms
++-- next_attempt_at = now(), so the cadence follows that anchor, and adding
++-- to next_attempt_at keeps the cadence self-healing after downtime.
++UPDATE reference_call
++SET status                 = 'contact_initiated',
++    form_token             = $2,
++    form_token_expires_at  = now() + interval '10 days',
++    attempts               = attempts || $3::jsonb,
++    attempt_count          = attempt_count + 1,
++    next_attempt_at        = next_attempt_at + ($4 * interval '1 hour'),
++    updated_at             = now()
++WHERE id = $1
++  AND status = 'queued'
++  AND attempt_count = 0
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/sweep_due_reference_calls.sql b/server/src/reference_checks/sql/sweep_due_reference_calls.sql
+new file mode 100644
+index 00000000..aa557db2
+--- /dev/null
++++ b/server/src/reference_checks/sql/sweep_due_reference_calls.sql
+@@ -0,0 +1,54 @@
++-- The cadence SELECT (AD-4): every row the sweep owns this tick. Due =
++-- next_attempt_at <= now (pinned for tests), taken_over_at IS NULL (A7 — a
++-- landlord-taken-over row is skipped entirely; the form link stays live),
++-- and status IN ('queued','contact_initiated') — the two v1-active states
++-- the cadence drives. Every terminal (form_completed/unreachable/refused/
++-- objected/manual_recorded/failed/partial), 'skipped', and
++-- 'awaiting_correction' (NULL next_attempt_at — rc3-4's wrong-person route)
++-- is excluded by construction, so the sweep can never re-send a row that
++-- already reached its end state (AD-14 stickiness + the live-row index).
++--
++-- One join carries everything a step needs: the referee's effective
++-- contacts (corrected ?? snapshot, AD-7), the form-token + draft/session
++-- fields (A2 co-nudge gate + partial terminal), the attempt log + cadence
++-- position, the applicant's name + email (co-nudge), and the landlord +
++-- vacancy context the warm-handoff notification needs (§8.3). Nullable
++-- non-text columns use COALESCE(x::text, '') — squirrel types cast
++-- expressions non-optional and cannot codegen timestamptz, so '' is the
++-- absent marker, mirroring the NULLIF($n,'') input convention.
++--
++-- `now` is a TEXT param ('' = let Postgres default to now()) so tests pin
++-- the clock; `limit` bounds a single tick (a backlog after downtime drains
++-- across ticks rather than blowing the job timeout).
++SELECT rc.id::text,
++       rc.application_id::text,
++       rc.ref_slot,
++       rc.status::text                     AS status,
++       rc.attempt_count,
++       rc.contact_name,
++       rc.contact_email,
++       rc.contact_phone,
++       rc.corrected_email,
++       rc.corrected_phone,
++       rc.form_token,
++       COALESCE(rc.form_opened_at::text, '') AS form_opened_at,
++       COALESCE(rc.draft_answers::text, '')  AS draft_answers,
++       COALESCE(rc.attempts::text, '[]')     AS attempts,
++       COALESCE(rc.created_at::text, '')     AS created_at,
++       a.vacancy_id::text                   AS vacancy_id,
++       a.first_name                         AS applicant_first_name,
++       a.last_name                          AS applicant_last_name,
++       a.email                              AS applicant_email,
++       COALESCE(a.retention_due_at::text, '') AS retention_due_at,
++       v.user_id::text                      AS landlord_id,
++       v.origin_domain,
++       l.name                               AS landlord_display_name
++FROM reference_call rc
++JOIN application a ON a.id = rc.application_id
++JOIN vacancy v ON v.id = a.vacancy_id
++JOIN landlord l ON l.id = v.user_id
++WHERE rc.next_attempt_at <= COALESCE(NULLIF($1, '')::timestamptz, now())
++  AND rc.taken_over_at IS NULL
++  AND rc.status IN ('queued', 'contact_initiated')
++ORDER BY rc.next_attempt_at
++LIMIT $2;
+diff --git a/server/src/reference_checks/sql/sweep_mark_failed.sql b/server/src/reference_checks/sql/sweep_mark_failed.sql
+new file mode 100644
+index 00000000..3dda99f2
+--- /dev/null
++++ b/server/src/reference_checks/sql/sweep_mark_failed.sql
+@@ -0,0 +1,20 @@
++-- Mark a row failed (§4.6, AD-15): a row the sweep could not process (a
++-- DB/decode error mid-tick — NOT a provider send failure, which the rc3-2
++-- helpers log as a `failed` attempt outcome and the cadence continues past).
++-- Outcome is forced NULL (no referee contact occurred) and NO result is
++-- written (the §10 uniform-read rule: failed rows emit no result entry).
++-- next_attempt_at is cleared (terminal). Sentry captures the cause; NO
++-- landlord notification fires (§4.6).
++--
++-- Guarded on the two sweep-active statuses so a row that already
++-- terminalized (a concurrent writer) is not clobbered; a 0-row result is a
++-- harmless no-op (the failure is still Sentry-captured by the caller).
++UPDATE reference_call
++SET status          = 'failed',
++    outcome         = NULL,
++    terminal_reason = $2,
++    next_attempt_at = NULL,
++    updated_at      = now()
++WHERE id = $1
++  AND status IN ('queued', 'contact_initiated')
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/sweep_terminal.sql b/server/src/reference_checks/sql/sweep_terminal.sql
+new file mode 100644
+index 00000000..452b1f57
+--- /dev/null
++++ b/server/src/reference_checks/sql/sweep_terminal.sql
+@@ -0,0 +1,33 @@
++-- Guarded silent terminal at T+144h (AD-14, §8.3): the cadence's last
++-- step. No message, no notification — the warm handoff already landed at
++-- T+96h, so the §8.3 no-duplicate-terminal rule makes this silent.
++--
++-- The caller picks the branch from draft_answers (A2): a saved draft ->
++-- 'partial' (result structured from the draft, unanswered null,
++-- confidence capped medium); no draft -> 'unreachable' (the minimal §4.6
++-- result: outcome + attempts, null verification). The pre-built result
++-- JSON is passed in; outcome + status follow it. next_attempt_at is
++-- cleared (terminal), and purge_after is stamped from the application's
++-- retention_due_at when set (§9.3: referee data follows the application's
++-- retention schedule — the same stamp complete_reference_call applies).
++--
++-- attempt_count = 4 pins the T+144 step (only a row that ran the full
++-- cadence terminalizes here); the status guard makes the terminal sticky.
++-- `outcome` is passed as TEXT and NULLIF-cast (the repo convention —
++-- reference_call_status and reference_call_outcome share constructor
++-- names, so Squirrel must not emit a second Gleam type for the outcome
++-- enum; the NULLIF forces a String inference, matching every other
++-- outcome-bearing query).
++UPDATE reference_call
++SET status          = $2::reference_call_status,
++    outcome         = NULLIF($3, '')::reference_call_outcome,
++    terminal_reason = $4,
++    result          = $5::jsonb,
++    next_attempt_at = NULL,
++    purge_after     = CASE WHEN $6 = '' THEN purge_after
++                           ELSE $6::timestamptz END,
++    updated_at      = now()
++WHERE id = $1
++  AND status = 'contact_initiated'
++  AND attempt_count = 4
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sweep.gleam b/server/src/reference_checks/sweep.gleam
+new file mode 100644
+index 00000000..26dd3828
+--- /dev/null
++++ b/server/src/reference_checks/sweep.gleam
+@@ -0,0 +1,828 @@
++//// The reference-check cadence sweep (Story RC3.5) — the 15-minute engine
++//// that owns every reference-check send and transition. Humane chasing,
++//// exactly-once, self-healing after downtime, never silently dead.
++////
++//// It is the scheduler/driver for rc3-2's templates + send helpers (the
++//// payload): each tick selects due rows (`next_attempt_at <= now` AND
++//// `taken_over_at IS NULL` AND status IN queued/contact_initiated),
++//// computes the due step from the attempt log (AD-4), sends via the rc3-2
++//// helpers, and applies transition + atomic attempt-append + next-step as
++//// ONE guarded update (AD-4, AD-14). T0 also mints the form_token (rc3-5
++//// owns the T0 mint — creation stamps none).
++////
++//// Separation of concerns (the retention_job / verification_reminder_job
++//// split): `main/0` reads env + bootstraps the DB pool; `run/5` is the
++//// pure-ish worker (DB + SendDeps + a pinned `now` ISO string so fake-clock
++//// tests are deterministic). The Cloud Run Job entry is wired in
++//// `docker-entrypoint.sh` (`reference-checks` arm); the 15-min Cloud
++//// Scheduler + manual-fire `POST /api/v1/internal/reference-checks` route
++//// live in Terraform + `router.gleam`/`sweep_handler.gleam`.
++////
++//// No-op without keys (rc3-2 doctrine): a missing RESEND_API_KEY / Disabled
++//// Twilio handle yields `skipped` attempt outcomes — the sweep still runs +
++//// transitions, SMS/email just don't send until the keys are provisioned.
++
++import db/db
++import dot_env
++import envoy
++import gleam/dict
++import gleam/dynamic/decode
++import gleam/int
++import gleam/json
++import gleam/list
++import gleam/option.{None, Some}
++import gleam/result
++import gleam/string
++import gleam/time/calendar
++import gleam/time/timestamp
++import notification/notification_dispatch
++import notification/sms_client
++import pog
++import reference_checks/messages.{
++  type AttemptEntry, type ChannelOutcome, type RefereeContext, AttemptEntry,
++}
++import reference_checks/questions
++import reference_checks/result as ref_result
++import reference_checks/send
++import reference_checks/sql
++import sentry/sentry_client
++import shared/reference_call.{ref_slot_from_string}
++import wisp
++import youid/uuid.{type Uuid}
++
++// -- Cadence increments (AD-4). The horizon after each step is the row's
++//    CURRENT next_attempt_at + the increment, so a re-enabled row's re-armed
++//    clock is followed and the cadence self-heals after downtime. ---------
++
++/// T0 -> T+24h.
++const step_to_co_nudge: Float = 24.0
++
++/// T+24h -> T+48h.
++const step_to_reminder_1: Float = 24.0
++
++/// T+48h -> T+96h.
++const step_to_reminder_2: Float = 48.0
++
++/// T+96h -> T+144h (then silent terminal).
++const step_to_terminal: Float = 48.0
++
++/// Cap a single tick drains so a backlog after downtime spreads across ticks
++/// instead of blowing the job timeout. 500 is generous for a 15-min cadence.
++const default_batch_limit: Int = 500
++
++/// terminal_reason slugs (§4.6).
++const reason_sequence_exhausted: String = "sequence_exhausted"
++
++pub type RunSummary {
++  RunSummary(
++    due: Int,
++    invited: Int,
++    co_nudged: Int,
++    co_nudge_skipped: Int,
++    reminded_1: Int,
++    reminded_2: Int,
++    warm_handoffs: Int,
++    terminal_partial: Int,
++    terminal_unreachable: Int,
++    failed: Int,
++    stood_down: Int,
++  )
++}
++
++pub type RunError {
++  DbError(String)
++}
++
++// ---------------------------------------------------------------------------
++// Cloud Run Job entry
++// ---------------------------------------------------------------------------
++
++/// Cloud Run Job entry (`docker-entrypoint.sh reference-checks`). Loads env,
++/// bootstraps the DB pool + send deps, runs one tick, logs a per-tick
++/// completion line (AD-15 liveness), and panics on fatal config/DB error so
++/// Cloud Run marks the job failed (the scheduler's retry_config is 0 — the
++/// 15-min cadence is the retry). Per-row failures are logged + Sentry-captured,
++/// never fail the whole tick.
++pub fn main() {
++  dot_env.load_default()
++  wisp.configure_logger()
++
++  let env = envoy.get("ENV") |> result.unwrap("development")
++  wisp.log_info("reference_checks sweep starting (env=" <> env <> ")")
++
++  case bootstrap() {
++    Ok(summary) ->
++      wisp.log_info(
++        "reference_checks sweep complete: "
++        <> "due="
++        <> int.to_string(summary.due)
++        <> " invited="
++        <> int.to_string(summary.invited)
++        <> " co_nudged="
++        <> int.to_string(summary.co_nudged)
++        <> " co_nudge_skipped="
++        <> int.to_string(summary.co_nudge_skipped)
++        <> " reminded_1="
++        <> int.to_string(summary.reminded_1)
++        <> " reminded_2="
++        <> int.to_string(summary.reminded_2)
++        <> " warm_handoffs="
++        <> int.to_string(summary.warm_handoffs)
++        <> " terminal_partial="
++        <> int.to_string(summary.terminal_partial)
++        <> " terminal_unreachable="
++        <> int.to_string(summary.terminal_unreachable)
++        <> " failed="
++        <> int.to_string(summary.failed)
++        <> " stood_down="
++        <> int.to_string(summary.stood_down),
++      )
++    Error(DbError(msg)) -> {
++      wisp.log_error("reference_checks sweep failed (db): " <> msg)
++      sentry_client.capture(
++        sentry_client.init(),
++        sentry_client.BackgroundEvent(
++          event_type: "ReferenceSweepFailed",
++          message: "bootstrap db failure: " <> msg,
++          level: sentry_client.LevelError,
++          tags: [#("sweep", "reference_checks"), #("phase", "bootstrap")],
++        ),
++      )
++      panic as "reference_checks sweep db failure"
++    }
++  }
++}
++
++fn bootstrap() -> Result(RunSummary, RunError) {
++  use db_conn <- result.try(db.start() |> result.map_error(DbError))
++  let resend_api_key = envoy.get("RESEND_API_KEY") |> result.unwrap("")
++  // sms_client.init returns Disabled when TWILIO_* is unset (the external
++  // gate — no SMS sends until the Alpha Sender ID is provisioned, Q1).
++  let twilio = sms_client.init()
++  let sentry = sentry_client.init()
++  let deps = send.SendDeps(resend_api_key:, twilio:, sentry:)
++  // A real ISO now stamps the attempt-log `at` field (a pinned "" would leave
++  // every entry timestampless in production). Tests pass a fixed string.
++  Ok(run(
++    db_conn,
++    deps,
++    now_iso: now_iso(),
++    sentry: sentry,
++    batch_limit: default_batch_limit,
++  ))
++}
++
++/// The current UTC time as an RFC3339 string — the attempt-log `at` stamp
++/// and (cast to timestamptz) the cadence SELECT's `now`. Exposed so the
++/// manual-fire handler stamps the same way.
++pub fn now_iso() -> String {
++  timestamp.system_time()
++  |> timestamp.to_rfc3339(calendar.utc_offset)
++}
++
++// ---------------------------------------------------------------------------
++// The worker
++// ---------------------------------------------------------------------------
++
++/// Run one sweep tick. `now_iso` is an ISO-8601 timestamp string, or "" to
++/// let Postgres default to now() (production passes ""; tests pin the clock
++/// so cadence steps are deterministic). `deps` carries the send helpers'
++/// Resend key + Twilio handle + Sentry; `sentry` is also passed for the
++/// per-row failure path (bootstrap reuses deps.sentry). `batch_limit` caps
++/// the tick. Returns a RunSummary for the liveness log.
++///
++/// Per-row failures (a DB/decode error) mark the row `failed` + Sentry + the
++/// tick continues — a single bad row never aborts the sweep (AD-15). The
++/// guarded updates' 0-row results (a concurrent writer / retry) are counted
++/// as `stood_down`, not failures (AD-14 — exactly-once state transitions).
++pub fn run(
++  db: pog.Connection,
++  deps: send.SendDeps,
++  now_iso now_iso: String,
++  sentry sentry: sentry_client.Sentry,
++  batch_limit batch_limit: Int,
++) -> RunSummary {
++  case sql.sweep_due_reference_calls(db, now_iso, batch_limit) {
++    Error(err) -> {
++      // The due-SELECT failed — the sweep can't run. Capture + return empty.
++      capture(sentry, "", "due-select failed: " <> query_error(err), "select")
++      empty_summary(0)
++    }
++    Ok(pog.Returned(_, rows)) ->
++      list.fold(rows, empty_summary(list.length(rows)), fn(acc, row) {
++        case process_row(db, deps, now_iso, sentry, row) {
++          Invited -> RunSummary(..acc, invited: acc.invited + 1)
++          CoNudged -> RunSummary(..acc, co_nudged: acc.co_nudged + 1)
++          CoNudgeSkipped ->
++            RunSummary(..acc, co_nudge_skipped: acc.co_nudge_skipped + 1)
++          Reminded1 -> RunSummary(..acc, reminded_1: acc.reminded_1 + 1)
++          Reminded2 -> RunSummary(..acc, reminded_2: acc.reminded_2 + 1)
++          WarmHandoff -> RunSummary(..acc, warm_handoffs: acc.warm_handoffs + 1)
++          TerminalPartial ->
++            RunSummary(..acc, terminal_partial: acc.terminal_partial + 1)
++          TerminalUnreachable ->
++            RunSummary(
++              ..acc,
++              terminal_unreachable: acc.terminal_unreachable + 1,
++            )
++          Failed -> RunSummary(..acc, failed: acc.failed + 1)
++          StoodDown -> RunSummary(..acc, stood_down: acc.stood_down + 1)
++        }
++      })
++  }
++}
++
++fn empty_summary(due: Int) -> RunSummary {
++  RunSummary(
++    due:,
++    invited: 0,
++    co_nudged: 0,
++    co_nudge_skipped: 0,
++    reminded_1: 0,
++    reminded_2: 0,
++    warm_handoffs: 0,
++    terminal_partial: 0,
++    terminal_unreachable: 0,
++    failed: 0,
++    stood_down: 0,
++  )
++}
++
++/// The per-row outcome (folded into the RunSummary by `run`).
++pub type RowOutcome {
++  Invited
++  CoNudged
++  CoNudgeSkipped
++  Reminded1
++  Reminded2
++  WarmHandoff
++  TerminalPartial
++  TerminalUnreachable
++  Failed
++  StoodDown
++}
++
++// ---------------------------------------------------------------------------
++// Per-row step logic
++// ---------------------------------------------------------------------------
++
++fn process_row(
++  db: pog.Connection,
++  deps: send.SendDeps,
++  now_iso: String,
++  sentry: sentry_client.Sentry,
++  row: sql.SweepDueReferenceCallsRow,
++) -> RowOutcome {
++  case uuid.from_string(row.id) {
++    Error(_) -> mark_failed(db, sentry, row.id, "bad reference_call id")
++    Ok(row_uuid) ->
++      case row.attempt_count {
++        0 -> step_t0(db, deps, now_iso, sentry, row, row_uuid)
++        1 -> step_co_nudge(db, deps, now_iso, sentry, row, row_uuid)
++        2 ->
++          step_reminder(
++            db,
++            deps,
++            now_iso,
++            sentry,
++            row,
++            row_uuid,
++            messages.ReminderOne,
++            step_to_reminder_2,
++          )
++        3 -> step_warm_handoff(db, deps, now_iso, sentry, row, row_uuid)
++        4 -> step_terminal(db, sentry, row, row_uuid)
++        _ ->
++          // attempt_count > 4 is impossible (T+144 terminalizes at 4); a row
++          // in this state was hand-edited. Mark failed rather than advance.
++          mark_failed(
++            db,
++            sentry,
++            row.id,
++            "attempt_count out of cadence range: "
++              <> int.to_string(row.attempt_count),
++          )
++      }
++  }
++}
++
++/// T0 invite (AD-4): mint the form_token, send the invite (email+SMS), then
++/// guarded claim (queued -> contact_initiated + stamp token + append +
++/// advance). Send-then-claim: a concurrent T0's worst case is a duplicate
++/// invite, never a missing one. A 0-row claim = someone else won -> stand down.
++fn step_t0(
++  db: pog.Connection,
++  deps: send.SendDeps,
++  now_iso: String,
++  sentry: sentry_client.Sentry,
++  row: sql.SweepDueReferenceCallsRow,
++  row_uuid: Uuid,
++) -> RowOutcome {
++  let token = wisp.random_string(48)
++  let context = build_context(row, token)
++  let outcomes =
++    send.send_invite(
++      deps,
++      send.RefereeMessage(
++        context:,
++        to_email: effective_email(row),
++        to_phone: effective_phone(row),
++      ),
++    )
++  let entries = outcomes_to_json(outcomes, now_iso)
++  case sql.sweep_claim_t0(db, row_uuid, token, entries, step_to_co_nudge) {
++    Ok(pog.Returned(_, [_])) -> Invited
++    Ok(_) -> StoodDown
++    // A persistent claim error (a CHECK/trigger violation on this row — a
++    // global DB outage fails the due-SELECT first, so a per-row UPDATE error
++    // is row-specific poison data) would re-send the invite every 15 min
++    // forever under send-then-claim. Mark failed + capture so it stops + is
++    // loud (AC7, AD-15) — the orphaned-invite edge case is the rare
++    // transient blip, Sentry-captured for ops to re-trigger.
++    Error(err) ->
++      mark_failed(db, sentry, row.id, "T0 claim failed: " <> query_error(err))
++  }
++}
++
++/// T+24h applicant co-nudge (AD-4, A2): fires ONLY when the form was never
++/// opened AND no draft exists. Gate fail -> advance the cadence without
++/// sending (log a `skipped` entry so the warm-handoff render shows the full
++/// cadence). Guarded advance; 0-row = stand down.
++fn step_co_nudge(
++  db: pog.Connection,
++  deps: send.SendDeps,
++  now_iso: String,
++  sentry: sentry_client.Sentry,
++  row: sql.SweepDueReferenceCallsRow,
++  row_uuid: Uuid,
++) -> RowOutcome {
++  let context = build_context(row, row.form_token |> option.unwrap(""))
++  let fires = co_nudge_should_fire(row)
++  let entries = case fires {
++    True -> {
++      let outcome =
++        send.send_co_nudge(
++          deps,
++          to_email: row.applicant_email,
++          applicant_first_name: row.applicant_first_name,
++          referee_name: row.contact_name,
++          referee_first_name: context.referee_first_name,
++        )
++      outcomes_to_json([outcome], now_iso)
++    }
++    False -> {
++      // Gate failed (form opened OR draft exists): advance without sending.
++      let reason = case form_was_opened(row) {
++        True -> "co-nudge skipped: form already opened"
++        False -> "co-nudge skipped: draft exists"
++      }
++      json.array([skipped_entry(now_iso, reason)], fn(e) { e })
++    }
++  }
++  case sql.sweep_advance(db, row_uuid, entries, step_to_reminder_1, 1) {
++    Ok(pog.Returned(_, [_])) ->
++      case fires {
++        True -> CoNudged
++        False -> CoNudgeSkipped
++      }
++    Ok(_) -> StoodDown
++    // See step_t0: a persistent advance error is row-specific poison data —
++    // mark failed + capture rather than loop (AC7, AD-15).
++    Error(err) ->
++      mark_failed(
++        db,
++        sentry,
++        row.id,
++        "co-nudge advance failed: " <> query_error(err),
++      )
++  }
++}
++
++/// T+48h reminder 1 / T+96h reminder 2 (the shared reminder step). Sends the
++/// reminder on both channels, guarded-advances. `increment` is the gap to the
++/// next step (24 for T+48, 48 for T+96).
++fn step_reminder(
++  db: pog.Connection,
++  deps: send.SendDeps,
++  now_iso: String,
++  sentry: sentry_client.Sentry,
++  row: sql.SweepDueReferenceCallsRow,
++  row_uuid: Uuid,
++  stage: messages.ReminderStage,
++  increment: Float,
++) -> RowOutcome {
++  let context = build_context(row, row.form_token |> option.unwrap(""))
++  let outcomes =
++    send.send_reminder(
++      deps,
++      stage:,
++      message: send.RefereeMessage(
++        context:,
++        to_email: effective_email(row),
++        to_phone: effective_phone(row),
++      ),
++    )
++  let entries = outcomes_to_json(outcomes, now_iso)
++  // attempt_count guard = 2 for reminder 1, 3 for reminder 2.
++  let expected = case stage {
++    messages.ReminderOne -> 2
++    messages.ReminderTwo -> 3
++  }
++  case sql.sweep_advance(db, row_uuid, entries, increment, expected) {
++    Ok(pog.Returned(_, [_])) ->
++      case stage {
++        messages.ReminderOne -> Reminded1
++        messages.ReminderTwo -> Reminded2
++      }
++    Ok(_) -> StoodDown
++    // See step_t0: a persistent advance error loops (re-sends the reminder
++    // every 15 min). Mark failed + capture (AC7, AD-15).
++    Error(err) ->
++      mark_failed(
++        db,
++        sentry,
++        row.id,
++        "reminder advance failed: " <> query_error(err),
++      )
++  }
++}
++
++/// T+96h reminder 2 + landlord warm-handoff (§8.3). Sends reminder 2,
++/// guarded-advances (to attempt_count 4), THEN dispatches the
++/// `reference_unreachable` notification — AFTER the advance so a retry never
++/// duplicates it (§8.3 no-duplicate-terminal). The notification IS the
++/// unreachable-path notification; the T+144h terminal is silent.
++fn step_warm_handoff(
++  db: pog.Connection,
++  deps: send.SendDeps,
++  now_iso: String,
++  sentry: sentry_client.Sentry,
++  row: sql.SweepDueReferenceCallsRow,
++  row_uuid: Uuid,
++) -> RowOutcome {
++  let context = build_context(row, row.form_token |> option.unwrap(""))
++  let outcomes =
++    send.send_reminder(
++      deps,
++      stage: messages.ReminderTwo,
++      message: send.RefereeMessage(
++        context:,
++        to_email: effective_email(row),
++        to_phone: effective_phone(row),
++      ),
++    )
++  let entries = outcomes_to_json(outcomes, now_iso)
++  case sql.sweep_advance(db, row_uuid, entries, step_to_terminal, 3) {
++    Ok(pog.Returned(_, [_])) -> {
++      // Advance won — dispatch the warm handoff (exactly-once: only the
++      // advance winner notifies), merging this tick's REAL reminder-2
++      // outcomes into the rendered attempt log (W2: no fabricated entry).
++      dispatch_warm_handoff(db, deps, now_iso, row, context, outcomes)
++      WarmHandoff
++    }
++    Ok(_) -> StoodDown
++    // Do NOT dispatch the warm handoff (the advance didn't commit). See
++    // step_t0: a persistent advance error loops; mark failed + capture.
++    Error(err) ->
++      mark_failed(
++        db,
++        sentry,
++        row.id,
++        "warm-handoff advance failed: " <> query_error(err),
++      )
++  }
++}
++
++/// T+144h silent terminal (§8.3): no message, no notification. Branches on
++/// draft_answers (A2) — a saved draft -> `partial` (result structured from
++/// the draft, confidence capped medium); no draft -> `unreachable` (minimal
++/// §4.6 result). next_attempt_at cleared; purge_after stamped from the
++/// application's retention_due_at when set (§9.3).
++fn step_terminal(
++  db: pog.Connection,
++  sentry: sentry_client.Sentry,
++  row: sql.SweepDueReferenceCallsRow,
++  row_uuid: Uuid,
++) -> RowOutcome {
++  let has_draft = has_draft_answers(row)
++  let #(status, outcome, result_json, terminal_outcome) = case has_draft {
++    True -> {
++      let slot = ref_slot_from_string(row.ref_slot)
++      let draft = questions.decode_draft(row.draft_answers)
++      let result =
++        ref_result.partial_result(
++          slot,
++          draft,
++          ref_result.StructureContext(
++            reference_call_id: row.id,
++            application_id: row.application_id,
++            ref_slot: row.ref_slot,
++            owner_label: "primary",
++            attempts: row.attempts,
++            focus_seconds: 0,
++          ),
++        )
++      #(sql.Partial, "partial", result, TerminalPartial)
++    }
++    False -> {
++      let result =
++        ref_result.minimal_terminal_result(
++          outcome: "unreachable",
++          attempts: row.attempts,
++          note: None,
++        )
++      #(sql.Unreachable, "unreachable", result, TerminalUnreachable)
++    }
++  }
++  case
++    sql.sweep_terminal(
++      db,
++      row_uuid,
++      status,
++      outcome,
++      reason_sequence_exhausted,
++      result_json,
++      row.retention_due_at,
++    )
++  {
++    Ok(pog.Returned(_, [_])) -> terminal_outcome
++    Ok(_) -> StoodDown
++    // See step_t0: a persistent terminal error loops (the row stays due,
++    // re-terminalizing every tick). Mark failed + capture (AC7, AD-15).
++    Error(err) ->
++      mark_failed(db, sentry, row.id, "terminal failed: " <> query_error(err))
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Warm-handoff dispatch (§8.3)
++// ---------------------------------------------------------------------------
++
++fn dispatch_warm_handoff(
++  db: pog.Connection,
++  deps: send.SendDeps,
++  now_iso: String,
++  row: sql.SweepDueReferenceCallsRow,
++  context: RefereeContext,
++  outcomes: List(ChannelOutcome),
++) -> Nil {
++  // The attempt log as the landlord will see it: the row's prior attempts
++  // PLUS this tick's REAL reminder-2 outcomes (W2 — no fabricated entry; the
++  // advance already appended these to the row, so this mirrors the truth).
++  let attempts =
++    parse_attempts_entries(row.attempts)
++    |> list.append(outcomes_to_entries(outcomes, now_iso))
++  case uuid.from_string(row.landlord_id), uuid.from_string(row.id) {
++    Ok(landlord_uuid), Ok(reference_call_uuid) -> {
++      let application_url = application_url(row)
++      let email_subject =
++        messages.warm_handoff_email_subject(
++          row.contact_name,
++          context.applicant_full_name,
++        )
++      let email_html =
++        messages.build_warm_handoff_email_html(
++          landlord_name: row.landlord_display_name,
++          referee_name: row.contact_name,
++          applicant_full_name: context.applicant_full_name,
++          attempts:,
++          application_url:,
++        )
++      // W3: this is the ONLY unreachable-path notification (the T+144h
++      // terminal is silent, §8.3). A lost insert must NOT be silent — log +
++      // Sentry so ops notice the missing warm handoff.
++      case
++        notification_dispatch.notify_reference_unreachable(
++          db,
++          landlord_id: landlord_uuid,
++          reference_call_id: reference_call_uuid,
++          referee_name: row.contact_name,
++          applicant_full_name: context.applicant_full_name,
++          email_subject:,
++          email_html:,
++          resend_api_key: deps.resend_api_key,
++        )
++      {
++        Ok(_) -> Nil
++        Error(reason) -> {
++          wisp.log_error(
++            "reference warm-handoff notification failed for "
++            <> row.id
++            <> ": "
++            <> reason,
++          )
++          sentry_client.capture(
++            deps.sentry,
++            sentry_client.BackgroundEvent(
++              event_type: "ReferenceWarmHandoffLost",
++              message: "warm-handoff notification insert failed: " <> reason,
++              level: sentry_client.LevelError,
++              tags: [
++                #("sweep", "reference_checks"),
++                #("reference_call_id", row.id),
++              ],
++            ),
++          )
++          Nil
++        }
++      }
++    }
++    _, _ -> Nil
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Failure path (§4.6, AD-15)
++// ---------------------------------------------------------------------------
++
++/// Mark a row `failed` (outcome NULL, no result) + Sentry capture. Best-effort
++/// on the DB write (a down DB can't be written to); the Sentry capture is the
++/// durable signal. Returns `Failed` regardless (the row could not process).
++fn mark_failed(
++  db: pog.Connection,
++  sentry: sentry_client.Sentry,
++  row_id: String,
++  reason: String,
++) -> RowOutcome {
++  case uuid.from_string(row_id) {
++    Ok(row_uuid) -> {
++      let _ = sql.sweep_mark_failed(db, row_uuid, reason)
++      Nil
++    }
++    Error(_) -> Nil
++  }
++  capture(sentry, row_id, reason, "processing error")
++  Failed
++}
++
++fn capture(
++  sentry: sentry_client.Sentry,
++  row_id: String,
++  detail: String,
++  class: String,
++) -> Nil {
++  sentry_client.capture(
++    sentry,
++    sentry_client.BackgroundEvent(
++      event_type: "ReferenceSweepRowFailed",
++      message: detail,
++      level: sentry_client.LevelError,
++      tags: [
++        #("sweep", "reference_checks"),
++        #("reference_call_id", row_id),
++        #("class", class),
++      ],
++    ),
++  )
++}
++
++// ---------------------------------------------------------------------------
++// Helpers — context, effective contacts, gates, attempt entries
++// ---------------------------------------------------------------------------
++
++/// Build the RefereeContext for the send helpers (rc3-2). `base_url` is the
++/// vacancy's origin domain; `expiry_date` is unknown to the sweep ("").
++fn build_context(
++  row: sql.SweepDueReferenceCallsRow,
++  token: String,
++) -> RefereeContext {
++  messages.RefereeContext(
++    referee_first_name: first_name(row.contact_name),
++    applicant_full_name: row.applicant_first_name
++      <> " "
++      <> row.applicant_last_name,
++    applicant_first_name: row.applicant_first_name,
++    landlord_display_name: row.landlord_display_name,
++    slot: ref_slot_from_string(row.ref_slot),
++    form_token: token,
++    base_url: "https://" <> row.origin_domain,
++    expiry_date: "",
++  )
++}
++
++/// Effective email (corrected ?? snapshot, AD-7).
++fn effective_email(row: sql.SweepDueReferenceCallsRow) -> option.Option(String) {
++  case row.corrected_email {
++    Some(e) -> Some(e)
++    None -> row.contact_email
++  }
++}
++
++/// Effective phone (corrected ?? snapshot, AD-7).
++fn effective_phone(row: sql.SweepDueReferenceCallsRow) -> option.Option(String) {
++  case row.corrected_phone {
++    Some(p) -> Some(p)
++    None -> row.contact_phone
++  }
++}
++
++/// The co-nudge gate (A2): fires only when the form was NEVER opened AND no
++/// draft answers exist. Form-opened or a saved draft means the referee is
++/// already engaging — no point nudging the applicant.
++fn co_nudge_should_fire(row: sql.SweepDueReferenceCallsRow) -> Bool {
++  !form_was_opened(row) && !has_draft_answers(row)
++}
++
++fn form_was_opened(row: sql.SweepDueReferenceCallsRow) -> Bool {
++  row.form_opened_at != ""
++}
++
++/// A draft exists when draft_answers decodes to a non-empty map (a saved
++/// answer). "" / null / corrupt all degrade to empty (questions.decode_draft).
++fn has_draft_answers(row: sql.SweepDueReferenceCallsRow) -> Bool {
++  !dict.is_empty(questions.decode_draft(row.draft_answers))
++}
++
++/// The application-detail URL for the warm-handoff CTA.
++fn application_url(row: sql.SweepDueReferenceCallsRow) -> String {
++  "https://"
++  <> row.origin_domain
++  <> "/vacancies/"
++  <> row.vacancy_id
++  <> "/applications/"
++  <> row.application_id
++}
++
++/// First token of a name (best-effort; the full name is used everywhere it
++/// matters — this is only for the co-nudge's first-name address).
++fn first_name(full: String) -> String {
++  case string.split(full, " ") {
++    [first, ..] -> first
++    _ -> full
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Attempt-log entry builders (the row's `attempts` JSONB shape: {at, channel,
++// outcome, detail}). The sweep stamps `at`; the rc3-2 helpers supply the rest.
++// ---------------------------------------------------------------------------
++
++/// Build the JSON array to append for a step's send outcomes.
++fn outcomes_to_json(outcomes: List(ChannelOutcome), at: String) -> json.Json {
++  json.array(outcomes, fn(o) { outcome_entry(o, at) })
++}
++
++/// Build typed AttemptEntry records for a step's send outcomes (the warm-
++/// handoff render merges these with the row's prior attempts — the real
++/// this-tick outcomes, never a fabricated entry).
++fn outcomes_to_entries(
++  outcomes: List(ChannelOutcome),
++  at: String,
++) -> List(AttemptEntry) {
++  list.map(outcomes, fn(o) {
++    AttemptEntry(
++      at:,
++      channel: messages.channel_name(o.channel),
++      outcome: messages.outcome_name(o.outcome),
++      detail: o.detail,
++    )
++  })
++}
++
++fn outcome_entry(outcome: ChannelOutcome, at: String) -> json.Json {
++  json.object([
++    #("at", json.string(at)),
++    #("channel", json.string(messages.channel_name(outcome.channel))),
++    #("outcome", json.string(messages.outcome_name(outcome.outcome))),
++    #("detail", json.string(outcome.detail)),
++  ])
++}
++
++/// A `skipped` attempt entry (the gate-failed co-nudge), pre-built as JSON.
++fn skipped_entry(at: String, reason: String) -> json.Json {
++  json.object([
++    #("at", json.string(at)),
++    #("channel", json.string("email")),
++    #("outcome", json.string("skipped")),
++    #("detail", json.string(reason)),
++  ])
++}
++
++/// Parse the row's attempts JSONB text into typed entries (for the warm-handoff
++/// render). Malformed -> [].
++fn parse_attempts_entries(text: String) -> List(AttemptEntry) {
++  case text {
++    "" -> []
++    _ ->
++      case json.parse(text, decode.list(attempt_decoder())) {
++        Ok(entries) -> entries
++        Error(_) -> []
++      }
++  }
++}
++
++fn attempt_decoder() -> decode.Decoder(AttemptEntry) {
++  use at <- decode.optional_field("at", "", decode.string)
++  use channel <- decode.optional_field("channel", "", decode.string)
++  use outcome <- decode.optional_field("outcome", "", decode.string)
++  use detail <- decode.optional_field("detail", "", decode.string)
++  decode.success(AttemptEntry(at:, channel:, outcome:, detail:))
++}
++
++fn query_error(err: pog.QueryError) -> String {
++  case err {
++    pog.PostgresqlError(code, name, message) ->
++      "PostgreSQL " <> code <> " (" <> name <> "): " <> message
++    _ -> "query error"
++  }
++}
+diff --git a/server/src/reference_checks/sweep_handler.gleam b/server/src/reference_checks/sweep_handler.gleam
+new file mode 100644
+index 00000000..c28b5af1
+--- /dev/null
++++ b/server/src/reference_checks/sweep_handler.gleam
+@@ -0,0 +1,73 @@
++//// Internal HTTP trigger for the reference-check cadence sweep (RC3.5).
++//// POST /api/v1/internal/reference-checks
++////
++//// Protected by the X-Internal-Secret header (the digest / verification-
++//// reminder precedent). Lets ops fire the sweep on demand instead of waiting
++//// for the 15-min Cloud Scheduler tick — useful after a deploy, a Twilio key
++//// flip-on, or to drain a backlog. The scheduler-driven Cloud Run Job is the
++//// normal path; this route is the manual override. Runs against the live
++//// config (DB + Resend + Twilio + Sentry), so failures escalate to Sentry
++//// the same as a scheduled tick.
++
++import config.{type ServerConfig}
++import gleam/int
++import gleam/json
++import reference_checks/send
++import reference_checks/sweep
++import response_helpers
++import sentry/sentry_client
++import wisp.{type Request, type Response}
++
++/// Handle POST /api/v1/internal/reference-checks. Runs one sweep tick against
++/// the live config and returns the per-step counts as JSON.
++pub fn handle_run_reference_checks(
++  req req: Request,
++  config config: ServerConfig,
++) -> Response {
++  case response_helpers.require_internal_secret(req, config.internal_secret) {
++    Error(resp) -> resp
++    Ok(_) -> {
++      let deps =
++        send.SendDeps(
++          resend_api_key: config.resend_api_key,
++          twilio: config.twilio,
++          // Manual runs don't escalate per-row failures to the production
++          // Sentry (the verification_reminder precedent) — the scheduled
++          // Cloud Run Job (sweep.main/0) owns the live capture path.
++          sentry: sentry_client.Disabled,
++        )
++      let summary =
++        sweep.run(
++          config.db,
++          deps,
++          now_iso: sweep.now_iso(),
++          sentry: sentry_client.Disabled,
++          batch_limit: 1000,
++        )
++      wisp.log_info(
++        "reference-checks manual sweep: due="
++        <> int.to_string(summary.due)
++        <> " invited="
++        <> int.to_string(summary.invited)
++        <> " failed="
++        <> int.to_string(summary.failed),
++      )
++      let body =
++        json.object([
++          #("due", json.int(summary.due)),
++          #("invited", json.int(summary.invited)),
++          #("co_nudged", json.int(summary.co_nudged)),
++          #("co_nudge_skipped", json.int(summary.co_nudge_skipped)),
++          #("reminded_1", json.int(summary.reminded_1)),
++          #("reminded_2", json.int(summary.reminded_2)),
++          #("warm_handoffs", json.int(summary.warm_handoffs)),
++          #("terminal_partial", json.int(summary.terminal_partial)),
++          #("terminal_unreachable", json.int(summary.terminal_unreachable)),
++          #("failed", json.int(summary.failed)),
++          #("stood_down", json.int(summary.stood_down)),
++        ])
++        |> json.to_string
++      wisp.json_response(body, 200)
++    }
++  }
++}
+diff --git a/server/src/router.gleam b/server/src/router.gleam
+index 1bc441d8..29b06cea 100644
+--- a/server/src/router.gleam
++++ b/server/src/router.gleam
+@@ -43,6 +43,7 @@ import payment/payment_handler
+ import payment/webhook_handler
+ import pog
+ import reference_checks/form_handler
++import reference_checks/sweep_handler
+ import reference_checks/trigger
+ import sentry/csp_report_handler
+ import sentry/sentry_client.{type Sentry}
+@@ -859,6 +860,13 @@ pub fn handle_request(ctx: Context, req: Request) -> Response {
+         config: ctx.config,
+       )
+ 
++    // Internal manual-fire for the reference-check cadence sweep (RC3.5).
++    // Shared-secret-gated (the digest / verification-reminder precedent);
++    // the 15-min Cloud Scheduler tick is the normal path, this is the ops
++    // override (drain a backlog, fire after a Twilio key flip-on).
++    http.Post, ["api", "v1", "internal", "reference-checks"] ->
++      sweep_handler.handle_run_reference_checks(req:, config: ctx.config)
++
+     // Webhook routes (no session auth — verified by signature)
+     http.Post, ["api", "v1", "webhooks", "inbound-email"] ->
+       inbound_handler.handle_webhook(req, ctx.config)
+diff --git a/server/test/integration/reference_checks_sweep_integration_test.gleam b/server/test/integration/reference_checks_sweep_integration_test.gleam
+new file mode 100644
+index 00000000..1b161801
+--- /dev/null
++++ b/server/test/integration/reference_checks_sweep_integration_test.gleam
+@@ -0,0 +1,669 @@
++//// Integration tests for the reference-check cadence sweep (RC3.5).
++////
++//// Pins the acceptance criteria against a real Postgres (Docker test DB):
++//// the per-step cadence (T0 invite / T+24 co-nudge / T+48 reminder 1 /
++//// T+96 reminder 2 + warm-handoff / T+144 silent terminal), EXACTLY-ONCE
++//// (the no-duplicate-T0-across-retry hard requirement), terminal-state
++//// respect (objected sticky, taken-over skipped), and partial vs
++//// unreachable from drafts. Sends no-op (empty RESEND key + Disabled
++//// Twilio) — the sweep still transitions, which is what we assert.
++
++import gleam/dynamic/decode
++import gleam/int
++import gleeunit/should
++import integration/helpers
++import integration/test_db
++import notification/sms_client
++import pog
++import reference_checks/send
++import reference_checks/sweep
++import sentry/sentry_client
++import unitest
++import wisp
++
++fn no_key_deps() -> send.SendDeps {
++  send.SendDeps(
++    resend_api_key: "",
++    twilio: sms_client.Disabled,
++    sentry: sentry_client.Disabled,
++  )
++}
++
++fn run_sweep(db: pog.Connection) -> sweep.RunSummary {
++  wisp.configure_logger()
++  sweep.run(
++    db,
++    no_key_deps(),
++    now_iso: "",
++    sentry: sentry_client.Disabled,
++    batch_limit: 100,
++  )
++}
++
++/// Seed a due reference_call row at a chosen cadence position.
++/// `attempt_count` + `status` set the step; `form_opened` and `draft` drive
++/// the co-nudge gate / partial terminal; `taken_over` skips the row.
++fn seed_due_row(
++  db: pog.Connection,
++  attempt_count attempt_count: Int,
++  status status: String,
++  form_opened form_opened: Bool,
++  draft draft: String,
++  taken_over taken_over: Bool,
++) -> String {
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 0)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let assert Ok(returned) =
++    pog.query(
++      "INSERT INTO application (
++         vacancy_id, first_name, last_name, email, phone,
++         employment_status, monthly_income_cents,
++         employer_name, job_title, employment_duration,
++         landlord_ref_name, landlord_ref_email, landlord_ref_phone,
++         never_rented_before, reference_contact_choice
++       )
++       VALUES (
++         $1::uuid, 'Aisling', 'O''Brien', 'applicant@example.com', '+353861234567',
++         'employed', 350000,
++         'Acme Ltd', 'Senior Chef', '3 years',
++         'Colm Byrne', 'colm@example.com', '+353871111111',
++         false, 'attested'
++       )
++       RETURNING id::text",
++    )
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  let assert [application_id, ..] = returned.rows
++  let opened_sql = case form_opened {
++    True -> "now() - interval '3 hours'"
++    False -> "NULL"
++  }
++  let draft_sql = case draft {
++    "" -> "NULL"
++    _ -> "$3::jsonb"
++  }
++  let taken_sql = case taken_over {
++    True -> "now()"
++    False -> "NULL"
++  }
++  // next_attempt_at is in the past (now() - 1h) so the row is due this tick
++  // regardless of which cadence step it's at.
++  let sql = "INSERT INTO reference_call (
++       application_id, ref_slot, status, attempt_count,
++       contact_name, contact_email, contact_phone,
++       form_opened_at, draft_answers, taken_over_at, next_attempt_at
++     )
++     VALUES (
++       $1::uuid, 'landlord_ref', $2::reference_call_status, " <> int.to_string(
++      attempt_count,
++    ) <> ",
++       'Colm Byrne', 'colm@example.com', '+353871111111',
++       " <> opened_sql <> ", " <> draft_sql <> ", " <> taken_sql <> ", now() - interval '1 hour'
++     )
++     RETURNING id::text"
++  let assert Ok(inserted) = case draft {
++    "" ->
++      pog.query(sql)
++      |> pog.parameter(pog.text(application_id))
++      |> pog.parameter(pog.text(status))
++      |> pog.returning(decode.at([0], decode.string))
++      |> pog.execute(db)
++    _ ->
++      pog.query(sql)
++      |> pog.parameter(pog.text(application_id))
++      |> pog.parameter(pog.text(status))
++      |> pog.parameter(pog.text(draft))
++      |> pog.returning(decode.at([0], decode.string))
++      |> pog.execute(db)
++  }
++  let assert [row_id, ..] = inserted.rows
++  row_id
++}
++
++fn row_status(db: pog.Connection, row_id: String) -> String {
++  test_db.query_text(
++    db,
++    "SELECT status::text FROM reference_call WHERE id = '" <> row_id <> "'",
++  )
++  |> result_unwrap
++}
++
++fn row_attempt_count(db: pog.Connection, row_id: String) -> Int {
++  to_int(test_db.query_text(
++    db,
++    "SELECT attempt_count::text FROM reference_call WHERE id = '"
++      <> row_id
++      <> "'",
++  ))
++}
++
++fn row_next_attempt_at_present(db: pog.Connection, row_id: String) -> Bool {
++  to_bool(test_db.query_text(
++    db,
++    "SELECT (next_attempt_at IS NOT NULL)::text FROM reference_call WHERE id = '"
++      <> row_id
++      <> "'",
++  ))
++}
++
++fn row_form_token_present(db: pog.Connection, row_id: String) -> Bool {
++  to_bool(test_db.query_text(
++    db,
++    "SELECT (form_token IS NOT NULL)::text FROM reference_call WHERE id = '"
++      <> row_id
++      <> "'",
++  ))
++}
++
++fn row_outcome(db: pog.Connection, row_id: String) -> String {
++  result_unwrap(test_db.query_text(
++    db,
++    "SELECT COALESCE(outcome::text, '') FROM reference_call WHERE id = '"
++      <> row_id
++      <> "'",
++  ))
++}
++
++fn attempts_length(db: pog.Connection, row_id: String) -> Int {
++  to_int(test_db.query_text(
++    db,
++    "SELECT jsonb_array_length(attempts)::text FROM reference_call WHERE id = '"
++      <> row_id
++      <> "'",
++  ))
++}
++
++fn notification_count(db: pog.Connection, row_id: String) -> Int {
++  to_int(test_db.query_text(
++    db,
++    "SELECT count(*)::text FROM notification WHERE entity_type = 'reference_call' AND entity_id = '"
++      <> row_id
++      <> "'",
++  ))
++}
++
++fn result_verification_present(db: pog.Connection, row_id: String) -> Bool {
++  to_bool(test_db.query_text(
++    db,
++    "SELECT (result->'verification' IS NOT NULL)::text FROM reference_call WHERE id = '"
++      <> row_id
++      <> "'",
++  ))
++}
++
++fn result_confidence(db: pog.Connection, row_id: String) -> String {
++  test_db.query_text(
++    db,
++    "SELECT COALESCE(result->'ai_summary'->>'confidence', '') FROM reference_call WHERE id = '"
++      <> row_id
++      <> "'",
++  )
++  |> result_unwrap
++}
++
++fn result_unwrap(r: Result(String, String)) -> String {
++  let assert Ok(s) = r
++  s
++}
++
++fn to_int(r: Result(String, String)) -> Int {
++  let assert Ok(n) = result_unwrap(r) |> int.parse
++  n
++}
++
++fn to_bool(r: Result(String, String)) -> Bool {
++  result_unwrap(r) == "true"
++}
++
++// ===========================================================================
++// T0 invite (AC2): queued -> contact_initiated, token minted, attempts logged,
++// next_attempt_at advanced.
++// ===========================================================================
++
++pub fn t0_invite_advances_and_mints_token_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 0,
++      status: "queued",
++      form_opened: False,
++      draft: "",
++      taken_over: False,
++    )
++
++  let summary = run_sweep(db)
++
++  summary.invited |> should.equal(1)
++  row_status(db, row_id) |> should.equal("contact_initiated")
++  row_attempt_count(db, row_id) |> should.equal(1)
++  // The T0 invite sends on 2 channels (email + sms); both no-op/skip here,
++  // but both are logged as attempt entries.
++  attempts_length(db, row_id) |> should.equal(2)
++  // The token is minted at T0 (rc3-5 owns the mint).
++  row_form_token_present(db, row_id) |> should.be_true()
++  // next_attempt_at advanced into the future (no longer due).
++  row_next_attempt_at_present(db, row_id) |> should.be_true()
++}
++
++// ===========================================================================
++// EXACTLY-ONCE (AC3) — the hard requirement: a retry / double-fire does NOT
++// re-send T0. After T0 advances next_attempt_at into the future, a second
++// run does not re-select the row.
++// ===========================================================================
++
++pub fn no_duplicate_t0_across_retry_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 0,
++      status: "queued",
++      form_opened: False,
++      draft: "",
++      taken_over: False,
++    )
++
++  let _ = run_sweep(db)
++  // A second run immediately (the retry / double-fire / downtime-recovery case).
++  let second = run_sweep(db)
++
++  // The row was NOT re-selected (next_attempt_at is now future) -> 0 invited.
++  second.invited |> should.equal(0)
++  second.due |> should.equal(0)
++  // attempt_count stayed at 1 (no double-advance); still one invite set.
++  row_attempt_count(db, row_id) |> should.equal(1)
++  attempts_length(db, row_id) |> should.equal(2)
++}
++
++// ===========================================================================
++// Co-nudge gate (AC4): fires ONLY when the form was never opened AND no draft.
++// ===========================================================================
++
++pub fn co_nudge_fires_when_form_unopened_no_draft_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 1,
++      status: "contact_initiated",
++      form_opened: False,
++      draft: "",
++      taken_over: False,
++    )
++
++  let summary = run_sweep(db)
++
++  summary.co_nudged |> should.equal(1)
++  row_attempt_count(db, row_id) |> should.equal(2)
++  // One co-nudge attempt entry (email channel, to the applicant).
++  attempts_length(db, row_id) |> should.equal(1)
++}
++
++pub fn co_nudge_skipped_when_form_already_opened_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 1,
++      status: "contact_initiated",
++      form_opened: True,
++      draft: "",
++      taken_over: False,
++    )
++
++  let summary = run_sweep(db)
++
++  // Gate failed (form opened) -> cadence advances without sending.
++  summary.co_nudge_skipped |> should.equal(1)
++  summary.co_nudged |> should.equal(0)
++  row_attempt_count(db, row_id) |> should.equal(2)
++  // A skipped co-nudge still logs one entry (the warm-handoff render's sake).
++  attempts_length(db, row_id) |> should.equal(1)
++}
++
++pub fn co_nudge_skipped_when_draft_exists_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 1,
++      status: "contact_initiated",
++      form_opened: False,
++      draft: "{\"identity_confirmed\":\"yes\"}",
++      taken_over: False,
++    )
++
++  let summary = run_sweep(db)
++
++  summary.co_nudge_skipped |> should.equal(1)
++  summary.co_nudged |> should.equal(0)
++  row_attempt_count(db, row_id) |> should.equal(2)
++}
++
++// ===========================================================================
++// T+48 reminder 1 + T+96 reminder 2 / warm-handoff (AC2, AC5)
++// ===========================================================================
++
++pub fn reminder_1_advances_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 2,
++      status: "contact_initiated",
++      form_opened: True,
++      draft: "",
++      taken_over: False,
++    )
++
++  let summary = run_sweep(db)
++
++  summary.reminded_1 |> should.equal(1)
++  row_attempt_count(db, row_id) |> should.equal(3)
++  // Reminder 1 = email + sms = 2 entries.
++  attempts_length(db, row_id) |> should.equal(2)
++}
++
++pub fn reminder_2_fires_warm_handoff_notification_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 3,
++      status: "contact_initiated",
++      form_opened: True,
++      draft: "",
++      taken_over: False,
++    )
++
++  let summary = run_sweep(db)
++
++  summary.warm_handoffs |> should.equal(1)
++  row_attempt_count(db, row_id) |> should.equal(4)
++  // The reference_unreachable in-app notification landed (always, regardless
++  // of preference / email key) — §8.3's warm handoff IS the notification.
++  notification_count(db, row_id) |> should.equal(1)
++}
++
++// ===========================================================================
++// T+144 silent terminal (AC5): partial (draft) vs unreachable (no draft).
++// No notification (the warm handoff landed at T+96).
++// ===========================================================================
++
++pub fn terminal_unreachable_no_draft_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 4,
++      status: "contact_initiated",
++      form_opened: True,
++      draft: "",
++      taken_over: False,
++    )
++
++  let summary = run_sweep(db)
++
++  summary.terminal_unreachable |> should.equal(1)
++  row_status(db, row_id) |> should.equal("unreachable")
++  row_outcome(db, row_id) |> should.equal("unreachable")
++  // Silent: no notification at T+144 (§8.3 no-duplicate-terminal).
++  notification_count(db, row_id) |> should.equal(0)
++}
++
++pub fn terminal_partial_with_draft_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 4,
++      status: "contact_initiated",
++      form_opened: True,
++      draft: "{\"identity_confirmed\":\"yes\",\"relationship_to_applicant\":\"landlord\",\"tenancy_confirmed\":\"yes\",\"tenancy_period\":{\"from\":\"2023-01\",\"to\":\"2024-06\"},\"rent_amount\":{\"amount_eur\":\"1500\"},\"rent_payment_record\":\"always_on_time\",\"property_condition\":\"good\",\"notice_given_properly\":\"yes\",\"deposit_returned\":\"in_full\",\"would_rent_again\":\"yes\"}",
++      taken_over: False,
++    )
++
++  let summary = run_sweep(db)
++
++  summary.terminal_partial |> should.equal(1)
++  row_status(db, row_id) |> should.equal("partial")
++  row_outcome(db, row_id) |> should.equal("partial")
++  // The result is structured from the draft (verification present)...
++  result_verification_present(db, row_id) |> should.be_true()
++  // ...and confidence is CAPPED at medium (an abandoned draft is never high).
++  result_confidence(db, row_id) |> should.equal("medium")
++  notification_count(db, row_id) |> should.equal(0)
++}
++
++// ===========================================================================
++// Terminal-state respect (AC6): objected (sticky) + taken-over rows are
++// never selected/re-sent.
++// ===========================================================================
++
++pub fn objected_terminal_not_reswept_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  // An objected row has next_attempt_at NULL (terminal) — but even if a bad
++  // migration left it set, the status guard excludes it. Seed with a past
++  // next_attempt_at to prove the SELECT's status filter is the guard.
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 2,
++      status: "objected",
++      form_opened: False,
++      draft: "",
++      taken_over: False,
++    )
++
++  let summary = run_sweep(db)
++
++  summary.due |> should.equal(0)
++  row_status(db, row_id) |> should.equal("objected")
++  row_attempt_count(db, row_id) |> should.equal(2)
++}
++
++pub fn taken_over_row_skipped_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 2,
++      status: "contact_initiated",
++      form_opened: False,
++      draft: "",
++      taken_over: True,
++    )
++
++  let summary = run_sweep(db)
++
++  summary.due |> should.equal(0)
++  row_attempt_count(db, row_id) |> should.equal(2)
++}
++
++// ===========================================================================
++// Full cadence: a single row walks T0 -> T+24 -> T+48 -> T+96 -> T+144
++// across successive runs (each run advances it one step). Pins the whole
++// engine end-to-end with a no-op send config.
++// ===========================================================================
++
++pub fn full_cadence_walks_to_unreachable_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  let row_id =
++    seed_due_row(
++      db,
++      attempt_count: 0,
++      status: "queued",
++      form_opened: False,
++      draft: "",
++      taken_over: False,
++    )
++
++  // T0
++  let s1 = run_sweep(db)
++  s1.invited |> should.equal(1)
++  row_status(db, row_id) |> should.equal("contact_initiated")
++  // Re-arm next_attempt_at into the past to simulate each cadence step
++  // becoming due (production waits 24h; the test fast-forwards).
++  rearm_due(db, row_id)
++  // T+24 (form never opened -> co-nudge fires)
++  let s2 = run_sweep(db)
++  s2.co_nudged |> should.equal(1)
++  rearm_due(db, row_id)
++  // T+48 reminder 1
++  let s3 = run_sweep(db)
++  s3.reminded_1 |> should.equal(1)
++  rearm_due(db, row_id)
++  // T+96 reminder 2 + warm handoff
++  let s4 = run_sweep(db)
++  s4.warm_handoffs |> should.equal(1)
++  rearm_due(db, row_id)
++  // T+144 silent terminal (no draft -> unreachable)
++  let s5 = run_sweep(db)
++  s5.terminal_unreachable |> should.equal(1)
++  row_status(db, row_id) |> should.equal("unreachable")
++  // Exactly one warm-handoff notification across the whole walk (at T+96),
++  // none at T+144.
++  notification_count(db, row_id) |> should.equal(1)
++}
++
++fn rearm_due(db: pog.Connection, row_id: String) -> Nil {
++  let _ =
++    pog.query(
++      "UPDATE reference_call SET next_attempt_at = now() - interval '1 hour' WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(row_id))
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  Nil
++}
++
++// ===========================================================================
++// W5: cadence offsets pinned with a fake clock. A wrong offset (24h where
++// 48h was intended, etc.) would ship undetected by the step-advance tests
++// above (they only check attempt_count moves). Here each step's horizon is
++// asserted in seconds-from-anchor against the AD-4 table
++// (T0->+24h, T+24->+24h, T+48->+48h, T+96->+48h).
++// ===========================================================================
++
++/// Seed a row at a chosen cadence position with a FIXED next_attempt_at (the
++/// anchor), so the offset to the next horizon is deterministic.
++fn seed_due_row_at(
++  db: pog.Connection,
++  attempt_count attempt_count: Int,
++  status status: String,
++  anchor anchor: String,
++) -> String {
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 0)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let assert Ok(returned) =
++    pog.query(
++      "INSERT INTO application (
++         vacancy_id, first_name, last_name, email, phone,
++         employment_status, monthly_income_cents,
++         employer_name, job_title, employment_duration,
++         landlord_ref_name, landlord_ref_email, landlord_ref_phone,
++         never_rented_before, reference_contact_choice
++       )
++       VALUES (
++         $1::uuid, 'Aisling', 'O''Brien', 'applicant@example.com', '+353861234567',
++         'employed', 350000,
++         'Acme Ltd', 'Senior Chef', '3 years',
++         'Colm Byrne', 'colm@example.com', '+353871111111',
++         false, 'attested'
++       )
++       RETURNING id::text",
++    )
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  let assert [application_id, ..] = returned.rows
++  let assert Ok(inserted) =
++    pog.query("INSERT INTO reference_call (
++         application_id, ref_slot, status, attempt_count,
++         contact_name, contact_email, contact_phone,
++         next_attempt_at
++       )
++       VALUES (
++         $1::uuid, 'landlord_ref', $2::reference_call_status, " <> int.to_string(
++      attempt_count,
++    ) <> ",
++         'Colm Byrne', 'colm@example.com', '+353871111111',
++         NULLIF($3, '')::timestamptz
++       )
++       RETURNING id::text")
++    |> pog.parameter(pog.text(application_id))
++    |> pog.parameter(pog.text(status))
++    |> pog.parameter(pog.text(anchor))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  let assert [row_id, ..] = inserted.rows
++  row_id
++}
++
++/// Seconds between the row's next_attempt_at and the anchor — the offset the
++/// step applied. Asserted in seconds so it's robust to Postgres's text format.
++fn offset_seconds(db: pog.Connection, row_id: String, anchor: String) -> Int {
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT EXTRACT(EPOCH FROM (next_attempt_at - NULLIF($1, '')::timestamptz))::bigint::text FROM reference_call WHERE id = $2::uuid",
++    )
++    |> pog.parameter(pog.text(anchor))
++    |> pog.parameter(pog.text(row_id))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  let assert [secs, ..] = returned.rows
++  let assert Ok(n) = int.parse(secs)
++  n
++}
++
++pub fn cadence_offsets_pinned_with_fake_clock_test() {
++  use <- unitest.tag("integration")
++  let db = helpers.setup()
++  // One row per cadence position, all anchored at the same instant.
++  let anchor = "2026-01-01T00:00:00+00:00"
++  let t0 = seed_due_row_at(db, 0, "queued", anchor)
++  let t24 = seed_due_row_at(db, 1, "contact_initiated", anchor)
++  let t48 = seed_due_row_at(db, 2, "contact_initiated", anchor)
++  let t96 = seed_due_row_at(db, 3, "contact_initiated", anchor)
++
++  // Run with a fixed now one second after the anchor (every row is due).
++  let summary =
++    sweep.run(
++      db,
++      no_key_deps(),
++      now_iso: "2026-01-01T00:00:01+00:00",
++      sentry: sentry_client.Disabled,
++      batch_limit: 100,
++    )
++
++  // All four advanced this tick.
++  summary.invited |> should.equal(1)
++  summary.co_nudged + summary.co_nudge_skipped |> should.equal(1)
++  summary.reminded_1 |> should.equal(1)
++  summary.warm_handoffs |> should.equal(1)
++
++  // AD-4 per-step INCREMENTS (the offset each query applies to the row's
++  // current next_attempt_at), asserted in seconds from the shared anchor:
++  //   T0   step (0->1): +24h   T+24 step (1->2): +24h
++  //   T+48 step (2->3): +48h   T+96 step (3->4): +48h
++  // A wrong increment (24h where 48h was intended at a given step) fails
++  // here — the direct pin a step-advance-only test can't catch.
++  offset_seconds(db, t0, anchor) |> should.equal(24 * 3600)
++  offset_seconds(db, t24, anchor) |> should.equal(24 * 3600)
++  offset_seconds(db, t48, anchor) |> should.equal(48 * 3600)
++  offset_seconds(db, t96, anchor) |> should.equal(48 * 3600)
++}
+diff --git a/server/test/reference_checks/send_test.gleam b/server/test/reference_checks/send_test.gleam
+index 97e789a1..ac44a554 100644
+--- a/server/test/reference_checks/send_test.gleam
++++ b/server/test/reference_checks/send_test.gleam
+@@ -86,23 +86,6 @@ pub fn send_co_nudge_no_key_skips_test() {
+   ))
+ }
+ 
+-pub fn send_warm_handoff_no_key_skips_test() {
+-  send.send_warm_handoff(
+-    no_key_deps(),
+-    to_email: "niamh@example.ie",
+-    landlord_name: "Niamh",
+-    referee_name: "Colm Byrne",
+-    applicant_full_name: "Aisling O'Brien",
+-    attempts: [],
+-    application_url: "https://righttenantry.ie/x",
+-  )
+-  |> should.equal(messages.ChannelOutcome(
+-    messages.Email,
+-    messages.Skipped,
+-    "no RESEND_API_KEY",
+-  ))
+-}
+-
+ // -- AC4: an absent contact skips only its own channel -----------------------
+ 
+ pub fn send_invite_missing_email_skips_email_only_test() {

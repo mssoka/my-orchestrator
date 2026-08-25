@@ -1,0 +1,579 @@
+diff --git a/app/input/mouse.odin b/app/input/mouse.odin
+index f2b811e..9fd3cc1 100644
+--- a/app/input/mouse.odin
++++ b/app/input/mouse.odin
+@@ -31,10 +31,13 @@ mouse_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
+ 	// Game_Over: the only input is retry (a fresh run in a fresh context —
+ 	// no state leakage, ODN-13). R or Enter, exactly like the current code.
+ 	if inp.mode == .Game_Over {
++		// R OR Enter — the old `||`, ONE retry (r2 note: same-frame R+Enter must
++		// not double-restart)
+ 		for ev in events {
+ 			if k, ok := ev.(Key_Press); ok {
+ 				if k.key == .R || k.key == .Enter {
+ 					append(out, Intent(Retry{}))
++					break
+ 				}
+ 			}
+ 		}
+@@ -52,7 +55,9 @@ mouse_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
+ 	// the branches — Perkins B2).
+ 	keys: [4]Key
+ 	keys_n := 0
+-	esc_cancelled := false
++	esc_pressed := false // any ESC key this frame
++	esc_cancelled := false // ESC + placing >= 0 (the cancel branch)
++	esc_deselect := false // ESC + placing < 0 (the deselect branch)
+ 	right_press: rl.Vector2
+ 	has_right := false
+ 	left_press: rl.Vector2
+@@ -62,7 +67,7 @@ mouse_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
+ 	// W5 (Perkins): no per-frame heap churn — the poll emits at most ONE
+ 	// Mouse_Move per frame, so a fixed buffer suffices (the project-context
+ 	// zero-per-frame-heap-churn rule).
+-	moves: [2]rl.Vector2
++	moves: [4]rl.Vector2 // the poll emits <=1 per frame; headroom for scripted frames
+ 	moves_n := 0
+ 
+ 	for ev in events {
+@@ -102,6 +107,9 @@ mouse_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
+ 		case:
+ 		}
+ 	}
++	if has_key(keys[:], .Esc) {
++		esc_pressed = true
++	}
+ 
+ 	// emit the phase-1 key intents (the old pre-mouse block, `||`-coalesced)
+ 	for i in 0 ..< keys_n {
+@@ -114,7 +122,9 @@ mouse_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
+ 			append(out, Intent(Toggle_Assist{}))
+ 		case .Esc:
+ 			if inp.placing >= 0 {
+-				esc_cancelled = true
++			esc_cancelled = true
++			} else {
++				esc_deselect = true
+ 			}
+ 			append(out, Intent(Cancel{}))
+ 		case:
+@@ -127,6 +137,19 @@ mouse_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
+ 	if esc_cancelled {
+ 		placing_eff = -1
+ 	}
++	// B1 (Perkins r2): the old `elif ESC { deselect }` ran BEFORE the press
++	// block — so a same-frame ESC + popover/QoS click saw NO selection (the
++	// hooks returned false, no command fired). The Cancel intent is only
++	// QUEUED (it executes after the mapping), so mirror the deselect into
++	// map-time state NOW: the press branch's on_ui_press reads the ctx.
++	if esc_deselect {
++		inp.sel_pipe = -1
++		inp.sel_node = -1
++	}
++	// B2 (Perkins r2): while placing, every move frame sets drag.active (the
++	// ghost) — an ESC cancel this frame clears it in the executor, so the
++	// mapping must not take the drag branch on the stale ghost.
++	drag_eff := inp.drag.active && !esc_cancelled
+ 	// hoisted press-branch outcomes (the phase-2 gate below mirrors the old
+ 	// early returns, so it needs them after the branch block)
+ 	ui := false
+@@ -162,11 +185,13 @@ mouse_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
+ 		} else {
+ 			append(out, Intent(Right_Click{pos = right_press}))
+ 		}
+-		if has_left {
+-			// the right+left chord re-anchored the latch above; a same-frame
+-			// cancel (the placement Cancel just emitted) would re-latch it — emit
+-			// the Press_Anchor so the press's reset wins (the old chord ran AFTER
+-			// the cancel block — Perkins B2)
++		if has_left && placing_eff >= 0 && !esc_cancelled {
++			// the right+left chord re-anchored the latch above; the placement
++			// Cancel just emitted would re-latch it — emit the Press_Anchor so
++			// the press's reset wins (the old chord ran AFTER the cancel block).
++			// ONLY when a Cancel is actually in the queue: an unconditional
++			// Press_Anchor after Right_Click would undo right_click_select's
++			// was_dragging latch (Perkins r2 warning).
+ 			append(out, Intent(Press_Anchor{}))
+ 		}
+ 	} else if has_left {
+@@ -232,7 +257,7 @@ mouse_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
+ 		}
+ 	} else if has_release || moves_n > 0 {
+ 		// --- the release/drag else-if chain ----------------------------------
+-		if inp.drag.active && placing_eff < 0 {
++		if drag_eff && placing_eff < 0 {
+ 			// the drag branch: every move re-snaps + re-validates the
+ 			// in-progress draw (live preview, READ-ONLY); the release frame
+ 			// re-snaps to the release point, then commits-or-selects.
+diff --git a/app/main.odin b/app/main.odin
+index 752634c..2eba9b7 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -792,7 +792,7 @@ pipe_anchor :: proc(app: ^App, ps: u32) -> rl.Vector2 {
+ 
+ // (set_lane_key + the lane command producers moved into app/input/exec.odin
+ // in story 5.4 — the 1/2 + E/S/B keys now route through the intent layer's
+-// shared executor; the #55 terminology rename (Cmd_Set_Weights ->
++// shared executor; the #55 terminology rename (Cmd_Set_Emphasis ->
+ // Cmd_Set_Weights) is reflected there.)
+ 
+ 
+diff --git a/goldens/input_parity_draw.t1 b/goldens/input_parity_draw.t1
+index 98e5aa2..4336cdb 100644
+--- a/goldens/input_parity_draw.t1
++++ b/goldens/input_parity_draw.t1
+@@ -5,15 +5,15 @@ seed 42
+ logic_hz 20
+ catalog_hash 8f94df8eb817dddb
+ ticks 12
+-1 2c9e8e95434152f0
+-2 4f21ea613b3ebf41
+-3 0907ea096589ffba
+-4 13d25db14068065b
+-5 48fc04b82bf3dbbc
+-6 37ddd7794cf5a52d
+-7 37fb566c338285c6
+-8 1104e4d1aecf5a77
+-9 938f2a9588bd1398
+-10 bc3abada869a7349
+-11 1a8b5207f1cca1a2
+-12 6d04f5cd18e484c3
++1 abe08323106c0ef2
++2 7c99fe1fc4047cf9
++3 a4f185d299c297b8
++4 3020699e2b5beec7
++5 316878edcef2be4e
++6 65337db370377115
++7 61f3493183e156f4
++8 34caba847740c413
++9 9a474adeae656eda
++10 416ae4437d7eaf01
++11 9b91e759947bb380
++12 6e472e162d6437ef
+diff --git a/goldens/input_parity_draw_wide.t1 b/goldens/input_parity_draw_wide.t1
+index 2a9bcd6..47524a1 100644
+--- a/goldens/input_parity_draw_wide.t1
++++ b/goldens/input_parity_draw_wide.t1
+@@ -5,15 +5,15 @@ seed 42
+ logic_hz 20
+ catalog_hash 8f94df8eb817dddb
+ ticks 12
+-1 fedd21eb8c67dc9b
+-2 02d92ab03dcbe076
+-3 c23e429e7b123a25
+-4 26acf023bbaea670
+-5 1b3a980e751a6567
+-6 ee2a034f4f056022
+-7 43386dae258d4591
+-8 cf43cd104e10db6c
+-9 113213b7f5de7e23
+-10 7286e6b088aa2e3e
+-11 7a64137dbfdc808d
+-12 d93d1f5edba38058
++1 ec48606220933a6c
++2 4ad49623c767c2bf
++3 94753bdf64635c52
++4 31fa3e4e4d30b8ed
++5 1fc9978002976468
++6 336e15b7739ab6db
++7 5176ff3e4e821b8e
++8 e49dd087bc9308d9
++9 88a86970e20a14f4
++10 61ac3af45d647a27
++11 dd1c5c133b9efd7a
++12 1e1a441972b67cb5
+diff --git a/harness/main.odin b/harness/main.odin
+index 429872d..a736245 100644
+--- a/harness/main.odin
++++ b/harness/main.odin
+@@ -82,6 +82,11 @@ main :: proc() {
+ 	// construction (FORGE #6 / ODN-12). `save` re-blesses the input_parity
+ 	// manifests (deliberate, PR-reviewed like any golden).
+ 	if verb == "input-parity" {
++		// the only valid arg is the optional `save` — anything else is a usage
++		// error (r2 note: extra args were silently ignored)
++		if len(rest) > 1 || (len(rest) == 1 && rest[0] != "save") {
++			usage()
++		}
+ 		save := len(rest) > 0 && rest[0] == "save"
+ 		cat: pp.Catalogs
+ 		if e := load_catalogs(&cat); e != "" {
+diff --git a/harness/parity.odin b/harness/parity.odin
+index f9e9f17..a55117d 100644
+--- a/harness/parity.odin
++++ b/harness/parity.odin
+@@ -24,7 +24,6 @@ package main
+ // CLI: `harness input-parity [save]`.
+ 
+ import "core:fmt"
+-import "core:os"
+ import rl "vendor:raylib"
+ import pp "../core"
+ import rnd "../app/render"
+@@ -75,6 +74,7 @@ Parity_Run :: struct {
+ 	drag_active: bool,
+ 	mode:       inp.Mode, // the post-run FSM state (the pause scenario)
+ 	last_reject: pp.Edit_Error, // the post-run reject toast (the rejection scenario)
++	press_swallowed: bool, // the post-run swallow latch (the esc_press assert)
+ 	has_pipe0: bool, // a pipe 0 existed at the run end (the lane assert)
+ 	pipe0_weights: [3]i32, // the final pipe-0 weights (the auto-follow wrote them)
+ 	pipe0_auto:    [3]i32, // the ladder's split for pipe 0's final assignments
+@@ -118,6 +118,25 @@ parity_right_click_effect :: proc(user: rawptr, ictx: ^inp.Input, pos: rl.Vector
+ 	inp.right_click_select(ictx, pos)
+ }
+ 
++// parity_ui_press_effect — the app's popover_click demolish-button path, wired
++// into the parity ctx so the B1 pin (same-frame ESC + UI click) exercises the
++// UI-swallow surface: a press on the selected junction's demolish button
++// swallows + fires the demolish through the shared executor.
++parity_ui_press_effect :: proc(user: rawptr, ictx: ^inp.Input, pos: rl.Vector2) -> bool {
++	if ictx.sel_node >= 0 {
++		slot, ok := pp.node_slot(ictx.topo, u32(ictx.sel_node))
++		if ok && ictx.topo.node_kind[slot] == .Junction {
++			anchor := rnd.node_screen(ictx.view, ictx.topo.node_pos[slot])
++			pop := rnd.popover_rect(ictx.view, anchor, rnd.POPOVER_H_NODE)
++			if rl.CheckCollisionPointRec(pos, rnd.demolish_button_rect(pop)) {
++				inp.demolish_node(ictx, u32(ictx.sel_node))
++				return true
++			}
++		}
++	}
++	return false
++}
++
+ // drive_parity — run one device's scripted frames through the intent layer
+ // and step the produced log (the T1 hash stream). Deterministic: seed-42
+ // fixture, minimal run setup (era 0, no growth — the input layer's
+@@ -125,7 +144,8 @@ parity_right_click_effect :: proc(user: rawptr, ictx: ^inp.Input, pos: rl.Vector
+ // `on_right_click` is an optional effect hook (nil except the right-click
+ // scenario, which wires parity_right_click_effect).
+ drive_parity :: proc(cat: ^pp.Catalogs, frames: [dynamic][]inp.Device_Event, tier: u16,
+-	sel_pipe: i64, sel_class: u16, on_right_click: proc(rawptr, ^inp.Input, rl.Vector2) = nil) -> Parity_Run {
++	sel_pipe: i64, sel_class: u16, on_right_click: proc(rawptr, ^inp.Input, rl.Vector2) = nil,
++	on_ui_press: proc(rawptr, ^inp.Input, rl.Vector2) -> bool = nil) -> Parity_Run {
+ 	state: pp.Run_State
+ 	pp.run_init(&state, 42, cat.hash, cat.balance.logic_hz)
+ 	seed_fixture(&state, cat)
+@@ -148,6 +168,7 @@ drive_parity :: proc(cat: ^pp.Catalogs, frames: [dynamic][]inp.Device_Event, tie
+ 	ictx.sel_class = sel_class
+ 	ictx.placing = -1
+ 	ictx.on_right_click = on_right_click
++	ictx.on_ui_press = on_ui_press
+ 
+ 	for f in frames {
+ 		inp.dispatch_frame(&ictx, f)
+@@ -159,13 +180,13 @@ drive_parity :: proc(cat: ^pp.Catalogs, frames: [dynamic][]inp.Device_Event, tie
+ 	for w in u64(1) ..= PARITY_TICKS {
+ 		before := len(state.events)
+ 		sim_tick += 1
+-		batch := make([dynamic]pp.Command, 0, 4, context.temp_allocator)
+-		for cmd in state.action_log {
+-			if cmd.apply_tick == sim_tick {
+-				append(&batch, cmd)
+-			}
+-		}
+-		pp.step(&state, sim_tick, batch[:], cat)
++		// The input layer already applied the commands via the edit fast-path
++		// (topology_apply_edit at input time) — step with an EMPTY batch, exactly
++		// like the live app (main.odin:303). Feeding the log back through
++		// pp.step's batch would DOUBLE-APPLY (validate_draw has no duplicate-pipe
++		// rejection, so the blessed goldens would pin a two-parallel-pipes state
++		// no real path produces — Perkins r2).
++		pp.step(&state, sim_tick, {}, cat)
+ 		append(&hashes, pp.state_hash(&state, state.events[before:], cat, context.temp_allocator))
+ 		clear(&state.events)
+ 		// NOTE: NO per-tick free_all here — the scenario checks append fail strings
+@@ -191,6 +212,7 @@ drive_parity :: proc(cat: ^pp.Catalogs, frames: [dynamic][]inp.Device_Event, tie
+ 		drag_active = ictx.drag.active,
+ 		mode = ictx.mode,
+ 		last_reject = ictx.last_reject,
++		press_swallowed = ictx.press_swallowed,
+ 	}
+ 	if len(state.topology.pipe_weights) > 0 {
+ 		run.has_pipe0 = true
+@@ -228,7 +250,7 @@ cmd_string :: proc(c: pp.Command) -> string {
+ 	case pp.Cmd_Place_Router:
+ 		return fmt.tprintf("Place{%d,(%d,%d)}@%d", k.type_idx, k.pos[0], k.pos[1], c.apply_tick)
+ 	case pp.Cmd_Set_Weights:
+-		return fmt.tprintf("Emphasis{%d,%v}@%d", k.pipe, k.weights, c.apply_tick)
++		return fmt.tprintf("Weights{%d,%v}@%d", k.pipe, k.weights, c.apply_tick)
+ 	case pp.Cmd_Set_Lane:
+ 		return fmt.tprintf("Lane{%d,class%d,lane%d}@%d", k.pipe, k.class, k.lane, c.apply_tick)
+ 	}
+@@ -443,10 +465,12 @@ build_scenarios :: proc(cat: ^pp.Catalogs, view: ^rnd.View) -> [dynamic]Parity_S
+ 		sel_pipe = -1, // no preset selection
+ 		tier = tier_std,
+ 		touch = frames(
+-			evs(inp.Touch_Press{pos = empty01}),
+-			evs(inp.Two_Finger_Pan{dx = 12, dy = -4}),
++			evs(inp.Touch_Press{pos = empty01}), // 0->1 touches
++			evs(inp.Touch_Release{pos = empty01}), // 1->2 (the poll ends the drag)
++			evs(inp.Two_Finger_Pan{dx = 12, dy = -4}), // the pan frames
+ 			evs(inp.Two_Finger_Pan{dx = 8, dy = -2}),
+-			evs(inp.Touch_Release{pos = empty01}),
++			evs(inp.Touch_Press{pos = empty01}), // 2->1 (a fresh press)
++			evs(inp.Touch_Release{pos = empty01}), // 1->0 (the lift)
+ 		),
+ 		expected = expected_of(),
+ 	})
+@@ -472,10 +496,13 @@ build_scenarios :: proc(cat: ^pp.Catalogs, view: ^rnd.View) -> [dynamic]Parity_S
+ 		),
+ 	})
+ 
+-	// 8. demolish — mouse+keys: draw, click-select the pipe, X demolishes it
++	// 8. demolish — mouse+keys: draw, click-select the pipe, X demolishes it.
++	// sel_pipe preset -1 (the click-select must DO the selecting — a zero-value
++	// preset of 0 would make the step vacuous — Perkins r2).
+ 	append(&sc, Parity_Scenario{
+ 		name = "input_parity_demolish",
+ 		tier = tier_std,
++		sel_pipe = -1, // no preset selection — the click-select does it
+ 		mouse = frames(
+ 			evs(inp.Mouse_Press{pos = n0, button = .Left}),
+ 			evs(inp.Mouse_Release{pos = n1, button = .Left}),
+@@ -615,22 +642,79 @@ build_scenarios :: proc(cat: ^pp.Catalogs, view: ^rnd.View) -> [dynamic]Parity_S
+ 		expected = expected_of(),
+ 	})
+ 
+-	// 17. pad_cursor — W10 pin: the pad_step boundaries — first Dpad_Up lands
+-	// on the LAST alive node (2), the wrap from 2 steps back to 0.
++	// 17. pad_cursor_up — W10 pin: the first Dpad_Up lands on the LAST alive
++	// node (2). Split from the wrap scenario so a DROPPED first Up fails this
++	// assert (pad_has stays false / pad_node wrong — Perkins r2 vacuity).
+ 	append(&sc, Parity_Scenario{
+-		name = "input_parity_pad_cursor",
++		name = "input_parity_pad_cursor_up",
+ 		tier = tier_std,
+ 		sel_pipe = -1, // no preset selection
+ 		pad = frames(
+ 			evs(inp.Pad_Button_Press{button = .Dpad_Up}), // first placement -> last (2)
++		),
++		expected = expected_of(),
++	})
++
++	// 18. pad_cursor_wrap — W10 pin: from node 2, Dpad_Down wraps to node 0.
++	append(&sc, Parity_Scenario{
++		name = "input_parity_pad_cursor_wrap",
++		tier = tier_std,
++		sel_pipe = -1, // no preset selection
++		pad = frames(
++			evs(inp.Pad_Button_Press{button = .Dpad_Up}), // -> 2
+ 			evs(inp.Pad_Button_Press{button = .Dpad_Down}), // wrap -> 0
+ 		),
+ 		expected = expected_of(),
+ 	})
+ 
++	// 19. esc_ui — B1 pin (Perkins r2): a same-frame ESC + demolish-button
++	// click. The old ESC-deselect ran BEFORE the press block, so the popover
++	// hook saw NO selection and NO command fired. The fix mirrors the deselect
++	// into map-time state (the wired parity_ui_press_effect would fire the
++	// demolish on a live selection). Assert: no commands (the expected check)
++	// + the selection is cleared — the demolish never ran.
++	btn := demolish_btn_center(view)
++	append(&sc, Parity_Scenario{
++		name = "input_parity_esc_ui",
++		tier = tier_std,
++		sel_pipe = -1, // no preset selection
++		mouse = frames(
++			evs(inp.Mouse_Press{pos = n1, button = .Left}), // select the router
++			evs(inp.Mouse_Release{pos = n1, button = .Left}),
++			evs(inp.Key_Press{key = .Esc}, inp.Mouse_Press{pos = btn, button = .Left}),
++		),
++		expected = expected_of(),
++	})
++
++	// 20. esc_release_place — B2 pin (Perkins r2): a same-frame ESC + left
++	// release while placing. The placement ghost set drag.active on the move
++	// frame; the ESC cancel clears it + latches the swallow in the executor —
++	// the release must be a TOTAL no-op (no drag-branch click-select at the
++	// release point). Assert: no commands + no selection + placement cleared.
++	append(&sc, Parity_Scenario{
++		name = "input_parity_esc_release_place",
++		tier = tier_std,
++		sel_pipe = -1, // no preset selection
++		mouse = frames(
++			evs(inp.Mouse_Press{pos = chip_router, button = .Left}), // arm placement
++			evs(inp.Mouse_Move{pos = place_pos}), // the placement ghost (drag.active)
++			evs(inp.Key_Press{key = .Esc}, inp.Mouse_Release{pos = n1, button = .Left}),
++		),
++		expected = expected_of(),
++	})
++
+ 	return sc
+ }
+ 
++// demolish_btn_center — the demolish button's center for the selected router
++// (the B1 pin's UI-click position).
++demolish_btn_center :: proc(view: ^rnd.View) -> rl.Vector2 {
++	anchor := rnd.node_screen(view, FIXTURE_RT_POS)
++	pop := rnd.popover_rect(view, anchor, rnd.POPOVER_H_NODE)
++	b := rnd.demolish_button_rect(pop)
++	return {b.x + b.width / 2, b.y + b.height / 2}
++}
++
+ // chip_center — the center of tray chip i.
+ chip_center :: proc(view: ^rnd.View, i: int) -> rl.Vector2 {
+ 	r := rnd.tray_chip_rect(view, i)
+@@ -658,6 +742,9 @@ run_input_parity :: proc(cat: ^pp.Catalogs, save: bool) -> i32 {
+ 			for &f in sc.mouse { delete(f) }
+ 			for &f in sc.touch { delete(f) }
+ 			for &f in sc.pad { delete(f) }
++			delete(sc.mouse)
++			delete(sc.touch)
++			delete(sc.pad)
+ 			delete(sc.expected)
+ 		}
+ 		delete(scenarios)
+@@ -669,6 +756,11 @@ run_input_parity :: proc(cat: ^pp.Catalogs, save: bool) -> i32 {
+ 
+ 	for &sc in scenarios {
+ 		devs := scenario_devices(&sc)
++		if len(devs) == 0 {
++			// a scenario with no device scripts would pass vacuously (r2 note)
++			append(&fails, fmt.tprintf("  %s: no device scripts — vacuous scenario", sc.name))
++			continue
++		}
+ 		defer delete(devs)
+ 		runs := make([]Parity_Run, len(devs))
+ 		defer {
+@@ -682,13 +774,17 @@ run_input_parity :: proc(cat: ^pp.Catalogs, save: bool) -> i32 {
+ 			if sc.name == "input_parity_right_click" || sc.name == "input_parity_right_x" {
+ 				hook = parity_right_click_effect
+ 			}
++			ui_hook: proc(rawptr, ^inp.Input, rl.Vector2) -> bool = nil
++			if sc.name == "input_parity_esc_ui" {
++				ui_hook = parity_ui_press_effect
++			}
+ 			switch d {
+ 			case .Mouse:
+-				runs[i] = drive_parity(cat, sc.mouse, sc.tier, sc.sel_pipe, sc.sel_class, hook)
++				runs[i] = drive_parity(cat, sc.mouse, sc.tier, sc.sel_pipe, sc.sel_class, hook, ui_hook)
+ 			case .Touch:
+-				runs[i] = drive_parity(cat, sc.touch, sc.tier, sc.sel_pipe, sc.sel_class, hook)
++				runs[i] = drive_parity(cat, sc.touch, sc.tier, sc.sel_pipe, sc.sel_class, hook, ui_hook)
+ 			case .Pad:
+-				runs[i] = drive_parity(cat, sc.pad, sc.tier, sc.sel_pipe, sc.sel_class, hook)
++				runs[i] = drive_parity(cat, sc.pad, sc.tier, sc.sel_pipe, sc.sel_class, hook, ui_hook)
+ 			}
+ 		}
+ 
+@@ -698,7 +794,7 @@ run_input_parity :: proc(cat: ^pp.Catalogs, save: bool) -> i32 {
+ 		// the lane auto-follow structural assert (the ladder is the source)
+ 		if sc.name == "input_parity_lane" {
+ 			check_lane_emphasis(cat, runs[:], devs[:], &fails)
+-			// the auto-follow wrote a third command (Set_Emphasis with the ladder's
++			// the auto-follow wrote a third command (Cmd_Set_Weights with the ladder's
+ 			// weights for the pipe's final assignments — read from the run, never
+ 			// hand-duplicated) — fold it into the expected stream so the equality
+ 			// check covers it.
+@@ -739,8 +835,8 @@ run_input_parity :: proc(cat: ^pp.Catalogs, save: bool) -> i32 {
+ 
+ // check_states — the per-scenario input-surface assertions (no commands):
+ // select (mouse/touch sel_node == pad pad_node == 1), tier_cycle (both ==
+-// wide), class_cycle (mouse == 0, pad == 1 — key SETS, bumper CYCLES), pan
+-// (nothing changed), cancel (placing == -1).
++// wide), class_cycle (mouse == 1 via the 2 key, pad == 1 via L_Bumper — key
++// SETS, bumper CYCLES), pan (nothing changed), cancel (placing == -1).
+ check_states :: proc(cat: ^pp.Catalogs, sc: ^Parity_Scenario, runs: []Parity_Run, devs: []Parity_Device,
+ 	fails: ^[dynamic]string) {
+ 	// helper: find a device's run
+@@ -804,11 +900,25 @@ check_states :: proc(cat: ^pp.Catalogs, sc: ^Parity_Scenario, runs: []Parity_Run
+ 		if r, ok := find(runs, devs, .Mouse); ok && r.placing != -1 {
+ 			append(fails, fmt.tprintf("  %s mouse: placing %d, want -1 (the ESC cancel stuck)", sc.name, r.placing))
+ 		}
++		if r, ok := find(runs, devs, .Mouse); ok && r.press_swallowed {
++			// deleting Press_Anchor must fail this — the ESC's Cancel re-latches
++			// the swallow, and the press's reset must win (the old press block
++			// ran after the cancel block)
++			append(fails, fmt.tprintf("  %s mouse: press_swallowed %v, want false (the press reset the latch)", sc.name, r.press_swallowed))
++		}
+ 	case "input_parity_reject":
+-		if r, ok := find(runs, devs, .Mouse); ok && r.sel_node != -1 && r.sel_pipe != -1 {
++		// Perkins r2: sel_node/sel_pipe are MUTUALLY EXCLUSIVE by construction
++		// (click_select keeps one) — the old && could never fire. Assert the
++		// selection is still clear (the rejected draw changed nothing) + the
++		// drag-reject path surfaces via the ghost, NOT the toast (last_reject
++		// stays .None — the invalid-draw path never sets it).
++		if r, ok := find(runs, devs, .Mouse); ok && (r.sel_node != -1 || r.sel_pipe != -1) {
+ 			append(fails, fmt.tprintf("  %s mouse: a rejected draw must not change the selection (sel pipe %d, node %d)",
+ 				sc.name, r.sel_pipe, r.sel_node))
+ 		}
++		if r, ok := find(runs, devs, .Mouse); ok && r.last_reject != .None {
++			append(fails, fmt.tprintf("  %s mouse: an invalid DRAW surfaces via the ghost, not the toast (last_reject %v, want .None)", sc.name, r.last_reject))
++		}
+ 	case "input_parity_pad_cancel":
+ 		if r, ok := find(runs, devs, .Pad); ok && r.drag_active {
+ 			append(fails, fmt.tprintf("  %s pad: B must abandon the draw (drag still active)", sc.name))
+@@ -817,9 +927,34 @@ check_states :: proc(cat: ^pp.Catalogs, sc: ^Parity_Scenario, runs: []Parity_Run
+ 		if r, ok := find(runs, devs, .Mouse); ok && r.mode != .Paused {
+ 			append(fails, fmt.tprintf("  %s mouse: P must pause (mode %v, want Paused)", sc.name, r.mode))
+ 		}
+-	case "input_parity_pad_cursor":
++	case "input_parity_pad_cursor_up":
++		if r, ok := find(runs, devs, .Pad); ok && (!r.pad_has || r.pad_node != 2) {
++			append(fails, fmt.tprintf("  %s pad: cursor (has %v, node %d), want node 2 (the first Dpad_Up lands on the LAST alive node)", sc.name, r.pad_has, r.pad_node))
++		}
++	case "input_parity_pad_cursor_wrap":
+ 		if r, ok := find(runs, devs, .Pad); ok && (!r.pad_has || r.pad_node != 0) {
+-			append(fails, fmt.tprintf("  %s pad: cursor (has %v, node %d), want node 0 (Up first -> 2, Down wraps -> 0)", sc.name, r.pad_has, r.pad_node))
++			append(fails, fmt.tprintf("  %s pad: cursor (has %v, node %d), want node 0 (Up -> 2, Down wraps -> 0)", sc.name, r.pad_has, r.pad_node))
++		}
++	case "input_parity_esc_ui":
++		// B1 pin: the same-frame ESC deselected at MAP time (before the wired
++		// UI hook), so the demolish button click saw NO selection — sel cleared,
++		// no command (the expected check asserts the empty log)
++		if r, ok := find(runs, devs, .Mouse); ok && (r.sel_node != -1 || r.sel_pipe != -1) {
++			append(fails, fmt.tprintf("  %s mouse: ESC+UI-click must NOT demolish (sel node %d, pipe %d — the map-time deselect cleared the selection before the hook)", sc.name, r.sel_node, r.sel_pipe))
++		}
++	case "input_parity_esc_release_place":
++		// B2 pin: ESC + non-moved release while placing is a TOTAL no-op — no
++		// drag-branch click-select at the release point (the old cancel cleared
++		// the ghost + latched the swallow first)
++		if r, ok := find(runs, devs, .Mouse); ok && r.placing != -1 {
++			append(fails, fmt.tprintf("  %s mouse: placing %d, want -1 (the ESC cancel stuck)", sc.name, r.placing))
++		}
++		if r, ok := find(runs, devs, .Mouse); ok && (r.sel_node != -1 || r.sel_pipe != -1) {
++			append(fails, fmt.tprintf("  %s mouse: the ESC+release must not click-select (sel node %d, pipe %d)", sc.name, r.sel_node, r.sel_pipe))
++		}
++	case "input_parity_demolish":
++		if r, ok := find(runs, devs, .Mouse); ok && r.sel_pipe != -1 {
++			append(fails, fmt.tprintf("  %s mouse: the demolish must clear the selection (sel_pipe %d, want -1)", sc.name, r.sel_pipe))
+ 		}
+ 	}
+ }
+diff --git a/tools/ci-local.sh b/tools/ci-local.sh
+index bcd133d..ab7ed14 100755
+--- a/tools/ci-local.sh
++++ b/tools/ci-local.sh
+@@ -1,9 +1,9 @@
+ #!/usr/bin/env bash
+ # tools/ci-local.sh — the GH CI gates, run locally for free.
+ #
+-#   tools/ci-local.sh                 # all 8 gates in a linux container (the ubuntu leg)
++#   tools/ci-local.sh                 # all 9 gates in a linux container (the ubuntu leg)
+ #   tools/ci-local.sh --fast          # gates 1-2 only (lint + unit tests — the 10-second loop)
+-#   tools/ci-local.sh --mac           # the same 8 gates natively on macOS
++#   tools/ci-local.sh --mac           # the same 9 gates natively on macOS
+ #   tools/ci-local.sh --native        # alias for --mac
+ #   tools/ci-local.sh --windows-cross # EXPERIMENTAL: compile-only windows cross-build
+ #
+@@ -25,9 +25,9 @@ usage() {
+   cat <<'EOF'
+ tools/ci-local.sh — the GH CI gates, run locally for free.
+ 
+-  tools/ci-local.sh                 # all 8 gates in a linux container (the ubuntu leg)
++  tools/ci-local.sh                 # all 9 gates in a linux container (the ubuntu leg)
+   tools/ci-local.sh --fast          # gates 1-2 only (lint + unit tests — the 10-second loop)
+-  tools/ci-local.sh --mac           # the same 8 gates natively on macOS
++  tools/ci-local.sh --mac           # the same 9 gates natively on macOS
+   tools/ci-local.sh --native        # alias for --mac
+   tools/ci-local.sh --windows-cross # EXPERIMENTAL: compile-only windows cross-build
+                                     # (probes the LOCAL toolchain; use --in-container for the container's)
+@@ -60,6 +60,7 @@ GATES=(
+   "Assist preview cross-check (R2a preview == sim routing)|tools/harness.sh preview-check"
+   "PP_DEBUG overlay builds (compile gate)|odin build app -define:PP_DEBUG=true -out:app-debug.bin && odin build harness -define:PP_DEBUG=true -out:bin/harness-debug"
+   "Stats stream replay-identity (live == replay)|tools/harness.sh stats-check pause && tools/harness.sh stats-check qos_contention"
++  "Input parity (T1 across inputs — mouse == touch == controller)|tools/harness.sh input-parity"
+ )
+ 
+ # run_gates <count> — run the first <count> gates, stop-on-fail, summarize.

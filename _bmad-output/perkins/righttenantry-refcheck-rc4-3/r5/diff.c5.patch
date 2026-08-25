@@ -1,0 +1,2441 @@
+diff --git a/server/test/application/application_detail_handler_test.gleam b/server/test/application/application_detail_handler_test.gleam
+index 59a964fd..bb9f685e 100644
+--- a/server/test/application/application_detail_handler_test.gleam
++++ b/server/test/application/application_detail_handler_test.gleam
+@@ -256,36 +256,67 @@ fn sample_reference_call_row(
+     next_attempt_at: "2026-08-01T09:00:00Z",
+     form_opened_at: "2026-08-01T21:12:00Z",
+     submitted_at: "2026-08-02T09:00:00Z",
++    taken_over_at: "",
++    contact_name: "Maeve O'Brien",
++    contact_email: Some("maeve@example.ie"),
++    contact_phone: Some("+353 87 123 4567"),
++    corrected_name: "",
++    corrected_email: "",
++    corrected_phone: "",
++    correction_cycles: 0,
+     attempts: "[{\"at\":\"2026-08-01T08:00:00Z\",\"channel\":\"email\",\"outcome\":\"delivered\",\"detail\":\"\"}]",
+     result:,
+   )
+ }
+ 
+-/// §8.2 hook matrix — the load-bearing state rules. Terminal rows get no
++/// §8.2 hooks matrix — the load-bearing state rules. Terminal rows get no
+ /// manual-record; objected/unreachable get substitute; failed gets retry;
+-/// everything else is recordable.
++/// everything else is recordable. RC4.3 r1: `can_take_over` covers the §7.7
++/// warm-handoff set (queued / contact_initiated / unreachable).
+ pub fn hooks_compute_matrix_test() {
+-  let check = fn(status: String, record: Bool, substitute: Bool, retry: Bool) {
++  let check = fn(
++    status: String,
++    record: Bool,
++    substitute: Bool,
++    retry: Bool,
++    take_over: Bool,
++  ) {
+     let hooks = application_detail_handler.compute_hooks(status)
+     hooks.can_record_manual |> should.equal(record)
+     hooks.can_substitute_referee |> should.equal(substitute)
+     hooks.can_retry |> should.equal(retry)
++    hooks.can_take_over |> should.equal(take_over)
+   }
+-  check("queued", True, False, False)
+-  check("skipped", True, False, False)
+-  check("contact_initiated", True, False, False)
+-  check("awaiting_correction", True, False, False)
+-  check("form_completed", False, False, False)
+-  check("partial", False, False, False)
+-  check("unreachable", False, True, False)
+-  check("refused", False, False, False)
+-  check("objected", False, True, False)
+-  check("manual_recorded", False, False, False)
+-  check("failed", False, False, True)
++  check("queued", True, False, False, True)
++  check("skipped", True, False, False, False)
++  check("contact_initiated", True, False, False, True)
++  check("awaiting_correction", True, False, False, False)
++  check("form_completed", False, False, False, False)
++  check("partial", False, False, False, False)
++  check("unreachable", False, True, False, True)
++  check("refused", False, False, False, False)
++  check("objected", False, True, False, False)
++  check("manual_recorded", False, False, False, False)
++  check("failed", False, False, True, False)
+   // v2-reserved voice statuses are non-terminal — recordable.
+-  check("scheduled", True, False, False)
+-  check("calling", True, False, False)
+-  check("completed", False, False, False)
++  check("scheduled", True, False, False, False)
++  check("calling", True, False, False, False)
++  check("completed", False, False, False, False)
++}
++
++/// r1 (B3): the per-row take-over refinement — a taken-over row (A7 marker
++/// set) can never be taken over again, whatever its status rule says.
++pub fn take_over_hook_refined_by_taken_over_at_test() {
++  let hooks = application_detail_handler.compute_hooks("contact_initiated")
++  hooks.can_take_over |> should.be_true
++  let taken =
++    application_detail_handler.refine_take_over_hook(
++      hooks,
++      "2026-08-03T08:00:00Z",
++    )
++  taken.can_take_over |> should.be_false
++  let not_taken = application_detail_handler.refine_take_over_hook(hooks, "")
++  not_taken.can_take_over |> should.be_true
+ }
+ 
+ /// Unknown status decodes to Failed — hooks must agree with the wire render
+@@ -445,6 +476,14 @@ pub fn encode_reference_call_malformed_attempts_test() {
+       next_attempt_at: "",
+       form_opened_at: "",
+       submitted_at: "",
++      taken_over_at: "",
++      contact_name: "Maeve O'Brien",
++      contact_email: Some("maeve@example.ie"),
++      contact_phone: None,
++      corrected_name: "",
++      corrected_email: "",
++      corrected_phone: "",
++      correction_cycles: 0,
+       attempts: "{not json",
+       result: "",
+     )
+diff --git a/server/test/integration/reference_checks_actions_integration_test.gleam b/server/test/integration/reference_checks_actions_integration_test.gleam
+new file mode 100644
+index 00000000..169a6e85
+--- /dev/null
++++ b/server/test/integration/reference_checks_actions_integration_test.gleam
+@@ -0,0 +1,2082 @@
++//// Integration tests for the RC4.3 reference row actions (Story RC4.3) —
++//// durable DB-level pins for the story's acceptance criteria:
++////
++//// - Take over manually (A7): guarded on waiting states + unreachable,
++////   writes taken_over_at + clears the cadence clock, the sweep skips the
++////   row, a late completion still transitions (§8.6), audit row written.
++//// - Correct (AD-7/A1, one cycle): awaiting_correction -> queued with the
++////   corrected trio (snapshot immutable), app trio updated,
++////   correction_cycles = 1, next_attempt_at re-armed, audit written; the
++////   awaiting guard IS the one-cycle rule (a second correct 409s).
++//// - Exhaustion (AD-7 — the rc3-7 mechanism goes LIVE here): a delivery
++////   failure / wrong-person on a row that already ran its correction
++////   terminalizes as unreachable + stamps referee_contact_invalid + audits
++////   + notifies.
++//// - Substitute (AD-11 hook semantics): a NEW row for the slot (prior
++////   retained as history), app trio updated, audit carries old + new ids
++////   (AD-16), idempotent on double-submit (the existing successor returns
++////   200, no duplicate audit).
++//// - Per-slot start (?slot= — the RC2.3 pre-declared variant).
++////
++//// Handler-level via `actions_handler.do_*` (the trigger-test pattern);
++//// HTTP-level guard tests (409/404/400) via the handler paths.
++
++import application/form_view
++import gleam/dynamic/decode
++import gleam/http
++import gleam/int
++import gleam/json
++import gleam/list
++import gleam/option.{type Option, None, Some}
++import gleam/string
++import gleeunit/should
++import integration/helpers.{setup, test_server_config}
++import integration/test_db
++import pog
++import reference_checks/actions_handler
++import reference_checks/send
++import reference_checks/sql as rc_sql
++import reference_checks/sweep
++import reference_checks/trigger
++import reference_checks/webhooks
++import router
++import sentry/sentry_client
++import unitest
++import wisp
++import wisp/simulate
++import youid/uuid
++
++import notification/sms_client
++
++// --- seed helpers (mirror the trigger suite) --------------------------------
++
++/// Seeds a landlord + paid vacancy + application with full referee trios and
++/// `reference_contact_choice = 'attested'`. Returns the three ids.
++fn seed_full_app(db: pog.Connection, email: String) -> #(String, String, String) {
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 0)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let assert Ok(returned) =
++    pog.query(
++      "INSERT INTO application (
++         vacancy_id, first_name, last_name, email, phone,
++         employment_status, monthly_income_cents,
++         landlord_ref_name, landlord_ref_email, landlord_ref_phone,
++         character_ref_name, character_ref_email, character_ref_phone,
++         employer_ref_name, employer_ref_email, employer_ref_phone,
++         never_rented_before, reference_contact_choice
++       )
++       VALUES (
++         $1::uuid, 'Aisling', 'Applicant', $2, '+353861234567',
++         'employed', 250000,
++         'Larry Landlord', 'larry@example.com', '+353871111111',
++         'Carla Character', 'carla@example.com', '+353872222222',
++         'Ed Employer', 'ed@example.com', '+353873333333',
++         false, 'attested'
++       )
++       RETURNING id::text",
++    )
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.parameter(pog.text(email))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  let assert [application_id, ..] = returned.rows
++  #(landlord_id, vacancy_id, application_id)
++}
++
++fn uuids(
++  landlord_id: String,
++  vacancy_id: String,
++  application_id: String,
++) -> #(uuid.Uuid, uuid.Uuid, uuid.Uuid) {
++  let assert Ok(l) = uuid.from_string(landlord_id)
++  let assert Ok(v) = uuid.from_string(vacancy_id)
++  let assert Ok(a) = uuid.from_string(application_id)
++  #(l, v, a)
++}
++
++/// Creates the reference rows for the app (the viewed-trigger path).
++fn create_rows(
++  db: pog.Connection,
++  email: String,
++) -> #(String, String, String, String) {
++  let #(landlord_id, vacancy_id, app_id) = seed_full_app(db, email)
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(trigger.Created(count: _)) =
++    trigger.run_create_checks(test_server_config(db), app, landlord, vacancy)
++  // The landlord_ref row's id (the first created row).
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT id::text FROM reference_call
++       WHERE application_id = $1 AND ref_slot = 'landlord_ref' AND owner_label = 'primary'",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  let assert [call_id, ..] = returned.rows
++  #(landlord_id, vacancy_id, app_id, call_id)
++}
++
++/// Directly set a row's status (test setup — moves a row into the state a
++/// transition test needs).
++fn set_status(db: pog.Connection, call_id: String, status: String) -> Nil {
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET status = $2::reference_call_status WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.parameter(pog.text(status))
++    |> pog.execute(db)
++  Nil
++}
++
++fn row_field(
++  db: pog.Connection,
++  call_id: String,
++  field: String,
++) -> Option(String) {
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COALESCE("
++      <> field
++      <> "::text, '') FROM reference_call WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  case returned.rows {
++    [v, ..] -> Some(v)
++    _ -> None
++  }
++}
++
++fn count_audit(db: pog.Connection, event_str: String) -> Int {
++  let assert Ok(returned) =
++    pog.query("SELECT COUNT(*)::int FROM audit_log WHERE event_type = $1")
++    |> pog.parameter(pog.text(event_str))
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  case returned.rows {
++    [n, ..] -> n
++    _ -> -1
++  }
++}
++
++fn audit_details_for(db: pog.Connection, event_str: String) -> List(String) {
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT details::text FROM audit_log WHERE event_type = $1 ORDER BY created_at",
++    )
++    |> pog.parameter(pog.text(event_str))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  returned.rows
++}
++
++/// The app's trio columns for the landlord slot (COALESCE'd to text — the
++/// row decodes as a list of strings).
++fn app_trio(db: pog.Connection, app_id: String) -> List(String) {
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COALESCE(landlord_ref_name,''), COALESCE(landlord_ref_email,''), COALESCE(landlord_ref_phone,'') FROM application WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.list(decode.string))
++    |> pog.execute(db)
++  case returned.rows {
++    [t, ..] -> t
++    _ -> []
++  }
++}
++
++// --- r1 rework helpers ------------------------------------------------------
++
++fn run_sweep(db: pog.Connection) -> sweep.RunSummary {
++  wisp.configure_logger()
++  sweep.run(
++    db,
++    send.SendDeps(
++      resend_api_key: "",
++      twilio: sms_client.Disabled,
++      sentry: sentry_client.Disabled,
++    ),
++    now_iso: "",
++    sentry: sentry_client.Disabled,
++    batch_limit: 100,
++  )
++}
++
++fn notification_count(db: pog.Connection, row_id: String) -> Int {
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COUNT(*)::int FROM notification WHERE entity_type = 'reference_call' AND entity_id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(row_id))
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  case returned.rows {
++    [n, ..] -> n
++    _ -> -1
++  }
++}
++
++fn notification_bodies(db: pog.Connection, row_id: String) -> List(String) {
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT body FROM notification WHERE entity_type = 'reference_call' AND entity_id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(row_id))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  returned.rows
++}
++
++fn test_router_context(db: pog.Connection) -> router.Context {
++  router.Context(
++    config: test_server_config(db),
++    static_directory: "",
++    priv_directory: "",
++    spa_html: "<html>spa shell</html>",
++    bundle_hashes: router.BundleHashes(
++      client_js: option.None,
++      tailwind_css: option.None,
++    ),
++    secret: "",
++    sentry: sentry_client.Disabled,
++  )
++}
++
++// --- Take over (A7) ---------------------------------------------------------
++
++pub fn take_over_queued_row_stops_the_cadence_and_audits_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-a@example.com")
++  let #(landlord, _, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  let resp = actions_handler.do_take_over(config, app, landlord, call)
++
++  resp.status |> should.equal(200)
++  // A7: the marker is set and the cadence clock is cleared (the sweep's
++  // due-SELECT also excludes taken-over rows — belt and braces).
++  row_field(db, call_id, "taken_over_at") |> should.not_equal(Some(""))
++  row_field(db, call_id, "next_attempt_at") |> should.equal(Some(""))
++  row_field(db, call_id, "status") |> should.equal(Some("queued"))
++  count_audit(db, "reference_call_taken_over") |> should.equal(1)
++}
++
++pub fn take_over_works_from_contact_initiated_and_unreachable_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-b@example.com")
++  let #(landlord, _, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // In-flight (invite already sent).
++  set_status(db, call_id, "contact_initiated")
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(200)
++  row_field(db, call_id, "taken_over_at") |> should.not_equal(Some(""))
++
++  // A second take-over of the same row is a guarded no-op (409).
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(409)
++
++  // Unreachable (the §7.7 special case — the marker is not a status change,
++  // so the terminal stays sticky for every other writer).
++  let #(_, _, app2_id, call2_id) = create_rows(db, "rc43-c@example.com")
++  let #(_, _, app2) = uuids(landlord_id, vacancy_id, app2_id)
++  set_status(db, call2_id, "unreachable")
++  let assert Ok(call2) = uuid.from_string(call2_id)
++  actions_handler.do_take_over(config, app2, landlord, call2).status
++  |> should.equal(200)
++  row_field(db, call2_id, "status") |> should.equal(Some("unreachable"))
++  row_field(db, call2_id, "taken_over_at") |> should.not_equal(Some(""))
++}
++
++pub fn take_over_rejects_non_handoff_states_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-d@example.com")
++  let #(landlord, _, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // awaiting_correction is the correction flow's state — not take-over-able.
++  set_status(db, call_id, "awaiting_correction")
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(409)
++
++  // Skipped is the re-enable flow's state.
++  set_status(db, call_id, "skipped")
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(409)
++
++  // A completed row is sticky terminal.
++  set_status(db, call_id, "form_completed")
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(409)
++}
++
++pub fn taken_over_row_can_still_complete_late_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-e@example.com")
++  let #(landlord, _, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  set_status(db, call_id, "contact_initiated")
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(200)
++
++  // §8.6: the form link stays live — a late completion still transitions
++  // (the guarded status update from the in-flight state).
++  let assert Ok(_) =
++    rc_sql.update_reference_call_status(
++      db,
++      call,
++      rc_sql.FormCompleted,
++      "form_completed",
++      "",
++      rc_sql.ContactInitiated,
++    )
++  row_field(db, call_id, "status") |> should.equal(Some("form_completed"))
++}
++
++pub fn taken_over_row_is_excluded_from_the_sweep_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-f@example.com")
++  let #(landlord, _, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(200)
++
++  // A7: the cadence SELECT never returns a taken-over row, even when the
++  // clock is due.
++  let assert Ok(returned) =
++    rc_sql.sweep_due_reference_calls(db, "2099-01-01T00:00:00Z", 50)
++  // The employer row is still queued + due, so exactly ONE row comes back
++  // (the taken-over landlord row is excluded).
++  list.length(returned.rows) |> should.equal(1)
++}
++
++// --- Correct (AD-7/A1) ------------------------------------------------------
++
++pub fn correct_requeues_with_corrected_contact_and_audits_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-g@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "awaiting_correction")
++  // The failing send's evidence (r1 N4 — the clearing assertion must bite).
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET terminal_reason = 'email_bounced' WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++
++  let resp =
++    actions_handler.do_correct(
++      config,
++      app,
++      landlord,
++      vacancy,
++      call,
++      actions_handler.Trio(
++        name: "Larry Byrne",
++        email: "larry.byrne@example.com",
++        phone: "+353871999999",
++      ),
++    )
++
++  resp.status |> should.equal(200)
++  // Re-queued with the cadence clock re-armed (the sweep owns the fresh
++  // invite, AD-14).
++  row_field(db, call_id, "status") |> should.equal(Some("queued"))
++  row_field(db, call_id, "next_attempt_at") |> should.not_equal(Some(""))
++  // The corrected values land in corrected_* — the immutable snapshot is
++  // NEVER overwritten (A1).
++  row_field(db, call_id, "corrected_name") |> should.equal(Some("Larry Byrne"))
++  row_field(db, call_id, "corrected_email")
++  |> should.equal(Some("larry.byrne@example.com"))
++  row_field(db, call_id, "contact_email")
++  |> should.equal(Some("larry@example.com"))
++  // One correction cycle by the guard.
++  row_field(db, call_id, "correction_cycles") |> should.equal(Some("1"))
++  // The failure reason is cleared (resolved).
++  row_field(db, call_id, "terminal_reason") |> should.equal(Some(""))
++  // r1 (B1): the cadence restarts at T0 — attempt_count reset and the old
++  // capability token cleared so the sweep mints a fresh invite link.
++  row_field(db, call_id, "attempt_count") |> should.equal(Some("0"))
++  row_field(db, call_id, "form_token") |> should.equal(Some(""))
++  // A1: the application trio is updated inline.
++  case app_trio(db, app_id) {
++    [name, email, phone] -> {
++      name |> should.equal("Larry Byrne")
++      email |> should.equal("larry.byrne@example.com")
++      phone |> should.equal("+353871999999")
++    }
++    _ -> Nil
++  }
++  count_audit(db, "reference_call_corrected") |> should.equal(1)
++}
++
++pub fn correct_is_guarded_on_awaiting_correction_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-h@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  let trio =
++    actions_handler.Trio(name: "New", email: "new@example.com", phone: "")
++
++  // A queued row is not awaiting correction — 409, no mutation.
++  let resp =
++    actions_handler.do_correct(config, app, landlord, vacancy, call, trio)
++  resp.status |> should.equal(409)
++  row_field(db, call_id, "corrected_email") |> should.equal(Some(""))
++  count_audit(db, "reference_call_corrected") |> should.equal(0)
++
++  // One cycle spent: the second correct on an already-corrected (queued)
++  // row also 409s — the awaiting guard IS the one-cycle rule (AD-7).
++  set_status(db, call_id, "awaiting_correction")
++  actions_handler.do_correct(config, app, landlord, vacancy, call, trio).status
++  |> should.equal(200)
++  actions_handler.do_correct(config, app, landlord, vacancy, call, trio).status
++  |> should.equal(409)
++  row_field(db, call_id, "correction_cycles") |> should.equal(Some("1"))
++}
++
++/// The trio validation + the 404-vs-409 split live in the HTTP handler
++/// (require_json + validate before do_correct), so this test drives
++/// `handle_correct` over wisp/simulate.
++fn correct_http(
++  db: pog.Connection,
++  landlord_id: String,
++  vacancy_id: String,
++  application_id: String,
++  call_id: String,
++  body: json.Json,
++) -> wisp.Response {
++  let req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> vacancy_id
++        <> "/applications/"
++        <> application_id
++        <> "/reference-checks/"
++        <> call_id
++        <> "/correct",
++    )
++    |> simulate.json_body(body)
++  actions_handler.handle_correct(
++    req,
++    test_server_config(db),
++    test_db.test_landlord(landlord_id),
++    vacancy_id,
++    application_id,
++    call_id,
++  )
++}
++
++pub fn correct_validation_and_cross_application_guards_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-i@example.com")
++  let #(_landlord, _, _app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "awaiting_correction")
++
++  // No name — 400 via the handler validation.
++  let no_name =
++    correct_http(
++      db,
++      landlord_id,
++      vacancy_id,
++      app_id,
++      call_id,
++      json.object([
++        #("name", json.string("")),
++        #("email", json.string("x@example.com")),
++        #("phone", json.string("")),
++      ]),
++    )
++  no_name.status |> should.equal(400)
++
++  // No reachable channel — 400.
++  let no_channel =
++    correct_http(
++      db,
++      landlord_id,
++      vacancy_id,
++      app_id,
++      call_id,
++      json.object([
++        #("name", json.string("Larry")),
++        #("email", json.string("")),
++        #("phone", json.string("")),
++      ]),
++    )
++  no_channel.status |> should.equal(400)
++
++  // A call id from ANOTHER application reads as 404 (never a leaked 409).
++  let #(_, _, other_app_id, other_call_id) =
++    create_rows(db, "rc43-j@example.com")
++  let cross =
++    correct_http(
++      db,
++      landlord_id,
++      vacancy_id,
++      other_app_id,
++      other_call_id,
++      json.object([
++        #("name", json.string("Larry")),
++        #("email", json.string("x@example.com")),
++        #("phone", json.string("")),
++      ]),
++    )
++  cross.status |> should.equal(404)
++  // No mutation happened anywhere.
++  count_audit(db, "reference_call_corrected") |> should.equal(0)
++}
++
++// --- Exhaustion (AD-7 — the rc3-7 mechanism goes LIVE) ----------------------
++
++/// The exhaustion terminal via the delivery-failure SQL path: a row that
++/// already ran its correction never returns to awaiting_correction — it
++/// terminalizes as unreachable with the referee_contact_invalid signal.
++pub fn second_failure_exhausts_to_unreachable_with_signal_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-k@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // Cycle 1: awaiting_correction -> corrected (queued).
++  set_status(db, call_id, "awaiting_correction")
++  let assert Ok(returned) =
++    rc_sql.correct_reference_call(
++      db,
++      call,
++      app,
++      "Larry Byrne",
++      "larry.byrne@example.com",
++      "+353871999999",
++    )
++  list.length(returned.rows) |> should.equal(1)
++
++  // Failure 2: the row is queued with correction_cycles = 1 — the exhaustion
++  // terminal fires (this is what the webhook/wrong-person call sites run).
++  let result_json = reference_checks_result_minimal(db, call_id)
++  let assert Ok(returned) =
++    rc_sql.exhaust_reference_call(
++      db,
++      call,
++      "unreachable",
++      "email_bounced",
++      result_json,
++      "",
++    )
++  list.length(returned.rows) |> should.equal(1)
++  row_field(db, call_id, "status") |> should.equal(Some("unreachable"))
++  row_field(db, call_id, "next_attempt_at") |> should.equal(Some(""))
++
++  // rc3-7's signal goes LIVE: stamped on exhaustion (the call site runs the
++  // stamp right after the guarded terminal) — never on the first failure.
++  let assert Ok(stamped) = rc_sql.stamp_referee_contact_invalid(db, call)
++  list.length(stamped.rows) |> should.equal(1)
++  let signals = row_field(db, call_id, "fraud_signals")
++  case signals {
++    Some(raw) ->
++      // Stamped ON TOP of the creation-time signals (jsonb_set) — the key
++      // goes live exactly here, and only here.
++      raw
++      |> string.contains("\"referee_contact_invalid\": true")
++      |> should.be_true
++    None -> should.fail()
++  }
++  // The minimal terminal result carries the attempts log (§4.6).
++  row_field(db, call_id, "result") |> should.not_equal(Some(""))
++}
++
++/// Builds the minimal §4.6 terminal result JSON (outcome + attempts).
++fn reference_checks_result_minimal(
++  db: pog.Connection,
++  call_id: String,
++) -> json.Json {
++  let attempts = case row_field(db, call_id, "attempts") {
++    Some(a) -> a
++    None -> "[]"
++  }
++  json.object([
++    #("schema_version", json.string("refcall-v1")),
++    #("channel", json.string("form")),
++    #("outcome", json.string("unreachable")),
++    #("attempts", json.string(attempts)),
++    #("verification", json.null()),
++  ])
++}
++
++pub fn exhaustion_guard_only_fires_from_live_states_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-l@example.com")
++  let #(_, _, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // A terminal row cannot be exhausted (sticky terminals — 0 rows).
++  set_status(db, call_id, "objected")
++  let assert Ok(returned) =
++    rc_sql.exhaust_reference_call(
++      db,
++      call,
++      "unreachable",
++      "email_bounced",
++      json.null(),
++      "",
++    )
++  list.length(returned.rows) |> should.equal(0)
++  row_field(db, call_id, "status") |> should.equal(Some("objected"))
++}
++
++// --- Substitute (AD-11 hook semantics) --------------------------------------
++
++pub fn substitute_creates_new_row_and_audits_old_and_new_ids_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-m@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "objected")
++
++  let resp =
++    actions_handler.do_substitute(
++      config,
++      app,
++      landlord,
++      vacancy,
++      call,
++      actions_handler.Trio(
++        name: "Niamh Newref",
++        email: "niamh@example.com",
++        phone: "+353870000000",
++      ),
++    )
++
++  resp.status |> should.equal(200)
++  // The NEW row is queued with the new trio as its snapshot + the cadence
++  // clock armed (the sweep owns the invite).
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT id::text, contact_name, COALESCE(contact_email,''), COALESCE(contact_phone,''), status::text, (next_attempt_at IS NOT NULL)::text FROM reference_call
++       WHERE application_id = $1 AND ref_slot = 'landlord_ref' AND owner_label = 'primary'
++       ORDER BY created_at",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.list(decode.string))
++    |> pog.execute(db)
++  // Old row retained as history (still objected) + the new queued row.
++  // Each ROW decodes as a List(String) (decode.list on a row array).
++  case returned.rows {
++    [old_row, new_row] ->
++      case old_row, new_row {
++        [old_id, _, _, _, old_status, _],
++          [new_id, new_name, new_email, _, new_status, new_clock]
++        -> {
++          old_id |> should.equal(call_id)
++          old_status |> should.equal("objected")
++          new_id |> should.not_equal(call_id)
++          new_status |> should.equal("queued")
++          new_name |> should.equal("Niamh Newref")
++          new_email |> should.equal("niamh@example.com")
++          new_clock |> should.equal("true")
++        }
++        _, _ -> Nil
++      }
++    _ -> Nil
++  }
++
++  // A1: the application trio is updated to the new referee.
++  case app_trio(db, app_id) {
++    [name, email, phone] -> {
++      name |> should.equal("Niamh Newref")
++      email |> should.equal("niamh@example.com")
++      phone |> should.equal("+353870000000")
++    }
++    _ -> Nil
++  }
++
++  // AD-16: the audit entry carries old + new ids.
++  let audits = audit_details_for(db, "reference_call_substituted")
++  list.length(audits) |> should.equal(1)
++  let new_id = case returned.rows {
++    [_, new_row] ->
++      case new_row {
++        [nid, ..] -> nid
++        _ -> ""
++      }
++    _ -> ""
++  }
++  let has_both_ids = case audits {
++    [details, ..] ->
++      details |> string.contains("\"old_reference_call_id\": \"" <> call_id)
++      && details
++      |> string.contains("\"new_reference_call_id\": \"" <> new_id)
++    _ -> False
++  }
++  has_both_ids |> should.be_true
++}
++
++pub fn substitute_is_idempotent_and_guarded_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-n@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "unreachable")
++  let trio =
++    actions_handler.Trio(name: "Niamh", email: "n@example.com", phone: "")
++
++  // First substitution inserts; the double-submit on the SAME old row hits
++  // the live-slot conflict and returns the existing successor (200 no-op).
++  actions_handler.do_substitute(config, app, landlord, vacancy, call, trio).status
++  |> should.equal(200)
++  actions_handler.do_substitute(config, app, landlord, vacancy, call, trio).status
++  |> should.equal(200)
++
++  // Still exactly TWO rows (old terminal + one successor) and ONE audit.
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COUNT(*)::int FROM reference_call
++       WHERE application_id = $1 AND ref_slot = 'landlord_ref' AND owner_label = 'primary'",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  case returned.rows {
++    [n, ..] -> n |> should.equal(2)
++    _ -> Nil
++  }
++  count_audit(db, "reference_call_substituted") |> should.equal(1)
++
++  // A NON-substitutable terminal (refused) is rejected — 409, no row.
++  let #(_, _, app2_id, call2_id) = create_rows(db, "rc43-o@example.com")
++  let #(_, _, app2) = uuids(landlord_id, vacancy_id, app2_id)
++  set_status(db, call2_id, "refused")
++  let assert Ok(call2) = uuid.from_string(call2_id)
++  actions_handler.do_substitute(config, app2, landlord, vacancy, call2, trio).status
++  |> should.equal(409)
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COUNT(*)::int FROM reference_call WHERE application_id = $1",
++    )
++    |> pog.parameter(pog.text(app2_id))
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  case returned.rows {
++    [n2, ..] -> n2 |> should.equal(2)
++    _ -> Nil
++  }
++}
++
++// --- Per-slot start (?slot=) ------------------------------------------------
++
++pub fn per_slot_start_creates_only_the_requested_slot_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id) =
++    seed_full_app(db, "rc43-p@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++
++  // The RC2.3 pre-declared variant: start ONLY the employer check.
++  let outcome =
++    trigger.run_create_checks_slot(
++      config,
++      app,
++      landlord,
++      vacancy,
++      Some("employer_ref"),
++    )
++
++  outcome |> should.equal(Ok(trigger.Created(count: 1)))
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COUNT(*)::int FROM reference_call WHERE application_id = $1",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  case returned.rows {
++    [n, ..] -> n |> should.equal(1)
++    _ -> Nil
++  }
++  // The other slot is untouched (no landlord_ref row at all).
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COUNT(*)::int FROM reference_call
++       WHERE application_id = $1 AND ref_slot = 'landlord_ref'",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  case returned.rows {
++    [n2, ..] -> n2 |> should.equal(0)
++    _ -> Nil
++  }
++}
++
++// -- r1 (Perkins) rework pins ------------------------------------------------
++
++/// B1: a corrected row re-enters the cadence at T0 — the sweep re-invites
++/// it with a FRESH token (the invite goes to the corrected contact) instead
++/// of dead-ending in the co-nudge step forever.
++pub fn corrected_row_is_reinvited_by_the_sweep_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-q@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // Simulate a T0 failure: the sweep claimed once (attempt_count 1,
++  // contact_initiated) then the invite bounced -> awaiting_correction.
++  set_status(db, call_id, "contact_initiated")
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET attempt_count = 1, form_token = 'old_token', form_token_expires_at = now() + interval '10 days' WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++  set_status(db, call_id, "awaiting_correction")
++
++  // The correction re-queues at T0: attempt_count reset, old token cleared.
++  let resp =
++    actions_handler.do_correct(
++      config,
++      app,
++      landlord,
++      vacancy,
++      call,
++      actions_handler.Trio(
++        name: "Larry Byrne",
++        email: "larry.byrne@example.com",
++        phone: "+353871999999",
++      ),
++    )
++  resp.status |> should.equal(200)
++  row_field(db, call_id, "attempt_count") |> should.equal(Some("0"))
++  row_field(db, call_id, "form_token") |> should.equal(Some(""))
++  row_field(db, call_id, "status") |> should.equal(Some("queued"))
++
++  // The sweep's next tick runs the T0 claim: contact_initiated, a FRESH
++  // token minted, attempt_count 1 — the corrected contact is re-invited.
++  // (The sibling employer row is also queued + due — it gets its own T0;
++  // the landlord row's re-invite is the pin.)
++  let summary = run_sweep(db)
++  summary.invited |> should.equal(2)
++  row_field(db, call_id, "status") |> should.equal(Some("contact_initiated"))
++  row_field(db, call_id, "attempt_count") |> should.equal(Some("1"))
++  row_field(db, call_id, "form_token")
++  |> should.not_equal(Some(""))
++  row_field(db, call_id, "form_token") |> should.not_equal(Some("old_token"))
++}
++
++/// B1 negative control: the PRE-FIX shape (attempt_count 1 + queued) is the
++/// dead-end — the sweep's co-nudge step can never advance a queued row, so
++/// it stands down every tick (the corrected referee would never be
++/// re-invited). Proves the fix test bites.
++pub fn corrected_row_without_attempt_reset_dead_ends_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let #(_, _, app_id, call_id) = create_rows(db, "rc43-r@example.com")
++  set_status(db, call_id, "queued")
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET attempt_count = 1, next_attempt_at = now() - interval '1 minute' WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++
++  let summary = run_sweep(db)
++  // The dead-end: the queued row re-selects every tick and STANDS DOWN (the
++  // advance requires contact_initiated) — never advanced, never
++  // terminalized, never re-invited. (The sibling employer row's T0 invite
++  // is the invited count.)
++  summary.stood_down |> should.equal(1)
++  summary.invited |> should.equal(1)
++  row_field(db, call_id, "status") |> should.equal(Some("queued"))
++  row_field(db, call_id, "attempt_count") |> should.equal(Some("1"))
++}
++
++/// W3: a STALE failure event (a redelivered bounce of the PRE-correction
++/// send) on a corrected row stands down — no fabricated
++/// referee_contact_invalid, no exhaustion.
++pub fn stale_pre_correction_failure_stands_down_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-s@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // The pre-correction send: delivered entry an hour ago (now()-relative —
++  // r3 N10: an absolute fixture is clock-dependent).
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call
++       SET attempts = jsonb_build_array(jsonb_build_object('at', to_char(now() - interval '1 hour', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 'channel', 'email', 'outcome', 'delivered', 'detail', 'old_send_1')),
++           status = 'awaiting_correction'::reference_call_status
++       WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++  let resp =
++    actions_handler.do_correct(
++      config,
++      app,
++      landlord,
++      vacancy,
++      call,
++      actions_handler.Trio(
++        name: "Larry Byrne",
++        email: "larry.byrne@example.com",
++        phone: "+353871999999",
++      ),
++    )
++  resp.status |> should.equal(200)
++
++  // The provider redelivers the OLD bounce — the row is live again, but the
++  // matched send predates corrected_at: stand down (no stamp, no terminal).
++  webhooks.apply_delivery_failure(
++    db: db,
++    sentry: sentry_client.Disabled,
++    source: "resend",
++    event_id: "evt-stale",
++    send_ref: "old_send_1",
++    contact_email: "larry@example.com",
++    contact_phone: "",
++    terminal_reason: "email_bounced",
++  )
++  row_field(db, call_id, "status") |> should.equal(Some("queued"))
++  // The exhaustion KEY is NOT stamped (the creation-time signals stay).
++  let signals = row_field(db, call_id, "fraud_signals")
++  case signals {
++    Some(raw) ->
++      raw |> string.contains("referee_contact_invalid") |> should.be_false
++    None -> should.fail()
++  }
++  count_audit(db, "reference_call_correction_exhausted") |> should.equal(0)
++}
++
++/// W3 + W12: a GENUINE post-correction failure exhausts through the LIVE
++/// delivery-failure branch — unreachable + referee_contact_invalid + audit +
++/// in-app notification naming the CORRECTED referee (W2).
++pub fn genuine_post_correction_failure_exhausts_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-t@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // Cycle 1: bounce (pre-correction send), correction (name changed).
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call
++       SET attempts = '[{\"at\":\"2026-08-01T08:00:00Z\",\"channel\":\"email\",\"outcome\":\"delivered\",\"detail\":\"old_send_1\"}]'::jsonb,
++           status = 'awaiting_correction'::reference_call_status
++       WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++  actions_handler.do_correct(
++    config,
++    app,
++    landlord,
++    vacancy,
++    call,
++    actions_handler.Trio(
++      name: "Larry Byrne",
++      email: "larry.byrne@example.com",
++      phone: "+353871999999",
++    ),
++  ).status
++  |> should.equal(200)
++
++  // The fresh invite lands (a post-correction delivered entry — its `at`
++  // is now()-relative so it is genuinely AFTER corrected_at).
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call
++       SET attempts = attempts || jsonb_build_array(
++             jsonb_build_object('at', to_char(now() + interval '30 seconds', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 'channel', 'email', 'outcome', 'delivered', 'detail', 'new_send_1'),
++             jsonb_build_object('at', to_char(now() + interval '30 seconds', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 'channel', 'sms', 'outcome', 'delivered', 'detail', 'sms_send_1')
++           ),
++           status = 'contact_initiated'::reference_call_status
++       WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++
++  // …and its bounce exhausts: unreachable + stamp + audit + notification.
++  webhooks.apply_delivery_failure(
++    db: db,
++    sentry: sentry_client.Disabled,
++    source: "resend",
++    event_id: "evt-new",
++    send_ref: "new_send_1",
++    contact_email: "larry.byrne@example.com",
++    contact_phone: "",
++    terminal_reason: "email_bounced",
++  )
++  row_field(db, call_id, "status") |> should.equal(Some("unreachable"))
++  let signals = row_field(db, call_id, "fraud_signals")
++  case signals {
++    Some(raw) ->
++      raw
++      |> string.contains("\"referee_contact_invalid\": true")
++      |> should.be_true
++    None -> should.fail()
++  }
++  count_audit(db, "reference_call_correction_exhausted") |> should.equal(1)
++  // W2: the notification names the CORRECTED referee, not the stale snapshot.
++  notification_count(db, call_id) |> should.equal(1)
++  notification_bodies(db, call_id)
++  |> list.any(fn(body) { string.contains(body, "Larry Byrne") })
++  |> should.be_true
++}
++
++/// W12: the wrong-person route exhausts a corrected row end-to-end (the
++/// second failure via the SSR form, not the webhook).
++pub fn wrong_person_route_exhausts_corrected_row_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-u@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // Cycle 1: wrong person -> awaiting_correction -> corrected.
++  set_status(db, call_id, "contact_initiated")
++  let assert Ok(_) =
++    rc_sql.update_reference_call_status(
++      db,
++      call,
++      rc_sql.AwaitingCorrection,
++      "",
++      "contact_invalid",
++      rc_sql.ContactInitiated,
++    )
++  actions_handler.do_correct(
++    config,
++    app,
++    landlord,
++    vacancy,
++    call,
++    actions_handler.Trio(
++      name: "Larry Byrne",
++      email: "larry.byrne@example.com",
++      phone: "+353871999999",
++    ),
++  ).status
++  |> should.equal(200)
++
++  // The fresh invite lands (the sweep would mint the token — mint one here
++  // so the SSR route has a link), then the wrong-person response arrives.
++  set_status(db, call_id, "contact_initiated")
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET form_token = 'wp-test-token', form_token_expires_at = now() + interval '10 days' WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++  let form_token = "wp-test-token"
++  let loaded = form_view.current_unix_ms() - 10_000
++  let req =
++    simulate.request(http.Post, "/reference/" <> form_token <> "/wrong-person")
++    |> simulate.form_body([
++      #("_focus_seconds", "240"),
++      #("_website", ""),
++      #("_form_loaded_at", int.to_string(loaded)),
++    ])
++  let response = router.handle_request(test_router_context(db), req)
++  response.status |> should.equal(200)
++  row_field(db, call_id, "status") |> should.equal(Some("unreachable"))
++  count_audit(db, "reference_call_correction_exhausted") |> should.equal(1)
++  // r2 (N11): the in-app notification lands (naming the corrected referee).
++  notification_count(db, call_id) |> should.equal(1)
++}
++
++/// N13: an invalid ?slot= on the start endpoint is a branded 400.
++pub fn start_with_invalid_slot_returns_400_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id) =
++    seed_full_app(db, "rc43-v@example.com")
++  let req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> vacancy_id
++        <> "/applications/"
++        <> app_id
++        <> "/reference-checks/start?slot=fake_slot",
++    )
++  let resp =
++    trigger.handle_start(
++      req,
++      config,
++      test_db.test_landlord(landlord_id),
++      vacancy_id,
++      app_id,
++    )
++  resp.status |> should.equal(400)
++}
++
++/// N3: take-over + substitute over HTTP (happy paths) — the full handler
++/// chain incl. the ownership prechecks.
++pub fn take_over_and_substitute_http_happy_paths_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-w@example.com")
++  let landlord = test_db.test_landlord(landlord_id)
++  let #(l_uuid, v_uuid, a_uuid) = uuids(landlord_id, vacancy_id, app_id)
++
++  // The precheck itself must pass (r1 W10 — the app↔vacancy binding).
++  let assert Ok(verified) =
++    rc_sql.verify_application_in_vacancy(db, a_uuid, v_uuid, l_uuid)
++  case verified.rows {
++    [row, ..] -> row.match_count |> should.equal(1)
++    _ -> should.fail()
++  }
++
++  let take_over_req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> vacancy_id
++        <> "/applications/"
++        <> app_id
++        <> "/reference-checks/"
++        <> call_id
++        <> "/take-over",
++    )
++  actions_handler.handle_take_over(
++    take_over_req,
++    config,
++    landlord,
++    vacancy_id,
++    app_id,
++    call_id,
++  ).status
++  |> should.equal(200)
++  row_field(db, call_id, "taken_over_at") |> should.not_equal(Some(""))
++
++  // Substitute a different row through the handler — app2 lives in its OWN
++  // vacancy AND its own landlord (the prechecks bind all three).
++  let #(app2_landlord_id, app2_vacancy_id, app2_id, call2_id) =
++    create_rows(db, "rc43-x@example.com")
++  set_status(db, call2_id, "objected")
++  let substitute_req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> app2_vacancy_id
++        <> "/applications/"
++        <> app2_id
++        <> "/reference-checks/"
++        <> call2_id
++        <> "/substitute",
++    )
++    |> simulate.json_body(
++      json.object([
++        #("name", json.string("Niamh Newref")),
++        #("email", json.string("niamh@example.com")),
++        #("phone", json.string("")),
++      ]),
++    )
++  actions_handler.handle_substitute(
++    substitute_req,
++    config,
++    test_db.test_landlord(app2_landlord_id),
++    app2_vacancy_id,
++    app2_id,
++    call2_id,
++  ).status
++  |> should.equal(200)
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COUNT(*)::int FROM reference_call WHERE application_id = $1",
++    )
++    |> pog.parameter(pog.text(app2_id))
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  case returned.rows {
++    [n, ..] -> n |> should.equal(3)
++    _ -> Nil
++  }
++}
++
++/// W10: a same-owner CROSS-VACANCY application id in the path is a 404 —
++/// the trio update can never silently 0-row against a different vacancy.
++pub fn cross_vacancy_application_id_is_not_found_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-y@example.com")
++  let #(_, _, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "awaiting_correction")
++
++  // A SECOND vacancy owned by the same landlord — the app belongs to the
++  // first vacancy only.
++  let assert Ok(other_vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++
++  let req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> other_vacancy_id
++        <> "/applications/"
++        <> app_id
++        <> "/reference-checks/"
++        <> call_id
++        <> "/correct",
++    )
++    |> simulate.json_body(
++      json.object([
++        #("name", json.string("Larry")),
++        #("email", json.string("larry@example.com")),
++        #("phone", json.string("")),
++      ]),
++    )
++  let resp =
++    actions_handler.handle_correct(
++      req,
++      config,
++      test_db.test_landlord(landlord_id),
++      other_vacancy_id,
++      app_id,
++      call_id,
++    )
++  resp.status |> should.equal(404)
++  // No mutation, no audit.
++  row_field(db, call_id, "status") |> should.equal(Some("awaiting_correction"))
++  count_audit(db, "reference_call_corrected") |> should.equal(0)
++}
++
++/// W6 (r1): "Start this check now" on an application whose rows already
++/// exist re-arms the queued rows (the sweep picks them up on the next tick)
++/// — the start endpoint is never a silent no-op.
++pub fn start_reams_existing_queued_rows_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, _call_id) =
++    create_rows(db, "rc43-z@example.com")
++  // Age the cadence clocks into the past — the observable of the re-arm.
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET next_attempt_at = now() - interval '3 days' WHERE application_id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.execute(db)
++
++  let req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> vacancy_id
++        <> "/applications/"
++        <> app_id
++        <> "/reference-checks/start",
++    )
++  let resp =
++    trigger.handle_start(
++      req,
++      config,
++      test_db.test_landlord(landlord_id),
++      vacancy_id,
++      app_id,
++    )
++  resp.status |> should.equal(200)
++
++  // Both queued rows re-armed to due-now (no longer the 3-day-old clock).
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COUNT(*)::int FROM reference_call WHERE application_id = $1 AND next_attempt_at > now() - interval '1 minute'",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.at([0], decode.int))
++    |> pog.execute(db)
++  case returned.rows {
++    [n, ..] -> n |> should.equal(2)
++    _ -> Nil
++  }
++}
++
++// -- r2 (Perkins) rework pins ------------------------------------------------
++
++/// BLOCKER (r2): a delivery failure on a TAKEN-OVER row stands down — the
++/// landlord is handling it (A7); the row must never re-enter the correction
++/// loop (or exhaust with a fabricated referee_contact_invalid), and the §8.6
++/// late completion stays live.
++pub fn taken_over_row_bounce_stands_down_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-aa@example.com")
++  let #(landlord, _, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call
++       SET attempts = '[{\"at\":\"2026-08-01T08:00:00Z\",\"channel\":\"email\",\"outcome\":\"delivered\",\"detail\":\"send_1\"}]'::jsonb
++       WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++
++  // Take over (A7) — the sweep stops, the landlord handles it.
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(200)
++
++  // A redelivered bounce of the pre-take-over send: the find excludes
++  // taken-over rows — nothing happens (no awaiting, no audit, no stamp).
++  webhooks.apply_delivery_failure(
++    db: db,
++    sentry: sentry_client.Disabled,
++    source: "resend",
++    event_id: "evt-taken",
++    send_ref: "send_1",
++    contact_email: "larry@example.com",
++    contact_phone: "",
++    terminal_reason: "email_bounced",
++  )
++  row_field(db, call_id, "status") |> should.equal(Some("queued"))
++  row_field(db, call_id, "taken_over_at") |> should.not_equal(Some(""))
++  count_audit(db, "reference_call_correction_requested") |> should.equal(0)
++  count_audit(db, "reference_call_correction_exhausted") |> should.equal(0)
++  let signals = row_field(db, call_id, "fraud_signals")
++  case signals {
++    Some(raw) ->
++      raw |> string.contains("referee_contact_invalid") |> should.be_false
++    None -> should.fail()
++  }
++
++  // §8.6: a late completion still transitions (the take-over never broke it).
++  let assert Ok(_) =
++    rc_sql.update_reference_call_status(
++      db,
++      call,
++      rc_sql.FormCompleted,
++      "form_completed",
++      "",
++      rc_sql.Queued,
++    )
++  row_field(db, call_id, "status") |> should.equal(Some("form_completed"))
++
++  // The WRONG-PERSON leg of the blocker: a taken-over row's wrong-person
++  // response stands down too (never re-enters the correction loop).
++  let #(_, _, app2_id, call2_id) = create_rows(db, "rc43-zz@example.com")
++  let #(_, _, app2) = uuids(landlord_id, vacancy_id, app2_id)
++  let assert Ok(call2) = uuid.from_string(call2_id)
++  set_status(db, call2_id, "contact_initiated")
++  actions_handler.do_take_over(config, app2, landlord, call2).status
++  |> should.equal(200)
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET form_token = 'wp-taken-token', form_token_expires_at = now() + interval '10 days' WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call2_id))
++    |> pog.execute(db)
++  let loaded = form_view.current_unix_ms() - 10_000
++  let wp_req =
++    simulate.request(http.Post, "/reference/wp-taken-token/wrong-person")
++    |> simulate.form_body([
++      #("_focus_seconds", "240"),
++      #("_website", ""),
++      #("_form_loaded_at", int.to_string(loaded)),
++    ])
++  let wp_resp = router.handle_request(test_router_context(db), wp_req)
++  // 303: redirected to the token's truthful state — no transition.
++  wp_resp.status |> should.equal(303)
++  row_field(db, call2_id, "status") |> should.equal(Some("contact_initiated"))
++  count_audit(db, "reference_call_wrong_person") |> should.equal(0)
++}
++
++/// W1 (r2, 7-lens): the SAME-DAY stale-bounce gate — a redelivered
++/// pre-correction bounce whose send happened an hour before the correction
++/// on the SAME DAY stands down (the r1 string-format mix made every same-day
++/// send compare as post-correction: 'T' > ' ').
++pub fn same_day_stale_bounce_stands_down_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-bb@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // The pre-correction send an hour ago (RFC3339 — the sweep's format)…
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call
++       SET attempts = jsonb_build_array(jsonb_build_object('at', to_char(now() - interval '1 hour', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 'channel', 'email', 'outcome', 'delivered', 'detail', 'old_same_day')),
++           status = 'awaiting_correction'::reference_call_status
++       WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++  // …then the correction (corrected_at = now() — SAME DAY).
++  actions_handler.do_correct(
++    config,
++    app,
++    landlord,
++    vacancy,
++    call,
++    actions_handler.Trio(
++      name: "Larry Byrne",
++      email: "larry.byrne@example.com",
++      phone: "+353871999999",
++    ),
++  ).status
++  |> should.equal(200)
++
++  // The redelivered bounce of the OLD same-day send stands down — the
++  // typed timestamptz compare (r2) classifies it correctly.
++  webhooks.apply_delivery_failure(
++    db: db,
++    sentry: sentry_client.Disabled,
++    source: "resend",
++    event_id: "evt-same-day",
++    send_ref: "old_same_day",
++    contact_email: "larry@example.com",
++    contact_phone: "",
++    terminal_reason: "email_bounced",
++  )
++  row_field(db, call_id, "status") |> should.equal(Some("queued"))
++  count_audit(db, "reference_call_correction_exhausted") |> should.equal(0)
++  let signals = row_field(db, call_id, "fraud_signals")
++  case signals {
++    Some(raw) ->
++      raw |> string.contains("referee_contact_invalid") |> should.be_false
++    None -> should.fail()
++  }
++}
++
++/// W2 (r2): the correction clears the previous referee's session state — the
++/// wrong person's draft answers never rehydrate into the fresh invite.
++pub fn correction_clears_previous_session_state_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-cc@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "awaiting_correction")
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call
++       SET form_opened_at = now() - interval '1 day',
++           draft_answers = '{\"q1\":\"answered\"}'::jsonb
++       WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++
++  actions_handler.do_correct(
++    config,
++    app,
++    landlord,
++    vacancy,
++    call,
++    actions_handler.Trio(
++      name: "Larry Byrne",
++      email: "larry.byrne@example.com",
++      phone: "+353871999999",
++    ),
++  ).status
++  |> should.equal(200)
++  row_field(db, call_id, "form_opened_at") |> should.equal(Some(""))
++  row_field(db, call_id, "draft_answers") |> should.equal(Some(""))
++}
++
++/// W5 (r2): substituting the terminal referee's OWN effective trio is
++/// rejected — §8.2 is "ask the applicant for ANOTHER referee".
++pub fn substitute_rejects_identical_trio_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-dd@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "objected")
++
++  // Larry Landlord is the row's own snapshot — an unchanged save is a 400.
++  let resp =
++    actions_handler.do_substitute(
++      config,
++      app,
++      landlord,
++      vacancy,
++      call,
++      actions_handler.Trio(
++        name: "Larry Landlord",
++        email: "larry@example.com",
++        phone: "+353871111111",
++      ),
++    )
++  resp.status |> should.equal(400)
++  count_audit(db, "reference_call_substituted") |> should.equal(0)
++}
++
++/// W7 (r2): re-substituting the HISTORY row with DIFFERENT details after a
++/// prior substitution is a 409 — the typed referee is never silently
++/// dropped by the idempotent no-op.
++pub fn substitute_history_row_with_different_trio_is_conflict_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-ee@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "objected")
++
++  // First substitution (Niamh) — inserts.
++  actions_handler.do_substitute(
++    config,
++    app,
++    landlord,
++    vacancy,
++    call,
++    actions_handler.Trio(
++      name: "Niamh Newref",
++      email: "n@example.com",
++      phone: "",
++    ),
++  ).status
++  |> should.equal(200)
++
++  // Re-submitting the OLD (history) row with DIFFERENT details: 409 — the
++  // landlord is told the referee was already replaced, never silently
++  // dropped.
++  let resp =
++    actions_handler.do_substitute(
++      config,
++      app,
++      landlord,
++      vacancy,
++      call,
++      actions_handler.Trio(
++        name: "Oscar Other",
++        email: "o@example.com",
++        phone: "",
++      ),
++    )
++  resp.status |> should.equal(409)
++  count_audit(db, "reference_call_substituted") |> should.equal(1)
++}
++
++/// N9 (r2): the substituted row gets the creation-time fraud screening —
++/// the successor's fraud_signals are never empty after a substitution.
++pub fn substitute_stamps_creation_fraud_on_successor_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-ff@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "unreachable")
++
++  actions_handler.do_substitute(
++    config,
++    app,
++    landlord,
++    vacancy,
++    call,
++    actions_handler.Trio(
++      name: "Niamh Newref",
++      email: "n@example.com",
++      phone: "",
++    ),
++  ).status
++  |> should.equal(200)
++
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COALESCE(fraud_signals::text, '') FROM reference_call
++       WHERE application_id = $1 AND ref_slot = 'landlord_ref' AND owner_label = 'primary'
++         AND status = 'queued'",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  case returned.rows {
++    [signals, ..] ->
++      signals
++      |> string.contains("contact_reused_within_application")
++      |> should.be_true
++    _ -> should.fail()
++  }
++}
++
++/// N10 (r2): authz negatives for the row actions — a NON-OWNING landlord is
++/// a 404 and an ARCHIVED vacancy is a 422 (take-over/correct/substitute).
++pub fn row_actions_authz_negatives_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-gg@example.com")
++  // A DIFFERENT landlord (no ownership).
++  let assert Ok(outsider_id) = test_db.seed_landlord(db, 1)
++
++  let req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> vacancy_id
++        <> "/applications/"
++        <> app_id
++        <> "/reference-checks/"
++        <> call_id
++        <> "/take-over",
++    )
++  actions_handler.handle_take_over(
++    req,
++    config,
++    test_db.test_landlord(outsider_id),
++    vacancy_id,
++    app_id,
++    call_id,
++  ).status
++  |> should.equal(404)
++
++  // Archived vacancy: 422 — the app's OWN vacancy archived (the binding
++  // precheck must pass first for the archived check to be the answer).
++  let assert Ok(_) =
++    pog.query("UPDATE vacancy SET archived_at = now() WHERE id = $1::uuid")
++    |> pog.parameter(pog.text(vacancy_id))
++    |> pog.execute(db)
++  let archived_req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> vacancy_id
++        <> "/applications/"
++        <> app_id
++        <> "/reference-checks/"
++        <> call_id
++        <> "/take-over",
++    )
++  actions_handler.handle_take_over(
++    archived_req,
++    config,
++    test_db.test_landlord(landlord_id),
++    vacancy_id,
++    app_id,
++    call_id,
++  ).status
++  |> should.equal(422)
++}
++
++// -- r3 (Perkins) rework pins ------------------------------------------------
++
++/// BLOCKER (r3/r4, TOCTOU): a take-over landing between the wrong-person
++/// token read and the awaiting UPDATE must not yank a landlord-handled row
++/// into the correction loop. Two pins — the POST ROUTE end-to-end (a
++/// taken-over row's wrong-person response leaves it untouched; the read-time
++/// check is what the route exercises) and the SQL backstop directly (the
++/// mechanism — removing the taken_over_at guard turns this red).
++pub fn wrong_person_taken_over_race_stands_down_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, _, app_id, call_id) =
++    create_rows(db, "rc43-hh@example.com")
++  let #(landlord, _, app) =
++    uuids(landlord_id, "00000000-0000-0000-0000-000000000000", app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "contact_initiated")
++
++  // Take-over lands between the wrong-person read and the UPDATE.
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(200)
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET form_token = 'wp-race-token', form_token_expires_at = now() + interval '10 days' WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++
++  // The wrong-person POST route on the taken-over row: 303 + no transition.
++  let loaded = form_view.current_unix_ms() - 10_000
++  let wp_req =
++    simulate.request(http.Post, "/reference/wp-race-token/wrong-person")
++    |> simulate.form_body([
++      #("_focus_seconds", "240"),
++      #("_website", ""),
++      #("_form_loaded_at", int.to_string(loaded)),
++    ])
++  let wp_resp = router.handle_request(test_router_context(db), wp_req)
++  wp_resp.status |> should.equal(303)
++  row_field(db, call_id, "status") |> should.equal(Some("contact_initiated"))
++  row_field(db, call_id, "taken_over_at") |> should.not_equal(Some(""))
++  count_audit(db, "reference_call_wrong_person") |> should.equal(0)
++
++  // The SQL backstop (the mechanism behind the read-time check): 0 rows on
++  // the taken-over row.
++  let assert Ok(returned) =
++    rc_sql.mark_awaiting_correction_wrong_person(db, call)
++  list.length(returned.rows) |> should.equal(0)
++
++  // Control: WITHOUT the takeover the same SQL transitions normally.
++  let #(_, _, app2_id, call2_id) = create_rows(db, "rc43-ii@example.com")
++  let #(_, _, app2) =
++    uuids(landlord_id, "00000000-0000-0000-0000-000000000000", app2_id)
++  let assert Ok(call2) = uuid.from_string(call2_id)
++  set_status(db, call2_id, "contact_initiated")
++  let assert Ok(returned) =
++    rc_sql.mark_awaiting_correction_wrong_person(db, call2)
++  list.length(returned.rows) |> should.equal(1)
++  row_field(db, call2_id, "status") |> should.equal(Some("awaiting_correction"))
++}
++
++/// W2 (r3): the contact-fallback leg is PRE-correction only — a redelivered
++/// stale bounce whose envelope equals a CORRECTION-RETAINED channel (the
++/// send_ref is NOT in the attempts — the fallback path) stands down instead
++/// of exhausting a row whose corrected contact was never re-tried.
++pub fn fallback_leg_stale_bounce_stands_down_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-jj@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // The bounce hit the EMAIL; the correction kept the failed email channel
++  // (only the phone was corrected) — the corrected-only effective email
++  // still equals the stale envelope.
++  set_status(db, call_id, "awaiting_correction")
++  actions_handler.do_correct(
++    config,
++    app,
++    landlord,
++    vacancy,
++    call,
++    actions_handler.Trio(
++      name: "Larry Landlord",
++      email: "larry@example.com",
++      phone: "+353879999999",
++    ),
++  ).status
++  |> should.equal(200)
++
++  // A stale redelivered bounce whose send_ref is NOT in the attempts — the
++  // fallback leg — must stand down (post-correction the fallback is
++  // disabled; the row is not found).
++  webhooks.apply_delivery_failure(
++    db: db,
++    sentry: sentry_client.Disabled,
++    source: "resend",
++    event_id: "evt-fallback",
++    send_ref: "unmatched_send_ref",
++    contact_email: "larry@example.com",
++    contact_phone: "",
++    terminal_reason: "email_bounced",
++  )
++  row_field(db, call_id, "status") |> should.equal(Some("queued"))
++  count_audit(db, "reference_call_correction_exhausted") |> should.equal(0)
++  let signals = row_field(db, call_id, "fraud_signals")
++  case signals {
++    Some(raw) ->
++      raw |> string.contains("referee_contact_invalid") |> should.be_false
++    None -> should.fail()
++  }
++}
++
++/// W3 (r3): a bounce of the APPLICANT's co-nudge email never drives a
++/// referee row — co-nudge entries (kind-tagged AND legacy single-email
++/// batches) are excluded from the delivery-failure find (no fabricated
++/// referee_contact_invalid).
++pub fn co_nudge_bounce_stands_down_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, call_id) =
++    create_rows(db, "rc43-kk@example.com")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++
++  // A corrected row whose attempts include a LEGACY (untagged) co-nudge
++  // entry — the single-email batch shape (no sms sibling at the same at),
++  // POST-correction: without the exclusion a bounce of the applicant's
++  // address would exhaust the row (r4 W1/W2 — the fixture BITES).
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call
++       SET status = 'awaiting_correction'::reference_call_status,
++           attempts = jsonb_build_array(
++             jsonb_build_object('at', to_char(now() - interval '1 hour', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 'channel', 'email', 'outcome', 'delivered', 'detail', 'ref_send_1'),
++             jsonb_build_object('at', to_char(now() + interval '30 seconds', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 'channel', 'email', 'outcome', 'delivered', 'detail', 'co_nudge_send_1')
++           )
++       WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++  actions_handler.do_correct(
++    config,
++    app,
++    landlord,
++    vacancy,
++    call,
++    actions_handler.Trio(
++      name: "Larry Byrne",
++      email: "larry.byrne@example.com",
++      phone: "+353871999999",
++    ),
++  ).status
++  |> should.equal(200)
++
++  // The applicant's co-nudge email bounces — the kind-tagged entry is
++  // excluded, the row is not found, nothing happens.
++  webhooks.apply_delivery_failure(
++    db: db,
++    sentry: sentry_client.Disabled,
++    source: "resend",
++    event_id: "evt-conudge",
++    send_ref: "co_nudge_send_1",
++    contact_email: "aisling@example.com",
++    contact_phone: "",
++    terminal_reason: "email_bounced",
++  )
++  row_field(db, call_id, "status") |> should.equal(Some("queued"))
++  count_audit(db, "reference_call_correction_exhausted") |> should.equal(0)
++  let signals = row_field(db, call_id, "fraud_signals")
++  case signals {
++    Some(raw) ->
++      raw |> string.contains("referee_contact_invalid") |> should.be_false
++    None -> should.fail()
++  }
++
++  // Control: a REFEREE send bounce still exhausts (the co-nudge exclusion
++  // did not disable the find).
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call
++       SET attempts = attempts || jsonb_build_array(
++             jsonb_build_object('at', to_char(now() + interval '30 seconds', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 'channel', 'email', 'outcome', 'delivered', 'detail', 'ref_send_2'),
++             jsonb_build_object('at', to_char(now() + interval '30 seconds', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 'channel', 'sms', 'outcome', 'delivered', 'detail', 'sms_send_2')
++           ),
++           status = 'contact_initiated'::reference_call_status
++       WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++  webhooks.apply_delivery_failure(
++    db: db,
++    sentry: sentry_client.Disabled,
++    source: "resend",
++    event_id: "evt-ref2",
++    send_ref: "ref_send_2",
++    contact_email: "larry.byrne@example.com",
++    contact_phone: "",
++    terminal_reason: "email_bounced",
++  )
++  row_field(db, call_id, "status") |> should.equal(Some("unreachable"))
++  count_audit(db, "reference_call_correction_exhausted") |> should.equal(1)
++}
++
++/// W4 (r3): the sweep's terminal writers carry the taken_over guard — a
++/// take-over landing between the due-SELECT and the T+144h terminal never
++/// terminalizes a landlord-handled row.
++pub fn sweep_terminal_writers_respect_taken_over_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, _, app_id, call_id) =
++    create_rows(db, "rc43-ll@example.com")
++  let #(landlord, _, app) =
++    uuids(landlord_id, "00000000-0000-0000-0000-000000000000", app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "contact_initiated")
++  let assert Ok(_) =
++    pog.query("UPDATE reference_call SET attempt_count = 4 WHERE id = $1::uuid")
++    |> pog.parameter(pog.text(call_id))
++    |> pog.execute(db)
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(200)
++
++  // The T+144h terminal 0-rows on the taken-over row.
++  let assert Ok(returned) =
++    rc_sql.sweep_terminal(
++      db,
++      call,
++      rc_sql.Unreachable,
++      "unreachable",
++      "sequence_exhausted",
++      json.null(),
++      "",
++    )
++  list.length(returned.rows) |> should.equal(0)
++  row_field(db, call_id, "status") |> should.equal(Some("contact_initiated"))
++}
++
++/// N3 (r3): the per-slot re-arm only touches the requested slot, and the
++/// declined (suppressed) start path never re-arms.
++pub fn per_slot_rearm_and_declined_no_rearm_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id, _) =
++    create_rows(db, "rc43-mm@example.com")
++  // Age BOTH rows' clocks into the past.
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET next_attempt_at = now() - interval '3 days' WHERE application_id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.execute(db)
++
++  // Start ONLY the employer slot.
++  let req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> vacancy_id
++        <> "/applications/"
++        <> app_id
++        <> "/reference-checks/start?slot=employer_ref",
++    )
++  trigger.handle_start(
++    req,
++    config,
++    test_db.test_landlord(landlord_id),
++    vacancy_id,
++    app_id,
++  ).status
++  |> should.equal(200)
++
++  // Only the employer row is re-armed; the landlord row keeps the aged clock.
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT ref_slot, (next_attempt_at > now() - interval '1 minute')::text FROM reference_call WHERE application_id = $1 ORDER BY ref_slot",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.list(decode.string))
++    |> pog.execute(db)
++  case returned.rows {
++    [employer, landlord] ->
++      case employer, landlord {
++        [slot_e, armed_e], [slot_l, armed_l] -> {
++          slot_e |> should.equal("employer_ref")
++          armed_e |> should.equal("true")
++          slot_l |> should.equal("landlord_ref")
++          armed_l |> should.equal("false")
++        }
++        _, _ -> should.fail()
++      }
++    _ -> should.fail()
++  }
++
++  // Declined application: the suppressed start path never re-arms — the
++  // SAME app (its landlord row is still aged from the per-slot test above).
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE application SET reference_contact_choice = 'declined' WHERE id = $1::uuid",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.execute(db)
++  let declined_req =
++    simulate.request(
++      http.Post,
++      "/api/v1/vacancies/"
++        <> vacancy_id
++        <> "/applications/"
++        <> app_id
++        <> "/reference-checks/start",
++    )
++  trigger.handle_start(
++    declined_req,
++    config,
++    test_db.test_landlord(landlord_id),
++    vacancy_id,
++    app_id,
++  ).status
++  |> should.equal(200)
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT (next_attempt_at > now() - interval '1 minute')::text FROM reference_call WHERE application_id = $1 AND ref_slot = 'landlord_ref'",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  case returned.rows {
++    [armed, ..] -> armed |> should.equal("false")
++    _ -> should.fail()
++  }
++}
++
++/// N16 (r4): sweep_mark_failed carries the taken_over guard too (the r3-W4
++/// pin drove sweep_terminal only).
++pub fn sweep_mark_failed_respects_taken_over_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, _, app_id, call_id) =
++    create_rows(db, "rc43-oo@example.com")
++  let #(landlord, _, app) =
++    uuids(landlord_id, "00000000-0000-0000-0000-000000000000", app_id)
++  let assert Ok(call) = uuid.from_string(call_id)
++  set_status(db, call_id, "contact_initiated")
++  actions_handler.do_take_over(config, app, landlord, call).status
++  |> should.equal(200)
++
++  let assert Ok(returned) = rc_sql.sweep_mark_failed(db, call, "poison")
++  list.length(returned.rows) |> should.equal(0)
++  row_field(db, call_id, "status") |> should.equal(Some("contact_initiated"))
++}
+diff --git a/server/test/integration/reference_checks_sweep_integration_test.gleam b/server/test/integration/reference_checks_sweep_integration_test.gleam
+index 1b161801..bc839472 100644
+--- a/server/test/integration/reference_checks_sweep_integration_test.gleam
++++ b/server/test/integration/reference_checks_sweep_integration_test.gleam
+@@ -10,6 +10,7 @@
+ 
+ import gleam/dynamic/decode
+ import gleam/int
++import gleam/string
+ import gleeunit/should
+ import integration/helpers
+ import integration/test_db
+@@ -129,6 +130,20 @@ fn row_status(db: pog.Connection, row_id: String) -> String {
+   |> result_unwrap
+ }
+ 
++fn row_attempts_json(db: pog.Connection, row_id: String) -> String {
++  case
++    test_db.query_text(
++      db,
++      "SELECT COALESCE(attempts::text, '[]') FROM reference_call WHERE id = '"
++        <> row_id
++        <> "'",
++    )
++  {
++    Ok(text) -> text
++    Error(_) -> ""
++  }
++}
++
+ fn row_attempt_count(db: pog.Connection, row_id: String) -> Int {
+   to_int(test_db.query_text(
+     db,
+@@ -299,6 +314,10 @@ pub fn co_nudge_fires_when_form_unopened_no_draft_test() {
+   let summary = run_sweep(db)
+ 
+   summary.co_nudged |> should.equal(1)
++  // r4 (W2): the producer-side tag — the co-nudge entry rides the attempts
++  // log with the kind marker the delivery-failure find excludes.
++  let attempts = row_attempts_json(db, row_id)
++  attempts |> string.contains("\"kind\": \"co_nudge\"") |> should.be_true
+   row_attempt_count(db, row_id) |> should.equal(2)
+   // One co-nudge attempt entry (email channel, to the applicant).
+   attempts_length(db, row_id) |> should.equal(1)
+diff --git a/server/test/integration/reference_detail_payload_integration_test.gleam b/server/test/integration/reference_detail_payload_integration_test.gleam
+index 2755c8a3..973083be 100644
+--- a/server/test/integration/reference_detail_payload_integration_test.gleam
++++ b/server/test/integration/reference_detail_payload_integration_test.gleam
+@@ -163,7 +163,18 @@ pub fn payload_does_carry_public_reference_data_test() {
+   let body = fetch_detail(db, landlord_id, vacancy_id, application_id)
+   // The §8.1 entry surface is present — the search path is live.
+   string.contains(body, "\"reference_call_id\"") |> should.be_true
+-  string.contains(body, "larry@example.com") |> should.be_false
++  // RC4.3 note: the referee's CONTACT snapshot now legitimately rides the
++  // payload (the §7.7 take-over chips + §8.3 edit prefill need it) — the
++  // negative control moved to a still-internal marker (form_token is never
++  // selected by the detail read).
++  string.contains(body, "form_token_internal_sentinel") |> should.be_false
++  // r1 (N14): the RC4.3 additive keys ride the wire (the panel's action
++  // surfaces decode them).
++  string.contains(body, "\"taken_over_at\"") |> should.be_true
++  string.contains(body, "\"contact_name\"") |> should.be_true
++  string.contains(body, "\"corrected_email\"") |> should.be_true
++  string.contains(body, "\"correction_cycles\"") |> should.be_true
++  string.contains(body, "\"can_take_over\"") |> should.be_true
+ }
+ 
+ /// AD-2/A4: attestation_on_file is true when the applicant's
+diff --git a/server/test/reference_checks/form_handler_test.gleam b/server/test/reference_checks/form_handler_test.gleam
+index 313fb1c7..21e7202a 100644
+--- a/server/test/reference_checks/form_handler_test.gleam
++++ b/server/test/reference_checks/form_handler_test.gleam
+@@ -368,3 +368,28 @@ pub fn clamp_all_answered_targets_the_last_question_test() {
+   form_handler.clamp_current(LandlordRef, Some("free_text"), all_keys, None)
+   |> should.equal("free_text")
+ }
++
++// -- r3 (N6): the resend leg's effective-contact rule (W4) --------------------
++
++pub fn resend_effective_contact_pre_correction_test() {
++  form_handler.effective(
++    False,
++    Some("corrected@example.com"),
++    Some("snapshot@example.com"),
++  )
++  |> should.equal(Some("corrected@example.com"))
++  form_handler.effective(False, None, Some("snapshot@example.com"))
++  |> should.equal(Some("snapshot@example.com"))
++}
++
++pub fn resend_effective_contact_post_correction_test() {
++  // Corrected-only: a cleared channel stays absent, never the dead snapshot.
++  form_handler.effective(
++    True,
++    Some("corrected@example.com"),
++    Some("dead@example.com"),
++  )
++  |> should.equal(Some("corrected@example.com"))
++  form_handler.effective(True, None, Some("dead@example.com"))
++  |> should.equal(None)
++}
+diff --git a/server/test/reference_checks/schema_migration_test.gleam b/server/test/reference_checks/schema_migration_test.gleam
+index 2fbdce03..c1ace789 100644
+--- a/server/test/reference_checks/schema_migration_test.gleam
++++ b/server/test/reference_checks/schema_migration_test.gleam
+@@ -73,10 +73,32 @@ pub fn skipped_not_in_live_index_exclusion_test() {
+ 
+ pub fn amended_columns_present_test() {
+   let contents = read_ddl()
++  // The RC4.3 additive columns live in their own expand-only migration.
++  let assert Ok(rc43_contents) =
++    simplifile.read(
++      "../supabase/migrations/20260812140000_reference_call_corrected_name.sql",
++    )
+   list_each_true(
+-    ["draft_answers", "taken_over_at", "corrected_email", "corrected_phone"],
++    [
++      "draft_answers",
++      "taken_over_at",
++      "corrected_email",
++      "corrected_phone",
++    ],
+     fn(c) { string.contains(contents, c) },
+   )
++  list_each_true(
++    [
++      // RC4.3 (r1 N15): the correction loop's columns — the effective-name
++      // override, the one-cycle counter, and the exhaustion gate's
++      // correction instant.
++      "corrected_name",
++      "corrected_at",
++    ],
++    fn(c) { string.contains(rc43_contents, c) },
++  )
++  // correction_cycles lives in the RC2.1 create table (AD-7's counter).
++  string.contains(contents, "correction_cycles") |> should.be_true
+ }
+ 
+ pub fn outcome_enum_has_v1_amendments_test() {
+diff --git a/server/test/reference_checks/sweep_test.gleam b/server/test/reference_checks/sweep_test.gleam
+new file mode 100644
+index 00000000..21e50ac6
+--- /dev/null
++++ b/server/test/reference_checks/sweep_test.gleam
+@@ -0,0 +1,91 @@
++//// Sweep effective-contact unit tests (r2 N12) — the AD-7/W4 rule: once a
++//// correction ran (correction_cycles >= 1) the snapshot is PROVEN DEAD and
++//// the corrected values ARE the contact; a cleared channel stays absent
++//// (never falling back to the failed address). Before any correction,
++//// corrected ?? snapshot.
++
++import gleam/option.{type Option, None, Some}
++import gleeunit/should
++import reference_checks/sql
++import reference_checks/sweep
++
++fn row(
++  cycles cycles: Int,
++  corrected_email corrected_email: Option(String),
++  snapshot_email snapshot_email: Option(String),
++  corrected_phone corrected_phone: Option(String),
++  snapshot_phone snapshot_phone: Option(String),
++) -> sql.SweepDueReferenceCallsRow {
++  sql.SweepDueReferenceCallsRow(
++    id: "rc-1",
++    application_id: "app-1",
++    ref_slot: "landlord_ref",
++    status: "queued",
++    attempt_count: 0,
++    contact_name: "Larry Landlord",
++    contact_email: snapshot_email,
++    contact_phone: snapshot_phone,
++    corrected_email: corrected_email,
++    corrected_phone: corrected_phone,
++    correction_cycles: cycles,
++    form_token: None,
++    form_opened_at: "",
++    draft_answers: "",
++    attempts: "[]",
++    created_at: "2026-08-01T08:00:00Z",
++    vacancy_id: "vac-1",
++    applicant_first_name: "Aisling",
++    applicant_last_name: "Applicant",
++    applicant_email: "aisling@example.com",
++    retention_due_at: "",
++    landlord_id: "landlord-1",
++    origin_domain: "righttenantry.ie",
++    landlord_display_name: "Test Landlord",
++  )
++}
++
++/// Pre-correction: corrected ?? snapshot.
++pub fn effective_contact_pre_correction_test() {
++  let r =
++    row(
++      cycles: 0,
++      corrected_email: None,
++      snapshot_email: Some("snapshot@example.com"),
++      corrected_phone: None,
++      snapshot_phone: Some("+353870000000"),
++    )
++  sweep.effective_email(r) |> should.equal(Some("snapshot@example.com"))
++  sweep.effective_phone(r) |> should.equal(Some("+353870000000"))
++}
++
++/// Post-correction: the corrected value IS the contact.
++pub fn effective_contact_post_correction_test() {
++  let r =
++    row(
++      cycles: 1,
++      corrected_email: Some("corrected@example.com"),
++      snapshot_email: Some("dead@example.com"),
++      corrected_phone: None,
++      snapshot_phone: Some("+353870000000"),
++    )
++  sweep.effective_email(r) |> should.equal(Some("corrected@example.com"))
++  // Phone uncorrected — the corrected-only rule treats the whole snapshot
++  // as proven-dead (AD-7): an uncorrected channel stays absent.
++  sweep.effective_phone(r) |> should.equal(None)
++}
++
++/// r1 W4 / r2: a CLEARED channel post-correction stays ABSENT — the sweep
++/// never falls back to the proven-dead snapshot address (AD-7
++/// never-re-contact).
++pub fn cleared_channel_never_falls_back_to_dead_snapshot_test() {
++  let r =
++    row(
++      cycles: 1,
++      corrected_email: None,
++      snapshot_email: Some("dead@example.com"),
++      corrected_phone: Some("+353879999999"),
++      snapshot_phone: Some("+353870000000"),
++    )
++  sweep.effective_email(r) |> should.equal(None)
++  sweep.effective_phone(r) |> should.equal(Some("+353879999999"))
++}
+diff --git a/server/test/retention/audit_log_schema_test.gleam b/server/test/retention/audit_log_schema_test.gleam
+index 59687d46..e3c9436c 100644
+--- a/server/test/retention/audit_log_schema_test.gleam
++++ b/server/test/retention/audit_log_schema_test.gleam
+@@ -89,6 +89,8 @@ pub fn schema_variants_cover_registry_test() {
+       schema.NewClosesAt -> list.contains(schema.all_non_pii, k)
+       schema.PreviousStatus -> list.contains(schema.all_non_pii, k)
+       schema.RefSlot -> list.contains(schema.all_non_pii, k)
++      schema.OldReferenceCallId -> list.contains(schema.all_non_pii, k)
++      schema.NewReferenceCallId -> list.contains(schema.all_non_pii, k)
+     }
+   }
+   list.each(schema.all_pii, fn(k) { pii_membership(k) |> should.be_true })

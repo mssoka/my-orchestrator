@@ -1,0 +1,42 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "state",
+    "title": "Opening the settings modal mid-pan strands the pan latch; stale pan_last fires one accumulated-delta Pan on modal close",
+    "location": "app/input/mouse.odin:368-384 + app/input/exec.odin:47-54",
+    "evidence": "mouse.odin:\n\t\tif inp.panel_open {\n\t\t\t// suppressed — the panel owns the surface\n\t\t} else if inp.panning && !drag_eff && placing_eff < 0 {\n...\n\t\t\tfor i in 0 ..< moves_n {\n\t\t\t\tappend(out, Intent(Pan{dx = moves[i].x - inp.pan_last.x, dy = moves[i].y - inp.pan_last.y}))\n\t\t\t\tinp.pan_last = moves[i]\n\t\t\t}\nexec.odin:\n\tcase Toggle_Settings:\n\t\tinp.panel_open = !inp.panel_open\n\t\tif inp.panel_open {\n\t\t\tinp.panel_row = 0\n\t\t\tinp.press_swallowed = true // the opening gesture's release never selects\n\t\t}",
+    "detail": "S key pressed while a pan drag is held: Toggle_Settings never clears inp.panning, the panel_open branch suppresses the release (and the poll guard's synthesized release), so pan_last freezes; on modal close the pan branch emits the whole modal-session mouse travel as one Pan delta.",
+    "recommended_fix": "Clear the latch when Toggle_Settings opens (set inp.panning = false beside the press_swallowed reset), matching the begin_draw and start_run clears."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "Window resize while zoomed bypasses the world-rect clamp — paper void visible until the next camera action",
+    "location": "app/main.odin:547-550 + app/main.odin:1549-1553",
+    "evidence": "main.odin:\n\t\tif rl.IsWindowResized() {\n\t\t\trnd.view_compute(&app.view, rl.GetScreenWidth(), rl.GetScreenHeight(), &cat.balance)\n\t\t}\n...\n\tfit := min(f32(v.win_w)/v.world_w, f32(v.win_h)/v.world_h)\n\tv.scale = fit * app.cam_zoom\n\tv.off_x = f32(v.win_w)/2 - app.cam_wx * v.scale\n\tv.off_y = f32(v.win_h)/2 - app.cam_wy * v.scale",
+    "detail": "camera_update re-derives scale/off from the stored center every frame but never calls camera_clamp_center (it is only called inside camera_zoom_at/effect_pan at main.odin:1604/1625); after a resize the previously clamped center can lie outside the valid band, showing void beyond the world edge.",
+    "recommended_fix": "Re-clamp the targets in camera_update (or immediately after view_compute on resize) via camera_clamp_center at the live fit/zoom/window dims."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "input",
+    "title": "Sub-notch wheel deltas truncate to identity with no cross-frame accumulator — slow trackpad scrolling never zooms",
+    "location": "app/render/camera.odin:43-51 + app/input/poll.odin:79-81",
+    "evidence": "camera.odin:\ncamera_zoom_step :: proc(z, delta: f32) -> f32 {\n\tf := f32(1)\n\tfor d := i32(delta); d > 0; d -= 1 {\n\t\tf *= CAM_ZOOM_STEP\n\t}\n\tfor d := i32(delta); d < 0; d += 1 {\n\t\tf /= CAM_ZOOM_STEP\n\t}\n\treturn z * f\n}\npoll.odin:\n\tif w := rl.GetMouseWheelMove(); w != 0 {\n\t\tappend(&inp.events, Device_Event(Mouse_Wheel{delta = w, pos = pos}))\n\t}",
+    "detail": "i32(delta) truncates |delta|<1 to zero notches and nothing carries across frames; a steady slow trackpad scroll (e.g. 0.3/frame) never reaches a whole notch, so the zoom input is silently dead on trackpads.",
+    "recommended_fix": "Carry a fractional residual on Input: accumulate per-frame wheel delta, fire camera_zoom_step only when |accum| >= 1, keep the remainder."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Wheel is dead at Game_Over — the NOC log scroll that the removed render-block provided in every mode is unreachable",
+    "location": "app/input/mouse.odin:37-49 + app/main.odin (diff: removed render-block wheel read)",
+    "evidence": "mouse.odin:\n\tif inp.mode == .Game_Over {\n\t\t// R OR Enter — the old `||`, ONE retry (r2 note: same-frame R+Enter must\n\t\t// not double-restart)\n\t\tfor ev in events {\n\t\t\tif k, ok := ev.(Key_Press); ok {\n\t\t\t\tif k.key == .R || k.key == .Enter {\n\t\t\t\t\tappend(out, Intent(Retry{}))\n\t\t\t\t\tbreak\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\treturn\ndiff.patch (removed):\n-\t\t\t\tif w := rl.GetMouseWheelMove(); w != 0 {\n-\t\t\t\t\tapp.noc_scroll = max(0, app.noc_scroll - i32(w))\n-\t\t\t\t}",
+    "detail": "mouse_map returns at Game_Over before wheel collection, and the NOC scroll now lives only in effect_zoom, reachable solely via the Zoom intent. The old render-block scroll ran in every mode; the debug log is now unscrollable at Game_Over.",
+    "recommended_fix": "If Game_Over NOC scrolling matters, feed effect_zoom's NOC branch on a mode-independent path; otherwise document the dropped debug path as intentional."
+  }
+]

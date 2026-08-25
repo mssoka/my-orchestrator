@@ -1,0 +1,82 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "vacuous-test",
+    "title": "Era-1 'documented split' pin is dead code — no assertion covers it despite comment and PR body claiming otherwise",
+    "location": "core/legacy_test.odin:test_legacy_gate_lifecycle_agreement",
+    "evidence": "if era == 1 && legacy && !decayed {\n\t\t\t\t// the documented split: named legacy (the gate bar), factor 1000 (no decay)\n\t\t\t\tcontinue\n\t\t\t}\n(preceded in the same loop body only by the era>=2 expectf; `continue` is the final statement of the loop body, and the in-test comment says: \"The era-1 split is pinned explicitly so it can never silently drift.\" The PR body repeats: \"pins the one documented split (era 1: ...)\".)",
+    "detail": "The continue is a no-op at loop end — nothing about era 1 is asserted. If era 1's factor or predicate drifts (factor 500, say), this test still passes silently. Comment and PR body both claim a pin that does not exist.",
+    "recommended_fix": "Assert the split explicitly at era 1: expect era_pipe_is_legacy true for narrow AND pipe_effective_capacity == raw (factor 1000, no decay); delete the no-op continue."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "contradiction",
+    "title": "Same test's two 6.3 re-pin comments contradict: staging note says first shed lands on bundle 2, pinned expectation is bundle 0",
+    "location": "core/crisis_test.odin:test_crisis_settled_scan_names_slot_order_bundle",
+    "evidence": "Staging comment: \"// staging — the first streaming shed lands on bundle 2 while bundle 0's\n+ \t// streaming lane still pins at the bound by the trigger tick, so the (a)\n+ \t// scan names bundle 0 (slot order). (With bundle 0 NARROW both legs decay\n+ \t// at the same rate and bundle 0 sheds first — the staging collapsed; with\n+ \t// WIDE it never pinned at the bound and the scan named bundle 2.)\"\nAssertion site (same test, same diff): \"// 6.3 re-pin: the first class-1 shed is now bundle 0 (tick ~20) — the\" ... \"testing.expect_value(t, first_stream_drop_bundle, u32(0))\" (replacing \"testing.expect_value(t, first_stream_drop_bundle, u32(2))\").",
+    "detail": "Both comments describe first_stream_drop_bundle for identical staging. One says bundle 2, the pinned value is 0 — and the parenthetical implies bundle 0 must NOT shed first under the chosen standard-tier staging. One comment is wrong.",
+    "recommended_fix": "Rewrite the staging comment to match the pin (first shed bundle 0 at tick ~20), or re-derive the staging if the pin is wrong; the two 6.3 notes cannot both be true."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "validate_set_pipe_tier never checks the era's unlock table — modernize can target a tier the current era hasn't unlocked",
+    "location": "core/topology.odin:validate_set_pipe_tier",
+    "evidence": "validate_set_pipe_tier :: proc(t: ^Topology, c: Cmd_Set_Pipe_Tier, cat: ^Catalogs) -> Edit_Error {\n\tps, ok := pipe_slot(t, c.pipe)\n\tif !ok {\n\t\treturn .Missing_Pipe\n\t}\n\tif u32(c.tier) >= u32(len(cat.pipe_tiers)) {\n\t\treturn .Unknown_Tier\n\t}\n\tif c.tier <= t.pipe_tier[ps] {\n\t\treturn .Not_An_Upgrade\n\t}\n\treturn .None\n}\n(while eras.json gates tiers per era: \"pipe_tiers\": [\"narrow\", \"standard\"] for era 2, [\"narrow\", \"standard\", \"wide\"] only at era 3)",
+    "detail": "The function takes no era parameter, so era-unlock enforcement is structurally impossible. A modernize in era 2 straight to wide (unlocked only at era 3) is accepted, bypassing the unlock table the era system exists to enforce.",
+    "recommended_fix": "Pass the current era and reject tiers not in the era row's unlock_pipe_tiers (e.g. via the same era_newest_tier/era_row read the legacy predicate uses)."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "vacuous-test",
+    "title": "Assertion on nil ^testing.T inside build() cannot fail the test",
+    "location": "core/legacy_test.odin:test_legacy_decayed_vs_modernized_throughput",
+    "evidence": "build :: proc(cat: ^Catalogs, seed: u64, modernize: bool) -> (delivered: u64, dropped: u64) {\n... \t\ttesting.expectf(nil, !s.replay_error, \"no draw may be rejected\")\n\t\treturn s.flow.sla[1].delivered, s.flow.sla[1].dropped",
+    "detail": "build() has no ^testing.T, so nil is passed: if replay_error latches, the guard is a silent no-op (or a nil dereference) — the fixture-integrity check in the story's key measurement test enforces nothing.",
+    "recommended_fix": "Thread the real t into build() as a parameter and call expectf(t, ...), or hoist the replay_error check to the caller where t is available."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "pipe_effective_capacity's inner era_row ok-guard is unreachable-false and duplicates the lookup",
+    "location": "core/era.odin:pipe_effective_capacity",
+    "evidence": "pipe_effective_capacity :: proc(cat: ^Catalogs, era: u8, tier: u16) -> u32 {\n\traw := u32(cat.pipe_tiers[tier].capacity_units)\n\tif era_pipe_is_legacy(cat, era, tier) {\n\t\tif row, ok := era_row(cat, era); ok {\n\t\t\treturn raw * row.legacy_decay_permille / 1000\n\t\t}\n\t}\n\treturn raw\n}",
+    "detail": "era_pipe_is_legacy returns false whenever era_row(cat, era) fails, so inside the outer branch the row always exists: the ok guard is dead defensive code plus a redundant second lookup on the per-pipe capacity hot path.",
+    "recommended_fix": "Resolve the era row once and share it between the predicate and the factor read, or drop the inner ok check."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "contradiction",
+    "title": "era_step claims routing costs never change at an era flip while apply_set_pipe_tier calls routing 'the capacity-cost ladder'",
+    "location": "core/era.odin:era_step / core/topology.odin:apply_set_pipe_tier",
+    "evidence": "era_step: \"// ... The routing table is untouched (tier costs don't\n\t// change at a flip — only effective capacities do).\n\tbundles_rebuild(&state.bundles, &state.topology, cat, state.era)\" — apply_set_pipe_tier: \"Sets\n// the pipe's tier + bumps gen (rule 1 — the routing costs (the capacity-cost\n// ladder), the bundle capacity and the lane caps all rebuild at the next\n// step).\"",
+    "detail": "If routing costs are capacity-derived ('capacity-cost ladder'), the flip changes effective capacity (decay engages) and the untouched routing table serves stale costs until the next topology gen bump. One of the two comments must be wrong.",
+    "recommended_fix": "Reconcile: either document routing costs as raw-tier-only, or rebuild the routing view at the era fire alongside bundles and lane caps."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "comment-code-mismatch",
+    "title": "Modernize lowering vows 'never let a bad demo bless a poisoned log' but validates only the tier name",
+    "location": "harness/run.odin:lower_intents (modernize block)",
+    "evidence": "// catalog (fail loud, like a draw tier); a non-upgrade request is also an\n\t// authoring error (the apply-time validation would latch replay_error —\n\t// never let a bad demo bless a poisoned log). Group order: after\n... \t\ttier_idx, ok := pp.pipe_tier_index(cat, d.tier)\n\t\tif !ok {\n\t\t\treturn fmt.tprintf(\"demo %s: unknown pipe tier %q\", demo.name, d.tier)\n\t\t}\n\t\tappend(&state.action_log, pp.Command{",
+    "detail": "The lowering checks only the tier name; a typo'd pipe id or a downgrade/same-tier request still reaches the action log, relying entirely on apply-time replay_error latching — contradicting the stated fail-loud intent.",
+    "recommended_fix": "Validate pipe liveness and strictly-upward-ness at lowering (the topology is available there), or amend the comment to admit apply-time-only validation."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Replay-identity comparison indexes replay_hashes with live's length — no length-equality check",
+    "location": "core/legacy_test.odin:test_modernize_replay_identity",
+    "evidence": "diverged := false\n\tfor i in 0..<len(live_hashes) {\n\t\tif live_hashes[i] != replay_hashes[i] {\n\t\t\tdiverged = true\n\t\t}\n\t}",
+    "detail": "If replay produced fewer hashes, replay_hashes[i] is an out-of-bounds panic rather than a reported divergence; if more, the tail is silently uncompared. Hash-count divergence itself is never detected.",
+    "recommended_fix": "Assert equal lengths first (expect len equality), then compare elements; or iterate to min length and flag any count mismatch."
+  }
+]

@@ -1,0 +1,132 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "dead-condition",
+    "title": "`if args.bake or True:` makes the --bake flag a permanent no-op",
+    "location": "tools/osm_extract.py:586",
+    "evidence": "+    if args.bake or True:\n+        fetch_raw(args.cache)  # cache-first: no network when present\n+        bake(args.cache, args.out)\n+        verify(args.out, args.cache)",
+    "detail": "Condition is always True, so --bake changes nothing. Worse, early returns mean `--fetch --bake` never bakes and `--bake --verify` never bakes — flags silently drop actions.",
+    "recommended_fix": "Use `if args.bake:` for the explicit path, keep the default as a final `else`, and combine flags with elif-free sequencing so multiple flags compose."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "determinism",
+    "title": "fetched_utc baked from file mtime contradicts the byte-identical determinism contract",
+    "location": "tools/osm_extract.py:547",
+    "evidence": "+Determinism contract: same cached raw response -> byte-identical\n+dublin.json. The raw response hash is recorded in the asset; OSM drift is\n...\n+            \"fetched_utc\": _fetch_time(cache_dir),\n...\n+            times.append(os.stat(p).st_mtime)",
+    "detail": "fetched_utc derives from filesystem mtimes, not cache content. Identical cached bytes with touched mtimes (copy, checkout) produce a different dublin.json and a spurious verify FAIL.",
+    "recommended_fix": "Record fetch time inside the cache files at download time, or omit fetched_utc from the hash-compared asset / verify comparison."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "geometry",
+    "title": "polygonize() never checks ring closure; open ways (coastline, canal centerlines) become spurious polygons",
+    "location": "tools/osm_extract.py:298",
+    "evidence": "+def polygonize(ls: LineString):\n+    \"\"\"Ring -> Polygon (or None if degenerate).\"\"\"\n+    if ls is None or len(ls.coords) < 4 or not ls.is_valid:\n+        return None\n+    try:\n+        p = Polygon(ls.coords)\n...\n+        if nat == \"coastline\" or ww == \"riverbank\" or nat == \"water\" or ww == \"canal\" or ww == \"dock\":\n+            ring = polygonize(simplify_geom(geom, DP_TOL[\"water\"]))",
+    "detail": "OSM coastline and waterway=canal ways are open centerlines, not rings; Polygon() implicitly closes them, fabricating area polygons. No coords[0]==coords[-1] validation exists.",
+    "recommended_fix": "Require closed rings before Polygon(); treat unclosed linear ways (coastline, canal) as clipped area boundaries or drop them explicitly."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "geometry",
+    "title": "Relation members flattened into one LineString, producing franken-rings for multipolygon relations",
+    "location": "tools/osm_extract.py:288",
+    "evidence": "+    if not geoms:\n+        for m in el.get(\"members\", []):\n+            for g in m.get(\"geometry\", []):\n+                geoms.append(Point(*transformer.transform(g[\"lon\"], g[\"lat\"])))\n...\n+    if len(geoms) == 1:\n+        return geoms[0]\n+    return LineString(geoms)",
+    "detail": "The geom query pulls relation[\"natural\"=\"water\"]; disjoint member ways get concatenated into a single polyline that polygonize then closes, creating bogus merged polygons.",
+    "recommended_fix": "Build per-member geometries and per-ring polygons (outer/inner role-aware), unioning members instead of chaining their vertices."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "naming-inconsistency",
+    "title": "Baked terrain key \"coast\" actually holds only beaches; coastlines are folded into \"water\"",
+    "location": "tools/osm_extract.py:467",
+    "evidence": "+    coast = merge_and_emit(beach_rings, MIN_AREA[\"coast\"])\n...\n+        elif nat == \"beach\":\n+            ring = polygonize(simplify_geom(geom, DP_TOL[\"beach\"]))\n+            if ring:\n+                beach_rings.append(ring)\n...\n+  2. Layers   — terrain (water polygons + coastline + parks/beaches),",
+    "detail": "Asset key \"coast\" contains 13 beach polygons (memlog: \"13 beach\") while coastline ways feed water_rings. Consumers reading terrain.coast expect coastline data per the docstring and render draw order.",
+    "recommended_fix": "Rename the key to \"beach\" (matching DP_TOL[\"beach\"]) or genuinely emit coastline; keep layer names, query tags, and docstrings aligned."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-config",
+    "title": "DP_TOL[\"coast\"] is defined but never used",
+    "location": "tools/osm_extract.py:153",
+    "evidence": "+    \"coast\": 12.0,   # long shoreline ways — heavy simplification is the point\n...\n+        if nat == \"coastline\" or ww == \"riverbank\" or nat == \"water\" or ww == \"canal\" or ww == \"dock\":\n+            ring = polygonize(simplify_geom(geom, DP_TOL[\"water\"]))",
+    "detail": "Coastline elements are simplified with the water tolerance; the coast entry is dead config, a leftover from the coast/beach naming split.",
+    "recommended_fix": "Delete DP_TOL[\"coast\"] or actually route coastline ways through it once their layer assignment is fixed."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Unused imports: io and shapely.geometry.shape",
+    "location": "tools/osm_extract.py:49",
+    "evidence": "+import io\n...\n+from shapely.geometry import LineString, Point, Polygon, shape",
+    "detail": "Neither io nor shape is referenced anywhere in the module; both are leftovers.",
+    "recommended_fix": "Remove `import io` and drop `shape` from the shapely.geometry import."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-drift",
+    "title": "Docstring cache path `.osm-cache/<query-hash>.json` does not match actual cache file layout",
+    "location": "tools/osm_extract.py:13",
+    "evidence": "+  1. Extract  — pinned bbox + pinned Overpass QL -> raw JSON (cached in\n+     `.osm-cache/<query-hash>.json`; cache-first, so re-bakes are offline).\n...\n+def cache_path(cache_dir: str) -> str:\n+    return os.path.join(cache_dir, f\"dublin-{query_hash()}\")\n...\n+        path = f\"{base}.{key}.json\"",
+    "detail": "Docs promise one file named `<query-hash>.json`; code writes three files `dublin-<hash>.<key>.json` (buildings-0/1, geom) after the mega-query split.",
+    "recommended_fix": "Update the docstring to the split-cache layout so cache-first reruns are debuggable."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-drift",
+    "title": "District docstring omits \"village\" though query, code, and asset include it",
+    "location": "tools/osm_extract.py:18",
+    "evidence": "+     districts (place=city/town/suburb/quarter/neighbourhood nodes).\n...\n+  node[\"place\"~\"^(city|town|village|suburb|quarter|neighbourhood)$\"]({bbox});",
+    "detail": "The pipeline description lists five place kinds; the query and classifier handle six, and the baked asset contains 13 village districts.",
+    "recommended_fix": "Add village to the docstring's district list."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "cache-robustness",
+    "title": "Cache writes are non-atomic; a truncated download is thereafter treated as a cache hit",
+    "location": "tools/osm_extract.py:255",
+    "evidence": "+        path = f\"{base}.{key}.json\"\n+        if os.path.exists(path):\n+            print(f\"[fetch] cache hit: {path}\")\n+            continue\n...\n+            with open(path, \"w\") as f:\n+                f.write(text)",
+    "detail": "_post_one streams the response body straight into the final cache path. An interrupted fetch leaves a partial file that fetch_raw's exists() check forever accepts.",
+    "recommended_fix": "Write to a temp file and os.replace() into place after full validation (remark check, json.loads)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "render_view's label_filter parameter is never supplied by any caller",
+    "location": "tools/render_dublin_preview.py:68",
+    "evidence": "+def render_view(asset, palette, font_path, view, density_stride, out_path, label_filter=None):\n...\n+        if label_filter and d[\"name\"] not in label_filter:\n+            continue\n...\n+        render_view(asset, palette, args.font, None, stride, out)",
+    "detail": "Both call sites pass six arguments; label_filter is an unused knob, and render_view's return value is likewise discarded.",
+    "recommended_fix": "Drop label_filter (and the return) or wire a --labels option if filtering was intended."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "comment-mismatch",
+    "title": "SS is labeled \"supersample factor\" but no downsampling step exists",
+    "location": "tools/render_dublin_preview.py:30",
+    "evidence": "+SS = 2                # supersample factor for the bay-wide view (crisp lines)\n...\n+    img.save(out_path)\n+    return img",
+    "detail": "render_view ends at img.save with no resize/reduce anywhere, so output is simply rendered at 2x/4x, not supersampled then downscaled as the comment implies.",
+    "recommended_fix": "Either downscale by 1/SS before saving or reword the comment to \"render scale factor\"."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "bookkeeping",
+    "title": ".memlog.md \"updated:\" stamp not bumped when appending the 2026-08-23 entry",
+    "location": ".memlog.md:hunk",
+    "evidence": "@@ -28,3 +28,5 @@ updated: 2026-08-20T17:11\n+\n+- (by minion-dublin-map-spike) 2026-08-23 job: real-city board LOOK spike (user-gated arc).",
+    "detail": "The hunk appends a 2026-08-23 entry but leaves the file's updated: header at 2026-08-20T17:11; no other hunk touches it.",
+    "recommended_fix": "Update the updated: timestamp alongside the appended entry."
+  }
+]

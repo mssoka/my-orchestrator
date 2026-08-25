@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "null-guard",
+    "title": "Step dereferences Commands without a null check when NumCommands > 0",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:Step",
+    "evidence": "inline void Step(FSimState &State, uint64_t Tick, const FCommand *Commands = nullptr, int32_t NumCommands = 0) ... for (int32_t I = 0; I < NumCommands; ++I)\n\t{\n\t\tFEditResult R = ApplyDraw(State.Topology, Commands[I].A, Commands[I].B, Commands[I].Tier);",
+    "detail": "Step(S, 1, nullptr, 2) is undefined behavior \u2014 the (nullptr, >0) argument pair has no guard; every current caller passes a valid pointer or zero.",
+    "recommended_fix": "Guard 'if (NumCommands > 0 && !Commands) { State.ReplayError = true; return; }' or assert."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "dead-input",
+    "title": "Demand scheduled at tick 0 can never fire",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Flow.h:FlowStep spawn pass + PP_Sim.h Step guards",
+    "evidence": "for (const FSpawnReq &Req : F.Demand)\n\t{\n\t\tif (Req.Tick != Tick)\n\t\t{\n\t\t\tcontinue;\n\t\t} ; Step: if (Tick == State.Tick)\n\t{\n\t\tState.ReplayError = true;\n\t\treturn;\n\t}",
+    "detail": "FlowSeedDemand(F, 0, ...) is silently dead: Step never runs at tick 0 (same-tick latch on a fresh state), and no validation rejects a zero-tick demand entry.",
+    "recommended_fix": "Validate Tick >= 1 in FlowSeedDemand (fail loud) \u2014 mirroring the FSpawnReq contract the spawn pass assumes."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "integer-overflow",
+    "title": "SpawnNode accepts any int32 coordinates; Dist2 can overflow int64 (UB) inside the span-validation path",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Topology.h:151-156,193-206",
+    "evidence": "inline uint32_t SpawnNode(FTopology &T, FNodeKind Kind, int32_t X, int32_t Y)\n{\n\tconst uint32_t Id = T.NextNodeId; ... T.NodePosX.push_back(X); // no bounds validation ; Dist2: const int64_t Dx = static_cast<int64_t>(A.X) - B.X;\n\tconst int64_t Dy = static_cast<int64_t>(A.Y) - B.Y;\n\treturn Dx * Dx + Dy * Dy;",
+    "detail": "Two extreme int32 positions differ by ~2^32; Dx*Dx overflows int64 (signed-overflow UB) inside SpanBetween, which ValidateDraw's span rule then trusts. Latent: slice-1 callers pass small fixture coords.",
+    "recommended_fix": "Clamp/validate X,Y against map bounds (kMapTilesX/Y) in SpawnNode, or widen the Dist2 intermediates."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "EqualCostHops(from == dst) always reports no route \u2014 self-reachability is unhandled",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Routing.h:RoutingRebuild hop-collection loop",
+    "evidence": "for (uint32_t U = 0; U < N; ++U)\n\t\t{\n\t\t\tif (U == D || !T.NodeAlive[U] || Dist[U] == UNREACHABLE)\n\t\t\t{\n\t\t\t\tcontinue;\n\t\t\t} \u2014 the (u,u) slot is never written, so HopCount stays 0",
+    "detail": "HasPath(R, T, N, N) returns false for a node reaching itself; no guard documents the semantic. FlowStep never hits it (AtNode==Dst delivers first), but direct callers get a surprising answer.",
+    "recommended_fix": "Document count==0 for (x,x) as 'self \u2014 no hop needed', or special-case it in EqualCostHops."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "FlowSeedDemand/FlowSpawn accept Src/Dst node ids without existence validation",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Flow.h:82-110",
+    "evidence": "inline void FlowSeedDemand(FFlowState &F, uint64_t Tick, uint32_t Src, uint32_t Dst, uint16_t Class = 0)\n{\n\tF.Demand.push_back(FSpawnReq{Tick, Class, Src, Dst});\n} \u2014 no Topology argument, no existence check; FlowSpawn likewise constructs unconditionally",
+    "detail": "A demand entry naming a nonexistent node spawns a packet that waits forever (EqualCostHops fails), is never culled (cull drops only Delivered), and rides the serialized state. Latent: current callers pass fixture ids.",
+    "recommended_fix": "When demand becomes external (3.1 director/catalogs), validate Src/Dst existence fail-fast at FlowSeedDemand entry, mirroring ValidateDraw."
+  }
+]

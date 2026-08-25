@@ -1,0 +1,32 @@
+[
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "leak",
+    "title": "motion-strip prime render discards capture_frame's image without UnloadImage",
+    "location": "harness/motion_strip.odin:146",
+    "evidence": "harness/motion_strip.odin:143-148 (the internal prime render — the returned rl.Image is dropped):\n\t\t\tif (win_start - start_ms) % step_ms != 0 || win_start < start_ms {\n\t\t\t\talpha: f32 = 1.0\n\t\t\t\tif !snapshot && !paused {\n\t\t\t\t\talpha = 0.0\n\t\t\t\t}\n\t\t\t\tcapture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,\n\t\t\t\t\tstate.health_enabled, sim_tick, state.era, state.seed, nil, alpha)\n\nharness/motion_strip.odin:193-197 (the exported path, by contrast, unloads):\n\timg := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,\n\t\tstate.health_enabled, sim_tick, state.era, state.seed, nil, alpha)\n\tpath := fmt.tprintf(\"%s/%s-%06dms.png\", outdir, demo_name, ms)\n\trl.ExportImage(img, strings.clone_to_cstring(path, context.temp_allocator))\n\trl.UnloadImage(img)",
+    "detail": "capture_frame returns LoadImageFromScreen (a heap-allocated 1280×720 buffer). Every prime tick leaks ~3.5MB; a strip window primes ~17+ times. Every other capture_frame call site (harness/goldens.odin) unloads.",
+    "recommended_fix": "Bind and free the prime image: `img := capture_frame(...); rl.UnloadImage(img)` — mirroring render_strip_frame."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "untestable-gate",
+    "title": "a11y_reduced golden cannot exercise the new trail echo-off gate — trail_n is always 0 in golden captures",
+    "location": "app/render/view.odin:1349",
+    "evidence": "app/render/view.odin:1306-1308 (trail_n only becomes non-zero on the interp path):\n\t\tif interp_alpha < 1.0 {\n\t\t\tpos, trail_world, trail_n = packet_interp_pos(v, topo, p, pos, tick, interp_alpha)\n\t\t}\napp/render/view.odin:1349:\n\t\tif trail_n > 0 && !v.reduced_motion {\nharness/run.odin:489-490 (golden capture — no interp_alpha argument, so the default 1.0 applies):\n\t\t\t\timg := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,\n\t\t\t\t\tstate.health_enabled, sim_tick, state.era, state.seed, prev)",
+    "detail": "The claim that the a11y_reduced golden exercises echo-off is false as stated: its T2 captures render snapshot-exact, so the `!v.reduced_motion` branch never evaluates. The reduced pin is verified only for pulse_read; the trail gate is app/motion-strip-only.",
+    "recommended_fix": "Verify echo suppression via `harness motion-strip a11y_reduced <win>` (interp mode applies a11y pins) asserting zero echo pixels, or a unit test of the predicate."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "duplication",
+    "title": "run_motion_strip re-implements run_demo's wall-tick walk + action-log command batching",
+    "location": "harness/motion_strip.odin:126",
+    "evidence": "harness/motion_strip.odin:124-133:\n\t\tpaused := paused_at(cfg.pauses[:], w, hz)\n\t\tif !paused {\n\t\t\tsim_tick += 1\n\t\t\tbatch := make([dynamic]pp.Command, 0, 4, context.temp_allocator)\n\t\t\tfor cmd in state.action_log {\n\t\t\t\tif cmd.apply_tick == sim_tick {\n\t\t\t\t\tappend(&batch, cmd)\n\t\t\t\t}\n\nharness/run.odin:413-420 (the blessed-timeline original):\n\t\t} else {\n\t\t\tsim_tick += 1\n\t\t\tbatch := make([dynamic]pp.Command, 0, 4, context.temp_allocator)\n\t\t\tfor cmd in state.action_log {\n\t\t\t\tif cmd.apply_tick == sim_tick {\n\t\t\t\t\tappend(&batch, cmd)\n\t\t\t\t}\n\t\t\t}\n\t\t\tpp.step(&state, sim_tick, batch[:], cat)",
+    "detail": "The blessed sim-timeline walk now exists in two copies. If run_demo's loop later changes (new command source, pause semantics), the strip silently diverges from the T1-pinned timeline and its evidence misleads.",
+    "recommended_fix": "Extract a shared step-once helper (paused_at + action_log batch + pp.step + event clear) used by run_demo, replay, and run_motion_strip."
+  }
+]

@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "odn5-silent-default",
+    "title": "jint_strict silently defaults non-numeric JSON types (string/bool/null/object/array) instead of failing fast",
+    "location": "core/catalog.odin:564-571 (consumers: 231, 310-315, 354, 382-384, 405-407)",
+    "evidence": "jint_strict :: proc(o: json.Object, key: string, def: i32) -> (i32, bool) {\n\tif v, ok := o[key]; ok {\n\t\t#partial switch x in v {\n\t\tcase json.Integer: return i32(x), true\n\t\tcase json.Float:   return 0, false\n\t\t}\n\t}\n\treturn def, true\n}\n\nif de2.volume < 0 || de2.demand_weight < 1 || lane < 0 || lane > 2 {\n\treturn {\"demand.json\", jstr(eeo, \"class_id\"), \"entry volume/demand_weight/default_lane invalid\"}",
+    "detail": "json.String/Bool/Null/Object/Array match no switch case and fall through to `return def, true` (empirically: \"volume\":\"high\" -> (0,true)). Volume 0 passes the <0 check, so the spec silently never spawns, an ODN-5 silent default; r1 fix #9 covered only the Float path.",
+    "recommended_fix": "In jint_strict, add a default `case: return 0, false` (or reject any non-JSON-Integer type) so string/bool/null fields fail fast instead of silently defaulting; add negative rows."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "odn5-silent-drop",
+    "title": "Non-object rows silently skipped (or_continue) in the new packet_types/demand loaders — malformed rows vanish without a named error",
+    "location": "core/catalog.odin:286, 353, 370, 399",
+    "evidence": "for ev in entries {\n\teo := ev.(json.Object) or_continue\n\nfor ev in eras {\n\teo := ev.(json.Object) or_continue\n\nfor ee in es {\n\teeo := ee.(json.Object) or_continue\n\nfor se in sps {\n\tseo := se.(json.Object) or_continue",
+    "detail": "A non-object element (a stray number) in eras/entries/set_pieces is silently dropped: `{\"era\": 1, \"entries\": [42]}` loads clean; the `empty` rejection fires only when ALL rows are gone. Malformed demand changes spawn behavior instead of aborting per ODN-5.",
+    "recommended_fix": "Replace `or_continue` with a named rejection (e.g. `return {\"demand.json\", \"eras\", \"era row must be an object\"}`) in the three demand loops and the packet_types entries loop."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "leak-regression",
+    "title": "r1 leak fix landed wrong: load_demo_replay dropped the demo.nodes/draws/spawns deletes, now leaking those arrays per call",
+    "location": "harness/run.odin:308-309",
+    "evidence": "\tdelete(demo.demolishes) // r1 note: the sibling loaders leaked this too\n\tdelete(demo.captures)\n\n(harness/demo.odin:94-98 — all Demo arrays are default-allocator:)\n\td.nodes = make([dynamic]Node_Spawn, 0, 8, context.allocator)\n\td.draws = make([dynamic]Draw_Intent, 0, 8, context.allocator)\n\td.spawns = make([dynamic]Spawn_Intent, 0, 8, context.allocator)",
+    "detail": "The v2 base deleted demo.nodes/draws/spawns here; the r1 fix replaced those deletes with delete(demo.demolishes) instead of adding it, so those three arrays now leak on every call (drift-check: once per demo; run_replay: per invocation). Bounded one-shot CLI leak.",
+    "recommended_fix": "Restore the removed deletes: `delete(demo.nodes); delete(demo.draws); delete(demo.spawns)` alongside `delete(demo.demolishes); delete(demo.captures)`."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "int-overflow",
+    "title": "effective_volume i32 multiply overflows for accepted large set-piece multipliers -> spec silently stops spawning",
+    "location": "core/demand.odin:72-80 (check at core/catalog.odin:415, guard at core/flow.odin:200-201)",
+    "evidence": "effective_volume :: proc(plan: ^Pressure_Plan, class: u16, base: i32) -> i32 {\n\tv := base\n\tfor idx in plan.active_sp {\n\t\tsp := &plan.era_sp[idx]\n\t\tif sp.class == class {\n\t\t\tv *= sp.multiplier\n\t\t}\n\t}\n\treturn v\n\n\tif mult < 1 || st < 0 || dt < 1 || fl < 0 {\n\t\treturn {\"demand.json\", sp.id, \"set-piece multiplier/tick fields invalid\"}\n\n\t\tvol := effective_volume(&plan, spec.class, spec.volume)\n\t\tif vol <= 0 { continue }",
+    "detail": "multiplier is unbounded (only <1 rejected); base 2 x 2^30 wraps i32 negative, so `vol <= 0` silently skips the class all window. Accepted data yields silent no-spawn instead of fail-fast. Unreachable with shipped data (10x).",
+    "recommended_fix": "Bound multiplier (e.g. reject > 1_000_000 or check v > max_i32/base before the multiply) in the set-piece loader, or compute effective_volume in u64 with a spawn cap."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "allocator-leak",
+    "title": "New packet_types/demand loaders leak the parsed JSON value trees (no json.destroy_value)",
+    "location": "core/catalog.odin:278, 344",
+    "evidence": "\t\tv, e := json.parse(src.packet_types, parse_integers = true)\n\t\tv, e := json.parse(src.demand, parse_integers = true)\n\n(tracking-allocator output from `odin test core` at this sha:)\n+++ leak  7B @ 0xCF4898996 [catalog.odin:278:catalogs_load()]\n+++ leak 11B @ 0xCF48BE310 [catalog.odin:344:catalogs_load()]",
+    "detail": "json.parse allocates the value tree on the default allocator; neither new block calls json.destroy_value, so every catalogs_load leaks both trees (~2.5KB). Pattern pre-exists at 211/251/434, but the new blocks add two more; the negative suite triggers them ~50x per run.",
+    "recommended_fix": "`defer json.destroy_value(v)` after each json.parse in catalogs_load (all five blocks, or at least the new 278/344 sites) to close the leak."
+  }
+]

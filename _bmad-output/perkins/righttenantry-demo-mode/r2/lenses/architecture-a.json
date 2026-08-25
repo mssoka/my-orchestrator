@@ -1,0 +1,82 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "demo-boot",
+    "title": "Demo edit deep-link still never fetches its payload — r1 W11 fix didn't bite",
+    "location": "client/src/client.gleam:5823",
+    "evidence": "fn demo_entry_effects(store: DemoStore, route: Route) -> Effect(Msg) {\n  let base = [demo_api.fetch_notifications(store, ApiReturnedNotifications)]\n  let route_eff = case route {\n    routes.Demo | routes.Dashboard -> [\n      demo_api.list_vacancies(store, ApiReturnedDashboardData),\n    ]\n    routes.VacancyDetail(id) | routes.VacancyHandoff(id) -> [\n      demo_api.get_detail(store, id, ApiReturnedVacancyDetail),\n      demo_api.fetch_leaderboard(store, id, ApiReturnedLeaderboard),\n    ]\n    routes.ApplicationDetail(vid, aid) -> [\n      demo_api.fetch_application_detail(\n    routes.ArchivedVacancies -> [\n    routes.Comparison(vid) -> [\n    _ -> []\n\n// enter_demo (client.gleam:5806-5810) sets only the id, with a comment claiming the payload loads:\n          // A deep-linked demo edit page needs its id set so the\n          // get_for_edit response is accepted and the form can load.\n          vacancy_edit_id: edit_id,\n// model.gleam:606: vacancy_edit_loading: False (initial default, enter_demo never sets it)\n// vacancy_edit.gleam:22-28: case model.vacancy_edit_loading { True -> view_loading_skeleton()  False -> ...view_form(model) }",
+    "detail": "No VacancyEdit arm exists — the `_ -> []` catch-all swallows it, so refreshing /vacancies/v-maples/edit boots demo with an empty form. The boot route→fetch map is a third hand-maintained copy beside handle_browser_change and demo_update's AppRequested* arms; it drifted exactly as r1 W11 predicted.",
+    "recommended_fix": "Add `routes.VacancyEdit(id) -> [demo_api.get_for_edit(store, id, ApiReturnedVacancyForEdit)]` to demo_entry_effects and set vacancy_edit_loading: True in enter_demo for that route."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "demo-refcheck",
+    "title": "Demo substitute still discards the typed referee contact (r1 W22 half-landed)",
+    "location": "client/src/demo/demo_store.gleam:1377",
+    "evidence": "// demo_store.gleam apply_refcheck:\n    \"substitute\" ->\n      ReferenceCallDetail(\n        ..call,\n        contact_name: None,\n        contact_email: None,\n        contact_phone: None,\n      )\n\n// the real flow (client.gleam:7446-7452) persists the typed trio:\n                  reference_checks_api.substitute_reference(\n                    vid,\n                    aid,\n                    call,\n                    name,\n                    email,\n                    phone,\n                    csrf,\n                    on_response,\n                  )\n// demo_update.gleam UserSavedRefcheckEdit dispatches fire_demo_refcheck(model, call_id, \"substitute\") — no contact payload is threaded (demo_api.refcheck_action takes no contact args).",
+    "detail": "Dispatch now distinguishes substitute from correct (the confusing correction_cycles bump is gone), but the r1 complaint's second half persists: the landlord's typed name/email/phone are wiped to None instead of stored, so the row loses its contact entirely — diverging from the real substitute semantics the demo mirrors.",
+    "recommended_fix": "Thread the typed trio from model.refcheck_edit through demo_api.refcheck_action into apply_refcheck's \"substitute\" arm, setting contact_name/email/phone to the typed values."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "demo-reset",
+    "title": "Reset demo still strands non-dashboard pages on a spinner — r1 W13 fix didn't bite",
+    "location": "client/src/demo/demo_update.gleam:642",
+    "evidence": "fn reset_demo(model: Model) -> #(Model, Effect(Msg)) {\n  case demo_store.seed() {\n    Ok(store) -> {\n      demo_analytics.capture_event(demo_analytics.demo_reset)\n      let #(vacancies, stats) = demo_store.dashboard(store)\n        Model(\n          ..model,\n          demo_store: Some(store),\n          vacancy_detail: NotAsked,\n          leaderboard: NotAsked,\n          application_detail: NotAsked,\n          comparison_details: NotAsked,\n          archived_vacancies: NotAsked,\n        ),\n        demo_api.fetch_notifications(store, ApiReturnedNotifications),\n// no modem.push / route change anywhere in reset_demo\n// vacancy_detail.gleam:25-27: case model.vacancy_detail {\n      NotAsked | Loading -> view_loading()",
+    "detail": "Reset refetches only notifications; on a detail/archived/comparison route every surface goes NotAsked with no refetch effect and no navigation, so the page renders view_loading() indefinitely. The briefing's required fold \"reset navigates home\" did not land.",
+    "recommended_fix": "Push /demo from reset_demo (modem.push) or re-run demo_entry_effects(store, model.route) so the current route's data refetches after the reseed."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "lint",
+    "title": "lint_demo_network.py allowlists 4 helpers as demo-branched that contain no demo branch",
+    "location": "scripts/lint_demo_network.py:93",
+    "evidence": "# Helpers that branch on demo_mode internally (verified to carry the store).\nDEMO_BRANCHED_HELPERS = {\n    \"submit_vacancy\",\n    \"handle_vacancy_update\",\n    \"handle_application_opened\",\n    \"dispatch_status_update\",\n    \"refetch_refcheck_effect\",\n    \"fire_refcheck_slot_action\",\n    \"fire_refcheck_call_action\",\n    \"save_refcheck_edit\",\n}\n\n// verified per-helper demo_mode reference counts in client.gleam: submit_vacancy=1, handle_vacancy_update=2, handle_application_opened=1, refetch_refcheck_effect=1, but dispatch_status_update=0, fire_refcheck_slot_action=0, fire_refcheck_call_action=0, save_refcheck_edit=0.\n// dispatch_status_update body (client.gleam:6880-6895) fires unguarded:\n    application_api.update_application_status(\n      vid, aid, new_status, model.csrf_token, ApiReturnedStatusUpdate,\n    )\n// save_refcheck_edit body fires reference_checks_api.correct_reference (7428) / substitute_reference (7446) unguarded.",
+    "detail": "4 of 8 allowlisted helpers do not branch on demo_mode; their real api calls are safe only because demo_update intercepts the calling arms — a separately maintained list the lint trusts. Dropping one interception arm would escape the lint entirely: a vacuous class in the pillar-1 pin.",
+    "recommended_fix": "Give the four helpers real demo_mode branches (as refetch_refcheck_effect does), or reclassify them under the interception-trust exemption with an honest comment."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "demo_api.check_session is an orphaned mirror (0 call sites)",
+    "location": "client/src/demo/demo_api.gleam:66",
+    "evidence": "pub fn check_session(\n  store: DemoStore,\n  on_response: fn(Result(AuthResponse, ApiError)) -> msg,\n) -> Effect(msg) {\n  deliver(\n    on_response,\n    AuthResponse(\n      landlord: demo_store.landlord(store),\n      csrf_token: \"demo-csrf-token\",\n\n// grep 'demo_api.check_session' across client/src + client/test (excluding demo_api.gleam itself): 0 hits. Demo boot seeds auth directly in enter_demo; ApiReturnedSession is demo-guarded in client.gleam:1028-1032.",
+    "detail": "r1 N28 class residue: the refcheck mirrors were cleaned up, but check_session ships dead — nothing dispatches it, and it keeps the auth_api import alive in demo_api.",
+    "recommended_fix": "Delete demo_api.check_session (and the auth_api import if now unused)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "dup",
+    "title": "download_timeout and store_of still duplicated between client.gleam and demo_update.gleam (r1 N31)",
+    "location": "client/src/demo/demo_update.gleam:730",
+    "evidence": "// demo_update.gleam:728-735:\n/// 90s download timeout — mirrors client.gleam's `download_timeout` so a\n/// slow static asset (unlikely) still surfaces the brand-voice toast.\nfn download_timeout(id: String) -> Effect(Msg) {\n  effect.from(fn(dispatch) {\n    global.set_timeout(90_000, fn() {\n\n// client.gleam:6844-6846 (the parameterized original):\nfn download_timeout(analysis_id: String, delay_ms: Int) -> Effect(Msg) {\n  effect.from(fn(dispatch) {\n    global.set_timeout(delay_ms, fn() {\n\n// demo_update.gleam:629 fn store_of(model) duplicates client.gleam:5874 fn demo_store_of(model) — identical unwrap-or-seed-or-empty shape.",
+    "detail": "The r1 note is unfixed and twofold: two private mirror helpers (download_timeout, store_of) each drift-prone across modules — change the real timeout or seeding policy and the demo copy silently diverges.",
+    "recommended_fix": "Export one parameterized download_timeout from client.gleam and one store accessor; reuse both from demo_update."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "demo-storage",
+    "title": "Demo still writes comparison/sweep-nudge state to real web storage (r1 N24 unfixed)",
+    "location": "client/src/client.gleam:3532",
+    "evidence": "    UserToggledComparison(id) -> {\n      let ids = model.comparison_ids\n      case list.contains(ids, id) {\n        True -> {\n          let new_ids = list.filter(ids, fn(x) { x != id })\n          save_comparison_ids(new_ids)\n// client.gleam:4941-4943: save_dismissed_sweep_nudges(set.to_list(updated_dismissed)) — no demo branch\n// client.gleam:5411/5416 (handle_browser_change): save_comparison_ids([]) — no demo branch\n// client.gleam demo_entry_effects: routes.Comparison(vid) -> [demo_api.fetch_comparison(store, vid, load_comparison_ids(), ...)] — demo boot reads real sessionStorage",
+    "detail": "Carry-forward: comparison selections and sweep-nudge dismissals still persist from demo mode under the real storage keys, and demo boot hydrates whatever a real session left there — demo ids (a-aoife) can ride into a real comparison tray and vice versa.",
+    "recommended_fix": "Guard the save_* calls and the handle_browser_change resets with model.demo_mode, and pass [] instead of load_comparison_ids() in demo_entry_effects."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "copy",
+    "title": "Demo banner headline still inline while its copy.gleam constant ships unused",
+    "location": "client/src/components/demo_banner.gleam:42",
+    "evidence": "// demo_banner.gleam (message paragraph):\n          html.text(\n            \"Demo - nothing is saved. This is mock data, refreshed every visit.\",\n          ),\n\n// copy.gleam:382:\npub const demo_banner_message: String = \"Demo - nothing is saved. This is mock data, refreshed every visit.\"\n\n// grep 'demo_banner_message' outside copy.gleam: 0 references. The CTA/reset labels DID move (copy.demo_banner_cta / copy.demo_banner_reset are used).",
+    "detail": "r1 W15 residue: two of three strings moved to copy.gleam, but the banner headline — the demo's most visible landlord-facing string — is inline while its identical constant is dead. Two sources of truth; AGENTS' copy-file rule violated.",
+    "recommended_fix": "Render copy.demo_banner_message in demo_banner.gleam and delete the inline literal."
+  }
+]

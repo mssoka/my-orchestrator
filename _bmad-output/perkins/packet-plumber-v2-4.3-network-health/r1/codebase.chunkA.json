@@ -1,0 +1,72 @@
+[
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "orphan-data",
+    "title": "balance.json health.win_uptime_pct is loaded and validated but never consumed by any sim code",
+    "location": "core/catalog.odin:234",
+    "evidence": "core/catalog.odin:234:\n\twin_uptime_pct:          i32, // the surge-survival win threshold (1..100)\n\ncore/win_lose.odin:62-66:\n\tif state.surge_win_pct != 0 && state.health.surge_done {\n\t\ttotal := state.health.surge_delivered + state.health.surge_dropped\n\t\tif total > 0 {\n\t\t\tuptime := state.health.surge_delivered * 100 / total\n\t\t\tif uptime >= u64(state.surge_win_pct) {\n\nrg \"win_uptime_pct\" (repo, excl. goldens) hits ONLY: data/balance.json, core/catalog.odin (field def :234, load :719, validation :735-736), core/catalog_test.odin, core/determinism_test.odin, and _bmad-output docs. The win threshold actually used is the run-setup flag `state.surge_win_pct` (set from harness/demo.odin surge_win_pct) — changing the balance.json value has zero effect on any run.",
+    "detail": "Dead tuner-facing config: a balance tuner changing win_uptime_pct sees no behavior change; the real threshold lives in .dem run setup. Violates the ODN-5 single-source intent the comment claims.",
+    "recommended_fix": "Either default run surge_win_pct from balance.health.win_uptime_pct (single source), or drop the field and its validation from the catalog."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "recharge_pct_per_tick=0 (validation-permitted) emits no-change Meter_Changed every tick and the meter can never return to 100",
+    "location": "core/health.odin:346-354",
+    "evidence": "core/health.odin:346-354:\n\t} else if !any_breach && h.meter_pct < 100 {\n\t\t// recharge: every class healthy\n\t\trecharge := u32(bal.recharge_pct_per_tick)\n\t\tif h.meter_pct + recharge > 100 {\n\t\t\th.meter_pct = 100\n\t\t} else {\n\t\t\th.meter_pct += recharge\n\t\t}\n\t\tevent_emit_meter(state, tick, h.meter_pct)\n\t}\n\ncore/catalog.odin:732-733:\n\t\tif b.health.recharge_pct_per_tick < 0 {\n\t\t\treturn {\"balance.json\", \"health.recharge_pct_per_tick\", \"must be >= 0\"}",
+    "detail": "Validation allows 0. With recharge 0 and meter<100, `h.meter_pct += 0` then emits Meter_Changed with an unchanged pct every healthy tick forever, and the \"recharges when healthy\" contract (header line 44) is unreachable.",
+    "recommended_fix": "Validate recharge >= 1, or skip the Meter_Changed emission (and the +=0 branch) when recharge is 0."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "boundary",
+    "title": "A severity-0 class's Grace_Expired is silently swallowed when drain stays 0",
+    "location": "core/health.odin:283",
+    "evidence": "core/health.odin:283:\n\t\t\t\t\tappend(&expired, u16(c))\n\ncore/health.odin:329:\n\tif drain > 0 {\n\ncore/catalog.odin:449:\n\t\t\tif hg < 0 || hd < 0 {\n\t\t\t\treturn {\"packet_types.json\", pt.id, \"health_grace_ticks/health_drain_pct_per_tick must be >= 0\"}",
+    "detail": "health_drain_pct_per_tick=0 is valid (only negatives reject). Such a class's expiry lands in `expired`, but with drain==0 and any_breach==true neither branch emits — Grace_Expired is dropped, contradicting the header contract \"expiry while still breached emits Grace_Expired{class}\".",
+    "recommended_fix": "Emit the collected Grace_Expired events whenever `expired` is non-empty and the meter did not empty, independent of drain>0; or require severity >= 1."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "test-quality",
+    "title": "Tautological assertion in test_health_hysteresis_band_and_enter pins nothing",
+    "location": "core/health_test.odin:250-251",
+    "evidence": "\ttesting.expectf(t, s.health.grace[0].grace_left > 0 || s.health.grace[0].grace_left == 0,\n\t\t\"grace cell present for email\")",
+    "detail": "`x > 0 || x == 0` is true for every u32, so the expectf can never fail — the \"durable contract\" test asserts nothing about the grace cell.",
+    "recommended_fix": "Replace with a real pin, e.g. `grace_left` equals the class's catalog grace minus ticks-breached, or at minimum a bare `> 0`."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "consistency",
+    "title": "balance.json health block uses truncating jint while the same story's packet_types health fields use rejecting jint_strict",
+    "location": "core/catalog.odin:714",
+    "evidence": "core/catalog.odin:714:\n\t\t\tb.health.window_ticks = jint(hobj, \"window_ticks\", -1)\n\ncore/catalog.odin:928:\n\t\tcase json.Float:   return i32(x)\n\ncore/catalog.odin:425:\n\t\t\thg, okhg := jint_strict(eo, \"health_grace_ticks\", 0)",
+    "detail": "jint silently truncates decimals, so balance.json `\"drain_cap_pct_per_tick\": 2.5` loads as 2 with no error, while packet_types.json decimals reject — inconsistent with the 4.3 strict-int bar the diff's own comments claim.",
+    "recommended_fix": "Use jint_strict for the health block (missing-key still yields the -1 default, since jint_strict returns (def, true) when absent)."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "comment-drift",
+    "title": "test_health_drain_max_not_sum_e16 comments contradict the fixture's actual grace values",
+    "location": "core/health_test.odin:397",
+    "evidence": "core/health_test.odin:119-120:\nhealth_catalog_fast_grace :: proc(cat: ^Catalogs) {\n\tcat.packet_types[0].health_grace_ticks = 300\n}\n\ncore/health_test.odin:397:\n\thealth_catalog_fast_grace(cat) // both classes' grace 50 (the streaming\n\ncore/health_test.odin:407:\n\tstep_n(&s, 410, cat) // streaming drains from ~405; email (grace 10) from ~100",
+    "detail": "The fixture sets email's grace to 300 (streaming stays 400), but the comments claim \"both classes' grace 50\" and \"email (grace 10)\" — misdescribing the E16 assertion window in a durable-contract test.",
+    "recommended_fix": "Correct the comments to the actual 300/400 graces and the real drain-start ticks (~390/~405)."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "boundary",
+    "title": "health_update divides by window_ticks with no zero-guard; safety rests solely on catalogs_load validation",
+    "location": "core/health.odin:215",
+    "evidence": "core/health.odin:215:\n\t\tslot := int(c) * int(h.window_ticks) + int(tick % win)\n\ncore/health.odin:185:\n\twin := u64(h.window_ticks)\n\ncore/determinism_test.odin:63-64:\n\t// 4.3: the Network Health numbers (mirrors data/balance.json `health`) —\n\t// the window must be non-zero or every tick's ring index divides by zero.",
+    "detail": "The only protection is load-time validation (window 1..10000); a hand-built Catalogs fixture (the established test convention) with window 0 traps on `tick % win`. The file guards beyond-catalog rows defensively but not this.",
+    "recommended_fix": "Add a zero-window guard in health_update/health_ensure (return without measuring, like the n==0 E24 return)."
+  }
+]

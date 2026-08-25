@@ -1,0 +1,1481 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-v2-estate-spawning.md b/_bmad-output/implementation-artifacts/spec-v2-estate-spawning.md
+new file mode 100644
+index 0000000..9cd5a6a
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-v2-estate-spawning.md
+@@ -0,0 +1,156 @@
++---
++title: 'v2 estate spawning — strict cluster placement for director-spawned terminals'
++type: 'feature'
++created: '2026-08-22'
++status: 'done' # draft | ready-for-dev | in-progress | in-review | done
++review_loop_iteration: 0 # incremented by step-04 before each review loopback
++baseline_commit: '4ccc8c75a7642c76079dd9a480e83a429baec4d7'
++context:
++  - '{project-root}/project-context.md'
++  - '{project-root}/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md'
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** User ruling 2026-08-21 (~23:5xZ play session): director-spawned terminals still look randomly scattered — "not so great looking topology". The 5.12 soft bias (750‰ attach coin, cap 8) leaves too many strays and estates that read as noise; the user wants most nodes NEXT TO each other, like an estate, and after ~5 nodes a NEW area elsewhere, leaving routing room between sections.
++
++**Approach:** STRICT ESTATE (shape a from the briefing — the simpler one that satisfies both acceptance maps deterministically): every growth spawn is exactly one of two classes — ATTACH (an eligible cluster exists → candidate within adjacency radius of a member) or SEED (no eligible cluster → fresh area at ≥ new-area seed distance from every terminal, still in the outward-from-mesh annulus). Both classes keep the full E31 envelope. Existing 5.12 machinery (derived cluster view, attach draws, rejection sampling) is reused; the delta is the seed-distance predicate, the cap default 8→5, attach probability 750→1000, and the re-pinned tests + deliberate golden re-bless.
++
++## Boundaries & Constraints
++
++**Always:**
++- E31 spawn validity is the hard contract: bounds + min separation from every node/pipe + connectable-within-span; bounded rejection sampling from the same rng stream; deterministic, seed-derived, no serialization/LOG_VERSION change; growth spawns TERMINALS only, outward from the player-placed mesh, waits without a junction (story 5.1 / 3.5).
++- All tunables named in balance.json (ODN-5), loader fail-fast on missing/invalid keys; integer-only (ODN-10); no map iteration in core.
++- Cluster cap default 5 (`max_members`), new-area seed distance + adjacency radius (`radius_tiles`) as named knobs; a one-line balance.json change moves the cap.
++- Draw ORDER/counts per attempt unchanged where possible; the acceptance-pin tests update to the new policy (never deleted).
++
++**Ask First:**
++- None expected. If the strict contract cannot satisfy E31+connectability on the current map geometry, HALT rather than bending E31.
++
++**Never:**
++- No spawn-timing/cadence changes (`terminal_spawn_interval_ticks` stays 80), no node-type visual identity work (out of scope by the briefing), no routing semantics, no serialization/LOG_VERSION, no `terminal_min_sep_tiles` change (E31 packing floor).
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| Fresh map, first spawn | No terminals yet | SEED: annulus draw, seed-distance filter vacuous, E31 | bounded rejection → skip window |
++| Eligible cluster exists | Any cluster size < cap | ATTACH: within radius of a member, E31 | rejected → re-draw (bounded) → skip window deterministically |
++| All clusters at cap | Every cluster ≥ cap | SEED: ≥ seed_dist from every live terminal, within span of a junction | rejected → re-draw (bounded) → skip window |
++| Dense map | Budget exhausted (8 attempts) | No spawn this window (deterministic, no stall) | N/A |
++| attach_prob < 1000 (user opt-in) | Coin misses | SEED family (the 08-17 minority-isolate mix, now seed-distance-respecting) | N/A |
++| No junction | Router not yet placed | Growth waits (unchanged) | N/A |
++| Malformed growth_groups block | Missing/invalid key in balance.json | Fail-fast load error naming the key | N/A |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `data/balance.json` -- `growth_groups` block: `bias_prob_permille` 750→1000 (attach probability; 1000 = strict), `max_members` 8→5 (the cap), NEW `new_area_seed_tiles` (default 10), `min_members` 3 / `radius_tiles` 5 / `member_weight_permille` 250 unchanged; comments carry the 08-21 ruling + supersession note.
++- `core/catalog.odin` -- `Growth_Groups_Balance` struct (line ~258) + loader parse/validate (~line 861): bias range 1..999 → 1..1000 (0 still invalid); parse + validate the new key (must exceed `radius_tiles`); update the doctrine comments (the "NOT 100%" load-time bar is superseded at the default, kept as a data option).
++- `core/growth.odin` -- `growth_plan_demand` (~line 460): attach family unchanged (coin → eligible cluster → anchor → dir → dist ∈ [min_sep, radius]); the coin-miss AND no-eligible-cluster branches become the SEED family: existing annulus draw (router + dir + dist ∈ [GROWTH_OUT_MIN, span]) + NEW predicate `growth_seed_sep_ok` (candidate ≥ `new_area_seed_tiles` from every live terminal, i64 dist², ODN-10). Comments updated to the 08-21 ruling.
++- `core/catalog_test.odin` -- `BAL_VALID` fixture (~line 48) + the 5.12 loader rows (~line 651): "bias 1000" flips error→valid; new rows for the new key (missing / ≤ radius / negative).
++- `core/growth_test.odin` -- re-pin `test_groups_estates_and_isolated` to the strict audit (every spawn attach-or-seed; estates form; no stray isolates — every singleton is a fresh seed); new pure-unit pin for `growth_seed_sep_ok`; `test_groups_view_and_scale`, `test_groups_replay_byte_identical`, `test_growth_outward_bias_annulus`, E31 + determinism pins adapt (mechanism assertions survive; seed-dependent outcomes re-verified).
++- `_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md` -- append the 2026-08-21 canon entry (estate ruling + the 08-17 "NOT 100%" supersession flag), mirroring the 2026-08-19 entry style.
++- `goldens/` + `demos/growth.dem` + `docs/captures/` -- the deliberate re-bless (catalog_hash folds every balance byte) + before/after captures for the PR body (same seed, same tick, old vs new defaults).
++- `harness/main.odin`, `tools/harness.sh`, `tools/ci-local.sh` -- run/save verbs + the 10-gate suite (read-only: no changes expected).
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `data/balance.json` -- retune `growth_groups` (bias 1000, cap 5) + add `new_area_seed_tiles: 10` + rewrite the block comment (08-21 ruling, supersession note) -- the named tunables are the user's fun-test surface.
++- [x] `core/catalog.odin` -- struct field + loader parse + validation (`> radius_tiles` + the 08-21 map-diameter bound) + comment updates -- fail-fast named-knob loading.
++- [x] `core/growth.odin` -- `growth_seed_sep_ok` predicate + SEED family wiring + ruling comments (+ `growth_attach_radius_ok` + the live-terminal anchor guard — the strict "no strays" closures the acceptance audit requires) -- the strict attach-or-seed contract inside E31.
++- [x] `core/catalog_test.odin` -- fixture + loader rows for the new range/key -- loader pins updated to the new policy.
++- [x] `core/growth_test.odin` -- strict-audit re-pin + new predicate unit pins + adapt surviving pins -- acceptance as durable tests (updated, never deleted).
++- [x] `_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md` -- append the 08-21 canon entry -- the canon tension is flagged in-repo, not just in the PR.
++- [x] `goldens/` -- deliberate `harness save` re-bless (fold-check + splice proof per the re-bless discipline) -- byte-identical replay on the new stream.
++- [x] `docs/captures/v2-estate-spawning/` + PR body -- before/after spawn maps (rendered captures + coordinate dump, same seed/tick) + the one-line cap change (8→5) demonstrated -- the briefing's acceptance evidence.
++
++**Acceptance Criteria:**
++- Given a growing map with a player-placed router at default tunables, when N spawn windows run, then every spawn is auditable as ATTACH (within `radius_tiles` of a then-live terminal) or SEED (≥ `new_area_seed_tiles` from every then-live terminal) — no third class, no strays.
++- Given an estate at the cap (5), when growth continues, then the estate stops extending and a SEED spawns ≥ seed distance away (and still within connect span).
++- Given `max_members: 8` in balance.json (one-line change), when the same run repeats, then estates grow to 8 — demonstrated in the PR body.
++- Given the new defaults, when `harness run` + `tools/ci-local.sh --mac` execute, then all 10 gates green (T1 + T2 + replay byte-identical + drift + input-parity + lint).
++- Given a malformed `growth_groups` block (missing `new_area_seed_tiles`, seed_dist ≤ radius, bias 0/1001), when the catalog loads, then it fails fast naming the key.
++
++## Spec Change Log
++
++## Design Notes
++
++**Canon flag (briefing rule 1 — flagged, not silently rewritten):** the 08-21 ruling's acceptance ("no lone-node scatter", cap ~5, new areas) supersedes the 08-17 "estates, but NOT 100% of the time" mix at the DEFAULT (attach 1000‰). The 08-17 doctrine is not deleted: `bias_prob_permille < 1000` restores the minority-isolate mix as a data option. The spatial-lane canon (2026-08-12, commits 2e3acab/8ece056) governs PIPE lane rendering — node placement does not touch it; no tension. Both flags land in the decision-log entry + PR body.
++
++**Why strict over emergent:** the emergent shape (b) is the current 5.12 mechanism — probabilistic strays can't satisfy "no lone nodes far from any cluster" deterministically. Strict (a) satisfies both acceptance maps by construction, matches "after ~5 nodes, go to a new area" literally, and reuses the existing attach machinery — the delta is two predicates + defaults. Draw counts per attempt are unchanged (the strict predicates are rejection predicates, like E31), so the rng interleaving shifts only through the acceptance outcome — re-bless is the deliberate, cause-documented 08-21 fold.
++
++**Implementation-time closures (beyond the spec's one-predicate delta — forced by the acceptance's "no third class, no strays", cause-documented in code + decision-log + PR body):** (1) `growth_attach_radius_ok` — the attach candidate must sit within the EUCLIDEAN radius of its anchor member; the 5.12 compass draw's diagonal directions placed candidates at up to dist×√2 (5.7–7.1 tiles) — outside radius, inside the seed floor: the exact third class (measured pre-fix: 7/19 = 37% of growth.dem spawns were strays under the strict lens). (2) The attach anchor is a LIVE TERMINAL only — the derived view leaves dead slots' id at 0, colliding with cluster 0's id (the fixture residential at slot 0), so a raw id match could anchor an attach on a ROUTER (a pre-existing 5.12 defect invisible to the old pins). Both are zero-draw rejection predicates; the anchor guard changes the eligible member set (no rng draws). KEEP both — the strict audit tests (`test_groups_estates_strict`, `test_groups_strict_audit_with_fixture`) pin them.
++
++**Seed distance default 10:** 2× the adjacency radius — visually distinct sections on the 40×30-tile map while staying within the era-3 connect span (18) for E31. The rejection budget keeps it honest on dense maps (deterministic skip, no stall).
++
++## Verification
++
++**Commands:**
++- `tools/ci-local.sh --fast` -- expected: lint + all unit tests green.
++- `tools/harness.sh run` -- expected: all goldens green (T1 + replay + T2) after the deliberate `harness save`.
++- `tools/ci-local.sh --mac` -- expected: 10/10 gates green.
++- `odin run bin/splice_check` (or the fold-check equivalent) -- expected: boot tick-1 shift is the catalog-hash fold alone.
++
++## Suggested Review Order
++
++**Strict attach-or-seed policy (the entry point)**
++
++- Every growth spawn is exactly ATTACH or SEED — the 08-21 doctrine, branch by branch
++  [growth.odin:518](../../core/growth.odin#L518)
++
++- The no-eligible-cluster branch seeds a fresh area; the coin-miss (bias < 1000) shares it
++  [growth.odin:694](../../core/growth.odin#L694)
++
++- The seed predicate applies to both seed branches (the fresh-area floor)
++  [growth.odin:732](../../core/growth.odin#L732)
++
++**The two stray-closing predicates**
++
++- SEED candidates must clear every live terminal by the new-area floor (i64 dist²)
++  [growth.odin:301](../../core/growth.odin#L301)
++
++- ATTACH candidates must sit within the Euclidean radius of a live-terminal anchor (diagonal escape closed)
++  [growth.odin:335](../../core/growth.odin#L335)
++
++**Loader validation (fail-fast, named keys)**
++
++- New key parsed; bias range widened 1..999 → 1..1000 (1000 = strict default)
++  [catalog.odin:895](../../core/catalog.odin#L895)
++
++- Seed floor must exceed the attach radius — a closer seed would read as a stray
++  [catalog.odin:910](../../core/catalog.odin#L910)
++
++- Seed floor must stay under the map diameter — an absurd floor would stall all growth
++  [catalog.odin:1016](../../core/catalog.odin#L1016)
++
++**Tunables (the user's fun-test surface)**
++
++- The four knobs + the supersession flag in the block comment
++  [balance.json:16](../../data/balance.json#L16)
++
++**Acceptance pins (updated, never deleted)**
++
++- The mechanism-exact strict classification used by every audit
++  [growth_test.odin:521](../../core/growth_test.odin#L521)
++
++- The parametrized audit: cap 5 AND cap 8, mid-run seed, coin-miss seed asserted
++  [growth_test.odin:608](../../core/growth_test.odin#L608)
++
++- The 08-17 minority-isolate mix at bias 750 — the data option stays audit-clean
++  [growth_test.odin:754](../../core/growth_test.odin#L754)
++
++- The two pure predicate pins (reachable geometry only)
++  [growth_test.odin:769](../../core/growth_test.odin#L769)
++
++- Loader rows: bias 750 valid, diameter-bound errors, missing-key fail-fast
++  [catalog_test.odin:564](../../core/catalog_test.odin#L564)
++
++**Canon record**
++
++- The 08-21 ruling entry: supersession flag + spatial-lane non-tension + consequences
++  [decision-log.md:1052](../../_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md#L1052)
+diff --git a/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md b/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md
+index b0a9b60..de82b1d 100644
+--- a/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md
++++ b/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md
+@@ -1047,3 +1047,16 @@ the r1/r2 notes below), never by editing this exhibit.)*
+   first-assignment engagement, removal return, never-drop untouched floor, tier-change
+   survival); the `palcheck` lane-stripe oracle sets explicit Express weights (a default pipe
+   no longer shows Express). Full `tools/ci-local.sh --mac` suite green (10/10 gates).
++
++---
++
++## 2026-08-21 — Estate spawning canon: STRICT cluster placement for director-spawned terminals (supersedes the 08-17 "NOT 100%" mix at the default)
++
++- **Origin (user ruling 2026-08-21, ~23:5xZ play session, verbatim anchors):** *"not so great looking topology"* — the 5.12 soft bias (750‰ attach coin, cap 8) leaves "too many strays and estates that read as noise"; the user wants *"most nodes NEXT TO each other, like an estate, and after ~5 nodes a NEW area elsewhere, leaving routing room between sections."*
++- **Decision — the STRICT estate doctrine (shape (a) of the briefing):** every growth spawn is exactly one of two classes — **ATTACH** (an eligible cluster exists → the candidate sits within `radius_tiles` of a member — the estate extends) or **SEED** (no eligible cluster → a fresh area at ≥ `new_area_seed_tiles` from every live terminal, still in the outward-from-mesh annulus). The delta over 5.12: bias default 750→**1000** (strict; the coin-miss branch remains as a data option at < 1000), cap 8→**5** (the "after ~5 nodes" band), NEW `new_area_seed_tiles` = **10** (2× the adjacency radius — visually distinct sections on the 40×30 map, within the era-3 connect span 18 for E31), plus two zero-draw rejection predicates that close the stray classes the strict audit exposes:
++  1. **`growth_attach_radius_ok`** — the attach candidate must sit within the *Euclidean* radius of its anchor member. The 5.12 compass draw's diagonal directions placed candidates at up to dist×√2 (5.7–7.1 tiles) from the anchor — outside the adjacency radius, inside the seed floor: the exact third class the ruling deletes (measured pre-fix: 7 of 19 growth.dem spawns were strays (37%) under the strict lens).
++  2. **Anchor is a LIVE TERMINAL only** — the derived cluster view leaves dead slots' `id` at 0, which collides with cluster 0's id (the fixture residential at slot 0): a raw id match counted non-terminals (routers) as members and anchored "attaches" on a ROUTER — another stray source.
++- **Shape consequence (documented, not accidental):** with the attach dist range [min_sep, radius] = [4, 5], every diagonal compass draw lands at dist×√2 ≥ 5.66 > radius 5 and rejects pre-E31 — accepted attach geometry is CARDINAL-ONLY, so estates read as **compact crosses** (the ~50% per-attempt budget burn on diagonal draws is the known, deterministic cost).
++- **Canon flag (briefing rule 1 — flagged, not silently rewritten):** the 08-21 acceptance supersedes the 08-17 *"estates, but NOT 100% of the time"* mix **at the default** (attach 1000‰). The 08-17 doctrine is not deleted: `bias_prob_permille < 1000` restores the minority-isolate mix as a data option, now seed-distance-respecting. The spatial-lane canon (2026-08-12, commits 2e3acab/8ece056) governs PIPE lane rendering — node placement does not touch it; no tension.
++- **What this does NOT change:** E31 stays the hard contract (bounds + min separation + connectable-within-span; bounded rejection sampling from the same rng stream); per-attempt draw counts are unchanged EXCEPT the member pick, which counts live members only (the dead-slot collision guard — its rng_range can flip from drawn to SKIPPED in the collision case; every other count is unchanged; the two strict predicates are zero-draw rejection tests, like E31 — the rng interleaving shifts through the acceptance outcome + that one count); no spawn-timing change (`terminal_spawn_interval_ticks` stays 80), no `terminal_min_sep_tiles` change (4), no serialization/LOG_VERSION; growth spawns TERMINALS only, outward from the player-placed mesh.
++- **Applied:** balance.json `growth_groups` (bias 1000, cap 5, `new_area_seed_tiles` 10, comments carry the ruling + supersession note); core/catalog.odin (struct field + loader parse + validation — bias range 1..1000, the new key must exceed `radius_tiles` — fail-fast naming the key); core/growth.odin (`growth_seed_sep_ok` + `growth_attach_radius_ok` + the live-terminal anchor guard + the SEED family wiring); core/catalog_test.odin + core/growth_test.odin (the strict attach-or-seed audit re-pin — every spawn auditable as ATTACH or SEED, no third class, no strays, every singleton a fresh seed — + the two predicate unit pins); the 2026-08-21 golden re-bless (all 45 demos + input-parity; `harness fold-check` proves boot's tick-1 shift is the catalog-hash fold alone); `docs/captures/v2-estate-spawning/` before/after captures + coordinate dumps (same seed 42, same ticks, old vs new policy: 7/19 strays → 0 strays) + the one-line cap change (5→8) demonstrated.
+diff --git a/_pr_body_estate_spawning.md b/_pr_body_estate_spawning.md
+new file mode 100644
+index 0000000..dddddc6
+--- /dev/null
++++ b/_pr_body_estate_spawning.md
+@@ -0,0 +1,168 @@
++# v2 estate spawning — strict cluster placement for director-spawned terminals
++
++The 08-21 play-session ruling ("not so great looking topology") applied:
++director-spawned terminals now form **strict estates** — every growth spawn is
++exactly one of two classes, **ATTACH** (within `radius_tiles` of a member of an
++eligible cluster — the estate extends) or **SEED** (no eligible cluster → a
++fresh area ≥ `new_area_seed_tiles` from every live terminal, still in the
++outward-from-mesh annulus). No third class, no strays.
++
++The delta over 5.12 (all in `balance.json` `growth_groups` unless noted):
++
++| knob | before | after |
++|---|---|---|
++| `bias_prob_permille` (attach fraction) | 750 (0.75 — the 08-17 "NOT 100%" mix) | **1000 (strict — every spawn attach-or-seed)** |
++| `max_members` (estate cap) | 8 | **5** (the ruling: "after ~5 nodes a NEW area elsewhere") |
++| `new_area_seed_tiles` | — (new) | **10** (2× the adjacency radius — routing room between sections, within the era-3 connect span 18) |
++| `min_members` / `radius_tiles` / `member_weight_permille` | 3 / 5 / 250 | unchanged |
++
++Plus two zero-draw rejection predicates in `core/growth.odin` that close the
++stray classes the strict audit exposes (draw order/counts per attempt
++unchanged — the rng interleaving shifts only through acceptance):
++
++1. **`growth_attach_radius_ok`** — the attach candidate must sit within the
++   *Euclidean* radius of its anchor. The 5.12 compass draw's diagonal
++   directions placed candidates at up to dist×√2 (5.7–7.1 tiles) from the
++   anchor — outside the adjacency radius, inside the seed floor: the exact
++   third class the ruling deletes.
++2. **Anchor is a LIVE TERMINAL only** — the derived cluster view leaves dead
++   slots' `id` at 0, which collides with cluster 0's id (the fixture
++   residential at slot 0): a raw id match could anchor an "attach" on a
++   ROUTER — another stray source (pre-existing 5.12 defect, invisible to the
++   old pins).
++
++## Before / after (measured, same seed 42, same ticks — growth.dem)
++
++Coordinate dumps + rendered captures at `docs/captures/v2-estate-spawning/`
++(`before/`, `after/`, `spawn-audit-before.txt`, `spawn-audit-after.txt`).
++Honest attribution: the strays are killed by the **two predicates in code**
++(the Euclidean attach-radius closure + the live-terminal anchor guard) and the
++**seed floor**; the defaults (bias 1000, cap 5) set the regime. The
++before/after lens is old **policy** vs new **policy** — identical audit, same
++seed, same ticks.
++
++**The strict audit lens applied to both runs** (ATTACH = within 5 tiles of a
++then-live terminal; SEED = ≥ 10 tiles from every then-live terminal):
++
++| run | spawns | ATTACH | SEED | **STRAY** |
++|---|---|---|---|---|
++| before (5.12 policy) | 19 | 12 | 0 | **7 (37%)** — five diagonal-escape attaches at 5.66–7.07 tiles + the coin-miss/uniform draws at 6.4–8.9 tiles |
++| after (strict policy) | 13 | 12 | 1 | **0** |
++
++The after map at t1760 reads as three compact 5-member estates (the cap) —
++final derived clusters: {res fixture + 4}, {host fixture + 4}, and the seeded
++estate at {20,6}…{16,10} — every terminal sits within 5 tiles of a sibling,
++every singleton is a fresh seed. The static-start capture (t30) is
++byte-identical before/after (no render surface moved).
++
++**Quantified skip rate + capacity note:** the after run spawned on 13 of 21
++era-1 windows (8 skipped — the bounded rejection budget exhausted on the
++denser map, deterministic by design). The strict policy also reads as fewer,
++larger sections per map than the old mix: estates of 5 span ~12–20 tiles and
++seeds must clear 10 tiles from every terminal — the intended "distinct
++sections" reading. The knobs (`radius_tiles`, `new_area_seed_tiles`,
++`terminal_min_sep_tiles`) are the iteration surface if the fun-test wants
++denser or sparser sections.
++
++**The one-line cap change, demonstrated** (`max_members: 8` in balance.json,
++`spawn-audit-after-cap8.txt`): the same seed run grows estates to **8**
++members before seeding a new area — the cap is a data knob, one line.
++
++## Decisions & rationale
++
++- **Strict over emergent (shape (a) of the briefing):** probabilistic strays
++  can't satisfy "no lone nodes far from any cluster" deterministically; strict
++  attach-or-seed satisfies both acceptance maps by construction and reuses the
++  5.12 machinery — the delta is two predicates + defaults.
++- **Canon flag, not a rewrite:** the 08-21 acceptance supersedes the 08-17
++  "estates, but NOT 100% of the time" doctrine **at the default**. The 08-17
++  doctrine is not deleted: `bias_prob_permille < 1000` restores the
++  minority-isolate mix as a data option, now seed-distance-respecting. The
++  spatial-lane canon (08-12) governs pipe rendering — untouched, no tension.
++  Both flags are in the GDD decision-log entry (2026-08-21).
++- **Seed distance 10 = 2× the adjacency radius:** visually distinct sections
++  on the 40×30 map, inside the era-3 connect span (18) so E31 connectability
++  stays satisfiable; the bounded rejection budget keeps it honest on dense
++  maps (deterministic skip, no stall).
++- **Fail-fast loader (ODN-5):** `new_area_seed_tiles` is a named key —
++  missing / ≤ `radius_tiles` / bias 0 or 1001 all reject naming the key; bias
++  range widened 1..999 → 1..1000 (0 still invalid).
++
++## Save/action-log compatibility
++
++The `balance.json` knob changes fold into `catalog_hash` (every golden shifts
++— the established re-bless precedent): old action logs / saves from earlier
++builds **replay-fail under the new hash** — the app and harness refuse
++mismatched manifests, by design (ODN-11). Nothing from an earlier build is
++loadable into this one; this is the documented cost of a catalog retune.
++
++## Golden re-bless (deliberate, cause-documented)
++
++All 45 demos' T1 manifests + action logs + T2 captures and the input-parity
++manifests re-blessed (`harness save` + `harness input-parity save`). Every
++shift is caused by (a) the catalog_hash fold (the new knob values + comments)
++and (b) the genuine behavioral change (estate spawns — the point of the
++story). **`harness fold-check` PASS** (prev `dfe3e342b56679fb` /
++`4eaa272171fac065`): boot's tick-1 shift is the catalog fold alone — no
++serialization/layout drift. Replay gate: every blessed log re-sims its
++manifest bit-for-bit.
++
++## Tests
++
++The acceptance pins re-pinned (updated, never deleted) in `core/growth_test.odin`:
++- **`test_groups_estates_strict`** — the parametrized strict attach-or-seed
++  audit (the renamed re-pin) on seed 9, at BOTH caps: every spawn is audited
++  against its then-live terminal subset with the mechanism-exact class rule
++  (eligible cluster existed → ATTACH required; every cluster at the cap →
++  SEED required; fresh map → seed), a **mid-run seed** (spawn index > 0 — the
++  cap-to-new-area acceptance cannot pass on the forced first spawn alone),
++  estates form (≥ min_members), every final-view singleton is a fresh seed,
++  E31 + compactness hold. `max_members: 8` (acceptance criterion 3 — the
++  one-line change) is a repeatable leg of the same test, not a one-off
++  capture.
++- **`test_groups_strict_audit_with_fixture`** (new) — the same audit on the
++  fixture map (residential at slot 0): pins the dead-slot anchor collision fix.
++- **`test_groups_optin_mix_seeds_audit_clean`** (new) — bias 750 (the 08-17
++  "NOT 100%" data option): every spawn attach-or-seed, seed-distance-
++  respecting, and a coin-miss SEED (seed-class spawn while an eligible cluster
++  existed — mechanically impossible at bias 1000) is asserted: the branch
++  would regress silently without the pin. Loader positive row: bias 750 loads
++  clean.
++- **`test_growth_seed_sep_predicate`** + **`test_growth_attach_radius_predicate`**
++  (new pure-unit pins, no seed dependence).
++- Loader pins: bias 1000 valid (was a rejection), new key rows (missing / at
++  radius / below radius / negative) reject naming the key; the shared
++  `test_catalog` fixture mirrors the new data.
++- Surviving pins adapted: `test_growth_outward_bias_annulus` (the annulus
++  bound now holds for both families by construction — E31 keeps ATTACH
++  candidates ≥ the 4-tile floor and ≤ span), E31 + determinism + replay pins
++  re-verified on the new stream.
++
++Full suite: `tools/ci-local.sh --mac` **10/10 green**.
++
++## How the evidence was produced
++
++- **Before** captures + dumps: the baseline code at `4ccc8c75` (the spec's
++  baseline commit, old balance) in a scratch worktree; the growth.dem
++  scenario replayed there and the OLD blessed T2 frames extracted from git.
++- **After** captures + dumps: this branch's code + balance, same scenario.
++- Same seed 42, same ticks (t30/t300/t900/t1760), the same audit lens
++  (positions only — ATTACH within 5 of a then-live terminal, SEED ≥ 10 from
++  every then-live terminal).
++- The coordinate-dump tool was a scratch program, deleted by design after
++  producing the dumps — the dumps + captures in `docs/captures/` are the
++  durable artifact.
++
++## Out of scope (per the briefing)
++
++Spawn timing (`terminal_spawn_interval_ticks` stays 80), `terminal_min_sep_tiles`
++(stays 4 — the E31 packing floor), node-type visual identity, routing
++semantics, serialization / LOG_VERSION — all untouched. E31 is the hard
++contract throughout; growth spawns TERMINALS only, outward from the
++player-placed mesh.
++
++## Fun-test gate
++
++Merge ≠ done: the user plays `odin run app` after merge; the knobs
++(`max_members`, `new_area_seed_tiles`, `radius_tiles`) are the expected
++iteration surface for the follow-up tuning round (the cap change is one line).
+diff --git a/core/catalog.odin b/core/catalog.odin
+index 6676df8..cc25781 100644
+--- a/core/catalog.odin
++++ b/core/catalog.odin
+@@ -206,18 +206,25 @@ Balance :: struct {
+ 	// a content_host ≤ 1.33 pkts/tick long-run (40 u/s, half its 80 u/s).
+ 	cap_fraction_permille: i32, // 500 = 50% of the type's own throughput (playtest-tunable)
+ 	// 5.12: the aggregation-group tunables (spec-traffic-model Thread 3 + the
+-	// estates ruling — user 2026-08-17 night: "homes grouped together in
+-	// estates ... but NOT 100% of the time"). The group bias is a SOFT
+-	// PREFERENCE inside the E31 validity envelope (bias draw first, E31 on the
+-	// biased candidate, rejection-sampling unchanged; the uplink is never
+-	// forced — the player wires it). All data-driven + playtest-tunable:
+-	// bias_prob_permille (~750 = 0.75 — the ruling's 0.7–0.8 majority
+-	// clustered, minority isolated), min_members/max_members (3–8 — the estate
+-	// size band), radius_tiles (5 — the group radius + the derived-cluster
+-	// adjacency threshold, MUST exceed terminal_min_sep_tiles = 4, the E31
+-	// packing floor), member_weight_permille (the director's group-scoped
+-	// demand weight — a member's source-pick weight scales with its estate's
+-	// size, so aggregate group demand rises as members join).
++	// estates rulings — user 2026-08-17 night + the 2026-08-21 strict estate
++	// ruling). The strict doctrine: every growth spawn is one of two classes —
++	// ATTACH (an eligible cluster exists → candidate within radius_tiles of a
++	// member) or SEED (no eligible cluster → fresh area ≥ new_area_seed_tiles
++	// from every live terminal, still in the outward-from-mesh annulus). The
++	// group bias is a SOFT PREFERENCE inside the E31 validity envelope (bias
++	// draw first, E31 on the biased candidate, rejection-sampling unchanged;
++	// the uplink is never forced — the player wires it). All data-driven +
++	// playtest-tunable: bias_prob_permille (1000 = STRICT — the 08-21 default;
++	// the 08-17 "NOT 100%" minority-isolate mix is superseded at the default,
++	// kept as a data option at < 1000; 0 is invalid), min_members/max_members
++	// (3–5 — the estate size band; growth extends only clusters below the
++	// cap, the 08-21 ruling: after ~5 nodes a new area), radius_tiles (5 — the
++	// group radius + the derived-cluster adjacency threshold, MUST exceed
++	// terminal_min_sep_tiles = 4, the E31 packing floor), new_area_seed_tiles
++	// (10 — the SEED family's fresh-area floor, must exceed radius_tiles),
++	// member_weight_permille (the director's group-scoped demand weight — a
++	// member's source-pick weight scales with its estate's size, so aggregate
++	// group demand rises as members join).
+ 	growth_groups: Growth_Groups_Balance,
+ 	// 4.1: the warning-sign thresholds + lead times (art-direction §6.1
+ 	// "Trigger [balance.json]"; GDD Numerical Design). Integer percents +
+@@ -255,14 +262,20 @@ Balance :: struct {
+ }
+ 
+ // Growth_Groups_Balance — the 5.12 aggregation-group tunables (balance.json
+-// `growth_groups`; spec-traffic-model Thread 3 + the estates ruling
+-// 2026-08-17 night). All integer (ODN-10). bias_prob_permille = the fraction
+-// of growth draws that bias toward an existing cluster (the ruling: estates +
+-// the occasional isolated home — NOT 100% clustered; 750 = 0.75);
++// `growth_groups`; spec-traffic-model Thread 3 + the estates rulings — the
++// 08-17 night "estates ... but NOT 100% of the time" + the 08-21 STRICT
++// estate ruling that supersedes it at the default). All integer (ODN-10).
++// bias_prob_permille = the fraction of growth draws that ATTACH to an
++// existing cluster (1000 = strict — every spawn is attach-or-seed; the
++// 08-17 minority-isolate mix is a data option at < 1000; 0 is invalid);
+ // min_members/max_members = the estate size band (growth extends only
+-// clusters below the cap; 3–8); radius_tiles = the group radius + the
+-// derived-cluster adjacency threshold (5 — MUST exceed terminal_min_sep_tiles,
+-// the E31 packing floor, or members cannot pack inside it);
++// clusters below the cap; 3–5 at the 08-21 default — after ~5 nodes a new
++// area); radius_tiles = the group radius + the derived-cluster adjacency
++// threshold (5 — MUST exceed terminal_min_sep_tiles, the E31 packing floor,
++// or members cannot pack inside it); new_area_seed_tiles = the SEED family's
++// fresh-area floor — a seed candidate must sit ≥ this far from every live
++// terminal (10 = 2× the adjacency radius, the "new area elsewhere" reading
++// distance; MUST exceed radius_tiles, validated at load);
+ // member_weight_permille = the director's group-scoped demand-weight bonus
+ // per member (a source terminal in an estate picks at (1000 + (size-1) ×
+ // member_weight_permille)/1000 × demand_weight — aggregate group demand rises
+@@ -273,6 +286,7 @@ Growth_Groups_Balance :: struct {
+ 	min_members:            i32,
+ 	max_members:            i32,
+ 	radius_tiles:           i32,
++	new_area_seed_tiles:    i32,
+ 	member_weight_permille: i32,
+ }
+ 
+@@ -858,15 +872,19 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 			return {"balance.json", "cap_fraction_permille", "must be 1..1000 (500 = 50% of the terminal's own throughput — the honest-fraction invariant)"}
+ 		}
+ 		// 5.12: the aggregation-group block (spec-traffic-model Thread 3 + the
+-		// estates ruling 2026-08-17 night — balance.json `growth_groups`).
+-		// Fail-fast like its siblings: a MISSING key defaults to -1 (a partial
+-		// block is a load error, never a silent no-bias/100%-bias or an
+-		// estate-less map). The ranges pin the ruling: bias must be 1..999 (a
+-		// 0 disables estates, a 1000 makes every draw biased — both break the
+-		// "estates, but NOT 100% of the time" mix); min_members >= 2 (an
+-		// "estate" needs at least 2); max_members >= min_members; radius_tiles
+-		// MUST exceed terminal_min_sep_tiles (the E31 packing floor — a radius
++		// estates rulings — balance.json `growth_groups`). Fail-fast like its
++		// siblings: a MISSING key defaults to -1 (a partial block is a load
++		// error, never a silent no-bias/100%-bias or an estate-less map). The
++		// ranges pin the rulings: bias must be 1..1000 (a 0 disables estates;
++		// 1000 = STRICT — the 08-21 default, every growth spawn attach-or-seed;
++		// the 08-17 "estates, but NOT 100% of the time" mix is a data option at
++		// < 1000, superseded at the default); min_members >= 2 (an "estate"
++		// needs at least 2); max_members >= min_members; radius_tiles MUST
++		// exceed terminal_min_sep_tiles (the E31 packing floor — a radius
+ 		// <= 4 cannot pack members inside it, Perkins r1 W5);
++		// new_area_seed_tiles MUST exceed radius_tiles (a seed closer than the
++		// adjacency radius could land inside an existing estate and read as a
++		// stray — the "new area elsewhere" floor must clear the attach radius);
+ 		// member_weight_permille 1..1000 (the director's group-scoped demand
+ 		// weight must be a real bonus — a 0 would silently disable it).
+ 		if gobj, okg := obj["growth_groups"].(json.Object); okg {
+@@ -874,10 +892,11 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 			b.growth_groups.min_members = jint(gobj, "min_members", -1)
+ 			b.growth_groups.max_members = jint(gobj, "max_members", -1)
+ 			b.growth_groups.radius_tiles = jint(gobj, "radius_tiles", -1)
++			b.growth_groups.new_area_seed_tiles = jint(gobj, "new_area_seed_tiles", -1)
+ 			b.growth_groups.member_weight_permille = jint(gobj, "member_weight_permille", -1)
+ 		}
+-		if b.growth_groups.bias_prob_permille < 1 || b.growth_groups.bias_prob_permille > 999 {
+-			return {"balance.json", "growth_groups.bias_prob_permille", "must be 1..999 (the estates ruling: a majority of draws bias toward clusters, a minority stay uniform — 0 or 1000 breaks the NOT-100% mix)"}
++		if b.growth_groups.bias_prob_permille < 1 || b.growth_groups.bias_prob_permille > 1000 {
++			return {"balance.json", "growth_groups.bias_prob_permille", "must be 1..1000 (1000 = strict — every growth spawn attach-or-seed, the 08-21 default; 0 disables estates; < 1000 restores the 08-17 minority-isolate mix as a data option)"}
+ 		}
+ 		if b.growth_groups.min_members < 2 {
+ 			return {"balance.json", "growth_groups.min_members", "must be >= 2 (an estate needs at least 2 members)"}
+@@ -888,6 +907,9 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 		if b.growth_groups.radius_tiles <= b.terminal_min_sep_tiles {
+ 			return {"balance.json", "growth_groups.radius_tiles", "must exceed terminal_min_sep_tiles (the E31 packing floor — members cannot pack inside a smaller radius)"}
+ 		}
++		if b.growth_groups.new_area_seed_tiles <= b.growth_groups.radius_tiles {
++			return {"balance.json", "growth_groups.new_area_seed_tiles", "must exceed radius_tiles (a fresh-area seed must clear the attach radius — the 'new area elsewhere' floor)"}
++		}
+ 		if b.growth_groups.member_weight_permille < 1 || b.growth_groups.member_weight_permille > 1000 {
+ 			return {"balance.json", "growth_groups.member_weight_permille", "must be 1..1000 (the director's group-scoped demand weight — aggregate group demand rises as members join)"}
+ 		}
+@@ -984,6 +1006,17 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 		if b.map_w_tiles <= 0 || b.map_h_tiles <= 0 || b.tile_px <= 0 {
+ 			return {"balance.json", "map", "map w_tiles/h_tiles/tile_px must be > 0"}
+ 		}
++		// 08-21 (the estate ruling): the new-area seed floor must also be < the
++		// MAP DIAMETER — checked HERE, after the map dims load (the growth_groups
++		// block parses earlier). An absurd floor (>= the map's widest possible
++		// spacing) could never be cleared by any candidate, so EVERY growth
++		// window would exhaust the 8-attempt rejection budget and silently
++		// stall growth forever. Fail-fast naming the key (ODN-5): seed² < w² + h²
++		// in i64 (the tile distance must never wrap).
++		if i64(b.growth_groups.new_area_seed_tiles)*i64(b.growth_groups.new_area_seed_tiles) >=
++			i64(b.map_w_tiles)*i64(b.map_w_tiles) + i64(b.map_h_tiles)*i64(b.map_h_tiles) {
++			return {"balance.json", "growth_groups.new_area_seed_tiles", "must be < the map diameter (w² + h² — an absurd seed floor would stall every growth window)"}
++		}
+ 		// 5.6: the placement-separation block (user ruling 2026-08-14 — the
+ 		// values moved from the old PLACEMENT_MIN_SEP_TILES const to balance.json
+ 		// per ODN-5 + that const's own comment). Fail-fast like the warnings
+diff --git a/core/catalog_test.odin b/core/catalog_test.odin
+index f419e81..b5a274a 100644
+--- a/core/catalog_test.odin
++++ b/core/catalog_test.odin
+@@ -46,10 +46,11 @@ BAL_VALID :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_b
+   "pool_max_packets": 512,
+   "cap_fraction_permille": 500,
+   "growth_groups": {
+-    "bias_prob_permille": 750,
++    "bias_prob_permille": 1000,
+     "min_members": 3,
+-    "max_members": 8,
++    "max_members": 5,
+     "radius_tiles": 5,
++    "new_area_seed_tiles": 10,
+     "member_weight_permille": 250
+   },
+   "warnings": {
+@@ -543,6 +544,26 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		testing.expectf(t, cerr.file == "", "the GDD 12-min/era upper range (14400) must load clean, got %q %q", cerr.file, cerr.rule)
+ 		testing.expect_value(t, cat_ok.balance.advance.milestone_window_ticks, i32(14400))
+ 	}
++	// 08-21 (the canon flag — positive): bias < 1000 restores the 08-17
++	// "NOT 100%" minority-isolate mix as a DATA OPTION (superseded at the
++	// default, not deleted) — 750 must load clean and parse.
++	{
++		cat_storage: Catalogs
++		cat_ok := &cat_storage
++		defer catalogs_destroy(cat_ok)
++		src := Catalog_Sources{
++			node_types   = transmute([]u8)string(NT_VALID),
++			pipe_tiers   = transmute([]u8)string(TIER_VALID),
++			balance      = transmute([]u8)string(replace1(BAL_VALID, `"bias_prob_permille": 1000`, `"bias_prob_permille": 750`, 1)),
++			packet_types = transmute([]u8)string(PKT_VALID),
++			demand       = transmute([]u8)string(DEM_VALID),
++			eras         = transmute([]u8)string(ERAS_VALID),
++			crises       = transmute([]u8)string(CRISES_VALID),
++		}
++		cerr := catalogs_load(cat_ok, &src)
++		testing.expectf(t, cerr.file == "", "bias 750 (the 08-17 data option) must load clean, got %q %q", cerr.file, cerr.rule)
++		testing.expect_value(t, cat_ok.balance.growth_groups.bias_prob_permille, i32(750))
++	}
+ 
+ 	// --- 5.6 balance.json `placement` block negative rows -------------------
+ 	// a MISSING key defaults to -1 (the warnings-block convention) — a partial
+@@ -649,32 +670,55 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		{"cap_fraction over 1000", replace1(BAL_VALID, `"cap_fraction_permille": 500`, `"cap_fraction_permille": 1001`, 1), "cap_fraction_permille"},
+ 		{"cap_fraction decimal", replace1(BAL_VALID, `"cap_fraction_permille": 500`, `"cap_fraction_permille": 50.5`, 1), "cap_fraction_permille"},
+ 		// 5.12 growth_groups rows — the aggregation-group block (the estates
+-		// ruling 2026-08-17 night). A MISSING key defaults to -1 (the
+-		// warnings-block convention — a partial block is a load error, never a
+-		// silent no-bias/100%-bias or an estate-less map); bias must be 1..999
+-		// (0 disables estates, 1000 makes every draw biased — both break the
+-		// "estates, but NOT 100% of the time" mix); min_members >= 2; max >=
+-		// min; radius MUST exceed terminal_min_sep_tiles (the E31 packing floor —
+-		// members cannot pack inside a smaller radius); member_weight 1..1000
+-		// (a 0 would silently disable the group demand concentration).
++		// rulings, 08-17 night + the 08-21 strict doctrine). A MISSING key
++		// defaults to -1 (the warnings-block convention — a partial block is a
++		// load error, never a silent no-bias/100%-bias or an estate-less map);
++		// bias must be 1..1000 (0 disables estates; 1000 = STRICT — the 08-21
++		// default, every growth spawn attach-or-seed; the 08-17 "NOT 100%"
++		// mix is a data option at < 1000, superseded at the default);
++		// min_members >= 2; max >= min; radius MUST exceed
++		// terminal_min_sep_tiles (the E31 packing floor — members cannot pack
++		// inside a smaller radius); new_area_seed_tiles MUST exceed radius_tiles
++		// (a seed closer than the attach radius could land inside an existing
++		// estate and read as a stray — the fresh-area floor must clear it);
++		// member_weight 1..1000 (a 0 would silently disable the group demand
++		// concentration).
+ 		{"groups block missing", replace1(BAL_VALID, `  "growth_groups": {
+-    "bias_prob_permille": 750,
++    "bias_prob_permille": 1000,
+     "min_members": 3,
+-    "max_members": 8,
++    "max_members": 5,
+     "radius_tiles": 5,
++    "new_area_seed_tiles": 10,
+     "member_weight_permille": 250
+   },
+ `, ``, 1), "growth_groups.bias_prob_permille"},
+-		{"bias missing", replace1(BAL_VALID, `"bias_prob_permille": 750,`, ``, 1), "growth_groups.bias_prob_permille"},
+-		{"bias zero", replace1(BAL_VALID, `"bias_prob_permille": 750`, `"bias_prob_permille": 0`, 1), "growth_groups.bias_prob_permille"},
+-		{"bias 1000", replace1(BAL_VALID, `"bias_prob_permille": 750`, `"bias_prob_permille": 1000`, 1), "growth_groups.bias_prob_permille"},
+-		{"bias negative", replace1(BAL_VALID, `"bias_prob_permille": 750`, `"bias_prob_permille": -50`, 1), "growth_groups.bias_prob_permille"},
++		{"bias missing", replace1(BAL_VALID, `"bias_prob_permille": 1000,`, ``, 1), "growth_groups.bias_prob_permille"},
++		{"bias zero", replace1(BAL_VALID, `"bias_prob_permille": 1000`, `"bias_prob_permille": 0`, 1), "growth_groups.bias_prob_permille"},
++		{"bias 1001", replace1(BAL_VALID, `"bias_prob_permille": 1000`, `"bias_prob_permille": 1001`, 1), "growth_groups.bias_prob_permille"},
++		{"bias negative", replace1(BAL_VALID, `"bias_prob_permille": 1000`, `"bias_prob_permille": -50`, 1), "growth_groups.bias_prob_permille"},
+ 		{"min_members missing", replace1(BAL_VALID, `"min_members": 3,`, ``, 1), "growth_groups.min_members"},
+ 		{"min_members one", replace1(BAL_VALID, `"min_members": 3`, `"min_members": 1`, 1), "growth_groups.min_members"},
+-		{"max below min", replace1(BAL_VALID, `"max_members": 8`, `"max_members": 2`, 1), "growth_groups.max_members"},
+-		{"max missing", replace1(BAL_VALID, `"max_members": 8,`, ``, 1), "growth_groups.max_members"},
++		{"max below min", replace1(BAL_VALID, `"max_members": 5`, `"max_members": 2`, 1), "growth_groups.max_members"},
++		{"max missing", replace1(BAL_VALID, `"max_members": 5,`, ``, 1), "growth_groups.max_members"},
+ 		{"radius at floor", replace1(BAL_VALID, `"radius_tiles": 5`, `"radius_tiles": 3`, 1), "growth_groups.radius_tiles"},
+ 		{"radius missing", replace1(BAL_VALID, `"radius_tiles": 5,`, ``, 1), "growth_groups.radius_tiles"},
++		// the 08-21 new key — the fresh-area seed floor. MISSING defaults to -1
++		// (a partial block is a load error, never a silent no-floor that would
++		// bless seeds landing inside estates); it MUST exceed radius_tiles (a
++		// seed at or inside the attach radius could land inside an existing
++		// estate and read as a stray — the "new area elsewhere" floor must
++		// clear the adjacency radius); negative/zero fail the same check.
++		{"seed_tiles missing", replace1(BAL_VALID, `"new_area_seed_tiles": 10,`, ``, 1), "growth_groups.new_area_seed_tiles"},
++		{"seed_tiles at radius", replace1(BAL_VALID, `"new_area_seed_tiles": 10`, `"new_area_seed_tiles": 5`, 1), "growth_groups.new_area_seed_tiles"},
++		{"seed_tiles below radius", replace1(BAL_VALID, `"new_area_seed_tiles": 10`, `"new_area_seed_tiles": 4`, 1), "growth_groups.new_area_seed_tiles"},
++		{"seed_tiles negative", replace1(BAL_VALID, `"new_area_seed_tiles": 10`, `"new_area_seed_tiles": -3`, 1), "growth_groups.new_area_seed_tiles"},
++		// the 08-21 diameter bound (checked after the map block): a seed floor
++		// >= the map diameter (40×30 -> diameter 50) could never be cleared by
++		// any candidate — every growth window would exhaust the rejection
++		// budget and silently stall growth. At the diameter (50) and above (51)
++		// both reject, naming the key.
++		{"seed_tiles at map diameter", replace1(BAL_VALID, `"new_area_seed_tiles": 10`, `"new_area_seed_tiles": 50`, 1), "growth_groups.new_area_seed_tiles"},
++		{"seed_tiles above map diameter", replace1(BAL_VALID, `"new_area_seed_tiles": 10`, `"new_area_seed_tiles": 51`, 1), "growth_groups.new_area_seed_tiles"},
+ 		{"member_weight missing", replace1(BAL_VALID, `"member_weight_permille": 250,`, ``, 1), "growth_groups.member_weight_permille"},
+ 		{"member_weight zero", replace1(BAL_VALID, `"member_weight_permille": 250`, `"member_weight_permille": 0`, 1), "growth_groups.member_weight_permille"},
+ 		{"member_weight over 1000", replace1(BAL_VALID, `"member_weight_permille": 250`, `"member_weight_permille": 1001`, 1), "growth_groups.member_weight_permille"},
+diff --git a/core/determinism_test.odin b/core/determinism_test.odin
+index 6ebf039..2dbf5da 100644
+--- a/core/determinism_test.odin
++++ b/core/determinism_test.odin
+@@ -72,17 +72,19 @@ test_catalog :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalog
+ 	// the caps and bless uncapped expectations.
+ 	cat.balance.cap_fraction_permille = 500
+ 	// 5.12: the aggregation-group tunables (mirrors data/balance.json — the
+-	// estates ruling 2026-08-17 night: bias 750 permille = 0.75 majority
+-	// clustered + minority isolated; 3–8 members; radius 5 > the E31 packing
+-	// floor 4; the group-scoped demand weight 250 permille/member). The unit
+-	// tests MUST carry the real values (like the loader's ladder): a zeroed
+-	// bias would silently disable the estates, a zeroed member weight the
+-	// group demand concentration.
++	// estates rulings: the 08-21 STRICT estate doctrine, bias 1000 permille =
++	// every growth spawn attach-or-seed; 3–5 members — the cap 8→5 at the
++	// 08-21 ruling; radius 5 > the E31 packing floor 4; new_area_seed_tiles 10
++	// = 2× the adjacency radius, > radius; the group-scoped demand weight 250
++	// permille/member). The unit tests MUST carry the real values (like the
++	// loader's ladder): a zeroed bias would silently disable the estates, a
++	// zeroed member weight the group demand concentration.
+ 	cat.balance.growth_groups = Growth_Groups_Balance{
+-		bias_prob_permille = 750,
++		bias_prob_permille = 1000,
+ 		min_members = 3,
+-		max_members = 8,
++		max_members = 5,
+ 		radius_tiles = 5,
++		new_area_seed_tiles = 10,
+ 		member_weight_permille = 250,
+ 	}
+ 	// 4.1: the warning thresholds + lead times (mirrors data/balance.json) —
+diff --git a/core/growth.odin b/core/growth.odin
+index 1bf5e13..d2c4e94 100644
+--- a/core/growth.odin
++++ b/core/growth.odin
+@@ -94,21 +94,29 @@ GROWTH_MAX_ATTEMPTS :: i32(8)
+ // proc-local) replaces any angle/cos/sin (which would need floats in the sim).
+ GROWTH_DIR_COUNT :: i32(8)
+ 
+-// --- 5.12: aggregation groups (the estates ruling) ---------------------------
++// --- 5.12: aggregation groups (the estates rulings) -------------------------
+ // The derived estate view + the group-bias growth draw (spec-traffic-model
+ // Thread 3 — congestion lives at the shared uplink; user ruling 2026-08-17
+ // night: "we usually have homes grouped together in say estates, with the
+ // occasional residentials in the middle of nowhere isolated... clusters of
+-// end points, but NOT 100% of the time"). The group bias is a SOFT PREFERENCE
+-// INSIDE the E31 validity envelope: the bias draw runs first, E31 validates
+-// the biased candidate, rejection-sampling (which can land outside the group)
+-// is unchanged — E31 stays the hard contract, the uplink is never forced
+-// (the player wires it). Group tuning is DATA (balance.json `growth_groups`,
+-// playtest-tunable, never a code constant): bias_prob_permille (~750 = the
+-// ruling's 0.7–0.8 majority clustered), min/max_members (3–8), radius_tiles
+-// (5 — MUST exceed terminal_min_sep_tiles = 4, the E31 packing floor), and
+-// member_weight_permille (the director's group-scoped demand weight, read
+-// via group_pick_scale).
++// end points, but NOT 100% of the time"). The 08-21 STRICT estate ruling
++// supersedes that mix at the default (bias_prob_permille 1000): every growth
++// spawn is exactly one of two classes — ATTACH (an eligible cluster exists →
++// candidate within radius_tiles of a member) or SEED (no eligible cluster →
++// fresh area at ≥ new_area_seed_tiles from every live terminal, still in the
++// outward-from-mesh annulus). The group bias is a SOFT PREFERENCE INSIDE the
++// E31 validity envelope: the bias draw runs first, E31 validates the biased
++// candidate, rejection-sampling (which can land outside the group) is
++// unchanged — E31 stays the hard contract, the uplink is never forced (the
++// player wires it). The 08-17 minority-isolate mix is NOT deleted: bias <
++// 1000 restores it as a data option, now seed-distance-respecting. Group
++// tuning is DATA (balance.json `growth_groups`, playtest-tunable, never a
++// code constant): bias_prob_permille (1000 = strict default), min/max_members
++// (3–5 — the cap 8→5 at the 08-21 ruling: after ~5 nodes a new area),
++// radius_tiles (5 — MUST exceed terminal_min_sep_tiles = 4, the E31 packing
++// floor), new_area_seed_tiles (10 — the SEED family's fresh-area floor, 2×
++// the adjacency radius), and member_weight_permille (the director's
++// group-scoped demand weight, read via group_pick_scale).
+ 
+ // Group_Cluster_View — the DERIVED estate view: live terminals partitioned
+ // into groups under radius adjacency (two terminals are group-adjacent when
+@@ -280,6 +288,59 @@ growth_terminal_roster :: proc(cat: ^Catalogs, era: u8,
+ 	return
+ }
+ 
++// growth_seed_sep_ok — the SEED family's fresh-area predicate (the 08-21
++// estate ruling): a seed candidate must sit >= new_area_seed_tiles from EVERY
++// LIVE TERMINAL — a new estate starts at a readable distance from every
++// existing home, leaving routing room between sections. The predicate is
++// terminal-only (routers are NOT in the set — the seed still grows outward
++// from the mesh, and E31 connectability is the router-side contract). i64
++// dist² (ODN-10 — the tile distance must never wrap); a rejection predicate
++// like E31 (no rng draw — the bounded rejection budget covers it). The
++// degenerate guard is fail-CLOSED (a sub-1 floor accepts nothing — the
++// loader pins seed > radius >= 1, so the guard is belt-and-suspenders).
++growth_seed_sep_ok :: proc(t: ^Topology, pos: [2]i32, min_dist: i32) -> bool {
++	if min_dist < 1 {
++		return false // degenerate guard — fail-CLOSED, mirroring growth_attach_radius_ok (never a silent zero-floor accept)
++	}
++	d2 := i64(min_dist) * i64(min_dist)
++	for i in 0..<len(t.node_alive) {
++		if !t.node_alive[i] || t.node_kind[i] != .Terminal {
++			continue
++		}
++		d := t.node_pos[i] - pos
++		if i64(d[0])*i64(d[0]) + i64(d[1])*i64(d[1]) < d2 {
++			return false
++		}
++	}
++	return true
++}
++
++// growth_attach_radius_ok — the ATTACH family's strict-radius predicate (the
++// 08-21 "no strays" contract): the candidate must sit within the EUCLIDEAN
++// adjacency radius of its anchor member. The compass draw's diagonal
++// directions would otherwise place a candidate at up to dist×√2 tiles from
++// its anchor (dist ∈ [min_sep, radius] → 5.7–7.1) — OUTSIDE the Euclidean
++// adjacency radius (5) yet INSIDE the seed floor (10): the third class the
++// strict doctrine deletes (a node that neither joins its estate nor reads as
++// a fresh area — the "too many strays" of the 08-17 mix). Zero rng draws —
++// a rejection predicate like E31 (the bounded budget covers it); the draw
++// ORDER/counts are unchanged (the family's draws stay coin → cluster pick →
++// member pick → dir → dist). i64 dist² (ODN-10). SHAPE CONSEQUENCE
++// (documented, not accidental): with dist ∈ [min_sep, radius] = [4, 5], a
++// diagonal draw's Euclidean distance is dist×√2 ≥ 5.66 > radius 5 for EVERY
++// reachable dist — so all 4 diagonal compass directions reject pre-E31, and
++// accepted attach geometry is CARDINAL-ONLY: estates read as compact crosses
++// (the ~50% per-attempt budget burn on diagonal draws is the known,
++// deterministic cost — bounded rejection sampling, no stall).
++growth_attach_radius_ok :: proc(t: ^Topology, anchor_slot: u32, pos: [2]i32, radius: i32) -> bool {
++	if radius < 1 {
++		return false // degenerate guard — never a silent zero-radius accept
++	}
++	d := t.node_pos[anchor_slot] - pos
++	r2 := i64(radius) * i64(radius)
++	return i64(d[0])*i64(d[0]) + i64(d[1])*i64(d[1]) <= r2
++}
++
+ // growth_pos_valid — the E31 placement half: inside the map grid + min-
+ // separated from every live node AND pipe segment. `sep` is the separation in
+ // whole tiles; the node check is Euclidean² (dist2), the pipe check is the
+@@ -425,23 +486,35 @@ growth_dir_pick :: proc(rng: ^Rng) -> [2]i32 {
+ // at the top of step) — fixed order, byte-identical replay.
+ //
+ // Draw order: on a spawn window — 1 type-pick draw, then per attempt: 1 bias
+-// coin draw (5.12), then the selected family's draws — the BIASED family
+-// (coin landed under bias_prob_permille AND an eligible cluster exists): a
+-// cluster pick (SKIPPED when exactly one eligible cluster), a member pick
+-// (SKIPPED when the cluster has one member), the compass direction, and a
+-// distance in [terminal_min_sep_tiles, radius_tiles] (always drawn — the
+-// loader guarantees radius > the sep floor); the UNIFORM family (the
+-// pre-5.12 outward-from-mesh draw): the junction pick (SKIPPED when nj == 1),
+-// the direction, and the distance (SKIPPED when span == GROWTH_OUT_MIN —
+-// rng_range draws nothing when hi <= lo — rng.odin). The per-attempt count is
+-// a PURE FUNCTION of deterministic state (eligible-cluster count + cluster
+-// sizes + nj + span are topology/catalog derived) — byte-identical replay for
+-// a fixed seed. On a non-spawn window: ZERO draws. When growth is disabled
+-// (legacy runs) this proc is never called — existing runs' rng streams are
+-// untouched. The exact counts are not pinned (the same-seed identity + replay
+-// tests pin the aggregate); a future change that alters the per-window draw
+-// count shifts the growth/demand rng interleaving and MUST re-bless the
+-// growth goldens.
++// coin draw (5.12), then the selected family's draws — the ATTACH family
++// (coin under bias_prob_permille AND an eligible cluster exists): a cluster
++// pick (SKIPPED when exactly one eligible cluster), a member pick (SKIPPED
++// when the cluster has one member), the compass direction, and a distance in
++// [terminal_min_sep_tiles, radius_tiles] (always drawn — the loader
++// guarantees radius > the sep floor); the SEED family (the coin-miss — only
++// reachable at bias < 1000, the 08-17 minority-isolate data option — OR no
++// eligible cluster exists; the 08-21 strict doctrine: every spawn is
++// attach-or-seed): the junction pick (SKIPPED when nj == 1), the direction,
++// and the distance (SKIPPED when span == GROWTH_OUT_MIN — rng_range draws
++// nothing when hi <= lo — rng.odin). The strict contract adds two ZERO-DRAW
++// rejection predicates: growth_attach_radius_ok (the ATTACH candidate must
++// sit within the EUCLIDEAN radius of its anchor — the diagonal-escape
++// closure) and growth_seed_sep_ok (a SEED candidate must sit >=
++// new_area_seed_tiles from every live terminal — the fresh-area floor). The
++// per-attempt count is a PURE FUNCTION of deterministic state (eligible-
++// cluster count + cluster sizes + nj + span are topology/catalog derived) —
++// byte-identical replay for a fixed seed; the strict predicates shift the rng
++// interleaving ONLY through the acceptance outcome (the deliberate, cause-
++// documented 08-21 re-bless). ONE draw-count change vs 5.12, in the attach
++// family: the member pick counts LIVE MEMBERS only (the dead-slot id-0
++// collision guard) — its rng_range flips from drawn to SKIPPED when a
++// cluster's 5.12 member set included a dead slot; every other per-attempt
++// count is unchanged. On a non-spawn window: ZERO draws. When growth
++// is disabled (legacy runs) this proc is never called — existing runs' rng
++// streams are untouched. The exact counts are not pinned (the same-seed
++// identity + replay tests pin the aggregate); a future change that alters the
++// per-window draw count shifts the growth/demand rng interleaving and MUST
++// re-bless the growth goldens.
+ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+                              rng: ^Rng) -> Growth_Intent {
+ 	// 1. schedule — a pure function of the executed tick (never wall-clock).
+@@ -488,19 +561,25 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 	// 6. rejection sampling (E31) — draw a candidate from the same rng stream,
+ 	//    accept the FIRST valid one. Bounded (GROWTH_MAX_ATTEMPTS): exhaustion
+ 	//    skips the window deterministically — no wall-time retry loop.
+-	//    5.12: the group-bias draw family (the estates ruling) is a SOFT
+-	//    PREFERENCE inside the E31 envelope — every attempt first draws a bias
+-	//    COIN (1 draw, always); a biased attempt (coin < bias_prob_permille
+-	//    AND an eligible cluster exists — size < max_members) draws near a
+-	//    member of that cluster (within radius_tiles — the candidate JOINS the
+-	//    estate in the derived view); every other attempt is the pre-5.12
+-	//    outward-from-mesh draw (the isolated home in the middle of nowhere).
+-	//    EITHER family's candidate must still pass growth_pos_valid +
+-	//    growth_connectable — the bias never forces a placement E31 would
+-	//    reject, and a failed biased candidate is replaced by a fresh draw
+-	//    that CAN land outside the group (rejection-sampling unchanged). The
+-	//    cluster view is built ONCE per window (pure computation — zero rng,
+-	//    zero mutation); its draw counts are pure functions of the state.
++	//    5.12 (the 08-21 strict doctrine): every attempt first draws a bias
++	//    COIN (1 draw, always); a biased attempt (coin < bias_prob_permille —
++	//    at the 1000 default, EVERY attempt) with an eligible cluster exists
++	//    (size < max_members) is the ATTACH family: draw near a member of
++	//    that cluster (within radius_tiles — the candidate JOINS the estate
++	//    in the derived view). A biased attempt with NO eligible cluster, and
++	//    any coin-miss (only reachable at bias < 1000 — the 08-17
++	//    minority-isolate data option), is the SEED family: the pre-5.12
++	//    outward-from-mesh annulus draw (a mesh router, a compass direction,
++	//    a distance in [GROWTH_OUT_MIN, connect_span]) + the fresh-area
++	//    predicate growth_seed_sep_ok — the candidate must sit >=
++	//    new_area_seed_tiles from every live terminal (a new estate starts a
++	//    readable distance from every existing home). EITHER family's
++	//    candidate must still pass growth_pos_valid + growth_connectable —
++	//    the bias never forces a placement E31 would reject, and a failed
++	//    candidate is replaced by a fresh draw that CAN land outside the
++	//    group (rejection-sampling unchanged). The cluster view is built ONCE
++	//    per window (pure computation — zero rng, zero mutation); its draw
++	//    counts are pure functions of the state.
+ 	gview: Group_Cluster_View
+ 	gview_ready := false
+ 	defer if gview_ready {
+@@ -508,9 +587,10 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 	}
+ 	for attempt in 0..<GROWTH_MAX_ATTEMPTS {
+ 		pos: [2]i32
++		seed_attempt := false
+ 		coin := rng_range(rng, 0, 999)
+ 		if coin < cat.balance.growth_groups.bias_prob_permille {
+-			// the biased family — extend an existing estate (softly: the
++			// the ATTACH family — extend an existing estate (softly: the
+ 			// candidate still faces the full E31 test below).
+ 			if !gview_ready {
+ 				gview = group_cluster_view_build(t, cat)
+@@ -518,8 +598,8 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 			}
+ 			// the eligible clusters in slot order (a slot is a cluster's first
+ 			// member iff id[slot] == slot; a cluster is eligible iff its size is
+-			// below the cap — a full estate stops growing, new growth starts a
+-			// fresh estate via the uniform family).
++			// below the cap — a full estate stops extending, new growth seeds a
++			// fresh area via the SEED family below).
+ 			eligible := 0
+ 			for i in 0..<len(gview.id) {
+ 				if gview.size[i] == 0 || gview.id[i] != u32(i) {
+@@ -547,9 +627,25 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 					}
+ 					seen += 1
+ 				}
+-				// the member anchor (uniform over the cluster's members)
++				// the member anchor (uniform over the cluster's members). The
++				// member set is LIVE TERMINALS ONLY — the derived view leaves dead
++				// slots' id at 0, which collides with cluster 0's id, so a raw
++				// id match would count non-terminals (routers, demolished slots)
++				// as members and anchor an "attach" on a ROUTER — a candidate
++				// 5-7 tiles from every real home: the stray the 08-21 strict
++				// doctrine deletes. The member-pick DRAW COUNT is a pure
++				// function of the live-member set (deterministic — same-seed
++				// identity preserved); vs 5.12 it changed ONCE in the dead-slot
++				// collision case (a cluster whose 5.12 member set included a
++				// dead slot now counts fewer live members — the member-pick
++				// rng_range can flip from drawn to SKIPPED, exactly what
++				// test_groups_strict_audit_with_fixture pins). No OTHER draw
++				// count changed.
+ 				member_count := 0
+ 				for i in 0..<len(gview.id) {
++					if !t.node_alive[i] || t.node_kind[i] != .Terminal {
++						continue
++					}
+ 					if gview.id[i] == u32(cluster_first) {
+ 						member_count += 1
+ 					}
+@@ -558,6 +654,9 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 				anchor_slot := 0
+ 				seen = 0
+ 				for i in 0..<len(gview.id) {
++					if !t.node_alive[i] || t.node_kind[i] != .Terminal {
++						continue
++					}
+ 					if gview.id[i] != u32(cluster_first) {
+ 						continue
+ 					}
+@@ -575,10 +674,24 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 				}
+ 				dist := rng_range(rng, lo, hi)
+ 				pos = t.node_pos[anchor_slot] + dir * dist
++				// the strict-radius predicate (the 08-21 "no strays" contract):
++				// the candidate must ACTUALLY sit within the Euclidean adjacency
++				// radius of its anchor — the compass draw's diagonal directions
++				// would otherwise place it at up to dist×√2 (outside radius,
++				// inside the seed floor: the third class the ruling deletes).
++				// Zero draws — a rejection predicate like E31 (a diagonal draw
++				// is re-sampled; the draw counts per attempt are unchanged).
++				if !growth_attach_radius_ok(t, u32(anchor_slot), pos, cat.balance.growth_groups.radius_tiles) {
++					continue
++				}
+ 			} else {
+-				// no eligible cluster (no terminals yet, or every estate full) —
+-				// the biased coin falls through to the uniform family (a fresh
+-				// estate is born as an isolated home).
++				// no eligible cluster (no terminals yet, or every estate at the
++				// cap) — the SEED family: a fresh area is born at a readable
++				// distance from every existing home (the 08-21 ruling: after ~5
++				// nodes, a NEW area elsewhere). Same draws as the coin-miss
++				// branch below (the pre-5.12 annulus draw) — the family is the
++				// draw + the fresh-area predicate applied after the draw.
++				seed_attempt = true
+ 				router_slot := growth_junction_slot_at(t, rng_range(rng, 0, i32(nj) - 1))
+ 				dir := growth_dir_pick(rng)
+ 				lo := GROWTH_OUT_MIN_TILES
+@@ -590,12 +703,15 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 				pos = t.node_pos[router_slot] + dir * dist
+ 			}
+ 		} else {
+-			// the uniform family — the pre-5.12 outward-from-mesh draw (the
+-			// isolated home in the middle of nowhere): a mesh router (uniform),
+-			// a compass direction, and a distance in [GROWTH_OUT_MIN,
+-			// connect_span] — the fringe of the mesh, still within the
+-			// connectable radius of the picked router (E31 by construction;
+-			// growth_connectable below is the self-contained contract check).
++			// the coin-miss — the SEED family (reachable only at bias < 1000,
++			// the 08-17 minority-isolate mix as a data option, now
++			// seed-distance-respecting): the pre-5.12 outward-from-mesh draw —
++			// a mesh router (uniform), a compass direction, and a distance in
++			// [GROWTH_OUT_MIN, connect_span] — the fringe of the mesh, still
++			// within the connectable radius of the picked router (E31 by
++			// construction; growth_connectable below is the self-contained
++			// contract check).
++			seed_attempt = true
+ 			router_slot := growth_junction_slot_at(t, rng_range(rng, 0, i32(nj) - 1))
+ 			dir := growth_dir_pick(rng)
+ 			lo := GROWTH_OUT_MIN_TILES
+@@ -606,6 +722,17 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 			dist := rng_range(rng, lo, hi)
+ 			pos = t.node_pos[router_slot] + dir * dist
+ 		}
++		// the strict contract's rejection predicates (zero rng draws — like E31,
++		// rejection predicates inside the bounded budget): the SEED family's
++		// fresh-area floor (a seed must sit >= new_area_seed_tiles from every
++		// live terminal); the ATTACH family's radius closure ran with its draw
++		// (growth_attach_radius_ok — the diagonal escape can never spawn a
++		// third class).
++		if seed_attempt {
++			if !growth_seed_sep_ok(t, pos, cat.balance.growth_groups.new_area_seed_tiles) {
++				continue
++			}
++		}
+ 		if !growth_pos_valid(t, &cat.balance, pos, cat.balance.terminal_min_sep_tiles) {
+ 			continue
+ 		}
+diff --git a/core/growth_test.odin b/core/growth_test.odin
+index ec61110..3a2fb79 100644
+--- a/core/growth_test.odin
++++ b/core/growth_test.odin
+@@ -184,13 +184,15 @@ test_growth_e31_validity :: proc(t: ^testing.T) {
+ 
+ @(test)
+ test_growth_outward_bias_annulus :: proc(t: ^testing.T) {
+-	// outward-from-mesh bias, mechanically pinned: a ONE-router mesh (the
+-	// fixture) — every spawn must land in the annulus [GROWTH_OUT_MIN,
+-	// connect_span] around the router (the draw range), i.e. Euclidean
+-	// distance >= GROWTH_OUT_MIN_TILES (the outward floor — a spawn on top
+-	// of the mesh would violate the floor) and <= connect_span (E31 — the
+-	// draw's hi bound; connectability is the strict contract, this is the
+-	// bias range).
++	// the mesh-annulus bound under the 08-21 strict doctrine, mechanically
++	// pinned: a ONE-router mesh (the fixture) — every spawn must land in the
++	// annulus [GROWTH_OUT_MIN, connect_span] around the router. Under the
++	// strict policy the bound holds for BOTH families by construction: a SEED
++	// draws in [GROWTH_OUT_MIN, span] (the annulus draw); an ATTACH candidate
++	// must still pass E31 — node separation (>= the 4-tile packing floor from
++	// the router, above the 3-tile outward floor) + connectability (<= span of
++	// the junction) — so the outward floor + the connectable radius are never
++	// bent.
+ 	cat_storage: Catalogs
+ 	cat := test_catalog(&cat_storage)
+ 	defer catalogs_destroy(cat)
+@@ -497,78 +499,197 @@ test_growth_replay_byte_identical :: proc(t: ^testing.T) {
+ 	testing.expectf(t, !diverged, "REPLAY DIVERGENCE: growing-map hashes differ — growth must be seed-derived (E10)")
+ }
+ 
+-// --- 5.12: aggregation groups (the estates ruling) ---------------------------
+-
+-// test_groups_estates_and_isolated — THE estates ruling pin (user 2026-08-17
+-// night): "we usually have homes grouped together in say estates, with the
+-// occasional residentials in the middle of nowhere isolated... clusters of
+-// end points, but NOT 100% of the time." On a known seed (9), growth produces
+-// BOTH multi-member estates (>= min_members — the majority-clustered shape)
+-// AND isolated spawns (the bias-prob minority) on the SAME run; every estate
+-// is radius-connected (the named compactness heuristic: each member sits
+-// within radius_tiles of a sibling — the bird's-eye read of one neighborhood;
+-// true by construction of the derived view, re-audited against the raw
+-// positions so it is never vacuous); and every spawned terminal still
+-// satisfies E31 (the hard floor the bias never bends). NOTE: the DERIVED
+-// cluster size may exceed max_members when two estates grow near each other
+-// and bridge (a candidate within radius of both) — the growth CAP applies to
+-// the draws (an estate at the cap stops extending), never to the emergent
+-// derived view (neighborhoods merge in reality too).
+-@(test)
+-test_groups_estates_and_isolated :: proc(t: ^testing.T) {
+-	cat_storage: Catalogs
+-	cat := test_catalog(&cat_storage)
+-	defer catalogs_destroy(cat)
++// --- 5.12: aggregation groups (the estates rulings) --------------------------
++
++// strict_spawn_class — the mechanism-exact attach-or-seed classification of
++// ONE growth spawn against its THEN-LIVE terminal subset (the terminals that
++// existed before the spawn — the mechanism can only attach to or seed against
++// those). Rebuilds the derived cluster view over the subset (radius
++// adjacency, smallest-index roots — the group_cluster_view_build rule; n is
++// tiny, recomputed per spawn) and returns:
++//   attach   — the candidate sits within radius_tiles of a member of an
++//              ELIGIBLE cluster (size < max_members — the only clusters the
++//              ATTACH family may extend);
++//   seed     — the candidate sits >= new_area_seed_tiles from every then-live
++//              terminal (vacuous when the subset is empty — the fresh-map
++//              first spawn);
++//   eligible — an eligible cluster existed in the then-view (the strict
++//              mechanism's branch point: eligible > 0 -> ATTACH family, else
++//              SEED family). A seed-class spawn with eligible == true is
++//              necessarily a COIN-MISS seed (mechanically impossible at bias
++//              1000 — reachable only at bias < 1000, the 08-17 data option).
++strict_spawn_class :: proc(t: ^Topology, cat: ^Catalogs, then_slots: []int, pos: [2]i32) -> (attach, seed, eligible: bool) {
++	radius := i64(cat.balance.growth_groups.radius_tiles)
++	r2 := radius * radius
++	sd := i64(cat.balance.growth_groups.new_area_seed_tiles)
++	sd2 := sd * sd
++	n := len(then_slots)
++	parent := make([]i32, n, context.temp_allocator)
++	defer delete(parent)
++	for i in 0..<n {
++		parent[i] = i32(i)
++	}
++	find :: proc(parent: []i32, x: i32) -> i32 {
++		root := x
++		for parent[root] != root {
++			root = parent[root]
++		}
++		return root
++	}
++	// radius adjacency over the subset (smallest root wins — slot order)
++	for a in 0..<n {
++		for b in a + 1..<n {
++			pa := t.node_pos[then_slots[a]]
++			pb := t.node_pos[then_slots[b]]
++			d := pa - pb
++			if i64(d[0])*i64(d[0]) + i64(d[1])*i64(d[1]) <= r2 {
++				ra := find(parent, i32(a))
++				rb := find(parent, i32(b))
++				if ra < rb {
++					parent[rb] = ra
++				} else {
++					parent[ra] = rb
++				}
++			}
++		}
++	}
++	size := make([]i32, n, context.temp_allocator)
++	defer delete(size)
++	for i in 0..<n {
++		size[find(parent, i32(i))] += 1
++	}
++	cap := i32(cat.balance.growth_groups.max_members)
++	// seed: >= seed_dist from EVERY then-live terminal (vacuous when none)
++	seed = true
++	for i in 0..<n {
++		d := t.node_pos[then_slots[i]] - pos
++		if i64(d[0])*i64(d[0]) + i64(d[1])*i64(d[1]) < sd2 {
++			seed = false
++		}
++	}
++	// attach: within radius of a member of an eligible cluster
++	for i in 0..<n {
++		if size[find(parent, i32(i))] >= cap {
++			continue
++		}
++		d := t.node_pos[then_slots[i]] - pos
++		if i64(d[0])*i64(d[0]) + i64(d[1])*i64(d[1]) <= r2 {
++			attach = true
++			break
++		}
++	}
++	// eligible: any cluster below the cap
++	for i in 0..<n {
++		if find(parent, i32(i)) == i32(i) && size[i] < cap {
++			eligible = true
++			break
++		}
++	}
++	return
++}
++
++// run_groups_audit — the parametrized strict-estate audit (the 08-21
++// acceptance as a repeatable test): run `windows` growth windows on the
++// two-router mesh (no fixture terminals — every terminal is a growth spawn),
++// then audit EVERY spawn against its then-live terminal subset via
++// strict_spawn_class, the final derived view (estates form, singletons are
++// fresh seeds, compactness), and E31. `strict` selects the assertion flavor:
++//   strict (bias 1000) — the mechanism's branch point decides the class: an
++//     eligible cluster existed -> the spawn MUST be ATTACH (the ATTACH family
++//     always ran); no eligible cluster (or no terminals) -> the spawn MUST be
++//     SEED. No forced first-spawn mark — the fresh-map seed falls out of the
++//     empty subset (seed vacuous, eligible false).
++//   opt-in (bias < 1000) — every spawn is attach-or-seed (the coin-miss SEED
++//     family must audit clean, seed-distance-respecting).
++// Returns (spawns, midrun_seed, coinmiss_seed): midrun_seed = a SEED-class
++// spawn with spawn index > 0 (the estate-at-cap -> fresh-area acceptance —
++// NOT the forced first spawn); coinmiss_seed = a SEED-class spawn while an
++// eligible cluster existed (necessarily a coin-miss — the 08-17 branch).
++run_groups_audit :: proc(t: ^testing.T, cat: ^Catalogs, seed: u64, cap, bias: i32, windows: int, strict: bool) -> (spawns: int, midrun_seed, coinmiss_seed: bool) {
+ 	s: Run_State
+ 	defer run_destroy(&s)
+-	run_init(&s, 9, cat.hash, TEST_LOGIC_HZ)
++	run_init(&s, seed, cat.hash, TEST_LOGIC_HZ)
+ 	// the mesh is PLAYER-PLACED (3.5): two routers give the grown estates
+-	// placement room + connectability. Every terminal on the map is therefore
+-	// a growth spawn (clean estate/isolated accounting — no fixture terminals).
++	// placement room + connectability.
+ 	rt, _ := node_type_index(cat, "router_basic")
+ 	topology_spawn_node(&s.topology, rt, {20, 15}, cat)
+ 	topology_spawn_node(&s.topology, rt, {34, 24}, cat)
+ 	s.era = 3
+ 	s.growth_enabled = true
+-	run_growth(&s, 28*cat.balance.terminal_spawn_interval_ticks, cat)
++	cat.balance.growth_groups.max_members = cap
++	cat.balance.growth_groups.bias_prob_permille = bias
++	run_growth(&s, u64(windows)*cat.balance.terminal_spawn_interval_ticks, cat)
+ 
+-	min_m := cat.balance.growth_groups.min_members
+-	radius := i64(cat.balance.growth_groups.radius_tiles)
+-	r2 := radius * radius
+ 	view := group_cluster_view_build(&s.topology, cat)
+ 	defer group_view_destroy(&view)
+ 	span := growth_connect_span(cat, 3)
+-	spawns := 0
+-	estate_seen := false
+-	isolated_seen := false
+-	compact_ok := true
++	min_m := cat.balance.growth_groups.min_members
++	r2 := i64(cat.balance.growth_groups.radius_tiles) * i64(cat.balance.growth_groups.radius_tiles)
++
++	// spawn order == slot order (the routers precede growth) — the then-live
++	// terminal subset accumulates in the same order.
++	spawn_slots: [dynamic]int
++	defer delete(spawn_slots)
+ 	for i in 0..<len(s.topology.node_alive) {
+-		if !s.topology.node_alive[i] || s.topology.node_kind[i] != .Terminal {
+-			continue
++		if s.topology.node_alive[i] && s.topology.node_kind[i] == .Terminal {
++			append(&spawn_slots, i)
+ 		}
+-		pos := s.topology.node_pos[i]
++	}
++	then_slots: [dynamic]int
++	defer delete(then_slots)
++	estate_seen := false
++	compact_ok := true
++	for slot, idx in spawn_slots { // Odin iterates value, index — slot = node slot, idx = spawn order
++		pos := s.topology.node_pos[slot]
+ 		spawns += 1
+-		size := i32(view.size[i])
++		size := i32(view.size[slot])
+ 		if size >= min_m {
+ 			estate_seen = true
+ 		}
++		attach, seed_ok, eligible := strict_spawn_class(&s.topology, cat, then_slots[:], pos)
++		if strict {
++			if eligible {
++				testing.expectf(t, attach,
++					"growth spawn at %v must be ATTACH (an eligible cluster existed) — got neither attach (within %d tiles of an eligible cluster member) nor a seed-family spawn",
++					pos, cat.balance.growth_groups.radius_tiles)
++			} else {
++				testing.expectf(t, seed_ok,
++					"growth spawn at %v must be SEED (no eligible cluster existed) — the fresh-area floor %d was not cleared",
++					pos, cat.balance.growth_groups.new_area_seed_tiles)
++			}
++		} else {
++			// opt-in (bias < 1000): attach-or-seed, seed-distance-respecting
++			testing.expectf(t, attach || seed_ok,
++				"growth spawn at %v is NEITHER attach (within %d of an eligible cluster member) nor seed (>= %d from every then-live terminal) — a stray under the opt-in bias %d",
++				pos, cat.balance.growth_groups.radius_tiles, cat.balance.growth_groups.new_area_seed_tiles, bias)
++		}
++		if seed_ok && idx > 0 {
++			midrun_seed = true
++		}
++		if seed_ok && eligible {
++			coinmiss_seed = true
++		}
++		// no stray isolates: a final-view singleton is always a fresh seed (an
++		// attach would sit within radius of an earlier terminal and merge into
++		// its cluster by construction of the derived view).
+ 		if size == 1 {
+-			isolated_seen = true
++			testing.expectf(t, seed_ok,
++				"singleton %d at %v must be a fresh SEED (no stray isolates — an attach would sit within radius of an earlier terminal and merge)", slot, pos)
+ 		}
+ 		// the compactness heuristic (named): every estate member sits within
+ 		// radius_tiles of at least one OTHER member of the same estate — the
+-		// bird's-eye read. The derived view is connected by construction; this
+-		// re-audits against the raw positions so the heuristic is never vacuous.
++		// bird's-eye read. Re-audited against raw positions so it is never
++		// vacuous.
+ 		if size >= 2 {
+ 			within := false
+ 			for j in 0..<len(s.topology.node_alive) {
+-				if !s.topology.node_alive[j] || i == j {
++				if !s.topology.node_alive[j] || slot == j {
+ 					continue
+ 				}
+-				if view.id[j] != view.id[i] {
++				if view.id[j] != view.id[slot] {
+ 					continue
+ 				}
+-				d := s.topology.node_pos[i] - s.topology.node_pos[j]
++				d := s.topology.node_pos[slot] - s.topology.node_pos[j]
+ 				if i64(d[0])*i64(d[0]) + i64(d[1])*i64(d[1]) <= r2 {
+ 					within = true
+ 					break
+@@ -578,16 +699,201 @@ test_groups_estates_and_isolated :: proc(t: ^testing.T) {
+ 				compact_ok = false
+ 			}
+ 		}
+-		// E31 on every growth spawn (the existing audit — the bias never bends
+-		// the hard floor).
+-		testing.expectf(t, e31_recheck(&s.topology, cat, u32(i), pos, span),
++		// E31 on every growth spawn (the hard floor the strict bias never bends).
++		testing.expectf(t, e31_recheck(&s.topology, cat, u32(slot), pos, span),
+ 			"growth spawn at %v violates E31 (bounds/separation/connectability) vs the final topology", pos)
++		append(&then_slots, slot)
+ 	}
+ 	testing.expectf(t, spawns > 0, "growth must spawn terminals, got %d", spawns)
+-	testing.expectf(t, estate_seen, "estates must form: no cluster reached %d members (the ruling's majority-clustered shape)", min_m)
+-	testing.expectf(t, isolated_seen, "isolated spawns must still appear (the ruling's minority — NOT 100% clustered)")
++	testing.expectf(t, estate_seen, "estates must form: no cluster reached %d members (the majority-clustered shape)", min_m)
+ 	testing.expect(t, compact_ok, "every estate member must sit within radius of a sibling (the radius-connected compactness heuristic)")
+ 	testing.expect(t, !s.replay_error, "growth run must not latch replay_error")
++	return
++}
++
++// test_groups_estates_strict — THE estates pin (user ruling 2026-08-21,
++// ~23:5xZ play session — strict cluster placement: "most nodes NEXT TO each
++// other, like an estate, and after ~5 nodes a NEW area elsewhere, leaving
++// routing room between sections"; supersedes the 08-17 "NOT 100%" mix at the
++// default). The parametrized strict audit runs at BOTH caps: max_members 5
++// (the 08-21 default — the acceptance's "estate at the cap -> fresh area")
++// and max_members 8 (the one-line balance change — acceptance criterion 3
++// becomes a repeatable test, not a one-off capture). Every spawn is audited
++// against its then-live terminal subset with the mechanism-exact class rule
++// (no forced first-spawn mark), and a MID-RUN seed (spawn index > 0) is
++// asserted — the cap-to-new-area acceptance cannot pass on the forced first
++// spawn alone. NOTE: the DERIVED cluster size may exceed max_members when two
++// estates grow near each other and bridge (a candidate within radius of both)
++// — the growth CAP applies to the draws (an estate at the cap stops
++// extending), never to the emergent derived view (neighborhoods merge in
++// reality too).
++@(test)
++test_groups_estates_strict :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	// cap 5 — the 08-21 default (seed 9, 28 windows)
++	spawns5, midrun5, _ := run_groups_audit(t, cat, 9, 5, 1000, 28, strict = true)
++	testing.expectf(t, midrun5, "a MID-RUN seed must occur at cap 5 (the estate at the cap seeds a fresh area — spawns %d)", spawns5)
++
++	// cap 8 — the one-line balance.json change (acceptance criterion 3):
++	// estates grow to 8 before seeding a new area.
++	spawns8, midrun8, _ := run_groups_audit(t, cat, 9, 8, 1000, 28, strict = true)
++	testing.expectf(t, midrun8, "a MID-RUN seed must occur at cap 8 too (estates grow to 8, then a fresh area — spawns %d)", spawns8)
++}
++
++// test_groups_optin_mix_seeds_audit_clean — the 08-17 "NOT 100%" mix as a
++// DATA OPTION (bias_prob_permille < 1000 — the canon flag: superseded at the
++// default, not deleted): the coin-miss SEED family must still audit clean —
++// every spawn attach-or-seed, seed-distance-respecting. `coinmiss` pins that
++// a SEED-class spawn occurred while an eligible cluster existed (mechanically
++// impossible at bias 1000 — this is the branch under test; it would regress
++// silently without the pin).
++@(test)
++test_groups_optin_mix_seeds_audit_clean :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	_, _, coinmiss := run_groups_audit(t, cat, 4242, 5, 750, 28, strict = false)
++	testing.expectf(t, coinmiss, "a coin-miss SEED must occur at bias 750 (the 08-17 data option) — the branch is unpinned and would regress silently")
++}
++
++// test_growth_seed_sep_predicate — the 08-21 SEED family's fresh-area
++// predicate, unit-pinned (no seed dependence): a candidate >=
++// new_area_seed_tiles from every LIVE TERMINAL passes; one inside any
++// terminal's seed disk fails; junctions (routers) are NOT in the predicate's
++// set — "existing homes" are terminals only (the seed still grows outward
++// from the mesh, and E31's node separation covers the router side).
++@(test)
++test_growth_seed_sep_predicate :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	res_idx, _ := node_type_index(cat, "residential")
++	rt_idx, _ := node_type_index(cat, "router_basic")
++	seed_dist := cat.balance.growth_groups.new_area_seed_tiles // 10 at the 08-21 default
++	topology_spawn_node(&s.topology, res_idx, {20, 15}, cat) // a terminal — an "existing home"
++	topology_spawn_node(&s.topology, rt_idx, {20, 30}, cat)  // a router — NOT an "existing home"
++
++	// inside the seed disk (< 10 from the terminal): reject
++	testing.expect(t, !growth_seed_sep_ok(&s.topology, {25, 15}, seed_dist), "candidate 5 tiles from a terminal must fail the seed predicate")
++	testing.expect(t, !growth_seed_sep_ok(&s.topology, {29, 15}, seed_dist), "candidate 9 tiles from a terminal must fail the seed predicate")
++	// at the boundary (10): accept
++	testing.expect(t, growth_seed_sep_ok(&s.topology, {30, 15}, seed_dist), "candidate exactly at the seed distance must pass")
++	// beyond: accept
++	testing.expect(t, growth_seed_sep_ok(&s.topology, {31, 15}, seed_dist), "candidate beyond the seed distance must pass")
++	// a candidate near the ROUTER passes (junctions are not "existing homes";
++	// E31's node separation is the router-side contract)
++	testing.expect(t, growth_seed_sep_ok(&s.topology, {20, 29}, seed_dist), "a candidate near a router must pass the seed predicate (terminals-only set)")
++}
++
++// test_growth_attach_radius_predicate — the ATTACH family's strict-radius
++// closure (the 08-21 "no strays" contract), unit-pinned (no seed dependence):
++// a candidate within the EUCLIDEAN radius of its anchor member passes; one at
++// a diagonal draw's escape distance (dist×√2 — beyond radius, inside the seed
++// floor: the third class the ruling deletes) fails. The predicate is what
++// keeps every accepted attach auditable as "within radius_tiles of a then-
++// live terminal" and every singleton a fresh seed. GEOMETRY NOTE: the
++// reachable attach dist range is [terminal_min_sep_tiles, radius_tiles] =
++// [4, 5], so the ONLY passing geometry is CARDINAL (a diagonal at any
++// reachable dist lands at dist×√2 ≥ 5.66 > radius 5 and rejects pre-E31) —
++// the cases below stay within the reachable range; a sub-min_sep diagonal
++// (dist 3) is deliberately NOT pinned (the draw cannot produce it).
++@(test)
++test_growth_attach_radius_predicate :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	res_idx, _ := node_type_index(cat, "residential")
++	// the anchor member at {20,15}; radius 5 (the 08-21 default)
++	topology_spawn_node(&s.topology, res_idx, {20, 15}, cat)
++	radius := cat.balance.growth_groups.radius_tiles // 5
++
++	// a cardinal draw at dist 5 -> Euclidean 5: pass (boundary)
++	testing.expect(t, growth_attach_radius_ok(&s.topology, 0, {25, 15}, radius), "a cardinal candidate at exactly radius must pass")
++	// a cardinal draw at dist 4 -> Euclidean 4: pass (the reachable minimum)
++	testing.expect(t, growth_attach_radius_ok(&s.topology, 0, {24, 15}, radius), "a cardinal candidate inside radius must pass")
++	// a diagonal draw at dist 5 -> Euclidean ~7.07: FAIL (the escape the
++	// strict doctrine closes — outside radius, inside the seed floor)
++	testing.expect(t, !growth_attach_radius_ok(&s.topology, 0, {25, 20}, radius), "a diagonal candidate at dist x sqrt(2) must fail the attach radius (the third-class escape)")
++	// a diagonal draw at dist 4 -> Euclidean ~5.66: FAIL (the minimum escape)
++	testing.expect(t, !growth_attach_radius_ok(&s.topology, 0, {24, 19}, radius), "a diagonal candidate at the min-sep escape distance must fail the attach radius")
++	// beyond radius on a cardinal axis: fail
++	testing.expect(t, !growth_attach_radius_ok(&s.topology, 0, {26, 15}, radius), "a candidate beyond radius must fail")
++	// a degenerate radius never accepts (defensive — the loader pins radius >= 1)
++	testing.expect(t, !growth_attach_radius_ok(&s.topology, 0, {25, 15}, 0), "a zero radius must never accept")
++}
++
++// test_groups_strict_audit_with_fixture — the strict mechanism-exact audit on
++// the FIXTURE map (residential at slot 0 — the case that exposes the dead-
++// slot anchor collision: the derived view leaves dead slots' id at 0, which
++// matches cluster 0's id, so a raw id match would count the router as a
++// cluster-0 member and anchor an "attach" on a ROUTER — a candidate 5-7
++// tiles from every real home, the stray the 08-21 doctrine deletes). The
++// fixture terminals are live from tick 1 and singleton clusters (always
++// eligible below the cap), so at bias 1000 EVERY growth spawn must classify
++// as ATTACH against its then-live subset (fixture + earlier spawns) via
++// strict_spawn_class — a router-anchored candidate is within radius of no
++// TERMINAL and fails the class rule (attach false, seed false).
++@(test)
++test_groups_strict_audit_with_fixture :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, _, rt, _ := topo_setup(t, cat) // fixture: res slot 0, router slot 1, host slot 2
++	defer run_destroy(&s)
++	s.era = 3
++	s.growth_enabled = true
++	basic, _ := node_type_index(cat, "router_basic")
++	append(&s.action_log, Command{apply_tick = 1, kind = Cmd_Place_Router{type_idx = basic, pos = {34, 15}}})
++	_ = rt
++	run_growth(&s, 16*cat.balance.terminal_spawn_interval_ticks, cat)
++
++	span := growth_connect_span(cat, 3)
++	// the then-live terminal subset: the fixture terminals (live from tick 1)
++	// + every earlier growth spawn, in slot order.
++	terminals: [dynamic]int
++	defer delete(terminals)
++	spawns := 0
++	for i in 0..<len(s.topology.node_alive) {
++		if !s.topology.node_alive[i] || s.topology.node_kind[i] != .Terminal {
++			continue
++		}
++		pos := s.topology.node_pos[i]
++		if pos == TEST_FIXTURE_RES_POS || pos == TEST_FIXTURE_HOST_POS {
++			append(&terminals, i)
++			continue
++		}
++		spawns += 1
++		attach, seed_ok, eligible := strict_spawn_class(&s.topology, cat, terminals[:], pos)
++		// the mechanism-exact class rule: eligible cluster existed -> the
++		// ATTACH family ran -> the spawn must be an attach (within radius of a
++		// member of an eligible cluster); every cluster at the cap -> the SEED
++		// family ran -> the spawn must clear the seed floor. The router-anchor
++		// collision candidate (5-7 tiles from every real home) is neither
++		// (attach false, seed false) and fails whichever branch.
++		if eligible {
++			testing.expectf(t, attach,
++				"growth spawn at %v must be ATTACH (an eligible cluster existed) — a stray (the router-anchor collision?)",
++				pos)
++		} else {
++			testing.expectf(t, seed_ok,
++				"growth spawn at %v must be SEED (every cluster at the cap) — a stray (the router-anchor collision?)",
++				pos)
++		}
++		testing.expectf(t, e31_recheck(&s.topology, cat, u32(i), pos, span),
++			"growth spawn at %v violates E31 (bounds/separation/connectability) vs the final topology", pos)
++		append(&terminals, i)
++	}
++	testing.expectf(t, spawns > 0, "growth must spawn terminals, got %d", spawns)
++	testing.expect(t, !s.replay_error, "growth run must not latch replay_error")
+ }
+ 
+ // test_groups_view_and_scale — the mechanism's pure pieces, unit-pinned (no
+diff --git a/data/balance.json b/data/balance.json
+index b55489a..86cccab 100644
+--- a/data/balance.json
++++ b/data/balance.json
+@@ -1,5 +1,5 @@
+ {
+-  "_comment": "Balance catalog (GDD § Numerical Design, ODN-5). Single source for every tunable number. All state-affecting values are int (ODN-10). logic_hz=20 is the fixed-timestep tick rate (ODN-2). snap_radius = inclusive node-snap radius in world px (E4). packet_bandwidth = THE PACE KNOB (packet-plumber-v2-pace-tuning, 2026-08-21): the bandwidth units a packet must accumulate to cross one edge (1.3 flow; transit ticks = ceil(packet_bandwidth / pipe.capacity_units)). It is the single named pace-scale tunable — a standard pipe (cap 15) takes 8 ticks (400 ms @ 20 Hz), 4× the pre-tuning 30 (2 ticks / 100 ms); the time axis stretches while demand stays units-anchored (the 5.9 spawn-credit accrual divides by it, so per-terminal units/s are scale-invariant; the 3.4 SLA tolerances + the E30 exit margin in packet_types.json/health scale with it to preserve semantics). terminal_spawn_interval_ticks = the growth cadence knob (moved from the GROWTH_INTERVAL_TICKS const at the 2026-08-21 legitimate re-bless — the 5.6 placement-block precedent): one terminal per spawn window, every N executed ticks (20 Hz: 80 = 4 s, 2× the pre-tuning 40 = 2 s — the pace-tuning spawn-rate reduction). terminal_min_sep_tiles = the E31 packing floor (moved from GROWTH_MIN_SEP_TILES): min separation between a new terminal and every existing node AND pipe segment (3 → 4 at the same re-bless — the added cluster spacing). lane_presets = the 3.2 emphasis-dial positions (GDD M2 lever 2), per-pipe lane WFQ weights, data-driven — the 5.8 panel keeps them as manual quick-sets; default_lane_preset is the resting position every pipe starts on + the E5 all-zero fallback. lane_auto_reserve_ladder = the 5.8 assignment-driven auto-reservation (user ruling 2026-08-14, GDD M2 / ODN-3): rows[n-1] = the split for n in-play lanes — [100] · [70,30] · [50,30,20], strictly descending (higher-priority lane reserves more). In-play lanes = the lanes the player assigned + Standard (always reserved — the default home of un-categorized types, canon-safe); an UNTOUCHED pipe rides the ladder's 1-lane row — 100% Standard (user ruling 2026-08-19: \"no queue configured = all traffic on the standard queue at 100% of capacity\" — supersedes the 5.8 balanced-preset resting state, which was the divergence; the 08-19 default-allocation change re-blesses every golden, this comment folding into catalog_hash). Playtest-tunable; load-fail-fast validated (ODN-5). lane_queue_packets = the 3.3 per-(bundle, lane) queue bound — when a lane queue is full, the E9 drop precedence sheds the lowest-priority non-empty lane. pool_max_packets = the 3.3 global in-flight pool cap — the E22 backstop (pool exhaustion drops the lowest-priority lane first; one saturated link can never absorb the whole pool and starve the map). map.* = the design-grid world the camera fits into the 1280x720 window. placement.* = the 5.6 placement-separation rules (user ruling 2026-08-14, GDD M3): router↔router 4 tiles (playtest-tunable); router↔terminal = the snap-disambiguation floor + a small readability margin (~2 tiles — the floor derives from snap_radius: a terminal 1 tile away sits inside the 36px snap radius, so the smallest unambiguous gap is ceil(36/26) = 2 tiles). Terminals never block router placement the way the old blanket 7-tile rule did. cap_fraction_permille = the 5.9 per-terminal source demand cap (spec-traffic-model Thread 2): accrue = fraction × throughput ÷ packet_bandwidth milli-packets/tick per terminal, uniformly (500 = 50% — endpoints never self-congest). growth_groups = the 5.12 aggregation-group tunables (spec-traffic-model Thread 3 + the estates ruling, user 2026-08-17 night): the group-bias growth draw (a majority of draws bias toward existing clusters, a minority stay uniform — NOT 100% clustered) + the director's group-scoped demand weight. bias_prob_permille = the biased-draw fraction (750 = 0.75, the ruling's 0.7–0.8; a 0 or 1000 would break the estates+isolated mix); min_members/max_members = the estate size band (3–8); radius_tiles = the group radius + the derived-cluster adjacency threshold (5 — MUST exceed terminal_min_sep_tiles = 4, the E31 packing floor); member_weight_permille = the per-member source-pick-weight bonus (250 — aggregate group demand rises as members join).",
++  "_comment": "Balance catalog (GDD § Numerical Design, ODN-5). Single source for every tunable number. All state-affecting values are int (ODN-10). logic_hz=20 is the fixed-timestep tick rate (ODN-2). snap_radius = inclusive node-snap radius in world px (E4). packet_bandwidth = THE PACE KNOB (packet-plumber-v2-pace-tuning, 2026-08-21): the bandwidth units a packet must accumulate to cross one edge (1.3 flow; transit ticks = ceil(packet_bandwidth / pipe.capacity_units)). It is the single named pace-scale tunable — a standard pipe (cap 15) takes 8 ticks (400 ms @ 20 Hz), 4× the pre-tuning 30 (2 ticks / 100 ms); the time axis stretches while demand stays units-anchored (the 5.9 spawn-credit accrual divides by it, so per-terminal units/s are scale-invariant; the 3.4 SLA tolerances + the E30 exit margin in packet_types.json/health scale with it to preserve semantics). terminal_spawn_interval_ticks = the growth cadence knob (moved from the GROWTH_INTERVAL_TICKS const at the 2026-08-21 legitimate re-bless — the 5.6 placement-block precedent): one terminal per spawn window, every N executed ticks (20 Hz: 80 = 4 s, 2× the pre-tuning 40 = 2 s — the pace-tuning spawn-rate reduction). terminal_min_sep_tiles = the E31 packing floor (moved from GROWTH_MIN_SEP_TILES): min separation between a new terminal and every existing node AND pipe segment (3 → 4 at the same re-bless — the added cluster spacing). lane_presets = the 3.2 emphasis-dial positions (GDD M2 lever 2), per-pipe lane WFQ weights, data-driven — the 5.8 panel keeps them as manual quick-sets; default_lane_preset is the resting position every pipe starts on + the E5 all-zero fallback. lane_auto_reserve_ladder = the 5.8 assignment-driven auto-reservation (user ruling 2026-08-14, GDD M2 / ODN-3): rows[n-1] = the split for n in-play lanes — [100] · [70,30] · [50,30,20], strictly descending (higher-priority lane reserves more). In-play lanes = the lanes the player assigned + Standard (always reserved — the default home of un-categorized types, canon-safe); an UNTOUCHED pipe rides the ladder's 1-lane row — 100% Standard (user ruling 2026-08-19: \"no queue configured = all traffic on the standard queue at 100% of capacity\" — supersedes the 5.8 balanced-preset resting state, which was the divergence; the 08-19 default-allocation change re-blesses every golden, this comment folding into catalog_hash). Playtest-tunable; load-fail-fast validated (ODN-5). lane_queue_packets = the 3.3 per-(bundle, lane) queue bound — when a lane queue is full, the E9 drop precedence sheds the lowest-priority non-empty lane. pool_max_packets = the 3.3 global in-flight pool cap — the E22 backstop (pool exhaustion drops the lowest-priority lane first; one saturated link can never absorb the whole pool and starve the map). map.* = the design-grid world the camera fits into the 1280x720 window. placement.* = the 5.6 placement-separation rules (user ruling 2026-08-14, GDD M3): router↔router 4 tiles (playtest-tunable); router↔terminal = the snap-disambiguation floor + a small readability margin (~2 tiles — the floor derives from snap_radius: a terminal 1 tile away sits inside the 36px snap radius, so the smallest unambiguous gap is ceil(36/26) = 2 tiles). Terminals never block router placement the way the old blanket 7-tile rule did. cap_fraction_permille = the 5.9 per-terminal source demand cap (spec-traffic-model Thread 2): accrue = fraction × throughput ÷ packet_bandwidth milli-packets/tick per terminal, uniformly (500 = 50% — endpoints never self-congest). growth_groups = the 5.12 aggregation-group tunables (spec-traffic-model Thread 3 + the estates rulings, user 2026-08-17 night + 2026-08-21): the strict estate doctrine — every growth spawn is ATTACH (within radius_tiles of an existing cluster member when an eligible cluster exists) or SEED (≥ new_area_seed_tiles from every live terminal — a fresh area, still in the outward-from-mesh annulus) — plus the director's group-scoped demand weight. bias_prob_permille = the attach-draw fraction (1000 = STRICT at the 08-21 default — the 08-17 \"estates, but NOT 100% of the time\" minority-isolate mix is superseded at the default, kept as a data option at < 1000; a 0 is invalid — it would disable estates entirely); min_members/max_members = the estate size band (3–5 — the cap 8→5 at the 08-21 ruling: after ~5 nodes growth seeds a NEW area); radius_tiles = the group radius + the derived-cluster adjacency threshold (5 — MUST exceed terminal_min_sep_tiles = 4, the E31 packing floor); new_area_seed_tiles = the SEED-family floor (10 = 2× the adjacency radius — the \"new area elsewhere, routing room between sections\" reading distance, within the era-3 connect span 18); member_weight_permille = the per-member source-pick-weight bonus (250 — aggregate group demand rises as members join).",
+   "logic_hz": 20,
+   "max_ticks": 100000,
+   "snap_radius": 36,
+@@ -10,11 +10,12 @@
+   "pool_max_packets": 512,
+   "cap_fraction_permille": 500,
+   "growth_groups": {
+-    "_comment": "5.12 aggregation groups (spec-traffic-model Thread 3 + the estates ruling, user 2026-08-17 night — 'homes grouped together in estates ... but NOT 100% of the time'): the group bias is a SOFT PREFERENCE inside the E31 validity envelope (bias draw first, E31 on the biased candidate, rejection-sampling unchanged; the uplink is never forced — the player wires it). bias_prob_permille = the fraction of growth draws that bias toward an existing cluster (750 = 0.75 — the majority-clustered, minority-isolated mix); min_members/max_members = the estate size band (growth extends only clusters below the cap); radius_tiles = the group radius + the derived-cluster adjacency threshold (MUST exceed terminal_min_sep_tiles = 4, the E31 packing floor); member_weight_permille = the director's group-scoped demand weight (a member's source-pick weight scales with its estate's size — aggregate group demand rises as members join, the surge is an aggregation event at the shared uplink).",
+-    "bias_prob_permille": 750,
++    "_comment": "5.12 aggregation groups (spec-traffic-model Thread 3 + the estates rulings): STRICT estate doctrine (user ruling 2026-08-21, ~23:5xZ play session — 'most nodes NEXT TO each other, like an estate, and after ~5 nodes a NEW area elsewhere, leaving routing room between sections'). Supersedes the 08-17 'estates, but NOT 100% of the time' mix AT THE DEFAULT (the canon flag — the 08-17 doctrine is not deleted: bias_prob_permille < 1000 restores the minority-isolate mix as a data option, now seed-distance-respecting). bias_prob_permille = the ATTACH-draw fraction (1000 = strict — every growth spawn is ATTACH within radius_tiles of a member of an eligible cluster, or SEED when no eligible cluster exists; a 0 is invalid — it would disable estates entirely); min_members/max_members = the estate size band (growth extends only clusters below the cap — the cap 8→5 at the 08-21 ruling: after ~5 nodes growth seeds a new area elsewhere); radius_tiles = the group radius + the derived-cluster adjacency threshold (MUST exceed terminal_min_sep_tiles = 4, the E31 packing floor); new_area_seed_tiles = the SEED-family floor — a fresh-area candidate must sit >= this far from every live terminal (10 = 2× the adjacency radius, the \"new area elsewhere\" reading distance, within the era-3 connect span 18 for E31); member_weight_permille = the director's group-scoped demand weight (a member's source-pick weight scales with its estate's size — aggregate group demand rises as members join, the surge is an aggregation event at the shared uplink).",
++    "bias_prob_permille": 1000,
+     "min_members": 3,
+-    "max_members": 8,
++    "max_members": 5,
+     "radius_tiles": 5,
++    "new_area_seed_tiles": 10,
+     "member_weight_permille": 250
+   },
+   "placement": {

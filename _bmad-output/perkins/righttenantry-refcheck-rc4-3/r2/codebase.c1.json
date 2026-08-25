@@ -1,0 +1,42 @@
+[
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "edge",
+    "title": "STILL PRESENT (r1): Exhaustion gate compares RFC3339 'at' against Postgres ::text corrected_at — same-day stale bounces still exhaust the corrected row and stamp fabricated referee_contact_invalid",
+    "location": "server/src/reference_checks/webhooks.gleam:303-304 (compare); server/src/reference_checks/sweep.gleam:178-185 (at format); server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:34-38 (matched_send_at/corrected_at)",
+    "evidence": "webhooks.gleam:303-304: \"// ISO timestamps — lexical compare is chronological.\" / \"string.compare(at, corrected) != order.Lt\". sweep.gleam now_iso(): \"timestamp.system_time() |> timestamp.to_rfc3339(calendar.utc_offset)\" → '2026-08-12T09:00:00.123456Z' (T separator, Z). find_reference_call_by_send_ref.sql: \"COALESCE(rc.corrected_at::text, '') AS corrected_at\" → Postgres '2026-08-12 10:00:00.123456+00' (space separator).",
+    "detail": "The two formats differ at index 10 ('T' 0x54 vs ' ' 0x20), so ANY same-calendar-day comparison yields at > corrected regardless of instants: a redelivered pre-correction bounce hours earlier the same day classifies as genuine and exhaust_reference_call terminalizes the corrected row as unreachable with referee_contact_invalid — the exact r1 W3 false-positive the gate was built to prevent (only cross-day bounces now stand down).",
+    "recommended_fix": "Normalize before comparing (e.g. compare e->>'at' and corrected_at::text both via to_char/to_timestamp, or cast both to timestamptz in SQL) and pin a same-day stale-bounce stand-down test."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "edge",
+    "title": "Substitute idempotent 'existing' path re-stamps fraud_signals on the existing successor — documented no-op is not a no-op",
+    "location": "server/src/reference_checks/actions_handler.gleam:415-421; server/src/reference_checks/sql/stamp_creation_fraud_signals.sql:15",
+    "evidence": "actions_handler.gleam:415-421: \"Ok(new_id) -> { // r1 (N1): the new row gets the same creation-time fraud screening the // viewed trigger applies (parity — best-effort, post-commit). trigger.stamp_creation_fraud_for( config, app_uuid, landlord_uuid, vacancy_uuid, [new_id], )\" — this runs for BOTH the how='inserted' AND the how='existing' (double-submit) branch. stamp_creation_fraud_signals.sql: \"SET fraud_signals = $2::jsonb\" (full overwrite).",
+    "detail": "The how='existing' branch is documented as a pure no-op ('No trio rewrite, no duplicate audit — the original did both') but still re-stamps the existing successor with a full-overwrite creation-signals write plus a fresh Twilio line-type lookup; a full overwrite could wipe form_session evidence written between two submits.",
+    "recommended_fix": "Gate stamp_creation_fraud_for on new_row.how == \"inserted\" (only freshly-created rows), matching the trigger's created_ids-only scope."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "codebase",
+    "title": "STILL PRESENT (r1): Spec Files list names files that don't exist under those names",
+    "location": "_bmad-output/implementation-artifacts/spec-rc4-3-row-actions.md:187-189",
+    "evidence": "Line 188: \"**EDIT:** ... `server/src/reference_checks/sql/list_reference_calls_for_detail.sql` + `find_reference_call_by_send_ref.sql` ...\" Line 189: \"**NEW:** ... `server/src/reference_checks/sql/update_application_referee_trio.sql` ...\"",
+    "detail": "list_reference_calls_for_detail.sql lives under server/src/application/sql/ (not reference_checks/sql), and update_application_referee_trio.sql does not exist — the three per-slot files (update_application_referee_trio_{landlord,character,employer}.sql) do. Spec artifact paths remain wrong after the rework.",
+    "recommended_fix": "Correct the two paths and recount new vs edited SQL in the spec's Files section."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "codebase",
+    "title": "STILL PRESENT (r1): Live-slot idempotent INSERT + 8-status ON CONFLICT predicate maintained in three SQL files",
+    "location": "server/src/reference_checks/sql/substitute_reference_call.sql:28-37; server/src/reference_checks/sql/insert_reference_call_if_absent.sql:28-35; server/src/reference_checks/sql/insert_reference_call_skipped.sql:24-29",
+    "evidence": "substitute_reference_call.sql:37: \"ON CONFLICT (application_id, ref_slot, owner_label) WHERE status NOT IN ( 'form_completed', 'unreachable', 'refused', 'objected', 'manual_recorded', 'failed', 'completed', 'partial' )\" — byte-identical to the other two files and to idx_reference_call_live (20260731222000_create_reference_call.sql:138), but still triplicated.",
+    "detail": "The substitute query still carries its own copy of the live-slot insert semantics instead of reusing the existing query; the predicates are consistent today, but a future status-list change must be made in three places plus the index — the drift risk N10 flagged is unchanged.",
+    "recommended_fix": "Extract the predicate into a shared SQL view/comment-pinned constant or add a schema test asserting all three files' predicates equal the index definition."
+  }
+]

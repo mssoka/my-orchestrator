@@ -1,0 +1,22 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "Empty --stats-out token (\"\") silently disables telemetry and bypasses the one-demo guard in both binaries",
+    "location": "harness/main.odin:117-131; app/main.odin:151,176",
+    "evidence": "harness/main.odin:\n\t\tif rest[i] == \"--stats-out\" {\n\t\t\tif i+1 >= len(rest) || stats_out != \"\" {\n\t\t\t\tusage()\n\t\t\t}\n\t\t\tstats_out = rest[i+1]\n\t\t\ti += 2\n\t\t\tcontinue\n\t\t}\n\t}\n\tif stats_out != \"\" && len(filtered) != 1 {\n\t\tfmt.eprintln(\"harness: --stats-out requires exactly one demo\")\n\t\tos.exit(2)\n\t}\napp/main.odin:\n\t\t\tstats_path = os.args[i+1]\n...\n\tapp.stats_live = stats_path != \"\"\nEmpirically verified against the built harness: `run --stats-out \"\" qos_contention boot` printed \"harness: 2 demo(s) green\" and exited 0 with no stream file written.",
+    "detail": "An explicitly passed empty path token (e.g. an unset shell variable quoted as \"$OUT\") is accepted: stats_live becomes false, so both binaries run telemetry-off with exit 0 and no stream — violating the stated W1 intent \"never silently run telemetry-off\"; the exactly-one-demo guard is skipped too.",
+    "recommended_fix": "Reject an empty path token as a usage error (exit 2) in both parsers: after consuming the token, error when the path string is empty."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "App's new per-step state_hash/stats_emit path allocates into the temp allocator that the app never frees",
+    "location": "app/main.odin:246-260",
+    "evidence": "app/main.odin (the new 5.7 step-loop block):\n\t\t\tif app.stats_live || app.overlay_on {\n\t\t\t\tif app.stats_valid {\n\t\t\t\t\tpp.stats_destroy(&app.stats)\n\t\t\t\t}\n\t\t\t\th := pp.state_hash(&app.state, app.state.events[events_before:], &cat, context.temp_allocator)\ncore/serialize.odin:66-69:\nstate_hash :: proc(state: ^Run_State, tick_events: []Event, cat: ^Catalogs,\n                   scratch := context.temp_allocator) -> u64 {\n\tw := state_writer(state, tick_events, cat, scratch)\n\treturn fnv1a64(w.buf[:])\ngrep for free_all across app/main.odin and app/render/*.odin: zero occurrences.",
+    "detail": "state_hash serializes the full state into the temp scratch each stepped tick (20 Hz), and the PP_DEBUG overlay's fmt_tmp strings add per-frame allocations; unlike the harness drivers (free_all per tick), the app loop never frees the temp allocator — sessions with --stats-out or the overlay grow memory without bound.",
+    "recommended_fix": "Bracket the per-step hash+stats_emit block (and the overlay draw) with free_all(context.temp_allocator) per tick/frame in the app loop, mirroring the harness drivers."
+  }
+]

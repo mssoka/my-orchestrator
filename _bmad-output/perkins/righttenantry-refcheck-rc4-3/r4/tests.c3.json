@@ -1,0 +1,52 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "take-over",
+    "title": "STILL PRESENT (r3): wrong-person awaiting UPDATE is still the unguarded update_reference_call_status — the guarded mark_awaiting_correction_wrong_person is unwired and the race pin is vacuous",
+    "location": "server/src/reference_checks/form_handler.gleam:1235-1257; server/src/reference_checks/sql/update_reference_call_status.sql:23-25; server/test/integration/reference_checks_actions_integration_test.gleam:1729-1766",
+    "evidence": "form_handler.gleam:1235-1257: `case row.taken_over_at != \"\" { True -> wisp.redirect(...) False -> case row.correction_cycles >= 1 { True -> exhaust_wrong_person(...) False -> case sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated) {...` — update_reference_call_status.sql: `WHERE id = $1 AND status = $5::reference_call_status` (no taken_over_at clause); mark_awaiting_correction_wrong_person.sql HAS `AND taken_over_at IS NULL` but grep of server/src shows its only callers are the tests at integration line 1746/1758: `rc_sql.mark_awaiting_correction_wrong_person(db, call)` — direct SQL, never the handler.",
+    "detail": "Handler still executes the unguarded UPDATE; a take-over landing between the token read and the UPDATE yanks a landlord-handled row into awaiting_correction (status-only guard still matches). The guarded SQL exists but is unwired; the pin drives the SQL directly and cannot catch an unwired backstop.",
+    "recommended_fix": "Wire mark_awaiting_correction_wrong_person into apply_wrong_person's cycles=0 branch; rewrite the race test to drive handle_wrong_person_post through the router with a pre-taken-over row so neutralizing the backstop turns it red."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "one-cycle",
+    "title": "Wrong-person awaiting UPDATE also lacks the correction_cycles backstop — a correction + sweep T0-claim racing the read re-enters a corrected row into awaiting_correction and enables a second correction (AD-7 cycle cap violated)",
+    "location": "server/src/reference_checks/form_handler.gleam:1242-1257; server/src/reference_checks/sql/mark_awaiting_correction_wrong_person.sql:12-16",
+    "evidence": "form_handler.gleam:1242-1243: `case row.correction_cycles >= 1 { True -> exhaust_wrong_person(...)` then the False branch calls the unguarded `sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, ...)` (WHERE id + status only). mark_awaiting_correction.sql gained `AND correction_cycles = 0`, but mark_awaiting_correction_wrong_person.sql has only `AND status = 'contact_initiated'::reference_call_status AND taken_over_at IS NULL` — no cycles guard.",
+    "detail": "Read-time cycles check is TOCTOU-racy: correction (queued, cycles=1) + sweep T0 claim (contact_initiated) landing between read and UPDATE still matches the status guard, re-entering a corrected row into awaiting_correction where do_correct (status='awaiting_correction') runs a second correction (cycles=2).",
+    "recommended_fix": "Add `AND correction_cycles = 0` to mark_awaiting_correction_wrong_person.sql (mirroring mark_awaiting_correction) and wire it in — the same fix as the take-over backstop closes both race partners."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage",
+    "title": "r3 W4 pin covers only sweep_terminal — sweep_mark_failed's taken-over guard is unpinned",
+    "location": "server/test/integration/reference_checks_actions_integration_test.gleam:1903-1936; server/src/reference_checks/sql/sweep_mark_failed.sql:20-22",
+    "evidence": "sweep_terminal_writers_respect_taken_over_test body only calls `rc_sql.sweep_terminal(db, call, rc_sql.Unreachable, \"unreachable\", \"sequence_exhausted\", json.null(), \"\")` — no sweep_mark_failed call anywhere in server/test (grep: 0 hits). sweep_mark_failed.sql DOES carry `AND taken_over_at IS NULL` and is a live writer (sweep.gleam:655 `let _ = sql.sweep_mark_failed(db, row_uuid, reason)`).",
+    "detail": "The SQL fix for W4 is real in both writers, but the round-4 mandate asked the pin to assert both stand down; sweep_mark_failed's guard has zero test coverage. Guard present, consequence of a regression would be silent.",
+    "recommended_fix": "Extend sweep_terminal_writers_respect_taken_over_test (or add a sibling) asserting rc_sql.sweep_mark_failed 0-rows on a taken-over row with status unchanged."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "test-quality",
+    "title": "STILL PRESENT (r3): no_em_dash_test duplicate disjunct remains in the for_each_copy loop",
+    "location": "client/test/copy_test.gleam:355-358",
+    "evidence": "`for_each_copy(fn(s) { case string.contains(s, \"\\u{2014}\") || string.contains(s, \"—\") { True -> panic as \"em-dash in copy\"` — the r3-rework cleaned only the second loop (refcheck_action_strings, now a single `\\u{2014}` check with the \"r3 (N13)\" comment); the original loop still ORs the same character twice.",
+    "detail": "N18's duplicate-disjunct fix was applied to the new action-copy loop only; the pre-existing copy loop keeps `\"\\u{2014}\" || \"—\"` — identical codepoint checked twice. Harmless but the audit item is only half cleaned.",
+    "recommended_fix": "Drop the second disjunct in the for_each_copy check (keep `string.contains(s, \"\\u{2014}\")` only)."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "P0 gap verified: the wrong-person awaiting race has no pin on the EXECUTED path — wrong_person_awaiting_sql_has_taken_over_backstop_test calls rc_sql.mark_awaiting_correction_wrong_person directly (integration test lines 1746/1758) while the handler executes sql.update_reference_call_status (form_handler.gleam:1250-1257); neutralizing the backstop turns nothing red. All other r3 pins verified real: per-slot re-arm + declined no-re-arm (real start route), fallback-leg stand-down + genuine-exhaustion control, co-nudge exclusion with in-test control, sweep_terminal guard, resend effective pre/post, N15 now()-relative, N8-client ?slot= URLs, wrong-person exhaustion via router.",
+    "detail": "Gate thresholds: P0 must be 100% — the wrong-person TOCTOU race pin is vacuous and the executed awaiting UPDATE carries no backstop, so P0 < 100% despite strong coverage elsewhere (~533 integration / 554 client / 110 shared / 1482 unit claimed green).",
+    "recommended_fix": "Close the blocker (wire the guarded SQL into apply_wrong_person + handler-level race test), then re-run the gate — with the blocker closed the suite's breadth (exhaustion both routes, idempotent substitute, prechecks) supports PASS."
+  }
+]

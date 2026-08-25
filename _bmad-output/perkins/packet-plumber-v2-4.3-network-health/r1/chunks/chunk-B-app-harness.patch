@@ -1,0 +1,1088 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-4-3-network-health.md b/_bmad-output/implementation-artifacts/spec-4-3-network-health.md
+new file mode 100644
+index 0000000..a0ed11f
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-4-3-network-health.md
+@@ -0,0 +1,322 @@
++---
++title: 'Story 4.3 — Network Health meter + win/lose/retry'
++type: 'feature'
++created: '2026-08-14'
++status: 'in-review'
++baseline_commit: 948996d
++review_loop_iteration: 0
++context:
++  - '{project-root}/_bmad-output/planning-artifacts/architecture/odin-architecture-v1.md'
++  - '{project-root}/_bmad-output/implementation-artifacts/epic-4-context.md'
++  - '{project-root}/_bmad-output/implementation-artifacts/spec-4-2-surge-crisis.md'
++---
++
++<frozen-after-approval reason="pre-approved by the orchestrator (standing orders: internal approval checkpoints pre-approved)">
++
++## Intent
++
++**Problem:** The 4.2 crisis engine names the surge's WHY, but nothing makes the player
++SUFFER for ignoring it: there is no aggregate loss condition, no win, no lose, no stakes.
++The surge-survival loop (slice 4's exit = THE FUN-TEST LOOP) is open-ended: a run can sit
++saturated forever with no consequence. The 1.4 win/lose stub (goal + tick cap) is a
++skeleton, not the GDD's Network Health loss mechanic.
++
++**Approach:** Add the Network Health meter (S5, arch §6.5) + the health-driven
++win/lose/retry (story 4.3, slice 4). The meter drains on SUSTAINED per-class SLA breach
++(after a per-class grace countdown), recharges when healthy, and emptying it → `Run_Lost`
++(Error 404) → the terminal barrier freezes the run (E17 — one terminal event per run).
++Win = overall uptime ≥ 90% through the surge window (the GDD MVP row). Retry = the
++existing fresh-run-context path (ODN-13), pinned by the no-soft-lock property test
++`[FORGE #3]`. The 3.4 cumulative SLA stays untouched (golden compat); the health layer
++brings the WINDOWED per-class measurement the 3.4 comment deferred ("windowed measurement
+++ E30 hysteresis land with the slice-4 health layer on this same event seam").
++
++**Reference:** the proven-fun prototype (`packet-plumber-prototype-ref/core/health.odin`)
++implemented this exact system with tuned numbers (`win_uptime_pct 90`, `breach_exit_pct 93`,
++`grace_window_ticks 200`, `meter_drain_per_tick_max 2`, `meter_recharge_per_tick 1`,
++`rolling_window_ticks 100`, `grace_refill_per_tick 5`, `grace_refill_streak_ticks 50`).
++The v2 arch's per-class contract (§6.5: "any active class's SLA is breached",
++E30 "per class (catalog values)") is the letter; the prototype's mechanics + numbers
++(gradual grace refill, the never-lose exploit guard, the surge-window win) are carried.
++
++## Boundaries & Constraints
++
++**Always:**
++- **Core eval** (`core/health.odin`, NEW): `health_update(state, tick, cat)` called inside
++  `core.step` AFTER `crisis_evaluate`, BEFORE `win_lose_eval` (spine: flow → crisis →
++  health → win/lose). Pure (ODN-1), integer-only (ODN-10), arrays only (ODN-10), no new
++  commands (**LOG_VERSION stays 3** — flagged per the briefing scope guard; the 4.3
++  additions are append-only state sections + event tags, never command records).
++- **The layer READS the flow's SLA accumulators only** (the per-tick deltas are DIFFED
++  from the cumulative counters — re-step-safe, replay-safe, zero coupling to flow
++  internals). It never mutates flow/topology/crisis. `sla_evaluate` (3.4, cumulative,
++  monotone) stays untouched — its events + latches ride the existing goldens.
++- **Windowed measurement (the E30 seam):** per class, a rolling window of
++  `health.window_ticks` per-tick deltas (delivered/dropped/latency_ms — a flat ring
++  sized classes × window, indexed `class × window + tick % window`). Windowed breach
++  ENTER: windowed loss_pct > max_loss_pct OR windowed avg_ms > latency_tol_ms (the same
++  strict-> convention as 3.4, per-class catalog tolerances). EXIT (hysteresis): BOTH
++  loss_pct ≤ max_loss_pct − exit_margin_pct AND avg_ms ≤ latency_tol_ms − exit_margin_ms
++  (clamped ≥ 0) — an oscillating class cannot flap the latch every tick. E24: a class
++  with zero completed demand in the window measures nothing (neutral — the window never
++  fabricates a breach).
++- **Grace (per class, one countdown per episode — E30):** breach ENTER with
++  `grace_left > 0` starts the countdown (`Grace_Started{class}`; `grace_left` counts down
++  from the class's `health_grace_ticks` — catalog value; hard-SLA classes get a short
++  grace). Re-breach during an ACTIVE grace = no-op (the countdown is NOT restarted).
++  Recovery during the grace cancels it (no drain — the meter never moved; no cancel
++  event — the arch's interface has none). Expiry while still breached emits
++  `Grace_Expired{class}` + the class starts DRAINING. **Gradual refill (the prototype's
++  never-lose guard):** a recovered class's `grace_left` refills +grace_refill_per_tick
++  ONLY after a `grace_refill_streak_ticks` healthy streak, capped at the class's full
++  grace — consecutive episodes burn the shared countdown, so a flapping line can never
++  re-arm a full grace forever.
++- **Drain (E16):** per tick, drain = `min(max over drained classes of
++  health_drain_pct_per_tick, health.drain_cap_pct_per_tick)` — max(severity), NOT sum,
++  plus the per-tick cap (never instant: ≥ 100/cap ticks to empty). A class drains only
++  while breached AND post-grace (`grace_left == 0`).
++- **Recharge:** when NO class is windowed-breached, the meter recharges
++  +health.recharge_pct_per_tick toward 100.
++- **Empty → `Run_Lost` (E17, sim-side suppression):** on the drain tick that would empty
++  the meter, `health_update` emits `Run_Lost` (tag 3 — the existing terminal tag),
++  latches `terminal`/`outcome = .Lost`, and emits NO `Grace_Expired`/`Meter_Changed` that
++  tick (`run_lost` supersedes `grace_expired`). The step barrier then skips
++  `win_lose_eval` (its terminal guard) — the rest of the tick is skipped, one terminal
++  event per run by construction.
++- **Win (the GDD MVP row):** `Run_State.surge_win_pct` (run setup; 0 = disabled, like
++  goal/cap). When enabled, `health_update` tracks the era's first set-piece carrying a
++  crisis archetype (the surge — the crises.json cross-ref): accumulates OVERALL
++  delivered/dropped (all classes) over the active span, latches `surge_done` on the
++  deactivation tick (accumulators frozen). `win_lose_eval` (the gate's domain): goal win
++  (1.4) → surge win (completed > 0 [E24 neutral] AND delivered×100/completed ≥
++  surge_win_pct at the window-end tick) → cap lose (1.4). Meter-empty Run_Lost precedes
++  the surge win on a same-tick collision (spine order — pinned).
++- **Enabling (back-compat):** `Run_State.health_enabled` (run setup, like goal/cap).
++  Disabled → the layer is INERT: meter 100, no events, no drain, no Run_Lost — the
++  boot/draw/flow/… demos keep their BEHAVIOR; only their T1 bytes shift via the
++  catalog_hash fold (balance.json + packet_types.json gain the health numbers — the
++  documented mechanical re-bless, the 4.2 precedent). T2 pixels byte-identical (the
++  meter HUD draws zero pixels when disabled — the capture-stability contract).
++- **Data (ODN-5):** balance.json gains a `health` block: `window_ticks 200`,
++  `exit_margin_pct 3`, `exit_margin_ms 40`, `drain_cap_pct_per_tick 2`,
++  `recharge_pct_per_tick 1`, `win_uptime_pct 90`, `grace_refill_per_tick 5`,
++  `grace_refill_streak_ticks 50` (the prototype's proven numbers scaled to 20 Hz).
++  packet_types.json entries gain `health_grace_ticks` (email 400 = 20 s, streaming 200 =
++  10 s — the GDD "hard-SLA classes drain it fast (short grace)") + `health_drain_pct_per_tick`
++  (email 1, streaming 2 — the severity; matches the prototype's max drain 2).
++- **Events (ODN-14, append-only):** `EVENT_TAG_GRACE_STARTED :: u8(10)` /
++  `EVENT_TAG_GRACE_EXPIRED :: u8(11)` (payload: class) / `EVENT_TAG_METER_CHANGED :: u8(12)`
++  (payload: meter pct via a NEW `Event.meter: u8` field — tag-conditional serialization;
++  pre-4.3 streams byte-identical).
++- **Serialization:** a `health` section in `state_writer`, present ONLY when
++  `health_enabled` (absent-when-disabled — the golden-stability rule): `meter_pct: u32`
++  + grace rows (absent-when-empty: `{class: u16, grace_left: u32}`) + surge-win rows
++  (absent-when-empty: `{surge_delivered: u64, surge_dropped: u64, done: bool}`). The
++  window rings + breach latches + prev-diff scratch + healthy streaks are DERIVED
++  (rebuilt identically on replay from the serialized flow + events — same status as
++  lane_caps/sla_breach; never serialized).
++- **Render (never color alone):** `app/render/health.odin` (NEW) — a Network Health card
++  (label + bar + pct number + per-class grace countdowns), zero pixels when health is
++  disabled. Shared by the app HUD + the harness capture (like forecast.odin/crisis.odin).
++- **Harness:** NEW demo directives `health on` + `win surge <n>`; `Session_Cfg` gains
++  `health_on: bool` + `surge_win_pct: u32`, threaded through BOTH run_demo (live) +
++  replay_hashes (replay) — the determinism field-note: new run-setup rides both paths or
++  ODN-11 replay diverges at the terminal tick.
++- **App session:** era 3 + `health on` + `win surge 90` + goal 0/cap 0 (the surge-survival
++  session). Game_Over copy: Won → "SURGE SURVIVED - YOU WIN"; Lost → "ERROR 404 -
++  CONNECTION LOST" (existing). Retry = the existing fresh-run-fresh-seed path (ODN-13/E32).
++  Title → story 4.3.
++- **Goldens:** NEW `health_win.dem` (a PREPARED wide-fiber fan sized by MEASUREMENT to
++  carry the real surge — 20 streaming/tick × 60 u = 1200 u/tick; 15 routers × 4 wide
++  pipes respects the 4-port router limit) + `health_lose.dem` (the unprepared narrow
++  path — the full lose surface: crisis banner + draining meter + the empty-meter
++  terminal frame). Both carry T1 + T2 of the win/lose frames. Re-bless = ALL `.t1`
++  (the catalog_hash fold, mechanical + cause-documented); `.log.bin` byte-identical (no
++  new commands); old demos' T2 pixels byte-identical (the meter's zero-pixels-when-
++  disabled negative proof) — **STOP + flag any other shift**.
++
++**Ask First:** none expected — the prototype's proven numbers + the v2 arch's per-class
++letter settle the mechanics; the win demo fixture is sized empirically (measure, don't
++guess). The one flagged tuning risk (the era-3 session demand scale vs the 20-Hz pipe
++capacity — see Design Notes) is a playtest call, recorded, NOT re-tuned here.
++
++**Never:** NOT 4.4+ (no such story), NOT the remaining four crisis archetypes, NOT era
++content, NOT a second SLA evaluator (the 3.4 cumulative one stays — the health layer is
++windowed and separate), NO new player commands, NO changes to `sla_evaluate`'s latches or
++events, NO crisis-engine changes, no floats in core, no maps in core, no changes to
++`scripted_plan_pressure`.
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| HAPPY_PATH (prepared) | era 3, wide fan, health on + win surge 90 | the surge passes (uptime ~100%); `Run_Won` fires at the deactivation tick (3000); no drops, no breach, no crisis (AC-E13 rides along) | n/a |
++| SUSTAINED_BREACH (unprepared) | narrow path, health on | windowed loss breaches → `Grace_Started{streaming}` → countdown → `Grace_Expired` → drain 2/tick → meter 0 → `Run_Lost` (Error 404) | n/a |
++| E30 hysteresis | class oscillating around the tolerance | no latch flap per tick: ENTER only above the tolerance, EXIT only ≤ tolerance − margin | n/a |
++| E30 re-breach in grace | class exits + re-enters during an active grace | countdown NOT restarted (one countdown per episode) | n/a |
++| Grace recovery | breach → player fixes → healthy during grace | grace cancelled, no drain, no event; refill only after the healthy streak gate | n/a |
++| Never-lose exploit | flapping line (deep breach ↔ recovery) | each episode burns the shared per-class grace; refill is gradual (5/tick after 50 healthy ticks) — the meter MUST eventually drain on sustained flapping | n/a |
++| E16 max-not-sum | two classes draining (severities 1 + 2) | drain = 2/tick, NOT 3 | n/a |
++| E16 per-tick cap | a severity > cap | drain = the cap; meter cannot empty faster than 100/cap ticks | n/a |
++| Recharge | all classes healthy | meter +1/tick toward 100 | n/a |
++| E17 empty meter | drain tick where meter would hit 0 | `Run_Lost` emitted; NO `Grace_Expired`/`Meter_Changed` that tick; terminal latched; `win_lose_eval` skipped (no double terminal); post-terminal ticks frozen | n/a |
++| Win/lose same-tick | surge window ends AND meter empties the same tick | `Run_Lost` (health_update precedes win_lose_eval in the spine — pinned) | n/a |
++| E24 zero-demand | no completed traffic in the window | neutral: no breach, no drain, no win (a zero-completion surge window yields no `Run_Won` — never a fake win; the meter governs) | n/a |
++| Health disabled | `health_enabled` false (all pre-4.3 demos) | meter inert: no events, no drain, no Run_Lost; behavior unchanged; T1 shifts only via the catalog_hash fold; T2 byte-identical | n/a |
++| Terminal (E17) | run frozen | `health_update` skipped by the step barrier — health state frozen | n/a |
++| Replay (E10) | blessed log re-sim | identical meter/grace/events (the ring is derived; the diff is re-step-safe); replay gate rejects divergence | n/a |
++| Retry (ODN-13) | Game_Over → fresh run | fresh run context: meter 100, no grace/breach/ring/events/terminal leakage (pinned) | n/a |
++| Catalog validation | `window_ticks` 0/negative, margins > tolerances, negative severities/graces, cap 0, win_uptime_pct > 100 | load aborts with a named error | fail-fast (ODN-5) |
++
++## Code Map
++
++- `core/types.odin` -- `Health_State` (meter_pct, per-class breach/grace_left/streak/prev-diff arrays, the flat window ring + sums, surge accumulators + done), `Run_State.health` + `health_enabled` + `surge_win_pct`, `Event.meter: u8`, tags 10/11/12, `health_make`/`health_destroy` wiring
++- `core/health.odin` (NEW) -- `health_update`: diff the accumulators → ring/sums → windowed breach latches (E30) → grace lifecycle (start/cancel/expire/refill) → drain (E16) / recharge → empty = Run_Lost (E17) → surge-window tracking
++- `core/win_lose.odin` -- the surge-win check (goal win → surge win → cap lose; E24 guard)
++- `core/step.odin` -- the `health_update` call (after `crisis_evaluate`, before `win_lose_eval`); `win_lose_eval` gains the surge win
++- `core/serialize.odin` -- the health section (absent-when-disabled + absent-when-empty rows) + tag-conditional 10/11/12 payloads (the `meter` byte)
++- `core/catalog.odin` -- the `health` Balance block + per-class `health_grace_ticks`/`health_drain_pct_per_tick` parse + fail-fast validation (hash folds automatically)
++- `data/balance.json` + `data/packet_types.json` -- the health numbers (the catalog_hash fold)
++- `core/health_test.odin` (NEW) -- every I/O-matrix row + the replay pin + the serialization byte pins + the no-soft-lock property test
++- `core/win_lose_test.odin` -- the surge-win integration pins (or health_test; whichever reads best)
++- `core/catalog_test.odin` -- the health validation rows; `core/determinism_test.odin` -- the test_catalog health mirror
++- `app/render/health.odin` (NEW) + `app/main.odin` + `harness/goldens.odin` -- the meter card (zero pixels when disabled) + the capture draw + the app session config (health on + win surge 90) + Game_Over copy + title
++- `harness/demo.odin` + `harness/run.odin` -- `health on` + `win surge <n>` directives; Session_Cfg/demo_apply_setup threading (BOTH live + replay paths)
++- `demos/health_win.dem` + `demos/health_lose.dem` (NEW) -- the launchable goldens (win + lose frames)
++- `goldens/*` -- the documented mechanical re-bless (ALL `.t1`; catalog_hash fold); old demos' T2 + `.log.bin` byte-identical (the negative proof)
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `core/types.odin` -- Health_State + Run_State fields + Event.meter + tags + init/destroy
++- [x] `core/health.odin` (NEW) -- the meter/lifecycle/surge-tracking eval
++- [x] `core/win_lose.odin` + `core/step.odin` -- the surge win + the spine call
++- [x] `core/serialize.odin` -- the health section + tag-conditional payloads
++- [x] `core/catalog.odin` + `data/balance.json` + `data/packet_types.json` -- the health numbers + fail-fast
++- [x] `core/health_test.odin` (NEW) -- every I/O-matrix row + the no-soft-lock property test + replay + byte pins
++- [x] `core/catalog_test.odin` + `core/determinism_test.odin` -- validation rows + the test mirror
++- [x] `app/render/health.odin` (NEW) + `app/main.odin` + `harness/goldens.odin` -- the meter card + capture + session
++- [x] `harness/demo.odin` + `harness/run.odin` -- the directives + setup threading
++- [x] `demos/health_win.dem` + `demos/health_lose.dem` (NEW) -- author → run → READ the actual stream → pin ticks + the win/lose frames
++- [x] Golden pass -- re-bless ALL `.t1` (catalog_hash fold with proof), old T2s + `.log.bin` byte-identical, `drift-check` green
++
++**Acceptance Criteria:**
++- Given health on + a sustained per-class SLA breach, when the grace expires, then the meter drains at max(severity) capped per tick (E16 — never instant); re-breach during an active grace is a no-op; the meter recharges when healthy (E30); an empty meter → `Run_Lost` (Error 404) with the rest of the tick skipped — one terminal event per run (E17).
++- Given health on + win surge 90, when the surge window ends, then overall uptime ≥ 90% → `Run_Won` at the deactivation tick; < 90% (or zero completed demand) → no win (the meter governs).
++- Given any run with health on, when it replays from the action log, then identical health state + events (E10); post-terminal ticks stay frozen (E17).
++- Given the no-soft-lock property test, then every adversarial fixture reaches terminal (Run_Lost) within a bounded horizon, a mid-drain fix recovers the meter (recoverable-until-empty), and a healthy run never goes terminal `[FORGE #3]`.
++- Given the golden pass, when the harness runs, then every shifted `.t1` has the documented cause (the catalog_hash fold); old demos' T2 pixels + `.log.bin` are byte-identical; the new win/lose demos pin the terminal frames; any other shift STOPS the line.
++
++## Spec Change Log
++
++- 2026-08-14 (implementation findings, pre-review): the mechanism refinements +
++  measurement results, all within the frozen contract's spirit:
++  1. **The breach is FAST (E9, not the pool):** the narrow fixture's lane bound
++     fills within ~4 ticks (2 arrivals/tick vs 0.083 service) — the breach
++     enters at ~tick 5, NOT the pool-fill ~256 I first modeled. The lose
++     timeline: breach ~5 → grace expiry ~404 → drain 2/tick → Run_Lost at
++     ~452-455 (22.6 s) — pinned by health_lose.dem (READ from the run).
++  2. **The grace scale (recovery slack):** the prototype's grace was 200 ticks
++     @ 10 Hz = 20 SECONDS. Scaling it as 200 @ 20 Hz (10 s) against a 200-tick
++     (10 s) window left ZERO recovery slack — the windowed exit needs a FULL
++     window slide after the drops stop, so grace must exceed window + drain.
++     Both classes now carry 400 ticks (20 s — the prototype's exact scale);
++     the streaming class's faster DRAIN (severity 2 vs 1) carries the
++     hard-SLA differentiation. The survival band: a fix within ~200 ticks of
++     the breach exits before the expiry (no drain at all); a fix in the last
++     ~50 ticks of the grace drains first but survives (the recoverable-
++     until-empty band, pinned by the property test).
++  3. **The windowed-exit latency:** the E30 exit fires only when the burst
++     slides out of the full window (fix + ~200 ticks) — so a mid-grace fix
++     keeps the latch hot (the countdown keeps burning through the stuck
++     window: the same episode — the E30 one-countdown-per-episode pin uses
++     this).
++  4. **The 2-router fix fixture:** the 4-port router cap means ONE router
++     cannot serve the real base demand (120 u/tick needs 3+ wides per leg = 6
++     ports). The recovery + win fixtures use TWO routers (ECMP splits the
++     load; 2+2 wides per router = 80 u/tick each). The recovery edit is
++     Cmd_Place_Router + draws — the real player path. (The placed router must
++     clear PLACEMENT_MIN_SEP_TILES = 7 — my first position (26,15) was 6 from
++     the host and got silently rejected; (25,9) clears it + the span ladder.)
++  5. **The broken-path-clears-breach effect:** a demolish-only "fix" stops ALL
++     drops (no pipes = no sheds) and the windowed ratio falls to 0% — the
++     breach clears without any capacity. The re-breach tests re-draw the
++     narrows (the honest re-saturation); the app's demolish-only path is a
++     real (if degenerate) player move and is safe (it never soft-locks — the
++     pool fills and E22 sheds resume).
++  6. **The below-threshold win is unreachable alive:** with the MVP numbers a
++     sub-90% window ALWAYS ends in a meter death before the window closes
++     (breach ~5 + grace 400 + drain 50 = death ~455 < 3000) — the
++     "no fake win" pin therefore asserts the precedence (the meter loses
++     before any win could fire) instead of an alive-at-window-end sub-90 run.
++  7. **The win demo fixture (measured):** 16 routers × 4 wides = 64 pipes on
++     the real surge (1200 u/tick); the run reads 35453 delivered / 489
++     dropped = 98.6% uptime; Run_Won fires at tick 3000 exactly (the
++     deactivation tick). The ~72-drop transient at the window OPEN is the
++     pool's admission churn — the windowed ratio never approaches the 10%
++     tolerance.
++  8. **The `.log.bin` re-bless is exactly the header hash field:** cmp-proven
++     — every pre-4.3 log differs ONLY in the 8 catalog_hash header bytes
++     (33-byte files, same length); the T1 manifests re-bless mechanically; the
++     old T2 PNGs are byte-identical (zero PNG files changed in git).
++  9. **LOG_VERSION stays 3** (flagged per the briefing): no new commands — the
++     health section + tags 10-12 are append-only state/events.
++  10. **The meter card pixel-verified:** the T2 frames show the full green bar
++      (100), the draining bar (~62%), and the empty red-bar terminal frame
++      (bar + pct number + chips — never color alone).
++
++## Design Notes
++
++- **Why windowed (and why NOT the 3.4 latches):** the 3.4 cumulative loss latch is
++  MONOTONE by contract ("a breached loss class stays breached until a windowed
++  measurement replaces this one — slice-4 health, E30" — pinned in sla_evaluate's own
++  comment). Feeding the meter from it would drain forever after the first breach: every
++  run would lose. The health layer's rolling window (the prototype's proven
++  `rolling_window_ticks`, 10 s at 20 Hz) is the promised replacement seam — it forgives
++  the build phase and makes recovery real.
++- **Why per-class (v2 arch letter) over the prototype's overall meter:** the v2 arch §6.5
++  is the standing bar — "drains while ANY ACTIVE CLASS's SLA is breached",
++  "enter/exit thresholds PER CLASS (catalog values)", E30 "one countdown per episode".
++  The prototype's single global meter (overall uptime < 90) is the earlier design; the
++  per-class model carries the same numbers + mechanics (the prototype's per-class
++  rolling windows already existed) and satisfies the arch. The WIN stays overall
++  (E6.1: "per-class AND OVERALL, sustained over the surge window" — the win row is the
++  overall one).
++- **Why per-class catalog severity (not the prototype's magnitude formula):** the
++  prototype computed `drain = clamp((90 − uptime)/10, 1, 2)`. The v2 arch pins only
++  "max(severity) + per-tick cap"; per-class catalog values (ODN-5: numbers single-
++  source) are the tunable, testable form — email 1, streaming 2 reproduce the
++  prototype's max drain 2/tick exactly. "Rate ∝ severity" holds: the harder class
++  drains faster.
++- **The never-lose exploit + the gradual refill:** without refill, a flapping line
++  (breach → recover → breach) gets a fresh FULL grace every episode and the meter never
++  drains — the Godot-prototype exploit the Odin prototype's review W1 killed. The
++  per-class `grace_left` persists across episodes and refills only +5/tick after a
++  50-tick healthy streak — consecutive episodes burn the shared countdown. Carried
++  verbatim in spirit (per-class).
++- **The win demo fixture is sized by MEASUREMENT, not guesswork:** the real surge is
++  20 streaming/tick × 60 units = 1200 u/tick; wide = 40 u/tick; the 4-port router cap
++  bounds bundles to ≤ 4 pipes/router. The candidate fixture: 15 routers × (2-wide
++  host→rt + 2-wide rt→res) = 60 wide pipes ≈ 1200 u/tick per leg — measured against the
++  actual sim and adjusted until the windowed uptime clears 90% with margin (the 
++  field-note: reported success lies — read the sim's own numbers).
++- **FLAGGED tuning risk (recorded, not re-tuned):** the era-3 session demand scale
++  (120 u/tick base, 1200 u/tick surge) vs the 20-Hz pipe capacities (wide 40 u/tick)
++  makes the app session a hard build-race: ~3 wides pre-surge + ~30 wides during the
++  surge (the surge window + grace/drain ≈ 100 s of reaction). The win IS achievable
++  (the demo proves it); whether the RACE is fun is exactly the slice-4 fun-test question
++  the GDD defers to playtest tuning (`[ASSUMPTION: prototype tuning]`). The numbers are
++  all catalog values (ODN-5) — a playtest re-tune touches data only.
++- **LOG_VERSION stays 3** (flagged per the briefing): 4.3 adds state sections + event
++  tags — the log format is append-only, no new command records (the 1.2/3.5 bumps were
++  command-set changes). The pre-4.3 streams stay byte-identical (the health section is
++  absent-when-disabled; tags 10-12 are genuinely append-only).
++
++## Verification
++
++**Commands:**
++- `odin test core` -- all suites green incl. the health_test pins + the no-soft-lock property test
++- `tools/lint.sh` -- all 6 gates green (the ASCII gate covers the new HUD strings)
++- `tools/harness.sh run` -- green after the documented re-bless; the negative proof = old demos' T2 pixels + `.log.bin` byte-identical
++- `tools/harness.sh save <all>` -- the catalog_hash fold re-bless (cause-documented); `tools/harness.sh save health_win health_lose` -- the new goldens; `tools/harness.sh drift-check` -- every mutation rejected
++- `odin build app` + run -- the era-3 session: the forecast counts the surge down; an unprepared network drains the meter (grace countdown → drain → Error 404); retry restarts fresh; a prepared network wins at the window end
+diff --git a/_pr_body.md b/_pr_body.md
+index a90530b..0be0c38 100644
+--- a/_pr_body.md
++++ b/_pr_body.md
+@@ -1,107 +1,104 @@
+-# Job C — R4 forecast flow-shift prediction (canon: problem-solution-2026-08-13)
++# Story 4.3 — Network Health meter + win/lose/retry (the fun-test loop closes)
+ 
+-The thundering-herd trap, made legible: when the player considers upgrading a
+-pipe's tier, the forecast panel shows the PREDICTED post-upgrade routing
+-BEFORE commitment. Prediction is a PURE look — never a write, never a command.
++The aggregate loss condition: a Network Health meter drains on SUSTAINED
++per-class SLA breach (per-class grace countdown first), recharges when healthy,
++and emptying it → **Run_Lost (Error 404)** → the run freezes (E17 — one
++terminal event per run). **Win = overall uptime ≥ 90% through the surge**
++(the GDD MVP row). Retry = the existing fresh-run-fresh-seed path (ODN-13/E32).
++**Slice 4 exit: the surge-survival loop is playable — predict, survive or
++drain, win/lose, retry.**
+ 
+ ## Acceptance (how each is pinned)
+ 
+-1. **Predictive helper (core, PURE)** — `core/forecast_shift.odin`:
+-   `forecast_shift(t, cat, pipe, new_tier)` re-runs Job A's Dijkstra against
+-   the hypothetical tier and diffs the per-pair next-hop sets. Integer-only,
+-   array-only, no rng, mutates nothing (pinned by
+-   `test_forecast_pure_no_mutation_and_deterministic`: topology + catalog
+-   byte-unchanged, twice-called identical). **It is a look, never a write** —
+-   no Run_State involvement, never in the action log.
+-2. **Forecast panel integration** — pipe selected + `U` (view-only) arms the
+-   preview; `app/render/forecast.odin` draws the UPGRADE PREVIEW card below
+-   the weather report with the acceptance's messages verbatim ("N routes
+-   reroute to node X" / "N routes split - equal cost" / "N routes consolidate
+-   on node X" + the magnet telegraph "this upgrade attracts N routes").
+-   Automated coverage (Perkins B1): the pure aggregation (`forecast_summarize`)
+-   + next-tier decision (`preview_next_tier`) are core procs pinned by
+-   `@(test)`, AND a NEW harness golden (`forecast_preview.dem`) renders a
+-   NON-nil `Upgrade_Preview` — the real panel, byte-for-byte.
+-3. **Honest-prediction pin** — `test_forecast_honest_prediction_pin`: the
+-   helper's predicted post-upgrade routing == the sim's ACTUAL post-upgrade
+-   routing after the upgrade is applied FOR REAL (demolish + redraw at the
+-   higher tier through the real edit path), asserted per-pair next-hop set,
+-   plus a flow-level proof. Constructional too: both tables run the SAME
+-   Dijkstra (`routing_rebuild_with_tiers` — `routing_rebuild` is a one-line
+-   wrapper).
+-4. **Golden discipline** — NEW `forecast_shift.dem` + `forecast_preview.dem`
+-   + NEW golden files only; `harness run`: all 18 demos PASS, every existing
+-   golden byte-identical (zero tracked-golden changes in this PR).
+-   `forecast_shift.dem` applies the upgrades FOR REAL mid-run; its captures
+-   pin the actual behavior (pre: both diamonds on their old unique paths;
+-   post: A rerouted to m2 — upper path empty; B split across BOTH legs).
+-   `forecast_preview.dem` pins the acceptance-2 PANEL: four card states
+-   (reroute + magnet, split, identical-tier "no reroute predicted", merge)
+-   stacked under the live weather card, era-3 surge window.
++1. **Meter drains on sustained breach, never instant (E16)** —
++   `core/health.odin`: windowed per-class SLA measurement (the E30 seam the
++   3.4 comment deferred — the 3.4 cumulative latch is monotone by contract,
++   so the meter cannot consume it); drain = `min(max severity over drained
++   classes, per-tick cap)` — NOT sum, capped (a severity-5 class drains at
++   the cap 2/tick; ≥ 100/cap ticks to empty). Pinned: `test_health_drain_max_not_sum_e16`
++   (two classes → exactly 2/tick) + `test_health_drain_cap_e16` (≥ 50 drain
++   ticks) + `test_health_grace_lifecycle` (no drain during the grace).
++2. **SLA hysteresis + re-breach no-op (E30)** — enter strictly above the
++   tolerance, exit only at tolerance − margin (the band); one countdown per
++   episode: a re-breach never re-arms the countdown, and a spent grace
++   refills ONLY gradually (+5/tick after a 50-tick healthy streak — the
++   never-lose guard, carried from the proven-fun prototype). Pinned:
++   `test_health_grace_rebreach_noop_e30` + `test_health_grace_refill_gradual`
++   (the first refilled value is exactly 5, never a jump to 400) +
++   `test_health_windowed_breach_recovers` (a burst breach RECOVERS as the
++   window slides — the 3.4 monotone trap avoided).
++3. **Empty → Run_Lost; one terminal event per run (E17)** — `health_update`
++   emits Run_Lost (tag 3), suppresses Grace_Expired/Meter_Changed that tick
++   (`run_lost` supersedes `grace_expired`), the step barrier skips the rest of
++   the tick. Pinned: `test_health_empty_run_lost_e17` (the terminal tick's
++   event stream + the frozen post-terminal ticks) + the existing barrier
++   tests.
++4. **Win at uptime ≥ 90% through the surge** — the surge-window accumulators
++   (overall delivered/dropped) freeze at the deactivation tick; the win fires
++   at tick 3000 EXACTLY. Pinned: `test_health_surge_win_on_prepared_network`
++   (won_tick == 3000 + the honest 90%+ ratio) + `health_win.dem` (READ from
++   the run: 35453 delivered / 489 dropped = 98.6%; Run_Won at 3000). The
++   win/lose precedence: a meter-empty is a LOSE before any win (spine order),
++   pinned by `test_health_win_lose_same_tick_lose_wins`.
++5. **Retry + no-soft-lock (FORGE #3)** — `test_health_restart_clean` (a fresh
++   run context after a full lose: meter 100, no grace/breach/ring/event
++   leakage, fully playable again) + `test_health_no_soft_lock_property`
++   (adversarial fixtures × seeds reach Run_Lost within a bounded horizon;
++   a mid-grace fix recovers the meter — the escape exists while the meter is
++   above 0; a healthy run never goes terminal).
++6. **Goldens — win + lose frames + the property test** — `health_win.dem` +
++   `health_lose.dem` (T1 + T2 of the win and lose frames; the lose T2s show
++   the meter at 100 → draining → 0). Re-bless: ALL `.t1` (the catalog_hash
++   fold — balance.json `health` block + packet_types health fields);
++   **`.log.bin` diffs are EXACTLY the 8 catalog_hash header bytes (cmp-proven,
++   same lengths); ZERO old T2 PNGs changed** (the meter draws zero pixels when
++   disabled — the capture-stability negative proof).
++7. **Launchable increment** — `health_win.dem` / `health_lose.dem` play the
++   full loop (you can LOSE — Error 404 — and retry); the app session is the
++   surge-survival loop (health on + win surge 90, era 3).
+ 
+-## Verify (all green locally)
+-
+-- `odin test core`: 135/135 (10 new pins)
+-- `odin build app -out:app.bin`: links
+-- `tools/harness.sh run`: 18/18 demos PASS (T1 + T2 + replay gate)
+-- `tools/lint.sh`: all gates green
+-- `tools/harness.sh drift-check`: 125/125 mutations rejected
+-- Launchable increment: select a pipe → U → panel predicts → demolish +
+-  redraw at the higher tier → the predicted reroute/split happens (proven in
+-  the demo + the pin; the app's U-preview drives the same helper)
+-
+-## Perkins r1 fixes folded in (review 4932570764)
++## Decisions & rationale
+ 
+-- **B1 (test gate)** — the panel path now has automated coverage: core
+-  `forecast_summarize` + `preview_next_tier` pins + the `forecast_preview.dem`
+-  golden (a harness capture rendering a non-nil `Upgrade_Preview` via a new
+-  render-only `at <n>ms preview <pipe> <tier>` demo verb — the sim + T1
+-  hashes are untouched; a missing/illegal preview fails the demo loudly).
+-- **W1** — `attract` is now pair-honest: it fires when the UPGRADED PIPE
+-  connects `from` to any member of the new set (a non-representative parallel
+-  bundle member re-prices the edge while the rep stays put). Pinned by
+-  `test_forecast_attract_non_representative_parallel`.
+-- **W2** — the panel labels ROUTES, not flows ("2 routes reroute to node 2"):
+-  one shift entry = one (from,dst) pair, never a packet count.
+-- **W3** — the hypothetical tier scratch is sized by `len(pipe_tier)` (the
+-  parallel-array authority), and the seam asserts the lengths match (N1).
+-- **W4** — the card's render branches are pinned: the pure aggregation test
+-  (grouping, magnet, bounded-buffer overflow, empty) + the four golden card
+-  states (magnet line, split amber, pluralization, zero-shift line, merge
+-  rows, overflow tail via the core pin).
+-- **N4** — every disarm path frees the app-owned shifts (`disarm_preview`).
+-- **N5** — pins added: attract-on-split, `old_pipe`, same-cost-different-tier
+-  (mutated catalog → zero shifts, the full-diff path).
+-- **N6** — the preview card's height no longer over-counts by a line.
+-- **N2** — the weather + preview cards share `draw_panel_card` (byte-identical
+-  chrome).
+-- **N3** — noted: the demo is the walkable commit leg (the app has no demolish
+-  input — pre-existing 2.3 scope; adding one would violate no-new-commands).
++- **Windowed measurement, not the 3.4 latches** — the 3.4 cumulative loss
++  latch is monotone by its own pinned contract ("a breached loss class stays
++  breached until a windowed measurement replaces this one — slice-4 health,
++  E30"); feeding the meter from it would make every run unloseable-proof.
++  The health layer measures its own per-class rolling window (200 ticks = the
++  prototype's 10 s at 20 Hz) against the same catalog tolerances.
++- **Per-class model (the v2 arch letter) over the prototype's overall meter**
++  — arch §6.5 is the standing bar ("any active class's SLA is breached",
++  "enter/exit thresholds per class"). The prototype's proven NUMBERS and
++  mechanics (gradual grace refill, the never-lose guard, the surge-window
++  win, the drain cap 2/recharge 1) are carried; the win stays overall (E6.1).
++- **Grace scale — flagged correction** — the prototype's grace was 200 ticks
++  @ 10 Hz = 20 SECONDS; scaling it as 200 @ 20 Hz (10 s) against a 10 s
++  window leaves ZERO recovery slack (the windowed exit needs a full window
++  slide). Both classes now carry 400 ticks (20 s — the prototype's exact
++  scale); the streaming class's faster DRAIN (severity 2 vs email 1) carries
++  the hard-SLA differentiation. The survival band: fix within ~200 ticks of
++  the breach → the exit beats the expiry (no drain); the last ~50 ticks of
++  the grace → drains first but survives (recoverable-until-empty, pinned).
++- **Per-class catalog severity (not the prototype's magnitude formula)** —
++  ODN-5: the numbers live in packet_types.json (`health_grace_ticks`,
++  `health_drain_pct_per_tick`); "rate ∝ severity" holds via the class values.
++- **The win demo fixture is measured, not guessed** — the real surge is
++  1200 u/tick; the 4-port router cap forces a 2+ router fan: 16 routers × 4
++  wides = 64 pipes; the run reads 98.6% uptime and wins at tick 3000.
++- **LOG_VERSION stays 3** (flagged per the briefing scope guard) — no new
++  commands; the health section + tags 10–12 are append-only state/events.
++- **FLAGGED tuning risk (recorded, not re-tuned)** — the era-3 session demand
++  scale vs the 20 Hz pipe capacities makes the app session a hard build-race
++  (the win is ACHIEVABLE — the demo proves the exact network shape — but the
++  race's fun is the slice-4 playtest question; the GDD's own
++  `[ASSUMPTION: prototype tuning]`; every number is a catalog value).
+ 
+-## Decisions & rationale
++## Verification
+ 
+-- **Shared Dijkstra seam (`routing_rebuild_with_tiers`)** — the prediction
+-  and the sim run the SAME algorithm by construction; the tier view is a pure
+-  input like the topology. The empirical pin then proves the equivalence
+-  through the real edit path.
+-- **The helper recomputes BOTH tables from the topology** — no dependency on
+-  `Run_State.routing` (one frame stale after a fast-path edit); the helper is
+-  a pure function of (Topology, Catalogs, pipe, tier).
+-- **The "real upgrade" = demolish + redraw** — the player's actual action
+-  today; NO new player command (scope guard). Routing-identical for the demo
+-  geometry.
+-- **Shift kinds Split/Merge/Reroute** — the graph is unchanged by a tier
+-  change, so a next-hop-set delta is exactly one of these; "New_Route" is
+-  impossible (reachability is tier-independent).
+-- **Magnet signal is pair-honest** (W1) — it can undercount a deep-path
+-  reroute but never overcounts. Full path tracing was rejected as overkill.
+-- **Capacity effects out of scope** — a tier change also fattens the bundle
+-  (2.1, transit speed); R4 predicts PATH-CHOICE shift only, per canon. The
+-  panel's "no reroute predicted" for a single-path upgrade is honest.
+-- **No LOG_VERSION change** — nothing serialized: the helper is derived +
+-  app-side only; the demo goldens are new files. Flagged per the scope guard.
+-- **File ownership (parallel Job B)** — this PR touches `app/render/forecast.odin`
+-  (the forecast panel — Job C's per both briefings) + `app/main.odin` (the
+-  U-preview input seam). `app/render/view.odin` / `tray.odin` (Job B's
+-  ghost/glow) untouched. `app/main.odin` is shared-risk with Job B — flagged
+-  for Silas; the seam is additive (a new key + a HUD call), merge-friendly.
++- `odin test core` — **153 tests green** (13 new health pins + 4 catalog rows)
++- `tools/lint.sh` — **all 6 gates green** (incl. the ASCII gate over the new HUD strings)
++- `tools/harness.sh run` — **20/20 demos PASS** (18 re-blessed + 2 new)
++- `tools/harness.sh drift-check` — **139 mutations across 20 demos all rejected**
++- `odin build app` — clean (the era-3 surge-survival session)
++- Re-bless proof: every `.log.bin` differs ONLY in the 8 catalog_hash header
++  bytes (cmp-verified); zero old T2 PNGs changed; the T1 manifests re-blessed
++  mechanically (the catalog_hash fold, the 4.2 precedent).
+diff --git a/app/main.odin b/app/main.odin
+index 15250df..4175ab2 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -23,14 +23,15 @@ import rl "vendor:raylib"
+ WIN_W :: 1280
+ WIN_H :: 720
+ 
+-// 1.4 stub session config — SUPERSEDED in the 4.1 session: the era-3 warning
+-// sandbox (win/lose disabled — goal 0 + cap 0) so the launchable increment
+-// outlasts the forecast window: the panel names the surge ~30 s out, the
+-// surge fires (as director demand) at 60 s, and the player watches the strain
+-// telegraph while oversubscribing. The real win/lose (4.3's Network Health
+-// meter) replaces this stub wholesale.
+-WIN_GOAL :: u32(0)            // 0 = win/lose disabled (4.1 session)
+-LOSE_TICK_CAP :: u64(0)       // 0 = no cap (4.1 session)
++// 4.3 session config — the surge-survival loop: the Network Health meter is
++// LIVE (health on) + the win is the surge-uptime threshold (win surge 90).
++// The 1.4 goal/cap stub stays disabled (goal 0 + cap 0) — the lose is the
++// meter's (Error 404); the win is the GDD MVP row (uptime >= 90% through the
++// surge window).
++WIN_GOAL :: u32(0)            // 0 = the 1.4 deliver-N win disabled (4.3 session)
++LOSE_TICK_CAP :: u64(0)       // 0 = the 1.4 tick-cap lose disabled (4.3 session)
++APP_HEALTH_ON :: bool(true)   // 4.3: the Network Health meter is live
++APP_SURGE_WIN_PCT :: u32(90)  // 4.3: the surge-survival win threshold (GDD MVP row)
+ APP_ERA :: u8(3)              // 4.1: the streaming-surge era (director demand + the forecast schedule)
+ 
+ // Mode — the app-layer FSM (ODN-13, §9.5). Boot is the pre-loop transient; Run
+@@ -61,6 +62,8 @@ App :: struct {
+ 	run_live:      bool,   // 1.4: has App.state been run_init'd (the restart destroy guard)
+ 	win_goal:      u32,    // 1.4: the session goal (mirrored into state.goal each run)
+ 	lose_tick_cap: u64,    // 1.4: the session cap (mirrored into state.tick_cap each run)
++	health_on:     bool,   // 4.3: the session meter flag (mirrored into state.health_enabled)
++	surge_win_pct: u32,    // 4.3: the session surge-win threshold (mirrored into state.surge_win_pct)
+ 	// 3.2: the QoS interaction state — the selected pipe (the readout + the
+ 	// lane-key target; -1 = none) + the class index the lane keys act on, +
+ 	// the transient rejection toast (a rejected QoS edit must never be
+@@ -110,7 +113,7 @@ main :: proc() {
+ 	}
+ 	defer pp.catalogs_destroy(&cat)
+ 
+-	rl.InitWindow(WIN_W, WIN_H, "Packet Plumber - v2 story 4.2 (surge + crisis engine)")
++	rl.InitWindow(WIN_W, WIN_H, "Packet Plumber - v2 story 4.3 (network health + win/lose/retry)")
+ 	defer rl.CloseWindow()
+ 	rl.SetTargetFPS(60)
+ 
+@@ -120,6 +123,8 @@ main :: proc() {
+ 	app.tier = std
+ 	app.win_goal = WIN_GOAL
+ 	app.lose_tick_cap = LOSE_TICK_CAP
++	app.health_on = APP_HEALTH_ON
++	app.surge_win_pct = APP_SURGE_WIN_PCT
+ 	app.sel_pipe = -1 // 3.2: no selection at startup (0 is a LIVE pipe id, not a sentinel)
+ 	app.sel_class = 0
+ 	// Job B: the assist config + the starting tier (full for beginners —
+@@ -217,6 +222,8 @@ start_run :: proc(app: ^App, seed: u64) {
+ 	app.state.era = APP_ERA            // 4.1: the streaming-surge era (run setup — the director + forecast schedule)
+ 	app.state.goal = app.win_goal       // the win/lose session config (run setup)
+ 	app.state.tick_cap = app.lose_tick_cap
++	app.state.health_enabled = app.health_on // 4.3: the Network Health meter (run setup)
++	app.state.surge_win_pct = app.surge_win_pct // 4.3: the surge-uptime win threshold (run setup)
+ 	app.tick = 0
+ 	app.accum = 0
+ 	app.drag = {}
+@@ -703,19 +710,28 @@ update_preview :: proc(app: ^App) {
+ draw_hud :: proc(app: ^App) {
+ 	p := app.palette
+ 	// title
+-	draw_text(app, "Packet Plumber - v2 story 4.2 (surge + crisis engine)", 12, 10, 22, p.ink)
++	draw_text(app, "Packet Plumber - v2 story 4.3 (network health + win/lose/retry)", 12, 10, 22, p.ink)
+ 
+ 	// the game-over screen: the WIN/LOSE toast (the terminal-event barrier
+ 	// guarantees exactly one outcome). The world still draws behind it; retry hint.
+ 	if app.mode == .Game_Over {
+ 		#partial switch app.state.outcome {
+ 		case .Won:
+-			draw_text(app, "PACKET DELIVERED - YOU WIN", 12, 56, 30, rl.Color{50, 160, 80, 255})
++			// 4.3: the win is the surge-uptime row in this session (the 1.4
++			// deliver-N goal is disabled) — the GDD MVP "survive the surge" copy.
++			if app.surge_win_pct > 0 {
++				draw_text(app, "SURGE SURVIVED - YOU WIN", 12, 56, 30, rl.Color{50, 160, 80, 255})
++			} else {
++				draw_text(app, "PACKET DELIVERED - YOU WIN", 12, 56, 30, rl.Color{50, 160, 80, 255})
++			}
+ 		case .Lost:
+ 			draw_text(app, "ERROR 404 - CONNECTION LOST", 12, 56, 30, rl.Color{200, 60, 60, 255})
+ 		case:
+ 			draw_text(app, "RUN OVER", 12, 56, 30, p.ink)
+ 		}
++		// 4.3: the meter card rides the lose screen too (the empty meter IS the
++		// loss mechanic's surface — the bar + pct + chips, never color alone).
++		rnd.draw_health_meter(&app.view, &app.state.health, &app.cat, app.state.health_enabled)
+ 		draw_text(app, "press R or Enter to retry (fresh run, fresh seed)", 12, 92, 16, p.ink_soft)
+ 		return
+ 	}
+@@ -754,10 +770,18 @@ draw_hud :: proc(app: ^App) {
+ 	} else {
+ 		rnd.draw_forecast_panel(&app.view, &app.state.crisis, &app.cat, app.state.era)
+ 	}
++	// 4.3: the Network Health meter (top-center, above the crisis banner) —
++	// the bar + pct + per-class grace chips. Zero pixels when the session
++	// meter is off (the pre-4.3 capture-stability contract).
++	rnd.draw_health_meter(&app.view, &app.state.health, &app.cat, app.state.health_enabled)
++	banner_y: i32 = 10
++	if app.state.health_enabled {
++		banner_y = 10 + rnd.HEALTH_CARD_H + 6
++	}
+ 	// 4.2: the crisis banner (top-center) — names the ACTIVE surge + the WHY
+ 	// (bottleneck bundle + pipe) + the preventive redesign. Zero pixels when
+ 	// no crisis is active.
+-	rnd.draw_crisis_banner(&app.view, &app.state.crisis, &app.cat, app.state.era)
++	rnd.draw_crisis_banner(&app.view, &app.state.crisis, &app.cat, app.state.era, banner_y)
+ 	wb := &app.cat.balance.warnings
+ 	hz := i64(max(1, app.cat.balance.logic_hz))
+ 	lead_s := fmt.tprintf("node strain ~%ds to critical / node critical ~%ds / pipe ~%ds to saturation - ring + glyph, never color alone",
+diff --git a/app/render/crisis.odin b/app/render/crisis.odin
+index 65d1070..271b9b4 100644
+--- a/app/render/crisis.odin
++++ b/app/render/crisis.odin
+@@ -21,8 +21,10 @@ import rl "vendor:raylib"
+ // HUD + the top-right forecast panel). One title line + one redesign line per
+ // active crisis; catalog display strings throughout (a future archetype
+ // labels itself — never a hardcoded "SURGE"). Draws NOTHING when the registry
+-// is empty (the capture-stability contract).
+-draw_crisis_banner :: proc(v: ^View, crisis: ^pp.Crisis_State, cat: ^pp.Catalogs, era: u8) {
++// is empty (the capture-stability contract). `y_base` places the card (the
++// 4.3 meter card sits at y=10, so the banner drops below it when the meter
++// is live).
++draw_crisis_banner :: proc(v: ^View, crisis: ^pp.Crisis_State, cat: ^pp.Catalogs, era: u8, y_base: i32 = 10) {
+ 	if len(crisis.active) == 0 {
+ 		return
+ 	}
+@@ -32,7 +34,7 @@ draw_crisis_banner :: proc(v: ^View, crisis: ^pp.Crisis_State, cat: ^pp.Catalogs
+ 	title_h := i32(20)
+ 	line_h := i32(17)
+ 	x := (v.win_w - card_w) / 2
+-	y := i32(10)
++	y := y_base
+ 	rows := 2 * len(crisis.active)
+ 	h := title_h + i32(rows) * line_h + pad
+ 	card := rl.Color{255, 244, 236, 240}
+diff --git a/app/render/health.odin b/app/render/health.odin
+new file mode 100644
+index 0000000..8555461
+--- /dev/null
++++ b/app/render/health.odin
+@@ -0,0 +1,91 @@
++package render
++
++// health.odin — the 4.3 Network Health surface (S5, the aggregate loss
++// condition): a HUD card with the meter bar + pct + per-class grace/breach
++// chips. Never color alone: the bar + the pct NUMBER + the per-class captions
++// carry the state (the colorblind-safe canon — the fill shifts green →
++// amber → red as the meter drops, but the number + label are the primary
++// read). Reads the serialized health state only (read-only — the draw never
++// steps the sim, ODN-1). Draws ZERO pixels when the meter is disabled (the
++// capture-stability contract: a health-off session returns the frame to
++// byte-identical — the pre-4.3 goldens' negative proof).
++
++import "core:fmt"
++import pp "../../core"
++import rl "vendor:raylib"
++
++// HEALTH_CARD_H — the meter card's total height (the crisis banner draws
++// below it when the meter is live: y = 10 + HEALTH_CARD_H + 6).
++HEALTH_CARD_H :: i32(52)
++
++// draw_health_meter — the top-center meter card (clear of the top-left run
++// HUD + the top-right forecast panel). The bar spans 240 px with a 10 px
++// segment per 4 pct (chunky — readable at a glance); the fill color follows
++// the meter (green >= 60, amber >= 30, red below — the number + caption are
++// the never-color-alone encoders). The per-class chips show the countdowns
++// (seconds = grace_left / logic_hz) and the drain state. Zero pixels when
++// `enabled` is false.
++draw_health_meter :: proc(v: ^View, health: ^pp.Health_State, cat: ^pp.Catalogs, enabled: bool) {
++	if !enabled {
++		return
++	}
++	p := v.palette
++	card_w := i32(440)
++	pad := i32(10)
++	x := (v.win_w - card_w) / 2
++	y := i32(10)
++
++	// the card backdrop
++	rl.DrawRectangle(x - pad, y - pad, card_w + 2 * pad, HEALTH_CARD_H, rl.Color{255, 244, 236, 240})
++	rl.DrawRectangleLines(x - pad, y - pad, card_w + 2 * pad, HEALTH_CARD_H, p.ink_soft)
++
++	// label + the pct number (the primary read — never color alone)
++	draw_text_c(v, "NETWORK HEALTH", x, y, 15, p.ink)
++	pct_txt := fmt.aprintf("%d%%", health.meter_pct, allocator = context.temp_allocator)
++	col := p.state_healthy
++	if health.meter_pct < 60 {
++		col = p.state_strain
++	}
++	if health.meter_pct < 30 {
++		col = p.state_critical
++	}
++	draw_text_c(v, pct_txt, x + card_w - 48, y, 15, col)
++
++	// the bar: 240 px, 10 px per 4 pct (chunky segments, deterministic)
++	bar_x := x
++	bar_y := y + 22
++	bar_w := i32(240)
++	bar_h := i32(14)
++	rl.DrawRectangle(bar_x, bar_y, bar_w, bar_h, p.ink_soft)
++	fill := i32(health.meter_pct) * bar_w / 100
++	if fill > 0 {
++		rl.DrawRectangle(bar_x, bar_y, fill, bar_h, col)
++	}
++	rl.DrawRectangleLines(bar_x, bar_y, bar_w, bar_h, p.ink)
++
++	// the per-class chips: countdowns + the drain state. One line per class
++	// with an active grace or breach (class-id order — deterministic).
++	chip_x := x + bar_w + 14
++	chip_y := y + 4
++	hz := i32(max(1, cat.balance.logic_hz))
++	for c in 0..<len(health.grace) {
++		if c >= len(cat.packet_types) {
++			continue
++		}
++		pt := &cat.packet_types[c]
++		chip := ""
++		chip_col := p.ink_soft
++		if health.grace[c].grace_left > 0 {
++			secs := i32(health.grace[c].grace_left) / hz
++			chip = fmt.aprintf("%s grace %ds", pt.display, secs, allocator = context.temp_allocator)
++			chip_col = p.state_strain
++		} else if c < len(health.breach) && health.breach[c] {
++			chip = fmt.aprintf("%s BREACHED", pt.display, allocator = context.temp_allocator)
++			chip_col = p.state_critical
++		} else {
++			continue // healthy + no countdown — no chip (zero extra pixels)
++		}
++		draw_text_c(v, chip, chip_x, chip_y, 12, chip_col)
++		chip_y += 15
++	}
++}
+diff --git a/demos/health_lose.dem b/demos/health_lose.dem
+new file mode 100644
+index 0000000..86ebf3e
+--- /dev/null
++++ b/demos/health_lose.dem
+@@ -0,0 +1,29 @@
++# health_lose.dem — Story 4.3: the LOSE frame (Error 404 — the Network Health
++# meter). The unprepared narrow path (the crisis shape): the era-3 base demand
++# (2 streaming/tick x 60 u) saturates the 5 u/tick narrows within ticks — the
++# E9 lane bound fills, sheds accrue, and the WINDOWED loss breaches at ~tick 5
++# (0.25 s). The streaming grace (400 ticks = 20 s) counts down (Grace_Started
++# at ~5, Grace_Expired at ~405), then the meter drains 2/tick -> empty at
++# ~452 (22.6 s — READ from the run) -> Run_Lost (Error 404) -> the terminal
++# barrier freezes the run (E17 — one terminal event). The death precedes the
++# surge window (1200), so there is no crisis banner — the lose surface is the
++# meter itself:
++#   capture 5000ms  — in grace: the meter 100 + the streaming grace chip
++#   capture 21000ms — draining: the meter ~68 (tick 420, mid-drain)
++#   capture 23000ms — the terminal frame: the meter at 0 (tick 460, frozen)
++# run 24000ms lets the post-terminal ticks exercise the barrier (frozen hashes).
++seed 4243
++run 24000ms
++era 3
++health on
++win surge 90
++fixture off
++spawn_node residential 8 15
++spawn_node router_basic 14 15
++spawn_node content_host 20 15
++at 100ms draw 0 1 narrow
++at 100ms draw 1 2 narrow
++capture at 5000ms
++capture at 21000ms
++capture at 23000ms
++expect hash stable
+diff --git a/demos/health_win.dem b/demos/health_win.dem
+new file mode 100644
+index 0000000..3774cf2
+--- /dev/null
++++ b/demos/health_win.dem
+@@ -0,0 +1,110 @@
++# health_win.dem — Story 4.3: the WIN frame (the GDD MVP row — uptime >= 90%
++# through the surge). The PREPARED network: a 16-router wide-fiber fan sized
++# by measurement to carry the real surge (20 streaming/tick x 60 u = 1200
++# u/tick): res(6,15) -> 16 routers (8 columns x 2 rows, x=17..24 at y=13/17)
++# -> host(34,15), two wides per leg per router (4 ports/router <= the 4-port
++# cap; 4 pipes x 40 u = 160 u/tick per router vs the ECMP-split 125 u/tick —
++# headroom). Latency: 2 hops x 2 ticks (wide 40 u vs streaming 60 u) = 200 ms
++# < 300 — latency-healthy. The surge passes; READ from the run: 35453
++# delivered vs 489 dropped over the window = 98.6% uptime (the ~72-drop
++# transient at the window OPEN is the pool's admission churn — the windowed
++# ratio never approaches the 10% tolerance); Run_Won fires at the deactivation
++# tick 3000 (150 s) — exactly. No breach, no grace, no crisis (AC-E13 rides
++# along — a healthy within-capacity topology stays silent):
++#   capture 30000ms — the forecast countdown ("-30s"): the meter 100, no banner
++#   capture 75000ms — the surge ACTIVE: the fan carries it — the meter 100
++#   capture 150500ms — the post-win frame (Run_Won at 3000, frozen)
++# run 152000ms lets the post-terminal ticks exercise the barrier.
++seed 4243
++run 152000ms
++era 3
++health on
++win surge 90
++fixture off
++spawn_node residential 6 15
++spawn_node content_host 34 15
++spawn_node router_basic 17 13
++spawn_node router_basic 18 13
++spawn_node router_basic 19 13
++spawn_node router_basic 20 13
++spawn_node router_basic 21 13
++spawn_node router_basic 22 13
++spawn_node router_basic 23 13
++spawn_node router_basic 24 13
++spawn_node router_basic 17 17
++spawn_node router_basic 18 17
++spawn_node router_basic 19 17
++spawn_node router_basic 20 17
++spawn_node router_basic 21 17
++spawn_node router_basic 22 17
++spawn_node router_basic 23 17
++spawn_node router_basic 24 17
++# 64 wides: 2 per leg per router (draws group by leg pair; pipe ids 0..63)
++at 100ms draw 0 2 wide
++at 100ms draw 0 2 wide
++at 100ms draw 2 1 wide
++at 100ms draw 2 1 wide
++at 100ms draw 0 3 wide
++at 100ms draw 0 3 wide
++at 100ms draw 3 1 wide
++at 100ms draw 3 1 wide
++at 100ms draw 0 4 wide
++at 100ms draw 0 4 wide
++at 100ms draw 4 1 wide
++at 100ms draw 4 1 wide
++at 100ms draw 0 5 wide
++at 100ms draw 0 5 wide
++at 100ms draw 5 1 wide
++at 100ms draw 5 1 wide
++at 100ms draw 0 6 wide
++at 100ms draw 0 6 wide
++at 100ms draw 6 1 wide
++at 100ms draw 6 1 wide
++at 100ms draw 0 7 wide
++at 100ms draw 0 7 wide
++at 100ms draw 7 1 wide
++at 100ms draw 7 1 wide
++at 100ms draw 0 8 wide
++at 100ms draw 0 8 wide
++at 100ms draw 8 1 wide
++at 100ms draw 8 1 wide
++at 100ms draw 0 9 wide
++at 100ms draw 0 9 wide
++at 100ms draw 9 1 wide
++at 100ms draw 9 1 wide
++at 100ms draw 0 10 wide
++at 100ms draw 0 10 wide
++at 100ms draw 10 1 wide
++at 100ms draw 10 1 wide
++at 100ms draw 0 11 wide
++at 100ms draw 0 11 wide
++at 100ms draw 11 1 wide
++at 100ms draw 11 1 wide
++at 100ms draw 0 12 wide
++at 100ms draw 0 12 wide
++at 100ms draw 12 1 wide
++at 100ms draw 12 1 wide
++at 100ms draw 0 13 wide
++at 100ms draw 0 13 wide
++at 100ms draw 13 1 wide
++at 100ms draw 13 1 wide
++at 100ms draw 0 14 wide
++at 100ms draw 0 14 wide
++at 100ms draw 14 1 wide
++at 100ms draw 14 1 wide
++at 100ms draw 0 15 wide
++at 100ms draw 0 15 wide
++at 100ms draw 15 1 wide
++at 100ms draw 15 1 wide
++at 100ms draw 0 16 wide
++at 100ms draw 0 16 wide
++at 100ms draw 16 1 wide
++at 100ms draw 16 1 wide
++at 100ms draw 0 17 wide
++at 100ms draw 0 17 wide
++at 100ms draw 17 1 wide
++at 100ms draw 17 1 wide
++capture at 30000ms
++capture at 75000ms
++capture at 150500ms
++expect hash stable
+diff --git a/harness/demo.odin b/harness/demo.odin
+index d6467f1..c2afe0f 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -131,6 +131,8 @@ Demo :: struct {
+ 	captures:           [dynamic]i64, // T2 capture times (ms)
+ 	win_goal:           u32, // 1.4: packets to deliver for a WIN (0 = win/lose disabled)
+ 	lose_cap_ms:        i64, // 1.4: tick-cap lose time (0 = no cap); lose if run reaches this with score < goal
++	health_on:          bool,   // 4.3: the Network Health meter is live (0 = inert — back-compat)
++	surge_win_pct:      u32,    // 4.3: the surge-uptime win threshold (0 = disabled)
+ }
+ 
+ // parse_demo — line-based; `seed <n>`, `run <n>ms`, `expect hash stable`,
+@@ -139,7 +141,8 @@ Demo :: struct {
+ // `at <n>ms emphasis <pipe> <preset>`, `at <n>ms lane <pipe> <class> <lane>`,
+ // `at <n>ms preview <pipe> <tier>` (Job C / R4 — render-only),
+ // `spawn_node <type> <x> <y>`, `fixture on|off`, `win goal <n>`,
+-// `lose cap <n>ms`, `capture at <n>ms`.
++// `win surge <n>` (4.3 — the surge-uptime win threshold), `health on`
++// (4.3 — the Network Health meter), `lose cap <n>ms`, `capture at <n>ms`.
+ //
+ // VERB ORDERING AT LOWERING (documented): commands are appended to the action
+ // log in FIXED GROUP order — draws, then demolishes, then places (3.5), then
+@@ -372,15 +375,32 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 			}
+ 			append(&d.captures, ms)
+ 		case "win":
+-			// win goal <n> — the deliver-N win condition (1.4 run setup)
+-			if len(fields) < 3 || fields[1] != "goal" {
+-				return {}, fmt.tprintf("bad win (want: win goal <n>): %s", line)
++			// win goal <n> — the deliver-N win condition (1.4 run setup);
++			// win surge <n> — the surge-uptime win threshold (4.3 run setup)
++			if len(fields) < 3 {
++				return {}, fmt.tprintf("bad win (want: win goal <n> | win surge <n>): %s", line)
+ 			}
+-			v, ok := strconv.parse_uint(fields[2], 10)
+-			if !ok {
+-				return {}, fmt.tprintf("bad win goal: %q", fields[2])
++			if fields[1] == "surge" {
++				v, ok := strconv.parse_uint(fields[2], 10)
++				if !ok || v > 100 {
++					return {}, fmt.tprintf("bad win surge pct: %q", fields[2])
++				}
++				d.surge_win_pct = u32(v)
++			} else if fields[1] == "goal" {
++				v, ok := strconv.parse_uint(fields[2], 10)
++				if !ok {
++					return {}, fmt.tprintf("bad win goal: %q", fields[2])
++				}
++				d.win_goal = u32(v)
++			} else {
++				return {}, fmt.tprintf("bad win (want: win goal <n> | win surge <n>): %s", line)
++			}
++		case "health":
++			// health on — the Network Health meter is live (4.3 run setup)
++			if len(fields) < 2 || fields[1] != "on" {
++				return {}, fmt.tprintf("bad health (want: health on): %s", line)
+ 			}
+-			d.win_goal = u32(v)
++			d.health_on = true
+ 		case "lose":
+ 			// lose cap <n>ms — the tick-cap lose condition (1.4 run setup)
+ 			if len(fields) < 3 || fields[1] != "cap" {
+diff --git a/harness/goldens.odin b/harness/goldens.odin
+index b04f309..40e2ba4 100644
+--- a/harness/goldens.odin
++++ b/harness/goldens.odin
+@@ -46,15 +46,22 @@ render_setup :: proc(rc: ^Render_Ctx, cat: ^pp.Catalogs) {
+ // drawn-pipe state, not a mid-drag preview. 4.1: the capture ALSO draws the
+ // forecast panel + the warning telegraph (crisis + tick) — the story's T2
+ // golden is "of the forecast + warning state"; frames with no forecast rows
+-// and no strain draw zero extra pixels (capture-stability). Job C / R4: a
++// and no strain draw zero extra pixels (capture-stability). 4.3: the Network
++// Health meter card joins the capture (zero pixels when the session meter is
++// off — the pre-4.3 T2s' negative proof). Job C / R4: a
+ // non-nil `preview` (the app's Upgrade_Preview) draws the upgrade-preview
+ // card below the weather report — the acceptance-2 panel golden (Perkins B1);
+ // nil (every pre-R4 capture) draws zero extra pixels.
+-capture_frame :: proc(rc: ^Render_Ctx, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, crisis: ^pp.Crisis_State, tick: u64, era: u8, preview: ^rnd.Upgrade_Preview = nil) -> rl.Image {
++capture_frame :: proc(rc: ^Render_Ctx, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, crisis: ^pp.Crisis_State, health: ^pp.Health_State, health_on: bool, tick: u64, era: u8, preview: ^rnd.Upgrade_Preview = nil) -> rl.Image {
+ 	rl.BeginDrawing()
+ 	rnd.draw_world(&rc.view, topo, bundles, flow, crisis, tick, {})
+ 	rnd.draw_forecast_panel(&rc.view, crisis, rc.view.catalogs, era, preview)
+-	rnd.draw_crisis_banner(&rc.view, crisis, rc.view.catalogs, era)
++	rnd.draw_health_meter(&rc.view, health, rc.view.catalogs, health_on)
++	banner_y: i32 = 10
++	if health_on {
++		banner_y = 10 + rnd.HEALTH_CARD_H + 6
++	}
++	rnd.draw_crisis_banner(&rc.view, crisis, rc.view.catalogs, era, banner_y)
+ 	rl.EndDrawing()
+ 	img := rl.LoadImageFromScreen()
+ 	rl.ImageFlipVertical(&img) // framebuffer readback is bottom-up
+diff --git a/harness/run.odin b/harness/run.odin
+index 133007f..77129b4 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -188,7 +188,7 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 		name = demo.name,
+ 		use_fixture = demo.use_fixture,
+ 		qos_fixture = demo.qos_fixture,
+-		session = {demo.win_goal, demo.lose_cap_ms},
++		session = {goal = demo.win_goal, cap_ms = demo.lose_cap_ms, health_on = demo.health_on, surge_win_pct = demo.surge_win_pct},
+ 	}
+ 	defer {
+ 		delete(cfg.nodes)
+@@ -291,7 +291,8 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 					}
+ 					prev = &pv
+ 				}
+-				img := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, tick, state.era, prev)
++				img := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,
++					state.health_enabled, tick, state.era, prev)
+ 				if prev != nil {
+ 					delete(sh) // the draw consumed the shifts synchronously
+ 				}
+@@ -366,23 +367,30 @@ lower_spawns :: proc(state: ^pp.Run_State, spawns: []Spawn_Intent, hz: i32, cat:
+ 	return ""
+ }
+ 
+-// Session_Cfg — a demo's win/lose run setup (1.4): the deliver-N goal + the
+-// tick-cap lose time. Run setup (like the fixture + the spawn demand) — NOT in
+-// the action log; re-created identically on every replay. Threaded through both
+-// run_demo (live) + replay_hashes (replay) so a win/lose loop is replay-
++// Session_Cfg — a demo's win/lose run setup (1.4 + 4.3): the deliver-N goal,
++// the tick-cap lose time, the Network Health meter flag + the surge-uptime
++// win threshold. Run setup (like the fixture + the spawn demand) — NOT in
++// the action log; re-created identically on every replay. Threaded through
++// both run_demo (live) + replay_hashes (replay) so a win/lose loop is replay-
+ // determinate (the determinism field-note: new run-setup threads through BOTH
+ // paths, or ODN-11 replay diverges at the terminal tick).
+ Session_Cfg :: struct {
+-	goal:   u32,
+-	cap_ms: i64,
++	goal:         u32,
++	cap_ms:       i64,
++	health_on:    bool, // 4.3
++	surge_win_pct: u32, // 4.3
+ }
+ 
+ // apply_session — seed a run's win/lose config (run setup). goal 0 = win/lose
+ // disabled (back-compat: boot/draw/flow never terminate). cap_ms -> tick_cap via
+-// the same floor(ms*hz/1000) the spawn/run timers use.
++// the same floor(ms*hz/1000) the spawn/run timers use. 4.3: health_on +
++// surge_win_pct mirror the core flags (a health-off / win-off demo keeps the
++// pre-4.3 behavior — only the catalog_hash fold shifts its T1).
+ apply_session :: proc(state: ^pp.Run_State, cfg: Session_Cfg, hz: i32) {
+ 	state.goal = cfg.goal
+ 	state.tick_cap = u64(max(0, cfg.cap_ms * i64(hz) / 1000))
++	state.health_enabled = cfg.health_on
++	state.surge_win_pct = cfg.surge_win_pct
+ }
+ 
+ // Demo_Replay — the run-setup a replay re-creates identically: the fixture
+@@ -464,6 +472,8 @@ load_demo_replay :: proc(demo_name: string) -> Demo_Replay {
+ 	}
+ 	cfg.session.goal = demo.win_goal
+ 	cfg.session.cap_ms = demo.lose_cap_ms
++	cfg.session.health_on = demo.health_on    // 4.3
++	cfg.session.surge_win_pct = demo.surge_win_pct // 4.3
+ 	delete(demo.demolishes) // r1 note: the sibling loaders leaked this too
+ 	delete(demo.emphasis)   // 3.2
+ 	delete(demo.lanes)      // 3.2

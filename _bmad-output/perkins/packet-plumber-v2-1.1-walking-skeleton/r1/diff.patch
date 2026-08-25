@@ -1,0 +1,1611 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index e7f2f85..c1a1b80 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1,8 +1,13 @@
+ # .github/workflows/ci.yml — the §16.3 gates (ODN-17: the harness is a
+-# release-gated CI citizen). Every job: purity + grep gates, odin test (T1
+-# contracts), app build, harness run (T1 hashes + T2 pixels via the software
+-# renderer + the replay gate). Matrix: linux + macos; goldens are platform-
+-# independent because T2 is software-rendered.
++# release-gated CI citizen). Matrix: linux + macos; T1 goldens are platform-
++# independent (state hashes — no GPU).
++#
++# Story 1.1 scope (headless determinism spine): core purity + grep gates, the
++# core T1 unit tests, and the golden harness's T1 + replay gate. The app
++# build, the orchestration tests (app/run), and the T2 software-pixel path
++# (tools/harness.sh + tools/build_raylib_sw.sh) re-enable in story 1.2+ when
++# the window + a view land — the spine is proven headless before any window
++# (lavish choice 2B).
+ name: ci
+ 
+ on:
+@@ -19,8 +24,8 @@ jobs:
+     steps:
+       - uses: actions/checkout@v4
+ 
+-      # The pin (.odin-version) is an upstream RELEASE TAG; nightlies are
+-      # release artifacts, not git branches — fetch the pinned tarball.
++      # The pin (.odin-version) is an upstream RELEASE TAG; fetch the pinned
++      # release tarball for the runner's OS/arch.
+       - name: Install Odin (pinned release artifact)
+         shell: bash
+         run: |
+@@ -38,49 +43,37 @@ jobs:
+           curl -fsSL "$URL" -o "$RUNNER_TEMP/odin.tar.gz"
+           mkdir -p "$RUNNER_TEMP/odin"
+           tar -xzf "$RUNNER_TEMP/odin.tar.gz" -C "$RUNNER_TEMP/odin"
+-          tar -xzf "$RUNNER_TEMP/odin.tar.gz" -C "$RUNNER_TEMP/odin"
+           ODIN_BIN="$(find "$RUNNER_TEMP/odin" -maxdepth 3 -name odin -type f | head -1 | xargs dirname || true)"
+           if [ -z "${ODIN_BIN:-}" ] || [ ! -x "$ODIN_BIN/odin" ]; then
+             echo "odin binary not found; artifact layout:"
+             find "$RUNNER_TEMP/odin" -maxdepth 2 | head -20
+             exit 1
+           fi
+-          # $GITHUB_PATH applies to LATER steps; in THIS step invoke by full path
+           echo "$ODIN_BIN" >> "$GITHUB_PATH"
+           xattr -dr com.apple.quarantine "$ODIN_BIN" 2>/dev/null || true
+           "$ODIN_BIN/odin" version
+ 
+-      # the stock vendor:raylib desktop build links system X11/GL on linux
+-      - name: Linux GUI link deps
+-        if: runner.os == 'Linux'
+-        run: |
+-          sudo apt-get update -qq
+-          sudo apt-get install -y -qq libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libgl1-mesa-dev
+-
+-      - name: Purity + grep gates
+-        run: |
+-          odin build core -build-mode:obj -out:"$RUNNER_TEMP/core.obj"
+-          tools/lint.sh
++      # ODN-1: the core purity + grep gates. lint.sh gate 1 is the structural
++      # purity check (core/ imports whitelisted core:* only — never vendor:*,
++      # core:os, core:time); a package with zero forbidden imports cannot
++      # reference the renderer/os/time. (odin build core -build-mode:obj is the
++      # §16.3 aspiration; the user `package core` collides with Odin's runtime
++      # `core` for obj-output naming — the import lint is the authoritative
++      # gate; the obj artifact is reconciled with a later CI-gate design.)
++      - name: Purity + grep gates (ODN-1)
++        run: tools/lint.sh
+ 
+-      - name: Core unit tests (T1 contracts)
++      # ODN-9/10/11 + E10: the determinism spine — RNG pinned vectors,
++      # replay-equality, the binary log round-trip + corrupt-input rejection.
++      - name: Core unit tests (the determinism contracts)
+         run: odin test core
+ 
+-      - name: Orchestration-layer tests (driver/snap/bus)
+-        run: odin test app/run
+-
+-      - name: Game builds (the shipped artifact compiles)
+-        run: odin build app -out:"$RUNNER_TEMP/packet-plumber"
+-
+-      - name: Golden harness (T1 hashes + T2 software pixels + replay gate)
+-        run: |
+-          tools/harness.sh run || {
+-            if [ "$(uname -s)" = Linux ]; then
+-              echo "== harness crashed on linux; installing gdb for the backtrace"
+-              sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+-              ODIN_ROOT=tools/raylib-sw/shadow gdb -batch -ex run -ex bt -ex "info registers rip" --args bin/harness run || true
+-            fi
+-            exit 1
+-          }
++      # ODN-17/11: the golden harness — T1 state-hash manifest compare + the
++      # replay gate (the blessed action log re-sims the manifest bit-for-bit;
++      # catalog/logic_hz drift is a defined rejection). Headless — no window,
++      # no GPU, no raylib (the first runnable app.bin + T2 pixels land in 1.2).
++      - name: Golden harness (T1 hashes + replay gate)
++        run: odin run harness -- run
+ 
+       - name: Upload diff bundles on failure
+         if: failure()
+diff --git a/core/determinism_test.odin b/core/determinism_test.odin
+new file mode 100644
+index 0000000..1be24c3
+--- /dev/null
++++ b/core/determinism_test.odin
+@@ -0,0 +1,221 @@
++package core
++
++// determinism_test.odin — THE determinism spine (ODN-1/9/10/11; the briefing's
++// ONE hard blocker). Pins:
++//   (a) re-stepping (seed, action_log) twice yields byte-identical state_hash
++//       sequences [E10, ODN-10] — the replay-equality keystone;
++//   (b) the same seed reproduces a run, different seeds / catalogs diverge;
++//   (c) the action log survives the binary round-trip, and corrupt inputs get
++//       the defined rejection (never a crash / silent partial parse) [ODN-11];
++//   (d) FNV-1a-64 (the T1 + catalog hash primitive) matches the conformance
++//       basis — the spine's hashes are the canonical algorithm, not a typo.
++//
++// The spine has no topology yet (story 1.2); step is a heartbeat + command
++// recorder, so the keystone exercises the rng + the applied-command record +
++// the canonical serializer + the binary log end to end — the same plumbing
++// real sim state will ride once Topology lands.
++
++import "core:testing"
++
++// A stable catalog_hash for the test runs (the spine doesn't load real
++// catalogs from disk — core is pure, ODN-1; the harness resolves it). The
++// value just has to be consistent within a run so the log/replay binding is
++// exercised identically. A literal avoids a context-requiring proc call at
++// global scope (fnv1a64 is exercised by state_hash + test_fnv1a64_conformance).
++TEST_CATALOG_HASH :: u64(0x0123456789ABCDEF)
++TEST_LOGIC_HZ :: i32(20)
++
++// Step a run from tick 1..ticks, feeding step the commands whose apply_tick
++// == tick (the pinned replay convention: apply all log entries for tick N
++// BEFORE stepping N — §11.1). Records the per-tick state hash. The same proc
++// serves live + replay (the spine has no edit fast-path yet; story 1.2 adds
++// the bus). Drains the tick's events into the hash (ODN-14).
++record_run :: proc(state: ^Run_State, ticks: u64, allocator := context.allocator) -> [dynamic]u64 {
++	hashes := make([dynamic]u64, 0, ticks, allocator)
++	for tick in u64(1)..=ticks {
++		before := len(state.events)
++		batch := make([dynamic]Command, 0, 4, context.temp_allocator)
++		for cmd in state.action_log {
++			if cmd.apply_tick == tick {
++				append(&batch, cmd)
++			}
++		}
++		step(state, tick, batch[:])
++		h := state_hash(state, state.events[before:], context.temp_allocator)
++		append(&hashes, h)
++		clear(&state.events)
++		free_all(context.temp_allocator)
++	}
++	return hashes
++}
++
++// Deep-copy an action log so the replayed run owns its own backing store
++// (avoids a shared-array double-free between the live + replayed runs).
++clone_log :: proc(src: [dynamic]Command, allocator := context.allocator) -> [dynamic]Command {
++	out := make([dynamic]Command, 0, len(src), allocator)
++	for cmd in src {
++		append(&out, cmd)
++	}
++	return out
++}
++
++@(test)
++test_fnv1a64_conformance :: proc(t: ^testing.T) {
++	// empty input = the FNV-1a-64 offset basis (the canonical conformance value)
++	testing.expect_value(t, fnv1a64([]u8{}), FNV64_OFFSET) // empty input == the offset basis
++	// deterministic + nonzero
++	testing.expect(t, fnv1a64([]u8{'p', 'p'}) == fnv1a64([]u8{'p', 'p'}), "fnv1a64 must be deterministic")
++	testing.expect(t, fnv1a64([]u8{'p', 'p'}) != 0, "fnv1a64(pp) must be nonzero")
++	// byte order matters (a hash, not a commutative sum)
++	testing.expect(t, fnv1a64([]u8{'a', 'b'}) != fnv1a64([]u8{'b', 'a'}), "fnv1a64 must be order-sensitive")
++}
++
++@(test)
++test_replay_byte_identical :: proc(t: ^testing.T) {
++	live: Run_State
++	defer {
++		run_destroy(&live)
++	}
++	run_init(&live, 42, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
++
++	// inject a command-built action log (simulating the Command_Bus, story 1.2)
++	append(&live.action_log, Command{apply_tick = 1, kind = Cmd_Set_Arg{arg = 7}})
++	append(&live.action_log, Command{apply_tick = 50, kind = Cmd_Set_Arg{arg = 99}})
++	append(&live.action_log, Command{apply_tick = 200, kind = Cmd_Set_Arg{arg = 3}})
++
++	live_hashes := record_run(&live, 300)
++	defer delete(live_hashes)
++
++	// sanity: the keystone must be command-built + the rng heartbeat must
++	// actually advance state (a vacuous keystone would pass while broken)
++	testing.expectf(t, len(live.applied) == 3, "keystone must apply 3 commands, applied %d", len(live.applied))
++	testing.expectf(t, len(live_hashes) == 300, "expected 300 hashes, got %d", len(live_hashes))
++	testing.expect(t, live_hashes[0] != live_hashes[1], "per-tick hashes must vary (rng heartbeat)")
++
++	// replay: fresh run, same seed, the SAME action-log artifact (ODN-11)
++	replayed: Run_State
++	defer {
++		run_destroy(&replayed)
++	}
++	run_init(&replayed, 42, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
++	delete(replayed.action_log) // run_init's empty log — replaced by the clone
++	replayed.action_log = clone_log(live.action_log)
++	replay_hashes := record_run(&replayed, 300)
++	defer delete(replay_hashes)
++
++	testing.expect(t, !replayed.replay_error, "replay must not latch replay_error (ODN-11 critical)")
++	testing.expectf(t, len(live_hashes) == len(replay_hashes),
++		"tick count mismatch: live %d vs replay %d", len(live_hashes), len(replay_hashes))
++	diverged := false
++	for i in 0..<len(live_hashes) {
++		if live_hashes[i] != replay_hashes[i] {
++			diverged = true
++		}
++	}
++	testing.expectf(t, !diverged, "REPLAY DIVERGENCE: live vs replay hashes differ")
++}
++
++@(test)
++test_seed_reproduces_and_diverges :: proc(t: ^testing.T) {
++	a: Run_State
++	defer {
++		run_destroy(&a)
++	}
++	run_init(&a, 99, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
++	ha := record_run(&a, 300)
++	defer delete(ha)
++
++	b: Run_State
++	defer {
++		run_destroy(&b)
++	}
++	run_init(&b, 99, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
++	hb := record_run(&b, 300)
++	defer delete(hb)
++	same := true
++	for i in 0..<len(ha) {
++		if ha[i] != hb[i] {
++			same = false
++		}
++	}
++	testing.expect(t, same, "same seed must reproduce the hash sequence")
++
++	// a different seed must NOT reproduce the same sequence
++	c: Run_State
++	defer {
++		run_destroy(&c)
++	}
++	run_init(&c, 100, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
++	hc := record_run(&c, 300)
++	defer delete(hc)
++	diff_seed := true
++	for i in 0..<len(ha) {
++		if ha[i] == hc[i] {
++			diff_seed = false
++		}
++	}
++	testing.expect(t, diff_seed, "different seeds must diverge")
++
++	// a different catalog_hash must diverge (the replay gate's binding is real)
++	d: Run_State
++	defer {
++		run_destroy(&d)
++	}
++	run_init(&d, 99, TEST_CATALOG_HASH + 1, TEST_LOGIC_HZ)
++	hd := record_run(&d, 300)
++	defer delete(hd)
++	diff_cat := true
++	for i in 0..<len(ha) {
++		if ha[i] == hd[i] {
++			diff_cat = false
++		}
++	}
++	testing.expect(t, diff_cat, "different catalog_hash must diverge")
++}
++
++@(test)
++test_action_log_binary_roundtrip :: proc(t: ^testing.T) {
++	state: Run_State
++	defer {
++		run_destroy(&state)
++	}
++	run_init(&state, 42, TEST_CATALOG_HASH, TEST_LOGIC_HZ)
++	append(&state.action_log, Command{apply_tick = 1, kind = Cmd_Set_Arg{arg = 7}})
++	append(&state.action_log, Command{apply_tick = 50, kind = Cmd_Set_Arg{arg = 99}})
++
++	bytes := log_write(&state, context.temp_allocator)
++
++	// clean round-trip: header + commands survive byte-for-byte-semantically
++	header, cmds, ok := log_read(bytes, context.temp_allocator)
++	testing.expect(t, ok, "round-trip must parse")
++	testing.expectf(t, header.seed == 42, "header seed: got %d, want 42", header.seed)
++	testing.expect(t, header.catalog_hash == TEST_CATALOG_HASH, "header catalog_hash mismatch")
++	testing.expect(t, header.logic_hz == TEST_LOGIC_HZ, "header logic_hz mismatch")
++	testing.expectf(t, len(cmds) == len(state.action_log),
++		"command count: got %d, want %d", len(cmds), len(state.action_log))
++	for i in 0..<len(cmds) {
++		testing.expectf(t, cmds[i].apply_tick == state.action_log[i].apply_tick,
++			"cmd %d apply_tick mismatch", i)
++		ca := cmds[i].kind.(Cmd_Set_Arg)
++		cb := state.action_log[i].kind.(Cmd_Set_Arg)
++		testing.expectf(t, ca.arg == cb.arg, "cmd %d arg mismatch: %d != %d", i, ca.arg, cb.arg)
++	}
++
++	// defined rejections — never a silent partial parse or a crash (ODN-11)
++	_, _, truncated := log_read(bytes[:len(bytes)-1], context.temp_allocator)
++	testing.expect(t, !truncated, "truncated log must reject")
++	_, _, header_only := log_read(bytes[:8], context.temp_allocator)
++	testing.expect(t, !header_only, "header-only log must reject")
++	garbage := make([]u8, 64, context.temp_allocator)
++	_, _, bad := log_read(garbage, context.temp_allocator)
++	testing.expect(t, !bad, "garbage must reject")
++	_, _, partial_magic := log_read(bytes[:4], context.temp_allocator)
++	testing.expect(t, !partial_magic, "partial magic must reject")
++	// future version field must reject
++	fut := make([]u8, len(bytes), context.temp_allocator)
++	copy(fut, bytes)
++	fut[4] = 99 // bump the version field (second u32, little-endian)
++	fut[5], fut[6], fut[7] = 0, 0, 0
++	_, _, future := log_read(fut, context.temp_allocator)
++	testing.expect(t, !future, "unknown version must reject")
++}
+diff --git a/core/hash.odin b/core/hash.odin
+new file mode 100644
+index 0000000..c746502
+--- /dev/null
++++ b/core/hash.odin
+@@ -0,0 +1,19 @@
++package core
++
++// hash.odin — FNV-1a-64, the T1 state-hash + catalog-hash primitive. The T1
++// golden (arch §10.2) is the FNV-1a-64 of the canonical serialized sim state
++// (serialize.odin); the catalog_hash (ODN-11, in the save header + every
++// golden manifest) is the FNV-1a-64 of the exact catalog bytes in force.
++// Pinned constants; identical on every target (the spine, ODN-10).
++
++FNV64_OFFSET :: u64(0xcbf29ce484222325) // FNV-1a 64-bit offset basis
++FNV64_PRIME :: u64(0x100000001b3)        // FNV-1a 64-bit prime
++
++fnv1a64 :: proc(data: []u8) -> u64 {
++	h := FNV64_OFFSET
++	for b in data {
++		h ~= u64(b)
++		h *= FNV64_PRIME
++	}
++	return h
++}
+diff --git a/core/rng.odin b/core/rng.odin
+new file mode 100644
+index 0000000..d44a06a
+--- /dev/null
++++ b/core/rng.odin
+@@ -0,0 +1,70 @@
++package core
++
++// rng.odin — the owned PRNG (ODN-9). PCG32 XSH-RR (64-bit state, 32-bit
++// output) with seed expansion via splitmix64. Explicit integer code; the
++// algorithm's constants are written in the source (the canonical
++// pcg-random.org PCG32 XSH-RR). NOT core:math/rand — the stdlib
++// implementation may drift between Odin releases, and the determinism
++// guarantee must not depend on the toolchain's internals.
++//
++// Seed expansion: splitmix64 expands a single u64 seed into the PCG state +
++// an odd stream selector (three splitmix64 draws), then two PCG advances mix
++// before the first user output. This is the reference seeding the pinned
++// vectors in rng_test.odin were generated against; any future port (server
++// validator, wasm) must reproduce it — this IS the cross-language determinism
++// conformance test (arch REVIEW m6, resolved by ODN-1/9/10).
++
++Rng :: struct {
++	state: u64,
++	inc:   u64, // odd (the PCG stream selector)
++}
++
++// PCG32 constants (pcg-random.org, pinned in source).
++PCG32_MULT :: u64(6364136223846793005)
++
++// splitmix64 constants (SplitMix64 / David Stafford's Mix13), pinned.
++SPLITMIX_DELTA :: u64(0x9E3779B97F4A7C15)
++SPLITMIX_GAMMA1 :: u64(0xBF58476D1CE4E5B9)
++SPLITMIX_GAMMA2 :: u64(0x94D049BB133111EB)
++
++// splitmix64 — advances s by the golden-ratio delta, returns the mixed value.
++// Pure w.r.t. everything except the ^u64 it mutates (the determinism
++// finalizer reused for fresh-seed expansion and — later — the ECMP hash).
++splitmix64 :: proc(s: ^u64) -> u64 {
++	s^ += SPLITMIX_DELTA
++	z := s^
++	z = (z ~ (z >> 30)) * SPLITMIX_GAMMA1
++	z = (z ~ (z >> 27)) * SPLITMIX_GAMMA2
++	return z ~ (z >> 31)
++}
++
++// Seed the PRNG from a single u64. splitmix64 expands the seed into the PCG
++// state + an odd stream selector; two PCG advances mix the state before the
++// first output. Same seed → identical stream (the determinism keystone).
++rng_seed :: proc(r: ^Rng, seed: u64) {
++	s := seed
++	r.state = splitmix64(&s)
++	r.inc = (splitmix64(&s) | 1) // inc must be odd
++	rng_next(r)                  // first mix advance
++	r.state += splitmix64(&s)
++	rng_next(r)                  // second mix advance
++}
++
++// pcg32 XSH-RR: the output is a function of the OLD state, then the state
++// advances. Constants + shift counts pinned to the canonical reference.
++rng_next :: proc(r: ^Rng) -> u32 {
++	old := r.state
++	r.state = old * PCG32_MULT + r.inc
++	xorshifted := u32(((old >> 18) ~ old) >> 27)
++	rot := u32(old >> 59)
++	return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
++}
++
++// Bounded draw in [lo, hi] INCLUSIVE. Multiply-shift (Lemire) instead of
++// modulo: bias is < 2^-32 and the draw is a single multiply. Callers pass
++// span-ordered (lo <= hi) bounds; a degenerate span returns lo.
++rng_range :: proc(r: ^Rng, lo, hi: i32) -> i32 {
++	if hi <= lo do return lo
++	span := u64(u32(hi - lo)) + 1
++	return lo + i32((u64(rng_next(r)) * span) >> 32)
++}
+diff --git a/core/rng_test.odin b/core/rng_test.odin
+new file mode 100644
+index 0000000..2a91cbc
+--- /dev/null
++++ b/core/rng_test.odin
+@@ -0,0 +1,76 @@
++package core
++
++// rng_test.odin — the pinned PRNG conformance vectors (ODN-9). Generated from
++// the canonical PCG32 XSH-RR + splitmix64 seed expansion implemented in
++// rng.odin (constants in source). Any future port (server validator, wasm,
++// leaderboard re-sim) MUST reproduce these — this IS the cross-language
++// determinism contract (arch REVIEW m6, resolved by ODN-1/9/10).
++
++import "core:testing"
++
++@(test)
++test_rng_pinned_vectors :: proc(t: ^testing.T) {
++	r: Rng
++	rng_seed(&r, 0)
++	expected := [8]u32{2196338726, 1832588393, 3253730937, 2647056997,
++	                   2191141068, 1480505347, 3030956019, 209995402}
++	for e, i in expected {
++		got := rng_next(&r)
++		testing.expectf(t, got == e, "seed 0 output %d: got %d, want %d", i, got, e)
++	}
++}
++
++@(test)
++test_rng_seed42_pinned :: proc(t: ^testing.T) {
++	r: Rng
++	rng_seed(&r, 42)
++	expected := [4]u32{2399007886, 4293122540, 1743717038, 2217374311}
++	for e, i in expected {
++		got := rng_next(&r)
++		testing.expectf(t, got == e, "seed 42 output %d: got %d, want %d", i, got, e)
++	}
++}
++
++@(test)
++test_rng_range_bounds :: proc(t: ^testing.T) {
++	r: Rng
++	rng_seed(&r, 7)
++	ok := true
++	for _ in 0..<10000 {
++		v := rng_range(&r, 6, 34)
++		if v < 6 || v > 34 {
++			ok = false
++		}
++	}
++	testing.expect(t, ok, "rng_range must stay in [6,34]")
++	// degenerate / inverted span returns lo (the bias-avoidance note, ODN-9)
++	testing.expect(t, rng_range(&r, 5, 5) == 5, "degenerate span must return lo")
++	testing.expect(t, rng_range(&r, 9, 3) == 9, "inverted span must return lo")
++}
++
++@(test)
++test_rng_streams_independent :: proc(t: ^testing.T) {
++	// same seed => identical stream (the determinism keystone)
++	a, b: Rng
++	rng_seed(&a, 1337)
++	rng_seed(&b, 1337)
++	ok := true
++	for _ in 0..<100 {
++		if rng_next(&a) != rng_next(&b) {
++			ok = false
++		}
++	}
++	testing.expect(t, ok, "same seed must reproduce the stream")
++
++	// different seeds must diverge (no correlated streams)
++	c, d: Rng
++	rng_seed(&c, 1)
++	rng_seed(&d, 2)
++	same := true
++	for _ in 0..<16 {
++		if rng_next(&c) != rng_next(&d) {
++			same = false
++		}
++	}
++	testing.expect(t, !same, "different seeds must diverge")
++}
+diff --git a/core/serialize.odin b/core/serialize.odin
+new file mode 100644
+index 0000000..01d0020
+--- /dev/null
++++ b/core/serialize.odin
+@@ -0,0 +1,201 @@
++package core
++
++// serialize.odin — the canonical serialized form (ODN-11 / T1). Field-wise
++// little-endian, lengths-not-capacities, no padding, no pointers — INCLUDING
++// rng state + the applied-command record + the tick's event stream. FNV-1a-64
++// over this byte stream is the T1 state hash (hash.odin). "Byte-identical
++// replay" = identical hashes = identical canonical bytes (E10).
++//
++// Also the action-log binary format (ODN-11): a versioned little-endian
++// header (magic, version, seed, era, catalog_hash, logic_hz) +
++// length-prefixed records of post-validation commands. The replay gate
++// (harness) reads this back and re-sims; catalog/logic_hz drift is a defined
++// rejection, never silent divergence.
++
++Writer :: struct {
++	buf: [dynamic]u8,
++}
++
++writer_make :: proc(scratch := context.temp_allocator) -> Writer {
++	w: Writer
++	w.buf = make([dynamic]u8, 0, 4096, scratch)
++	return w
++}
++
++w_u8 :: proc(w: ^Writer, v: u8) { append(&w.buf, v) }
++
++w_u16 :: proc(w: ^Writer, v: u16) {
++	append(&w.buf, u8(v), u8(v >> 8))
++}
++
++w_u32 :: proc(w: ^Writer, v: u32) {
++	append(&w.buf, u8(v), u8(v >> 8), u8(v >> 16), u8(v >> 24))
++}
++
++w_i32 :: proc(w: ^Writer, v: i32) { w_u32(w, u32(v)) }
++
++w_u64 :: proc(w: ^Writer, v: u64) {
++	for i in 0..<8 { append(&w.buf, u8(v >> (8 * uint(i)))) }
++}
++
++w_bool :: proc(w: ^Writer, v: bool) { w_u8(w, 1 if v else 0) }
++
++// Per-variant command tag (stable across the wire; new variants append).
++CMD_TAG_SET_ARG :: u8(1)
++
++// --- the T1 state hash --------------------------------------------------------
++
++// Serialize the full sim state and FNV-1a-64 it. Called per tick by the
++// harness (and by the replay-equality unit test). `tick_events` is the slice
++// of state.events produced THIS tick (drained after hashing, ODN-14).
++state_hash :: proc(state: ^Run_State, tick_events: []Event,
++                   scratch := context.temp_allocator) -> u64 {
++	w := state_writer(state, tick_events, scratch)
++	return fnv1a64(w.buf[:])
++}
++
++// The raw canonical bytes (for debugging / future diff bundles).
++state_dump :: proc(state: ^Run_State, tick_events: []Event,
++                   scratch := context.temp_allocator) -> []u8 {
++	w := state_writer(state, tick_events, scratch)
++	return w.buf[:]
++}
++
++state_writer :: proc(state: ^Run_State, tick_events: []Event,
++                     scratch := context.temp_allocator) -> Writer {
++	w := writer_make(scratch)
++
++	w_u64(&w, state.seed)
++	w_u64(&w, state.tick)
++	w_u64(&w, state.rng.state)
++	w_u64(&w, state.rng.inc)
++	w_u8(&w, state.era)
++	w_u64(&w, state.catalog_hash)
++	w_i32(&w, state.logic_hz)
++	w_u32(&w, state.tick_nonce) // per-tick rng heartbeat (1.2: real sim state)
++
++	// the replay artifact (the action log) — lengths-not-capacities, in order
++	w_u32(&w, u32(len(state.action_log)))
++	for cmd in state.action_log {
++		w_u64(&w, cmd.apply_tick)
++		switch c in cmd.kind {
++		case Cmd_Set_Arg: w_u8(&w, CMD_TAG_SET_ARG); w_u32(&w, c.arg)
++		}
++	}
++
++	// applied commands — the spine's "topology" (replaces with real state 1.2)
++	w_u32(&w, u32(len(state.applied)))
++	for a in state.applied {
++		w_u64(&w, a.tick)
++		w_u32(&w, a.arg)
++	}
++
++	// the tick's event stream (ODN-14) — part of the hash so event divergence
++	// is caught without a single pixel
++	w_u32(&w, u32(len(tick_events)))
++	for e in tick_events {
++		w_u64(&w, e.tick)
++		w_u8(&w, e.tag)
++	}
++
++	return w
++}
++
++// --- the action log (ODN-11 binary) -------------------------------------------
++
++LOG_MAGIC :: u32(0x314C5050) // "PPL1" little-endian
++LOG_VERSION :: u32(1)
++
++// Write the run's action log: versioned header + length-prefixed command
++// records. catalog_hash + logic_hz ride in the header so the replay gate can
++// reject drift (ODN-11).
++log_write :: proc(state: ^Run_State, scratch := context.temp_allocator) -> []u8 {
++	w := writer_make(scratch)
++	w_u32(&w, LOG_MAGIC)
++	w_u32(&w, LOG_VERSION)
++	w_u64(&w, state.seed)
++	w_u8(&w, state.era)
++	w_u64(&w, state.catalog_hash)
++	w_i32(&w, state.logic_hz)
++	w_u32(&w, u32(len(state.action_log)))
++	for cmd in state.action_log {
++		w_u64(&w, cmd.apply_tick)
++		switch c in cmd.kind {
++		case Cmd_Set_Arg: w_u8(&w, CMD_TAG_SET_ARG); w_u32(&w, c.arg)
++		}
++	}
++	return w.buf[:]
++}
++
++// --- log reader (the replay half) ---------------------------------------------
++
++Reader :: struct {
++	data: []u8,
++	pos:  int,
++	bad:  bool, // set on any past-end read (truncation = corrupt, never silent)
++}
++
++r_u8 :: proc(r: ^Reader) -> u8 {
++	if r.pos >= len(r.data) {
++		r.bad = true
++		return 0
++	}
++	v := r.data[r.pos]
++	r.pos += 1
++	return v
++}
++
++r_u16 :: proc(r: ^Reader) -> u16 {
++	return u16(r_u8(r)) | (u16(r_u8(r)) << 8)
++}
++
++r_u32 :: proc(r: ^Reader) -> u32 {
++	return u32(r_u8(r)) | (u32(r_u8(r)) << 8) | (u32(r_u8(r)) << 16) | (u32(r_u8(r)) << 24)
++}
++
++r_i32 :: proc(r: ^Reader) -> i32 { return i32(r_u32(r)) }
++
++r_u64 :: proc(r: ^Reader) -> u64 {
++	v: u64 = 0
++	for i in 0..<8 { v |= u64(r_u8(r)) << (8 * uint(i)) }
++	return v
++}
++
++Log_Header :: struct {
++	seed:         u64,
++	era:          u8,
++	catalog_hash: u64,
++	logic_hz:     i32,
++}
++
++// Parse an action log. ok=false on any corruption (magic/version mismatch,
++// truncation, trailing bytes, unknown tag) — critical-error handling (§7.1),
++// never a silent partial parse.
++log_read :: proc(data: []u8, allocator := context.allocator) -> (Log_Header, []Command, bool) {
++	r := Reader{data = data}
++	if r_u32(&r) != LOG_MAGIC do return {}, nil, false
++	if r_u32(&r) != LOG_VERSION do return {}, nil, false
++	h: Log_Header
++	h.seed = r_u64(&r)
++	h.era = r_u8(&r)
++	h.catalog_hash = r_u64(&r)
++	h.logic_hz = r_i32(&r)
++	n := r_u32(&r)
++	// bounds sanity before allocation: the smallest record is 9 bytes
++	// (apply_tick u64 + tag u8); a count beyond the remaining bytes is corrupt.
++	if u64(n) * 9 > u64(len(r.data) - r.pos) do return {}, nil, false
++	cmds := make([]Command, n, allocator)
++	for i in 0..<int(n) {
++		cmd: Command
++		cmd.apply_tick = r_u64(&r)
++		switch r_u8(&r) {
++		case CMD_TAG_SET_ARG:
++			cmd.kind = Cmd_Set_Arg{arg = r_u32(&r)}
++		case:
++			return {}, nil, false
++		}
++		cmds[i] = cmd
++	}
++	if r.bad || r.pos != len(r.data) do return {}, nil, false // truncation/trailing = corrupt
++	return h, cmds, true
++}
+diff --git a/core/step.odin b/core/step.odin
+new file mode 100644
+index 0000000..f88fd45
+--- /dev/null
++++ b/core/step.odin
+@@ -0,0 +1,36 @@
++package core
++
++// step.odin — the ONLY entry point that advances the simulation (ODN-1).
++//
++// Story 1.1 spine: step is a no-op heartbeat. It (a) applies the tick's
++// replay commands to `applied` (the spine's topology stand-in) and (b) draws
++// the owned RNG once per tick — the thinnest sim activity that makes the
++// determinism plumbing (rng → serialize → hash → replay) real and testable.
++// There is no topology / flow / crisis / health yet (later slices); nothing
++// here reads a clock, a file, or a device (ODN-1), and all math is integer
++// (ODN-10).
++//
++// The command-application convention (pinned, arch §11.1): live edits apply
++// immediately via the edit fast-path (story 1.2's Command_Bus) and are logged
++// with apply_tick = the next tick; replay applies every log entry with
++// apply_tick == N BEFORE stepping N — so live and replay see identical state
++// at every step boundary (E10). For the spine the harness/test feeds step the
++// matching commands directly (no bus yet); the convention still holds.
++step :: proc(state: ^Run_State, tick: u64, commands: []Command) {
++	state.tick = tick
++
++	// apply this tick's commands (spine: record them; 1.2 mutates Topology)
++	for cmd in commands {
++		switch c in cmd.kind {
++		case Cmd_Set_Arg:
++			append(&state.applied, Applied_Cmd{tick = tick, arg = c.arg})
++		}
++	}
++
++	// heartbeat: one owned-RNG draw folded into a per-tick state field. This
++	// is the thinnest sim activity that ties the RNG into the step path
++	// (different seed → different nonce sequence → different hashes; replay
++	// reproduces it exactly). Story 1.2+ replaces tick_nonce with real
++	// rng-derived sim state (demand, spawn, ECMP, …).
++	state.tick_nonce = rng_next(&state.rng)
++}
+diff --git a/core/types.odin b/core/types.odin
+new file mode 100644
+index 0000000..d15cc0e
+--- /dev/null
++++ b/core/types.odin
+@@ -0,0 +1,92 @@
++package core
++
++// types.odin — the spine state model. A deliberate SUBSET of the full game
++// state (arch §8.2): no Topology / Flow / Crisis / Health yet (those are
++// later slices — story 1.2 onward). Everything here is integer (ODN-10) and
++// the RNG is owned (ODN-9). The determinism spine needs only:
++//   - the seed + rng (the owned PRNG),
++//   - the tick counter,
++//   - the action log (ODN-11 — the replay artifact),
++//   - the per-tick event buffer (ODN-14),
++//   - the catalog_hash + logic_hz the replay gate binds to (ODN-11).
++//
++// `applied` is the spine's stand-in for "the topology that commands mutate":
++// step records each applied command here so the state hash reflects command
++// application (replay-equality is real, not vacuous). Story 1.2 replaces it
++// with the real Topology SOA; the serialize/step/hash plumbing is unchanged.
++
++// Command — the post-validation action-log entry (ODN-11). Tagged union; the
++// spine carries one placeholder variant so the binary log round-trips a
++// payload and replay-equality is exercised. Later stories add Draw_Pipe,
++// Demolish, Set_Lane_Weights, … as new variants behind the same `switch`.
++Command_Kind :: union {
++	Cmd_Set_Arg,
++}
++
++// Spine placeholder command: carries a u32 the run records in `applied`.
++// Real commands (Draw_Pipe{a, b, tier}, …) land in story 1.2+.
++Cmd_Set_Arg :: struct {
++	arg: u32,
++}
++
++Command :: struct {
++	apply_tick: u64,
++	kind:       Command_Kind,
++}
++
++// The spine's deterministic record of command application (replaces with the
++// real Topology in story 1.2). Serialized into the state hash so replay
++// divergence is caught (E10).
++Applied_Cmd :: struct {
++	tick: u64,
++	arg:  u32,
++}
++
++// Event — the per-tick event buffer entry (ODN-14). The spine emits none
++// (step is a no-op heartbeat); later stories add Packet_Arrived,
++// Crisis_Triggered, … The tag byte is the serialized discriminator.
++Event :: struct {
++	tick: u64,
++	tag:  u8, // 0 = (none); spine reserves 1.. for future variants
++}
++
++// Run_State — the authoritative sim state (ODN-1/13). One value per run,
++// created fresh per run (reset = make a new one), passed by pointer. No
++// globals (ODN-13); no maps anywhere (ODN-10).
++Run_State :: struct {
++	seed:         u64,
++	tick:         u64,
++	rng:          Rng,
++	era:          u8,           // [LATER] Era FSM; spine pins 0
++	catalog_hash: u64,          // ODN-11 — binds the run to its catalogs
++	logic_hz:     i32,          // ODN-11 — binds the run to its tick rate
++	action_log:   [dynamic]Command, // the replay artifact (ODN-11)
++	applied:      [dynamic]Applied_Cmd,
++	events:       [dynamic]Event,   // per-tick buffer (ODN-14)
++	tick_nonce:   u32,           // per-tick rng-derived value (heartbeat; 1.2 replaces with real sim state)
++	replay_error: bool,         // latched if a replayed command fails (critical)
++}
++
++// run_init — create a fresh run context (ODN-13: reset = make a new one).
++// The caller (harness/app) resolves catalog_hash + logic_hz from data/*.json
++// (core is pure — no file I/O, ODN-1) and seeds the owned RNG.
++run_init :: proc(state: ^Run_State, seed: u64, catalog_hash: u64, logic_hz: i32,
++                 allocator := context.allocator) {
++	state^ = {} // zero everything (no stale state across runs)
++	state.seed = seed
++	state.catalog_hash = catalog_hash
++	state.logic_hz = logic_hz
++	state.era = 0
++	state.action_log = make([dynamic]Command, allocator)
++	state.applied = make([dynamic]Applied_Cmd, allocator)
++	state.events = make([dynamic]Event, allocator)
++	rng_seed(&state.rng, seed)
++}
++
++// run_destroy — free the run's owned buffers (mirrors run_init; ODN-18
++// arena discipline lands later, but explicit frees are correct now).
++run_destroy :: proc(state: ^Run_State) {
++	delete(state.action_log)
++	delete(state.applied)
++	delete(state.events)
++}
+diff --git a/data/balance.json b/data/balance.json
+new file mode 100644
+index 0000000..fe2b0d9
+--- /dev/null
++++ b/data/balance.json
+@@ -0,0 +1,4 @@
++{
++  "logic_hz": 20,
++  "max_ticks": 100000
++}
+diff --git a/demos/boot.dem b/demos/boot.dem
+new file mode 100644
+index 0000000..f6db234
+--- /dev/null
++++ b/demos/boot.dem
+@@ -0,0 +1,8 @@
++# boot.dem — harness skeleton smoke (Story 1.1): an idle seeded run, T1
++# hash-stable. The determinism spine: step is a heartbeat — the owned RNG
++# advances one draw per tick — so every per-tick state hash differs and a
++# re-run / replay must reproduce the EXACT sequence. No window, no map, no
++# commands (those land in 1.2+).
++seed 42
++run 5000ms
++expect hash stable
+diff --git a/goldens/boot.log.bin b/goldens/boot.log.bin
+new file mode 100644
+index 0000000..8df6db7
+Binary files /dev/null and b/goldens/boot.log.bin differ
+diff --git a/goldens/boot.t1 b/goldens/boot.t1
+new file mode 100644
+index 0000000..6be863b
+--- /dev/null
++++ b/goldens/boot.t1
+@@ -0,0 +1,107 @@
++# t1 manifest — per-tick FNV-1a-64 state hashes (full sim state)
++t1 1
++demo boot
++seed 42
++logic_hz 20
++catalog_hash 52075c6ea4c9f1b2
++ticks 100
++1 6103b02cb7372d23
++2 b33f67a17a4a204b
++3 7bc73e7ea474f4bc
++4 6f06ea4449d45c06
++5 755f3ecc19172f12
++6 4a255a73efe5297c
++7 af8a200cc1b81b8d
++8 37cf7a3d305a7ae7
++9 6e06bdfff5894547
++10 39006c481bf23b65
++11 3a63f66867184789
++12 fca0e8cd99a29096
++13 5e4dce44e3f562d7
++14 abd5903ca0b15d7a
++15 5159a8536d59e5dd
++16 d1f3f8d51de37932
++17 3839403f23fa8b93
++18 fca97cbeed0ae32f
++19 9ab86cd2d1a9c44f
++20 82b485e00548ae28
++21 20a98d1cc122f652
++22 b618bf67b32fdde2
++23 7e3de01de4af0f70
++24 ce8d5215c522f312
++25 04119dadb2d3da13
++26 305e0166719a7f8f
++27 d40314c8457c56b2
++28 af12bcba469a869c
++29 d258f743edc6ac6c
++30 b462e41704fc47ea
++31 44676c826a5f74c4
++32 327b6873323c6048
++33 d98d284274579eb6
++34 138cf2fb3309ae20
++35 aaaa71388c9c3290
++36 995d8022f4318c02
++37 851eac5d55ff71fe
++38 5049eb603fc28def
++39 4cccef5f6495ff26
++40 85280ee936da15a3
++41 f276f592bc5002ed
++42 4d6f2f61be2e6451
++43 488f153cc91868ab
++44 f1e485a526b3c86f
++45 3a65dc3095db213f
++46 9124edfa94c4d482
++47 b175e6fe8fc7bb9c
++48 b12b0ca3c8381522
++49 90791f0949dd5f47
++50 96fb16c1935af966
++51 2922f5c0a33cc6c9
++52 a30cf9cfd3b73409
++53 6ef3f568b4172f78
++54 88615621769030dd
++55 dd7a6d5cb3399abe
++56 f5c12955a0bdcd2c
++57 792403f9e7c252f7
++58 22f64549d5e95b49
++59 de3a4edad829a820
++60 86d4f9f70589829d
++61 24e3370b8c42b3e3
++62 07f2dd85004ddbe8
++63 6cc5dd34b7817e97
++64 1b0ab708a5a74f8f
++65 935d971cd1a66ad7
++66 1bc6b37e5e34efe0
++67 0fa5f9e241a351e7
++68 4e7cf3717fa2a774
++69 9a2a1a5784ce9282
++70 04676d40a541fe7f
++71 1e37cd4b658c402e
++72 df8b46ed72eba367
++73 16d345e2120f3810
++74 64af4e862604c009
++75 1fd019c7b7258d37
++76 9074028b63a35033
++77 9b7d8d0df9e0978f
++78 931b50be95cdf8ce
++79 21db5624db5a1c6b
++80 7787b777d22c3101
++81 c7c3bda95245a0ac
++82 60088029e31d2243
++83 05dff24b581da880
++84 4b06d2bd89ca0784
++85 2e121e7b4a72c600
++86 d8f4d019ed4f5319
++87 b73ae0c70b9a65bf
++88 e14a2dbb139c3314
++89 adfef9d0b7922669
++90 138751deecb76e98
++91 21a3d726f05995d1
++92 ee6dee823a434d1e
++93 1d66244c69dfdb99
++94 568dd2449d444c20
++95 18297b83acbd7c13
++96 2d5aeaa2a48827a1
++97 55dcee8ae6fe9927
++98 153bd37b09477d9f
++99 9939725bf4e11e29
++100 8d3c7eebbeb06093
+diff --git a/harness/demo.odin b/harness/demo.odin
+new file mode 100644
+index 0000000..c8b8f89
+--- /dev/null
++++ b/harness/demo.odin
+@@ -0,0 +1,88 @@
++package main
++
++// demo.odin — the scripted-demo model + parser (arch §10.3). A demo is a
++// header (seed) + a run length (ms) + expectations; it lowers to an action
++// log through the real core path (the harness plays intents through the
++// Command_Bus in 1.2; for the 1.1 spine boot.dem has no commands).
++//
++// Time: demo `run` is authored in ms and converted to ticks by
++// floor(ticks = run_ms * logic_hz / 1000) — the spine ticks directly (no
++// frame loop / no rendering); the 1/60s virtual clock + floor-to-frame
++// capture quantization lands with T2 (story 1.2+).
++
++import "core:fmt"
++import "core:strconv"
++import "core:strings"
++
++Demo :: struct {
++	name:             string,
++	seed:             u64,
++	run_ms:           i64,
++	expect_hash_stable: bool,
++}
++
++// parse_demo — line-based; `seed <n>`, `run <n>ms`, `expect hash stable`.
++// Returns "" on success, a one-line error otherwise.
++parse_demo :: proc(name: string, text: string) -> (Demo, string) {
++	d := Demo{name = name}
++	for raw in strings.split(text, "\n", context.temp_allocator) {
++		line := strings.trim_space(raw)
++		if len(line) == 0 || line[0] == '#' {
++			continue
++		}
++		fields := strings.fields(line)
++		if len(fields) == 0 {
++			continue
++		}
++		switch fields[0] {
++		case "seed":
++			if len(fields) < 2 {
++				return {}, "seed needs a value"
++			}
++			v, ok := strconv.parse_uint(fields[1], 10)
++			if !ok {
++				return {}, fmt.tprintf("bad seed: %q", fields[1])
++			}
++			d.seed = u64(v)
++		case "run":
++			if len(fields) < 2 {
++				return {}, "run needs a duration (e.g. run 5000ms)"
++			}
++			ms, ok := parse_ms(fields[1])
++			if !ok {
++				return {}, fmt.tprintf("bad run duration: %q", fields[1])
++			}
++			d.run_ms = ms
++		case "expect":
++			if len(fields) >= 3 && fields[1] == "hash" && fields[2] == "stable" {
++				d.expect_hash_stable = true
++			} else {
++				return {}, fmt.tprintf("unknown expect: %s", line)
++			}
++		case:
++			// forward-compat: silently skip future verbs (map, capture, at, …)
++			// so a 1.2+ demo doesn't hard-fail the 1.1 harness. T1 is the spine.
++		}
++	}
++	if d.run_ms <= 0 {
++		return {}, "demo must set `run <n>ms`"
++	}
++	return d, ""
++}
++
++// parse_ms — "5000ms" -> 5000. Trailing 'ms' required.
++parse_ms :: proc(s: string) -> (i64, bool) {
++	if !strings.has_suffix(s, "ms") {
++		return 0, false
++	}
++	n, ok := strconv.parse_int(s[:len(s)-2], 10)
++	if !ok {
++		return 0, false
++	}
++	return i64(n), true
++}
++
++// demo_run_ticks — floor(run_ms * logic_hz / 1000); the integer tick count.
++demo_run_ticks :: proc(d: ^Demo, logic_hz: i32) -> u64 {
++	return u64(max(0, i64(d.run_ms) * i64(logic_hz) / 1000))
++}
+diff --git a/harness/main.odin b/harness/main.odin
+new file mode 100644
+index 0000000..1c0494e
+--- /dev/null
++++ b/harness/main.odin
+@@ -0,0 +1,102 @@
++package main
++
++// main.odin — the golden-image harness CLI (ODN-17). Headless for Story 1.1
++// (no window, no raylib — the determinism spine is proven before any view;
++// lavish choice 2B). The first runnable app.bin + T2 pixel goldens land in
++// 1.2; this harness already links the SAME package core and exercises T1 +
++// the replay gate.
++//
++// Usage:
++//   odin run harness -- run [demo...]    replay demos; T1 + replay gate; non-zero on failure
++//   odin run harness -- save [demo...]   re-bless goldens (deliberate; PR-reviewed)
++//   odin run harness -- replay <demo> <log.bin>  re-run from an action log; manifest must match
++
++import "core:fmt"
++import "core:os"
++import "core:strings"
++
++main :: proc() {
++	args := os.args[1:]
++	if len(args) == 0 {
++		usage()
++	}
++	verb := args[0]
++	rest := args[1:]
++
++	if verb == "replay" {
++		if len(rest) != 2 {
++			usage()
++		}
++		os.exit(int(run_replay(rest[0], rest[1])))
++	}
++	if verb != "run" && verb != "save" {
++		usage()
++	}
++
++	names := rest
++	collected: [dynamic]string
++	defer delete(collected)
++	if len(names) == 0 {
++		entries, err := list_demos()
++		if err != nil {
++			fmt.eprintln("harness: no demos/ directory")
++			os.exit(2)
++		}
++		for n in entries {
++			append(&collected, n)
++		}
++		if len(collected) == 0 {
++			fmt.eprintln("harness: no demos/*.dem found")
++			os.exit(2)
++		}
++		names = collected[:]
++	}
++
++	failures := 0
++	for name in names {
++		ok := run_demo(name, verb == "save")
++		if !ok {
++			failures += 1
++		}
++		free_all(context.temp_allocator)
++	}
++
++	if verb == "save" {
++		if failures > 0 {
++			fmt.printf("harness: %d demo(s) FAILED during bless\n", failures)
++			os.exit(1)
++		}
++		fmt.printf("harness: blessed %d demo(s)\n", len(names))
++		os.exit(0)
++	}
++	if failures > 0 {
++		fmt.printf("harness: %d demo(s) FAILED\n", failures)
++		os.exit(1)
++	}
++	fmt.printf("harness: %d demo(s) green\n", len(names))
++}
++
++usage :: proc() {
++	fmt.eprintln("usage: harness run|save [demo...] | replay <demo> <log.bin>")
++	os.exit(2)
++}
++
++// list_demos — names (without .dem) of every demo in demos/.
++list_demos :: proc() -> ([]string, os.Error) {
++	out: [dynamic]string
++	f, err := os.open("demos")
++	if err != nil {
++		return {}, err
++	}
++	entries, derr := os.read_dir(f, -1, context.temp_allocator)
++	os.close(f)
++	if derr != nil {
++		return {}, derr
++	}
++	for e in entries {
++		if strings.has_suffix(e.name, ".dem") {
++			append(&out, strings.clone(e.name[:len(e.name)-4], context.allocator))
++		}
++	}
++	return out[:], nil
++}
+diff --git a/harness/manifest.odin b/harness/manifest.odin
+new file mode 100644
+index 0000000..ba0aed7
+--- /dev/null
++++ b/harness/manifest.odin
+@@ -0,0 +1,145 @@
++package main
++
++// manifest.odin — the T1 golden manifest (arch §10.2/§10.3). One per demo at
++// goldens/<demo>.t1: a header (the version, demo, seed, logic_hz,
++// catalog_hash, tick count) + one FNV-1a-64 state hash per tick. The header
++// carries catalog_hash + logic_hz so retuning either is a DEFINED re-bless,
++// never a silent shift (ODN-11). The replay gate (run.odin) binds the same
++// pair from the action-log header.
++
++import "core:fmt"
++import "core:os"
++import "core:strconv"
++import "core:strings"
++
++Manifest :: struct {
++	version:      i64,
++	demo:         string,
++	seed:         u64,
++	logic_hz:     i64,
++	catalog_hash: u64,
++	ticks:        i64,
++	hashes:       [dynamic]u64,
++}
++
++manifest_path :: proc(demo: string) -> string {
++	return fmt.tprintf("goldens/%s.t1", demo)
++}
++
++// read_manifest — tolerant line parser (the prototype's shape): keyword lines
++// fill the header; any other 2-field line whose 2nd field parses as hex is a
++// per-tick hash. Returns false on unreadable / missing file.
++read_manifest :: proc(path: string) -> (Manifest, bool) {
++	m: Manifest
++	m.version = -1
++	if !os.exists(path) {
++		return m, false
++	}
++	data, err := os.read_entire_file_from_path(path, context.temp_allocator)
++	if err != nil {
++		return m, false
++	}
++	for raw_line in strings.split(string(data), "\n", context.temp_allocator) {
++		line := strings.trim_space(raw_line)
++		if len(line) == 0 || line[0] == '#' {
++			continue
++		}
++		fields := strings.fields(line)
++		if len(fields) != 2 {
++			continue
++		}
++		switch fields[0] {
++		case "t1":
++			v, _ := strconv.parse_int(fields[1], 10)
++			m.version = i64(v)
++		case "demo":
++			m.demo = strings.clone(fields[1], context.allocator)
++		case "seed":
++			v, _ := strconv.parse_int(fields[1], 10)
++			m.seed = u64(v)
++		case "logic_hz":
++			v, _ := strconv.parse_int(fields[1], 10)
++			m.logic_hz = i64(v)
++		case "catalog_hash":
++			v, _ := strconv.parse_uint(fields[1], 16)
++			m.catalog_hash = u64(v)
++		case "ticks":
++			v, _ := strconv.parse_int(fields[1], 10)
++			m.ticks = i64(v)
++		case:
++			// a per-tick hash line: "<index> <hex>"
++			v, okv := strconv.parse_uint(fields[1], 16)
++			if okv {
++				append(&m.hashes, u64(v))
++			}
++		}
++	}
++	return m, true
++}
++
++// write_manifest — bless the T1 golden (deliberate; PR-reviewed like code).
++write_manifest :: proc(demo_name: string, demo: ^Demo, catalog_hash: u64, logic_hz: i32,
++                       hashes: []u64) {
++	sb := strings.builder_make(context.temp_allocator)
++	strings.write_string(&sb, "# t1 manifest — per-tick FNV-1a-64 state hashes (full sim state)\n")
++	fmt.sbprintf(&sb, "t1 1\ndemo %s\nseed %d\nlogic_hz %d\ncatalog_hash %016x\nticks %d\n",
++		demo_name, demo.seed, logic_hz, catalog_hash, len(hashes))
++	for h, i in hashes {
++		fmt.sbprintf(&sb, "%d %016x\n", i+1, h)
++	}
++	write_file(manifest_path(demo_name), transmute([]u8)strings.to_string(sb))
++}
++
++// check_manifest — compare a live run's hashes + header against the blessed
++// golden. Appends a one-line message per failure. Returns true iff green.
++check_manifest :: proc(demo_name: string, demo: ^Demo, catalog_hash: u64, logic_hz: i32,
++                       hashes: []u64, fails: ^[dynamic]string) -> bool {
++	path := manifest_path(demo_name)
++	if !os.exists(path) {
++		append(fails, fmt.tprintf("T1: no manifest at %s (bless with `harness save %s`)",
++			path, demo_name))
++		return false
++	}
++	m, okm := read_manifest(path)
++	if !okm {
++		append(fails, "T1: unreadable manifest")
++		return false
++	}
++	ok := true
++	if m.version != 1 {
++		append(fails, fmt.tprintf("T1: manifest version %d (want 1)", m.version))
++		ok = false
++	}
++	if m.seed != demo.seed {
++		append(fails, fmt.tprintf("T1: seed drift — manifest %d vs demo %d", m.seed, demo.seed))
++		ok = false
++	}
++	if m.catalog_hash != catalog_hash {
++		append(fails, fmt.tprintf("T1: catalog drift — manifest %016x vs current %016x (re-bless deliberately)",
++			m.catalog_hash, catalog_hash))
++		ok = false
++	}
++	if m.logic_hz != i64(logic_hz) {
++		append(fails, fmt.tprintf("T1: logic_hz drift — manifest %d vs current %d", m.logic_hz, logic_hz))
++		ok = false
++	}
++	if m.ticks != i64(len(m.hashes)) {
++		append(fails, fmt.tprintf("T1: manifest corrupt — ticks header %d but %d hash lines",
++			m.ticks, len(m.hashes)))
++		ok = false
++	}
++	if len(m.hashes) != len(hashes) {
++		append(fails, fmt.tprintf("T1: tick count %d vs golden %d", len(hashes), len(m.hashes)))
++		ok = false
++	} else {
++		for i in 0..<len(hashes) {
++			if hashes[i] != m.hashes[i] {
++				append(fails, fmt.tprintf("T1: STATE DIVERGENCE at tick %d: %016x != golden %016x",
++					i+1, hashes[i], m.hashes[i]))
++				ok = false
++				break
++			}
++		}
++	}
++	return ok
++}
+diff --git a/harness/run.odin b/harness/run.odin
+new file mode 100644
+index 0000000..c745190
+--- /dev/null
++++ b/harness/run.odin
+@@ -0,0 +1,253 @@
++package main
++
++// run.odin — the harness run/replay engine (arch §10, ODN-17). Headless for
++// Story 1.1: no window, no raylib, T1 only. Loads the catalogs (resolving the
++// catalog_hash + logic_hz the replay gate binds to — ODN-11), plays a demo
++// through the real core, records per-tick T1 state hashes, compares to the
++// blessed manifest (run) / blesses it (save), and runs the replay gate (the
++// blessed action log must re-sim the manifest bit-for-bit; catalog/logic_hz
++// drift is a defined rejection).
++
++import "core:encoding/json"
++import "core:fmt"
++import "core:os"
++import pp "../core"
++
++Catalogs :: struct {
++	hash:     u64,
++	logic_hz: i32,
++}
++
++// The subset of data/balance.json the spine parses (ODN-5: JSON single
++// source, integer-only sim values). Other fields ride in catalog_hash.
++Balance_File :: struct {
++	logic_hz: i32,
++}
++
++// load_catalogs — read data/balance.json, FNV-1a-64 its bytes (catalog_hash),
++// parse logic_hz. Core is pure (no file I/O — ODN-1), so the harness resolves
++// both and hands them to run_init.
++load_catalogs :: proc() -> (Catalogs, string) {
++	data, err := os.read_entire_file_from_path("data/balance.json", context.temp_allocator)
++	if err != nil {
++		return {}, fmt.tprintf("cannot read data/balance.json: %v", err)
++	}
++	bal: Balance_File
++	if jerr := json.unmarshal(data, &bal); jerr != nil {
++		return {}, fmt.tprintf("bad data/balance.json: %v", jerr)
++	}
++	if bal.logic_hz <= 0 || bal.logic_hz > 1000 {
++		return {}, fmt.tprintf("logic_hz %d out of range (1..1000)", bal.logic_hz)
++	}
++	return Catalogs{hash = pp.fnv1a64(data), logic_hz = bal.logic_hz}, ""
++}
++
++log_path :: proc(demo: string) -> string {
++	return fmt.tprintf("goldens/%s.log.bin", demo)
++}
++
++// run_demo — play a demo through the real core, record per-tick T1 hashes,
++// compare to the blessed manifest (run) or bless it (save), and run the
++// replay gate (the blessed log must reproduce the manifest bit-for-bit).
++run_demo :: proc(name: string, save: bool) -> bool {
++	path := fmt.tprintf("demos/%s.dem", name)
++	text_bytes, rerr := os.read_entire_file_from_path(path, context.temp_allocator)
++	if rerr != nil {
++		fmt.eprintfln("harness: cannot read %s", path)
++		return false
++	}
++	demo, perr := parse_demo(name, string(text_bytes))
++	if perr != "" {
++		fmt.eprintfln("harness: %s: parse error: %s", path, perr)
++		return false
++	}
++	catalogs, cerr := load_catalogs()
++	if cerr != "" {
++		fmt.eprintfln("harness: %s", cerr)
++		return false
++	}
++
++	state: pp.Run_State
++	defer pp.run_destroy(&state)
++	pp.run_init(&state, demo.seed, catalogs.hash, catalogs.logic_hz)
++
++	ticks := demo_run_ticks(&demo, catalogs.logic_hz)
++	hashes := make([dynamic]u64, 0, ticks)
++	defer delete(hashes)
++	for tick in u64(1)..=ticks {
++		before := len(state.events)
++		// gather this tick's replay commands (empty for boot.dem — no intents)
++		batch := make([dynamic]pp.Command, 0, 4, context.temp_allocator)
++		for cmd in state.action_log {
++			if cmd.apply_tick == tick {
++				append(&batch, cmd)
++			}
++		}
++		pp.step(&state, tick, batch[:])
++		append(&hashes, pp.state_hash(&state, state.events[before:], context.temp_allocator))
++		clear(&state.events)
++		free_all(context.temp_allocator)
++	}
++
++	fails: [dynamic]string
++	defer delete(fails)
++
++	if save {
++		write_manifest(name, &demo, catalogs.hash, catalogs.logic_hz, hashes[:])
++		write_file(log_path(name), pp.log_write(&state, context.temp_allocator))
++		fmt.printf("  save %-20s ticks=%d\n", name, len(hashes))
++		return true
++	}
++
++	check_manifest(name, &demo, catalogs.hash, catalogs.logic_hz, hashes[:], &fails)
++
++	// replay gate: the blessed log must re-sim the live hashes bit-for-bit
++	if len(fails) == 0 {
++		if !os.exists(log_path(name)) {
++			append(&fails, fmt.tprintf("no blessed log at %s (bless with `harness save %s`)",
++				log_path(name), name))
++		} else if !verify_replay(name, &catalogs, hashes[:]) {
++			append(&fails, "replay of the blessed log diverges from the manifest")
++		}
++	}
++	if state.replay_error {
++		append(&fails, "replay_error latched during the run (ODN-11 critical)")
++	}
++
++	if len(fails) == 0 {
++		fmt.printf("  PASS %-20s ticks=%d\n", name, len(hashes))
++		return true
++	}
++	fmt.printf("  FAIL %s\n", name)
++	for m in fails {
++		fmt.printf("    - %s\n", m)
++	}
++	return false
++}
++
++// replay_hashes — re-run from an action log alone. The ODN-11 replay gate:
++// the header's catalog_hash + logic_hz must match the current catalogs (else a
++// defined rejection, never silent divergence), then re-sim tick 1..ticks.
++replay_hashes :: proc(lpath: string, catalogs: ^Catalogs, ticks: u64,
++                       fails: ^[dynamic]string) -> ([dynamic]u64, bool) {
++	out := make([dynamic]u64)
++	data, err := os.read_entire_file_from_path(lpath, context.temp_allocator)
++	if err != nil {
++		append(fails, fmt.tprintf("replay: cannot read %s", lpath))
++		return out, false
++	}
++	header, cmds, ok := pp.log_read(data, context.allocator)
++	if !ok {
++		append(fails, fmt.tprintf("replay: corrupt log %s", lpath))
++		return out, false
++	}
++	defer delete(cmds)
++	if header.catalog_hash != catalogs.hash {
++		append(fails, fmt.tprintf("replay: catalog drift — log %016x vs current %016x (defined rejection, ODN-11)",
++			header.catalog_hash, catalogs.hash))
++		return out, false
++	}
++	if header.logic_hz != catalogs.logic_hz {
++		append(fails, fmt.tprintf("replay: logic_hz drift — log %d vs current %d (defined rejection, ODN-11)",
++			header.logic_hz, catalogs.logic_hz))
++		return out, false
++	}
++
++	state: pp.Run_State
++	defer pp.run_destroy(&state)
++	pp.run_init(&state, header.seed, catalogs.hash, catalogs.logic_hz)
++	for cmd in cmds {
++		append(&state.action_log, cmd)
++	}
++	for tick in u64(1)..=ticks {
++		before := len(state.events)
++		batch := make([dynamic]pp.Command, 0, 4, context.temp_allocator)
++		for cmd in state.action_log {
++			if cmd.apply_tick == tick {
++				append(&batch, cmd)
++			}
++		}
++		pp.step(&state, tick, batch[:])
++		append(&out, pp.state_hash(&state, state.events[before:], context.temp_allocator))
++		clear(&state.events)
++		free_all(context.temp_allocator)
++	}
++	if state.replay_error {
++		append(fails, "replay: replay_error latched (ODN-11 critical)")
++		return out, false
++	}
++	return out, true
++}
++
++// verify_replay — the in-run gate: the blessed log reproduces the live hashes.
++verify_replay :: proc(demo_name: string, catalogs: ^Catalogs, live_hashes: []u64) -> bool {
++	fails := make([dynamic]string, context.temp_allocator)
++	defer delete(fails)
++	replayed, ok := replay_hashes(log_path(demo_name), catalogs, u64(len(live_hashes)), &fails)
++	defer delete(replayed)
++	if !ok {
++		for f in fails {
++			fmt.printf("    - %s\n", f)
++		}
++		return false
++	}
++	if len(replayed) != len(live_hashes) {
++		fmt.printfln("    - replay length %d != manifest %d", len(replayed), len(live_hashes))
++		return false
++	}
++	for i in 0..<len(live_hashes) {
++		if replayed[i] != live_hashes[i] {
++			fmt.printfln("    - replay FIRST DIVERGENCE at tick %d: %016x != %016x",
++				i+1, replayed[i], live_hashes[i])
++			return false
++		}
++	}
++	return true
++}
++
++// run_replay — standalone: `harness replay <demo> <log.bin>`. Manifest-driven,
++// full length; the bit-for-bit ODN-11 check.
++run_replay :: proc(demo_name, lpath: string) -> i32 {
++	catalogs, cerr := load_catalogs()
++	if cerr != "" {
++		fmt.eprintfln("harness replay: %s", cerr)
++		return 2
++	}
++	man, okm := read_manifest(manifest_path(demo_name))
++	if !okm {
++		fmt.eprintfln("harness replay: no manifest for %s (nothing to verify against)", demo_name)
++		return 1
++	}
++	if man.ticks != i64(len(man.hashes)) {
++		fmt.eprintfln("harness replay: manifest corrupt — ticks header %d but %d hash lines",
++			man.ticks, len(man.hashes))
++		return 1
++	}
++	fails := make([dynamic]string, context.temp_allocator)
++	defer delete(fails)
++	replayed, ok := replay_hashes(lpath, &catalogs, u64(man.ticks), &fails)
++	defer delete(replayed)
++	if !ok {
++		for f in fails {
++			fmt.eprintfln("harness replay: %s", f)
++		}
++		return 1
++	}
++	for i in 0..<min(len(replayed), len(man.hashes)) {
++		if replayed[i] != man.hashes[i] {
++			fmt.eprintfln("harness replay: FIRST DIVERGENCE at tick %d: %016x != golden %016x",
++				i+1, replayed[i], man.hashes[i])
++			return 1
++		}
++	}
++	fmt.printf("harness replay: %d ticks verified against the manifest — bit-for-bit (ODN-11)\n", man.ticks)
++	return 0
++}
++
++// write_file — os.write_entire_file with the error checked-and-logged (never
++// dropped — §7.1).
++write_file :: proc(path: string, data: []u8) {
++	if err := os.write_entire_file(path, data); err != nil {
++		fmt.eprintfln("harness: write failed %s: %v", path, err)
++	}
++}

@@ -1,0 +1,82 @@
+[
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "take-over",
+    "title": "STILL PRESENT (r3): the wrong-person awaiting UPDATE executed by the handler is still the unguarded update_reference_call_status — the taken_over_at backstop is never wired (TOCTOU open)",
+    "location": "server/src/reference_checks/form_handler.gleam:1235-1257 (apply_wrong_person); server/src/reference_checks/sql/update_reference_call_status.sql:23-24",
+    "evidence": "form_handler.gleam:1235 `case row.taken_over_at != \"\" {` ... 1250-1257 `sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated)`; update_reference_call_status.sql:23-24 `WHERE id = $1` / `  AND status = $5::reference_call_status` (no taken_over_at clause); mark_awaiting_correction_wrong_person.sql:16 `  AND taken_over_at IS NULL` (guarded, but grep finds no src caller outside the generated module); race pin reference_checks_actions_integration_test.gleam:1743-1746 drives do_take_over then calls `rc_sql.mark_awaiting_correction_wrong_person(db, call)` DIRECTLY, not the POST route",
+    "detail": "The executed awaiting transition still guards only on status; the read-time check at 1235 leaves the TOCTOU window (take-over never changes status, so the guard still matches). The race pin is vacuous — neutralizing the backstop in the executed UPDATE turns nothing red.",
+    "recommended_fix": "Wire apply_wrong_person's awaiting branch to mark_awaiting_correction_wrong_person (0-row -> stand down); rewrite the race test to drive POST /reference/:token/wrong-person through handle_wrong_person_post so it bites when the backstop is removed."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "dead-code",
+    "title": "Orphan code: mark_awaiting_correction_wrong_person.sql + its generated Gleam function ship with no caller outside the vacuous test",
+    "location": "server/src/reference_checks/sql/mark_awaiting_correction_wrong_person.sql:1-17; server/src/reference_checks/sql.gleam:1891-1908",
+    "evidence": "grep of server/src: the only references are the generated module itself (sql.gleam:1891 `pub fn mark_awaiting_correction_wrong_person(`) and the integration test (reference_checks_actions_integration_test.gleam:1746 `rc_sql.mark_awaiting_correction_wrong_person(db, call)`); the wrong-person handler executes update_reference_call_status instead (form_handler.gleam:1250)",
+    "detail": "The dedicated guarded query and its generated code ship dead while the handler runs a different unguarded UPDATE. The direct-call test is the vacuous pin the r4 mandate names; dead security SQL misleads readers into believing the backstop is live.",
+    "recommended_fix": "Wire the handler to the guarded query (blocker finding) or delete the SQL file, its generated function, and the vacuous test."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "client-state",
+    "title": "STILL PRESENT (r3): N5 single-slot edit — the edit-open arms still unconditionally discard another row's in-progress typed trio",
+    "location": "client/src/client.gleam:3383-3402 (UserChoseRefcheckAction), 3471-3479 (UserEditedRefcheckTrio)",
+    "evidence": "client.gleam:3386-3391 `refcheck_edit: Some(prefill_refcheck_edit(model, call_id, RefcheckEditSubstitute))` and 3397-3402 `refcheck_edit: Some(prefill_refcheck_edit(model, call_id, RefcheckEditCorrect))` (no guard on an existing edit); 3472-3478 `Some(e) if e.call_id == call_id -> e` / `_ -> prefill_refcheck_edit(model, call_id, refcheck_edit_kind_for(model, call_id))`; the r3-rework scoped only the success-clear (edit_kept, ~3558-3561)",
+    "detail": "Success-clear is scoped to the acting call_id, but choosing an action on (or typing into) a second row still replaces the shared refcheck_edit — the typed trio is discarded with no carry reason documented.",
+    "recommended_fix": "Keep an in-progress edit when the choice/edit-open targets a different call_id (mirror edit_kept), or explicitly document the single-edit-surface tradeoff."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "STILL PRESENT (r3): N17 substitution's reference_call_id is still decoded and still discarded — neither the field nor the decode was dropped",
+    "location": "client/src/api/reference_checks_api.gleam:36-42 (action_result_decoder); client/src/client.gleam:3555",
+    "evidence": "reference_checks_api.gleam:37-41 `use id <- decode.optional_field(\"reference_call_id\", None, decode.optional(decode.string))` / `decode.success(option.unwrap(id, \"\"))`; client.gleam:3555 `Ok(_) -> {` (result value unused); the refetch is unconditional (refetch_refcheck_effect)",
+    "detail": "The substitution response's new row id is still decoded and immediately discarded; the module doc even claims it is carried. Dead plumbing remains — the r3-rework did neither option.",
+    "recommended_fix": "Drop reference_call_id from action_result_decoder (and the module doc claim), or consume it in the ApiReturnedRefcheckAction Ok arm."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "test-quality",
+    "title": "STILL PRESENT (r3): N18 no_em_dash_test's original for_each_copy branch still checks the same U+2014 character twice",
+    "location": "client/test/copy_test.gleam:356",
+    "evidence": "copy_test.gleam:356 `case string.contains(s, \"\\u{2014}\") || string.contains(s, \"—\") {` (unchanged original branch); the r3-rework's new loop at 363 uses the single check `case string.contains(s, \"\\u{2014}\") {`",
+    "detail": "The r3-rework cleaned only its new refcheck loop; the duplicate disjunct ('\\u{2014}' and '—' are the same character) remains at the exact cited r3 location.",
+    "recommended_fix": "Reduce the original branch to the single `string.contains(s, \"\\u{2014}\")` check."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "spec-drift",
+    "title": "STILL PRESENT (r3): N8/N9-spec drift — 2 of 3 spots remain (deleted SQL file still named; 'One additive column' still claimed)",
+    "location": "_bmad-output/implementation-artifacts/spec-rc4-3-row-actions.md:73,233",
+    "evidence": "spec-rc4-3-row-actions.md:73 `substitute_reference_call.sql` (reads the old row's slot/owner + verifies the pre-state guard)` — the file was deleted at 111e221 (substitute now lives in actions_handler.gleam do_substitute, idempotent CTE); :233 `effective name. One additive column, nothing destructive.` — the migration ships corrected_name AND corrected_at (20260812140000_reference_call_corrected_name.sql:13,18); epic-RC4-context.md:27-31 now states the W4 rule (fixed)",
+    "detail": "The spec still names a deleted query as a new PR file and still claims one additive column, contradicting its own line 80. The context artifact's W4 drift is fixed.",
+    "recommended_fix": "Point line 73 at the idempotent-CTE substitute implementation and change line 233 to 'two additive columns'."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "test-quality",
+    "title": "NEW: the prefill-claim panel tests inject the edit state directly — the A1 corrected-override and §8.2 substitute-empty prefill branches are unpinned",
+    "location": "client/test/components/reference_panel_test.gleam:1442-1478 (edit_trio_prefills_effective_contact_test), 1479-1518 (substitute_trio_never_prefills_terminal_contact_test)",
+    "evidence": "reference_panel_test.gleam:1457-1466 `edit: Some(model.RefcheckEdit(call_id: \"rc-1\", kind: model.RefcheckEditCorrect, name: \"Maeve Byrne\", email: \"maeve.byrne@example.ie\", ...))` — the renderer is handed the values its asserts then find; prefill_refcheck_edit (client.gleam:6713, private) is never exercised; the only handler-level prefill pin (client_test refcheck_trio_editing_updates_live_values_test) uses a call with NO corrected_* fields and the Correct kind",
+    "detail": "Both tests claim prefill behavior (corrected-override effective contact / substitute-empty trio) but only pin that the renderer echoes injected state; a regression to snapshot-prefill or terminal-contact-prefill passes green.",
+    "recommended_fix": "Drive the prefill through client.update (UserChoseRefcheckAction Correct/Substitute) or export and call prefill_refcheck_edit with corrected_* populated fixtures and assert the values."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "test-quality",
+    "title": "NEW: refcheck_action_strings() omits refcheck_action_correct_details — the RC4.3 em-dash pin list is incomplete",
+    "location": "client/test/copy_test.gleam:310-334 (refcheck_action_strings); client/src/copy.gleam:810",
+    "evidence": "copy.gleam:810 `pub const refcheck_action_correct_details: String = \"Correct details\"` is a new implementer-authored RC4.3 const; copy_test.gleam:310-334 lists every other new refcheck const/function but not this one; for_each_copy scans only toast/page arms, so consts are covered solely via refcheck_action_strings",
+    "detail": "The r3-rework's em-dash pin intentionally covers all implementer-authored RC4.3 strings; 'Correct details' slipped the list, so the ban silently stops covering it (dash-free today).",
+    "recommended_fix": "Add copy.refcheck_action_correct_details to refcheck_action_strings()."
+  }
+]

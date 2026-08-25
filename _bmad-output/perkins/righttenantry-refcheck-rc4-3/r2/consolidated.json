@@ -1,0 +1,424 @@
+{
+  "round": "r2",
+  "job": "righttenantry-refcheck-rc4-3",
+  "pr": 606,
+  "reviewed_sha": "0fdbf93cb56c010bcbee3dfe3c7268225d70e5eb",
+  "failed_layers": [],
+  "verdict": "NEEDS CHANGES",
+  "counts": {
+    "blocker": 1,
+    "warning": 8,
+    "note": 15,
+    "rejected": 4
+  },
+  "lens_input": {
+    "total_findings": 110,
+    "waves": {
+      "c1": 28,
+      "c2": 22,
+      "c3": 30,
+      "c4": 30
+    }
+  },
+  "fix_audit": {
+    "prior_total": 33,
+    "fixed": 29,
+    "still_present_or_partial": [
+      "N9",
+      "N10",
+      "N18",
+      "W3 (wrong fix)",
+      "W4 (resend leg)",
+      "W8 (partial)",
+      "N11",
+      "N13 (client leg)"
+    ],
+    "notes": "B1, B2, B3, W1, W2, W5, W6(partial), W7, W9, W10, W11, W12, N1-N7, N12, N14-N17 verified fixed in the worktree."
+  },
+  "findings": [
+    {
+      "source": [
+        "edge"
+      ],
+      "severity": "blocker",
+      "category": "take-over",
+      "title": "Failure paths ignore taken_over_at: a bounce/wrong-person on a landlord-handled row re-enters the correction loop or exhausts it, killing the \u00a78.6 late-completion transition and dead-ending the row",
+      "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql (WHERE status IN queued/contact_initiated, no taken_over_at); mark_awaiting_correction.sql:17-20; exhaust_reference_call.sql:29-30; complete_reference_call.sql (WHERE status='contact_initiated')",
+      "evidence": "find_reference_call_by_send_ref.sql: 'WHERE rc.status IN (\\'queued\\', \\'contact_initiated\\')' \u2014 no taken_over_at filter; mark_awaiting_correction.sql: 'WHERE id = $1 AND status IN (\\'queued\\', \\'contact_initiated\\')' \u2014 no taken_over_at; exhaust_reference_call.sql: 'WHERE id = $1 AND status IN (\\'queued\\', \\'contact_initiated\\')' \u2014 no taken_over_at; complete_reference_call.sql: 'WHERE id = $1 AND status = \\'contact_initiated\\''",
+      "detail": "Take-over writes only taken_over_at (status sticks), so a taken-over row stays queued/contact_initiated and matches the delivery-failure find. A redelivered pre-take-over bounce then yanks it to awaiting_correction (or, at correction_cycles>=1, exhausts it to unreachable + stamps referee_contact_invalid). The landlord's correction re-queues it queued+taken_over+token cleared \u2014 the sweep excludes taken-over rows forever, so the corrected contact is never re-invited and the form link is dead: permanent dead-end. The \u00a78.6 promise ('a late form completion still transitions') is broken because complete_reference_call requires contact_initiated.",
+      "recommended_fix": "Add AND taken_over_at IS NULL to find_reference_call_by_send_ref (and the wrong-person route's status guard), or stand down in apply_delivery_failure/apply_wrong_person when the matched row is taken over; pin with a taken-over-row bounce test.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind",
+        "edge",
+        "acceptance",
+        "security",
+        "architecture",
+        "codebase",
+        "tests"
+      ],
+      "severity": "warning",
+      "category": "exhaustion",
+      "title": "STILL PRESENT (r1 W3): stale-bounce gate is format-mixed \u2014 same-day redelivered pre-correction bounces still exhaust the corrected row and fabricate referee_contact_invalid",
+      "location": "server/src/reference_checks/webhooks.gleam:297-305 (compare); server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:40-42 (matched_send_at/corrected_at)",
+      "evidence": "webhooks.gleam: 'let genuine_failure = case row.matched_send_at { \"\" -> True; at -> case row.corrected_at { \"\" -> True; corrected -> string.compare(at, corrected) != order.Lt } }' \u2014 at is RFC3339 (sweep now_iso()/to_rfc3339: '2026-08-12T08:00:00Z'), corrected is Postgres ::text ('2026-08-12 08:05:00.123456+00'). 'T'(0x54) > ' '(0x20) at index 10: every same-day send compares >= the correction.",
+      "detail": "The comment 'ISO timestamps \u2014 lexical compare is chronological' is false across the two producers. A same-day redelivered pre-correction bounce (the common webhook-retry case) classifies as genuine and exhaust_reference_call terminalizes the corrected row as unreachable + stamps referee_contact_invalid \u2014 the exact W3 fabrication the gate was built to prevent. The pin tests only exercise cross-day fixtures (2026-08-01 vs run-date).",
+      "recommended_fix": "Normalize both sides to one format before comparing (e.g. compare the RFC3339 send stamp against corrected_at cast to text with to_char(...,'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), or compare epoch millis server-side), and pin with a SAME-DAY stale-bounce test.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "architecture",
+        "security",
+        "blind"
+      ],
+      "severity": "warning",
+      "category": "correction",
+      "title": "Correction clears the token but leaves form_opened_at + draft_answers live \u2014 the wrong person's draft answers rehydrate into the corrected referee's form and the co-nudge is suppressed forever",
+      "location": "server/src/reference_checks/sql/correct_reference_call.sql:32-34 (SET list); server/src/reference_checks/form_handler.gleam:162 (GET decodes row.draft_answers); server/src/reference_checks/sweep.gleam:706-715 (co_nudge gate)",
+      "evidence": "correct_reference_call.sql: 'form_token = NULL, form_token_expires_at = NULL' \u2014 no form_opened_at/draft_answers clearing; form_handler.gleam:162: 'let draft = questions.decode_draft(row.draft_answers)' (the corrected referee's fresh token rehydrates the stored draft); sweep.gleam co_nudge_should_fire: '!form_was_opened(row) && !has_draft_answers(row)'",
+      "detail": "The \u00a78.3 correction swaps the referee contact but the row still carries the previous person's form session: the corrected referee's fresh link rehydrates the wrong person's answers (data contamination of the reference evidence), and form_opened_at already set suppresses the A2 co-nudge for the whole corrected cycle.",
+      "recommended_fix": "Clear form_opened_at and draft_answers in correct_reference_call alongside the token (the B1 fix cleared the capability; the session state must die with it).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "security",
+        "codebase",
+        "tests"
+      ],
+      "severity": "warning",
+      "category": "late-response",
+      "title": "STILL PRESENT (r1 W8): late-response guard is partial \u2014 a stale ApiReturnedRefcheckAction still toasts on unrelated pages because application_detail survives navigation and the id-match guard never checks the route",
+      "location": "client/src/client.gleam:3522-3559 (handler), 6584-6596 (find_refcheck_call), 651 (detail reset only on entering the detail route)",
+      "evidence": "find_refcheck_call: 'case model.application_detail { Success(detail) -> ... }' \u2014 the guard searches the RETAINED detail; BrowserChangedUrl sets 'application_detail: Loading' only in the 'routes.ApplicationDetail(vid, aid) ->' branch; the success arm unconditionally 'add_toast(cleared, toast_copy, ToastSuccess)'.",
+      "detail": "The W8 fix dropped stale responses only when the call id is absent from the retained detail; navigating detail \u2192 dashboard keeps the old detail in the model, so a late action response still pops a success toast on the dashboard (the refetch is route-guarded, the toast is not). The comment claims the guard drops late answers \u2014 it only partially does.",
+      "recommended_fix": "Add a route check to ApiReturnedRefcheckAction (drop unless model.route is ApplicationDetail for the same vid/aid), or clear application_detail on every non-detail navigation.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "edge"
+      ],
+      "severity": "warning",
+      "category": "correction",
+      "title": "STILL PRESENT (r1 W4): the resend path's effective() lacks the correction_cycles gate \u2014 a cleared channel falls back to the proven-dead snapshot address on the referee's expired-link resend",
+      "location": "server/src/reference_checks/form_handler.gleam:716-724 (effective helper), 682-714 (send_invite_to_effective_contact)",
+      "evidence": "fn effective(corrected: Option(String), snapshot: Option(String)) -> Option(String) { case corrected, snapshot { Some(c), _ -> Some(c); None, s -> s } }' \u2014 no correction_cycles input; sweep.gleam:709-732 has the corrected-only rule the resend path does not share.",
+      "detail": "W4's corrected-replaces-snapshot rule landed in the sweep + find fallback but not in the expired-link resend: after a correction that cleared one channel, a referee-initiated resend re-contacts the snapshot address that already failed (AD-7 never-re-contact violated \u2014 potentially messaging the wrong person).",
+      "recommended_fix": "Thread correction_cycles into the resend send and apply the same corrected-only rule (cleared channel = no channel).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "codebase"
+      ],
+      "severity": "warning",
+      "category": "substitution",
+      "title": "Substitute edit-trio prefills the terminal referee's own contact and the server accepts an identical trio \u2014 one-click re-invite of an objected/unreachable person routes around the Art 21 hard stop and the exhaustion stamp",
+      "location": "client/src/client.gleam:6680-6695 (prefill_refcheck_edit); client/src/components/reference_panel.gleam:1000-1011 (view_edit_trio prefill); server/src/reference_checks/sql/substitute_reference_call.sql (INSERT has no contact-difference guard)",
+      "evidence": "prefill_refcheck_edit: '#(reference_panel.effective_name_value(call), reference_panel.effective_email_value(call), reference_panel.effective_phone_value(call))' \u2014 the terminal row's OWN contact; substitute_reference_call.sql INSERT 'SELECT application_id, ref_slot, owner_label, $3, NULLIF($4,''), NULLIF($5,''), now() FROM guard' \u2014 no comparison against the prior row's contact.",
+      "detail": "\u00a78.2 substitution is 'the landlord asks the applicant for ANOTHER referee'. The prefill + no server-side different-contact guard lets an unchanged save create a fresh invite to the person who objected (Art 21 hard stop) or to the contact the exhaustion mechanism just stamped referee_contact_invalid on \u2014 the signal is fabricated-proof only if the flow cannot re-target the same contact.",
+      "recommended_fix": "Require at least one contact field to differ from the substituted row (server-side), and/or do not prefill the substitute trio with the terminal row's own contact.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "acceptance"
+      ],
+      "severity": "warning",
+      "category": "take-over",
+      "title": "Queued rows never offer 'Take over manually' although A7/AC2 include queued in the take-over set and the server hook can_take_over is True for queued rows",
+      "location": "client/src/components/reference_panel.gleam:485-507 (overflow_actions), 570-595 (Queued row detail); server/src/application/application_detail_handler.gleam:1108 (can_take_over includes Queued); server/src/reference_checks/sql/take_over_reference_call.sql:29 (guard includes 'queued')",
+      "evidence": "overflow_actions: 'Queued -> [RefcheckStart, RefcheckSkip]' \u2014 no RefcheckTakeOver arm; compute_hooks_decoded: 'can_take_over: status == Queued || status == ContactInitiated || status == Unreachable'; take_over_reference_call.sql: 'AND status IN (\\'queued\\', \\'contact_initiated\\', \\'unreachable\\')'",
+      "detail": "\u00a77.7 offers take-over 'from unreachable or any waiting state'; the server guard + hook include queued, but the client only surfaces it on contact_initiated/unreachable. A landlord cannot take over a queued row from the UI even though the server accepts it \u2014 the hook value is dead for queued rows.",
+      "recommended_fix": "Offer the take-over entry for queued rows in the overflow menu (or restrict the server guard/hook to the surfaced states \u2014 one contract).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "edge"
+      ],
+      "severity": "warning",
+      "category": "substitution",
+      "title": "Substitute 'existing' idempotent no-op silently drops a NEW trio: re-substituting the history row with changed details returns 200 and discards the typed referee",
+      "location": "server/src/reference_checks/actions_handler.gleam:363-366 (how='existing' -> Ok(new_row.id), no trio write); server/src/reference_checks/sql/substitute_reference_call.sql:44-55 (any live non-terminal successor)",
+      "evidence": "actions_handler: '\"existing\" -> Ok(new_row.id)' \u2014 the typed trio is never written; substitute_reference_call.sql second SELECT: 'AND rc.status NOT IN (\\'form_completed\\', \\'unreachable\\', \\'refused\\', \\'objected\\', \\'manual_recorded\\', \\'failed\\', \\'completed\\', \\'partial\\')' \u2014 skipped/awaiting_correction successors also match.",
+      "detail": "The substitute affordance stays live on the terminal history row (can_substitute_referee is status-based). A landlord who re-substitutes it with corrected details gets 200 + the substituted toast while the new trio is silently discarded \u2014 the successor keeps the old contact. The idempotent contract must not swallow legitimate new input.",
+      "recommended_fix": "On how='existing' with a different trio, return a 409 with a 'referee already replaced' message (or update the successor); never silently drop the submitted trio.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "warning",
+      "category": "coverage-gate",
+      "title": "Advisory test gate: CONCERNS",
+      "location": "server/test/integration/reference_checks_actions_integration_test.gleam; client/test/components/reference_panel_test.gleam",
+      "evidence": "P0 guards pinned (B1 double-pin incl. negative control, substitute idempotence, take-over sweep exclusion, one-cycle guard, W3 both routes at handler level); P1/P2 gaps: no authz negatives (non-owning 404, archived 422), W9 route-reset unpinned, substitute fraud stamp untested, wrong-person notification unasserted, W4 sweep-level test missing, client ?slot= wire untested.",
+      "detail": "All P0 load-bearing guards are pinned, but several P1/P2 behaviours shipped without tests, so the gate sits at CONCERNS (P1 80-89%, overall >=80%).",
+      "recommended_fix": "Add the negative-authz tests, the W9 reset pin, and the substitute-stamp assertion to lift the gate.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "acceptance",
+        "edge"
+      ],
+      "severity": "note",
+      "category": "copy-verbatim",
+      "title": "STILL PRESENT (r1 N18): take-over confirm body uses 'they' not \u00a77.7's 'he'; the \u00a77.4 start confirm likewise uses 'them' not 'her' \u2014 verbatim guard not fully met",
+      "location": "client/src/copy.gleam:811-815 (refcheck_start_confirm), 826-831 (refcheck_take_over_confirm_body)",
+      "evidence": "refcheck_take_over_confirm_body: 'If they complete the form anyway, it still shows up here.' vs UX \u00a77.7 'If he completes the form anyway, it still shows up here.'; refcheck_start_confirm: 'We\\'ll email and text them the form now.' vs \u00a77.4 'We\\'ll email and text her the form now.'",
+      "detail": "The name interpolation fix landed (r1 N18 half), but the gender-neutral pronoun rewrites still deviate from the spec-verbatim copy in both inline confirms. Note-level per the r1 classification; the em-dash ban itself is clean.",
+      "recommended_fix": "Match the spec pronouns ('he'/'her') or get an explicit product ruling that gender-neutral supersedes verbatim.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "codebase",
+        "architecture",
+        "tests"
+      ],
+      "severity": "note",
+      "category": "spec-drift",
+      "title": "STILL PRESENT (r1 N8/N9): the PR's own spec artifacts drift from the code \u2014 item 6 omits corrected_name, item 5 claims ONE additive column while the migration ships two (corrected_name + corrected_at), the Files list names update_application_referee_trio.sql which does not exist, and the effective-contact rule documented is the pre-W4 one",
+      "location": "_bmad-output/implementation-artifacts/spec-rc4-3-row-actions.md:79-84, 187-189; supabase/migrations/20260812140000_reference_call_corrected_name.sql:1-18",
+      "evidence": "spec item 6: 'additive detail keys: taken_over_at, contact_name, contact_email, contact_phone, corrected_email, corrected_phone, correction_cycles' \u2014 no corrected_name; item 5: 'ONE additive column: corrected_name TEXT' \u2014 the migration adds corrected_at too; Files: 'sql/update_application_referee_trio.sql' \u2014 three per-slot files exist instead.",
+      "detail": "Doc-level drift: the spec enumeration, the column count, the file names, and the documented effective-contact rule no longer match the implemented code. Zero runtime impact; the migration header comment also documents the pre-W4 fallback rule.",
+      "recommended_fix": "Update the spec artifacts in a follow-up (they are the round's contract record).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "architecture",
+        "codebase"
+      ],
+      "severity": "note",
+      "category": "maintainability",
+      "title": "STILL PRESENT (r1 N10): the live-slot ON CONFLICT predicate is maintained in three SQL files (plus the migration's partial index) \u2014 byte-consistent today, drift-prone tomorrow",
+      "location": "server/src/reference_checks/sql/substitute_reference_call.sql:37-46; insert_reference_call_if_absent.sql:28-35; insert_reference_call_skipped.sql:24-29; supabase/migrations/20260731222000_create_reference_call.sql:138-140",
+      "evidence": "Three files carry the identical 'ON CONFLICT (application_id, ref_slot, owner_label) WHERE status NOT IN (\\'form_completed\\', \\'unreachable\\', \\'refused\\', \\'objected\\', \\'manual_recorded\\', \\'failed\\', \\'completed\\', \\'partial\\')' predicate, mirroring the migration's partial index.",
+      "detail": "The predicates are byte-identical today (verified), so no drift bug exists yet; a future status-list change must be made in four places. Maintainability note carried from r1.",
+      "recommended_fix": "Extract the live-slot insert into one query the substitute path reuses.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind",
+        "architecture",
+        "acceptance",
+        "tests"
+      ],
+      "severity": "note",
+      "category": "scope",
+      "title": "Per-slot 'Start this check now' re-arms EVERY queued row of the application \u2014 the slot filter is ignored and the re-arm also fires on the suppressed (declined) start path; the re-arm is effectively inert because queued rows are always already due",
+      "location": "server/src/reference_checks/trigger.gleam:527-540 (run_start_action); server/src/reference_checks/sql/rearm_queued_reference_calls.sql:9-13",
+      "evidence": "rearm_queued_reference_calls.sql: 'WHERE application_id = $1 AND status = \\'queued\\'::reference_call_status AND taken_over_at IS NULL' \u2014 no slot filter; run_start_action calls it unconditionally after run_create_checks_slot Ok(_) \u2014 including the Ok(Suppressed) declined path.",
+      "detail": "The W6 fix re-arms the whole application, contradicting the trigger's own comment ('the other slot is untouched') and AC1's per-reference promise; in v1 flows queued rows are always due, so the observable impact is nil. On the declined path it returns 200 started:true with a re-arm of any stray queued rows.",
+      "recommended_fix": "Scope the re-arm to the requested slot (or drop it and let the sweep's own tick govern), and skip it on the Suppressed outcome.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "edge",
+        "architecture",
+        "blind"
+      ],
+      "severity": "note",
+      "category": "client-state",
+      "title": "Single-slot refcheck_edit: a second action choice (or any action success) silently discards another row's in-progress typed trio values; Cancel resets the trio but never closes it",
+      "location": "client/src/model.gleam:375-376 (single Option(RefcheckEdit)); client/src/client.gleam:3454-3472, 3543-3544 (UserEditedRefcheckTrio / success clearing); client/src/components/reference_panel.gleam:960-1010 (always-open correction trio)",
+      "evidence": "UserChoseRefcheckAction Substitute arm: 'refcheck_edit: Some(prefill_refcheck_edit(...))' \u2014 overwrites any open edit; success arm: 'Model(..model, refcheck_edit: None, refcheck_confirm: None, ...)' \u2014 clears the OTHER row's edit; view_correction_surface renders the trio unconditionally.",
+      "detail": "The awaiting_correction trio is always open; typing corrections on it, then opening a substitute edit on another row (or any action completing), silently drops the typed-but-unsaved values. Recoverable by retyping, but silent data loss in the \u00a78.3 flow.",
+      "recommended_fix": "Key the edit state per call (or block the second edit while one is dirty with a confirm).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "edge"
+      ],
+      "severity": "note",
+      "category": "concurrency",
+      "title": "STILL PRESENT (r1 N11): a truly concurrent substitute double-submit can still return 409 instead of the documented 200 idempotent no-op",
+      "location": "server/src/reference_checks/sql/substitute_reference_call.sql:36-55",
+      "evidence": "The UNION ALL's second SELECT runs under the statement snapshot taken before the concurrent INSERT committed; under READ COMMITTED the 'NOT EXISTS (SELECT 1 FROM inserted)' + successor SELECT can miss the just-committed row, yielding 0 rows -> Error(NotSubstitutable) -> 409.",
+      "detail": "The serialized double-submit returns 200 how='existing' (pinned), but two simultaneous submits can still race to a 409. Note-level: the landlord retries and lands on the successor; no duplicate row or audit either way.",
+      "recommended_fix": "Accept the 409 as the race outcome and document it, or retry the successor SELECT once after a 0-row insert.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind",
+        "codebase"
+      ],
+      "severity": "note",
+      "category": "substitution",
+      "title": "Substitute idempotent no-op re-stamps creation fraud on the existing successor \u2014 a full overwrite that can wipe submission-time form_session in a narrow double-submit race",
+      "location": "server/src/reference_checks/actions_handler.gleam:414-421; server/src/reference_checks/sql/stamp_creation_fraud_signals.sql:15",
+      "evidence": "actions_handler: 'Ok(new_id) -> { trigger.stamp_creation_fraud_for(config, app_uuid, landlord_uuid, vacancy_uuid, [new_id]) ... }' \u2014 runs for how='existing' too; stamp_creation_fraud_signals.sql: 'SET fraud_signals = $2::jsonb' \u2014 full overwrite with form_session: null.",
+      "detail": "The 'existing' branch is documented as a pure no-op but still recomputes and overwrites the successor's fraud_signals (plus a fresh Twilio line-type lookup). If the successor already completed a submission between the two submits, its form_session in the denormalised column is wiped (the result document keeps its own copy).",
+      "recommended_fix": "Skip the fraud stamp on the how='existing' path.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage",
+      "title": "STILL PRESENT (r1 N13, partial): the client's ?slot= wire format for per-row start has no test (the server 400 branch is pinned)",
+      "location": "client/src/api/reference_checks_api.gleam:56-70; server/test/integration/reference_checks_actions_integration_test.gleam:1138 (start_with_invalid_slot_returns_400_test)",
+      "evidence": "start_check builds '?slot=' <> s \u2014 no client test asserts the URL; the server-side invalid-slot 400 is pinned.",
+      "detail": "The server leg is covered; the client wire format is a small gap.",
+      "recommended_fix": "Add a client test asserting the ?slot= query on the start request.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage",
+      "title": "Substitution creation-fraud stamping (r1 N1 fold) has no test \u2014 the successor row's fraud_signals are never asserted",
+      "location": "server/src/reference_checks/actions_handler.gleam:414-421; server/test/integration/reference_checks_actions_integration_test.gleam:668-811",
+      "evidence": "No assertion reads fraud_signals on the substituted successor in the substitute tests.",
+      "detail": "The stamp is best-effort (AD-10) but is the N1 fold's deliverable; a pin would keep it honest.",
+      "recommended_fix": "Assert the successor's fraud_signals are non-null after substitution.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage",
+      "title": "No authz negatives on the new action endpoints: non-owning-landlord 404 and archived-vacancy 422 are untested for take-over/correct/substitute",
+      "location": "server/src/reference_checks/actions_handler.gleam:547-573; server/test/integration/reference_checks_actions_integration_test.gleam:1166-1300",
+      "evidence": "The HTTP happy-path test passes a REAL owning landlord now (r1 N3 fixed); no test drives a foreign landlord's call id or an archived vacancy through the new arms.",
+      "detail": "The ownership precheck is verified present and correct; the negative legs are unexercised.",
+      "recommended_fix": "Add the two negative tests (foreign landlord 404; archived vacancy 422).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage",
+      "title": "Wrong-person exhaustion leg pins status + audit but not the in-app notification",
+      "location": "server/test/integration/reference_checks_actions_integration_test.gleam:1079-1136",
+      "evidence": "wrong_person_route_exhausts_corrected_row_test asserts status and audit count only; the webhook leg asserts notification_bodies.",
+      "detail": "The wrong-person notification path (notify_reference_correction_exhausted) is unasserted for the SSR route.",
+      "recommended_fix": "Assert the notification row/bodies in the wrong-person exhaustion test.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage",
+      "title": "W4 effective-contact rule (cleared channel stays absent after correction) has no sweep-level test, and the W9 route-change reset has no pin",
+      "location": "server/src/reference_checks/sweep.gleam:709-732; client/src/client.gleam:666-675; client/test/client_test.gleam",
+      "evidence": "No sweep test drives a corrected row with one cleared channel; no client test navigates away and asserts refcheck_confirm/edit/menu are None.",
+      "detail": "Both fixes are verified present in code; the pins are missing.",
+      "recommended_fix": "Add the two tests.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "copy",
+      "title": "Take-over confirm renders the referee's name twice (the \u00a77.7 body already interpolates it; a caption line repeats it)",
+      "location": "client/src/components/reference_panel.gleam:853-865",
+      "evidence": "view_take_over_confirm renders 'html.text(copy.refcheck_take_over_confirm_body(name))' AND 'html.text(name)' as a separate line.",
+      "detail": "Redundant duplicate name line inside the inline confirm; cosmetic.",
+      "recommended_fix": "Drop the extra caption line (or replace it with the \u00a77.7 contact chips the spec actually promises post-confirm).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "acceptance"
+      ],
+      "severity": "note",
+      "category": "a11y",
+      "title": "Overflow menu declares role=menu/menuitem but has no keyboard contract \u2014 no Escape-to-close, no arrow-key navigation",
+      "location": "client/src/components/reference_panel.gleam:692-760",
+      "evidence": "The menu div carries role/aria attributes and buttons; no keydown handling for Escape/arrows exists on the menu container.",
+      "detail": "Mouse + Tab operate the menu, but a declared menu without the WAI-ARIA keyboard contract is an a11y gap for keyboard users.",
+      "recommended_fix": "Add Escape-to-close and arrow navigation (or drop the menu roles).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "defensive",
+      "title": "update_trio's unknown-slot arm fabricates a bogus pog.UnexpectedArgumentCount error (unreachable \u2014 ref_slot comes from the DB enum)",
+      "location": "server/src/reference_checks/actions_handler.gleam:601-620",
+      "evidence": "'_ -> Error(pog.UnexpectedArgumentCount(expected: 5, got: 0))' \u2014 a squirrel-query-shaped error for a slot value that cannot occur.",
+      "detail": "Unreachable in practice; if it ever fired it would surface as a misleading 500 about query arity.",
+      "recommended_fix": "Use a plain Error/assert-style arm (or log-and-error) that names the slot.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "rejected",
+      "category": "verification",
+      "title": "REJECTED: exhaust_reference_call's WHERE lacks the documented correction_cycles>=1 gate",
+      "location": "server/src/reference_checks/sql/exhaust_reference_call.sql:28-29",
+      "evidence": "Both callers gate before calling: webhooks.gleam:288 'case row.correction_cycles >= 1' and form_handler.gleam:1217 'case row.correction_cycles >= 1'.",
+      "detail": "The gate lives at both call sites exactly as the SQL comment documents; no third caller exists. False positive.",
+      "recommended_fix": "N/A",
+      "verification": "rejected"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "rejected",
+      "category": "verification",
+      "title": "REJECTED: new payload negative control is vacuous",
+      "location": "server/test/integration/reference_detail_payload_integration_test.gleam",
+      "evidence": "The seed (seed_app_with_internal_rich_reference_call) inserts form_token = 'form_token_internal_sentinel'; the assertion 'string.contains(body, \"form_token_internal_sentinel\") |> should.be_false' is live against a stored sentinel.",
+      "detail": "The sentinel predates this PR (RC4.1 fixture), which is why it is absent from the diff \u2014 the control bites. False positive.",
+      "recommended_fix": "N/A",
+      "verification": "rejected"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "rejected",
+      "category": "verification",
+      "title": "REJECTED: archived-vacancy precheck fails open on query error",
+      "location": "server/src/reference_checks/actions_handler.gleam:559-567",
+      "evidence": "The identical posture exists in the pre-existing pattern at trigger.gleam:1041 ('Ok(Returned(_, [vacancy_row])) if vacancy_row.is_archived -> 422; _ -> action()'); ownership is verified upstream and the guarded UPDATEs remain the authority.",
+      "detail": "Mirrors the established codebase pattern reviewed in prior rounds; the archived check is a UX guardrail, not a security boundary. Not an incremental defect.",
+      "recommended_fix": "N/A",
+      "verification": "rejected"
+    },
+    {
+      "source": [
+        "security"
+      ],
+      "severity": "rejected",
+      "category": "verification",
+      "title": "REJECTED: do_correct/do_substitute discard update_trio's row count \u2014 a 0-row trio UPDATE still audits and 200s",
+      "location": "server/src/reference_checks/actions_handler.gleam:210-231, 368-386",
+      "evidence": "The trio UPDATE's WHERE is (application_id, vacancy_id) \u2014 the app is proven present by verify_application_in_vacancy precheck, and correct/substitute succeed only after their guarded row UPDATE within the same transaction (FK ensures the app row exists). 0 rows is unreachable short of a same-transaction app delete, which nothing performs.",
+      "detail": "The silent-0-row pattern W10 fixed is not reachable here. False positive.",
+      "recommended_fix": "N/A",
+      "verification": "rejected"
+    }
+  ]
+}

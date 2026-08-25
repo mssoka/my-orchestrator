@@ -1,0 +1,82 @@
+[
+ {
+  "source": "tests",
+  "severity": "warning",
+  "category": "coverage",
+  "title": "Exhaustion at the delivery-failure webhook (guard 4 route 1) is never tested through the handler — audit, stamp and in-app notification side effects unpinned",
+  "location": "server/src/reference_checks/webhooks.gleam:285-517 (apply_delivery_failure correction_cycles >= 1 branch; exhaust_row)",
+  "evidence": "webhooks.gleam:285 `case row.correction_cycles >= 1 { True -> exhaust_row(...) }`; exhaust_row calls exhaust_reference_call + stamp_referee_contact_invalid + write_exhaustion_audit(ReferenceCallCorrectionExhausted) + notify_reference_correction_exhausted. `grep -rn 'exhaust\\|correction_exhausted' server/test/` → only server/test/integration/reference_checks_actions_integration_test.gleam:491/565, which drive `rc_sql.exhaust_reference_call`/`rc_sql.stamp_referee_contact_invalid` DIRECTLY (the comment at :514 admits 'this is what the webhook/wrong-person call sites run'). server/test/integration/reference_checks_webhooks_integration_test.gleam seeds rows with correction_cycles default 0 (insert_reference_call sets no correction_cycles), so the handler branch is unreachable in that suite. No test asserts the `reference_call_correction_exhausted` audit row or the `reference_unreachable` in-app notification from exhaustion anywhere.",
+  "detail": "The SQL-level transition (queued/contact_initiated → unreachable) and the fraud stamp are pinned, and the first-failure boundary (→ awaiting_correction) is pinned via AC1/AC2. But the production path the webhook actually executes — the cycles gate, the guarded-terminal stand-down, and the audit + notification side effects of the RC4.3 live-exhaustion mechanism — is untested, so a regression in exhaust_row (wrong event, missing notification, stamp dropped) would pass CI. Guard 4 names both webhook routes AND the wrong-person route with 'audit + in-app notification'; neither side effect is asserted for either route.",
+  "recommended_fix": "Add a webhook integration test that seeds a contact_initiated row with correction_cycles = 1 and a matching delivered attempt, fires a signed svix bounce, and asserts: status → unreachable, terminal_reason set, audit event reference_call_correction_exhausted = 1, notification row reference_unreachable = 1, fraud_signals contains referee_contact_invalid."
+ },
+ {
+  "source": "tests",
+  "severity": "warning",
+  "category": "coverage",
+  "title": "Wrong-person exhaustion (guard 4 route 2) has NO test — only the first-failure path is pinned",
+  "location": "server/src/reference_checks/form_handler.gleam:1217-1320 (apply_wrong_person correction_cycles >= 1 branch; exhaust_wrong_person)",
+  "evidence": "form_handler.gleam:1217 `case row.correction_cycles >= 1 { True -> exhaust_wrong_person(config, row, id_uuid, token) ... }`; exhaust_wrong_person (:1262) terminalizes via exhaust_reference_call + stamps referee_contact_invalid + audits ReferenceCallCorrectionExhausted + notify_reference_correction_exhausted. server/test/integration/reference_exit_routes_integration_test.gleam:348 `wrong_person_transitions_to_awaiting_correction_and_stops_sends_test` and :760 `wrong_person_writes_reference_call_wrong_person_audit_test` cover only the correction_cycles = 0 path. `grep -rn 'correction_cycles' server/test/` → only reference_checks_actions_integration_test.gleam and application_detail_handler_test.gleam; no test ever seeds correction_cycles >= 1 and POSTs /wrong-person.",
+  "detail": "Guard 4 requires exhaustion at BOTH the delivery webhooks and the wrong-person route, with audit + in-app notification. The wrong-person route is the one a live referee actually uses (the form's identity question). The route's exhaustion branch — including the guarded-terminal stand-down (0-row → redirect back to /reference/<token>) and the wrong-person-specific result/attempts flow — is entirely unpinned. A regression making the second wrong-person response return to awaiting_correction (the pre-RC4.3 behaviour, silently re-asking the landlord to correct the same details) would pass every test in the suite.",
+  "recommended_fix": "Add an exit-routes integration test: seed a reference_call with correction_cycles = 1 (status queued or contact_initiated), POST /reference/<token>/wrong-person twice or once with the corrected row, and assert: status → unreachable, outcome → unreachable, fraud_signals referee_contact_invalid = true, audit event reference_call_correction_exhausted (plus reference_call_wrong_person on the first), and the reference_unreachable in-app notification. Also assert a second wrong-person POST on the exhausted row is a guarded no-op."
+ },
+ {
+  "source": "tests",
+  "severity": "note",
+  "category": "coverage",
+  "title": "?slot= per-row start: only the DB-level run_create_checks_slot is pinned; slot_query parsing and the invalid-slot 400 branch are untested",
+  "location": "server/src/reference_checks/trigger.gleam:428-530 (handle_start slot branch; slot_query)",
+  "evidence": "trigger.gleam:435 `let requested_slot = slot_query(req)`; :438 `case is_valid_slot(slot) { False -> ...400... }`. `grep -n 'slot=\\|slot_query' server/test/` → zero matches; the only per-slot test (reference_checks_actions_integration_test.gleam:740 `per_slot_start_creates_only_the_requested_slot_test`) calls `trigger.run_create_checks_slot` directly. By contrast the sibling handler guard IS pinned: trigger_integration_test.gleam:604 `handle_skip_unknown_slot_is_bad_request_test` drives handle_skip with 'fake_slot' → 400.",
+  "detail": "The core per-slot behaviour (only the requested slot created, other slot untouched) is pinned. Missing: the HTTP wiring the client menu actually calls — query-string parsing (a malformed query such as an unencoded pair or duplicate params), the invalid-slot 400 rejection, and a ?slot= request flowing through handle_start into run_create_checks_slot. The established suite pattern (skip's unknown-slot 400 test) shows exactly where the gap is.",
+  "recommended_fix": "Add a handler-level test: trigger.handle_start with a request whose query is 'slot=employer_ref' creates only that slot; with 'slot=bogus' returns 400 and creates nothing; with no query preserves the whole-application behaviour."
+ },
+ {
+  "source": "tests",
+  "severity": "note",
+  "category": "coverage",
+  "title": "Row-action shared prechecks: archived-vacancy 422 and take-over/substitute HTTP guards never exercised — only handle_correct's HTTP path is driven",
+  "location": "server/src/reference_checks/actions_handler.gleam:536-580 (run_action_with_prechecks); 55-133 (handle_take_over); 286-355 (handle_substitute)",
+  "evidence": "All three actions go through run_action_with_prechecks (ownership → archived-vacancy 422). Only `correct_validation_and_cross_application_guards_test` (actions_integration_test.gleam:445) drives an HTTP handler (handle_correct); take-over and substitute are tested only via do_take_over/do_substitute, bypassing parse_uuids (400), the ownership precheck and the archived branch. `grep -n 'archived' server/test/integration/reference_checks_actions_integration_test.gleam` → 0. The archived-422 branch IS pinned for the trigger path (trigger_integration_test.gleam:587 handle_start_archived_vacancy_is_unavailable_test), but that is a different call site.",
+  "detail": "The shared precheck logic is partially covered by analogy (trigger's handle_start 422 test + correct's HTTP cross-application 404), and the guarded transitions themselves are well pinned. But none of the three RC4.3 endpoints is tested against an archived vacancy (422), and take-over/substitute never exercise their HTTP entry points (400 on malformed ids, 404 for a non-owning landlord). Low risk given the shared plumbing, but the 422 branch of this specific new function is dead in the suite.",
+  "recommended_fix": "Extend the actions integration suite: seed_archived_vacancy + do_take_over/do_correct/do_substitute → 422 (via the handler path), and one take-over cross-tenant HTTP test asserting 404."
+ },
+ {
+  "source": "tests",
+  "severity": "note",
+  "category": "coverage",
+  "title": "Sweep effective-name coalesce (corrected ?? snapshot) has no assertion — a corrected name never verified to flow into the invite",
+  "location": "server/src/reference_checks/sql/sweep_due_reference_calls.sql:31 (COALESCE(NULLIF(rc.corrected_name, ''), rc.contact_name) AS contact_name)",
+  "evidence": "The RC4.3 change makes the sweep return the EFFECTIVE referee name so invite/reminder copy addresses the corrected name (§8.3). server/test/integration/reference_checks_sweep_integration_test.gleam seeds rows with only contact_name (lines 94, 597) — `grep -n 'corrected' server/test/integration/reference_checks_sweep_integration_test.gleam` → 0. taken_over_row_is_excluded_from_the_sweep_test (actions suite) calls sweep_due_reference_calls but asserts only row count, never the contact_name value.",
+  "detail": "The behaviour change is real (invites addressed by name after a correction) and entirely unpinned: no test seeds corrected_name and asserts sweep_due_reference_calls returns the corrected value, nor that a NULL/'' corrected_name falls back to the snapshot. Small, but it is the exact column the corrected trio must flow into.",
+  "recommended_fix": "In the sweep suite, seed a queued row with contact_name 'A' and corrected_name 'B' and assert sweep_due_reference_calls returns 'B' as contact_name; seed corrected_name = '' (or NULL) and assert the snapshot 'A' is returned."
+ },
+ {
+  "source": "tests",
+  "severity": "note",
+  "category": "coverage",
+  "title": "Detail payload integration test does not assert the RC4.3 wire fields (taken_over_at / corrected_* / correction_cycles / contact trio)",
+  "location": "server/src/application/application_detail_handler.gleam:1193-1218 (encode_reference_call RC4.3 additions); server/test/integration/reference_detail_payload_integration_test.gleam",
+  "evidence": "The RC4.2 precedent IS asserted on the wire (`detail_payload_carries_form_opened_and_submitted_test` asserts \"form_opened_at\" and \"submitted_at\" substrings); `grep -n 'taken_over_at\\|corrected_name\\|correction_cycles\\|corrected_email' server/test/integration/reference_detail_payload_integration_test.gleam` → 0. The unit encoder test (server/test/application/application_detail_handler_test.gleam:456-463) constructs ListReferenceCallsForDetailRow with the new fields and the pre-terminal test asserts form_opened_at/submitted_at but none of the new RC4.3 keys.",
+  "detail": "The panel renders take-over chips and corrected values from these payload fields; the encoder unit tests prove the fields decode/encode without crashing, but no test pins that a taken-over or corrected row actually carries taken_over_at / corrected_name / correction_cycles on the wire. The client side consumes these (c3), so a dropped key would surface only in the SPA.",
+  "recommended_fix": "Add a payload test seeding a row with taken_over_at, corrected_name/email/phone and correction_cycles = 1 and assert the exact JSON keys on the detail wire, mirroring the form_opened_at/submitted_at precedent."
+ },
+ {
+  "source": "tests",
+  "severity": "note",
+  "category": "coverage",
+  "title": "schema_migration_test amended_columns_present_test not extended with the RC4.3 additive columns (corrected_name, correction_cycles)",
+  "location": "server/test/reference_checks/schema_migration_test.gleam:74-80 (amended_columns_present_test)",
+  "evidence": "amended_columns_present_test asserts [\"draft_answers\", \"taken_over_at\", \"corrected_email\", \"corrected_phone\"] — the RC4.3-additive columns from the corrected_name migration are absent. The migration itself is replayed by test-db-reset and the integration tests do exercise correction_cycles (actions suite), so the column is not unprotected in practice; the DDL-text pin is simply incomplete for the two new columns.",
+  "detail": "Low impact: integration tests fail loudly if the columns are missing from the migrated schema. But this test exists precisely to pin additive DDL, and the RC4.3 additions (corrected_name, correction_cycles) were not added to it, so a future refactor that drops the pin's completeness check is blind to them.",
+  "recommended_fix": "Extend the amended_columns_present_test list with \"corrected_name\" and \"correction_cycles\"."
+ },
+ {
+  "source": "tests",
+  "severity": "warning",
+  "category": "coverage-gate",
+  "title": "Advisory test gate: CONCERNS",
+  "location": "server/test/integration/reference_checks_actions_integration_test.gleam (13 tests); reference_checks_webhooks_integration_test.gleam; reference_exit_routes_integration_test.gleam; reference_detail_payload_integration_test.gleam",
+  "evidence": "P0 = 100%: every critical happy path and core error is pinned — take-over guarded states + clock clear + sweep exclusion + late completion (5 tests), correct one-cycle + snapshot immutability + re-arm + audit + second-correct 409 (4 tests), substitute new row + old/new ids in audit + double-submit idempotency (exactly 2 rows, 1 audit) + refused 409 (2 tests), exhaustion SQL transition + live-states guard (2 tests), per-slot start (1 test). P1 < 90%: the two guard-4 exhaustion ROUTES (webhook handler branch, wrong-person route) have no handler-level test — audit event reference_call_correction_exhausted and the reference_unreachable in-app notification are asserted nowhere (0/2 side-effect chains tested). Claimed counts spot-check: client 540 exact, shared 110 exact, server total 1988 = 1476 unit + 512 integration (measured 514 in server/test/integration — within tolerance).",
+  "detail": "Coverage is strong (est. P1 ~85-88%, overall > 90% of changed lines exercised) but the two live-exhaustion call sites — the load-bearing guard of this story — are only pinned at the SQL layer, with their audit/notification side effects untested. Because the SQL-level transition and the first-failure boundary are both pinned, this does not drop the gate to FAIL, but the story's headline mechanism (rc3-7 going LIVE) deserves route-level pins.",
+  "recommended_fix": "Add the two exhaustion handler tests (webhook bounce on a correction_cycles = 1 row; second wrong-person POST) asserting status/outcome/terminal_reason, the referee_contact_invalid stamp, audit reference_call_correction_exhausted, and the reference_unreachable notification. That closes P1 to 100% and raises the gate to PASS."
+ }
+]

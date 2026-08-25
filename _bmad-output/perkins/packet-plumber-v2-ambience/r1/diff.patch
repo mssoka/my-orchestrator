@@ -1,0 +1,2118 @@
+diff --git a/.gitignore b/.gitignore
+index 132bf2c8..43091fce 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -41,3 +41,7 @@ _bmad-output/**/review/_charter-*.md
+ # Debug symbol dirs — never commit
+ *.dSYM/
+ .pp-settings.bin
++
++# The v2-ambience build intermediate (tools/build_ambience_loop.py writes
++# it next to the committed OGG; the committed artifact is the OGG only)
++assets/audio/ambience_loop.wav
+diff --git a/_bmad-output/field-notes/packet-plumber-v2-ambience.md b/_bmad-output/field-notes/packet-plumber-v2-ambience.md
+new file mode 100644
+index 00000000..17e9280f
+--- /dev/null
++++ b/_bmad-output/field-notes/packet-plumber-v2-ambience.md
+@@ -0,0 +1,21 @@
++# packet-plumber-v2-ambience — field notes
++
++- v2-ambience (2026-08-23): a seamless music-bed loop on a track with NO
++  beat-lockable phrase boundary = crossfade, never a hard cut — the
++  reproducible recipe: pick the highest spectral-similarity window
++  (8s-window cosine sim 0.76), then blend-at-end (last X=7.75s of the loop
++  = equal-power crossfade of tail into the file's own head); the residual
++  one-sample wrap discontinuity measures 0.048 peak. The WAV-intermediate
++  (24MB) must be .gitignored the same PR as the transform script that
++  writes it.
++- v2-ambience (2026-08-23): the T1 audio golden family (audio.dem /
++  audio_throttle / audio_spawn) pins the consumer's cosmetic-rng draw
++  pattern — a music bed stays golden-proof by adding ZERO draws and keeping
++  its duck envelope entirely in the device-gated flush/update half (the
++  harness mirror is a zero Audio; it never calls bed_update).
++- v2-ambience (2026-08-23): r1 review-swarm folds worth keeping — the duck
++  must be a RELATIVE reduction capped at 1.0 (a master tuned below the duck
++  level would otherwise be RAISED by ducking); mute must reset the duck
++  envelope (a pre-mute duck otherwise finishes recovery in silence and
++  unmute lands mid-ramp); a pure mirror flag (bed_paused) beside the
++  device-gated raylib pause/resume makes the mute branch headless-testable.
+diff --git a/_bmad-output/implementation-artifacts/spec-ambience-bed.md b/_bmad-output/implementation-artifacts/spec-ambience-bed.md
+new file mode 100644
+index 00000000..4a541d95
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-ambience-bed.md
+@@ -0,0 +1,206 @@
++---
++title: 'v2 ambience bed — the Suno music loop in the game'
++type: 'feature'
++created: '2026-08-23'
++status: 'in-review'
++review_loop_iteration: 0
++baseline_commit: '339e173'
++context:
++  - '{project-root}/assets/audio/README.md'
++  - '{project-root}/app/audio/audio.odin'
++---
++
++## Intent
++
++**Problem:** The user's Suno ambient track ("Warm Analog Drift", the flow-state
++bed candidate, fun-test verdict IN) never plays in-game — the game has only
++#81's event SFX (stings/clicks/chimes), no music bed.
++
++**Approach:** Ship a compressed seamless loop of the track as a raylib-streamed
++music bed, layered BESIDE the #81 event system (never into it): a new
++`assets/audio/ambience_loop.ogg` slot + bed playback/ducking/level logic in
++`app/audio/audio.odin`, driven per-frame from `app/main.odin`. Presentation-only:
++the sim, T1/T2 goldens and replay hashes cannot move.
++
++## Boundaries & Constraints
++
++**Always:**
++- Audio stays presentation-only: no Run_State writes, no sim-rng draws, no
++  new cosmetic-rng draws (the #81 consumer's draw pattern is T1-pinned —
++  the bed adds ZERO draws).
++- No audio-device failure may crash headless/CI: the bed loads and plays ONLY
++  when `device_on` (the #81 silent-fallback precedent); a missing/undecodable
++  OGG silently means "no bed".
++- Respect #81's event system: layer beside it (append-only event tags remain
++  the SFX path; `consumer_consume`/`Pending`/`audio_flush` unchanged in shape).
++- Mute (M key + settings row) must mute the bed too; captions stay live.
++- The 35MB vault WAV is never committed — only the ~0.9MB OGG + a documented,
++  reproducible transform script.
++- Loop points, ducking approach, and asset sizes must land in the PR body.
++
++**Ask First:**
++- None known — the briefing delegates loop length (~2min), ducking style, and
++  pause behavior to the minion ("minion's call", "minion picks, document").
++
++**Never:**
++- No golden re-bless, no .dem/.log.bin edits, no sim/catalog changes.
++- No sidechain/audio-graph machinery beyond raylib's API (raylib has no
++  sidechain — the duck is an app-side volume envelope; a conservative fixed
++  level would also be acceptable but the envelope is strictly better).
++- No per-state tracks / intensity layers (the vault README's mood plan is a
++  stage-3 candidate — record it, don't build it).
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| HAPPY_PATH | device on, OGG present | bed plays from boot, loops seamlessly (125.6s), events duck it | n/a |
++| NO_DEVICE (headless/CI) | `IsAudioDeviceReady()` false | no bed, no crash — SFX/captions unchanged | `bed_on = false`, all bed procs early-return |
++| MISSING_OGG | file absent or frameCount 0 | game runs exactly as before (SFX + placeholders only) | silent skip, stderr note |
++| PAUSED (5.3) | mode Paused | bed keeps playing at `MUSIC_VOLUME × MUSIC_PAUSE_LEVEL` (soft-lower, NOT a cut) | n/a |
++| GAME_OVER | mode Game_Over | bed keeps playing at full bed level (calm) | n/a |
++| MUTE | M key / settings row | bed pauses in place (resume continues where it left off) | n/a |
++| EVENT_BURST | flush stages ≥1 play | duck envelope: deep duck `MUSIC_DUCK_SECS`, then ramp back over `MUSIC_DUCK_RAMP_SECS` | n/a |
++
++## Code Map
++
++- `app/audio/audio.odin` -- the #81 raudio layer (package `audio`): `Audio`
++  struct (app-owned, no globals), `audio_init`/`audio_destroy`, pure
++  `consumer_consume` (T1-pinned draw pattern — DO NOT add draws),
++  `audio_flush` (device+gated playing half — the duck trigger hooks here),
++  `toggle_mute`. The bed adds fields + new procs in this file.
++- `app/main.odin` -- the frame loop: `au.audio_flush(&app.audio)` call site
++  (~line 480) is the bed-update anchor (per-frame, outside the run_live gate);
++  `app.mode == .Paused` is the level input. No title screen exists (Boot
++  collapses into Run) — the bed starts with the run by construction.
++- `app/audio/audio_test.odin` -- pure unit tests (no device, no raylib calls):
++  the new bed envelope/level helpers get tests here, mirroring the existing
++  pure-half discipline.
++- `harness/run.odin` -- the T1 consumer mirror (zero `au.Audio` +
++  `consumer_init`): must stay untouched — the bed must not leak into it.
++- `assets/audio/README.md` -- the drop-in contract doc; gains the bed slot
++  row, loop-point/crossfade documentation, sizes, provenance + transform.
++- `tools/build_ambience_loop.py` -- NEW: the reproducible vault→OGG transform
++  (loop trim + crossfade + encode), documented in the README.
++- Vault: `/Users/moses/code/_local-refs/audio/Warm Analog Drift.wav` +
++  its README (provenance + the mood-plan contract) — read-only, never edited.
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `tools/build_ambience_loop.py` -- NEW transform script (moved from the
++    scratch analysis; vault WAV → `assets/audio/ambience_loop.ogg`, ~125.6s)
++    -- reproducibility contract: loop points + crossfade are DATA in the script.
++- [x] `assets/audio/ambience_loop.ogg` -- the committed runtime asset
++    (vorbis 48kHz stereo, ~0.9MB) -- built from the vault WAV, never the WAV
++    itself (24MB intermediate stays untracked).
++- [x] `app/audio/audio.odin` -- add the bed: `MUSIC_BED_PATH`,
++    `MUSIC_VOLUME` (the named master volume tunable), `MUSIC_DUCK_VOLUME`,
++    `MUSIC_DUCK_SECS`, `MUSIC_DUCK_RAMP_SECS`, `MUSIC_PAUSE_LEVEL`; `bed`
++    field + `bed_on`/`bed_paused`/duck-envelope state; load+play in
++    `audio_init` (device-gated, with a boot fade-in via the recovery
++    ramp), `StopMusicStream`+`UnloadMusicStream` in `audio_destroy`; new
++    procs `bed_update` (stream update + envelope + `SetMusicVolume`),
++    `bed_envelope_step` (pure envelope transitions), `bed_duck_trigger`
++    (called from `audio_flush` via the `pending_any_plays` helper),
++    `bed_duck_multiplier` (pure, capped at 1.0 — the duck never raises the
++    bed), `bed_level` (pure: master × pause × duck), `pending_any_plays`;
++    `toggle_mute` pauses/resumes the bed in place + resets the envelope
++    (the `bed_paused` mirror flag is headless-assertable) -- SFX behavior
++    unchanged.
++- [x] `app/main.odin` -- one call per frame next to the audio flush:
++    `au.bed_update(&app.audio, f32(min(f64(rl.GetFrameTime()), 0.25)), app.mode == .Paused)`
++    -- the bed runs in every mode; Paused soft-lowers it.
++- [x] `app/audio/audio_test.odin` -- pure tests: envelope shape (no-duck =
++    1.0, ducked = `MUSIC_DUCK_VOLUME/MUSIC_VOLUME`, ramp returns to 1.0),
++    paused+ducked level (the relative-duck pin), paused level math,
++    trigger state transitions (incl. retrigger while deep + mid-recovery),
++    the duck-never-raises cap, the mute mirror flag + envelope reset, the
++    bed-off no-op -- the flush integration is device-gated (harness
++    consumer mirror + manual verification, documented in the PR, per the
++    existing flush-half discipline).
++- [x] `assets/audio/README.md` -- the bed slot row + loop documentation
++    (A=41.4s, B=167.0s window, 7.75s equal-power cosine crossfade at the
++    wrap, measured wrap discontinuity 0.048 peak) + provenance/transform +
++    the stage-3 mood-plan note.
++
++**Acceptance Criteria:**
++- Given a device with the OGG present, when the app runs, then the bed plays
++  from boot and wraps with no audible seam (125.6s loop; crossfade
++  construction, documented loop points).
++- Given wire clicks/spawn chimes/crisis stings firing, when the bed is
++  playing, then the SFX stay clearly audible over the ducked bed (duck
++  envelope: `MUSIC_DUCK_SECS` deep + `MUSIC_DUCK_RAMP_SECS` recovery).
++- Given Pause (5.3), when the sim freezes, then the bed keeps playing low
++  (soft-lower to `MUSIC_PAUSE_LEVEL`, never a hard cut); Game_Over keeps it
++  calm; Mute pauses it in place.
++- Given `MUSIC_VOLUME`, when the user tunes it by ear, then the named
++  constant is the single master-level knob (documented in README + code).
++- Given the full golden suite, when `tools/harness.sh run` runs, then every
++  T1/T2/replay check passes byte-identical — zero golden diffs (the bed adds
++  no consumer draws; `harness/run.odin` untouched).
++- Given headless/CI (no audio device), when the app/harness builds and runs,
++  then no crash, no new failure: `bed_on` guard mirrors the #81 silent
++  fallback; `audio_test`/`app`/`harness` suites stay green.
++- Given the PR, when the reviewer reads it, then the body carries: loop
++  points (A=41.4s/B=167.0s, 7.75s crossfade), the ducking approach (app-side
++  envelope — raylib has no sidechain), and asset sizes (OGG 0.91MB,
++  vault WAV 35MB untracked + transform path).
++
++## Spec Change Log
++
++- 2026-08-23 (step-04 r1 review swarm, 3 findings folded): proc-name drift
++  — the spec named the pure envelope helper `bed_level_multiplier`; the
++  code ships `bed_duck_multiplier` (+ `bed_envelope_step`, `bed_level`,
++  `pending_any_plays`, and the `bed_paused` mirror flag, none in the
++  original Tasks). Amended the Tasks list to the real names + the r1 fold
++  additions (duck cap, mute envelope reset, boot fade, build-script
++  guards/sha256). Known-bad state avoided: a reviewer diffing spec against
++  code finds procs that don't exist. KEEP: the duck is a RELATIVE
++  reduction capped at 1.0 (never raises the bed); the envelope stays in
++  the device-gated half; the bed adds zero consumer draws.
++
++## Design Notes
++
++**Why the bed adds zero consumer draws:** the T1 audio golden pins the
++consumer's cosmetic-rng draw pattern (audio.dem/audio_throttle/audio_spawn).
++The bed plays a stream and reads nothing from events; ducking is triggered in
++`audio_flush` (the playing half — never run in the harness mirror). So the
++consumer code is untouched and every golden stays byte-identical.
++
++**The loop construction (measured, not guessed):** the 184s track has no
++beat-lockable phrase boundary (waveform cross-correlation peaks ≤ 0.25), but
++the harmonic content at 41.4s and 167.0s matches closely (8s-window spectral
++cosine sim 0.76 — the same pad/chord). The 125.6s loop is the window
++[41.4s, 167.0s] with its last 7.75s replaced by an equal-power (cosine)
++crossfade of the window tail (fading out) into the window head (fading in).
++At the wrap, the residual discontinuity measures 0.048 peak amplitude —
++inaudible on an ambient bed (the alternative — a hard cut — would click at
++0.4+ amplitude).
++
++**Pause behavior choice:** soft-lower (0.6×) rather than soft-mute — pause-
++and-plan is doctrine; the calm bed stays present but recedes, and the
++difference from a hard cut is unambiguous. Mute is the hard stop (paused in
++place; resumes where it left off — unlike the one-shot StopSound path).
++
++## Verification
++
++**Commands:**
++- `odin test app/audio -out:bin/audio-test` -- expected: green incl. the new
++  bed envelope tests (pure, no device).
++- `tools/harness.sh run` -- expected: all T1/T2/replay checks pass; the
++  blessed manifests byte-identical (zero golden diff).
++- `tools/ci-local.sh --fast` + `tools/ci-local.sh --mac` (or the equivalent
++  gates: lint, `odin test core` + `odin test app` ×3 + render/input/audio/
++  harness tests, `odin build app -out:app.bin`, harness run, palcheck,
++  drift-check, preview-check, motion-pixel, PP_DEBUG build, stats-check,
++  input-parity) -- expected: all green.
++- `tools/build_ambience_loop.py` re-run -- expected: reproducible OGG
++  (documented loop points/crossfade; byte-identical output on the same
++  source + toolchain).
++- `ffprobe assets/audio/ambience_loop.ogg` -- expected: vorbis 48kHz stereo,
++  duration 125.6s, size ~0.9MB.
++
++**Manual checks (if no CLI):**
++- `odin run app` with sound on: bed starts at boot; Pause lowers it; M mutes
++  (bed pauses in place); events duck the bed audibly.
+diff --git a/_bmad-output/reviews/v2-ambience/blind-hunter.txt b/_bmad-output/reviews/v2-ambience/blind-hunter.txt
+new file mode 100644
+index 00000000..c01476cc
+--- /dev/null
++++ b/_bmad-output/reviews/v2-ambience/blind-hunter.txt
+@@ -0,0 +1,198 @@
++
++ ... (14 earlier lines, ctrl+o to expand)
++ -rw-r--r--@ 1 moses  staff    7920 23 Aug 07:52 README.md
++ ----
++ 339e173 Merge pull request #84 from solarity-services/packet-plumber-v2-spawn-feel
++ 9c0f11e v2 spawn feel: terminal-spawn telegraph + reveal (no instant pops) + estate r1 folds
++ dcde763 Merge pull request #83 from solarity-services/packet-plumber-v2-scale-depth
++
++ Took 0.0s
++
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && sed -n '1,60p'
++ app/audio/audio.odin
++
++ ... (55 earlier lines, ctrl+o to expand)
++ // throttle: wire draws are player-paced (a drag gesture each — a few per
++ // second at most) and growth spawns run at the 80-tick cadence (4 s).
++ ARRIVAL_MIN_GAP_TICKS :: u64(2)
++
++ // CAPTION_DWELL_TICKS — the on-screen caption lives 40 ticks (2 s at 20 Hz).
++
++ Took 0.0s
++
++
++ Thinking...
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && grep -n
++ "audio_init\|device_on\|IsAudioDeviceReady\|load_bed\|bed_update\|bed_duck_trigger\|toggle_mute\|audio_fl
++ ush" app/audio/audio.odin | head -40
++
++ ... (21 earlier lines, ctrl+o to expand)
++ 425:load_bed :: proc() -> rl.Music {
++ 441:// bed_update — the per-frame bed driver: stream update + the duck envelope
++ 447:bed_update :: proc(a: ^Audio, dt: f32, paused: bool) {
++ 473:// bed_duck_trigger — start a duck (event sounds just played). A retrigger
++ 475:bed_duck_trigger :: proc(a: ^Audio) {
++
++ Took 0.0s
++
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && sed -n '225,300p'
++ app/audio/audio.odin
++
++ ... (71 earlier lines, ctrl+o to expand)
++          a.draws += 1
++          a.crisis_draws += 1
++          a.pending.crisis_plays += 1
++          a.pending.crisis_variant = variant
++          set_caption(&a.caption, crisis_caption(&a.caption, cat, e), e.tick, true)
++
++ Took 0.0s
++
++
++ Thinking...
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && sed -n '200,224p'
++ app/audio/audio.odin
++
++ ... (20 earlier lines, ctrl+o to expand)
++       path_buf: [64]u8
++       a.arrival[i] = load_variant(
++          fmt.bprintf(path_buf[:], "assets/audio/arrival_%02d.ogg", i + 1),
++          .Arrival, i,
++       )
++
++ Took 0.0s
++
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && sed -n '349,395p'
++ app/audio/audio.odin
++
++ ... (42 earlier lines, ctrl+o to expand)
++ // ALL FOUR playable families — a mid-chime flip must not leave the spawn
++ // chime ringing past the flip). Captions stay live while muted (the a11y
++ // contract — a muted game is not a silent game).
++ toggle_mute :: proc(a: ^Audio) -> bool {
++    a.muted = !a.muted
++
++ Took 0.0s
++
++
++ Thinking...
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && git diff .gitignore &&
++ echo ---- && git diff --stat
++
++ ... (14 earlier lines, ctrl+o to expand)
++  app/audio/audio.odin      | 186 ++++++++++++++++++++++++++++++++++++++++++++--
++  app/audio/audio_test.odin |  75 +++++++++++++++++++
++  app/main.odin             |  10 +++
++  assets/audio/README.md    |  59 ++++++++++++++-
++  5 files changed, 328 insertions(+), 6 deletions(-)
++
++ Took 0.0s
++
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && sed -n '60,110p'
++ app/audio/audio.odin && echo ==== && sed -n '414,500p' app/audio/audio.odin
++
++ ... (134 earlier lines, ctrl+o to expand)
++       progress := 1.0 - a.bed_recover_t / MUSIC_DUCK_RAMP_SECS
++       return duck_ratio + (1.0 - duck_ratio) * progress
++    }
++    return 1.0
++ }
++
++ Took 0.0s
++
++
++ Thinking...
++
++ Findings:
++
++ 1. Duck envelope inverts when the master tunable is set below the duck volume. bed_duck_multiplier
++    computes duck_ratio := MUSIC_DUCK_VOLUME / MUSIC_VOLUME with no upper clamp. If the user tunes
++    MUSIC_VOLUME to, say, 0.10 (below MUSIC_DUCK_VOLUME 0.12), the ratio is 1.2 and event sounds make the
++    bed louder (0.10 × 1.2 = 0.12) than its normal level (0.10) — the opposite of a duck. The bed_level
++    comment explicitly blesses this state ("even when the master sits below it") while the constant's own
++    doc promises the bed is lowered under events.
++
++ 2. The "absolute duck floor" claim is false under pause. bed_level applies the pause soft-lower after the
++    duck ratio, so paused+ducked = 0.40 × 0.6 × 0.3 = 0.072 — not the documented "absolute" 0.12. The
++    constant comment ("the absolute bed level while ducked"), the bed_level comment ("the duck floor stays
++    MUSIC_DUCK_VOLUME absolute"), and the README ("ducks the bed to MUSIC_DUCK_VOLUME (0.12)") all
++    describe an invariant the code does not implement in the paused state.
++
++ 3. The envelope math leans on raylib's undocumented SetMusicVolume clamp. The bed_level comment relies on
++    "SetMusicVolume clamps at 1.0 in raylib" as the safety mechanism for the multiplier, instead of
++    clamping in the pure function the unit tests can actually drive — so the tuning edge cases (finding 1)
++    are masked by a version-dependent C-library behavior rather than fixed or tested.
++
++ 4. Missing tests for the two documented edge states. The new suite covers unducked, unducked+paused,
++    ducked, and ramp shape — but never ducked+paused (the 0.072 state where the floor claim breaks) and
++    never MUSIC_VOLUME ≤ MUSIC_DUCK_VOLUME (the inverted-duck state both constants' comments discuss).
++
++ 5. audio_destroy unloads the music stream without rl.StopMusicStream first. The raylib teardown idiom is
++    stop-then-unload; unloading a live streamed context (decode context + audio-thread buffer) while it is
++    playing is riskier than the one-shot path, and this diff introduces it without the stop.
++
++ 6. bed_update has no muted early-out. While muted the stream is paused, yet rl.UpdateMusicStream +
++    rl.SetMusicVolume still run every frame (decode work on a paused stream, per-frame volume churn), and
++    bed_envelope_step keeps advancing — a pre-mute duck finishes its recovery in silence, so unmute can
++    land mid-ramp with no envelope state preserved deliberately.
++
++ 7. The duck trigger re-encodes the flush's play-family list. audio_flush's four-way || condition
++    (crisis_plays || arrival_plays || wire_plays || spawn_plays) duplicates knowledge of every play
++    family; adding a fifth family to the flush later silently misses the duck unless this OR-list is
++    updated in lockstep. No shared "any plays staged" helper or per-family hook exists.
++
++ 8. No fade/ramp on bed start, mute, and unmute. The loop seam is crossfaded and the duck has ramps, but
++    boot starts the bed at full volume instantly and M flips pause/resume instantly — asymmetric with the
++    envelope discipline everywhere else in this change, and a start/stop pop risk.
++
++ 9. The build script has no failure guards and no verifiable output contract. A missing vault WAV is a raw
++    wave.open traceback; a non-s16 (24-bit) source would be silently misparsed (np.frombuffer(...,
++    np.int16) with no sampwidth assertion); a missing ffmpeg is a raw FileNotFoundError traceback. And no
++    checksum/hash of the committed OGG is recorded anywhere, so the "reproducible" claim and the binary
++    itself cannot be cross-checked post-hoc by a reviewer or CI.
++
++ 10. The 24 MB intermediate WAV is guarded only by a print statement. The script says "delete after
++     encode; never commit" but nothing in the payload enforces it — no ignore rule appears in the diff and
++     the script doesn't clean up after itself — so a later git add assets/audio/ can sweep the 24 MB file
++     into the repo.
++
++ 11. Spec/code drift on the proc name. The spec's Tasks section names the pure helper
++     bed_level_multiplier; the code ships bed_duck_multiplier (plus bed_level and bed_envelope_step,
++     neither of which appears in the spec's Tasks list or Code Map) — a reviewer diffing spec against code
++     finds a proc that does not exist.
++
++ 12. bed_envelope_step lacks the bed_on gate its sibling has. bed_duck_trigger guards on bed_on, but the
++     step proc does not — test_bed_off_is_silent_noop passes only because a zeroed Audio has zero envelope
++     state, not because the proc enforces it. Any future path that flips bed_on off with nonzero envelope
++     state (e.g., a reload path) would keep the envelope stepping silently.
++
++ 13. The retrigger-while-deep branch is untested. bed_duck_trigger's documented behavior has two halves
++     ("a retrigger while ducked extends the deep phase; a trigger mid-recovery re-deeps"), but
++     test_bed_duck_retrigger only exercises the mid-recovery branch — the deep-phase reset branch (and its
++     boundary, retrigger at exactly bed_duck_t == 0) is unverified.
++
++ 14. The change set as presented ships a binary asset with no accompanying verification. The payload
++     asserts the OGG is 913,706 bytes and 125.6 s, but contains no checksum and no gate that the committed
++     file matches the documented loop numbers — so the README's measured-claim table (0.048 peak
++     discontinuity, 0.76 similarity, crossfade geometry) is unverifiable against the actual committed
++     bytes by anyone without the vault file.
++
++───────────────────────────────────────────────────────────────────────────────────────────────────────────
++
++───────────────────────────────────────────────────────────────────────────────────────────────────────────
++~/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience (packet-plumber-v2-ambience)
++↑33k ↓30k R188k CH95.4% $0.013 6.2%/1.0M (auto)                          (deepseek) deepseek-v4-flash • max
++🔌 MCP: 2 servers enabled
+\ No newline at end of file
+diff --git a/_bmad-output/reviews/v2-ambience/edge-case.txt b/_bmad-output/reviews/v2-ambience/edge-case.txt
+new file mode 100644
+index 00000000..f259f2f6
+--- /dev/null
++++ b/_bmad-output/reviews/v2-ambience/edge-case.txt
+@@ -0,0 +1,75 @@
++╭─ packet-plumber/packet-plumber-v2-ambience on packet-plumber-v2-ambience ✗
++╰─❯ pi --model deepseek-v4-flash --thinking max                                      (1787468005.5s) 07:53
++
++───────────────────────────────────────────────────────────────────────────────────────────────────────────
++ Package Updates Available
++ Package updates are available. Run pi update --extensions
++ Packages:
++ - @juicesharp/rpiv-web-tools
++───────────────────────────────────────────────────────────────────────────────────────────────────────────
++
++
++ Read /Users/moses/code/.agents/skills/bmad-build/review-prompts/edge-case-hunter.md completely and follow
++ it as your review instructions. Review content: read the diff at
++ /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience/_bmad-output/reviews/v2-ambience/
++ review-diff.txt — it is the ONLY content in scope (code diff + new files). Do not invoke any skill. If
++ the instruction file is unreadable, report that exact failure and stop. Return only the review result.
++
++
++ Thinking...
++
++
++ read ~/code/.agents/skills/bmad-build/review-prompts/edge-case-hunter.md
++
++
++
++ $ wc -l
++ /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience/_bmad-output/reviews/v2-ambience/
++ review-diff.txt
++
++ 680
++ /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience/_bmad-output/reviews/v2-ambience/
++ review-diff.txt
++
++ Took 0.0s
++
++
++ Thinking...
++
++
++ read
++ ~/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience/_bmad-output/reviews/v2-ambience/review-diff
++ .txt
++
++
++ Thinking...
++
++ [{"location":"app/audio/audio.odin:378-386","trigger_condition":"Event flush while muted retriggers duck;
++ envelope advances while bed paused","guard_snippet":"if a.muted { return } // add to bed_duck_trigger and
++ skip bed_envelope_step while muted","potential_consequence":"Bed resumes mid-duck after unmute — audible
++ volume dip"},{"location":"app/audio/audio.odin:497-511","trigger_condition":"Paused and ducked bed level
++ drops below MUSIC_DUCK_VOLUME floor","guard_snippet":"if paused && bed_duck_multiplier(a) < 1.0 { level =
++ max(level, MUSIC_DUCK_VOLUME) }","potential_consequence":"Paused+ducked bed falls to 0.072, below the
++ documented 0.12 floor"},{"location":"tools/build_ambience_loop.py:42-44","trigger_condition":"Vault
++ source WAV missing or unreadable at SRC","guard_snippet":"if not os.path.exists(SRC): raise
++ SystemExit('vault WAV missing - see README')","potential_consequence":"Uncaught FileNotFoundError
++ traceback instead of actionable
++ note"},{"location":"tools/build_ambience_loop.py:46","trigger_condition":"Source sample width other than
++ 16-bit (samp_w != 2)","guard_snippet":"assert samp_w == 2, 'source must be PCM
++ s16le'","potential_consequence":"int16 decode misreads bytes — silent garbage
++ loop"},{"location":"tools/build_ambience_loop.py:47","trigger_condition":"Source channel count outside
++ 1..2 (mono branch else)","guard_snippet":"assert n_ch in (1, 2), 'source must be mono or
++ stereo'","potential_consequence":"Multi-channel frames written as stereo — invalid
++ WAV"},{"location":"tools/build_ambience_loop.py:49-53","trigger_condition":"Source shorter than loop
++ window B or crossfade x","guard_snippet":"assert b <= n_frames and L > x, 'source too short for
++ window'","potential_consequence":"Silent truncated loop violates 125.6s contract, or broadcast
++ crash"},{"location":"tools/build_ambience_loop.py:78-83","trigger_condition":"ffmpeg hangs or stalls — no
++ timeout on subprocess","guard_snippet":"subprocess.run([...], check=True,
++ timeout=600)","potential_consequence":"Build blocks indefinitely with no abort path"}]
++
++───────────────────────────────────────────────────────────────────────────────────────────────────────────
++
++───────────────────────────────────────────────────────────────────────────────────────────────────────────
++~/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience (packet-plumber-v2-ambience)
++↑15k ↓24k R47k CH63.1% $0.009 5.2%/1.0M (auto)                           (deepseek) deepseek-v4-flash • max
++🔌 MCP: 2 servers enabled
+\ No newline at end of file
+diff --git a/_bmad-output/reviews/v2-ambience/review-diff.txt b/_bmad-output/reviews/v2-ambience/review-diff.txt
+new file mode 100644
+index 00000000..ac2bbf64
+--- /dev/null
++++ b/_bmad-output/reviews/v2-ambience/review-diff.txt
+@@ -0,0 +1,680 @@
++# Diff vs baseline 339e173 (tracked)
++diff --git a/app/audio/audio.odin b/app/audio/audio.odin
++index 9d62e12..1d56b84 100644
++--- a/app/audio/audio.odin
+++++ b/app/audio/audio.odin
++@@ -101,6 +101,42 @@ SPAWN_TAU_TICK  :: f32(0.06)
++ SYNTH_SAMPLE_RATE :: 22050
++ SYNTH_RAMP_SAMPLES :: 110       // int(0.005 s * 22050 Hz) — a constant (110.25 truncates)
++ 
+++// --- v2-ambience: the music bed (the Suno ambient loop) ---------------------
+++//
+++// A single streamed music bed layered BESIDE the #81 event system: the
+++// sim and the consumer's T1-pinned draw pattern are untouched (the bed
+++// reads no events, draws nothing from the cosmetic rng). The asset is
+++// assets/audio/ambience_loop.ogg — a 125.6 s seamless loop (window
+++// [41.4 s, 167.0 s] of the vault source with a 7.75 s equal-power crossfade
+++// at the wrap; see assets/audio/README.md for the full contract + the
+++// reproducible transform in tools/build_ambience_loop.py).
+++
+++// MUSIC_BED_PATH — the committed bed asset (raylib streams OGG via
+++// stb_vorbis; missing/undecodable = no bed, exactly like an empty SFX
+++// slot — the silent-fallback precedent).
+++MUSIC_BED_PATH :: "assets/audio/ambience_loop.ogg"
+++
+++// MUSIC_VOLUME — the named MASTER music-volume tunable (the user tunes by
+++// ear; documented in assets/audio/README.md). Applied on top of the pause
+++// soft-lower and the event duck.
+++MUSIC_VOLUME :: f32(0.40)
+++
+++// MUSIC_DUCK_VOLUME — the absolute bed level while ducked under event
+++// sounds (wire clicks + spawn chimes + crisis stings stay clearly audible
+++// over it — the #81 contract). raylib has no sidechain support, so the
+++// duck is an app-side volume envelope (see bed_update).
+++MUSIC_DUCK_VOLUME :: f32(0.12)
+++
+++// MUSIC_DUCK_SECS — how long a duck stays deep after an event burst.
+++MUSIC_DUCK_SECS :: f32(0.30)
+++// MUSIC_DUCK_RAMP_SECS — the recovery ramp back to the normal bed level.
+++MUSIC_DUCK_RAMP_SECS :: f32(0.60)
+++
+++// MUSIC_PAUSE_LEVEL — the 5.3 pause soft-lower factor: the bed keeps
+++// playing calm and low while the sim is frozen (keep-playing-low is the
+++// documented choice — never a hard cut; Mute is the hard stop).
+++MUSIC_PAUSE_LEVEL :: f32(0.6)
+++
++ // Caption — one on-screen alert caption (the a11y contract). `text` is a
++ // view into `buf` (buf lives in Audio — the view stays stable). `crisis`
++ // marks a crisis caption for the priority rule (W1): an unexpired crisis
++@@ -147,6 +183,18 @@ Audio :: struct {
++ 	arrival:          [ARRIVAL_VARIANTS]rl.Sound,
++ 	wire:             [WIRE_VARIANTS]rl.Sound,   // v2-sound
++ 	spawn:            [SPAWN_VARIANTS]rl.Sound,  // v2-sound
+++	// v2-ambience: the music bed — the streamed ambient loop + its
+++	// app-owned duck envelope. `bed_on` mirrors the device/asset gate (no
+++	// device or an undecodable file = no bed, silently). The envelope is
+++	// wall-time driven (bed_update gets the frame dt from the app — never
+++	// the sim tick; the harness mirror never calls it, so the T1 golden
+++	// cannot move). Session-level state: it survives run restarts (only
+++	// Mute stops it) — a fresh run must not restart the bed.
+++	bed:            rl.Music,
+++	bed_on:         bool,
+++	bed_duck_t:     f32, // remaining deep-duck time (seconds)
+++	bed_recovering: bool, // the duck is ramping back to the normal level
+++	bed_recover_t:  f32, // remaining recovery-ramp time (seconds)
++ }
++ 
++ // audio_init — open the raudio device and load every variant slot (real
++@@ -191,6 +239,18 @@ audio_init :: proc(a: ^Audio) {
++ 			.Spawn, i,
++ 		)
++ 	}
+++	// v2-ambience: the music bed — load the streamed loop + start it. Same
+++	// silent-fallback rule as the SFX slots: no device or an undecodable
+++	// file leaves the bed off (the game plays exactly as before). The bed
+++	// starts with the run (Boot collapses into Run — there is no title
+++	// screen) and keeps playing across run restarts (session-level).
+++	a.bed = load_bed()
+++	if a.bed.frameCount > 0 {
+++		a.bed_on = true
+++		a.bed.looping = true // the seamless loop wraps forever
+++		rl.PlayMusicStream(a.bed)
+++		rl.SetMusicVolume(a.bed, bed_level(a, false))
+++	}
++ }
++ 
++ // audio_destroy — unload the sounds + close the device (app teardown).
++@@ -200,6 +260,7 @@ audio_destroy :: proc(a: ^Audio) {
++ 		for s in a.arrival { rl.UnloadSound(s) }
++ 		for s in a.wire { rl.UnloadSound(s) }
++ 		for s in a.spawn { rl.UnloadSound(s) }
+++		if a.bed_on { rl.UnloadMusicStream(a.bed) } // v2-ambience
++ 	}
++ 	rl.CloseAudioDevice()
++ }
++@@ -312,6 +373,16 @@ audio_flush :: proc(a: ^Audio) {
++ 		v := (a.pending.spawn_variant + i32(k)) % SPAWN_VARIANTS
++ 		rl.PlaySound(a.spawn[v])
++ 	}
+++	// v2-ambience: any staged event play ducks the bed (wire clicks, spawn
+++	// chimes, crisis stings, arrival ticks all sit on top of the music —
+++	// the duck keeps #81 clearly audible over it). A silent flush never
+++	// ducks. The envelope itself runs in bed_update (wall time); this is
+++	// just the trigger. The harness mirror never reaches this proc (device
+++	// gate), so the golden cannot move.
+++	if a.pending.crisis_plays > 0 || a.pending.arrival_plays > 0 ||
+++		a.pending.wire_plays > 0 || a.pending.spawn_plays > 0 {
+++		bed_duck_trigger(a)
+++	}
++ 	a.pending = {}
++ }
++ 
++@@ -322,11 +393,19 @@ audio_flush :: proc(a: ^Audio) {
++ // contract — a muted game is not a silent game).
++ toggle_mute :: proc(a: ^Audio) -> bool {
++ 	a.muted = !a.muted
++-	if a.muted && a.device_on {
++-		for s in a.crisis { rl.StopSound(s) }
++-		for s in a.arrival { rl.StopSound(s) }
++-		for s in a.wire { rl.StopSound(s) }
++-		for s in a.spawn { rl.StopSound(s) }
+++	if a.device_on {
+++		if a.muted {
+++			for s in a.crisis { rl.StopSound(s) }
+++			for s in a.arrival { rl.StopSound(s) }
+++			for s in a.wire { rl.StopSound(s) }
+++			for s in a.spawn { rl.StopSound(s) }
+++			// v2-ambience: the bed PAUSES in place on mute (the one-shots
+++			// stop; the stream resumes where it left off — a restart would
+++			// be a jarring seam, and a seamless loop has no need of one).
+++			if a.bed_on { rl.PauseMusicStream(a.bed) }
+++		} else if a.bed_on {
+++			rl.ResumeMusicStream(a.bed)
+++		}
++ 	}
++ 	return a.muted
++ }
++@@ -335,6 +414,100 @@ is_muted :: proc(a: ^Audio) -> bool {
++ 	return a.muted
++ }
++ 
+++// --- v2-ambience: the bed driver + the duck envelope -----------------------
+++
+++// load_bed — the one streamed music slot. Zero Music on any failure
+++// (missing file, failed decode — frameCount 0) so bed_on stays false and
+++// the game runs exactly as before (the #81 silent-fallback precedent). One
+++// stderr note on failure (like the settings loader's) — a missing bed must
+++// never be a silent mystery (the 2026-08-23 report was literally "i dont
+++// hear the ambient song").
+++load_bed :: proc() -> rl.Music {
+++	if rl.FileExists(MUSIC_BED_PATH) {
+++		m := rl.LoadMusicStream(MUSIC_BED_PATH)
+++		if m.frameCount > 0 {
+++			return m
+++		}
+++		// W6 (r1): a real file that FAILED to decode is unloaded before
+++		// the silent skip — no orphaned stream buffer.
+++		rl.UnloadMusicStream(m)
+++		fmt.eprintfln("audio: music bed %s failed to decode — no bed", MUSIC_BED_PATH)
+++	} else {
+++		fmt.eprintfln("audio: music bed %s missing — no bed (run tools/build_ambience_loop.py)", MUSIC_BED_PATH)
+++	}
+++	return {}
+++}
+++
+++// bed_update — the per-frame bed driver: stream update + the duck envelope
+++// + the effective volume. Called EVERY frame in every mode (Run / Paused /
+++// Game_Over) — the bed is session-level; only Mute stops it. `paused` is
+++// the 5.3 sim-freeze flag: the bed keeps playing low (soft-lower, never a
+++// hard cut). Wall-time based (presentation-only — the sim never sees it,
+++// and the harness mirror never calls this proc).
+++bed_update :: proc(a: ^Audio, dt: f32, paused: bool) {
+++	if !a.bed_on {
+++		return
+++	}
+++	rl.UpdateMusicStream(a.bed)
+++	bed_envelope_step(a, dt)
+++	rl.SetMusicVolume(a.bed, bed_level(a, paused))
+++}
+++
+++// bed_envelope_step — advance the duck envelope by dt (PURE — the unit
+++// tests drive it headless): deep phase -> recovery ramp -> normal.
+++bed_envelope_step :: proc(a: ^Audio, dt: f32) {
+++	if a.bed_duck_t > 0 {
+++		a.bed_duck_t = max(0, a.bed_duck_t - dt)
+++		if a.bed_duck_t == 0 {
+++			a.bed_recovering = true
+++			a.bed_recover_t = MUSIC_DUCK_RAMP_SECS
+++		}
+++	} else if a.bed_recovering {
+++		a.bed_recover_t = max(0, a.bed_recover_t - dt)
+++		if a.bed_recover_t == 0 {
+++			a.bed_recovering = false
+++		}
+++	}
+++}
+++
+++// bed_duck_trigger — start a duck (event sounds just played). A retrigger
+++// while ducked extends the deep phase; a trigger mid-recovery re-deeps.
+++bed_duck_trigger :: proc(a: ^Audio) {
+++	if !a.bed_on {
+++		return
+++	}
+++	a.bed_duck_t = MUSIC_DUCK_SECS
+++	a.bed_recovering = false
+++}
+++
+++// bed_duck_multiplier — the current duck multiplier (1.0 = no duck). Deep
+++// duck while the deep phase runs; linear ramp back over the recovery
+++// window. PURE — unit-tested headless.
+++bed_duck_multiplier :: proc(a: ^Audio) -> f32 {
+++	duck_ratio := MUSIC_DUCK_VOLUME / MUSIC_VOLUME
+++	if a.bed_duck_t > 0 {
+++		return duck_ratio
+++	}
+++	if a.bed_recovering {
+++		progress := 1.0 - a.bed_recover_t / MUSIC_DUCK_RAMP_SECS
+++		return duck_ratio + (1.0 - duck_ratio) * progress
+++	}
+++	return 1.0
+++}
+++
+++// bed_level — the effective bed volume: the master tunable × the pause
+++// soft-lower × the duck multiplier. SetMusicVolume clamps at 1.0 in raylib
+++// (the duck floor stays MUSIC_DUCK_VOLUME absolute even when the master
+++// sits below it — the tunable scales the normal level, never the duck's
+++// audibility floor). PURE — unit-tested headless.
+++bed_level :: proc(a: ^Audio, paused: bool) -> f32 {
+++	level := MUSIC_VOLUME
+++	if paused {
+++		level *= MUSIC_PAUSE_LEVEL
+++	}
+++	return level * bed_duck_multiplier(a)
+++}
+++
++ // caption_live — the current caption for tick (expired = none).
++ caption_live :: proc(a: ^Audio, tick: u64) -> (string, bool) {
++ 	if !a.caption.live || tick > a.caption.until_tick {
++diff --git a/app/audio/audio_test.odin b/app/audio/audio_test.odin
++index 9121af5..d595353 100644
++--- a/app/audio/audio_test.odin
+++++ b/app/audio/audio_test.odin
++@@ -233,3 +233,65 @@ test_consumer_spawn_draw :: proc(t: ^testing.T) {
++ 	testing.expectf(t, a.crisis_draws == 0 && a.arrival_draws == 0 && a.wire_draws == 0,
++ 		"spawn draw must not move the other kinds' counters")
++ }
+++
+++// --- v2-ambience: the music bed's pure envelope (no device, no raylib) -----
+++
+++@(test)
+++test_bed_envelope_shape :: proc(t: ^testing.T) {
+++	a: Audio
+++	a.bed_on = true // a loaded bed (the trigger + envelope gate on it)
+++	// unducked: multiplier 1.0; the level is the master tunable, the pause
+++	// soft-lower stacks on it.
+++	testing.expectf(t, bed_duck_multiplier(&a) == 1.0, "unducked multiplier %v, want 1.0", bed_duck_multiplier(&a))
+++	testing.expectf(t, abs(bed_level(&a, false) - MUSIC_VOLUME) < 0.0001,
+++		"unducked level %v, want %v", bed_level(&a, false), MUSIC_VOLUME)
+++	testing.expectf(t, abs(bed_level(&a, true) - MUSIC_VOLUME * MUSIC_PAUSE_LEVEL) < 0.0001,
+++		"paused level %v, want %v", bed_level(&a, true), MUSIC_VOLUME * MUSIC_PAUSE_LEVEL)
+++	// a trigger ducks immediately (deep phase).
+++	bed_duck_trigger(&a)
+++	testing.expectf(t, a.bed_duck_t == MUSIC_DUCK_SECS, "duck_t %v, want %v", a.bed_duck_t, MUSIC_DUCK_SECS)
+++	testing.expectf(t, abs(bed_duck_multiplier(&a) - MUSIC_DUCK_VOLUME / MUSIC_VOLUME) < 0.0001,
+++		"ducked multiplier %v", bed_duck_multiplier(&a))
+++	// stepping past the deep phase starts the recovery ramp (still at the
+++	// duck floor, then strictly between the floor and 1.0, then 1.0).
+++	bed_envelope_step(&a, MUSIC_DUCK_SECS)
+++	testing.expectf(t, a.bed_duck_t == 0 && a.bed_recovering,
+++		"deep phase did not end (duck_t %v, rec %v)", a.bed_duck_t, a.bed_recovering)
+++	testing.expectf(t, abs(bed_duck_multiplier(&a) - MUSIC_DUCK_VOLUME / MUSIC_VOLUME) < 0.0001,
+++		"ramp-start multiplier %v", bed_duck_multiplier(&a))
+++	bed_envelope_step(&a, MUSIC_DUCK_RAMP_SECS / 2)
+++	m := bed_duck_multiplier(&a)
+++	testing.expectf(t, m > MUSIC_DUCK_VOLUME / MUSIC_VOLUME && m < 1.0,
+++		"mid-ramp multiplier %v, want between the floor and 1.0", m)
+++	bed_envelope_step(&a, MUSIC_DUCK_RAMP_SECS)
+++	testing.expectf(t, !a.bed_recovering && bed_duck_multiplier(&a) == 1.0,
+++		"ramp did not end (rec %v, mult %v)", a.bed_recovering, bed_duck_multiplier(&a))
+++}
+++
+++@(test)
+++test_bed_duck_retrigger :: proc(t: ^testing.T) {
+++	a: Audio
+++	a.bed_on = true
+++	bed_duck_trigger(&a)
+++	bed_envelope_step(&a, MUSIC_DUCK_SECS) // deep phase done, ramp started
+++	testing.expectf(t, a.bed_recovering, "recovery not started")
+++	// a retrigger mid-recovery re-deeps (extends the duck, restarts the
+++	// envelope — an event burst must hold the bed down the whole time).
+++	bed_duck_trigger(&a)
+++	testing.expectf(t, a.bed_duck_t == MUSIC_DUCK_SECS && !a.bed_recovering,
+++		"retrigger did not re-deep (duck_t %v, rec %v)", a.bed_duck_t, a.bed_recovering)
+++	testing.expectf(t, abs(bed_duck_multiplier(&a) - MUSIC_DUCK_VOLUME / MUSIC_VOLUME) < 0.0001,
+++		"re-deep multiplier %v", bed_duck_multiplier(&a))
+++}
+++
+++@(test)
+++test_bed_off_is_silent_noop :: proc(t: ^testing.T) {
+++	// a zero Audio (no device — the headless/CI mirror) must not crash the
+++	// envelope procs and must stay at the full multiplier.
+++	a: Audio
+++	bed_envelope_step(&a, 0.1)
+++	testing.expectf(t, !a.bed_recovering && a.bed_duck_t == 0, "zero Audio envelope moved")
+++	testing.expectf(t, bed_duck_multiplier(&a) == 1.0, "zero Audio multiplier %v", bed_duck_multiplier(&a))
+++	bed_duck_trigger(&a) // bed_on false: no-op, no crash
+++	testing.expectf(t, a.bed_duck_t == 0, "trigger moved a bed_off Audio")
+++}
++diff --git a/app/main.odin b/app/main.odin
++index ca1928a..3250c4a 100644
++--- a/app/main.odin
+++++ b/app/main.odin
++@@ -491,6 +491,16 @@ main :: proc() {
++ 			au.audio_flush(&app.audio)
++ 		}
++ 
+++		// v2-ambience: the music bed — per-frame stream update + the duck
+++		// envelope + the mode level (Paused soft-lowers the bed; Run and
+++		// Game_Over keep the calm level — the bed is session-level, only
+++		// Mute stops it). Presentation-only: the sim never sees this, and
+++		// the harness mirror never calls it, so the T1 golden cannot move.
+++		// The dt clamp mirrors the sim's (a long stall must not jump the
+++		// envelope). Headless/CI with no audio device: bed_on stays false
+++		// and this is a no-op — the #81 silent-fallback precedent.
+++		au.bed_update(&app.audio, f32(min(f64(rl.GetFrameTime()), 0.25)), app.mode == .Paused)
+++
++ 		// v2-noc: the NOC feed — fold the NEW event slice once per frame (the
++ 		// audio-consumer mark discipline; the buffer is never drained — the
++ 		// 4.2 tripwire). PURE read-only scan of the serialized events; the sim
++diff --git a/assets/audio/README.md b/assets/audio/README.md
++index 922e6c8..bdd2c04 100644
++--- a/assets/audio/README.md
+++++ b/assets/audio/README.md
++@@ -42,6 +42,57 @@ no re-bless of goldens (the cosmetic draw pattern is asset-independent).
++   0.40, wire 0.55, spawn 0.50); deliver files near full scale and let the
++   module attenuate.
++ 
+++## The music bed (v2-ambience, 2026-08-23)
+++
+++| Slot path | Role | Notes |
+++|---|---|---|
+++| `assets/audio/ambience_loop.ogg` | the ambient music bed (streamed, loops forever) | 125.6 s seamless loop, vorbis 48 kHz stereo, ~0.91 MB |
+++
+++**Source (never committed):** `/Users/moses/code/_local-refs/audio/Warm Analog Drift.wav`
+++— PCM s16le 48 kHz stereo, 184.16 s, vaulted locally with its own README
+++(provenance: Suno Premier custom-mode ambient/neoclassical, no-drums; the
+++user owns the song with perpetual commercial rights incl. video games).
+++The 35 MB WAV stays out of the repo; the transform is reproducible:
+++
+++```bash
+++python3 tools/build_ambience_loop.py   # vault WAV -> assets/audio/ambience_loop.ogg
+++```
+++
+++**The seamless loop (numbers are data):** the loop is the source window
+++[41.4 s, 167.0 s] (125.6 s — the two regions with the highest harmonic
+++similarity in the track, 8 s-window spectral cosine similarity 0.76), with
+++its last 7.75 s replaced by an equal-power (cosine) crossfade of the window
+++tail (fading out) into the window head (fading in). At the wrap the file
+++returns to its own head at full level; the residual discontinuity measures
+++0.048 peak amplitude (measured by the build script) — inaudible on an
+++ambient bed. A hard cut would click (0.4+ amplitude — the track has no
+++beat-lockable phrase boundary).
+++
+++**Ducking:** raylib has no sidechain support, so the duck is an app-side
+++volume envelope (`app/audio/audio.odin`): any played event sound (wire
+++click, spawn chime, crisis sting, arrival tick) ducks the bed to
+++`MUSIC_DUCK_VOLUME` (0.12) for `MUSIC_DUCK_SECS` (0.30 s), then ramps back
+++over `MUSIC_DUCK_RAMP_SECS` (0.60 s). The #81 event sounds stay clearly
+++audible over the bed.
+++
+++**Levels & modes:** `MUSIC_VOLUME` (0.40) is the named master music-volume
+++tunable — the user tunes by ear. Pause (5.3) soft-lowers the bed to
+++`MUSIC_VOLUME × MUSIC_PAUSE_LEVEL` (keep-playing-low, never a hard cut);
+++Game_Over keeps it calm; Mute pauses the bed in place (it resumes where it
+++left off). The bed starts with the run (Boot collapses into Run — there is
+++no title screen) and is session-level: it survives run restarts; only Mute
+++stops it.
+++
+++**Missing/undecodable file:** no bed, one stderr note, everything else
+++plays exactly as before (the silent-fallback precedent). The variant-count
+++invariant is unaffected — the bed is not a variant slot and adds no
+++cosmetic-rng draws, so every golden stays valid with or without it.
+++
+++**Stage-3 candidate (recorded, NOT built):** the vault README's mood plan —
+++one evolving bed with intensity layers mapped to game states
+++(flow/tension/crisis) via the existing warning/surge hooks — is the
+++natural next step; this job ships the single calm bed only.
+++
++ ## Sources (user ruling 2026-08-17, FINAL — packet-plumber-v2-7.2-audio-juice)
++ 
++ - **SFX — the two stings in this contract (crisis alert + arrival click):
++@@ -83,5 +134,11 @@ no re-bless of goldens (the cosmetic draw pattern is asset-independent).
++   to *something* (file or placeholder). The cosmetic rng draw pattern never
++   depends on which slots are real — the `audio` T1 golden stays valid with or
++   without assets.
+++- The **bed adds zero draws** (v2-ambience): it reads no events and never
+++  touches the cosmetic rng — the duck lives in the device-gated playing
+++  half, which the harness mirror never runs. Every golden stays byte-valid
+++  with or without the bed.
++ - Never commit large binaries casually; the placeholders mean the repo needs
++-  no audio assets to run every gate.
+++  no audio assets to run every gate. The committed bed OGG is ~0.9 MB; the
+++  35 MB vault WAV is never committed (transform via
+++  `tools/build_ambience_loop.py`).
++
++# NEW: tools/build_ambience_loop.py
++#!/usr/bin/env python3
++"""Build the v2-ambience music bed from the vaulted source WAV.
++
++Source (NEVER committed — 35MB, vaulted locally):
++    /Users/moses/code/_local-refs/audio/Warm Analog Drift.wav
++    (PCM s16le 48kHz stereo, 184.16s; provenance + contract in the vault
++    README — Suno Premier, user-owned, perpetual commercial rights.)
++
++Output: assets/audio/ambience_loop.ogg (committed, ~0.9MB, vorbis 48kHz
++stereo, 125.6s) + a same-named .wav intermediate (24MB — delete it; it is
++the encode source, not a repo artifact).
++
++Seamless-loop design (numbers are DATA, re-derivable from the vault file):
++  - Window [A, B] = [41.4s, 167.0s] (125.6s). These two regions carry the
++    highest harmonic similarity in the track: 8s-window spectral cosine
++    similarity 0.76 (same pad/chord). A hard cut would click (waveform
++    cross-correlation across the wrap peaks at 0.25 — no beat-lockable
++    phrase boundary), so the wrap is crossfaded instead.
++  - Blend-at-end: the last X=7.75s of the loop are an equal-power (cosine)
++    crossfade of the window tail [B-X, B] (fading out) into the window head
++    [A, A+X] (fading in). At the wrap the file returns to its own head at
++    full level; the residual one-sample discontinuity measures 0.048 peak
++    (measured from this exact build) — inaudible on an ambient bed.
++
++Requires ffmpeg with a vorbis encoder (`-strict -2` for the experimental
++native encoder on homebrew builds).
++
++Run from the repo root:  python3 tools/build_ambience_loop.py
++"""
++import wave
++import numpy as np
++import subprocess
++import os
++
++SRC = "/Users/moses/code/_local-refs/audio/Warm Analog Drift.wav"
++OUT_WAV = "assets/audio/ambience_loop.wav"
++OUT_OGG = "assets/audio/ambience_loop.ogg"
++A = 41.4   # loop start (seconds in the source)
++B = 167.0  # loop end   (seconds in the source)
++XF = 7.75  # crossfade length (seconds)
++
++with wave.open(SRC, "rb") as w:
++    n_ch, samp_w, rate, n_frames = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
++    raw = w.readframes(n_frames)
++
++data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
++stereo = data.reshape(-1, n_ch) if n_ch == 2 else np.column_stack([data, data])
++
++a = int(A * rate)
++b = int(B * rate)
++x = int(XF * rate)
++seg = stereo[a:b].copy()
++L = seg.shape[0]
++
++# equal-power cosine crossfade over the last X seconds: tail fades out,
++# head fades in — the file's own head, so the wrap lands on material that
++# just faded in (harmonically identical by construction).
++t = np.arange(x) / x
++fade_out = np.cos(0.5 * np.pi * t)[:, None]
++fade_in = np.sin(0.5 * np.pi * t)[:, None]
++seg[L - x:L] = seg[L - x:L] * fade_out + seg[:x] * fade_in
++
++# --- continuity checks (documented in assets/audio/README.md) -------------
++wrap_disc = np.max(np.abs(seg[L - 1] - seg[0]))
++mid_disc = np.max(np.abs(seg[L - x] - seg[L - x - 1]))
++print(f"loop {L/rate:.2f}s: wrap discontinuity {wrap_disc:.4f} peak, "
++      f"crossfade entry {mid_disc:.5f} peak")
++
++pcm = (np.clip(seg, -1.0, 1.0) * 32767.0).astype(np.int16)
++with wave.open(OUT_WAV, "wb") as w:
++    w.setnchannels(2)
++    w.setsampwidth(2)
++    w.setframerate(rate)
++    w.writeframes(pcm.tobytes())
++print(f"wrote {OUT_WAV} ({os.path.getsize(OUT_WAV)/1e6:.1f}MB — intermediate, "
++      f"delete after encode; never commit)")
++
++subprocess.run([
++    "ffmpeg", "-y", "-loglevel", "error",
++    "-i", OUT_WAV,
++    "-c:a", "vorbis", "-strict", "-2", "-q:a", "5",
++    OUT_OGG,
++], check=True)
++print(f"wrote {OUT_OGG} ({os.path.getsize(OUT_OGG)/1e6:.2f}MB)")
++
++# NEW: _bmad-output/implementation-artifacts/spec-ambience-bed.md
++---
++title: 'v2 ambience bed — the Suno music loop in the game'
++type: 'feature'
++created: '2026-08-23'
++status: 'in-review'
++review_loop_iteration: 0
++baseline_commit: '339e173'
++context:
++  - '{project-root}/assets/audio/README.md'
++  - '{project-root}/app/audio/audio.odin'
++---
++
++## Intent
++
++**Problem:** The user's Suno ambient track ("Warm Analog Drift", the flow-state
++bed candidate, fun-test verdict IN) never plays in-game — the game has only
++#81's event SFX (stings/clicks/chimes), no music bed.
++
++**Approach:** Ship a compressed seamless loop of the track as a raylib-streamed
++music bed, layered BESIDE the #81 event system (never into it): a new
++`assets/audio/ambience_loop.ogg` slot + bed playback/ducking/level logic in
++`app/audio/audio.odin`, driven per-frame from `app/main.odin`. Presentation-only:
++the sim, T1/T2 goldens and replay hashes cannot move.
++
++## Boundaries & Constraints
++
++**Always:**
++- Audio stays presentation-only: no Run_State writes, no sim-rng draws, no
++  new cosmetic-rng draws (the #81 consumer's draw pattern is T1-pinned —
++  the bed adds ZERO draws).
++- No audio-device failure may crash headless/CI: the bed loads and plays ONLY
++  when `device_on` (the #81 silent-fallback precedent); a missing/undecodable
++  OGG silently means "no bed".
++- Respect #81's event system: layer beside it (append-only event tags remain
++  the SFX path; `consumer_consume`/`Pending`/`audio_flush` unchanged in shape).
++- Mute (M key + settings row) must mute the bed too; captions stay live.
++- The 35MB vault WAV is never committed — only the ~0.9MB OGG + a documented,
++  reproducible transform script.
++- Loop points, ducking approach, and asset sizes must land in the PR body.
++
++**Ask First:**
++- None known — the briefing delegates loop length (~2min), ducking style, and
++  pause behavior to the minion ("minion's call", "minion picks, document").
++
++**Never:**
++- No golden re-bless, no .dem/.log.bin edits, no sim/catalog changes.
++- No sidechain/audio-graph machinery beyond raylib's API (raylib has no
++  sidechain — the duck is an app-side volume envelope; a conservative fixed
++  level would also be acceptable but the envelope is strictly better).
++- No per-state tracks / intensity layers (the vault README's mood plan is a
++  stage-3 candidate — record it, don't build it).
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| HAPPY_PATH | device on, OGG present | bed plays from boot, loops seamlessly (125.6s), events duck it | n/a |
++| NO_DEVICE (headless/CI) | `IsAudioDeviceReady()` false | no bed, no crash — SFX/captions unchanged | `bed_on = false`, all bed procs early-return |
++| MISSING_OGG | file absent or frameCount 0 | game runs exactly as before (SFX + placeholders only) | silent skip, stderr note |
++| PAUSED (5.3) | mode Paused | bed keeps playing at `MUSIC_VOLUME × MUSIC_PAUSE_LEVEL` (soft-lower, NOT a cut) | n/a |
++| GAME_OVER | mode Game_Over | bed keeps playing at full bed level (calm) | n/a |
++| MUTE | M key / settings row | bed pauses in place (resume continues where it left off) | n/a |
++| EVENT_BURST | flush stages ≥1 play | duck envelope: deep duck `MUSIC_DUCK_SECS`, then ramp back over `MUSIC_DUCK_RAMP_SECS` | n/a |
++
++## Code Map
++
++- `app/audio/audio.odin` -- the #81 raudio layer (package `audio`): `Audio`
++  struct (app-owned, no globals), `audio_init`/`audio_destroy`, pure
++  `consumer_consume` (T1-pinned draw pattern — DO NOT add draws),
++  `audio_flush` (device+gated playing half — the duck trigger hooks here),
++  `toggle_mute`. The bed adds fields + new procs in this file.
++- `app/main.odin` -- the frame loop: `au.audio_flush(&app.audio)` call site
++  (~line 480) is the bed-update anchor (per-frame, outside the run_live gate);
++  `app.mode == .Paused` is the level input. No title screen exists (Boot
++  collapses into Run) — the bed starts with the run by construction.
++- `app/audio/audio_test.odin` -- pure unit tests (no device, no raylib calls):
++  the new bed envelope/level helpers get tests here, mirroring the existing
++  pure-half discipline.
++- `harness/run.odin` -- the T1 consumer mirror (zero `au.Audio` +
++  `consumer_init`): must stay untouched — the bed must not leak into it.
++- `assets/audio/README.md` -- the drop-in contract doc; gains the bed slot
++  row, loop-point/crossfade documentation, sizes, provenance + transform.
++- `tools/build_ambience_loop.py` -- NEW: the reproducible vault→OGG transform
++  (loop trim + crossfade + encode), documented in the README.
++- Vault: `/Users/moses/code/_local-refs/audio/Warm Analog Drift.wav` +
++  its README (provenance + the mood-plan contract) — read-only, never edited.
++
++## Tasks & Acceptance
++
++**Execution:**
++- [ ] `tools/build_ambience_loop.py` -- NEW transform script (moved from the
++    scratch analysis; vault WAV → `assets/audio/ambience_loop.ogg`, ~125.6s)
++    -- reproducibility contract: loop points + crossfade are DATA in the script.
++- [ ] `assets/audio/ambience_loop.ogg` -- the committed runtime asset
++    (vorbis 48kHz stereo, ~0.9MB) -- built from the vault WAV, never the WAV
++    itself (24MB intermediate stays untracked).
++- [ ] `app/audio/audio.odin` -- add the bed: `MUSIC_BED_PATH`,
++    `MUSIC_VOLUME` (the named master volume tunable), `MUSIC_DUCK_VOLUME`,
++    `MUSIC_DUCK_SECS`, `MUSIC_DUCK_RAMP_SECS`, `MUSIC_PAUSE_LEVEL`; `bed`
++    field + `bed_on`/duck-envelope state; load+play in `audio_init` (device-
++    gated), `UnloadMusicStream` in `audio_destroy`; new procs `bed_update`
++    (stream update + envelope + `SetMusicVolume`), `bed_duck_trigger` (called
++    from `audio_flush` when any family plays), pure `bed_level_multiplier`
++    envelope helper; `toggle_mute` pauses/resumes the bed in place -- SFX
++    behavior unchanged.
++- [ ] `app/main.odin` -- one call per frame next to the audio flush:
++    `au.bed_update(&app.audio, f32(min(f64(rl.GetFrameTime()), 0.25)), app.mode == .Paused)`
++    -- the bed runs in every mode; Paused soft-lowers it.
++- [ ] `app/audio/audio_test.odin` -- pure tests: envelope shape (no-duck =
++    1.0, ducked = `MUSIC_DUCK_VOLUME/MUSIC_VOLUME`, ramp returns to 1.0),
++    paused level math, trigger state transitions -- the flush integration is
++    device-gated (harness consumer mirror + manual verification, documented
++    in the PR, per the existing flush-half discipline).
++- [ ] `assets/audio/README.md` -- the bed slot row + loop documentation
++    (A=41.4s, B=167.0s window, 7.75s equal-power cosine crossfade at the
++    wrap, measured wrap discontinuity 0.048 peak) + provenance/transform +
++    the stage-3 mood-plan note.
++
++**Acceptance Criteria:**
++- Given a device with the OGG present, when the app runs, then the bed plays
++  from boot and wraps with no audible seam (125.6s loop; crossfade
++  construction, documented loop points).
++- Given wire clicks/spawn chimes/crisis stings firing, when the bed is
++  playing, then the SFX stay clearly audible over the ducked bed (duck
++  envelope: `MUSIC_DUCK_SECS` deep + `MUSIC_DUCK_RAMP_SECS` recovery).
++- Given Pause (5.3), when the sim freezes, then the bed keeps playing low
++  (soft-lower to `MUSIC_PAUSE_LEVEL`, never a hard cut); Game_Over keeps it
++  calm; Mute pauses it in place.
++- Given `MUSIC_VOLUME`, when the user tunes it by ear, then the named
++  constant is the single master-level knob (documented in README + code).
++- Given the full golden suite, when `tools/harness.sh run` runs, then every
++  T1/T2/replay check passes byte-identical — zero golden diffs (the bed adds
++  no consumer draws; `harness/run.odin` untouched).
++- Given headless/CI (no audio device), when the app/harness builds and runs,
++  then no crash, no new failure: `bed_on` guard mirrors the #81 silent
++  fallback; `audio_test`/`app`/`harness` suites stay green.
++- Given the PR, when the reviewer reads it, then the body carries: loop
++  points (A=41.4s/B=167.0s, 7.75s crossfade), the ducking approach (app-side
++  envelope — raylib has no sidechain), and asset sizes (OGG 0.91MB,
++  vault WAV 35MB untracked + transform path).
++
++## Spec Change Log
++
++## Design Notes
++
++**Why the bed adds zero consumer draws:** the T1 audio golden pins the
++consumer's cosmetic-rng draw pattern (audio.dem/audio_throttle/audio_spawn).
++The bed plays a stream and reads nothing from events; ducking is triggered in
++`audio_flush` (the playing half — never run in the harness mirror). So the
++consumer code is untouched and every golden stays byte-identical.
++
++**The loop construction (measured, not guessed):** the 184s track has no
++beat-lockable phrase boundary (waveform cross-correlation peaks ≤ 0.25), but
++the harmonic content at 41.4s and 167.0s matches closely (8s-window spectral
++cosine sim 0.76 — the same pad/chord). The 125.6s loop is the window
++[41.4s, 167.0s] with its last 7.75s replaced by an equal-power (cosine)
++crossfade of the window tail (fading out) into the window head (fading in).
++At the wrap, the residual discontinuity measures 0.048 peak amplitude —
++inaudible on an ambient bed (the alternative — a hard cut — would click at
++0.4+ amplitude).
++
++**Pause behavior choice:** soft-lower (0.6×) rather than soft-mute — pause-
++and-plan is doctrine; the calm bed stays present but recedes, and the
++difference from a hard cut is unambiguous. Mute is the hard stop (paused in
++place; resumes where it left off — unlike the one-shot StopSound path).
++
++## Verification
++
++**Commands:**
++- `odin test app/audio -out:bin/audio-test` -- expected: green incl. the new
++  bed envelope tests (pure, no device).
++- `tools/harness.sh run` -- expected: all T1/T2/replay checks pass; the
++  blessed manifests byte-identical (zero golden diff).
++- `tools/ci-local.sh --fast` + `tools/ci-local.sh --mac` (or the equivalent
++  gates: lint, `odin test core` + `odin test app` ×3 + render/input/audio/
++  harness tests, `odin build app -out:app.bin`, harness run, palcheck,
++  drift-check, preview-check, motion-pixel, PP_DEBUG build, stats-check,
++  input-parity) -- expected: all green.
++- `tools/build_ambience_loop.py` re-run -- expected: reproducible OGG
++  (documented loop points/crossfade; byte-identical output on the same
++  source + toolchain).
++- `ffprobe assets/audio/ambience_loop.ogg` -- expected: vorbis 48kHz stereo,
++  duration 125.6s, size ~0.9MB.
++
++**Manual checks (if no CLI):**
++- `odin run app` with sound on: bed starts at boot; Pause lowers it; M mutes
++  (bed pauses in place); events duck the bed audibly.
++
++# NEW (binary): assets/audio/ambience_loop.ogg — 913706 bytes, vorbis 48kHz stereo, 125.6s
+diff --git a/_bmad-output/reviews/v2-ambience/verif-gap.txt b/_bmad-output/reviews/v2-ambience/verif-gap.txt
+new file mode 100644
+index 00000000..cbe55141
+--- /dev/null
++++ b/_bmad-output/reviews/v2-ambience/verif-gap.txt
+@@ -0,0 +1,198 @@
++ // single-source rule: the same rect math the draw uses). DELEGATES to the
++ // input package's shared settings_press (Perkins r3 blocker 4: the app and
++
++ Took 0.0s
++
++
++ Thinking...
++
++ Let me verify the settings test setup (device state), check CI scripts for any asset checks, and confirm
++ the gitignore/asset state.
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && sed -n '1,60p'
++ app/settings_test.odin | grep -n "adjust_test_app" -A 25 | head -40
++
++ (no output)
++
++ Took 0.0s
++
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && echo "=== ambience/ogg
++ refs in tools ===" && grep -rn "ambience\|ffprobe\|\.ogg" tools/ 2>/dev/null | head && echo "===
++ .gitignore diff ===" && git diff 339e173 -- .gitignore && echo "=== asset present? ===" && ls -la
++ assets/audio/ && echo "=== settings_test calls effect_mute? ===" && grep -n
++ "effect_mute\|effect_settings_adjust\|SETTINGS_ROW_AUDIO" app/settings_test.odin app/main.odin | head
++
++ ... (31 earlier lines, ctrl+o to expand)
++ app/main.odin:351:   app.input.on_mute = effect_mute
++ app/main.odin:357:   app.input.on_settings_adjust = effect_settings_adjust
++ app/main.odin:889:// effect_mute — M: the 7.2 audio mute toggle (cosmetic — the sim never
++ app/main.odin:891:effect_mute :: proc(user: rawptr, ictx: ^inp.Input) {
++ app/main.odin:911:// effect_settings_adjust — apply + persist a settings-row change (the panel
++
++ Took 0.0s
++
++
++ Thinking...
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && grep -n "adjust_test_app"
++ app/settings_test.odin | head -3 && awk '/^adjust_test_app/,/^}/' app/settings_test.odin | head -30
++
++ ... (11 earlier lines, ctrl+o to expand)
++    app.input.user = &app
++    path = tmp_settings_path(t)
++    app.settings_path_override = path
++    return
++ }
++
++ Took 0.0s
++
++
++ Thinking...
++
++ All facts are grounded. Let me pin exact line numbers for the changed surfaces.
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && grep -n
++ "bed_duck_trigger\|audio_flush :: \|toggle_mute :: \|load_bed :: \|bed_update :: \|a.bed =
++ load_bed\|PlayMusicStream\|ResumeMusicStream\|PauseMusicStream\|bed_envelope_step\|bed_duck_multiplier\|b
++ ed_level :: \|SetMusicVolume\|if a.pending.crisis_plays" app/audio/audio.odin
++
++ ... (17 earlier lines, ctrl+o to expand)
++ 483:// bed_duck_multiplier — the current duck multiplier (1.0 = no duck). Deep
++ 489:bed_duck_multiplier :: proc(a: ^Audio) -> f32 {
++ 502:// soft-lower × the duck multiplier. SetMusicVolume clamps at 1.0 in raylib
++ 506:bed_level :: proc(a: ^Audio, paused: bool) -> f32 {
++ 511:   return level * bed_duck_multiplier(a)
++
++ Took 0.0s
++
++
++ Thinking...
++
++
++ $ cd /Users/moses/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience && grep -n
++ "test_bed_envelope_shape :: \|test_bed_duck_retrigger :: \|test_bed_off_is_silent_noop ::
++ \|test_bed_duck_never_raises :: \|test_bed" app/audio/audio_test.odin && grep -n
++ "settings_adjust_audio_effect :: \|au.is_muted" app/settings_test.odin && grep -n
++ "consumer_init\|consumer_consume" harness/run.odin | head -4
++
++ ... (3 earlier lines, ctrl+o to expand)
++ 300:test_bed_duck_never_raises :: proc(t: ^testing.T) {
++ 351:settings_adjust_audio_effect :: proc(t: ^testing.T) {
++ 355:   testing.expect(t, au.is_muted(&app.audio), "audio row toggles the mute (wired)")
++ 363:      au.consumer_init(&audio_consumer)
++ 433:            au.consumer_consume(&audio_consumer, state.events[before:], cat)
++
++ Took 0.0s
++
++
++ Thinking...
++
++ Review complete. All claims below are grounded in the files I read (working tree, which is a superset of
++ the review diff — see Other findings) and the symbol/import searches I ran.
++
++ ────────────────────────────────────────────────────────────────────────────────
++
++ ### Regression gap: the event→duck chain's device-gated halves (flush trigger + per-frame volume
++ application) have no test
++
++ - Changed surface: the new duck-trigger block in audio_flush — app/audio/audio.odin:382-384 (any staged
++   crisis_plays/arrival_plays/wire_plays/spawn_plays > 0 calls bed_duck_trigger) — and the new per-frame
++   applier bed_update at app/audio/audio.odin:447-453 (UpdateMusicStream + bed_envelope_step +
++   SetMusicVolume(bed_level(a, paused))), wired at app/main.odin:502 with the pause flag app.mode ==
++   .Paused.
++ - Impacted consumer or site: the app frame loop — the flush at app/main.odin:491 (inside the run_live
++   gate) and the per-frame bed_update call at app/main.odin:502, the only places the duck envelope is
++   triggered by real gameplay and applied to the stream.
++ - Existing test evidence: the four new tests test_bed_envelope_shape (app/audio/audio_test.odin:240),
++   test_bed_duck_retrigger (:272), test_bed_off_is_silent_noop (:288), test_bed_duck_never_raises (:300)
++   drive bed_duck_trigger, bed_envelope_step, bed_duck_multiplier, bed_level directly on a hand-built
++   Audio{bed_on = true} — none calls audio_flush or bed_update. Symbol searches: audio_flush appears only
++   at app/audio/audio.odin:354 and app/main.odin:491; bed_update only at app/main.odin:502; the harness
++   consumer mirror (harness/run.odin:363,433) calls only consumer_init/consumer_consume; CI
++   (tools/ci-local.sh:56) runs odin test app/audio (pure tests only) and builds — neither path executes in
++   any gate.
++ - Missing verification: an assertion that a flush with staged plays ducks the bed (and a silent flush
++   does not), and that bed_update actually applies the computed envelope level to the stream.
++ - Demonstration: the trigger block is moved after a.pending = {} (counts already zeroed → the duck never
++   fires), deleted, or its condition inverted (a silent flush ducks); or SetMusicVolume is dropped from
++   bed_update. Every envelope test still passes — they invoke the envelope procs directly and never
++   observe the trigger or the application.
++ - Consequence: the entire "SFX stay clearly audible over the ducked bed" contract silently dies (or ducks
++   at the wrong times), and the pause soft-lower wiring (app.mode == .Paused) is equally unobserved — all
++   gates stay green.
++ - Suggested test shape: extract the trigger decision into a pure predicate over Pending (e.g.,
++   pending_plays_any) that audio_flush uses, and unit-test it headless beside the existing envelope tests
++   — the repo's own pure-half discipline, no raylib needed.
++
++ ### Regression gap: mute/unmute bed pause–resume has no test
++
++ - Changed surface: toggle_mute — app/audio/audio.odin:405 (if a.bed_on { rl.PauseMusicStream(a.bed) } on
++   mute) and :407 (the new else if a.bed_on { rl.ResumeMusicStream(a.bed) } on unmute — previously unmute
++   did nothing).
++ - Impacted consumer or site: the M key via effect_mute (app/main.odin:893) and the settings audio row
++   (app/main.odin:936).
++ - Existing test evidence: the only test touching mute, settings_adjust_audio_effect
++   (app/settings_test.odin:351-355), drives the settings row and asserts only au.is_muted(&app.audio) —
++   the flag flip. adjust_test_app (app/settings_test.odin:302-315) never calls audio_init, so
++   device_on/bed_on are false and neither bed branch executes. Searches: no test calls toggle_mute with a
++   bed present; the M-key effect has no test at all.
++ - Missing verification: an assertion that muting pauses the bed stream and unmuting resumes it (in place,
++   not restarted).
++ - Demonstration: the ResumeMusicStream branch is deleted (or the pause branch is) — the bed stays frozen
++   after unmute (or keeps playing on mute). settings_adjust_audio_effect still passes: the muted flag
++   flips regardless of the bed branches.
++ - Consequence: the documented "Mute is the hard stop; the bed resumes where it left off" contract breaks
++   undetected.
++ - Suggested test shape: the settings exec test already runs toggle_mute via the row — if toggle_mute also
++   tracked a pure app-side bed_paused mirror flag (set beside the raylib calls), that test could assert
++   the intended pause/resume state headlessly; otherwise this stays manual-only under the existing
++   flush-half discipline.
++
++ ### Regression gap: boot load/start of the bed and the committed OGG asset are verified only on a device,
++ manually
++
++ - Changed surface: the bed block in audio_init — app/audio/audio.odin:247-252 (a.bed = load_bed();
++   frameCount > 0 → bed_on = true, looping = true, PlayMusicStream, initial SetMusicVolume) — and load_bed
++    itself (app/audio/audio.odin:425-440: ok / decode-fail-with-unload / missing-file-stderr-note, three
++   outcomes), plus the new binary asset assets/audio/ambience_loop.ogg.
++ - Impacted consumer or site: the app at boot (app/main.odin:258), and teardown (audio_destroy,
++   app/audio/audio.odin:263).
++ - Existing test evidence: no test calls audio_init or load_bed (searches: audio_init callers are only
++   app/main.odin:258-259; load_bed is referenced only inside app/audio/audio.odin). No CI script or tool
++   references the asset — grep of tools/ for ambience|ffprobe|.ogg finds only the build script's own
++   docstring; tools/ci-local.sh:56 never decodes it. The asset is currently untracked (git status → ??
++   assets/audio/ambience_loop.ogg).
++ - Missing verification: any automated check that the committed OGG exists, decodes (frameCount > 0), and
++   is the ~125.6 s loop.
++ - Demonstration: the OGG is omitted from the PR (it is untracked right now), truncated, or replaced by an
++   undecodable file → load_bed prints its stderr note, bed_on stays false, and the game runs with no music
++   while every T1/T2/replay/unit gate passes byte-identical (by design the bed adds zero draws).
++   Alternatively, a load_bed branch regression — e.g., dropping the UnloadMusicStream on decode failure
++   (app/audio/audio.odin:433) — ships a leaked stream buffer. Nothing fails.
++ - Consequence: the headline feature ("the ambient song plays") silently absent for every user, or a
++   leaked stream buffer on a bad asset — no gate detects either.
++ - Suggested test shape: a headless decode check in app/audio — rl.LoadMusicStream(MUSIC_BED_PATH)
++   decoding via stb_vorbis works without an audio device (playback alone needs one; verify first) —
++   asserting frameCount > 0 and duration ≈ 125.6 s, mirroring load_variant's frameCount guard; or a CI
++   ffprobe/file line on the committed asset.
++
++ Other findings
++
++ - The reviewed review-diff.txt is stale relative to the working tree: the tree already folds r1 fixes
++   absent from the diff — the min(MUSIC_DUCK_VOLUME / MUSIC_VOLUME, 1.0) cap on bed_duck_multiplier
++   (app/audio/audio.odin:489) and the extra test_bed_duck_never_raises (app/audio/audio_test.odin:300).
++   The diff's uncapped multiplier (a duck would have raised the bed above a master tuned below
++   MUSIC_DUCK_VOLUME) had no test in the diff; the tree closes that. Findings above were grounded in the
++   working tree, which is a superset of the diff content.
++
++───────────────────────────────────────────────────────────────────────────────────────────────────────────
++
++───────────────────────────────────────────────────────────────────────────────────────────────────────────
++~/.herdr/worktrees/packet-plumber/packet-plumber-v2-ambience (packet-plumber-v2-ambience)
++↑41k ↓28k R596k CH99.6% $0.015 7.9%/1.0M (auto)                          (deepseek) deepseek-v4-flash • max
++🔌 MCP: 2 servers enabled
+\ No newline at end of file
+diff --git a/_pr_body_ambience.md b/_pr_body_ambience.md
+new file mode 100644
+index 00000000..e3bc93d7
+--- /dev/null
++++ b/_pr_body_ambience.md
+@@ -0,0 +1,48 @@
++## What
++
++The user's Suno ambient bed now plays in-game (the 2026-08-23 report: "i dont hear the ambient song"). One calm, seamless music loop layered **beside** the #81 event-sound system — never into it.
++
++## Loop points (data, not guesses)
++
++- **Window:** [41.4 s, 167.0 s] of the vault source — **125.6 s** (the two regions with the highest harmonic similarity in the track: 8 s-window spectral cosine similarity **0.76**).
++- **Crossfade:** the last **7.75 s** of the loop are an equal-power (cosine) crossfade of the window tail into the window head (blend-at-end). The track has **no beat-lockable phrase boundary** (waveform cross-correlation peaks ≤ 0.25), so a hard cut would click (0.4+ amplitude); the crossfade construction measures **0.048 peak** residual discontinuity at the wrap (printed by the build script).
++- **Reproducible:** `tools/build_ambience_loop.py` rebuilds the committed OGG byte-identically (sha256-pinned).
++
++## Ducking approach
++
++raylib has **no sidechain support**, so the duck is an **app-side volume envelope**: any played event sound (wire click, spawn chime, crisis sting, arrival tick) ducks the bed to `MUSIC_DUCK_VOLUME/MUSIC_VOLUME` (0.12 at the default master 0.40) for `MUSIC_DUCK_SECS` (0.30 s), then ramps back over `MUSIC_DUCK_RAMP_SECS` (0.60 s). The duck is a **relative reduction capped at 1.0** — it never raises the bed. #81's sounds stay clearly audible.
++
++## Asset sizes
++
++| Asset | Size | Status |
++|---|---|---|
++| `assets/audio/ambience_loop.ogg` | **913,706 bytes (0.91 MB)** — vorbis 48 kHz stereo, 125.6 s | committed; sha256 `7fdb30925eba3f8490895742a69ffebba16643d2ebd4f5dfe5cf88329a06d609` |
++| vault `Warm Analog Drift.wav` | 35,359,760 bytes (35 MB) — PCM s16le 48 kHz stereo | **never committed**; transform documented in `assets/audio/README.md` |
++
++## Determinism & headless
++
++- **T1/T2/replay byte-identical:** 48/48 demos green, zero golden diffs — the bed adds **zero** consumer draws (the T1 audio golden pins the cosmetic-rng draw pattern; the harness mirror never calls `bed_update`).
++- **Headless/CI-safe:** bed load + play gate on `IsAudioDeviceReady()` (the #81 silent-fallback precedent); a missing/undecodable OGG prints one stderr note and the game plays exactly as before.
++- All 11 local CI gates green (`tools/ci-local.sh --mac`).
++
++## Placement decisions (briefing-delegated, documented in `assets/audio/README.md`)
++
++- **Pause (5.3):** keep playing **low** (`MUSIC_PAUSE_LEVEL` 0.6×) — soft-lower, never a hard cut; the bed resumes calmly. Mute is the hard stop (pauses in place; the duck envelope resets so unmute lands at the normal level).
++- **Boot:** no title screen exists (Boot collapses into Run) — the bed starts with the run, with a ~0.6 s fade-in (the recovery ramp reused).
++- **Volume knob:** `MUSIC_VOLUME` is the named master tunable (plus `MUSIC_DUCK_VOLUME`/`MUSIC_DUCK_SECS`/`MUSIC_DUCK_RAMP_SECS`/`MUSIC_PAUSE_LEVEL`); the existing M-key + settings-row mute also mutes the bed.
++- **Stage-3 candidate (recorded, not built):** the vault README's mood plan (intensity layers → flow/tension/crisis via existing state hooks) is noted in `assets/audio/README.md`.
++
++## Decisions & rationale
++
++- **OGG not WAV in-repo:** 0.91 MB vs 35 MB; raylib streams OGG via stb_vorbis; the WAV source stays vaulted (transform script + sha256 make the provenance auditable). The 24 MB encode intermediate is gitignored.
++- **Relative duck over an absolute floor:** an absolute floor would raise the bed when the user tunes the master below it; the capped relative reduction keeps ducking monotone and the docs honest (r1 review fold).
++- **Review-swarm r1 folds (3 hunters, 3 panes):** duck cap, mute envelope reset + `bed_paused` mirror flag (headless-testable mute branch), `StopMusicStream` before unload, boot fade-in, `pending_any_plays` single-source family list, `bed_envelope_step` bed_on gate, build-script guards + timeout + sha256. All folded; 17 audio unit tests now cover the pure envelope/level/mute state machine.
++- **Canon note (known bmad tooling HALT):** `bmad-quick-dev` → `bmad-build` render HALTs on this install (`ambiguous config value implementation_artifacts` — bmm + gds both define it; upstream 6.11.0, Silas-waived). Workflow step files were followed directly; the waiver is carried per the night-watchman field note.
++- **No CI-gate change for the OGG:** a broken asset surfaces at runtime with a clear stderr note; the committed sha256 lets any reviewer cross-check the binary (a decode gate would require touching the GH workflow + its local replica — deferred).
++
++## Verification
++
++- `tools/harness.sh run` → 48 demos green (T1/T2/replay byte-identical).
++- `tools/ci-local.sh --mac` → all 11 gates green.
++- `odin test app/audio` → 17/17 (13 pre-existing + 4 new bed tests).
++- Smoke run: `AUDIO: Device initialized successfully`, `[assets/audio/ambience_loop.ogg] Music file loaded successfully`, no crash.
+diff --git a/app/audio/audio.odin b/app/audio/audio.odin
+index 9d62e121..828a991b 100644
+--- a/app/audio/audio.odin
++++ b/app/audio/audio.odin
+@@ -101,6 +101,45 @@ SPAWN_TAU_TICK  :: f32(0.06)
+ SYNTH_SAMPLE_RATE :: 22050
+ SYNTH_RAMP_SAMPLES :: 110       // int(0.005 s * 22050 Hz) — a constant (110.25 truncates)
+ 
++// --- v2-ambience: the music bed (the Suno ambient loop) ---------------------
++//
++// A single streamed music bed layered BESIDE the #81 event system: the
++// sim and the consumer's T1-pinned draw pattern are untouched (the bed
++// reads no events, draws nothing from the cosmetic rng). The asset is
++// assets/audio/ambience_loop.ogg — a 125.6 s seamless loop (window
++// [41.4 s, 167.0 s] of the vault source with a 7.75 s equal-power crossfade
++// at the wrap; see assets/audio/README.md for the full contract + the
++// reproducible transform in tools/build_ambience_loop.py).
++
++// MUSIC_BED_PATH — the committed bed asset (raylib streams OGG via
++// stb_vorbis; missing/undecodable = no bed, exactly like an empty SFX
++// slot — the silent-fallback precedent).
++MUSIC_BED_PATH :: "assets/audio/ambience_loop.ogg"
++
++// MUSIC_VOLUME — the named MASTER music-volume tunable (the user tunes by
++// ear; documented in assets/audio/README.md). Applied on top of the pause
++// soft-lower and the event duck.
++MUSIC_VOLUME :: f32(0.40)
++
++// MUSIC_DUCK_VOLUME — the bed's ducked level at the DEFAULT master volume
++// (0.12). The duck is a RELATIVE reduction: the bed drops to
++// MUSIC_DUCK_VOLUME/MUSIC_VOLUME of its normal level (wire clicks + spawn
++// chimes + crisis stings stay clearly audible over it — the #81 contract),
++// capped at 1.0 so the duck never RAISES the bed (see bed_duck_multiplier).
++// raylib has no sidechain support, so the duck is an app-side volume
++// envelope (see bed_update).
++MUSIC_DUCK_VOLUME :: f32(0.12)
++
++// MUSIC_DUCK_SECS — how long a duck stays deep after an event burst.
++MUSIC_DUCK_SECS :: f32(0.30)
++// MUSIC_DUCK_RAMP_SECS — the recovery ramp back to the normal bed level.
++MUSIC_DUCK_RAMP_SECS :: f32(0.60)
++
++// MUSIC_PAUSE_LEVEL — the 5.3 pause soft-lower factor: the bed keeps
++// playing calm and low while the sim is frozen (keep-playing-low is the
++// documented choice — never a hard cut; Mute is the hard stop).
++MUSIC_PAUSE_LEVEL :: f32(0.6)
++
+ // Caption — one on-screen alert caption (the a11y contract). `text` is a
+ // view into `buf` (buf lives in Audio — the view stays stable). `crisis`
+ // marks a crisis caption for the priority rule (W1): an unexpired crisis
+@@ -147,6 +186,19 @@ Audio :: struct {
+ 	arrival:          [ARRIVAL_VARIANTS]rl.Sound,
+ 	wire:             [WIRE_VARIANTS]rl.Sound,   // v2-sound
+ 	spawn:            [SPAWN_VARIANTS]rl.Sound,  // v2-sound
++	// v2-ambience: the music bed — the streamed ambient loop + its
++	// app-owned duck envelope. `bed_on` mirrors the device/asset gate (no
++	// device or an undecodable file = no bed, silently). The envelope is
++	// wall-time driven (bed_update gets the frame dt from the app — never
++	// the sim tick; the harness mirror never calls it, so the T1 golden
++	// cannot move). Session-level state: it survives run restarts (only
++	// Mute stops it) — a fresh run must not restart the bed.
++	bed:            rl.Music,
++	bed_on:         bool,
++	bed_paused:     bool, // the mute mirror (the raylib pause/resume's pure twin — asserted headlessly)
++	bed_duck_t:     f32, // remaining deep-duck time (seconds)
++	bed_recovering: bool, // the duck is ramping back to the normal level
++	bed_recover_t:  f32, // remaining recovery-ramp time (seconds)
+ }
+ 
+ // audio_init — open the raudio device and load every variant slot (real
+@@ -191,6 +243,23 @@ audio_init :: proc(a: ^Audio) {
+ 			.Spawn, i,
+ 		)
+ 	}
++	// v2-ambience: the music bed — load the streamed loop + start it. Same
++	// silent-fallback rule as the SFX slots: no device or an undecodable
++	// file leaves the bed off (the game plays exactly as before). The bed
++	// starts with the run (Boot collapses into Run — there is no title
++	// screen) and keeps playing across run restarts (session-level).
++	a.bed = load_bed()
++	if a.bed.frameCount > 0 {
++		a.bed_on = true
++		a.bed.looping = true // the seamless loop wraps forever
++		rl.PlayMusicStream(a.bed)
++		// boot fade-in: the envelope starts in the recovery ramp, so the
++		// bed swells from the duck level to the master over the ramp
++		// window instead of slamming on at full volume (r1 review note 8).
++		a.bed_recovering = true
++		a.bed_recover_t = MUSIC_DUCK_RAMP_SECS
++		rl.SetMusicVolume(a.bed, bed_level(a, false))
++	}
+ }
+ 
+ // audio_destroy — unload the sounds + close the device (app teardown).
+@@ -200,6 +269,12 @@ audio_destroy :: proc(a: ^Audio) {
+ 		for s in a.arrival { rl.UnloadSound(s) }
+ 		for s in a.wire { rl.UnloadSound(s) }
+ 		for s in a.spawn { rl.UnloadSound(s) }
++		// r1 review note 5: stop the stream BEFORE unloading it (the
++		// raylib teardown idiom — no live decode context at unload).
++		if a.bed_on {
++			rl.StopMusicStream(a.bed)
++			rl.UnloadMusicStream(a.bed)
++		}
+ 	}
+ 	rl.CloseAudioDevice()
+ }
+@@ -312,6 +387,17 @@ audio_flush :: proc(a: ^Audio) {
+ 		v := (a.pending.spawn_variant + i32(k)) % SPAWN_VARIANTS
+ 		rl.PlaySound(a.spawn[v])
+ 	}
++	// v2-ambience: any staged event play ducks the bed (wire clicks, spawn
++	// chimes, crisis stings, arrival ticks all sit on top of the music —
++	// the duck keeps #81 clearly audible over it). A silent flush never
++	// ducks. The envelope itself runs in bed_update (wall time); this is
++	// just the trigger. The harness mirror never reaches this proc (device
++	// gate), so the golden cannot move. The play-family list lives in ONE
++	// helper (pending_any_plays) — a fifth family added to the flush later
++	// cannot silently miss the duck (r1 review note 7).
++	if pending_any_plays(a.pending) {
++		bed_duck_trigger(a)
++	}
+ 	a.pending = {}
+ }
+ 
+@@ -322,11 +408,36 @@ audio_flush :: proc(a: ^Audio) {
+ // contract — a muted game is not a silent game).
+ toggle_mute :: proc(a: ^Audio) -> bool {
+ 	a.muted = !a.muted
+-	if a.muted && a.device_on {
+-		for s in a.crisis { rl.StopSound(s) }
+-		for s in a.arrival { rl.StopSound(s) }
+-		for s in a.wire { rl.StopSound(s) }
+-		for s in a.spawn { rl.StopSound(s) }
++	// the pure mirror state (the raylib pause/resume's headless twin — the
++	// verif-gap r1 finding: the bed branch of toggle_mute was untestable
++	// without a device; the mirror + the envelope reset assert the intended
++	// pause/resume behavior headlessly). The duck envelope is RESET on
++	// mute: a pre-mute duck must not finish its recovery in silence and
++	// resume mid-ramp on unmute (r1 review note 6) — unmute lands at the
++	// normal level.
++	if a.bed_on {
++		a.bed_paused = a.muted
++		if a.muted {
++			a.bed_duck_t = 0
++			a.bed_recovering = false
++			a.bed_recover_t = 0
++		}
++	}
++	if a.device_on {
++		if a.muted {
++			for s in a.crisis { rl.StopSound(s) }
++			for s in a.arrival { rl.StopSound(s) }
++			for s in a.wire { rl.StopSound(s) }
++			for s in a.spawn { rl.StopSound(s) }
++			// v2-ambience: the bed PAUSES in place on mute (the one-shots
++			// stop; the stream resumes where it left off — a restart would
++			// be a jarring seam, and a seamless loop has no need of one).
++			if a.bed_on {
++				rl.PauseMusicStream(a.bed)
++			}
++		} else if a.bed_on {
++			rl.ResumeMusicStream(a.bed)
++		}
+ 	}
+ 	return a.muted
+ }
+@@ -335,6 +446,117 @@ is_muted :: proc(a: ^Audio) -> bool {
+ 	return a.muted
+ }
+ 
++// --- v2-ambience: the bed driver + the duck envelope -----------------------
++
++// load_bed — the one streamed music slot. Zero Music on any failure
++// (missing file, failed decode — frameCount 0) so bed_on stays false and
++// the game runs exactly as before (the #81 silent-fallback precedent). One
++// stderr note on failure (like the settings loader's) — a missing bed must
++// never be a silent mystery (the 2026-08-23 report was literally "i dont
++// hear the ambient song").
++load_bed :: proc() -> rl.Music {
++	if rl.FileExists(MUSIC_BED_PATH) {
++		m := rl.LoadMusicStream(MUSIC_BED_PATH)
++		if m.frameCount > 0 {
++			return m
++		}
++		// W6 (r1): a real file that FAILED to decode is unloaded before
++		// the silent skip — no orphaned stream buffer.
++		rl.UnloadMusicStream(m)
++		fmt.eprintfln("audio: music bed %s failed to decode — no bed", MUSIC_BED_PATH)
++	} else {
++		fmt.eprintfln("audio: music bed %s missing — no bed (run tools/build_ambience_loop.py)", MUSIC_BED_PATH)
++	}
++	return {}
++}
++
++// bed_update — the per-frame bed driver: stream update + the duck envelope
++// + the effective volume. Called EVERY frame in every mode (Run / Paused /
++// Game_Over) — the bed is session-level; only Mute stops it. `paused` is
++// the 5.3 sim-freeze flag: the bed keeps playing low (soft-lower, never a
++// hard cut). Wall-time based (presentation-only — the sim never sees it,
++// and the harness mirror never calls this proc). While muted the stream is
++// paused and the envelope is idle (toggle_mute reset it) — nothing to do
++// but skip (r1 review note 6: no decode churn on a paused stream).
++bed_update :: proc(a: ^Audio, dt: f32, paused: bool) {
++	if !a.bed_on || a.muted {
++		return
++	}
++	rl.UpdateMusicStream(a.bed)
++	bed_envelope_step(a, dt)
++	rl.SetMusicVolume(a.bed, bed_level(a, paused))
++}
++
++// bed_envelope_step — advance the duck envelope by dt (PURE — the unit
++// tests drive it headless): deep phase -> recovery ramp -> normal. Gated
++// on bed_on like its sibling (r1 review note 12): a bed_off Audio has no
++// envelope, ever.
++bed_envelope_step :: proc(a: ^Audio, dt: f32) {
++	if !a.bed_on {
++		return
++	}
++	if a.bed_duck_t > 0 {
++		a.bed_duck_t = max(0, a.bed_duck_t - dt)
++		if a.bed_duck_t == 0 {
++			a.bed_recovering = true
++			a.bed_recover_t = MUSIC_DUCK_RAMP_SECS
++		}
++	} else if a.bed_recovering {
++		a.bed_recover_t = max(0, a.bed_recover_t - dt)
++		if a.bed_recover_t == 0 {
++			a.bed_recovering = false
++		}
++	}
++}
++
++// bed_duck_trigger — start a duck (event sounds just played). A retrigger
++// while ducked extends the deep phase; a trigger mid-recovery re-deeps.
++bed_duck_trigger :: proc(a: ^Audio) {
++	if !a.bed_on {
++		return
++	}
++	a.bed_duck_t = MUSIC_DUCK_SECS
++	a.bed_recovering = false
++}
++
++// bed_duck_multiplier — the current duck multiplier (1.0 = no duck). Deep
++// duck while the deep phase runs; linear ramp back over the recovery
++// window. Capped at 1.0: the duck NEVER raises the bed above its normal
++// level — when the user tunes MUSIC_VOLUME at or below MUSIC_DUCK_VOLUME,
++// the multiplier just stays 1.0 (no duck needed: the bed already sits
++// under the events). PURE — unit-tested headless.
++bed_duck_multiplier :: proc(a: ^Audio) -> f32 {
++	duck_ratio := min(MUSIC_DUCK_VOLUME / MUSIC_VOLUME, 1.0)
++	if a.bed_duck_t > 0 {
++		return duck_ratio
++	}
++	if a.bed_recovering {
++		progress := 1.0 - a.bed_recover_t / MUSIC_DUCK_RAMP_SECS
++		return duck_ratio + (1.0 - duck_ratio) * progress
++	}
++	return 1.0
++}
++
++// bed_level — the effective bed volume: the master tunable × the pause
++// soft-lower × the duck multiplier (a RELATIVE reduction — the multiplier
++// is capped at 1.0 in bed_duck_multiplier, so the duck never raises the
++// bed and SetMusicVolume's 1.0 clamp is never load-bearing for it). PURE
++// — unit-tested headless.
++bed_level :: proc(a: ^Audio, paused: bool) -> f32 {
++	level := MUSIC_VOLUME
++	if paused {
++		level *= MUSIC_PAUSE_LEVEL
++	}
++	return level * bed_duck_multiplier(a)
++}
++
++// pending_any_plays — the ONE place that knows the play-family list (r1
++// review note 7): any staged play in the flush's Pending. The duck trigger
++// and (implicitly) the flush's play loops both key off it.
++pending_any_plays :: proc(p: Pending) -> bool {
++	return p.crisis_plays > 0 || p.arrival_plays > 0 || p.wire_plays > 0 || p.spawn_plays > 0
++}
++
+ // caption_live — the current caption for tick (expired = none).
+ caption_live :: proc(a: ^Audio, tick: u64) -> (string, bool) {
+ 	if !a.caption.live || tick > a.caption.until_tick {
+diff --git a/app/audio/audio_test.odin b/app/audio/audio_test.odin
+index 9121af5c..2b0f003f 100644
+--- a/app/audio/audio_test.odin
++++ b/app/audio/audio_test.odin
+@@ -233,3 +233,130 @@ test_consumer_spawn_draw :: proc(t: ^testing.T) {
+ 	testing.expectf(t, a.crisis_draws == 0 && a.arrival_draws == 0 && a.wire_draws == 0,
+ 		"spawn draw must not move the other kinds' counters")
+ }
++
++// --- v2-ambience: the music bed's pure envelope (no device, no raylib) -----
++
++@(test)
++test_bed_envelope_shape :: proc(t: ^testing.T) {
++	a: Audio
++	a.bed_on = true // a loaded bed (the trigger + envelope gate on it)
++	// unducked: multiplier 1.0; the level is the master tunable, the pause
++	// soft-lower stacks on it.
++	testing.expectf(t, bed_duck_multiplier(&a) == 1.0, "unducked multiplier %v, want 1.0", bed_duck_multiplier(&a))
++	testing.expectf(t, abs(bed_level(&a, false) - MUSIC_VOLUME) < 0.0001,
++		"unducked level %v, want %v", bed_level(&a, false), MUSIC_VOLUME)
++	testing.expectf(t, abs(bed_level(&a, true) - MUSIC_VOLUME * MUSIC_PAUSE_LEVEL) < 0.0001,
++		"paused level %v, want %v", bed_level(&a, true), MUSIC_VOLUME * MUSIC_PAUSE_LEVEL)
++	// a trigger ducks immediately (deep phase).
++	bed_duck_trigger(&a)
++	testing.expectf(t, a.bed_duck_t == MUSIC_DUCK_SECS, "duck_t %v, want %v", a.bed_duck_t, MUSIC_DUCK_SECS)
++	testing.expectf(t, abs(bed_duck_multiplier(&a) - MUSIC_DUCK_VOLUME / MUSIC_VOLUME) < 0.0001,
++		"ducked multiplier %v", bed_duck_multiplier(&a))
++	// stepping past the deep phase starts the recovery ramp (still at the
++	// duck floor, then strictly between the floor and 1.0, then 1.0).
++	bed_envelope_step(&a, MUSIC_DUCK_SECS)
++	testing.expectf(t, a.bed_duck_t == 0 && a.bed_recovering,
++		"deep phase did not end (duck_t %v, rec %v)", a.bed_duck_t, a.bed_recovering)
++	testing.expectf(t, abs(bed_duck_multiplier(&a) - MUSIC_DUCK_VOLUME / MUSIC_VOLUME) < 0.0001,
++		"ramp-start multiplier %v", bed_duck_multiplier(&a))
++	bed_envelope_step(&a, MUSIC_DUCK_RAMP_SECS / 2)
++	m := bed_duck_multiplier(&a)
++	testing.expectf(t, m > MUSIC_DUCK_VOLUME / MUSIC_VOLUME && m < 1.0,
++		"mid-ramp multiplier %v, want between the floor and 1.0", m)
++	bed_envelope_step(&a, MUSIC_DUCK_RAMP_SECS)
++	testing.expectf(t, !a.bed_recovering && bed_duck_multiplier(&a) == 1.0,
++		"ramp did not end (rec %v, mult %v)", a.bed_recovering, bed_duck_multiplier(&a))
++}
++
++@(test)
++test_bed_duck_retrigger :: proc(t: ^testing.T) {
++	a: Audio
++	a.bed_on = true
++	bed_duck_trigger(&a)
++	bed_envelope_step(&a, MUSIC_DUCK_SECS) // deep phase done, ramp started
++	testing.expectf(t, a.bed_recovering, "recovery not started")
++	// a retrigger mid-recovery re-deeps (extends the duck, restarts the
++	// envelope — an event burst must hold the bed down the whole time).
++	bed_duck_trigger(&a)
++	testing.expectf(t, a.bed_duck_t == MUSIC_DUCK_SECS && !a.bed_recovering,
++		"retrigger did not re-deep (duck_t %v, rec %v)", a.bed_duck_t, a.bed_recovering)
++	testing.expectf(t, abs(bed_duck_multiplier(&a) - MUSIC_DUCK_VOLUME / MUSIC_VOLUME) < 0.0001,
++		"re-deep multiplier %v", bed_duck_multiplier(&a))
++}
++
++@(test)
++test_bed_off_is_silent_noop :: proc(t: ^testing.T) {
++	// a zero Audio (no device — the headless/CI mirror) must not crash the
++	// envelope procs and must stay at the full multiplier.
++	a: Audio
++	bed_envelope_step(&a, 0.1)
++	testing.expectf(t, !a.bed_recovering && a.bed_duck_t == 0, "zero Audio envelope moved")
++	testing.expectf(t, bed_duck_multiplier(&a) == 1.0, "zero Audio multiplier %v", bed_duck_multiplier(&a))
++	bed_duck_trigger(&a) // bed_on false: no-op, no crash
++	testing.expectf(t, a.bed_duck_t == 0, "trigger moved a bed_off Audio")
++}
++
++@(test)
++test_bed_duck_never_raises :: proc(t: ^testing.T) {
++	// a master tuned AT or BELOW the duck floor must never be raised by a
++	// duck (multiplier capped at 1.0 — the bed already sits under events).
++	a: Audio
++	a.bed_on = true
++	bed_duck_trigger(&a)
++	testing.expectf(t, bed_duck_multiplier(&a) <= 1.0,
++		"duck multiplier %v exceeds 1.0 (would raise the bed)", bed_duck_multiplier(&a))
++	testing.expectf(t, bed_level(&a, false) <= MUSIC_VOLUME,
++		"ducked level %v exceeds the master %v", bed_level(&a, false), MUSIC_VOLUME)
++}
++
++@(test)
++test_bed_paused_ducked_level :: proc(t: ^testing.T) {
++	// the duck is a RELATIVE reduction: paused + ducked = master × pause
++	// soft-lower × duck ratio (r1 review note 2 — the docs no longer claim
++	// an absolute 0.12 floor under pause).
++	a: Audio
++	a.bed_on = true
++	bed_duck_trigger(&a)
++	want := MUSIC_VOLUME * MUSIC_PAUSE_LEVEL * (MUSIC_DUCK_VOLUME / MUSIC_VOLUME)
++	testing.expectf(t, abs(bed_level(&a, true) - want) < 0.0001,
++		"paused+ducked level %v, want %v", bed_level(&a, true), want)
++}
++
++@(test)
++test_bed_retrigger_while_deep :: proc(t: ^testing.T) {
++	// a retrigger DURING the deep phase restarts the deep timer (the burst
++	// holds the bed down for a full MUSIC_DUCK_SECS after the LAST event).
++	a: Audio
++	a.bed_on = true
++	bed_duck_trigger(&a)
++	bed_envelope_step(&a, MUSIC_DUCK_SECS / 2) // still deep
++	testing.expectf(t, a.bed_duck_t > 0, "deep phase ended early")
++	bed_duck_trigger(&a)
++	testing.expectf(t, a.bed_duck_t == MUSIC_DUCK_SECS, "retrigger did not extend the deep phase (duck_t %v)", a.bed_duck_t)
++	testing.expectf(t, !a.bed_recovering, "retrigger while deep started a recovery")
++	testing.expectf(t, abs(bed_duck_multiplier(&a) - MUSIC_DUCK_VOLUME / MUSIC_VOLUME) < 0.0001,
++		"deep multiplier %v", bed_duck_multiplier(&a))
++}
++
++@(test)
++test_bed_mute_mirror_flag :: proc(t: ^testing.T) {
++	// the verif-gap r1 finding: the bed branch of toggle_mute must be
++	// asserted headlessly. The pure mirror flag (bed_paused) flips beside
++	// the raylib pause/resume — device_on false here, so no raylib call
++	// runs; the state machine is what the test pins. The envelope must also
++	// reset on mute (a pre-mute duck cannot finish its recovery in silence).
++	a: Audio
++	a.bed_on = true // test-only: bed loaded without a device
++	bed_duck_trigger(&a)
++	m := toggle_mute(&a)
++	testing.expectf(t, m && a.bed_paused, "mute did not pause the bed mirror (muted %v, paused %v)", m, a.bed_paused)
++	testing.expectf(t, a.bed_duck_t == 0 && !a.bed_recovering,
++		"mute did not reset the duck envelope (duck_t %v, rec %v)", a.bed_duck_t, a.bed_recovering)
++	m = toggle_mute(&a)
++	testing.expectf(t, !m && !a.bed_paused, "unmute did not resume the bed mirror (muted %v, paused %v)", m, a.bed_paused)
++	// a muted bed_update is a skip (the stream is paused — no churn).
++	toggle_mute(&a)
++	a.bed_duck_t = MUSIC_DUCK_SECS // stale state that must survive untouched
++	bed_update(&a, 0.1, false)
++	testing.expectf(t, a.bed_duck_t == MUSIC_DUCK_SECS, "muted bed_update advanced the envelope")
++}
+diff --git a/app/main.odin b/app/main.odin
+index ca1928a6..3250c4ac 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -491,6 +491,16 @@ main :: proc() {
+ 			au.audio_flush(&app.audio)
+ 		}
+ 
++		// v2-ambience: the music bed — per-frame stream update + the duck
++		// envelope + the mode level (Paused soft-lowers the bed; Run and
++		// Game_Over keep the calm level — the bed is session-level, only
++		// Mute stops it). Presentation-only: the sim never sees this, and
++		// the harness mirror never calls it, so the T1 golden cannot move.
++		// The dt clamp mirrors the sim's (a long stall must not jump the
++		// envelope). Headless/CI with no audio device: bed_on stays false
++		// and this is a no-op — the #81 silent-fallback precedent.
++		au.bed_update(&app.audio, f32(min(f64(rl.GetFrameTime()), 0.25)), app.mode == .Paused)
++
+ 		// v2-noc: the NOC feed — fold the NEW event slice once per frame (the
+ 		// audio-consumer mark discipline; the buffer is never drained — the
+ 		// 4.2 tripwire). PURE read-only scan of the serialized events; the sim
+diff --git a/assets/audio/README.md b/assets/audio/README.md
+index 922e6c87..b6223e9f 100644
+--- a/assets/audio/README.md
++++ b/assets/audio/README.md
+@@ -42,6 +42,68 @@ no re-bless of goldens (the cosmetic draw pattern is asset-independent).
+   0.40, wire 0.55, spawn 0.50); deliver files near full scale and let the
+   module attenuate.
+ 
++## The music bed (v2-ambience, 2026-08-23)
++
++| Slot path | Role | Notes |
++|---|---|---|
++| `assets/audio/ambience_loop.ogg` | the ambient music bed (streamed, loops forever) | 125.6 s seamless loop, vorbis 48 kHz stereo, ~0.91 MB |
++
++**Source (never committed):** `/Users/moses/code/_local-refs/audio/Warm Analog Drift.wav`
++— PCM s16le 48 kHz stereo, 184.16 s, vaulted locally with its own README
++(provenance: Suno Premier custom-mode ambient/neoclassical, no-drums; the
++user owns the song with perpetual commercial rights incl. video games).
++The 35 MB WAV stays out of the repo; the transform is reproducible:
++
++```bash
++python3 tools/build_ambience_loop.py   # vault WAV -> assets/audio/ambience_loop.ogg
++```
++
++**The seamless loop (numbers are data):** the loop is the source window
++[41.4 s, 167.0 s] (125.6 s — the two regions with the highest harmonic
++similarity in the track, 8 s-window spectral cosine similarity 0.76), with
++its last 7.75 s replaced by an equal-power (cosine) crossfade of the window
++tail (fading out) into the window head (fading in). At the wrap the file
++returns to its own head at full level; the residual discontinuity measures
++0.048 peak amplitude (measured by the build script) — inaudible on an
++ambient bed. A hard cut would click (0.4+ amplitude — the track has no
++beat-lockable phrase boundary).
++
++**Ducking:** raylib has no sidechain support, so the duck is an app-side
++volume envelope (`app/audio/audio.odin`): any played event sound (wire
++click, spawn chime, crisis sting, arrival tick) ducks the bed to ~30% of
++its normal level (`MUSIC_DUCK_VOLUME`/`MUSIC_VOLUME` — 0.12 at the default
++master) for `MUSIC_DUCK_SECS` (0.30 s), then ramps back over
++`MUSIC_DUCK_RAMP_SECS` (0.60 s). The duck is a RELATIVE reduction, capped
++so it never raises the bed (a master tuned at or below the duck level just
++stays there — the events already sit above it). The #81 event sounds stay
++clearly audible over the bed.
++
++**Levels & modes:** `MUSIC_VOLUME` (0.40) is the named master music-volume
++tunable — the user tunes by ear. The bed starts with a short fade-in (the
++duck ramp reused — it swells from the duck level over ~0.6 s); Pause (5.3)
++soft-lowers it to `MUSIC_VOLUME × MUSIC_PAUSE_LEVEL` (keep-playing-low,
++never a hard cut; the duck stacks multiplicatively on top); Game_Over
++keeps it calm; Mute pauses it in place — instantly, deliberately (a mute
++toggle must be immediate; the bed resumes where it left off, envelope
++reset, at the normal level). The bed starts with the run (Boot collapses
++into Run — there is no title screen) and is session-level: it survives run
++restarts; only Mute stops it.
++
++**Missing/undecodable file:** no bed, one stderr note, everything else
++plays exactly as before (the silent-fallback precedent). The variant-count
++invariant is unaffected — the bed is not a variant slot and adds no
++cosmetic-rng draws, so every golden stays valid with or without it.
++
++**Reproducibility:** the transform is deterministic — `tools/build_ambience_loop.py`
++re-builds the committed OGG byte-identically (the script prints a sha256).
++Committed artifact hash: `7fdb30925eba3f8490895742a69ffebba16643d2ebd4f5dfe5cf88329a06d609`
++(verify with `shasum -a 256 assets/audio/ambience_loop.ogg`).
++
++**Stage-3 candidate (recorded, NOT built):** the vault README's mood plan —
++one evolving bed with intensity layers mapped to game states
++(flow/tension/crisis) via the existing warning/surge hooks — is the
++natural next step; this job ships the single calm bed only.
++
+ ## Sources (user ruling 2026-08-17, FINAL — packet-plumber-v2-7.2-audio-juice)
+ 
+ - **SFX — the two stings in this contract (crisis alert + arrival click):
+@@ -83,5 +145,11 @@ no re-bless of goldens (the cosmetic draw pattern is asset-independent).
+   to *something* (file or placeholder). The cosmetic rng draw pattern never
+   depends on which slots are real — the `audio` T1 golden stays valid with or
+   without assets.
++- The **bed adds zero draws** (v2-ambience): it reads no events and never
++  touches the cosmetic rng — the duck lives in the device-gated playing
++  half, which the harness mirror never runs. Every golden stays byte-valid
++  with or without the bed.
+ - Never commit large binaries casually; the placeholders mean the repo needs
+-  no audio assets to run every gate.
++  no audio assets to run every gate. The committed bed OGG is ~0.9 MB; the
++  35 MB vault WAV is never committed (transform via
++  `tools/build_ambience_loop.py`).
+diff --git a/assets/audio/ambience_loop.ogg b/assets/audio/ambience_loop.ogg
+new file mode 100644
+index 00000000..80a4566e
+Binary files /dev/null and b/assets/audio/ambience_loop.ogg differ
+diff --git a/tools/build_ambience_loop.py b/tools/build_ambience_loop.py
+new file mode 100644
+index 00000000..8c6cfd6b
+--- /dev/null
++++ b/tools/build_ambience_loop.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python3
++"""Build the v2-ambience music bed from the vaulted source WAV.
++
++Source (NEVER committed — 35MB, vaulted locally):
++    /Users/moses/code/_local-refs/audio/Warm Analog Drift.wav
++    (PCM s16le 48kHz stereo, 184.16s; provenance + contract in the vault
++    README — Suno Premier, user-owned, perpetual commercial rights.)
++
++Output: assets/audio/ambience_loop.ogg (committed, ~0.9MB, vorbis 48kHz
++stereo, 125.6s) + a same-named .wav intermediate (24MB — delete it; it is
++the encode source, not a repo artifact).
++
++Seamless-loop design (numbers are DATA, re-derivable from the vault file):
++  - Window [A, B] = [41.4s, 167.0s] (125.6s). These two regions carry the
++    highest harmonic similarity in the track: 8s-window spectral cosine
++    similarity 0.76 (same pad/chord). A hard cut would click (waveform
++    cross-correlation across the wrap peaks at 0.25 — no beat-lockable
++    phrase boundary), so the wrap is crossfaded instead.
++  - Blend-at-end: the last X=7.75s of the loop are an equal-power (cosine)
++    crossfade of the window tail [B-X, B] (fading out) into the window head
++    [A, A+X] (fading in). At the wrap the file returns to its own head at
++    full level; the residual one-sample discontinuity measures 0.048 peak
++    (measured from this exact build) — inaudible on an ambient bed.
++
++Requires ffmpeg with a vorbis encoder (`-strict -2` for the experimental
++native encoder on homebrew builds).
++
++Run from the repo root:  python3 tools/build_ambience_loop.py
++"""
++import wave
++import numpy as np
++import subprocess
++import os
++import hashlib
++
++SRC = "/Users/moses/code/_local-refs/audio/Warm Analog Drift.wav"
++OUT_WAV = "assets/audio/ambience_loop.wav"
++OUT_OGG = "assets/audio/ambience_loop.ogg"
++A = 41.4   # loop start (seconds in the source)
++B = 167.0  # loop end   (seconds in the source)
++XF = 7.75  # crossfade length (seconds)
++
++# --- guards (r1 review: actionable failures, no silent garbage) -----------
++if not os.path.exists(SRC):
++    raise SystemExit(f"vault WAV missing: {SRC} — see the vault README; never commit the WAV")
++
++with wave.open(SRC, "rb") as w:
++    n_ch, samp_w, rate, n_frames = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
++    if samp_w != 2:
++        raise SystemExit(f"source must be PCM s16 (sampwidth {samp_w}, want 2) — the int16 decode would misread")
++    if n_ch not in (1, 2):
++        raise SystemExit(f"source must be mono or stereo (got {n_ch} channels)")
++    raw = w.readframes(n_frames)
++
++if int(B * rate) > n_frames or int(B * rate) - int(A * rate) <= int(XF * rate):
++    raise SystemExit(f"loop window [{A}s, {B}s] does not fit the {n_frames/rate:.1f}s source")
++
++data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
++stereo = data.reshape(-1, n_ch) if n_ch == 2 else np.column_stack([data, data])
++
++a = int(A * rate)
++b = int(B * rate)
++x = int(XF * rate)
++seg = stereo[a:b].copy()
++L = seg.shape[0]
++
++# equal-power cosine crossfade over the last X seconds: tail fades out,
++# head fades in — the file's own head, so the wrap lands on material that
++# just faded in (harmonically identical by construction).
++t = np.arange(x) / x
++fade_out = np.cos(0.5 * np.pi * t)[:, None]
++fade_in = np.sin(0.5 * np.pi * t)[:, None]
++seg[L - x:L] = seg[L - x:L] * fade_out + seg[:x] * fade_in
++
++# --- continuity checks (documented in assets/audio/README.md) -------------
++wrap_disc = np.max(np.abs(seg[L - 1] - seg[0]))
++mid_disc = np.max(np.abs(seg[L - x] - seg[L - x - 1]))
++print(f"loop {L/rate:.2f}s: wrap discontinuity {wrap_disc:.4f} peak, "
++      f"crossfade entry {mid_disc:.5f} peak")
++
++pcm = (np.clip(seg, -1.0, 1.0) * 32767.0).astype(np.int16)
++with wave.open(OUT_WAV, "wb") as w:
++    w.setnchannels(2)
++    w.setsampwidth(2)
++    w.setframerate(rate)
++    w.writeframes(pcm.tobytes())
++print(f"wrote {OUT_WAV} ({os.path.getsize(OUT_WAV)/1e6:.1f}MB — intermediate, "
++      f"delete after encode; never commit)")
++
++subprocess.run([
++    "ffmpeg", "-y", "-loglevel", "error",
++    "-i", OUT_WAV,
++    "-c:a", "vorbis", "-strict", "-2", "-q:a", "5",
++    OUT_OGG,
++], check=True, timeout=600)  # r1 review: a hung ffmpeg must not block forever
++sha = hashlib.sha256(open(OUT_OGG, "rb").read()).hexdigest()
++print(f"wrote {OUT_OGG} ({os.path.getsize(OUT_OGG)/1e6:.2f}MB)")
++print(f"sha256: {sha}")

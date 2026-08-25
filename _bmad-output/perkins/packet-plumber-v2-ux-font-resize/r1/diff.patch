@@ -1,0 +1,869 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-v2-ux-font-resize.md b/_bmad-output/implementation-artifacts/spec-v2-ux-font-resize.md
+new file mode 100644
+index 0000000..1893b48
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-v2-ux-font-resize.md
+@@ -0,0 +1,93 @@
++---
++title: 'v2 UX: readable HUD font + resizable window'
++type: 'bugfix'
++created: '2026-08-15'
++status: 'in-progress'
++baseline_commit: '87b7374'
++review_loop_iteration: 0
++context: []
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** USER REPORT 2026-08-15 (ruling-grade): "the font is hard to read" + "i cant seem to be able to resize the window. prototype could". v2 renders the raylib DEFAULT bitmap font (pixelated/blocky at HUD sizes — verified: title+instructions run half-hidden under the centered Network Health card at 1280×720) and the window is fixed-size (no `FLAG_WINDOW_RESIZABLE`, unlike the prototype).
++
++**Approach:** (1) Bundle a high-legibility OFL font (Open Sans Regular, instanced static) as a repo asset; load via `rl.LoadFontEx` in BOTH the app and the harness (deterministic — rlsw rasterizes the same file); route all HUD text through `rl.DrawTextEx(v.font, …, spacing 1)`. Raise HUD text minimums to ~14px and darken state-colored TEXT for contrast. (2) Restore resize: `SetConfigFlags({.WINDOW_RESIZABLE})` + `SetWindowMinSize` before init (prototype pattern); HUD math moves off `WIN_W/WIN_H` constants onto the live `view.win_w/win_h`; camera-fit already reveals more map (GL5.2 aspect=expand); pause edge-chip becomes gap-adaptive. Resize is presentation-only — never touches sim/serialization/replay; harness captures stay fixed 1280×720.
++
++## Boundaries & Constraints
++
++**Always:**
++- Font is a BUNDLED asset (no system-font reads — platform-deterministic). ASCII text only (lint gate 6).
++- Resize must never touch sim state, serialization, LOG_VERSION, or the harness capture path (T1 hashes + T2 captures stay 1280×720).
++- T1 goldens must NOT shift. T2 goldens shift ONLY from the font/size/contrast fold — deliberate, listed, re-blessed.
++- Render determinism: no transcendentals; font atlas from the committed file via the same raylib path in app + harness.
++- Full local suite green (`tools/harness.sh run` = 28 demos) + lint gates.
++
++**Ask First:** (none — judgment calls below are delegated by the briefing and documented in the PR's Decisions & rationale)
++
++**Never:** No new HUD surfaces; no visibility/gauge work; no 5.2 health-ring changes; no input-parity work; no system fonts; no render-target letterboxing (adapt layout instead); no LOG_VERSION bump.
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| Resize to 1600×900 | window event | world re-fits (camera-fit), HUD re-anchors (win_w/win_h), no overlap | view_compute on IsWindowResized (existing) |
++| Resize to non-16:9 (1280×800) | window event | taller view, HUD bands stay clear, pause chip adapts to gap | same path |
++| Min clamp (1152×648) | user drags smaller | window clamps; top band (health card + forecast) + QoS + pause chip do not overlap | SetWindowMinSize |
++| Font file missing at load | LoadFontEx fails | fall back to GetFontDefault (belt+braces; file is committed so unreachable in practice) | IsFontValid check |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `app/main.odin` -- window init (flags + min size), `draw_text` (→ DrawTextEx with the app font), HUD math (WIN_W/WIN_H → view dims), title/instructions copy, pause chip position, temp `--shots` capture code (REVERT before PR)
++- `app/render/view.odin` -- `View.font` field, `draw_text_c` (→ DrawTextEx), `load_hud_font()` (render package — shared by app + harness)
++- `app/render/palette.odin` -- derived `state_strain_text`/`state_critical_text` (darkened, for TEXT only)
++- `app/render/forecast.odin` `health.odin` `crisis.odin` -- state-colored text → text variants; health-chip + banner sizes ≥14px
++- `app/qos_panel.odin` -- text sizes ≥14px
++- `app/render/tray.odin` + `app/main.odin` draw_tray -- chip label sizes ≥14px
++- `harness/goldens.odin` -- `render_setup` loads the font (deterministic capture)
++- `assets/fonts/open_sans_regular.ttf` + `assets/fonts/OFL.txt` -- bundled asset + license
++- `goldens/**` -- deliberate T2 re-bless (inventory in PR)
++
++## Tasks & Acceptance
++
++**Execution:**
++- [ ] `assets/fonts/` -- add Open Sans Regular (OFL 1.1) + OFL.txt -- bundled deterministic asset
++- [ ] `app/render/view.odin` -- View.font + load_hud_font() + draw_text_c→DrawTextEx -- one font source
++- [ ] `harness/goldens.odin` -- render_setup loads font -- deterministic T2 text
++- [ ] `app/main.odin` -- init flags/min-size; draw_text→DrawTextEx; HUD math centralization; title+instructions copy; pause chip gap-adaptive; remove temp --shots/F12 code
++- [ ] `app/render/palette.odin` -- text variants for state colors -- contrast
++- [ ] `app/render/forecast|health|crisis.odin`, `app/qos_panel.odin`, tray -- sizes ≥14px + text variants
++- [ ] `goldens/` -- deliberate T2 re-bless for text-bearing demos; T1 verified unshifted
++- [ ] `_pr_body.md` (new file, NOT the tracked one) -- before/after screenshots + font/license + contrast table + resize approach + min clamp + golden inventory + Decisions & rationale
++
++**Acceptance Criteria:**
++- Given the app window, when it launches, then HUD text renders in the bundled font with nothing below ~14px at 1280×720 and no top-band overlap (title/instructions clear the health card).
++- Given the app window, when the user drags any corner, then the window resizes (world re-fits; HUD re-anchors), and at 1280×720 / ~1600×900 / min clamp 1152×648 / a non-16:9 drag the pause edge-chip + QoS panel + weather report do not overlap.
++- Given `tools/harness.sh run`, then all 28 demos pass; T1 hashes byte-identical to pre-change; every re-blessed T2 is listed in the PR body.
++- Given the PR, then it carries before/after screenshots (font close-ups at HUD sizes; resize at default/1600×900/min/non-16:9), the font choice + license, the contrast numbers, the min-clamp value, the golden inventory, and a Decisions & rationale section.
++
++## Spec Change Log
++
++## Design Notes
++
++- **Font**: Open Sans (SIL OFL 1.1) instanced to static Regular via fonttools (variable → static, 130KB). Strong x-height + open counters; the prototype's own font story (system TTF candidates) proves TTF-at-64px + DrawTextEx works in both GPU + rlsw. Atlas generation (stb_truetype) is deterministic given the file + same raylib; verified by re-running the harness after re-bless.
++- **HUD text sizing**: every draw_text/draw_text_c size < 14 raised to ≥14 at 1280×720 (tray 11→14, pause chip 12/10→14/12, health chips 12→14, crisis redesign 12→14, QoS preset chips 12→14). Debug overlay (PP_DEBUG-only) untouched.
++- **Contrast**: ink {51,65,79} on canvas {232,221,194} ≈ 9.9:1 (pass). ink_soft {106,112,120} ≈ 4.1:1 — darkened to ~{96,102,110} (≈5:1) for secondary text. state_strain/state_critical used AS TEXT ≈ 1.7–2.2:1 (fail) — new derived `*_text` variants (≈55% darkened) for text only; telegraph colors unchanged for rings/outlines/shapes.
++- **Resize**: `SetConfigFlags({.WINDOW_RESIZABLE})` + `SetWindowMinSize(1152, 648)` before InitWindow (prototype pattern). HUD anchors move to `app.view.win_w/win_h` (single source — view_compute already updates them on IsWindowResized). Min clamp = the narrowest width where the top band fits: health card (460 centered) right edge `W/2+230` < forecast left `W-260` ⇒ W > 980; pause chip needs the gap ⇒ 1152 keeps a ~76px chip slot → adaptive chip (two-line at ≥104px gap, single-line "PAUSED" below).
++- **Title/instructions overlap** (pre-existing at 1280): the 22px title + 16px hint extend under the centered card (measured to x≈869 > card left 411). Fix: shorten title to "Packet Plumber - v2" and hints to ≤~45 chars so they clear the card's left edge at min width too.
++
++## Verification
++
++**Commands:**
++- `tools/lint.sh` -- expected: "lint: all gates green" (ASCII gate 6 covers the new strings)
++- `ODIN_ROOT=/Users/moses/code/packet-plumber/tools/raylib-sw/shadow odin build harness -out:bin/harness -debug && ./bin/harness run` -- expected: 28 demos green; T1 unchanged; T2 fold = only the listed text-bearing demos
++- `./bin/harness run` twice after re-bless -- expected: identical (determinism)
++- `odin build app` -- expected: compiles; `./app.bin --shots <dir> --shots-resize` captures at 1280×720, 1600×900, 1152×648, 1280×800 (temp code, reverted before PR)
++- `git diff --stat` + `git status` -- expected: temp `--shots`/F12 code absent; no accidental commits
++
++**Manual checks (if no CLI):**
++- Screenshots: font close-ups at HUD sizes; resize states with pause chip + QoS panel + weather report; verify no overlap by pixel scan (PIL) at default + min + non-16:9.
+diff --git a/app/main.odin b/app/main.odin
+index 2448435..fa6a486 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -22,6 +22,14 @@ import rl "vendor:raylib"
+ 
+ WIN_W :: 1280
+ WIN_H :: 720
++// 2026-08-15 (v2-ux-font-resize, user report): the window is RESIZABLE again
++// (the prototype's pattern — SetConfigFlags BEFORE InitWindow) with a minimum
++// clamp so the HUD can't collapse. MIN_WIN_W = the narrowest width where the
++// top band fits without overlap: the health card (460px centered) right edge
++// W/2+230 must clear the forecast panel's left edge W-260 => W > 980; the
++// pause chip needs the gap too, so 1152 keeps a >= ~76px slot at the minimum.
++MIN_WIN_W :: 1152
++MIN_WIN_H :: 648
+ 
+ // 4.3 session config — the surge-survival loop: the Network Health meter is
+ // LIVE (health on) + the win is the surge-uptime threshold (win surge 90).
+@@ -160,7 +168,9 @@ main :: proc() {
+ 		}
+ 	}
+ 
++	rl.SetConfigFlags({.WINDOW_RESIZABLE}) // v2-ux-font-resize: the prototype's pattern (before InitWindow)
+ 	rl.InitWindow(WIN_W, WIN_H, "Packet Plumber - v2 story 4.3 (network health + win/lose/retry)")
++	rl.SetWindowMinSize(MIN_WIN_W, MIN_WIN_H) // clamp so the HUD bands can't collapse
+ 	defer rl.CloseWindow()
+ 	rl.SetTargetFPS(60)
+ 
+@@ -215,6 +225,10 @@ main :: proc() {
+ 	app.palette = rnd.palette_load()
+ 	app.view.palette = &app.palette
+ 	app.view.catalogs = &cat
++	// v2-ux-font-resize: the bundled HUD font (Open Sans, assets/fonts) —
++	// loaded once after InitWindow (needs the GL context), same loader as the
++	// harness so app + T2 captures rasterize the same atlas.
++	app.view.font = rnd.load_hud_font()
+ 	rnd.view_compute(&app.view, WIN_W, WIN_H, &cat.balance)
+ 
+ 	tick_seconds := 1.0 / f64(cat.balance.logic_hz)
+@@ -352,12 +366,23 @@ main :: proc() {
+ 			// win_w/2 + 230) and the forecast panel (left edge at win_w - 250):
+ 			// the only top-edge slot free in every state. Computed from win_w
+ 			// so the chip tracks the cards on resize (the same centering math
+-			// as the health card).
+-			chip := rl.Rectangle{f32(app.view.win_w/2 + 240), 12, 120, 38}
++			// v2-ux-font-resize: the chip WIDTH adapts to the gap — two lines
++			// (PAUSED + hint) when the gap >= 104px (the hint needs ~98px +
++			// padding — measured from the rendered 12px line), a single 14px
++			// PAUSED line when it's tighter (the min-clamp window with the
++			// weather report showing leaves a ~76px slot) — it never overlaps
++			// either card.
++			gap_l := f32(app.view.win_w) / 2 + 240 // health card right edge + 10
++			gap_r := f32(app.view.win_w) - 260     // forecast card left edge - 10
++			avail := gap_r - gap_l
++			chip_w := f32(clamp(i32(avail), 64, 120))
++			chip := rl.Rectangle{gap_l, 12, chip_w, 38}
+ 			rl.DrawRectangleRec(chip, rl.Color{238, 230, 210, 255})
+ 			rl.DrawRectangleLinesEx(chip, 1, p.ink_soft)
+-			draw_text(&app, "PAUSED", i32(chip.x) + 8, i32(chip.y) + 4, 12, p.ink_soft)
+-			draw_text(&app, "P/Space to resume", i32(chip.x) + 8, i32(chip.y) + 21, 10, p.ink_soft)
++			draw_text(&app, "PAUSED", i32(chip.x) + 8, i32(chip.y) + 4, 14, p.ink_soft)
++			if avail >= 104 {
++				draw_text(&app, "P/Space to resume", i32(chip.x) + 8, i32(chip.y) + 21, 12, p.ink_soft)
++			}
+ 		}
+ 		draw_hud(&app)
+ 		// 5.7: the debug overlay draws ON TOP of the normal HUD (last pass).
+@@ -482,7 +507,6 @@ handle_input :: proc(app: ^App) {
+ 			app.overlay_on = !app.overlay_on
+ 		}
+ 	}
+-
+ 	// Job B: the assist tier toggle (T) — the R2a graduation control:
+ 	// full -> glow-only -> off -> full. Any engagement with the toggle
+ 	// dismisses the graduation nudge for this run (opt-in, never forced).
+@@ -1081,39 +1105,47 @@ update_preview :: proc(app: ^App) {
+ 
+ draw_hud :: proc(app: ^App) {
+ 	p := app.palette
+-	// title
+-	draw_text(app, "Packet Plumber - v2 story 4.3 (network health + win/lose/retry)", 12, 10, 22, p.ink)
++	// title — v2-ux-font-resize: SHORTENED so it clears the centered health
++	// card's left edge at every width >= the min clamp (the old 58-char title
++	// ran half-hidden UNDER the card at 1280x720 — a pre-existing overlap).
++	draw_text(app, "Packet Plumber - v2", 12, 10, 22, p.ink)
+ 
+ 	// the game-over screen: the WIN/LOSE toast (the terminal-event barrier
+ 	// guarantees exactly one outcome). The world still draws behind it; retry hint.
++	// v2-ux-font-resize: the toast + hint sit BELOW the centered meter card's
++	// band (y 68+/104+) — at the min clamp (1152 wide) the 30px toast (~390px
++	// wide) would run under the card's left edge at the old y 56.
+ 	if app.mode == .Game_Over {
+ 		#partial switch app.state.outcome {
+ 		case .Won:
+ 			// 4.3: the win is the surge-uptime row in this session (the 1.4
+ 			// deliver-N goal is disabled) — the GDD MVP "survive the surge" copy.
+ 			if app.surge_win_pct > 0 {
+-				draw_text(app, "SURGE SURVIVED - YOU WIN", 12, 56, 30, rl.Color{50, 160, 80, 255})
++				draw_text(app, "SURGE SURVIVED - YOU WIN", 12, 68, 30, rl.Color{44, 134, 66, 255})
+ 			} else {
+-				draw_text(app, "PACKET DELIVERED - YOU WIN", 12, 56, 30, rl.Color{50, 160, 80, 255})
++				draw_text(app, "PACKET DELIVERED - YOU WIN", 12, 68, 30, rl.Color{44, 134, 66, 255})
+ 			}
+ 		case .Lost:
+-			draw_text(app, "ERROR 404 - CONNECTION LOST", 12, 56, 30, rl.Color{200, 60, 60, 255})
++			draw_text(app, "ERROR 404 - CONNECTION LOST", 12, 68, 30, rl.Color{184, 52, 52, 255})
+ 		case:
+-			draw_text(app, "RUN OVER", 12, 56, 30, p.ink)
++			draw_text(app, "RUN OVER", 12, 68, 30, p.ink)
+ 		}
+ 		// 4.3: the meter card rides the lose screen too (the empty meter IS the
+ 		// loss mechanic's surface — the bar + pct + chips, never color alone).
+ 		rnd.draw_health_meter(&app.view, &app.state.health, &app.cat, app.state.health_enabled)
+-		draw_text(app, "press R or Enter to retry (fresh run, fresh seed)", 12, 92, 16, p.ink_soft)
++		draw_text(app, "press R or Enter to retry (fresh run, fresh seed)", 12, 104, 16, p.ink_soft)
+ 		return
+ 	}
+ 
+ 	// Run HUD: instructions + the score readout (progress toward the goal).
+ 	// 5.3: the pause binding is part of the one-line control hint (P / Space).
++	// v2-ux-font-resize: hints SHORTENED + dropped to 14px so they fit left of
++	// the centered health card at the min clamp too (the old 88-char hint ran
++	// under the card at 1280x720). The full control list lives in the README.
+ 	if app.placing >= 0 {
+-		draw_text(app, "placement: click the map to drop the router (ESC / right-click / chip to cancel)", 12, 36, 16, p.ink)
++		draw_text(app, "click to place; ESC / right-click cancels", 12, 36, 14, p.ink)
+ 	} else {
+-		draw_text(app, "draw source->router->sink; select a pipe + U previews its upgrade; P / Space pauses", 12, 36, 16, p.ink_soft)
++		draw_text(app, "draw pipes; P / Space pauses; U previews upgrade", 12, 36, 14, p.ink_soft)
+ 	}
+ 	if app.state.goal > 0 {
+ 		score := fmt.tprintf("delivered %d / %d", app.state.score, app.state.goal)
+@@ -1155,11 +1187,17 @@ draw_hud :: proc(app: ^App) {
+ 	// (bottleneck bundle + pipe) + the preventive redesign. Zero pixels when
+ 	// no crisis is active.
+ 	rnd.draw_crisis_banner(&app.view, &app.state.crisis, &app.cat, app.state.era, banner_y)
+-	wb := &app.cat.balance.warnings
+-	hz := i64(max(1, app.cat.balance.logic_hz))
+-	lead_s := fmt.tprintf("node strain ~%ds to critical / node critical ~%ds / pipe ~%ds to saturation - ring + glyph, never color alone",
+-		wb.node_strained_lead_ticks / u64(hz), wb.node_critical_lead_ticks / u64(hz), wb.pipe_pressure_lead_ticks / u64(hz))
+-	draw_text(app, lead_s, 12, 76, 14, p.ink_soft)
++	// v2-ux-font-resize: the strain-legend line is gated on NO active crisis —
++	// while a crisis runs, the centered banner (drawn above, y 58..~122)
++	// would overlap its tail (a pre-existing overlap). The banner + the rings
++	// carry the telegraph during the crisis; the lead times return when calm.
++	if len(app.state.crisis.active) == 0 {
++		wb := &app.cat.balance.warnings
++		hz := i64(max(1, app.cat.balance.logic_hz))
++		lead_s := fmt.tprintf("node strain ~%ds to critical / node critical ~%ds / pipe ~%ds to saturation - ring + glyph, never color alone",
++			wb.node_strained_lead_ticks / u64(hz), wb.node_critical_lead_ticks / u64(hz), wb.pipe_pressure_lead_ticks / u64(hz))
++		draw_text(app, lead_s, 12, 76, 14, p.ink_soft)
++	}
+ 
+ 	// 3.4: the per-class SLA gauges (the launchable increment) — bottom-left
+ 	// block, clear of the top-left run HUD + the QoS readout. Reads the
+@@ -1193,7 +1231,7 @@ draw_hud :: proc(app: ^App) {
+ 	if app.drag.active && app.drag_to != 0 {
+ 		cur := rnd.to_screen(&app.view, app.drag.wx, app.drag.wy)
+ 		if app.drag.valid != .None {
+-			draw_text(app, reject_label(app.drag.valid), i32(cur.x)+12, i32(cur.y)-14, 16, rl.Color{200, 60, 60, 255})
++			draw_text(app, reject_label(app.drag.valid), i32(cur.x)+12, i32(cur.y)-14, 16, rl.Color{184, 52, 52, 255})
+ 		} else if app.assist_mode == .Off || (app.assist_mode == .Full && !(app.preview_live && app.preview.ok)) {
+ 			label := fmt.tprintf("cost %d", app.drag.cost)
+ 			draw_text(app, label, i32(cur.x)+12, i32(cur.y)-14, 16, p.ink)
+@@ -1213,10 +1251,14 @@ draw_hud :: proc(app: ^App) {
+ 	case .Off:
+ 		mode_label = "assist: off (T cycles)"
+ 	}
+-	draw_text(app, mode_label, WIN_W - 320, WIN_H - 24, 14, p.ink_soft)
++	// v2-ux-font-resize: bottom-right anchors move off the WIN_W/WIN_H
++	// constants onto the LIVE view dims (view_compute updates them on resize)
++	// — the constants are the design-resolution init only now. The nudge also
++	// switches to the readable strain-TEXT variant (the raw amber is ~1.4:1).
++	draw_text(app, mode_label, app.view.win_w - 320, app.view.win_h - 24, 14, p.ink_soft)
+ 	if app.nudge_until > 0 && app.tick <= app.nudge_until {
+ 		nudge := fmt.tprintf("tip: you've drawn %d pipes - press T for glow-only assist", app.draws_since_nudge)
+-		draw_text(app, nudge, WIN_W - 320, WIN_H - 44, 14, p.state_strain)
++		draw_text(app, nudge, app.view.win_w - 320, app.view.win_h - 44, 14, rnd.state_strain_text(p))
+ 	}
+ }
+ 
+@@ -1258,7 +1300,7 @@ reject_label :: proc(e: pp.Edit_Error) -> string {
+ // gauges are read-only over the accumulators — the draw never steps the sim.
+ draw_sla_gauges :: proc(app: ^App) {
+ 	p := app.palette
+-	red := rl.Color{200, 60, 60, 255}
++	red := rl.Color{184, 52, 52, 255}
+ 	f := &app.state.flow
+ 	cat := &app.cat
+ 	// Bottom-left block, ABOVE the centered hardware tray (tray chips sit at
+@@ -1266,7 +1308,9 @@ draw_sla_gauges :: proc(app: ^App) {
+ 	// second line grazing the tray's left edge + an unbounded 3rd line going
+ 	// off-screen). Capped at 3 lines: the catalog roster is data-driven and
+ 	// the launchable needs 2; a fuller roster gets a proper panel later.
+-	draw_text(app, "SLA - delivered / dropped / avg ms (tol) / breach", 12, WIN_H - 96, 16, p.ink_soft)
++	// v2-ux-font-resize: anchored to the LIVE view height (the old WIN_H
++	// constant left the block mid-screen after a resize).
++	draw_text(app, "SLA - delivered / dropped / avg ms (tol) / breach", 12, app.view.win_h - 96, 16, p.ink_soft)
+ 	line := 0
+ 	for c in 0..<len(f.sla) {
+ 		if line >= 3 {
+@@ -1304,11 +1348,11 @@ draw_sla_gauges :: proc(app: ^App) {
+ 		gauge := fmt.aprintf("%s  del %d / drop %d (%s) / avg %s%s",
+ 			pt.display, acc.delivered, acc.dropped, loss, avg, markers,
+ 			allocator = context.temp_allocator)
+-		draw_text(app, gauge, 12, WIN_H - 80 + i32(line) * 16, 16, col)
++		draw_text(app, gauge, 12, app.view.win_h - 80 + i32(line) * 16, 16, col)
+ 		line += 1
+ 	}
+ 	if line == 0 {
+-		draw_text(app, "no traffic yet - draw pipes, deliver packets", 12, WIN_H - 80, 16, p.ink_soft)
++		draw_text(app, "no traffic yet - draw pipes, deliver packets", 12, app.view.win_h - 80, 16, p.ink_soft)
+ 	}
+ }
+ 
+@@ -1318,7 +1362,9 @@ draw_text :: proc(app: ^App, txt: string, x, y: i32, size: i32, col: rl.Color) {
+ 		append(&cbuf, u8(c))
+ 	}
+ 	append(&cbuf, 0)
+-	rl.DrawText(cstring(raw_data(cbuf)), x, y, size, col)
++	// v2-ux-font-resize: the bundled HUD font via DrawTextEx (spacing 1 — the
++	// same spacing raylib's DrawText used; only the glyph metrics change).
++	rl.DrawTextEx(app.view.font, cstring(raw_data(cbuf)), {f32(x), f32(y)}, f32(size), 1, col)
+ }
+ 
+ // draw_tray — the 3.5 hardware tray: link chips (tier select) + router chips
+@@ -1339,7 +1385,7 @@ draw_tray :: proc(app: ^App) {
+ 		// a little link glyph in the tier color
+ 		midy := r.y + r.height/2
+ 		rl.DrawLineEx({r.x + 8, midy}, {r.x + 22, midy}, 3, rnd.tier_pipe_color(&app.view, u16(ti)))
+-		draw_text(app, tier.id, i32(r.x) + 26, i32(r.y) + 7, 11, p.ink_soft)
++		draw_text(app, tier.id, i32(r.x) + 26, i32(r.y) + 7, 14, p.ink_soft)
+ 		i += 1
+ 	}
+ 	for k in 0 ..< nr {
+@@ -1353,7 +1399,7 @@ draw_tray :: proc(app: ^App) {
+ 		rl.DrawCircle(i32(r.x + 15), i32(r.y + r.height/2), 6, p.router_body)
+ 		short := nt.id
+ 		if short == "router_basic" { short = "basic" } else if short == "router_mid" { short = "mid" } else if short == "router_high" { short = "high" }
+-		draw_text(app, short, i32(r.x) + 26, i32(r.y) + 7, 11, p.ink_soft)
++		draw_text(app, short, i32(r.x) + 26, i32(r.y) + 7, 14, p.ink_soft)
+ 		i += 1
+ 	}
+ }
+diff --git a/app/qos_panel.odin b/app/qos_panel.odin
+index 1260d21..c82bcef 100644
+--- a/app/qos_panel.odin
++++ b/app/qos_panel.odin
+@@ -395,8 +395,8 @@ draw_qos_panel :: proc(app: ^App) {
+ 	btn0 := "Edit weights" if !manual else "Auto"
+ 	rl.DrawRectangleRounded(a0, 0.3, 4, rl.Color{226, 216, 190, 255})
+ 	rl.DrawRectangleRounded(a1, 0.3, 4, rl.Color{226, 216, 190, 255})
+-	draw_text(app, btn0, i32(a0.x) + 8, i32(a0.y) + 1, 13, p.ink)
+-	draw_text(app, "Revert", i32(a1.x) + 8, i32(a1.y) + 1, 13, p.ink)
++	draw_text(app, btn0, i32(a0.x) + 8, i32(a0.y) + 1, 14, p.ink)
++	draw_text(app, "Revert", i32(a1.x) + 8, i32(a1.y) + 1, 14, p.ink)
+ 
+ 	// the manual editor rows
+ 	if app.qos_editing {
+@@ -404,7 +404,7 @@ draw_qos_panel :: proc(app: ^App) {
+ 		for i in 0..<len(app.cat.balance.lane_presets) {
+ 			chip := qos_preset_chip_rect(app, i32(i))
+ 			rl.DrawRectangleRounded(chip, 0.3, 4, rl.Color{226, 216, 190, 255})
+-			draw_text(app, app.cat.balance.lane_presets[i].display, i32(chip.x) + 5, i32(chip.y) + 1, 12, p.ink)
++			draw_text(app, app.cat.balance.lane_presets[i].display, i32(chip.x) + 5, i32(chip.y) + 1, 14, p.ink)
+ 		}
+ 		// the weight nudges: E [--] 70 [++]  S [--] 30 [++]  B [--] 0 [++]
+ 		short := [3]string{"E", "S", "B"}
+@@ -426,6 +426,6 @@ draw_qos_panel :: proc(app: ^App) {
+ 	// the transient rejection toast (a rejected QoS edit is never silent —
+ 	// e.g. E6's never-drop guard once that content exists)
+ 	if app.last_reject != .None && app.tick - app.reject_tick < 30 {
+-		draw_text(app, reject_label(app.last_reject), QOS_PANEL_X + 10, i32(panel.y + panel.height) - 18, 14, rl.Color{200, 60, 60, 255})
++		draw_text(app, reject_label(app.last_reject), QOS_PANEL_X + 10, i32(panel.y + panel.height) - 18, 14, rl.Color{184, 52, 52, 255})
+ 	}
+ }
+diff --git a/app/render/crisis.odin b/app/render/crisis.odin
+index 271b9b4..dcfbc28 100644
+--- a/app/render/crisis.odin
++++ b/app/render/crisis.odin
+@@ -66,13 +66,16 @@ draw_crisis_banner :: proc(v: ^View, crisis: ^pp.Crisis_State, cat: ^pp.Catalogs
+ 			title = fmt.aprintf("!!  %s: %s ACTIVE - pool exhausted",
+ 				arch, sp_name, allocator = context.temp_allocator)
+ 		}
+-		draw_text_c(v, title, x, ty, 15, p.state_critical)
++		// 2026-08-15 (v2-ux-font-resize): the title draws in the darkened
++		// critical-TEXT variant (the raw telegraph red is ~2.9:1 — a shape
++		// color, illegible as text); the redesign line raised to 14px.
++		draw_text_c(v, title, x, ty, 15, state_critical_text(p^))
+ 		ty += line_h
+ 		redesign := "Add capacity before the countdown ends."
+ 		if int(ac.archetype) < len(cat.crises) {
+ 			redesign = cat.crises[ac.archetype].preventive_redesign
+ 		}
+-		draw_text_c(v, redesign, x, ty, 12, p.ink)
++		draw_text_c(v, redesign, x, ty, 14, p.ink)
+ 		ty += line_h
+ 	}
+ }
+diff --git a/app/render/forecast.odin b/app/render/forecast.odin
+index 7b50fee..2b0ba07 100644
+--- a/app/render/forecast.odin
++++ b/app/render/forecast.odin
+@@ -79,11 +79,14 @@ draw_forecast_panel :: proc(v: ^View, crisis: ^pp.Crisis_State, cat: ^pp.Catalog
+ 				}
+ 			}
+ 			mult := fmt.aprintf("x%d", f.multiplier, allocator = context.temp_allocator)
+-			col := p.state_strain
++			// 2026-08-15 (v2-ux-font-resize): text uses the darkened TEXT
++			// variants — the raw telegraph colors are shape colors (~1.4-2.9:1
++			// on the card), illegible as 14-15px text.
++			col := state_strain_text(p^)
+ 			when_suffix := ""
+ 			if f.active {
+ 				when_suffix = "NOW"
+-				col = p.state_critical
++				col = state_critical_text(p^)
+ 			} else {
+ 				secs := f.countdown_ticks / u64(max(1, cat.balance.logic_hz))
+ 				when_suffix = fmt.aprintf("-%ds", secs, allocator = context.temp_allocator)
+@@ -169,14 +172,14 @@ draw_upgrade_preview :: proc(v: ^View, cat: ^pp.Catalogs, prev: ^Upgrade_Preview
+ 	} else {
+ 		if magnet > 0 {
+ 			m := fmt.aprintf("attracts %d %s", magnet, route_word(magnet), allocator = context.temp_allocator)
+-			draw_text_c(v, m, x, ty, 14, p.state_strain)
++			draw_text_c(v, m, x, ty, 14, state_strain_text(p^))
+ 			ty += line_h
+ 		}
+ 		for i in 0..<nrows {
+ 			line := preview_row_line(rows[i])
+ 			col := p.ink
+ 			if rows[i].kind == .Split {
+-				col = p.state_strain // the tie message is the "look twice" row
++				col = state_strain_text(p^) // the tie message is the "look twice" row
+ 			}
+ 			draw_text_c(v, line, x, ty, 14, col)
+ 			ty += line_h
+diff --git a/app/render/health.odin b/app/render/health.odin
+index 8555461..0e76046 100644
+--- a/app/render/health.odin
++++ b/app/render/health.odin
+@@ -16,7 +16,9 @@ import rl "vendor:raylib"
+ 
+ // HEALTH_CARD_H — the meter card's total height (the crisis banner draws
+ // below it when the meter is live: y = 10 + HEALTH_CARD_H + 6).
+-HEALTH_CARD_H :: i32(52)
++// 2026-08-15: 52 -> 54 to seat the raised 14px chips (the font-resize
++// minimum; the pre-change 12px chips overflowed the old card at 3 rows).
++HEALTH_CARD_H :: i32(54)
+ 
+ // draw_health_meter — the top-center meter card (clear of the top-left run
+ // HUD + the top-right forecast panel). The bar spans 240 px with a 10 px
+@@ -39,15 +41,18 @@ draw_health_meter :: proc(v: ^View, health: ^pp.Health_State, cat: ^pp.Catalogs,
+ 	rl.DrawRectangle(x - pad, y - pad, card_w + 2 * pad, HEALTH_CARD_H, rl.Color{255, 244, 236, 240})
+ 	rl.DrawRectangleLines(x - pad, y - pad, card_w + 2 * pad, HEALTH_CARD_H, p.ink_soft)
+ 
+-	// label + the pct number (the primary read — never color alone)
++	// label + the pct number (the primary read — never color alone).
++	// 2026-08-15 (v2-ux-font-resize contrast audit): the pct NUMBER draws in
++	// the darkened TEXT variants of the state colors (the raw telegraph
++	// colors are ~1.4-2.9:1 on the card — fine for shapes, illegible as text).
+ 	draw_text_c(v, "NETWORK HEALTH", x, y, 15, p.ink)
+ 	pct_txt := fmt.aprintf("%d%%", health.meter_pct, allocator = context.temp_allocator)
+-	col := p.state_healthy
++	col := state_healthy_text(p^)
+ 	if health.meter_pct < 60 {
+-		col = p.state_strain
++		col = state_strain_text(p^)
+ 	}
+ 	if health.meter_pct < 30 {
+-		col = p.state_critical
++		col = state_critical_text(p^)
+ 	}
+ 	draw_text_c(v, pct_txt, x + card_w - 48, y, 15, col)
+ 
+@@ -65,8 +70,10 @@ draw_health_meter :: proc(v: ^View, health: ^pp.Health_State, cat: ^pp.Catalogs,
+ 
+ 	// the per-class chips: countdowns + the drain state. One line per class
+ 	// with an active grace or breach (class-id order — deterministic).
++	// 2026-08-15: 12px -> 14px (the font-resize minimum); rows start at y+2
++	// so the tallest 3-row stack still clears the crisis banner below.
+ 	chip_x := x + bar_w + 14
+-	chip_y := y + 4
++	chip_y := y + 2
+ 	hz := i32(max(1, cat.balance.logic_hz))
+ 	for c in 0..<len(health.grace) {
+ 		if c >= len(cat.packet_types) {
+@@ -78,14 +85,14 @@ draw_health_meter :: proc(v: ^View, health: ^pp.Health_State, cat: ^pp.Catalogs,
+ 		if health.grace[c].grace_left > 0 {
+ 			secs := i32(health.grace[c].grace_left) / hz
+ 			chip = fmt.aprintf("%s grace %ds", pt.display, secs, allocator = context.temp_allocator)
+-			chip_col = p.state_strain
++			chip_col = state_strain_text(p^)
+ 		} else if c < len(health.breach) && health.breach[c] {
+ 			chip = fmt.aprintf("%s BREACHED", pt.display, allocator = context.temp_allocator)
+-			chip_col = p.state_critical
++			chip_col = state_critical_text(p^)
+ 		} else {
+ 			continue // healthy + no countdown — no chip (zero extra pixels)
+ 		}
+-		draw_text_c(v, chip, chip_x, chip_y, 12, chip_col)
++		draw_text_c(v, chip, chip_x, chip_y, 14, chip_col)
+ 		chip_y += 15
+ 	}
+ }
+diff --git a/app/render/palette.odin b/app/render/palette.odin
+index 7babf6b..08a042c 100644
+--- a/app/render/palette.odin
++++ b/app/render/palette.odin
+@@ -66,7 +66,7 @@ palette_load :: proc(source: []byte = DEFAULT_PALETTE_JSON) -> Palette {
+ 	p.canvas = jcol(obj, "canvas", {232, 221, 194, 255})
+ 	p.grid = jcol(obj, "grid", {194, 182, 148, 255})
+ 	p.ink = jcol(obj, "ink", {51, 65, 79, 255})
+-	p.ink_soft = jcol(obj, "ink_soft", {106, 112, 120, 255})
++	p.ink_soft = jcol(obj, "ink_soft", {92, 98, 106, 255})
+ 	if arr, ok := obj["house_bodies"].(json.Array); ok && len(arr) == 4 {
+ 		for i in 0..<4 {
+ 			if q, okq := arr[i].(json.Array); okq { p.house_bodies[i] = jcol_arr(q, {232, 90, 74, 255}) }
+@@ -133,7 +133,7 @@ fallback_palette :: proc() -> Palette {
+ 	p.canvas = {232, 221, 194, 255}
+ 	p.grid = {194, 182, 148, 255}
+ 	p.ink = {51, 65, 79, 255}
+-	p.ink_soft = {106, 112, 120, 255}
++	p.ink_soft = {92, 98, 106, 255}
+ 	p.house_bodies = {{232, 90, 74, 255}, {242, 201, 76, 255}, {94, 203, 107, 255}, {74, 155, 226, 255}}
+ 	p.house_roofs = {{122, 46, 38, 255}, {122, 84, 24, 255}, {44, 106, 52, 255}, {38, 80, 126, 255}}
+ 	p.host_body = {62, 120, 208, 255}
+@@ -183,3 +183,26 @@ jcol_arr :: proc(arr: json.Array, def: rl.Color) -> rl.Color {
+ 	}
+ 	return c
+ }
++
++// state_strain_text / state_critical_text — the warning-triad colors DARKENED
++// for TEXT (2026-08-15, v2-ux-font-resize contrast audit). The telegraph
++// colors themselves ({242,181,68} / {232,69,69}) are ~1.4:1 / ~2.9:1 on the
++// canvas — fine for RINGS + OUTLINES + SHAPES (the never-color-alone canon
++// carries them with glyphs), illegible as TEXT. The 0.5-scaled variants land
++// at ~4.7:1 (AA) / ~7.8:1 (AAA) on the canvas while staying recognizably in
++// the amber/red family. Derived (no palette.json churn): one place, both the
++// app HUD and the harness-captured panels use them for text-only draws.
++state_strain_text :: proc(p: Palette) -> rl.Color {
++	return {u8(f32(p.state_strain.r) * 0.5), u8(f32(p.state_strain.g) * 0.5), u8(f32(p.state_strain.b) * 0.5), 255}
++}
++
++state_critical_text :: proc(p: Palette) -> rl.Color {
++	return {u8(f32(p.state_critical.r) * 0.5), u8(f32(p.state_critical.g) * 0.5), u8(f32(p.state_critical.b) * 0.5), 255}
++}
++
++// state_healthy_text — same treatment for the healthy-green TEXT (the pct
++// number at >= 60%): the raw {55,214,122} is ~1.7:1 on the card; the 0.5x
++// variant is ~5.8:1.
++state_healthy_text :: proc(p: Palette) -> rl.Color {
++	return {u8(f32(p.state_healthy.r) * 0.5), u8(f32(p.state_healthy.g) * 0.5), u8(f32(p.state_healthy.b) * 0.5), 255}
++}
+diff --git a/app/render/popover.odin b/app/render/popover.odin
+index 47b4e07..d579ecf 100644
+--- a/app/render/popover.odin
++++ b/app/render/popover.odin
+@@ -110,5 +110,5 @@ draw_popover_panel :: proc(v: ^View, r: rl.Rectangle) {
+ draw_demolish_button :: proc(v: ^View, r: rl.Rectangle) {
+ 	rl.DrawRectangleRec(r, rl.Color{250, 232, 228, 255})
+ 	rl.DrawRectangleLinesEx(r, 1, v.palette.state_critical)
+-	draw_text_c(v, "demolish", i32(r.x) + 12, i32(r.y) + 6, 13, v.palette.ink)
++	draw_text_c(v, "demolish", i32(r.x) + 12, i32(r.y) + 6, 14, v.palette.ink) // 14px per the font-resize minimum (was 13)
+ }
+diff --git a/app/render/view.odin b/app/render/view.odin
+index 0f15dbb..46125e6 100644
+--- a/app/render/view.odin
++++ b/app/render/view.odin
+@@ -17,6 +17,13 @@ import rl "vendor:raylib"
+ View :: struct {
+ 	palette:  ^Palette,
+ 	catalogs: ^pp.Catalogs,
++	// 2026-08-15 (v2-ux-font-resize, user report): the HUD font — the bundled
++	// Open Sans Regular (assets/fonts, OFL 1.1), loaded ONCE at init by the app
++	// AND the harness (same file + same raylib path = the same atlas in both,
++	// so T2 goldens stay bit-exact on every platform). The raylib DEFAULT
++	// bitmap font was illegible at HUD sizes on the light canvas. draw_text_c
++	// draws with this font; a nil/invalid font falls back inside load_hud_font.
++	font:     rl.Font,
+ 	win_w:    i32,
+ 	win_h:    i32,
+ 	scale:    f32,
+@@ -417,13 +424,37 @@ draw_building :: proc(v: ^View, id: u32, role: pp.Terminal_Role, c: rl.Vector2)
+ // draw_text_c — the render package's small DrawText helper (the app's
+ // main.odin has its own; the harness capture uses this one). The render
+ // package must not depend on the app package, so the helper lives here.
++// 2026-08-15 (v2-ux-font-resize): draws with the bundled HUD font via
++// DrawTextEx (spacing 1 — the same spacing raylib's DrawText used, so only
++// the glyph METRICS change, never the spacing semantics).
+ draw_text_c :: proc(v: ^View, txt: string, x, y, size: i32, col: rl.Color) {
+ 	cbuf := make([dynamic]u8, 0, len(txt)+1, context.temp_allocator)
+ 	for ch in txt {
+ 		append(&cbuf, u8(ch))
+ 	}
+ 	append(&cbuf, 0)
+-	rl.DrawText(cstring(raw_data(cbuf)), x, y, size, col)
++	rl.DrawTextEx(v.font, cstring(raw_data(cbuf)), {f32(x), f32(y)}, f32(size), 1, col)
++}
++
++// FONT_ASSET — the bundled HUD font (SIL OFL 1.1, license at
++// assets/fonts/OFL.txt). Loaded at app/harness init from the repo root cwd
++// (both run from the root); committed, so the load never depends on a system
++// font — the atlas is byte-deterministic across platforms (the T2 spine).
++FONT_ASSET :: "assets/fonts/open_sans_regular.ttf"
++FONT_BASE_SIZE :: 64 // the atlas size — downscaled to HUD sizes (14-22px)
++
++// load_hud_font — load the bundled Open Sans Regular at FONT_BASE_SIZE with
++// bilinear filtering (smooth at HUD sizes; the prototype's font story used
++// the same LoadFontEx(…, 64, …) + BILINEAR recipe). Fallback: the raylib
++// default font (belt+braces — the asset is committed, so the fallback is
++// unreachable in practice; the prototype kept the same guard).
++load_hud_font :: proc() -> rl.Font {
++	f := rl.LoadFontEx(FONT_ASSET, FONT_BASE_SIZE, nil, 0)
++	if rl.IsFontValid(f) {
++		rl.SetTextureFilter(f.texture, .BILINEAR)
++		return f
++	}
++	return rl.GetFontDefault()
+ }
+ 
+ // ROUTER_TIER_SCALE — the puck size multiplier per port tier (look-book A3:
+diff --git a/assets/fonts/OFL.txt b/assets/fonts/OFL.txt
+new file mode 100644
+index 0000000..d762c3c
+--- /dev/null
++++ b/assets/fonts/OFL.txt
+@@ -0,0 +1,92 @@
++Copyright 2020 The Open Sans Project Authors (https://github.com/googlefonts/opensans)
++
++This Font Software is licensed under the SIL Open Font License, Version 1.1.
++This license is copied below, and is also available with a FAQ at:
++https://scripts.sil.org/OFL
++
++-----------------------------------------------------------
++SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
++-----------------------------------------------------------
++
++PREAMBLE
++The goals of the Open Font License (OFL) are to stimulate worldwide
++development of collaborative font projects, to support the font
++creation efforts of academic and linguistic communities, and to
++provide a free and open framework in which fonts may be shared and
++improved in partnership with others.
++
++The OFL allows the licensed fonts to be used, studied, modified and
++redistributed freely as long as they are not sold by themselves. The
++fonts, including any derivative works, can be bundled, embedded,
++redistributed and/or sold with any software provided that any reserved
++names are not used by derivative works. The fonts and derivatives,
++however, cannot be released under any other type of license. The
++requirement for fonts to remain under this license does not apply to
++any document created using the fonts or their derivatives.
++
++DEFINITIONS
++"Font Software" refers to the set of files released by the Copyright
++Holder(s) under this license and clearly marked as such. This may
++include source files, build scripts and documentation.
++
++"Reserved Font Name" refers to any names specified as such after the
++copyright statement(s).
++
++"Original Version" refers to the collection of Font Software
++components as distributed by the Copyright Holder(s).
++
++"Modified Version" refers to any derivative made by adding to,
++deleting, or substituting -- in part or in whole -- any of the
++components of the Original Version, by changing formats or by porting
++the Font Software to a new environment.
++
++"Author" refers to any designer, engineer, programmer, technical
++writer or other person who contributed to the Font Software.
++
++PERMISSION & CONDITIONS
++Permission is hereby granted, free of charge, to any person obtaining
++a copy of the Font Software, to use, study, copy, merge, embed,
++modify, redistribute, and sell modified and unmodified copies of the
++Font Software, subject to the following conditions:
++
++1) Neither the Font Software nor any of its individual components, in
++Original or Modified Versions, may be sold by itself.
++
++2) Original or Modified Versions of the Font Software may be bundled,
++redistributed and/or sold with any software, provided that each copy
++contains the above copyright notice and this license. These can be
++included either as stand-alone text files, human-readable headers or
++in the appropriate machine-readable metadata fields within text or
++binary files as long as those fields can be easily viewed by the user.
++
++3) No Modified Version of the Font Software may use the Reserved Font
++Name(s) unless explicit written permission is granted by the
++corresponding Copyright Holder. This restriction only applies to the
++primary font name as presented to the users.
++
++4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
++Software shall not be used to promote, endorse or advertise any
++Modified Version, except to acknowledge the contribution(s) of the
++Copyright Holder(s) and the Author(s) or with their explicit written
++permission.
++
++5) The Font Software, modified or unmodified, in part or in whole,
++must be distributed entirely under this license, and must not be
++distributed under any other license. The requirement for fonts to
++remain under this license does not apply to any document created using
++the Font Software.
++
++TERMINATION
++This license becomes null and void if any of the above conditions are
++not met.
++
++DISCLAIMER
++THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
++MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
++OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
++COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
++DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
++OTHER DEALINGS IN THE FONT SOFTWARE.
+diff --git a/assets/fonts/open_sans_regular.ttf b/assets/fonts/open_sans_regular.ttf
+new file mode 100644
+index 0000000..bba741a
+Binary files /dev/null and b/assets/fonts/open_sans_regular.ttf differ
+diff --git a/data/palette.json b/data/palette.json
+index 063baf0..c18c122 100644
+--- a/data/palette.json
++++ b/data/palette.json
+@@ -3,7 +3,7 @@
+   "canvas":        [232, 221, 194, 255],
+   "grid":          [194, 182, 148, 255],
+   "ink":           [51, 65, 79, 255],
+-  "ink_soft":      [106, 112, 120, 255],
++  "ink_soft":      [92, 98, 106, 255],
+   "ink_faint":     [154, 160, 168, 255],
+   "state_healthy": [55, 214, 122, 255],
+   "state_strain":  [242, 181, 68, 255],
+diff --git a/docs/captures/v2-ux-font-resize/after_paused_1280.png b/docs/captures/v2-ux-font-resize/after_paused_1280.png
+new file mode 100644
+index 0000000..a5e7e67
+Binary files /dev/null and b/docs/captures/v2-ux-font-resize/after_paused_1280.png differ
+diff --git a/docs/captures/v2-ux-font-resize/after_resize_1280x800.png b/docs/captures/v2-ux-font-resize/after_resize_1280x800.png
+new file mode 100644
+index 0000000..5f1262d
+Binary files /dev/null and b/docs/captures/v2-ux-font-resize/after_resize_1280x800.png differ
+diff --git a/docs/captures/v2-ux-font-resize/after_resize_1600x900.png b/docs/captures/v2-ux-font-resize/after_resize_1600x900.png
+new file mode 100644
+index 0000000..2881742
+Binary files /dev/null and b/docs/captures/v2-ux-font-resize/after_resize_1600x900.png differ
+diff --git a/docs/captures/v2-ux-font-resize/after_resize_min_1152x648.png b/docs/captures/v2-ux-font-resize/after_resize_min_1152x648.png
+new file mode 100644
+index 0000000..7ceb342
+Binary files /dev/null and b/docs/captures/v2-ux-font-resize/after_resize_min_1152x648.png differ
+diff --git a/docs/captures/v2-ux-font-resize/after_run_1280.png b/docs/captures/v2-ux-font-resize/after_run_1280.png
+new file mode 100644
+index 0000000..19f4559
+Binary files /dev/null and b/docs/captures/v2-ux-font-resize/after_run_1280.png differ
+diff --git a/docs/captures/v2-ux-font-resize/before_run_1280.png b/docs/captures/v2-ux-font-resize/before_run_1280.png
+new file mode 100644
+index 0000000..4abbe22
+Binary files /dev/null and b/docs/captures/v2-ux-font-resize/before_run_1280.png differ
+diff --git a/docs/captures/v2-ux-font-resize/font_closeup_sla.png b/docs/captures/v2-ux-font-resize/font_closeup_sla.png
+new file mode 100644
+index 0000000..c431f83
+Binary files /dev/null and b/docs/captures/v2-ux-font-resize/font_closeup_sla.png differ
+diff --git a/docs/captures/v2-ux-font-resize/font_closeup_title.png b/docs/captures/v2-ux-font-resize/font_closeup_title.png
+new file mode 100644
+index 0000000..f0c9df8
+Binary files /dev/null and b/docs/captures/v2-ux-font-resize/font_closeup_title.png differ
+diff --git a/docs/captures/v2-ux-font-resize/font_closeup_tray.png b/docs/captures/v2-ux-font-resize/font_closeup_tray.png
+new file mode 100644
+index 0000000..347b33d
+Binary files /dev/null and b/docs/captures/v2-ux-font-resize/font_closeup_tray.png differ
+diff --git a/goldens/forecast_preview/30000ms.png b/goldens/forecast_preview/30000ms.png
+index 1b99879..443bd89 100644
+Binary files a/goldens/forecast_preview/30000ms.png and b/goldens/forecast_preview/30000ms.png differ
+diff --git a/goldens/forecast_preview/31000ms.png b/goldens/forecast_preview/31000ms.png
+index ea57573..3b842fa 100644
+Binary files a/goldens/forecast_preview/31000ms.png and b/goldens/forecast_preview/31000ms.png differ
+diff --git a/goldens/forecast_preview/32000ms.png b/goldens/forecast_preview/32000ms.png
+index ec2605e..302a285 100644
+Binary files a/goldens/forecast_preview/32000ms.png and b/goldens/forecast_preview/32000ms.png differ
+diff --git a/goldens/forecast_preview/33000ms.png b/goldens/forecast_preview/33000ms.png
+index 3a9a99c..f3f9578 100644
+Binary files a/goldens/forecast_preview/33000ms.png and b/goldens/forecast_preview/33000ms.png differ
+diff --git a/goldens/growth/15000ms.png b/goldens/growth/15000ms.png
+index 2d1ec4d..58473d4 100644
+Binary files a/goldens/growth/15000ms.png and b/goldens/growth/15000ms.png differ
+diff --git a/goldens/growth/45000ms.png b/goldens/growth/45000ms.png
+index f3c7a31..4075a75 100644
+Binary files a/goldens/growth/45000ms.png and b/goldens/growth/45000ms.png differ
+diff --git a/goldens/growth/88000ms.png b/goldens/growth/88000ms.png
+index ff45144..4c3c87f 100644
+Binary files a/goldens/growth/88000ms.png and b/goldens/growth/88000ms.png differ
+diff --git a/goldens/health_lose/05000ms.png b/goldens/health_lose/05000ms.png
+index 19b5584..db2e107 100644
+Binary files a/goldens/health_lose/05000ms.png and b/goldens/health_lose/05000ms.png differ
+diff --git a/goldens/health_lose/21000ms.png b/goldens/health_lose/21000ms.png
+index 4b42da0..f4a3565 100644
+Binary files a/goldens/health_lose/21000ms.png and b/goldens/health_lose/21000ms.png differ
+diff --git a/goldens/health_lose/23000ms.png b/goldens/health_lose/23000ms.png
+index 35c2e16..7268818 100644
+Binary files a/goldens/health_lose/23000ms.png and b/goldens/health_lose/23000ms.png differ
+diff --git a/goldens/health_win/150500ms.png b/goldens/health_win/150500ms.png
+index c3a2677..b16335a 100644
+Binary files a/goldens/health_win/150500ms.png and b/goldens/health_win/150500ms.png differ
+diff --git a/goldens/health_win/30000ms.png b/goldens/health_win/30000ms.png
+index 0d96e56..1e5dd1d 100644
+Binary files a/goldens/health_win/30000ms.png and b/goldens/health_win/30000ms.png differ
+diff --git a/goldens/health_win/75000ms.png b/goldens/health_win/75000ms.png
+index 8a102e9..d17e408 100644
+Binary files a/goldens/health_win/75000ms.png and b/goldens/health_win/75000ms.png differ
+diff --git a/goldens/lose/03000ms.png b/goldens/lose/03000ms.png
+index 7d6b7ce..e76af2c 100644
+Binary files a/goldens/lose/03000ms.png and b/goldens/lose/03000ms.png differ
+diff --git a/goldens/pause/65000ms.png b/goldens/pause/65000ms.png
+index c0df493..843576c 100644
+Binary files a/goldens/pause/65000ms.png and b/goldens/pause/65000ms.png differ
+diff --git a/goldens/pause/80000ms.png b/goldens/pause/80000ms.png
+index dcfb48c..c6ba1b9 100644
+Binary files a/goldens/pause/80000ms.png and b/goldens/pause/80000ms.png differ
+diff --git a/goldens/qos/65000ms.png b/goldens/qos/65000ms.png
+index 495ccba..aef91c8 100644
+Binary files a/goldens/qos/65000ms.png and b/goldens/qos/65000ms.png differ
+diff --git a/goldens/surge/119500ms.png b/goldens/surge/119500ms.png
+index fe40b20..c0821c8 100644
+Binary files a/goldens/surge/119500ms.png and b/goldens/surge/119500ms.png differ
+diff --git a/goldens/surge/149000ms.png b/goldens/surge/149000ms.png
+index 4797fdc..4d25cde 100644
+Binary files a/goldens/surge/149000ms.png and b/goldens/surge/149000ms.png differ
+diff --git a/goldens/surge/30000ms.png b/goldens/surge/30000ms.png
+index 260bae9..6dce48c 100644
+Binary files a/goldens/surge/30000ms.png and b/goldens/surge/30000ms.png differ
+diff --git a/goldens/surge/65000ms.png b/goldens/surge/65000ms.png
+index eb0935b..434e883 100644
+Binary files a/goldens/surge/65000ms.png and b/goldens/surge/65000ms.png differ
+diff --git a/goldens/warn/01500ms.png b/goldens/warn/01500ms.png
+index 6ddf89c..9d3b5b9 100644
+Binary files a/goldens/warn/01500ms.png and b/goldens/warn/01500ms.png differ
+diff --git a/goldens/warn/45000ms.png b/goldens/warn/45000ms.png
+index 841b088..d58329f 100644
+Binary files a/goldens/warn/45000ms.png and b/goldens/warn/45000ms.png differ
+diff --git a/goldens/warn/65000ms.png b/goldens/warn/65000ms.png
+index 0e7ef5b..e28eb78 100644
+Binary files a/goldens/warn/65000ms.png and b/goldens/warn/65000ms.png differ
+diff --git a/harness/goldens.odin b/harness/goldens.odin
+index 40e2ba4..82bde3c 100644
+--- a/harness/goldens.odin
++++ b/harness/goldens.odin
+@@ -29,12 +29,17 @@ Render_Ctx :: struct {
+ 	ready:   bool,
+ }
+ 
+-// render_setup — load the palette + compute the camera-fit view. Does NOT init
+-// raylib (the caller inits the window once for the whole harness run).
++// render_setup — load the palette + the bundled HUD font + compute the
++// camera-fit view. Does NOT init raylib (the caller inits the window once for
++// the whole harness run). 2026-08-15 (v2-ux-font-resize): loads the SAME
++// bundled font as the app (load_hud_font) so the rlsw T2 captures rasterize
++// the same atlas — deterministic across platforms (the asset is committed;
++// no system-font reads).
+ render_setup :: proc(rc: ^Render_Ctx, cat: ^pp.Catalogs) {
+ 	rc.palette = rnd.palette_load()
+ 	rc.view.palette = &rc.palette
+ 	rc.view.catalogs = cat
++	rc.view.font = rnd.load_hud_font()
+ 	rnd.view_compute(&rc.view, 1280, 720, &cat.balance)
+ 	rc.ready = true
+ }

@@ -1,0 +1,4 @@
+#!/bin/bash
+cd /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1
+pi -p --model deepseek/deepseek-v4-flash --no-session --name "mm-blind-r1" "You are the 'blind' code-review lens (Perkins automated review round 1 of PR #604). Read the lens brief at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1/lens-briefs/blind.md and follow its instructions EXACTLY. The ONLY thing you may read is the diff at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1/diff.patch — reading anything beyond it (worktree, specs, project files) invalidates your lens. Write ONLY your JSON array to /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1/blind.json and stop. Accuracy over volume; [] is an honest answer when nothing is wrong."
+echo "blind_DONE_0"

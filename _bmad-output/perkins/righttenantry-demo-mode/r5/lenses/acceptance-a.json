@@ -1,0 +1,152 @@
+[
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "state-hygiene",
+    "title": "still present since round 4: demo exit from a dirty edit page clears demo state BEFORE the unsaved-changes guard fires",
+    "location": "client/src/client.gleam:493-497, 5405-5418",
+    "evidence": "client.gleam:493-497: `_, True ->\n          case is_public_route(route) {\n            True ->\n              // Exiting the demo must clear every demo-populated store field\n              // — a stale Success(vacancies) would leak the fake vacancies\n              // onto a real landlord's dashboard after signup.\n              handle_browser_change(model |> model.clear_demo_state, uri, route)` ; client.gleam:5405-5415 (inside handle_browser_change, i.e. AFTER the clear): `let #(updated_model, eff) = case model.route, route {\n    routes.VacancyEdit(edit_id), r ->\n      case r {\n        routes.VacancyEdit(_) -> #(updated_model, eff)\n        _ ->\n          case model.vacancy_edit_has_unsaved_changes {\n            True -> #(\n              Model(\n                ..updated_model,\n                route: model.route,\n                show_unsaved_changes_prompt: True,`",
+    "detail": "Guard runs on the cleared model: the prompt offers to stay on VacancyEdit(\"v-…\") whose demo store is already destroyed and demo_mode is False.",
+    "recommended_fix": "On demo exits, run the dirty-edit guard against the pre-clear model (or skip the guard entirely — demo data is contractually disposable)."
+  },
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "still present since round 4: demo dispatch arms remain unpinned — refcheck trio (UserChoseRefcheckAction/UserConfirmedRefcheckAction/UserSavedRefcheckEdit), single mark-read, edit deep-link get_for_edit, mark-opened threading",
+    "location": "client/test/client_test.gleam:6400,6461,6631; client/test/demo/demo_flow_test.gleam:469-476",
+    "evidence": "client_test.gleam:6400: `let m = refcheck_detail_model([refcheck_call(\"rc-1\", reference_call.Queued)])` — grep for `demo_mode: True` in client_test.gleam returns no matches (all refcheck dispatch tests are non-demo); demo_flow_test.gleam:471-476: `let #(after_skip, _) =\n    demo_store.refcheck_action(\n      store,\n      \"v-maples\",\n      \"a-tom\",\n      \"rc-tom-employer\",\n      \"skip\",\n    )` (store-level only); grep for ApiReturnedApplicationOpened|get_for_edit|UserClickedNotification in client/test/demo/ returns no matches.",
+    "detail": "demo_update.gleam's demo arms for the refcheck messages (481-505), single mark-read (551-554) and mark-opened threading have zero dispatch coverage — reverting their store threading stays green.",
+    "recommended_fix": "Drive each arm through client.update from a demo model (the demo_mark_all_read pattern), one pin per arm."
+  },
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "no-network",
+    "title": "update()'s policy-refetch wrapper lacks the demo guard its sibling has — a pre-entry in-flight 428 can fire a real /me while demo_mode is True, and the lint passes the site on the dispatcher's unrelated demo_mode case",
+    "location": "client/src/client.gleam:265-266, 286-297, 310-311, 468",
+    "evidence": "client.gleam:265-266: `let #(next_model, next_effect) = case model.demo_mode {\n    True -> demo_update.handle(model, msg, update_inner)` ; client.gleam:286-297: `let #(next_model, next_effect) = case\n    should_refetch_session_for_policy_gate(\n      was_modal_open,\n      msg_triggered_policy_reaccept(msg),\n    )\n  {\n    False -> #(next_model, next_effect)\n    True -> #(\n      next_model,\n      effect.batch([next_effect, auth_api.check_session(ApiReturnedSession)]),\n    )\n  }` (no demo_mode term) ; client.gleam:310-311: `let #(next_model, next_effect) = case\n    auth_became_success && !next_model.demo_mode\n  {` ; client.gleam:468: `ApiReturnedVacancyDetail(Error(e)) -> check(e)`",
+    "detail": "An authed landlord entering demo with a gated request in flight that 428s (mid-session policy bump, was_modal_open False) dispatches a policy-reject message; the wrapper fires real check_session in demo. The lint credits fn update's dispatcher `case model.demo_mode` — which does not guard this call site.",
+    "recommended_fix": "Add `&& !next_model.demo_mode` to the wrapper condition (mirroring auth_became_success). Consider excluding fn update's dispatcher case from guard matching for later call sites."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "error-handling",
+    "title": "still present since round 4: failed demo seed desyncs model.route (Landing) from the browser URL — no navigation effect, no toast (reset_demo's Error arm was fixed; enter_demo's was not)",
+    "location": "client/src/client.gleam:5885-5888; contrast client/src/demo/demo_update.gleam:734-736",
+    "evidence": "client.gleam:5885-5888: `Error(_) -> #(\n      Model(..model, route: routes.Landing, demo_mode: False, demo_store: None),\n      effect.none(),\n    )` ; demo_update.gleam:734-736 (the fixed sibling): `Error(_) -> {\n      let #(toast_model, toast_eff) =\n        demo_not_in_demo_toast(model, copy.demo_reset_failed)`",
+    "detail": "On seed failure the URL still shows /vacancies/v-maples while the model renders Landing — refresh behaves differently than the live route.",
+    "recommended_fix": "Mirror reset_demo's W16 fix: brand-voice toast plus modem.push(\"/\", …) on the Error arm."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "analytics",
+    "title": "still present since round 4: deep-link demo boots fire only demo_entry — per-surface analytics undercount the primary entry path",
+    "location": "client/src/client.gleam:5813, 5233, 5339, 5367, 5453, 236-239",
+    "evidence": "client.gleam:5813 (enter_demo's only capture): `demo_analytics.capture_event(demo_analytics.demo_entry)` ; surface captures exist only inside handle_browser_change — 5233: `demo_analytics.capture_event(demo_analytics.demo_vacancy_open)`, 5339: `demo_analytics.capture_event(demo_analytics.demo_application_open)`, 5367: `demo_analytics.capture_event(demo_analytics.demo_archived_open)` ; boot path bypasses it, client.gleam:237-239: `let #(demo_model, demo_eff) = enter_demo(base_model, route)`",
+    "detail": "Deep-link entry (init and the W8 nav re-entry) never passes through handle_browser_change, so the landing surface's open event is never counted.",
+    "recommended_fix": "Capture the route's surface event inside demo_entry_effects (or enter_demo) for the deep-linked route."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "data-isolation",
+    "title": "still present since round 4: comparison deep link passes persisted real sessionStorage ids into the demo store, skipping the empty-ids guard",
+    "location": "client/src/client.gleam:5917-5924",
+    "evidence": "client.gleam demo_entry_effects: `routes.Comparison(vid) -> [\n      demo_api.fetch_comparison(\n        store,\n        vid,\n        load_comparison_ids(),\n        ApiReturnedComparisonDetails,\n      ),\n    ]` (load_comparison_ids reads the real \"rt_comparison_ids\" sessionStorage, see save_comparison_ids at client.gleam:6741-6748: `case storage.session() {`)",
+    "detail": "Real comparison ids (real application UUIDs) leak into the demo store's comparison resolution on a deep-linked /vacancies/v-…/compare boot.",
+    "recommended_fix": "Seed the demo comparison from fixture ids (or pass []) instead of load_comparison_ids() in demo_entry_effects."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "ux-fidelity",
+    "title": "still present since round 4: edit deep-link boot renders the empty editable form for the first frame (no vacancy_edit_loading)",
+    "location": "client/src/client.gleam:5878-5880; client/src/pages/vacancy_edit.gleam:22-24",
+    "evidence": "client.gleam:5878-5880 (enter_demo sets the id but never the loading flag): `// A deep-linked demo edit page needs its id set so the\n          // get_for_edit response is accepted and the form can load.\n          vacancy_edit_id: edit_id,` ; vacancy_edit.gleam:22-24: `case model.vacancy_edit_loading {\n        True -> view_loading_skeleton()\n        False ->`",
+    "detail": "First frame of /vacancies/v-maples/edit shows the blank form (real ids flash empty fields) before the store response lands.",
+    "recommended_fix": "Set vacancy_edit_loading: True in enter_demo when route is VacancyEdit, like handle_browser_change does."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "lifecycle",
+    "title": "still present since round 4: demo boot skips the visibility-refresh listener and localStorage hydrations for the page lifetime",
+    "location": "client/src/client.gleam:236-259",
+    "evidence": "client.gleam:236-240: `True -> {\n      let #(demo_model, demo_eff) = enter_demo(base_model, route)\n      #(demo_model, effect.batch([modem.init(BrowserChangedUrl), demo_eff]))\n    }` — listen_visibility_refresh(), hydrate_dismissed_sweep_nudges_effect() and hydrate_refcheck_explainer_dismissed_effect() are batched only in the False branch (client.gleam:242-258)",
+    "detail": "After exiting the demo via nav, the listeners are never installed for the page's remaining lifetime — real-mode behaviour differs from a normal boot.",
+    "recommended_fix": "Install the background listeners on demo exit (or batch them in init unconditionally, guarding their effects on demo_mode)."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "persistence",
+    "title": "still present since round 4: demo comparison ids and sweep-nudge dismissals write to real web storage",
+    "location": "client/src/client.gleam:3545-3546, 4953-4957, 6741-6742",
+    "evidence": "client.gleam:3545-3546: `let new_ids = list.filter(ids, fn(x) { x != id })\n          save_comparison_ids(new_ids)` ; client.gleam:4953-4957: `UserDismissedSweepNudge(application_id) -> {\n      let updated_dismissed =\n        set.insert(model.dismissed_sweep_nudges, application_id)\n      save_dismissed_sweep_nudges(set.to_list(updated_dismissed))` ; client.gleam:6741-6742: `fn save_comparison_ids(ids: List(String)) -> Nil {\n  case storage.session() {` — neither arm is in DEMO_INTERCEPTED, so both run in demo mode",
+    "detail": "Demo actions persist to real sessionStorage — spec says \"no persistence of any kind\"; a later real session inherits demo-written ids/dismissals.",
+    "recommended_fix": "Guard the save_* calls with model.demo_mode (skip writes in demo), mirroring the fetch-side demo branches."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "no-network",
+    "title": "still present since round 4: latent policy re-acceptance modal could surface in demo and fire a real accept_policy POST (UserAcceptedPolicy is EXEMPT_ARMS, not intercepted)",
+    "location": "client/src/client.gleam:1375-1384; scripts/lint_demo_network.py:62-63; client/src/demo/demo_fixtures.gleam:26",
+    "evidence": "client.gleam:1375-1384: `UserAcceptedPolicy ->\n      case model.policy_reaccept_loading {\n        True -> #(model, effect.none())\n        False -> #(\n          Model(..model, policy_reaccept_loading: True),\n          auth_api.accept_policy(` ; lint_demo_network.py:62-63: `\"UserAcceptedPolicy\",\n    \"ApiReturnedAcceptPolicy\",` ; demo_fixtures.gleam:26: `\"accepted_policy_version\":\"2026-05-23\"`",
+    "detail": "Latent until a real policy bump: an authed landlord entering demo carries a newer server_policy_version, the modal renders, and accepting fires a real POST with the demo csrf.",
+    "recommended_fix": "Intercept UserAcceptedPolicy in demo_update.handle (no-op with the settings notice), or force server_policy_version to the fixture's on demo entry."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "state-hygiene",
+    "title": "still present since round 4: enter_demo bypasses the full navigation reset — no polling cancellation, no landing-video reset, no focus-trap uninstall",
+    "location": "client/src/client.gleam:5840-5861 vs 5088, 5099-5100",
+    "evidence": "handle_browser_change resets (client.gleam:5088: `landing_intro_video_playing: False,` ; 5099-5100: `payment_polling: None,\n      payment_poll_count: 0,`) are absent from enter_demo's reset block (5840-5861), which resets only dropdowns/confirms/modals/checkout fields and fires no `policy_reaccept_modal_focus.uninstall()` effect",
+    "detail": "Entering demo from a payment-polling or popover-open page carries that state into the sandbox; comment claims it mirrors handle_browser_change but doesn't fully.",
+    "recommended_fix": "Reset payment_polling/payment_poll_count/scoring_generation/landing_intro_video_playing and uninstall the focus trap in enter_demo."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "still present since round 4: unreachable routes.Demo arm in view_protected_page duplicates the demo render",
+    "location": "client/src/client.gleam:6628-6632",
+    "evidence": "client.gleam:6628-6632: `// Dead by construction: view_protected_page is only entered for\n    // non-demo routes (Demo is rendered ungated in view_page), but the\n    // compiler needs the arm for exhaustiveness.\n    routes.Demo -> dashboard.view_dashboard(model)\n    routes.Dashboard -> dashboard.view_dashboard(model)`",
+    "detail": "Dead-by-construction arm duplicates view_demo_page's body; must be kept manually in sync if the demo dashboard render changes.",
+    "recommended_fix": "Render element.none() (or a shared helper both call) in the exhaustive-but-dead arm instead of duplicating the dashboard render."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "still present since round 4: dead routes.Dashboard arms in enter_demo/demo_entry_effects — Dashboard never reaches enter_demo",
+    "location": "client/src/client.gleam:5866-5872, 5897-5899",
+    "evidence": "client.gleam:5866-5872: `vacancies: case route {\n            routes.Demo | routes.Dashboard -> Loading\n            _ -> NotAsked\n          },\n          dashboard_stats: case route {\n            routes.Demo | routes.Dashboard -> Loading\n            _ -> NotAsked\n          },` ; 5897-5899: `routes.Demo | routes.Dashboard -> [\n      demo_api.list_vacancies(store, ApiReturnedDashboardData),\n    ]` — enter_demo's call sites (227 init is_demo_route, 491 routes.Demo-False, 505 is_demo_route) never pass routes.Dashboard (is_demo_route returns False for it)",
+    "detail": "The Dashboard halves of these arms are unreachable; is_demo_route deliberately excludes Dashboard, so the branches mislead readers.",
+    "recommended_fix": "Drop `| routes.Dashboard` from both cases (keep routes.Demo), or document why the defensive arm stays."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "coupling",
+    "title": "still present since round 4: download_timeout duplicated between client.gleam and demo_update.gleam (store_of half now fully delegated)",
+    "location": "client/src/client.gleam:6923; client/src/demo/demo_update.gleam:858-860",
+    "evidence": "client.gleam:6923: `fn download_timeout(analysis_id: String, delay_ms: Int) -> Effect(Msg) {` ; demo_update.gleam:858-860: `/// 90s download timeout — mirrors client.gleam's \\`download_timeout\\` so a\n/// stalled store response can't wedge the button.\nfn download_timeout(id: String) -> Effect(Msg) {` (demo_store_of now delegates: client.gleam:5952-5956 `demo_update.store_of(model)`)",
+    "detail": "Two implementations of the same timeout must be kept in sync by hand; the store_of duplication was fixed but this one remains.",
+    "recommended_fix": "Make demo_update call a shared pub'd helper (or client.gleam's) instead of mirroring it."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "still present since round 4 (pin half of the mark-all-read finding): the model-level unread_count pin is vacuous — demo_model() starts at unread_count 0",
+    "location": "client/test/demo/demo_flow_test.gleam:594-605, 29-38; client/src/model.gleam:695; client/src/demo/demo_update.gleam:570",
+    "evidence": "demo_flow_test.gleam:594-605: `let m = demo_model()\n  let #(after, _) = client.update(m, msg.UserClickedMarkAllRead)\n  ...\n  after.unread_count |> should.equal(0)` ; demo_model() (29-38) builds `..model.initial()` whose default is model.gleam:695 `unread_count: 0,` ; the fix under test is demo_update.gleam:570 `#(Model(..model, demo_store: Some(next), unread_count: 0), eff)`",
+    "detail": "The optimistic unread_count fix landed (code verified) but reverting it stays green — the pin starts at 0, so 0→0 can't fail. Store-level asserts do bite.",
+    "recommended_fix": "Start the pin from unread_count: 2 (like demo_exit_clears_demo_data_test) so the optimistic clear is asserted."
+  }
+]

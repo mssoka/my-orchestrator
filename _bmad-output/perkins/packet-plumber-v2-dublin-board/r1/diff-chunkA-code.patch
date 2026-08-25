@@ -1,0 +1,2101 @@
+diff --git a/README.md b/README.md
+index 61045099..38ab5cb3 100644
+--- a/README.md
++++ b/README.md
+@@ -12,13 +12,22 @@ proven-fun Godot prototype is preserved at the `prototype-fun-gate` tag
+ ## Build & play
+ 
+ ```bash
+-odin run app            # play (dev)
++odin run app            # play (dev) — boots the DUBLIN board (the real-maps arc: data/maps/dublin.json underlay)
++PP_MAP=procedural odin run app   # the named map tunable: flip back to the noise map
+ odin build app          # produce the binary
+ tools/run-dev.sh        # build + run the same app (D toggles the NOC drop-diagnosis panel — a runtime toggle, default available; the panel is OFF until D)
+ tools/run-dev.sh --e2e  # mechanical proof: scripted D presses + ON/OFF captures in a real run (bin/noc-e2e-*.png)
+ odin test core          # the determinism/fairness contract tests
+ ```
+ 
++The board (map source = dublin — the default for interactive runs) is the
++baked Dublin cross-section (data/maps/dublin.json, © OpenStreetMap
++contributors, ODbL — the credit renders bottom-left of the board). Growth
++spawns land on the board's real-street tiles at the 1-in-6 density; the map
++source is a named determinism input (demos pin it with `map dublin` /
++`map procedural` in their `.dem` header — absent = procedural, so every
++pre-board replay stays byte-identical).
++
+ Mouse-only prototype: drag node→node to draw pipes (1/2/3 picks the tier),
+ right-click a pipe to cycle its QoS priority, click a router to inspect
+ ports/flows + set triage, click a pipe for demolish. Space pauses (pause-and-
+diff --git a/app/main.odin b/app/main.odin
+index 05675b82..275b1298 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -86,6 +86,14 @@ Mode :: enum {
+ App :: struct {
+ 	cat:           pp.Catalogs,
+ 	state:         pp.Run_State,
++	// v2-dublin-board: the map source + the loaded board (the app boots
++	// dublin by default — the user ruling "new runs default dublin";
++	// PP_MAP=procedural flips the named tunable). The board is app-owned
++	// (loaded once at boot, freed at exit) and shared with the sim + the
++	// view (both read the same parse).
++	map_source: u8, // pp.Map_Source
++	board:      pp.Map_Board,
++	board_ok:   bool, // the board loaded (false = the app fell back to procedural with a loud boot warning)
+ 	view:          rnd.View,
+ 	palette:       rnd.Palette,
+ 	// 7.3: the loaded BASE palette — never mutated; palette_apply_mode
+@@ -391,6 +399,42 @@ main :: proc() {
+ 	app.view.route_wires = false
+ 	app.view.wire_anchors = false
+ 
++	// v2-dublin-board: the map source — the named tunable (map: dublin |
++	// procedural). The app boots DUBLIN by default (the user ruling:
++	// "new runs default dublin"; the board REPLACES the procedural terrain
++	// for interactive runs); PP_MAP=procedural flips back to the noise map.
++	// The board loads ONCE at boot (fail loud on a corrupt asset — the
++	// committed data is extract-validated; a bad load is a broken tree).
++	app.map_source = u8(pp.Map_Source.Dublin)
++	if env := os.get_env_alloc("PP_MAP", context.temp_allocator); env != "" {
++		if env == "procedural" {
++			app.map_source = 0
++		} else if env == "dublin" {
++			app.map_source = u8(pp.Map_Source.Dublin)
++		} else {
++			fmt.eprintfln("app: PP_MAP=%q - want dublin|procedural (defaulting to dublin)", env)
++		}
++	}
++	if app.map_source == u8(pp.Map_Source.Dublin) {
++		bytes, rerr := os.read_entire_file_from_path("data/maps/dublin.json", context.temp_allocator)
++		if rerr != nil {
++			fmt.eprintfln("app: cannot read data/maps/dublin.json (%v) - falling back to the procedural map", rerr)
++			app.map_source = 0
++		} else {
++			bd, lerr := pp.map_board_load(bytes, &app.cat.balance, context.allocator)
++			if lerr != "" {
++				fmt.eprintfln("app: dublin board failed to load: %s - falling back to the procedural map", lerr)
++				app.map_source = 0
++			} else {
++				app.board = bd
++				app.board_ok = true
++				fmt.printfln("app: map = dublin (data/maps/dublin.json, %d spawn tiles at 1-in-6)", len(app.board.candidates))
++			}
++		}
++	} else {
++		fmt.printfln("app: map = procedural (PP_MAP=procedural)")
++	}
++
+ 	// the first run: seed 42 (reproducible — matches the harness fixture). The
+ 	// session goal + cap are applied inside start_run. Restarts mint a fresh
+ 	// crypto seed (E32). Mode drops to Run inside start_run.
+@@ -821,6 +865,20 @@ start_run :: proc(app: ^App, seed: u64) {
+ 	pp.run_init(&app.state, seed, app.cat.hash, app.cat.balance.logic_hz)
+ 	app.res_id, app.rt_id, app.host_id = seed_fixture(&app.state, &app.cat)
+ 	app.state.era = APP_ERA            // 4.1: the streaming-surge era (run setup — the director + forecast schedule)
++	// v2-dublin-board: the map source is run setup like the seed (the named
++	// determinism input). The board pointer is app-owned + shared with the
++	// view — the sim reads it for the growth placement draws; the view draws
++	// the underlay from it (ODN-1: the view never mutates it).
++	app.state.map_source = app.map_source
++	if app.board_ok {
++		app.state.board = &app.board
++		app.view.map_source = app.map_source
++		app.view.board = &app.board
++	} else {
++		app.state.board = nil
++		app.view.map_source = 0
++		app.view.board = nil
++	}
+ 	app.state.goal = app.win_goal       // the win/lose session config (run setup)
+ 	app.state.tick_cap = app.lose_tick_cap
+ 	app.state.health_enabled = app.health_on // 4.3: the Network Health meter (run setup)
+diff --git a/app/render/dublin.odin b/app/render/dublin.odin
+new file mode 100644
+index 00000000..a4b4c8aa
+--- /dev/null
++++ b/app/render/dublin.odin
+@@ -0,0 +1,445 @@
++package render
++
++// dublin.odin — v2-dublin-board (stage 1 of the real-maps arc): the Dublin
++// board underlay renderer. When the map source = dublin this REPLACES the
++// procedural noise map (map.odin) as the world background, in the paper-map
++// aesthetic the #90 gallery blessed (the user's gate: the board must match
++// the gallery previews — KYLE grades a live capture side-by-side). Draw
++// order mirrors the gallery's renderer (tools/render_dublin_preview.py)
++// exactly: canvas -> terrain (water/coast/park) -> grid (18% blend) ->
++// streets (arterial heavier, local faint) -> spawn candidates (the 1-in-6
++// dotted texture) -> district labels (IBM Plex, collision-avoided, canvas
++// halo) -> the ODbL attribution (rule 5: "© OpenStreetMap contributors"
++// renders in-game, bottom-left of the board).
++//
++// Determinism: every draw is the same IEEE f32 camera transform the
++// procedural map uses (to_screen/scale/off — the §10.4 rasterized-path rule,
++// no transcendentals, no libm). The terrain rasterization (even-odd
++// point-in-polygon into a per-world-px cell grid) runs ONCE per board
++// (cached in the View — rebuilt when the board pointer changes) and is pure
++// integer/f32 arithmetic; the per-frame draws are pure functions of the
++// board + the camera. Same board + same camera -> byte-identical pixels
++// (the T2 spine).
++//
++// PRESENTATION ONLY (ODN-1): the view READS the board (the sim's board
++// pointer is run setup, never touched here); T1 hashes ignore this layer by
++// construction — the underlay is not sim state, exactly like the procedural
++// map's cells.
++
++import pp "../../core"
++import rl "vendor:raylib"
++
++// Dublin_Board_Render — the render-side cache for one Map_Board. The terrain
++// is rasterized ONCE per board into a per-world-px cell grid (even-odd
++// point-in-polygon — the SAME fill rule the gallery's renderer uses, so the
++// OSM pinch/retrace artifacts that break ear clipping fill exactly like the
++// blessed previews) + the district label draw order (kind priority, stable).
++// Rebuilt when the View's board pointer changes (dublin_render_ensure).
++Dublin_Board_Render :: struct {
++	board:    ^pp.Map_Board,
++	// terrain cells: one u8 per world px (the board rect w×h px): 0 = none
++	// (the canvas base shows through), 1 = water, 2 = coast, 3 = park
++	// (later kinds overwrite earlier — the gallery's draw order). Drawn as
++	// span-filled rects like the procedural map's cells (map_draw).
++	terrain_cells: [dynamic]u8,
++	cells_w:       i32,
++	cells_h:       i32,
++	// the district draw order (kind rank desc, stable for equal ranks —
++	// file order): labels draw highest-priority first, collision-dropped
++	// against the already-placed set (the gallery's label rule).
++	label_order: [dynamic]u16,
++}
++
++// terrain cell kinds (the cache's byte values — NOT Map_Kind: 0 must mean
++// "no feature" so the canvas base shows through; the procedural map's Land
++// has no equivalent on the board — the gallery's base IS the paper).
++DUBLIN_CELL_NONE  :: u8(0)
++DUBLIN_CELL_WATER :: u8(1)
++DUBLIN_CELL_COAST :: u8(2)
++DUBLIN_CELL_PARK  :: u8(3)
++
++// --- art-tuning constants (the D9 style dial; the gallery is the oracle) ----
++// Label sizes in WORLD px at the 26px/tile design grid (they scale with the
++// camera like everything in the world pass — at fit zoom the board reads like
++// the gallery's baywide view; zooming grows them proportionally). The
++// preview's sizes (30/24/20/17/14/12 at 52px/tile) scale by 26/52 = 0.5 for
++// the in-game grid; the city label nudged up (the game's font-overhaul
++// readability bar).
++DUBLIN_LABEL_SIZE := [6]i32{18, 15, 13, 11, 10, 10} // city/town/village/suburb/quarter/neighbourhood (world px)
++// Label-anchor collision gaps (world px) — the preview's at 2× scale, halved
++// for the in-game grid (the baywide's relative density).
++DUBLIN_LABEL_GAP := [6]f32{999, 75, 60, 48, 35, 30}
++// The street skeleton: arterials at 0.030 tiles wide, locals at 0.020 (the
++// preview's crop proportions — 3px/2px at 104px/tile). Widths are screen px,
++// scale-aware (max 1 at fit — the baywide's 1px look).
++DUBLIN_STREET_ARTERIAL_W :: 0.030
++DUBLIN_STREET_LOCAL_W    :: 0.020
++// The candidate-dot radius in world px (0.55 at the preview's SS=2 → 1.1px
++// screen at fit ≈ 1px; grows with the camera).
++DUBLIN_DOT_RADIUS :: 0.55
++// The grid blend (18% — map.odin's GRID_ALPHA is the procedural twin; the
++// preview draws 46/255).
++DUBLIN_GRID_ALPHA :: 46
++// The district-label halo color = canvas at 235 alpha (the preview's paper
++// halo) + the ink text.
++DUBLIN_LABEL_HALO_ALPHA :: 235
++
++// dublin_render_destroy — free the cache's buffers (called by view teardown).
++dublin_render_destroy :: proc(d: ^Dublin_Board_Render) {
++	delete(d.terrain_cells)
++	delete(d.label_order)
++	d.board = nil
++}
++
++// dublin_render_ensure — rebuild the cache when the board pointer changes
++// (the app/harness set view.board at run setup; a different board = a full
++// rebuild). The terrain rasterization + label order are deterministic (pure
++// f32/int ops — the even-odd crossings are IEEE division + comparisons).
++dublin_render_ensure :: proc(v: ^View) {
++	d := &v.dublin
++	if d.board == v.board && len(d.label_order) > 0 {
++		return
++	}
++	if d.board != nil {
++		dublin_render_destroy(d)
++	}
++	if v.board == nil {
++		return
++	}
++	b := v.board
++	d.board = b
++	// --- the terrain cell grid (1 cell per world px — the map_draw
++	// resolution; the gallery's even-odd fill rule) ---
++	w := b.w_tiles * i32(v.tile_px)
++	h := b.h_tiles * i32(v.tile_px)
++	d.cells_w = w
++	d.cells_h = h
++	d.terrain_cells = make([dynamic]u8, w * h) // 0 = none (canvas shows through)
++	tile_px := v.tile_px
++	// water, then coast, then park — each later kind overwrites (the
++	// gallery's draw order: coast beats water at the ring, park beats both).
++	dublin_rasterize_rings(&d.terrain_cells, b.water[:], DUBLIN_CELL_WATER, w, h, tile_px)
++	dublin_rasterize_rings(&d.terrain_cells, b.coast[:], DUBLIN_CELL_COAST, w, h, tile_px)
++	dublin_rasterize_rings(&d.terrain_cells, b.park[:], DUBLIN_CELL_PARK, w, h, tile_px)
++	// the label draw order: kind rank descending (stable for equal ranks —
++	// the gallery's sorted-by-priority rule).
++	d.label_order = make([dynamic]u16, 0, len(b.districts))
++	for i in 0..<len(b.districts) {
++		append(&d.label_order, u16(i))
++	}
++	// insertion sort by rank desc (121 items — trivial; deterministic).
++	for i in 1..<len(d.label_order) {
++		key := d.label_order[i]
++		j := i
++		for j > 0 && pp.district_kind_rank(b.districts[d.label_order[j-1]].kind) < pp.district_kind_rank(b.districts[key].kind) {
++			d.label_order[j] = d.label_order[j-1]
++			j -= 1
++		}
++		d.label_order[j] = key
++	}
++}
++
++// dublin_rasterize_rings — stamp `kind` on every cell inside any ring of
++// `rings` (even-odd point-in-polygon per cell, bbox-culled). The ray cast
++// counts crossings of the horizontal ray to +x — the EXACT rule PIL's
++// polygon fill uses, so the OSM pinch/retrace artifacts (which break ear
++// clipping) fill identically to the blessed gallery. Pure f32 ops
++// (division + comparisons — deterministic, no libm).
++dublin_rasterize_rings :: proc(cells: ^[dynamic]u8, rings: [][dynamic][2]f32, kind: u8, w, h: i32, tile_px: f32) {
++	for ring in rings {
++		if len(ring) < 3 {
++			continue
++		}
++		// the ring's tile-space bbox (the cells to test)
++		minx := ring[0][0]
++		maxx := minx
++		miny := ring[0][1]
++		maxy := miny
++		for p in ring {
++			minx = min(minx, p[0])
++			maxx = max(maxx, p[0])
++			miny = min(miny, p[1])
++			maxy = max(maxy, p[1])
++		}
++		x0 := max(0, i32(minx * tile_px))
++		x1 := min(w, i32(maxx * tile_px) + 1)
++		y0 := max(0, i32(miny * tile_px))
++		y1 := min(h, i32(maxy * tile_px) + 1)
++		for cy in y0..<y1 {
++			for cx in x0..<x1 {
++				// the cell center in tile space (the test point)
++				px := (f32(cx) + 0.5) / tile_px
++				py := (f32(cy) + 0.5) / tile_px
++				if dublin_point_in_ring(ring[:], px, py) {
++					cells[cy * w + cx] = kind
++				}
++			}
++		}
++	}
++}
++
++// dublin_point_in_ring — the even-odd ray cast (crossing number): the point
++// is inside iff the ray to +x crosses an odd number of edges. The classic
++// (y-bracketing + x-crossing) formulation — same rule as PIL's polygon fill.
++dublin_point_in_ring :: proc(ring: [][2]f32, x, y: f32) -> bool {
++	inside := false
++	j := len(ring) - 1
++	for i in 0..<len(ring) {
++		a := ring[i]
++		b := ring[j]
++		if (a[1] > y) != (b[1] > y) {
++			t := (y - a[1]) / (b[1] - a[1])
++			if a[0] + t * (b[0] - a[0]) > x {
++				inside = !inside
++			}
++		}
++		j = i
++	}
++	return inside
++}
++
++// dublin_tile_screen — the board's tile coords -> screen (the same
++// to_screen world transform the procedural map uses).
++dublin_tile_screen :: proc(v: ^View, tx, ty: f32) -> rl.Vector2 {
++	return to_screen(v, tx * v.tile_px, ty * v.tile_px)
++}
++
++// dublin_map_draw — the board underlay (called from map_draw when the map
++// source = dublin; the procedural path is untouched). Base canvas fill
++// (window), then the world pass in the gallery's draw order.
++dublin_map_draw :: proc(v: ^View, b: ^pp.Map_Board) {
++	dublin_render_ensure(v)
++	p := v.palette
++	rl.DrawRectangle(0, 0, v.win_w, v.win_h, p.canvas)
++	if v.dublin.board != b {
++		return // the cache failed to build (defensive — a nil cache draws nothing extra)
++	}
++
++	// 1. terrain (canon order: water -> coast -> park — the cell grid
++	//    rasterized at load already applied the overwrite order; the draw is
++	//    a span-fill over the world rect, skipping the none-cells).
++	dublin_draw_terrain(v)
++
++	// 2. the grid (18% blend over land AND water — map.odin's grid rule).
++	grid := p.grid
++	grid.a = DUBLIN_GRID_ALPHA
++	step := v.tile_px * v.scale
++	if step > 0 {
++		// verticals at every tile boundary, clipped to the world rect
++		for tx: i32 = 0; tx <= b.w_tiles; tx += 1 {
++			sx := v.off_x + f32(tx) * v.tile_px * v.scale
++			rl.DrawLineEx({sx, v.off_y}, {sx, v.off_y + f32(b.h_tiles) * v.tile_px * v.scale}, 1, grid)
++		}
++		for ty: i32 = 0; ty <= b.h_tiles; ty += 1 {
++			sy := v.off_y + f32(ty) * v.tile_px * v.scale
++			rl.DrawLineEx({v.off_x, sy}, {v.off_x + f32(b.w_tiles) * v.tile_px * v.scale, sy}, 1, grid)
++		}
++	}
++
++	// 3. the street skeleton (arterial heavier, local faint).
++	aw := max(1, i32(DUBLIN_STREET_ARTERIAL_W * v.tile_px * v.scale + 0.5))
++	lw := max(1, i32(DUBLIN_STREET_LOCAL_W * v.tile_px * v.scale + 0.5))
++	for line in b.arterial {
++		dublin_draw_line(v, line[:], p.ink_soft, aw)
++	}
++	for line in b.local {
++		dublin_draw_line(v, line[:], p.ink_faint, lw)
++	}
++
++	// 4. the spawn candidates (the 1-in-6 dotted texture — the gallery's
++	//    density knob at the user's blessed calm default).
++	dot := p.house_bodies[0]
++	dot.a = 150
++	r := max(1, i32(DUBLIN_DOT_RADIUS * v.scale + 0.5))
++	for d in b.render_dots {
++		s := dublin_tile_screen(v, d[0], d[1])
++		if s.x < -f32(r) || s.x > f32(v.play_w) + f32(r) || s.y < -f32(r) || s.y > f32(v.win_h) + f32(r) {
++			continue
++		}
++		rl.DrawCircleV(s, f32(r), dot)
++	}
++
++	// 5. the district labels (kind-priority order, collision-avoided, paper
++	//    halo) + 6. the ODbL attribution (rule 5 — the map corner).
++	dublin_draw_labels(v, b)
++	dublin_draw_attribution(v, b)
++}
++
++// dublin_draw_terrain — the span-filled terrain cell grid (the procedural
++// map's exact draw pattern: per-row runs of equal kind as integer-screen
++// rects; adjacent spans share fceil boundaries so no hairline leaks the
++// canvas through). Cells are 1 world px — at fit zoom they ARE the screen
++// pixels (pixel-exact coastlines); zoomed, the stepping is the soft-backdrop
++// cost of the deterministic even-odd fill (the streets/dots/labels stay
++// vector-crisp).
++dublin_draw_terrain :: proc(v: ^View) {
++	p := v.palette
++	w := v.dublin.cells_w
++	h := v.dublin.cells_h
++	if len(v.dublin.terrain_cells) < int(w * h) || w <= 0 || h <= 0 {
++		return
++	}
++	for y in 0..<h {
++		row_top := fceil(v.off_y + f32(y) * v.scale)
++		row_bot := fceil(v.off_y + f32(y + 1) * v.scale)
++		if row_bot <= row_top {
++			continue
++		}
++		x: i32 = 0
++		for x < w {
++			k := v.dublin.terrain_cells[y * w + x]
++			if k == DUBLIN_CELL_NONE {
++				x += 1
++				continue
++			}
++			x0 := x
++			for x < w && v.dublin.terrain_cells[y * w + x] == k {
++				x += 1
++			}
++			col: rl.Color
++			if k == DUBLIN_CELL_WATER {
++				col = p.water
++			} else if k == DUBLIN_CELL_COAST {
++				col = p.coast
++			} else {
++				col = p.park
++			}
++			sx0 := fceil(v.off_x + f32(x0) * v.scale)
++			sx1 := fceil(v.off_x + f32(x) * v.scale)
++			rl.DrawRectangle(sx0, row_top, sx1 - sx0, row_bot - row_top, col)
++		}
++	}
++}
++
++// dublin_draw_line — one street polyline (world px -> screen), culled by its
++// world bbox. `w` is the screen-px width.
++dublin_draw_line :: proc(v: ^View, pts: [][2]f32, col: rl.Color, w: i32) {
++	if len(pts) < 2 {
++		return
++	}
++	// world-px bbox cull (the polyline's points are tile coords)
++	minx := pts[0][0] * v.tile_px
++	maxx := minx
++	miny := pts[0][1] * v.tile_px
++	maxy := miny
++	for i in 1..<len(pts) {
++		x := pts[i][0] * v.tile_px
++		y := pts[i][1] * v.tile_px
++		minx = min(minx, x)
++		maxx = max(maxx, x)
++		miny = min(miny, y)
++		maxy = max(maxy, y)
++	}
++	view_left := -v.off_x / v.scale
++	view_top := -v.off_y / v.scale
++	view_right := (f32(v.play_w) - v.off_x) / v.scale
++	view_bot := (f32(v.win_h) - v.off_y) / v.scale
++	if maxx < view_left || minx > view_right || maxy < view_top || miny > view_bot {
++		return
++	}
++	prev := dublin_tile_screen(v, pts[0][0], pts[0][1])
++	for i in 1..<len(pts) {
++		cur := dublin_tile_screen(v, pts[i][0], pts[i][1])
++		rl.DrawLineEx(prev, cur, f32(w), col)
++		prev = cur
++	}
++}
++
++// dublin_draw_labels — the district labels: kind-priority order, dropped when
++// an already-placed label's anchor is within the kind's collision gap, drawn
++// centered with the canvas halo (the gallery's label rule). Screen size =
++// world size × the camera scale (labels grow with the zoom, like the map).
++dublin_draw_labels :: proc(v: ^View, b: ^pp.Map_Board) {
++	if len(v.dublin.label_order) == 0 {
++		return
++	}
++	ink := v.palette.ink
++	halo := v.palette.canvas
++	halo.a = DUBLIN_LABEL_HALO_ALPHA
++	placed := make([dynamic][2]f32, 0, 16, context.temp_allocator)
++	for oi in 0..<len(v.dublin.label_order) {
++		di := int(v.dublin.label_order[oi])
++		d := &b.districts[di]
++		s := dublin_tile_screen(v, d.pos[0], d.pos[1])
++		if s.x < -80 || s.x > f32(v.play_w) + 80 || s.y < -80 || s.y > f32(v.win_h) + 80 {
++			continue // off-screen (a label is up to ~80 px tall at zoom)
++		}
++		ki := int(d.kind)
++		gap := DUBLIN_LABEL_GAP[ki]
++		drop := false
++		for pl in placed {
++			dx := s.x - pl[0]
++			dy := s.y - pl[1]
++			if dx * dx + dy * dy < gap * gap {
++				drop = true
++				break
++			}
++		}
++		if drop {
++			continue
++		}
++		append(&placed, [2]f32{s.x, s.y})
++		size := max(8, i32(f32(DUBLIN_LABEL_SIZE[ki]) * v.scale))
++		// centered + the paper halo (the gallery's dtext). The label string
++		// rides the temp arena (freed per frame — the draws are synchronous).
++		w := rl.MeasureTextEx(v.font, cstring(raw_data(dublin_label_cstr(d.name))), f32(size), 1)
++		x := s.x - w.x / 2
++		y := s.y - w.y / 2
++		draw_text_font_halo(v.font, d.name, i32(x), i32(y), size, ink, halo)
++	}
++}
++
++// dublin_label_cstr — the district name as a null-terminated temp string
++// (DrawTextEx needs a cstring; the temp arena frees it at the frame end).
++dublin_label_cstr :: proc(s: string) -> string {
++	cbuf := make([dynamic]u8, 0, len(s) + 1, context.temp_allocator)
++	for b in transmute([]u8)(s) {
++		append(&cbuf, b)
++	}
++	append(&cbuf, 0)
++	return string(cbuf[:])
++}
++
++// draw_text_font_halo — the paper-map label: the canvas halo (8 offsets, the
++// gallery's dtext) + the ink text. Mirrors draw_text_font but with the halo.
++draw_text_font_halo :: proc(f: rl.Font, txt: string, x, y, size: i32, col, halo: rl.Color) {
++	cbuf := make([dynamic]u8, 0, len(txt) + 1, context.temp_allocator)
++	for b in transmute([]u8)(txt) {
++		append(&cbuf, b)
++	}
++	append(&cbuf, 0)
++	cstr := cstring(raw_data(cbuf))
++	offsets := [8][2]i32{{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {-1, -1}, {1, -1}, {-1, 1}, {1, 1}}
++	for o in offsets {
++		rl.DrawTextEx(f, cstr, {f32(x + o[0]), f32(y + o[1])}, f32(size), 1, halo)
++	}
++	rl.DrawTextEx(f, cstr, {f32(x), f32(y)}, f32(size), 1, col)
++}
++
++// dublin_draw_attribution — the ODbL credit (rule 5): the attribution string
++// from the asset, bottom-left of the board, small + faint (a map corner
++// credit, like a printed map's imprint). The © renders from the dedicated
++// one-glyph font (font_copyright — the shared atlas never changes); the rest
++// of the line rides the body font.
++dublin_draw_attribution :: proc(v: ^View, b: ^pp.Map_Board) {
++	if len(b.attribution) == 0 {
++		return
++	}
++	size := max(8, i32(10 * v.scale))
++	pos := dublin_tile_screen(v, 0.5, f32(b.h_tiles) - 0.75)
++	halo := v.palette.canvas
++	halo.a = DUBLIN_LABEL_HALO_ALPHA
++	x := i32(pos.x)
++	y := i32(pos.y)
++	// the attribution starts with the © codepoint (the UTF-8 lead "\xc2\xa9"
++	// — the source stays ASCII; the lint gate's rule). Draw it via the
++	// one-glyph font, then the remainder via the body font.
++	if len(b.attribution) >= 2 && b.attribution[0] == 0xC2 && b.attribution[1] == 0xA9 {
++		cstr := cstring(raw_data([]u8{0xC2, 0xA9, 0}))
++		w := rl.MeasureTextEx(v.font_copyright, cstr, f32(size), 1)
++		draw_text_font_halo(v.font_copyright, "\xc2\xa9", x, y, size, v.palette.ink_faint, halo)
++		draw_text_font_halo(v.font, b.attribution[2:], x + i32(w.x), y, size, v.palette.ink_faint, halo)
++	} else {
++		draw_text_font_halo(v.font, b.attribution, x, y, size, v.palette.ink_faint, halo)
++	}
++}
+diff --git a/app/render/palette.odin b/app/render/palette.odin
+index 9e70c613..caf02178 100644
+--- a/app/render/palette.odin
++++ b/app/render/palette.odin
+@@ -114,6 +114,7 @@ Palette :: struct {
+ 	ink:          rl.Color,
+ 	ink_soft:     rl.Color,
+ 	ink_soft_text: rl.Color, // 2026-08-23: the TEXT-only contrast fold (the shapes keep ink_soft — Rule 6)
++	ink_faint:    rl.Color, // v2-dublin-board: the local-street skeleton token (the gallery's faint street ink; palette.json has the bytes — the board underlay reads it)
+ 	house_bodies: [4]rl.Color,
+ 	house_roofs:  [4]rl.Color,
+ 	host_body:    rl.Color,
+@@ -200,6 +201,7 @@ palette_load :: proc(source: []byte = DEFAULT_PALETTE_JSON) -> Palette {
+ 	p.ink = jcol(obj, "ink", {51, 65, 79, 255})
+ 	p.ink_soft = jcol(obj, "ink_soft", {92, 98, 106, 255}) // the pre-fold byte (Rule 6: the 08-23 contrast fold is TEXT-only)
+ 	p.ink_soft_text = jcol(obj, "ink_soft_text", {66, 72, 80, 255}) // the text-only contrast fold (7.2:1 vs canvas)
++	p.ink_faint = jcol(obj, "ink_faint", {154, 160, 168, 255}) // v2-dublin-board (the local-street skeleton — the gallery's faint ink)
+ 	if arr, ok := obj["house_bodies"].(json.Array); ok && len(arr) == 4 {
+ 		for i in 0..<4 {
+ 			if q, okq := arr[i].(json.Array); okq { p.house_bodies[i] = jcol_arr(q, {232, 90, 74, 255}) }
+@@ -296,6 +298,7 @@ fallback_palette :: proc() -> Palette {
+ 	p.ink = {51, 65, 79, 255}
+ 	p.ink_soft = {92, 98, 106, 255}
+ 	p.ink_soft_text = {66, 72, 80, 255}
++	p.ink_faint = {154, 160, 168, 255} // v2-dublin-board (the local-street skeleton — the gallery's faint ink)
+ 	p.house_bodies = {{232, 90, 74, 255}, {242, 201, 76, 255}, {94, 203, 107, 255}, {74, 155, 226, 255}}
+ 	p.house_roofs = {{122, 46, 38, 255}, {122, 84, 24, 255}, {44, 106, 52, 255}, {38, 80, 126, 255}}
+ 	p.host_body = {62, 120, 208, 255}
+diff --git a/app/render/view.odin b/app/render/view.odin
+index 1e883bb8..36ccba45 100644
+--- a/app/render/view.odin
++++ b/app/render/view.odin
+@@ -33,6 +33,11 @@ View :: struct {
+ 	font:        rl.Font, // the body font (Plex Sans Regular + fallback)
+ 	font_header: rl.Font, // the header font (Plex Sans SemiBold + fallback)
+ 	font_mono:   rl.Font, // the NOC/tabular font (Plex Mono Regular + fallback)
++	// v2-dublin-board: the ONE-GLYPH © font (U+00A9 — the board attribution's
++	// copyright symbol). A dedicated atlas keeps the shared family untouched
++	// (a codepoint addition to the shared set shifted the ⚠ AA pixels across
++	// every golden; this font is additive and zero-impact).
++	font_copyright: rl.Font,
+ 	win_w:    i32,
+ 	win_h:    i32,
+ 	// 2026-08-23 (v2-noc-readability-2, the DOCK-RIGHT ruling): the PLAYFIELD
+@@ -77,6 +82,15 @@ View :: struct {
+ 	map_seed:  u64,
+ 	map_gen_w: i32,
+ 	map_gen_h: i32,
++	// v2-dublin-board: the map source + the loaded board (nil = procedural —
++	// the zero value, every legacy path byte-identical). The app/harness set
++	// these at run setup (the sim's board pointer is run setup too — the view
++	// only READS it, ODN-1); map_draw branches on them. `dublin` is the
++	// render-side triangulation cache (dublin.odin), rebuilt when the board
++	// pointer changes.
++	map_source: u8, // pp.Map_Source (0 = Procedural; 1 = Dublin)
++	board:      ^pp.Map_Board,
++	dublin:     Dublin_Board_Render,
+ 	// 7.3 (E9.2): reduced-motion — pin the PULSE16 effects (health rings,
+ 	// crisis outline swell) to a static full width. Crisis readability
+ 	// survives on the already-static channels: glyph "!"/"!!", the banner
+@@ -547,6 +561,13 @@ draw_world :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp
+ // through — and the f32 camera math is the same deterministic IEEE ops the
+ // rest of the view uses (the T2 spine).
+ map_draw :: proc(v: ^View, seed: u64) {
++	// v2-dublin-board: the board underlay REPLACES the procedural terrain
++	// when the map source = dublin (the view's board pointer is set at run
++	// setup by the app/harness; nil = the procedural path, byte-identical).
++	if v.map_source == u8(pp.Map_Source.Dublin) && v.board != nil {
++		dublin_map_draw(v, v.board)
++		return
++	}
+ 	map_ensure(v, seed)
+ 	p := v.palette
+ 	rl.DrawRectangle(0, 0, v.win_w, v.win_h, p.canvas)
+@@ -1376,6 +1397,9 @@ FONT_GLYPH_PADDING :: 4 // the atlas packing padding (OUR choice — raylib's Lo
+ // game uses + U+26A0 (⚠, the warning glyph; missing from Plex — the fallback
+ // covers it). Drawn strings stay ASCII by lint gate 6; the ⚠ slot makes the
+ // pipeline non-regressing (the raylib-default failure mode) + future-proof.
++// NOTE: the ODbL attribution's © is NOT in this set — it renders from its
++// OWN one-glyph font (view.font_copyright) so the shared atlas never shifts
++// (a codepoint addition moved the ⚠ AA pixels across every golden).
+ font_codepoints :: proc() -> [96]rune {
+ 	cps: [96]rune
+ 	n := 0
+@@ -1549,6 +1573,12 @@ load_fonts :: proc(v: ^View) -> bool {
+ 		return false
+ 	}
+ 	v.font_mono, ok = load_font_file(FONT_MONO_ASSET)
++	if !ok {
++		return false
++	}
++	// v2-dublin-board: the one-glyph © font (the board attribution's
++	// copyright symbol — separate atlas, zero impact on the shared set).
++	v.font_copyright, ok = font_glyph_load(FONT_ASSET, rune(0x00A9))
+ 	return ok
+ }
+ 
+@@ -2069,3 +2099,22 @@ font_atlas_build_from_file :: proc(asset: string) -> (f: rl.Font, atlas: rl.Imag
+ 	glyphs, count := font_merge_fallback(asset, FONT_FALLBACK_ASSET, FONT_BASE_SIZE, cps[:])
+ 	return font_atlas_build(glyphs, count, FONT_BASE_SIZE)
+ }
++
++// font_glyph_load — ONE codepoint as its own font (v2-dublin-board: the
++// board attribution's © renders from a dedicated one-glyph atlas so the
++// shared HUD atlases never change — a codepoint addition to the shared set
++// moved the ⚠ AA pixels across every golden; the © font is additive and
++// zero-impact). Same deterministic load path (TTF bytes + the fallback
++// merge + the PIXELPACK atlas).
++font_glyph_load :: proc(asset: string, cp: rune) -> (rl.Font, bool) {
++	cps := [1]rune{cp}
++	glyphs, count := font_merge_fallback(asset, FONT_FALLBACK_ASSET, FONT_BASE_SIZE, cps[:])
++	f, atlas, ok := font_atlas_build(glyphs, count, FONT_BASE_SIZE)
++	if !ok {
++		return {}, false
++	}
++	f.texture = rl.LoadTextureFromImage(atlas)
++	rl.SetTextureFilter(f.texture, .BILINEAR)
++	rl.UnloadImage(atlas)
++	return f, rl.IsFontValid(f)
++}
+diff --git a/core/growth.odin b/core/growth.odin
+index d2c4e940..0e70a01c 100644
+--- a/core/growth.odin
++++ b/core/growth.odin
+@@ -1,5 +1,6 @@
+ package core
+ 
++
+ // growth.odin — Story 5.1: deterministic map growth + spawn validity (E31).
+ // The director's map-growth branch of the ODN-7 congestion family (sibling of
+ // demand.odin): nodes appear over time (Mini Motorways model),
+@@ -54,6 +55,21 @@ package core
+ //
+ // Integer-only (ODN-10); arrays only (no map iteration); no file/clock reads
+ // (ODN-1).
++//
++// v2-dublin-board (stage 1 of the real-maps arc): growth_plan_demand takes
++// the caller-loaded Map_Board (nil = procedural — every legacy path stays
++// byte-identical). On the board (map source = Dublin) the placement DRAWS
++// come from dublin.json's street-adjacent spawn pool at the 1-in-6 density
++// (map.odin): the SEED family draws one pool tile (the new estate anchors to
++// the tile's district), the ATTACH family draws one tile from the anchor's
++// STREET RING (the pool tiles within the estate radius of a member — the
++// strict-radius closure preserved). The E31 validity predicates + the 08-21
++// strict-radius/fresh-area floors are UNCHANGED and still gate the board
++// candidates (the briefing's "filter at bake-load" happens in
++// map_board_load: out-of-grid tiles never enter the pool; the pairwise E31
++// separation is spawn-time rejection sampling, never a legal violation).
++// Streets do NOT constrain pipes in this story (stage 2 — the existing
++// placement rules are unchanged).
+ 
+ // Growth cadence + spacing (2026-08-21 pace-tuning — MOVED from these consts
+ // to balance.json `terminal_spawn_interval_ticks` + `terminal_min_sep_tiles`
+@@ -477,6 +493,98 @@ growth_dir_pick :: proc(rng: ^Rng) -> [2]i32 {
+ 	return dirs[rng_range(rng, 0, GROWTH_DIR_COUNT - 1)]
+ }
+ 
++// board_district_at — the nearest district anchor to a tile position
++// (Euclidean; ties to the LOWER index). MUST mirror map_board_load's
++// assignment exactly (same strict-less comparison + best init 0) — a
++// terminal spawned from a pool tile re-derives the identical district the
++// loader assigned that tile (deterministic on both paths; f32 IEEE ops).
++board_district_at :: proc(board: ^Map_Board, pos: [2]i32) -> u16 {
++	best: u16 = 0
++	bd2 := max(f32)
++	for di in 0..<len(board.districts) {
++		dx := f32(pos[0]) - board.districts[di].pos[0]
++		dy := f32(pos[1]) - board.districts[di].pos[1]
++		d2 := dx * dx + dy * dy
++		if d2 < bd2 {
++			bd2 = d2
++			best = u16(di)
++		}
++	}
++	return best
++}
++
++// growth_board_seed_draw — the Dublin SEED-family placement draw: ONE rng
++// draw over the board's 1-in-6 street-adjacent tile pool (the fresh estate
++// anchors to the tile's district). The E31 + fresh-area predicates still gate
++// below (rejection sampling unchanged — a pool tile is a candidate, never a
++// guaranteed placement). The caller guarantees a non-empty pool (the
++// degenerate guard at the top of the attempt loop).
++growth_board_seed_draw :: proc(rng: ^Rng, board: ^Map_Board) -> [2]i32 {
++	k := rng_range(rng, 0, i32(len(board.candidates)) - 1)
++	return board.candidates[k]
++}
++
++// growth_board_ring_scan — collect the board tiles in the ATTACH ring of a
++// member anchor: the pool tiles at Euclidean distance in [min_sep,
++// radius_tiles] (the E31 packing floor to the estate radius — the ring the
++// procedural compass draw targets, expressed over the street grid). The scan
++// is a pure function of (pool, topology) — deterministic, zero rng; the
++// caller draws one index. The ring is GLOBAL (not district-scoped): the
++// estate forms on the streets the grid gives it — a street crossing a
++// district's Voronoi boundary keeps its houses together (the streets-rule
++// interplay, documented in the header); the seed's district labels the
++// estate. Returns the ring size (0 = the anchor's streets are exhausted).
++growth_board_ring_scan :: proc(board: ^Map_Board, t: ^Topology, anchor: [2]i32, sep, radius: i32, ring: ^[dynamic]u32, alloc := context.temp_allocator) -> i32 {
++	lo2 := i64(sep) * i64(sep)
++	hi2 := i64(radius) * i64(radius)
++	clear(ring)
++	for k in 0..<len(board.candidates) {
++		c := board.candidates[k]
++		d := c - anchor
++		d2 := i64(d[0]) * i64(d[0]) + i64(d[1]) * i64(d[1])
++		if d2 >= lo2 && d2 <= hi2 {
++			append(ring, u32(k))
++		}
++	}
++	return i32(len(ring))
++}
++
++// growth_board_cluster_has_room — the board-aware ATTACH eligibility: a
++// cluster is eligible to extend only while SOME member's ring holds a tile
++// that can still be placed legally (the E31 node/pipe separation + the
++// connect span — the same predicates the draw faces, checked ahead so a
++// saturated estate yields to the SEED family instead of stalling the window
++// budget). Pure scans, zero rng (deterministic).
++growth_board_cluster_has_room :: proc(board: ^Map_Board, t: ^Topology, gview: ^Group_Cluster_View, cluster_first: u32, sep, radius, span: i32) -> bool {
++	ring: [dynamic]u32
++	defer delete(ring)
++	for i in 0..<len(t.node_alive) {
++		if !t.node_alive[i] || t.node_kind[i] != .Terminal {
++			continue
++		}
++		if gview.id[i] != cluster_first {
++			continue
++		}
++		if growth_board_ring_scan(board, t, t.node_pos[i], sep, radius, &ring) <= 0 {
++			continue
++		}
++		for k in ring {
++			c := board.candidates[k]
++			if !growth_node_sep_ok(t, c, sep) {
++				continue
++			}
++			if !growth_pipe_sep_ok(t, c, sep) {
++				continue
++			}
++			if !growth_connectable(t, c, span) {
++				continue
++			}
++			return true
++		}
++	}
++	return false
++}
++
+ // growth_plan_demand — the director's map-growth branch (ODN-7): decide THIS
+ // tick's growth intent from (topology view, catalog, era, tick, rng). PURE
+ // w.r.t. sim state — it reads the topology + draws the owned rng, mutates
+@@ -515,8 +623,34 @@ growth_dir_pick :: proc(rng: ^Rng) -> [2]i32 {
+ // identity + replay tests pin the aggregate); a future change that alters the
+ // per-window draw count shifts the growth/demand rng interleaving and MUST
+ // re-bless the growth goldens.
++//
++// v2-dublin-board (the board-aware placement — the STREETS RULE): when
++// `board` is non-nil (the map source = Dublin) the family DRAWS change
++// domains — the ATTACH family draws ONE candidate from the anchor's STREET
++// RING (the pool tiles at Euclidean distance in [terminal_min_sep_tiles,
++// radius_tiles] of a member — the exact ring the procedural compass draw
++// targets, expressed over the real street grid; the strict-radius closure is
++// preserved, so an attach always sits within the estate radius of a member:
++// no strays), the SEED family draws ONE candidate from the board's 1-in-6
++// street-adjacent tile pool (the fresh area anchors to the tile's district).
++// THE INTERPLAY (documented per the briefing): the estate (the derived
++// cluster) forms on the streets the grid gives it — cluster radius/caps
++// apply within the estate, and the estate's seed district labels it. A
++// street crossing a district's Voronoi boundary keeps its houses together
++// (the district assignment is label-anchored; the streets are the geometry
++// that binds an estate). An estate is eligible only while SOME member's ring
++// holds a legally-placeable tile (E31 sep + connect span — the same
++// predicates the draw faces, checked ahead so a saturated estate yields to
++// the SEED family instead of burning the window budget). The procedural
++// compass draws are never touched in board runs and the board branch never
++// runs in procedural runs — each source keeps its own rng interleaving
++// (procedural stays byte-identical; dublin re-blesses). The rejection
++// predicates are UNCHANGED (E31 + the strict-radius + the fresh-area floor
++// still gate the board candidates — a pool tile is a candidate, never a
++// guaranteed placement; the briefing's "filter at bake-load" happened in
++// map_board_load: out-of-grid tiles never enter the pool).
+ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+-                             rng: ^Rng) -> Growth_Intent {
++                             rng: ^Rng, board: ^Map_Board) -> Growth_Intent {
+ 	// 1. schedule — a pure function of the executed tick (never wall-clock).
+ 	// 2026-08-21: the interval is the balance.json pace knob
+ 	// (terminal_spawn_interval_ticks — 80 = 4 s @ 20 Hz, the 2× reduction).
+@@ -561,6 +695,11 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 	// 6. rejection sampling (E31) — draw a candidate from the same rng stream,
+ 	//    accept the FIRST valid one. Bounded (GROWTH_MAX_ATTEMPTS): exhaustion
+ 	//    skips the window deterministically — no wall-time retry loop.
++	// v2-dublin-board: a loaded board with an EMPTY pool is degenerate (the
++	// loader forbids it — belt-and-suspenders): skip the window, never draw.
++	if board != nil && len(board.candidates) == 0 {
++		return {}
++	}
+ 	//    5.12 (the 08-21 strict doctrine): every attempt first draws a bias
+ 	//    COIN (1 draw, always); a biased attempt (coin < bias_prob_permille —
+ 	//    at the 1000 default, EVERY attempt) with an eligible cluster exists
+@@ -585,6 +724,10 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 	defer if gview_ready {
+ 		group_view_destroy(&gview)
+ 	}
++	// v2-dublin-board: the attach ring scratch (temp-allocated per window —
++	// the board's ring scan fills it; the per-attempt draw indexes it).
++	ring_scratch: [dynamic]u32
++	defer delete(ring_scratch)
+ 	for attempt in 0..<GROWTH_MAX_ATTEMPTS {
+ 		pos: [2]i32
+ 		seed_attempt := false
+@@ -608,6 +751,13 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 				if i32(gview.size[i]) >= cat.balance.growth_groups.max_members {
+ 					continue
+ 				}
++				// v2-dublin-board: on the board an estate is eligible only while
++				// its members' rings hold a legally-placeable street tile (the
++				// growth_groups interplay: cluster radius/caps apply within the
++				// estate; a saturated estate yields to the SEED family).
++				if board != nil && !growth_board_cluster_has_room(board, t, &gview, u32(i), cat.balance.terminal_min_sep_tiles, cat.balance.growth_groups.radius_tiles, span) {
++					continue
++				}
+ 				eligible += 1
+ 			}
+ 			if eligible > 0 {
+@@ -621,6 +771,12 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 					if i32(gview.size[i]) >= cat.balance.growth_groups.max_members {
+ 						continue
+ 					}
++					// the SAME board predicate as the count loop (a mismatched
++					// seen counter would index a different cluster than eligible
++					// counted — and could pick an ineligible one with an empty ring)
++					if board != nil && !growth_board_cluster_has_room(board, t, &gview, u32(i), cat.balance.terminal_min_sep_tiles, cat.balance.growth_groups.radius_tiles, span) {
++						continue
++					}
+ 					if seen == int(cluster_k) {
+ 						cluster_first = i
+ 						break
+@@ -666,23 +822,43 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 					}
+ 					seen += 1
+ 				}
+-				dir := growth_dir_pick(rng)
+-				lo := cat.balance.terminal_min_sep_tiles
+-				hi := cat.balance.growth_groups.radius_tiles
+-				if lo > hi {
+-					lo = hi // degenerate guard — the loader already pins radius > sep
+-				}
+-				dist := rng_range(rng, lo, hi)
+-				pos = t.node_pos[anchor_slot] + dir * dist
+-				// the strict-radius predicate (the 08-21 "no strays" contract):
+-				// the candidate must ACTUALLY sit within the Euclidean adjacency
+-				// radius of its anchor — the compass draw's diagonal directions
+-				// would otherwise place it at up to dist×√2 (outside radius,
+-				// inside the seed floor: the third class the ruling deletes).
+-				// Zero draws — a rejection predicate like E31 (a diagonal draw
+-				// is re-sampled; the draw counts per attempt are unchanged).
+-				if !growth_attach_radius_ok(t, u32(anchor_slot), pos, cat.balance.growth_groups.radius_tiles) {
+-					continue
++				if board != nil {
++					// v2-dublin-board: the ATTACH draw is ONE rng draw over the
++					// anchor's STREET RING (the pool tiles in [min_sep, radius] of
++					// the member anchor — the strict-radius closure preserved: the
++					// candidate always sits within the estate radius of its
++					// anchor, exactly like the procedural compass draw). The ring
++					// scan is a pure function of the pool + topology (zero rng);
++					// the index draw is the family's one draw. The E31 + strict
++					// predicates still gate below.
++					rng_size := growth_board_ring_scan(board, t, t.node_pos[anchor_slot], cat.balance.terminal_min_sep_tiles, cat.balance.growth_groups.radius_tiles, &ring_scratch)
++					if rng_size <= 0 {
++						continue // degenerate — the anchor's streets are exhausted (defensive)
++					}
++					k := rng_range(rng, 0, rng_size - 1)
++					pos = board.candidates[ring_scratch[k]]
++					if !growth_attach_radius_ok(t, u32(anchor_slot), pos, cat.balance.growth_groups.radius_tiles) {
++						continue
++					}
++				} else {
++					dir := growth_dir_pick(rng)
++					lo := cat.balance.terminal_min_sep_tiles
++					hi := cat.balance.growth_groups.radius_tiles
++					if lo > hi {
++						lo = hi // degenerate guard — the loader already pins radius > sep
++					}
++					dist := rng_range(rng, lo, hi)
++					pos = t.node_pos[anchor_slot] + dir * dist
++					// the strict-radius predicate (the 08-21 "no strays" contract):
++					// the candidate must ACTUALLY sit within the Euclidean adjacency
++					// radius of its anchor — the compass draw's diagonal directions
++					// would otherwise place it at up to dist×√2 (outside radius,
++					// inside the seed floor: the third class the ruling deletes).
++					// Zero draws — a rejection predicate like E31 (a diagonal draw
++					// is re-sampled; the draw counts per attempt are unchanged).
++					if !growth_attach_radius_ok(t, u32(anchor_slot), pos, cat.balance.growth_groups.radius_tiles) {
++						continue
++					}
+ 				}
+ 			} else {
+ 				// no eligible cluster (no terminals yet, or every estate at the
+@@ -691,16 +867,22 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 				// nodes, a NEW area elsewhere). Same draws as the coin-miss
+ 				// branch below (the pre-5.12 annulus draw) — the family is the
+ 				// draw + the fresh-area predicate applied after the draw.
++				// v2-dublin-board: on the board the family's draw is ONE
++				// candidate from the street-adjacent pool (growth_board_seed_draw).
+ 				seed_attempt = true
+-				router_slot := growth_junction_slot_at(t, rng_range(rng, 0, i32(nj) - 1))
+-				dir := growth_dir_pick(rng)
+-				lo := GROWTH_OUT_MIN_TILES
+-				hi := span
+-				if lo > hi {
+-					lo = hi // degenerate span guard — the draw stays in [0, span]
++				if board != nil {
++					pos = growth_board_seed_draw(rng, board)
++				} else {
++					router_slot := growth_junction_slot_at(t, rng_range(rng, 0, i32(nj) - 1))
++					dir := growth_dir_pick(rng)
++					lo := GROWTH_OUT_MIN_TILES
++					hi := span
++					if lo > hi {
++						lo = hi // degenerate span guard — the draw stays in [0, span]
++					}
++					dist := rng_range(rng, lo, hi)
++					pos = t.node_pos[router_slot] + dir * dist
+ 				}
+-				dist := rng_range(rng, lo, hi)
+-				pos = t.node_pos[router_slot] + dir * dist
+ 			}
+ 		} else {
+ 			// the coin-miss — the SEED family (reachable only at bias < 1000,
+@@ -710,17 +892,23 @@ growth_plan_demand :: proc(t: ^Topology, cat: ^Catalogs, era: u8, tick: u64,
+ 			// [GROWTH_OUT_MIN, connect_span] — the fringe of the mesh, still
+ 			// within the connectable radius of the picked router (E31 by
+ 			// construction; growth_connectable below is the self-contained
+-			// contract check).
++			// contract check). v2-dublin-board: on the board the family's draw
++			// is ONE candidate from the street-adjacent pool (the same draw
++			// as the no-eligible-cluster branch).
+ 			seed_attempt = true
+-			router_slot := growth_junction_slot_at(t, rng_range(rng, 0, i32(nj) - 1))
+-			dir := growth_dir_pick(rng)
+-			lo := GROWTH_OUT_MIN_TILES
+-			hi := span
+-			if lo > hi {
+-				lo = hi // degenerate span guard — the draw stays in [0, span]
++			if board != nil {
++				pos = growth_board_seed_draw(rng, board)
++			} else {
++				router_slot := growth_junction_slot_at(t, rng_range(rng, 0, i32(nj) - 1))
++				dir := growth_dir_pick(rng)
++				lo := GROWTH_OUT_MIN_TILES
++				hi := span
++				if lo > hi {
++					lo = hi // degenerate span guard — the draw stays in [0, span]
++				}
++				dist := rng_range(rng, lo, hi)
++				pos = t.node_pos[router_slot] + dir * dist
+ 			}
+-			dist := rng_range(rng, lo, hi)
+-			pos = t.node_pos[router_slot] + dir * dist
+ 		}
+ 		// the strict contract's rejection predicates (zero rng draws — like E31,
+ 		// rejection predicates inside the bounded budget): the SEED family's
+diff --git a/core/map.odin b/core/map.odin
+new file mode 100644
+index 00000000..f1249b78
+--- /dev/null
++++ b/core/map.odin
+@@ -0,0 +1,450 @@
++package core
++
++// map.odin — the map-source model (packet-plumber-v2-dublin-board, stage 1 of
++// the real-maps arc): the named determinism input `map` (procedural | dublin)
++// + the baked Dublin board (data/maps/dublin.json, merged in #90). The map
++// source is run setup like the seed — serialized into the T1 hash
++// (ABSENT-WHEN-procedural, so every legacy run stays byte-identical) and
++// re-created identically on replay from the demo/asset (the fixture
++// precedent). The BOARD is caller-owned data (loaded from bytes by the
++// app/harness — core does no file I/O, ODN-1), exactly like the catalogs.
++//
++// Streets do NOT constrain pipes in this story (stage 2): the board changes
++// WHERE growth spawns + what the view draws, never the placement rules. The
++// extract pipeline (tools/osm_extract.py) is untouched — this file is the
++// read side of the baked snapshot only.
++//
++// The 1-in-6 density (user ruling 2026-08-23, rulings.density_default in the
++// asset): the asset stores street-adjacent points at sub-tile resolution
++// (~0.02 tiles ≈ 14 m apart along streets); the user's blessed calm default
++// is the deterministic stride-6 subsample (spawn_candidates[::6] — the same
++// index set the preview tool renders at 1in6). At bake-LOAD the pool is
++// snapped to the integer tile grid + deduped (a spawn is a TILE, never a
++// sub-tile point) + out-of-grid tiles discarded — the "filter at bake-load"
++// of the briefing (rule 3): the pool only ever contains legal tiles; the E31
++// pairwise predicates (growth_pos_valid: grid bounds + min-separation from
++// nodes/pipe segments) still run at spawn time and can REJECT a pool tile —
++// the pool is a candidate set, never a guaranteed placement.
++//
++// District assignment (the estate anchors): each pool tile is assigned to its
++// NEAREST district anchor (Euclidean, tile units; ties to the lower district
++// index — deterministic, no map iteration, ODN-10). The growth_groups
++// estate machinery (cluster radius/caps) applies WITHIN districts on the
++// board: the ATTACH family draws from the anchor's OWN district's pool (an
++// estate never crosses a district boundary), and the derived cluster view is
++// unchanged (radius adjacency) — the district scoping at the DRAW makes
++// cross-district estates unreachable by construction. The exact interplay is
++// documented in growth.odin.
++
++import "core:encoding/json"
++import "core:fmt"
++import "core:math"
++
++// Map_Source — the named map input (run setup, serialized absent-when-0).
++Map_Source :: enum u8 {
++	// Procedural = 0 — the pre-board noise map (the zero value: every legacy
++	// run/demo/replay defaults here and stays byte-identical).
++	Procedural = 0,
++	// Dublin = 1 — the baked cross-section board (data/maps/dublin.json).
++	Dublin = 1,
++}
++
++// MAP_SPAWN_STRIDE — the 1-in-6 density stride over the asset's
++// spawn_candidates (the user's blessed calm default; the asset comment names
++// 1in3 = [::3] as the denser data option — the stride is a load-time
++// constant so the GAMEPLAY pool and the render dots can never disagree).
++MAP_SPAWN_STRIDE :: 6
++
++// District_Kind — the label tier of a Dublin district (mirrors the preview
++// tool's LABEL_PRIORITY: city > town > village > suburb > quarter ==
++// neighbourhood). Render-only (the sim reads only the anchor assignment).
++District_Kind :: enum u8 {
++	City = 0,
++	Town = 1,
++	Village = 2,
++	Suburb = 3,
++	Quarter = 4,
++	Neighbourhood = 5,
++}
++
++district_kind_rank :: proc(k: District_Kind) -> i32 {
++	#partial switch k {
++	case .City:          return 5
++	case .Town:          return 4
++	case .Village:       return 3
++	case .Suburb:        return 2
++	case .Quarter:       return 1
++	case .Neighbourhood: return 1
++	}
++	return 0
++}
++
++// Map_District — one baked district (a named anchor the user's gallery
++// labels). `pos` is in tile units (the baked center); `kind` drives label
++// priority/size; `name` is the render label text.
++Map_District :: struct {
++	name: string,
++	kind: District_Kind,
++	pos:  [2]f32, // tile units (the baked anchor)
++}
++
++// Map_Board — the parsed dublin.json asset. Loaded by the caller (app/
++// harness) from bytes via map_board_load; owned by the caller (run_destroy
++// never frees it — the board outlives any single run, like the catalogs).
++// The SIM reads only: w_tiles/h_tiles (validated == balance), the candidate
++// pool + per-district ranges + district anchors. The terrain/streets/
++// attribution fields are RENDER-ONLY (the view draws them; the sim never
++// reads a byte — growth touches only the pool).
++Map_Board :: struct {
++	w_tiles: i32,
++	h_tiles: i32,
++	// the 1-in-6 spawn pool: integer tile positions, snapped + deduped +
++	// grid-filtered at load (the briefing rule-3 "filter at bake-load").
++	candidates: [dynamic][2]i32,
++	// the 1-in-6 RENDER dots: the RAW sub-tile points (the blessed gallery's
++	// dotted-street texture — the dots sit at ~14 m spacing along streets, so
++	// they render as a dotted line, not individual buildings). The view draws
++	// these; the sim spawns from `candidates` (the snapped pool) — the two
++	// can never disagree (both derive from the same stride-6 subsample).
++	render_dots: [dynamic][2]f32,
++	// parallel to candidates: the tile's district index (nearest anchor).
++	candidate_district: [dynamic]u16,
++	// per-district candidate index runs — district d's pool is
++	// candidates[district_start[d]..district_start[d+1]) (flat, no map
++	// iteration — ODN-10). Length = len(districts) + 1.
++	district_start: [dynamic]u32,
++	// the district anchors (file order — deterministic; index = the u16
++	// above). `name` is a parse-time clone (owned, freed by map_board_destroy).
++	districts: [dynamic]Map_District,
++	// --- render-only underlay (the sim never reads these) ---
++	water:      [dynamic][dynamic][2]f32, // terrain polygons (tile units)
++	coast:      [dynamic][dynamic][2]f32,
++	park:       [dynamic][dynamic][2]f32,
++	arterial:   [dynamic][dynamic][2]f32, // street polylines (tile units)
++	local:      [dynamic][dynamic][2]f32,
++	attribution: string, // the ODbL credit line ("© OpenStreetMap contributors")
++}
++
++// map_board_destroy — free the board's owned buffers (the caller owns the
++// board value; call once when the process is done with it — the app frees at
++// exit, the harness's board cache lives for the process).
++map_board_destroy :: proc(b: ^Map_Board) {
++	for d in b.districts {
++		delete(d.name)
++	}
++	delete(b.districts)
++	delete(b.attribution)
++	delete(b.candidates)
++	delete(b.render_dots)
++	delete(b.candidate_district)
++	delete(b.district_start)
++	map_polys_destroy(&b.water)
++	map_polys_destroy(&b.coast)
++	map_polys_destroy(&b.park)
++	map_polys_destroy(&b.arterial)
++	map_polys_destroy(&b.local)
++}
++
++map_polys_destroy :: proc(polys: ^[dynamic][dynamic][2]f32) {
++	for p in polys {
++		delete(p)
++	}
++	delete(polys^)
++}
++
++// map_json_str — a required string field from a JSON object (fail loud).
++map_json_str :: proc(obj: json.Object, key: string) -> (string, bool) {
++	v, ok := obj[key].(json.String)
++	if !ok {
++		return "", false
++	}
++	return v, true
++}
++
++// map_json_f32_pair — a required [x, y] pair from a JSON array (fail loud).
++map_json_f32_pair :: proc(v: json.Value) -> ([2]f32, bool) {
++	arr, ok := v.(json.Array)
++	if !ok || len(arr) != 2 {
++		return {}, false
++	}
++	x, okx := arr[0].(json.Float)
++	y, oky := arr[1].(json.Float)
++	if !okx || !oky {
++		return {}, false
++	}
++	return {f32(x), f32(y)}, true
++}
++
++// map_ring_clean — dedupe consecutive duplicate points (OSM rings repeat the
++// closing/stitch vertex; an ear-clip triangulator needs a simple ring), drop
++// the closing repeat, and reject degenerate rings (< 3 points). Appends the
++// cleaned ring to `out` — OWNERSHIP TRANSFER: the appended dynamic array
++// shares `pts`'s backing store, so the success path never deletes it (the
++// failure paths delete explicitly — never free a store the board now owns).
++map_ring_clean :: proc(out: ^[dynamic][dynamic][2]f32, poly: json.Array, allocator := context.allocator) {
++	pts := make([dynamic][2]f32, 0, len(poly), allocator)
++	for v in poly {
++		p, ok := map_json_f32_pair(v)
++		if !ok {
++			delete(pts)
++			return // malformed — skip the ring (the asset is baked; defensive)
++		}
++		if len(pts) > 0 && pts[len(pts)-1] == p {
++			continue // consecutive duplicate (OSM stitch vertices)
++		}
++		append(&pts, p)
++	}
++	if len(pts) < 3 {
++		delete(pts)
++		return
++	}
++	// a ring's last point may repeat the first (closed rings) — drop it so
++	// the triangulator sees a simple open chain.
++	if pts[0] == pts[len(pts)-1] {
++		pop(&pts)
++	}
++	if len(pts) < 3 {
++		delete(pts)
++		return
++	}
++	append(out, pts)
++}
++
++// map_line_clean — a street polyline (NOT a ring): consecutive-duplicate
++// dedupe + the ≥2-point minimum. Same ownership rule as map_ring_clean.
++map_line_clean :: proc(out: ^[dynamic][dynamic][2]f32, line: json.Array, allocator := context.allocator) {
++	pts := make([dynamic][2]f32, 0, len(line), allocator)
++	for v in line {
++		p, ok := map_json_f32_pair(v)
++		if !ok {
++			delete(pts)
++			return
++		}
++		if len(pts) > 0 && pts[len(pts)-1] == p {
++			continue
++		}
++		append(&pts, p)
++	}
++	if len(pts) < 2 {
++		delete(pts)
++		return
++	}
++	append(out, pts)
++}
++
++// map_polys_load — parse a terrain (ring) list or a street (polyline) list.
++// `rings` selects the cleaning rule (terrain rings close; street polylines
++// are open chains — a 2-point street is legal).
++map_polys_load :: proc(out: ^[dynamic][dynamic][2]f32, v: json.Value, rings: bool, allocator := context.allocator) -> bool {
++	arr, ok := v.(json.Array)
++	if !ok {
++		return false
++	}
++	for poly in arr {
++		pa, okp := poly.(json.Array)
++		if !okp {
++			return false
++		}
++		if rings {
++			map_ring_clean(out, pa, allocator)
++		} else {
++			map_line_clean(out, pa, allocator)
++		}
++	}
++	return true
++}
++
++// map_board_load — parse + validate the baked dublin.json bytes into a
++// Map_Board. Fail-loud on any structural violation (the asset is committed +
++// extract-validated; a bad load is a broken tree, never a silent partial
++// board). `bal` pins the design-grid contract: the board dims MUST equal the
++// balance map dims (the camera fit + E31 grid bounds derive from balance —
++// a mismatch would place the city off the play surface).
++map_board_load :: proc(src: []u8, bal: ^Balance, allocator := context.allocator) -> (b: Map_Board, err: string) {
++	v, perr := json.parse(src, parse_integers = false, allocator = allocator)
++	if perr != nil {
++		return {}, fmt.tprintf("map_board_load: dublin.json parse failed: %v", perr)
++	}
++	defer json.destroy_value(v, allocator)
++	obj, ok := v.(json.Object)
++	if !ok {
++		return {}, "map_board_load: dublin.json root is not an object"
++	}
++	// --- board dims (the design-grid contract) ---
++	bo, okb := obj["board"].(json.Object)
++	if !okb {
++		return {}, "map_board_load: missing board block"
++	}
++	b.w_tiles = i32(json_get_int(bo, "w_tiles", -1))
++	b.h_tiles = i32(json_get_int(bo, "h_tiles", -1))
++	if b.w_tiles != bal.map_w_tiles || b.h_tiles != bal.map_h_tiles {
++		return {}, fmt.tprintf("map_board_load: board dims %dx%d != balance map dims %dx%d (the design-grid contract)",
++			b.w_tiles, b.h_tiles, bal.map_w_tiles, bal.map_h_tiles)
++	}
++	// --- attribution (the ODbL credit the view renders) ---
++	if attr, oka := map_json_str(obj, "attribution"); oka {
++		b.attribution = strings_clone(attr, allocator)
++	}
++	// --- districts (file order = index order; deterministic) ---
++	dist_arr, okd := obj["districts"].(json.Array)
++	if !okd {
++		return {}, "map_board_load: missing districts"
++	}
++	for dv in dist_arr {
++		doj, okdo := dv.(json.Object)
++		if !okdo {
++			return {}, "map_board_load: malformed district"
++		}
++		name, okn := map_json_str(doj, "name")
++		if !okn {
++			return {}, "map_board_load: district missing name"
++		}
++		px, okx := doj["x"].(json.Float)
++		py, oky := doj["y"].(json.Float)
++		if !okx || !oky {
++			return {}, "map_board_load: district missing x/y"
++		}
++		kind := District_Kind.Suburb
++		if ks, oks := map_json_str(doj, "kind"); oks {
++			switch ks {
++			case "city":          kind = .City
++			case "town":          kind = .Town
++			case "village":       kind = .Village
++			case "suburb":        kind = .Suburb
++			case "quarter":       kind = .Quarter
++			case "neighbourhood": kind = .Neighbourhood
++			case: // unknown kind — keep the suburb default (defensive; the asset is baked)
++			}
++		}
++		append(&b.districts, Map_District{name = strings_clone(name, allocator), kind = kind, pos = {f32(px), f32(py)}})
++	}
++	if len(b.districts) == 0 {
++		return {}, "map_board_load: no districts"
++	}
++	// --- the 1-in-6 spawn pool (stride -> snap -> grid filter -> dedupe) ---
++	cands, okc := obj["spawn_candidates"].(json.Array)
++	if !okc {
++		return {}, "map_board_load: missing spawn_candidates"
++	}
++	// pass 1: snap + filter (a spawn is a TILE — the E31 grid contract)
++	snapped := make([dynamic][2]i32, 0, len(cands) / MAP_SPAWN_STRIDE, allocator)
++	defer delete(snapped)
++	for i := 0; i < len(cands); i += MAP_SPAWN_STRIDE {
++		p, okp := map_json_f32_pair(cands[i])
++		if !okp {
++			return {}, "map_board_load: malformed spawn candidate"
++		}
++		tx := i32(math.round(f64(p[0])))
++		ty := i32(math.round(f64(p[1])))
++		if tx < 0 || tx >= b.w_tiles || ty < 0 || ty >= b.h_tiles {
++			continue // the "filter at bake-load": out-of-grid tiles never enter the pool
++		}
++		append(&snapped, [2]i32{tx, ty})
++	}
++	// pass 2: dedupe (first occurrence wins — file order, deterministic) +
++	// the district assignment (nearest anchor; ties to the lower index).
++	// Linear scans (no map iteration, ODN-10): 37k tiles × 719 pool is
++	// trivial at load.
++	b.candidates = make([dynamic][2]i32, 0, len(snapped), allocator)
++	b.candidate_district = make([dynamic]u16, 0, len(snapped), allocator)
++	for p in snapped {
++		dup := false
++		for i in 0..<len(b.candidates) {
++			if b.candidates[i] == p {
++				dup = true
++				break
++			}
++		}
++		if dup {
++			continue
++		}
++		best: u16 = 0
++		bd2 := max(f32)
++		for di in 0..<len(b.districts) {
++			dx := f32(p[0]) - b.districts[di].pos[0]
++			dy := f32(p[1]) - b.districts[di].pos[1]
++			d2 := dx * dx + dy * dy
++			if d2 < bd2 {
++				bd2 = d2
++				best = u16(di)
++			}
++		}
++		append(&b.candidates, p)
++		append(&b.candidate_district, best)
++	}
++	// the render dots (raw sub-tile points — the gallery's dotted texture)
++	b.render_dots = make([dynamic][2]f32, 0, len(snapped), allocator)
++	for i := 0; i < len(cands); i += MAP_SPAWN_STRIDE {
++		p, okp := map_json_f32_pair(cands[i])
++		if !okp {
++			return {}, "map_board_load: malformed spawn candidate"
++		}
++		if p[0] < 0 || p[0] >= f32(b.w_tiles) || p[1] < 0 || p[1] >= f32(b.h_tiles) {
++			continue
++		}
++		append(&b.render_dots, p)
++	}
++	if len(b.candidates) == 0 {
++		return {}, "map_board_load: the 1-in-6 spawn pool is empty (degenerate asset)"
++	}
++	// per-district ranges (flat — the ATTACH family's pool draw)
++	b.district_start = make([dynamic]u32, len(b.districts) + 1, allocator)
++	for di in 0..<len(b.districts) {
++		b.district_start[di] = 0 // (filled below; the sentinel at the end)
++	}
++	// count per district, then prefix-sum into the start table. Two passes
++	// (no per-district dynamic arrays — flat ranges, ODN-10).
++	counts := make([]u32, len(b.districts), allocator)
++	defer delete(counts)
++	for i in 0..<len(b.candidates) {
++		counts[b.candidate_district[i]] += 1
++	}
++	acc: u32 = 0
++	for di in 0..<len(b.districts) {
++		b.district_start[di] = acc
++		acc += counts[di]
++	}
++	b.district_start[len(b.districts)] = acc
++	// --- the render-only underlay (terrain rings + street polylines) ---
++	if !map_polys_load(&b.water, obj["terrain"].(json.Object)["water"], true, allocator) {
++		return {}, "map_board_load: malformed terrain.water"
++	}
++	if !map_polys_load(&b.coast, obj["terrain"].(json.Object)["coast"], true, allocator) {
++		return {}, "map_board_load: malformed terrain.coast"
++	}
++	if !map_polys_load(&b.park, obj["terrain"].(json.Object)["park"], true, allocator) {
++		return {}, "map_board_load: malformed terrain.park"
++	}
++	if !map_polys_load(&b.arterial, obj["streets"].(json.Object)["arterial"], false, allocator) {
++		return {}, "map_board_load: malformed streets.arterial"
++	}
++	if !map_polys_load(&b.local, obj["streets"].(json.Object)["local"], false, allocator) {
++		return {}, "map_board_load: malformed streets.local"
++	}
++	return b, ""
++}
++
++// json_get_int — a required integer field (the catalog loader's convention).
++json_get_int :: proc(obj: json.Object, key: string, def: i64) -> i64 {
++	if v, ok := obj[key]; ok {
++		#partial switch x in v {
++		case json.Float:
++			return i64(x)
++		}
++	}
++	return def
++}
++
++// strings_clone — strings.clone under the board's allocator (the core already
++// imports core:strings elsewhere; a tiny alias keeps map.odin self-contained).
++strings_clone :: proc(s: string, allocator := context.allocator) -> string {
++	out := make([]u8, len(s), allocator)
++	copy(out, s)
++	return string(out)
++}
++
++// map_board_candidate_pool — the global pool range (the SEED family's draw
++// domain): candidates[0..len). Convenience accessor mirroring the per-district
++// ranges (district d = candidates[district_start[d]..district_start[d+1])).
++map_board_pool_lo :: proc(b: ^Map_Board) -> u32 { return 0 }
++map_board_pool_hi :: proc(b: ^Map_Board) -> u32 { return u32(len(b.candidates)) }
+diff --git a/core/map_test.odin b/core/map_test.odin
+new file mode 100644
+index 00000000..71fbcf3e
+--- /dev/null
++++ b/core/map_test.odin
+@@ -0,0 +1,206 @@
++package core
++
++// map_test.odin — v2-dublin-board: the board loader + the board-aware growth
++// as durable tests (the acceptance-pin convention). Pins:
++//   (a) the 1-in-6 stride -> snap -> grid-filter -> dedupe pool contract
++//       (a spawn is a TILE; out-of-grid points never enter the pool);
++//   (b) the district assignment (nearest anchor, ties to the lower index) +
++//       the flat per-district ranges (the ATTACH family's draw domain);
++//   (c) the design-grid contract: board dims != balance map dims is a
++//       defined load error (fail loud, never a mis-sized play surface);
++//   (d) dublin growth spawns land ON the pool (a real-street tile), the E31
++//       predicates still gate (never an illegal placement), and the ATTACH
++//       family stays WITHIN the anchor's district (the growth_groups
++//       interplay: cluster radius/caps apply within districts);
++//   (e) the procedural path is untouched (existing growth tests pin it).
++
++import "core:fmt"
++import "core:testing"
++
++// test_board — a synthetic board on the catalog's 40×30 grid with TWO
++// districts (A at (6,6), B at (24,6)) and a cross-shaped pool per district:
++// the tiles sit 4 tiles from the district anchor (the E31 sep floor) so the
++// ATTACH family can land candidates (a tile must be >= terminal_min_sep_tiles
++// from the anchor node AND within radius_tiles of it — the [4, 5] ring).
++test_board :: proc(allocator := context.allocator) -> Map_Board {
++	b: Map_Board
++	b.w_tiles = 40
++	b.h_tiles = 30
++	append(&b.districts, Map_District{name = "A", pos = {6, 6}})
++	append(&b.districts, Map_District{name = "B", pos = {24, 6}})
++	// pool tiles in file order (the dedupe keeps first occurrences): A's
++	// cross (the anchor + the 4-tile ring), then B's cross.
++	pool := [10][2]i32{
++		[2]i32{2, 6}, [2]i32{10, 6}, [2]i32{6, 2}, [2]i32{6, 10}, [2]i32{6, 6},
++		[2]i32{20, 6}, [2]i32{28, 6}, [2]i32{24, 2}, [2]i32{24, 10}, [2]i32{24, 6},
++	}
++	for p in pool {
++		append(&b.candidates, p)
++	}
++	b.candidate_district = make([dynamic]u16, 0, 16, allocator)
++	for i in 0..<len(b.candidates) {
++		append(&b.candidate_district, board_district_at(&b, b.candidates[i]))
++	}
++	// the flat per-district ranges (the loader's prefix-sum shape)
++	b.district_start = make([dynamic]u32, 3, allocator)
++	acc: u32 = 0
++	for di in 0..<2 {
++		b.district_start[di] = acc
++		for i in 0..<len(b.candidates) {
++			if b.candidate_district[i] == u16(di) {
++				acc += 1
++			}
++		}
++	}
++	b.district_start[2] = acc
++	return b
++}
++
++test_board_destroy :: proc(b: ^Map_Board) {
++	delete(b.candidates)
++	delete(b.candidate_district)
++	delete(b.district_start)
++	for d in b.districts {
++		delete(d.name)
++	}
++	delete(b.districts)
++}
++
++// dublin_growth_run — step a run with growth on + the board pinned. `bias`
++// overrides the test catalog's growth_groups bias (0 = the SEED family only
++// — the pool-draw test; 1000 = the strict ATTACH doctrine — the district
++// test). `seeds` pre-places terminals on pool tiles (the attach anchors).
++// The router goes at (6,14) — 8 tiles below district A's anchor, clear of
++// every pool tile's E31 sep ring, connectable to both districts (span 18).
++// Returns the grown terminal positions (ids >= 4 — the director's spawns;
++// the fixture ids 0..2 + the router + the pre-seeded anchors are excluded).
++dublin_growth_run :: proc(t: ^testing.T, cat: ^Catalogs, board: ^Map_Board, bias: i32, seeds: [][2]i32) -> [dynamic][2]i32 {
++	s, _, _, _ := topo_setup(t, cat)
++	defer run_destroy(&s)
++	router_idx, _ := node_type_index(cat, "router_basic")
++	topology_spawn_node(&s.topology, router_idx, {6, 14}, cat)
++	res_idx, _ := node_type_index(cat, "residential")
++	for sd in seeds {
++		topology_spawn_node(&s.topology, res_idx, sd, cat)
++	}
++	s.era = 3
++	s.growth_enabled = true
++	s.map_source = u8(Map_Source.Dublin)
++	s.board = board
++	cat.balance.growth_groups.bias_prob_permille = bias
++	// 480 ticks = 6 spawn windows (80 = the balance pace knob)
++	record_run(&s, 480, cat)
++	out := make([dynamic][2]i32, context.temp_allocator)
++	for i in 0..<len(s.topology.node_alive) {
++		if s.topology.node_alive[i] && s.topology.node_kind[i] == .Terminal && s.topology.node_id[i] >= 4 + u32(len(seeds)) {
++			// ids 0..3 are the fixture (res, rt, host) + the test router;
++			// the pre-seeded anchors follow — only the director's OWN
++			// spawns are under test
++			append(&out, s.topology.node_pos[i])
++		}
++	}	return out
++}
++
++@(test)
++test_map_board_load_pool_contract :: proc(t: ^testing.T) {
++	// (a) stride -> snap -> grid filter -> dedupe: the pool holds integer
++	// TILES only, in first-occurrence order; out-of-grid points never enter.
++	// A 5-point strip at 0.2-tile spacing inside the grid + points outside.
++	src := `{"board":{"w_tiles":8,"h_tiles":6},"spawn_candidates":[[1.1,1.2],[1.3,1.4],[1.5,1.6],[7.9,5.1],[-0.4,2.0],[2.0,6.4]],"districts":[{"name":"D","kind":"city","x":4,"y":3}],"terrain":{"water":[],"coast":[],"park":[]},"streets":{"arterial":[],"local":[]}}`
++	bal := Balance{map_w_tiles = 8, map_h_tiles = 6}
++	b, err := map_board_load(transmute([]u8)src, &bal, context.temp_allocator)
++	defer map_board_destroy(&b)
++	testing.expect(t, err == "", fmt.tprintf("board load failed: %s", err))
++	// stride 6 over 6 candidates = 1 point (the first). It snaps to (1,1).
++	testing.expectf(t, len(b.candidates) == 1, "pool must hold exactly 1 tile, got %d", len(b.candidates))
++	testing.expectf(t, b.candidates[0] == [2]i32{1, 1}, "snapped pool tile wrong: %v", b.candidates[0])
++	// the render dots hold the RAW subsample (same stride)
++	testing.expectf(t, len(b.render_dots) == 1, "render dots must hold 1 point, got %d", len(b.render_dots))
++}
++
++@(test)
++test_map_board_load_dims_contract :: proc(t: ^testing.T) {
++	// (c) the design-grid contract: a board whose dims differ from the
++	// balance map dims is a defined load error (fail loud).
++	src := `{"board":{"w_tiles":40,"h_tiles":30},"spawn_candidates":[[1,1]],"districts":[{"name":"D","kind":"city","x":4,"y":3}],"terrain":{"water":[],"coast":[],"park":[]},"streets":{"arterial":[],"local":[]}}`
++	bal := Balance{map_w_tiles = 8, map_h_tiles = 6} // mismatched
++	b, err := map_board_load(transmute([]u8)src, &bal, context.temp_allocator)
++	defer map_board_destroy(&b)
++	testing.expect(t, err != "", "mismatched board dims must fail loud")
++	testing.expectf(t, len(b.candidates) == 0, "a failed load must not return a usable pool (%d tiles)", len(b.candidates))
++}
++
++@(test)
++test_growth_dublin_spawns_on_pool :: proc(t: ^testing.T) {
++	// (d) the headline acceptance: dublin growth spawns land ON the board's
++	// street tiles (the pool), never off-pool, and every spawn stays E31-valid
++	// (the existing predicates gate the pool — a candidate, never a
++	// guaranteed placement). The SEED family (bias 0) draws the pool; the
++	// fresh-area floor + E31 reject what they reject — the pool is the only
++	// domain.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	board := test_board(context.allocator)
++	defer test_board_destroy(&board)
++	terminals := dublin_growth_run(t, cat, &board, 0, {})
++	defer delete(terminals)
++	testing.expectf(t, len(terminals) > 0, "dublin SEED growth must spawn (the mesh + the pool are connectable)")
++	for pos in terminals {
++		on_pool := false
++		for c in board.candidates {
++			if c == pos {
++				on_pool = true
++				break
++			}
++		}
++		testing.expectf(t, on_pool, "spawn %v is NOT on a pool tile (the streets-constrain rule)", pos)
++		// the E31 floor still holds (the existing predicate — belt)
++		testing.expectf(t, pos[0] >= 0 && pos[0] < board.w_tiles && pos[1] >= 0 && pos[1] < board.h_tiles,
++			"spawn %v is outside the board grid", pos)
++	}
++}
++
++@(test)
++test_growth_dublin_attach_stays_in_estate_radius :: proc(t: ^testing.T) {
++	// (d) the growth_groups interplay on the board (the streets rule): the
++	// ATTACH family draws the anchor's STREET RING (the pool tiles in
++	// [min_sep, radius] of a member) — every attach spawn sits within the
++	// estate radius of a member (the strict-radius closure preserved: no
++	// strays), on a pool tile, E31-valid. Pre-seed one terminal per district
++	// (the anchors at the cross centers); the strict doctrine (bias 1000)
++	// then extends each estate from its own streets.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	board := test_board(context.allocator)
++	defer test_board_destroy(&board)
++	seeds := [2][2]i32{{6, 6}, {24, 6}}
++	terminals := dublin_growth_run(t, cat, &board, 1000, seeds[:])
++	defer delete(terminals)
++	testing.expectf(t, len(terminals) > 0, "dublin ATTACH growth must spawn (the anchors sit on the pool)")
++	radius := i64(cat.balance.growth_groups.radius_tiles)
++	r2 := radius * radius
++	for pos in terminals {
++		on_pool := false
++		for c in board.candidates {
++			if c == pos {
++				on_pool = true
++				break
++			}
++		}
++		testing.expectf(t, on_pool, "attach spawn %v is NOT on a pool tile", pos)
++		// the strict-radius closure: every spawn sits within the estate radius
++		// of the nearest seed anchor (the attach's own ring guarantees this —
++		// pinned so a regression to an unbounded draw fails here).
++		in_radius := false
++		for sd in seeds {
++			d := pos - sd
++			if i64(d[0])*i64(d[0])+i64(d[1])*i64(d[1]) <= r2 {
++				in_radius = true
++				break
++			}
++		}
++		testing.expectf(t, in_radius, "attach spawn %v sits outside the estate radius of every anchor (a stray)", pos)
++	}
++}
+diff --git a/core/serialize.odin b/core/serialize.odin
+index 79dd4e66..331a7966 100644
+--- a/core/serialize.odin
++++ b/core/serialize.odin
+@@ -118,6 +118,16 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event, cat: ^Catalogs,
+ 	if state.era_advance_to != 0 {
+ 		w_u8(&w, state.era_advance_to)
+ 	}
++	// v2-dublin-board: the map source (the named determinism input) —
++	// ABSENT-WHEN-procedural (the golden-stability rule: the zero value
++	// writes zero bytes, so every legacy run/demo/replay hashes
++	// byte-identically — LOG_VERSION-safe by construction; the ONLY shift is
++	// the deliberate map_source byte on dublin runs, part of the cause-
++	// documented re-bless). The board DATA itself is never serialized (the
++	// fixture precedent — its observable state rides the topology section).
++	if state.map_source != 0 {
++		w_u8(&w, state.map_source)
++	}
+ 	w_u64(&w, state.catalog_hash)
+ 	w_i32(&w, state.logic_hz)
+ 	// the win/lose gate (1.4): score + goal + tick_cap + terminal + outcome ride
+diff --git a/core/step.odin b/core/step.odin
+index 7dba6e0b..9bb4e69a 100644
+--- a/core/step.odin
++++ b/core/step.odin
+@@ -113,7 +113,7 @@ step :: proc(state: ^Run_State, tick: u64, commands: []Command, cat: ^Catalogs)
+ 	// routing_gen — replay re-derives the identical step sequence).
+ 	if state.growth_enabled && state.growth_last_tick != tick {
+ 		state.growth_last_tick = tick
+-		intent := growth_plan_demand(&state.topology, cat, state.era, tick, &state.rng)
++		intent := growth_plan_demand(&state.topology, cat, state.era, tick, &state.rng, state.board)
+ 		if intent.spawn {
+ 			growth_apply(state, intent, cat)
+ 			// v2-sound: the node-spawn cue — emitted at the growth tick (the
+diff --git a/core/types.odin b/core/types.odin
+index a21d4c28..ea904196 100644
+--- a/core/types.odin
++++ b/core/types.odin
+@@ -528,6 +528,16 @@ Run_State :: struct {
+ 	surge_win_pct:  u32,               // 4.3: the surge-uptime win threshold (run setup; 0 = disabled)
+ 	health:       Health_State,         // 4.3: S5 — the meter + grace + window + surge tracking
+ 	growth_enabled: bool,             // 5.1: the director's map growth is live (run setup, like health_enabled — NOT serialized; its observable state is the spawned terminals, which ride the topology section of the T1 hash). Disabled (the zero value) = every legacy run stays static + its rng stream untouched.
++	// v2-dublin-board: the MAP SOURCE — run setup like the seed (the named
++	// determinism input `map`: dublin | procedural). Serialized into the T1
++	// hash ABSENT-WHEN-procedural (the golden-stability rule: the zero value
++	// = every legacy run/demo/replay stays byte-identical — LOG_VERSION-safe,
++	// the log format never changes). The BOARD (state.board) is caller-owned
++	// data, never serialized — like the fixture, its observable state (the
++	// spawned terminals at real-street tiles) rides the topology section of
++	// the T1 hash, and the replay re-derives it from the same asset bytes.
++	map_source: u8, // Map_Source (0 = Procedural — the zero value; 1 = Dublin)
++	board: ^Map_Board, // the loaded board when map_source == Dublin (caller-owned — run_destroy never frees it, the caller owns the load lifetime; nil = procedural)
+ 	growth_last_tick: u64,            // 5.1: the last executed tick the growth branch RAN on (a non-serialized run-scoped marker, same status as routing_gen — rebuilt identically on replay, never in the T1 hash). The same-tick re-step guard: the pre-existing step_once test convention re-steps a tick, and a re-step must not re-plan + re-apply growth (the rng would not have advanced between the two calls, so a re-plan could find a SECOND valid spot and double-spawn). Setting it on EVERY enabled tick (spawn window or not) also makes a re-step consume zero rng.
+ 	// 6.2: the era-advance gate is live (run setup, like health_enabled/growth_enabled
+ 	// — NOT serialized; its observable state is the event stream + the era byte).
+diff --git a/demos/dublin_board.dem b/demos/dublin_board.dem
+new file mode 100644
+index 00000000..9436d04d
+--- /dev/null
++++ b/demos/dublin_board.dem
+@@ -0,0 +1,29 @@
++# dublin_board.dem — v2-dublin-board's named golden (stage 1 of the real-maps
++# arc): the Dublin cross-section board (data/maps/dublin.json, merged in #90)
++# under the growth director — the board REPLACES the procedural terrain, and
++# growth spawns land on the board's real-street tile pool (the 1-in-6 density,
++# the user's blessed calm default) with estates clustering within districts
++# (the growth_groups interplay: the ATTACH family draws from the anchor's
++# district pool — a cluster never crosses a district boundary).
++#
++# The mesh: two high routers on the city core's street tiles ((20,15) + (16,12)
++# are pool tiles near Temple Bar / the Liffey) joined by a wide fiber — the
++# era-3 connect span (18) + the dense core give the growth director the
++# widest valid spawn surface. Spawns are seed-derived (the 5.1 canon): the
++# T1 manifest pins the full timeline; the T2 captures show the board underlay
++# + the grown terminals + the player-built wire.
++#
++# T1 pins (replay gate + manifest): every per-tick hash incl. the growth
++# spawns (replay byte-identical [E10] — the replay re-derives the same
++# spawns from the same seed + the same board bytes).
++seed 2026
++era 3
++run 90000ms
++fixture off
++map dublin
++growth on
++spawn_node router_high 20 15
++spawn_node router_high 16 12
++at 100ms draw 0 1 wide
++capture at 30000ms
++capture at 90000ms
+diff --git a/docs/captures/dublin-board/attribution.png b/docs/captures/dublin-board/attribution.png
+new file mode 100644
+index 00000000..4e400d3e
+Binary files /dev/null and b/docs/captures/dublin-board/attribution.png differ
+diff --git a/docs/captures/dublin-board/game_vs_gallery.png b/docs/captures/dublin-board/game_vs_gallery.png
+new file mode 100644
+index 00000000..5b793630
+Binary files /dev/null and b/docs/captures/dublin-board/game_vs_gallery.png differ
+diff --git a/docs/captures/dublin-board/underlay_vs_gallery.png b/docs/captures/dublin-board/underlay_vs_gallery.png
+new file mode 100644
+index 00000000..3cd610b7
+Binary files /dev/null and b/docs/captures/dublin-board/underlay_vs_gallery.png differ
+diff --git a/harness/catalogs.odin b/harness/catalogs.odin
+index b3aa8453..96711309 100644
+--- a/harness/catalogs.odin
++++ b/harness/catalogs.odin
+@@ -74,3 +74,34 @@ seed_qos_fixture :: proc(state: ^pp.Run_State, cat: ^pp.Catalogs) {
+ 	pp.topology_spawn_node(&state.topology, res_idx, {14, 22}, cat)
+ 	pp.topology_spawn_node(&state.topology, res_idx, {26, 22}, cat)
+ }
++
++// --- v2-dublin-board: the board cache ---------------------------------------
++// The baked Dublin board (data/maps/dublin.json) is loaded ONCE per harness
++// process (a sequential demo run shares the read-only parse — the sim and
++// the view read the same Map_Board; the replay paths re-derive the identical
++// spawns from the identical asset bytes, so byte-identical replay holds by
++// construction). Package-level cache (package main — the ODN-13 no-globals
++// rule binds core, not the harness CLI).
++board_cache: pp.Map_Board
++board_cache_loaded: bool
++
++// board_load — parse data/maps/dublin.json into the cached Map_Board (lazy,
++// once per process). Returns the cache pointer + "" on success, "" + a
++// one-line error otherwise (fail loud — a dublin demo must never silently
++// run procedural).
++board_load :: proc(cat: ^pp.Catalogs) -> (^pp.Map_Board, string) {
++	if board_cache_loaded {
++		return &board_cache, ""
++	}
++	bytes, e := os.read_entire_file_from_path("data/maps/dublin.json", context.temp_allocator)
++	if e != nil {
++		return nil, fmt.tprintf("board_load: cannot read data/maps/dublin.json: %v", e)
++	}
++	b, lerr := pp.map_board_load(bytes, &cat.balance, context.allocator)
++	if lerr != "" {
++		return nil, fmt.tprintf("board_load: %s", lerr)
++	}
++	board_cache = b
++	board_cache_loaded = true
++	return &board_cache, ""
++}
+diff --git a/harness/demo.odin b/harness/demo.odin
+index f3a2d7df..372c0f61 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -15,6 +15,7 @@ package main
+ import "core:fmt"
+ import "core:strconv"
+ import "core:strings"
++import pp "../core"
+ 
+ Draw_Intent :: struct {
+ 	at_ms: i64,
+@@ -184,6 +185,7 @@ Demo :: struct {
+ 	advances:           [dynamic]Advance_Intent,  // 6.1: `at <n>ms advance <era>` (a LOGGED command — the era FSM's input)
+ 	growth_on:          bool,    // 5.1: `growth on` — the director's map growth (run setup, like the fixture)
+ 	advance_gate_on:    bool,    // 6.2: `advance gate on` — the era-advance modernization gate (run setup; disabled = the 6.1 mechanics, byte-identical)
++	map_source:         u8,      // v2-dublin-board: `map dublin` / `map procedural` — the named map input (run setup, like the seed; 0 = procedural — the zero value, every legacy demo stays byte-identical)
+ 
+ 	captures:           [dynamic]i64, // T2 capture times (ms)
+ 	win_goal:           u32, // 1.4: packets to deliver for a WIN (0 = win/lose disabled)
+@@ -209,6 +211,10 @@ Demo :: struct {
+ // `at <n>ms pause|resume` (5.3 — the driver pause schedule; see Pause_Event),
+ // `at <n>ms preview <pipe> <tier>` (Job C / R4 — render-only),
+ // `at <n>ms advance <era>` (6.1 — request an era advance; a LOGGED command),
++// `map dublin|procedural` (v2-dublin-board — the named map input: run setup,
++// like the seed; a demo pins the board it was authored for. Absent = procedural
++// (the zero value) so every pre-board demo stays byte-identical — the
++// LOG_VERSION-safe back-compat contract),
+ // `spawn_node <type> <x> <y>`, `fixture on|off`, `win goal <n>`,
+ // `win surge <n>` (4.3 — the surge-uptime win threshold), `health on`
+ // (4.3 — the Network Health meter), `lose cap <n>ms`, `capture at <n>ms`.
+@@ -603,6 +609,26 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 				return {}, fmt.tprintf("bad growth (want: growth on): %s", line)
+ 			}
+ 			d.growth_on = true
++		case "map":
++			// map dublin|procedural — v2-dublin-board: the named map input
++			// (run setup, like the seed — re-created identically on every
++			// replay from the demo + the committed asset bytes). Absent =
++			// procedural (the zero value — every legacy demo stays
++			// byte-identical; the LOG_VERSION-safe contract). `map dublin`
++			// requires the board to load (the harness fails loud at setup,
++			// like an unknown tier — a dublin demo must never silently bless
++			// a procedural golden).
++			if len(fields) < 2 {
++				return {}, fmt.tprintf("bad map (want: map dublin|procedural): %s", line)
++			}
++			switch fields[1] {
++			case "dublin":
++				d.map_source = u8(pp.Map_Source.Dublin)
++			case "procedural":
++				d.map_source = 0
++			case:
++				return {}, fmt.tprintf("bad map value %q (want dublin|procedural): %s", fields[1], line)
++			}
+ 		case "advance":
+ 			// advance gate on — the 6.2 era-advance modernization gate (run
+ 			// setup, like growth on / health on: re-created identically on
+diff --git a/harness/dublin_shot.odin b/harness/dublin_shot.odin
+new file mode 100644
+index 00000000..98eede0e
+--- /dev/null
++++ b/harness/dublin_shot.odin
+@@ -0,0 +1,90 @@
++package main
++
++// dublin_shot.odin — v2-dublin-board: the KYLE-gate capture verb. Renders the
++// DUBLIN board underlay at the camera-fit zoom + a zoomed core close-up
++// (pure underlay — the gallery's exact framing: terrain/streets/candidates/
++// labels, no nodes/HUD) so the live board can be graded side-by-side against
++// the blessed #90 gallery previews (docs/captures/dublin-map-spike). The
++// in-game frame itself is proven by the dublin demo's T2 goldens (underlay +
++// nodes + pipes + HUD through the real draw_world path).
++//
++// Usage: harness dublin-shot [outdir]   (default bin/dublin-shot)
++//   writes <outdir>/baywide.png + <outdir>/templebar.png
++//
++// The zoomed capture drives the view transform directly (scale = fit ×
++// CAM_ZOOM_STEP^n, off centered on the world point) — the same f32 math the
++// camera derives (camera.odin), deterministic (the §10.4 rule).
++
++import "core:fmt"
++import "core:strings"
++import rl "vendor:raylib"
++import pp "../core"
++import rnd "../app/render"
++
++// dublin_shot_view — set the view transform for a zoom level: `zoom` = the
++// CAM_ZOOM_STEP^n multiplier (1.0 = fit; 3.2 ≈ 4 notches in), centered on
++// the world point `center_tx, center_ty` (tiles). Mirrors the camera's
++// derivation (screen = win/2 + (world - center) × fit × zoom).
++dublin_shot_view :: proc(v: ^rnd.View, zoom: f32, center_tx, center_ty: f32) {
++	v.scale = rnd.camera_fit(v) * zoom
++	cx := center_tx * v.tile_px
++	cy := center_ty * v.tile_px
++	v.off_x = (f32(v.win_w) - v.world_w * v.scale) / 2 - (cx - v.world_w / 2) * v.scale
++	v.off_y = (f32(v.win_h) - v.world_h * v.scale) / 2 - (cy - v.world_h / 2) * v.scale
++}
++
++// dublin_shot_capture — draw the current view + write the PNG (the rlsw
++// readback path: flip + swizzle — the T2 spine's normalization). The
++// topology is EMPTY (the pure-underlay framing — the board itself is the
++// subject, like the gallery previews).
++dublin_shot_capture :: proc(rc: ^Render_Ctx, state: ^pp.Run_State, out: string) {
++	rl.BeginDrawing()
++	rnd.draw_world(&rc.view, &state.topology, &state.bundles, &state.flow, &state.crisis, 0, {}, -1, -1, 42)
++	rl.EndDrawing()
++	img := rl.LoadImageFromScreen()
++	rl.ImageFlipVertical(&img)
++	swizzle_rb(&img)
++	cpath := strings.clone_to_cstring(out, context.temp_allocator)
++	if !rl.ExportImage(img, cpath) {
++		fmt.eprintfln("dublin-shot: failed to write %s", out)
++	}
++	rl.UnloadImage(img)
++}
++
++run_dublin_shot :: proc(outdir: string, cat: ^pp.Catalogs) -> int {
++	rl.SetTraceLogLevel(.ERROR)
++	rl.InitWindow(1280, 720, "pp-dublin-shot")
++	defer rl.CloseWindow()
++
++	rc: Render_Ctx
++	render_setup(&rc, cat)
++	bd, e := board_load(cat)
++	if e != "" {
++		fmt.eprintfln("dublin-shot: %s", e)
++		return 2
++	}
++	rc.view.map_source = u8(pp.Map_Source.Dublin)
++	rc.view.board = bd
++
++	state: pp.Run_State
++	defer pp.run_destroy(&state)
++	dublin_board_scene(&state, cat, 42)
++
++	// the fit view (the whole board — the gallery's baywide framing)
++	dublin_shot_view(&rc.view, 1.0, 20, 15)
++	dublin_shot_capture(&rc, &state, fmt.tprintf("%s/baywide.png", outdir))
++
++	// the city-core close-up (Temple Bar — the gallery's crop framing)
++	dublin_shot_view(&rc.view, 3.2, 17.9, 17.4)
++	dublin_shot_capture(&rc, &state, fmt.tprintf("%s/templebar.png", outdir))
++
++	fmt.printfln("dublin-shot: board captures written to %s/baywide.png + %s/templebar.png", outdir, outdir)
++	return 0
++}
++
++// dublin_board_scene — the bare board frame: an empty run at era 3 (the
++// underlay is the whole frame — zero nodes/pipes, like the preview renderer).
++dublin_board_scene :: proc(state: ^pp.Run_State, cat: ^pp.Catalogs, seed: u64) {
++	pp.run_init(state, seed, cat.hash, cat.balance.logic_hz)
++	state.era = 3
++}
+diff --git a/harness/main.odin b/harness/main.odin
+index 42385b71..2b374d83 100644
+--- a/harness/main.odin
++++ b/harness/main.odin
+@@ -94,6 +94,27 @@ main :: proc() {
+ 		pp.catalogs_destroy(&cat)
+ 		os.exit(int(code))
+ 	}
++	if verb == "dublin-shot" {
++		// v2-dublin-board: the KYLE-gate captures — the board underlay at the
++		// fit + a city-core close-up (the gallery's framing). Usage:
++		// harness dublin-shot [outdir]   (default bin/dublin-shot)
++		if len(rest) > 1 {
++			usage()
++		}
++		outdir := "bin/dublin-shot"
++		if len(rest) == 1 {
++			outdir = strings.clone(rest[0], context.allocator)
++		}
++		mkdir_p(outdir)
++		cat: pp.Catalogs
++		if e := load_catalogs(&cat); e != "" {
++			fmt.eprintfln("dublin-shot: %s", e)
++			os.exit(2)
++		}
++		code := run_dublin_shot(outdir, &cat)
++		pp.catalogs_destroy(&cat)
++		os.exit(int(code))
++	}
+ 	if verb == "wire-preview" {
+ 		// 7.5: the lavish-gate tool — routed-vs-straight side-by-side + junction
+ 		// close-ups on the juice (dense core) + estate (5.12) scenes. Usage:
+@@ -399,7 +420,7 @@ main :: proc() {
+ }
+ 
+ usage :: proc() {
+-	fmt.eprintln("usage: harness run|save [demo...] [--stats-out <path>] | replay <demo> <log.bin> | drift-check | preview-check | stats-check <demo> | input-parity [save] | palcheck | map-preview <seed> [out.png] | wire-preview [outdir] | motion-strip <demo> <start_ms> <end_ms> <step_ms> <outdir> [snapshot] | motion-pixel")
++	fmt.eprintln("usage: harness run|save [demo...] [--stats-out <path>] | replay <demo> <log.bin> | drift-check | preview-check | stats-check <demo> | input-parity [save] | palcheck | map-preview <seed> [out.png] | dublin-shot [outdir] | wire-preview [outdir] | motion-strip <demo> <start_ms> <end_ms> <step_ms> <outdir> [snapshot] | motion-pixel")
+ 	when #config(PP_DEBUG, false) {
+ 		fmt.eprintln("       PP_DEBUG: overlay-check <demo> <ms>")
+ 		fmt.eprintln("       PP_DEBUG: overlay-pixels <demo> <ms>")
+diff --git a/harness/run.odin b/harness/run.odin
+index 2ae019b8..3dd3a584 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -287,6 +287,21 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx, s
+ 	// golden by construction).
+ 	a11y_reset(rc)
+ 	apply_demo_a11y(rc, &demo)
++	// v2-dublin-board: the map source is View state too — reset to
++	// procedural, then apply this demo's pin (a dublin demo renders the
++	// board underlay; every other demo is byte-identical to its blessed
++	// golden by construction — the view never touches the sim, ODN-1).
++	rc.view.map_source = 0
++	rc.view.board = nil
++	if demo.map_source == u8(pp.Map_Source.Dublin) {
++		bd, e := board_load(cat)
++		if e != "" {
++			fmt.eprintfln("harness: %s", e)
++			return false
++		}
++		rc.view.map_source = demo.map_source
++		rc.view.board = bd
++	}
+ 	// v2-spawn-feel: a fresh demo drops every spawn effect + the prediction
+ 	// dedup (node ids recycle across demos — a stale telegraph from the
+ 	// previous demo must never announce a spawn in this one).
+@@ -302,6 +317,7 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx, s
+ 		qos_fixture = demo.qos_fixture,
+ 		growth_on = demo.growth_on, // 5.1: run setup — the director's map growth
+ 		advance_gate_on = demo.advance_gate_on, // 6.2: run setup — the era-advance gate (r1 B1: the live/bless path MUST carry the flag or the blessed goldens pin gate-off runs while the replay path — load_demo_replay — runs gate-on and diverges at the fire tick)
++		map_source = demo.map_source, // v2-dublin-board: run setup — the named map input (dublin|procedural)
+ 		session = {goal = demo.win_goal, cap_ms = demo.lose_cap_ms, health_on = demo.health_on, surge_win_pct = demo.surge_win_pct},
+ 	}
+ 	defer {
+@@ -670,6 +686,7 @@ Demo_Replay :: struct {
+ 	pauses:      [dynamic]Pause_Event, // 5.3: the driver pause schedule (run setup)
+ 	growth_on:   bool, // 5.1: the director's map growth (run setup, like the fixture)
+ 	advance_gate_on: bool, // 6.2: the era-advance gate (run setup, like the fixture)
++	map_source:  u8,  // v2-dublin-board: the named map input (run setup, like the seed — the replay re-creates the board from the same committed asset bytes)
+ 	session:     Session_Cfg,
+ }
+ 
+@@ -696,6 +713,21 @@ demo_apply_setup :: proc(state: ^pp.Run_State, cfg: ^Demo_Replay, cat: ^pp.Catal
+ 	apply_session(state, cfg.session, cat.balance.logic_hz)
+ 	state.growth_enabled = cfg.growth_on // 5.1: run setup — re-created identically on every replay
+ 	state.advance_gate_enabled = cfg.advance_gate_on // 6.2: run setup — re-created identically on every replay
++	// v2-dublin-board: the named map input — run setup, re-created
++	// identically on every replay (the fixture precedent). A dublin demo
++	// loads the board ONCE (cached) and pins it on the state; the board's
++	// observable state (the spawned terminals at real-street tiles) rides
++	// the topology section of the T1 hash. A board that fails to load is a
++	// defined setup error (fail loud, like an unknown tier — a dublin demo
++	// must never silently run procedural).
++	if cfg.map_source == u8(pp.Map_Source.Dublin) {
++		bd, e := board_load(cat)
++		if e != "" {
++			return e
++		}
++		state.map_source = cfg.map_source
++		state.board = bd
++	}
+ 	return ""
+ }
+ 
+@@ -749,6 +781,7 @@ load_demo_replay :: proc(demo_name: string) -> Demo_Replay {
+ 	cfg.session.surge_win_pct = demo.surge_win_pct // 4.3
+ 	cfg.growth_on = demo.growth_on // 5.1: run setup — re-created identically on replay
+ 	cfg.advance_gate_on = demo.advance_gate_on // 6.2: run setup — re-created identically on replay
++	cfg.map_source = demo.map_source // v2-dublin-board: run setup — re-created identically on replay (the board re-loads from the same committed asset bytes)
+ 	delete(demo.demolishes) // r1 note: the sibling loaders leaked this too
+ 	delete(demo.emphasis)   // 3.2
+ 	delete(demo.lanes)      // 3.2

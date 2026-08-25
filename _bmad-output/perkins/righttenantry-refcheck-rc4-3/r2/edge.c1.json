@@ -1,0 +1,22 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "stale-bounce-gate",
+    "title": "STILL PRESENT (r1): W3 — stale-bounce exhaustion gate defeated for same-day corrections (RFC3339 vs Postgres ::text lexical mix)",
+    "location": "server/src/reference_checks/webhooks.gleam:297-305; server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:33-42",
+    "evidence": "webhooks.gleam: let genuine_failure = case row.matched_send_at { \"\" -> True at -> case row.corrected_at { \"\" -> True corrected -> // ISO timestamps — lexical compare is chronological. string.compare(at, corrected) != order.Lt } } ; find_reference_call_by_send_ref.sql: COALESCE(( SELECT e->>'at' FROM jsonb_array_elements(rc.attempts) AS e WHERE e->>'detail' = $4 AND e->>'outcome' = 'delivered' ORDER BY e->>'at' DESC LIMIT 1 ), '') AS matched_send_at, ... COALESCE(rc.corrected_at::text, '') AS corrected_at",
+    "detail": "attempts 'at' is RFC3339 (sweep now_iso: timestamp.to_rfc3339 — 'T' at pos 10) while corrected_at::text is Postgres ' ' format. Same UTC day: 'T'(0x54) > ' '(0x20), so any same-day send compares >= corrected_at regardless of order — a stale pre-correction bounce exhausts the corrected row and fabricates referee_contact_invalid.",
+    "recommended_fix": "Compare instants, not text: emit corrected_at via to_char(...,'YYYY-MM-DD\"T\"HH24:MI:SS') (or at time zone 'UTC') in SQL so both sides share one lexical format, and pin with a same-day test."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "take-over-failure-race",
+    "title": "Delivery-failure paths ignore taken_over_at — a late bounce on a taken-over row yanks it to awaiting_correction or exhausts it, breaking the §8.6 late-completion transition",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:53; server/src/reference_checks/sql/mark_awaiting_correction.sql:20; server/src/reference_checks/sql/exhaust_reference_call.sql:29; server/src/reference_checks/sql/complete_reference_call.sql:31",
+    "evidence": "find_reference_call_by_send_ref.sql: WHERE rc.status IN ('queued', 'contact_initiated') ; mark_awaiting_correction.sql: WHERE id = $1 AND status IN ('queued', 'contact_initiated') ; exhaust_reference_call.sql: WHERE id = $1 AND status IN ('queued', 'contact_initiated') ; complete_reference_call.sql: AND status = 'contact_initiated' ; take_over_reference_call.sql: AND taken_over_at IS NULL AND status IN ('queued', 'contact_initiated', 'unreachable')",
+    "detail": "N12's taken_over_at re-check landed only in the sweep (due/claim/advance). Take-over never changes status, so a post-take-over bounce still matches find/mark/exhaust: cycles=0 rows get yanked to awaiting_correction (a correction then re-queues a sweep-excluded, token-cleared row whose corrected contact is never re-invited); cycles>=1 rows exhaust to unreachable + referee_contact_invalid stamp, which blocks the still-live form (complete requires contact_initiated).",
+    "recommended_fix": "Add taken_over_at IS NULL to find_reference_call_by_send_ref, mark_awaiting_correction and exhaust_reference_call (and gate exhaust_wrong_person likewise) so failure events stand down on landlord-handled rows, mirroring the sweep's A7 exclusion."
+  }
+]

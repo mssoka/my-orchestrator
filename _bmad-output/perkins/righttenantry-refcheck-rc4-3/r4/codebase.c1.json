@@ -1,0 +1,52 @@
+[
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "take-over",
+    "title": "STILL PRESENT (r3): the wrong-person leg's awaiting UPDATE is still unguarded on taken_over_at — the dedicated guarded SQL is never called and the race pin is vacuous",
+    "location": "server/src/reference_checks/form_handler.gleam:1235-1257; server/src/reference_checks/sql/update_reference_call_status.sql:23-24; server/test/integration/reference_checks_actions_integration_test.gleam:1729-1762",
+    "evidence": "form_handler.gleam:1235-1257: `case row.taken_over_at != \"\" { True -> wisp.redirect(...) ... False -> case row.correction_cycles >= 1 { True -> exhaust_wrong_person(...) False -> case sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated) {...` — update_reference_call_status.sql:23-24: `WHERE id = $1 AND status = $5::reference_call_status` (no taken_over_at clause). mark_awaiting_correction_wrong_person.sql:16 `AND taken_over_at IS NULL` has ZERO callers outside the generated sql.gleam:1891. Test 1743-1747: `// Take-over lands between the wrong-person read and the UPDATE. actions_handler.do_take_over(...) |> should.equal(200)` then `rc_sql.mark_awaiting_correction_wrong_person(db, call)` — calls the guarded SQL DIRECTLY, never the POST /reference/:token/wrong-person path the handler runs.",
+    "detail": "The executed first-cycle awaiting transition still runs the unguarded update_reference_call_status; a take-over between the token read and the UPDATE still yanks a landlord-handled row into awaiting_correction. The direct-SQL pin cannot catch an unwired backstop.",
+    "recommended_fix": "Call sql.mark_awaiting_correction_wrong_person from apply_wrong_person (replacing the awaiting update_reference_call_status call) and rework the pin to drive the real POST route with the take-over mid-flight so neutralizing the backstop turns it red."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Orphan code: mark_awaiting_correction_wrong_person.sql and its generated function ship dead — no caller outside the generated module",
+    "location": "server/src/reference_checks/sql/mark_awaiting_correction_wrong_person.sql:1-18; server/src/reference_checks/sql.gleam:1891-1905",
+    "evidence": "`grep -rn 'mark_awaiting_correction_wrong_person' server/src/` outside sql.gleam: no matches (exit 1). sql.gleam:1891: `pub fn mark_awaiting_correction_wrong_person(db: pog.Connection, arg_1: Uuid) -> Result(...)` generated from the SQL whose header comment states its purpose: `-- a take-over landing between the read and this UPDATE must NOT yank a landlord-handled row into the correction loop`. The wrong-person handler executes sql.update_reference_call_status instead (form_handler.gleam:1250).",
+    "detail": "The blocker backstop query plus its Squirrel-generated Gleam function ship dead: only the test references the generated fn, and the executed handler path never touches it.",
+    "recommended_fix": "Wire it into apply_wrong_person's awaiting transition (closing the blocker), or delete the query and its generated code if the handler is reworked to a guarded UPDATE."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "STILL PRESENT (r3): substitution's returned reference_call_id is still decoded but never consumed",
+    "location": "client/src/api/reference_checks_api.gleam:36-43; client/src/client.gleam:3556-3557",
+    "evidence": "reference_checks_api.gleam:36-43: `fn action_result_decoder() -> decode.Decoder(String) { use id <- decode.optional_field(\"reference_call_id\", None, decode.optional(decode.string)) decode.success(option.unwrap(id, \"\")) }` with file header: `The on_response carries the reference_call_id (substitution returns the new row id; the other actions return \"\")`. client.gleam:3556: `case result { Ok(_) -> {` — the decoded String is matched away; no consumer exists.",
+    "detail": "Neither dropped nor consumed: the decoder still reads reference_call_id and ApiReturnedRefcheckAction still discards it (the refetch carries state, so the plumbing is dead).",
+    "recommended_fix": "Drop the field from the decoder (return a unit/empty string) or consume the returned new row id; document which if kept for RC4.4."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "spec-drift",
+    "title": "STILL PRESENT (r3): spec-rc4-3-row-actions.md still names deleted substitute_reference_call.sql (line 73) and claims ONE additive column (line 232) while the migration ships corrected_name + corrected_at",
+    "location": "_bmad-output/implementation-artifacts/spec-rc4-3-row-actions.md:73,232",
+    "evidence": "Line 73: \"`take_over_reference_call.sql`, `correct_reference_call.sql` (guard + corrected_* + cycle bump + re-arm in ONE update), `substitute_reference_call.sql` (reads the old row's slot/owner + verifies the pre-state guard)\" — no such file in server/src/reference_checks/sql/ (38 files, none named substitute_reference_call.sql); do_substitute (actions_handler.gleam:377-382) calls `sql.insert_reference_call_if_absent`. Line 232: \"effective name. One additive column, nothing destructive.\" — supabase/migrations/20260812140000_reference_call_corrected_name.sql adds `corrected_name TEXT` AND `corrected_at TIMESTAMPTZ`. (epic-RC4-context.md's effective-contact W4 text is fixed.)",
+    "detail": "Both r3 drift spots persist; the Dev Agent Record's 'self-contained guarded CTE' claim also contradicts the insert_reference_call_if_absent implementation.",
+    "recommended_fix": "Update line 73 to the actual substitution path (insert_reference_call_if_absent) and line 232 to name both migration columns; align the N10/N11 record with the code."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "a11y",
+    "title": "STILL PRESENT (r3): Escape-to-close is still wired to the menu div, which never receives focus in the natural click-⋯-then-Escape flow",
+    "location": "client/src/components/reference_panel.gleam:744-750",
+    "evidence": "The keydown handler is on the menu card: `html.div([attribute(\"data-testid\", \"refcheck-menu-\" <> slot), attribute(\"role\", \"menu\"), // r2 (N14): Escape closes the menu (the confirm_modal pattern). event.on(\"keydown\", menu_escape_decoder(msg.UserToggledRefcheckMenu(call.reference_call_id))), ...]` — a SIBLING of the ⋯ button (which carries only `event.on_click(msg.UserToggledRefcheckMenu(...))` at line 735-736). The button keeps focus after the click; keydown never bubbles through the sibling menu div.",
+    "detail": "Neither moved to the ⋯ button nor autofocus into the menu: Escape still does nothing right after opening the menu; the r3-rework only added a comment.",
+    "recommended_fix": "Attach the keydown handler to the ⋯ button (Escape closes the open menu) or move focus into the menu on open."
+  }
+]

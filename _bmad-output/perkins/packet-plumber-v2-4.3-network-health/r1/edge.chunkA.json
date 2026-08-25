@@ -1,0 +1,62 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "balance.json health block uses jint: out-of-i32-range integers wrap and decimals truncate, bypassing the fail-fast validation",
+    "location": "core/catalog.odin:714-721, 926-929",
+    "evidence": "b.health.window_ticks = jint(hobj, \"window_ticks\", -1)\nb.health.exit_margin_pct = jint(hobj, \"exit_margin_pct\", -1)\nb.health.exit_margin_ms = jint(hobj, \"exit_margin_ms\", -1)\nb.health.drain_cap_pct_per_tick = jint(hobj, \"drain_cap_pct_per_tick\", -1)\nb.health.recharge_pct_per_tick = jint(hobj, \"recharge_pct_per_tick\", -1)\nb.health.win_uptime_pct = jint(hobj, \"win_uptime_pct\", -1)\nb.health.grace_refill_per_tick = jint(hobj, \"grace_refill_per_tick\", -1)\nb.health.grace_refill_streak_ticks = jint(hobj, \"grace_refill_streak_ticks\", -1)\n---\ncase json.Integer: return i32(x)\ncase json.Float:   return i32(x)",
+    "detail": "jint casts without range check: \"window_ticks\": 4294967496 wraps to 200 and passes 1..10000; \"drain_cap_pct_per_tick\": 4294967297 wraps to 1. Decimals (200.9) silently truncate. The new fail-fast validation is bypassed.",
+    "recommended_fix": "Use jint_strict (range-checked, float-rejecting) for all eight health keys, like the packet_types health fields, and reject instead of wrapping."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "state",
+    "title": "surge_done is never reset when a new surge starts — a stale latch plus reset accumulators can fire Run_Won mid-second-surge on partial-window data",
+    "location": "core/health.odin:191-194, core/win_lose.odin:62-71",
+    "evidence": "if in_surge && !h.prev_in_surge {\n\t\th.surge_delivered = 0 // a NEW surge starts a fresh window (never double-count)\n\t\th.surge_dropped = 0\n\t}\n---\nif state.surge_win_pct != 0 && state.health.surge_done {\n\t\ttotal := state.health.surge_delivered + state.health.surge_dropped\n\t\tif total > 0 {\n\t\t\tuptime := state.health.surge_delivered * 100 / total\n\t\t\tif uptime >= u64(state.surge_win_pct) {\n\t\t\t\tevent_emit(state, tick, EVENT_TAG_RUN_WON)",
+    "detail": "After a below-threshold first window, surge_done stays latched. A second crisis-archetype set-piece resets accumulators to 0 while the gate stays open; the first delivery tick reads 100% uptime and wins mid-surge — a fake win E24 does not cover.",
+    "recommended_fix": "Reset h.surge_done = false in the new-surge-start branch, so the ratio is only evaluated at each window's deactivation edge."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "recharge_pct_per_tick == 0 (validation allows >= 0) emits an unchanged Meter_Changed event every healthy tick forever",
+    "location": "core/catalog.odin:732-733, core/health.odin:346-354",
+    "evidence": "if b.health.recharge_pct_per_tick < 0 {\n\t\t\treturn {\"balance.json\", \"health.recharge_pct_per_tick\", \"must be >= 0\"}\n\t\t}\n---\n} else if !any_breach && h.meter_pct < 100 {\n\t\t// recharge: every class healthy\n\t\trecharge := u32(bal.recharge_pct_per_tick)\n\t\tif h.meter_pct + recharge > 100 {\n\t\t\th.meter_pct = 100\n\t\t} else {\n\t\t\th.meter_pct += recharge\n\t\t}\n\t\tevent_emit_meter(state, tick, h.meter_pct)\n\t}",
+    "detail": "With recharge 0 and a meter below 100 (after any partial drain), the else-branch adds 0 and unconditionally appends Meter_Changed with the same value every tick — no-op event spam in every hash.",
+    "recommended_fix": "Only emit Meter_Changed when the meter value actually changed (guard on recharge > 0 before the emit), or require recharge >= 1 at load."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "events",
+    "title": "A class with health_drain_pct_per_tick == 0 (validation allows >= 0) expires its grace but Grace_Expired is never emitted — emission is gated on drain > 0",
+    "location": "core/catalog.odin:449-450, core/health.odin:283, 329-345",
+    "evidence": "if hg < 0 || hd < 0 {\n\t\t\t\treturn {\"packet_types.json\", pt.id, \"health_grace_ticks/health_drain_pct_per_tick must be >= 0\"}\n\t\t\t}\n---\nappend(&expired, u16(c))\n---\nif drain > 0 {\n\t\tif h.meter_pct <= drain {\n---\n\t\t} else {\n\t\t\th.meter_pct -= drain\n\t\t\tfor c in expired {\n\t\t\t\tevent_emit_health(state, tick, EVENT_TAG_GRACE_EXPIRED, c)\n\t\t\t}",
+    "detail": "Severity 0 makes drain 0, so the expired list is discarded and Grace_Expired never lands: the event stream shows Grace_Started with no expiry, and the class silently never drains. Contract says expiry emits Grace_Expired.",
+    "recommended_fix": "Emit the pending Grace_Expired events whenever the expired list is non-empty, independent of the drain amount, or reject a 0 severity at load."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "The absent-when-disabled serialization contract (no health bytes when off) is claimed but never asserted — dump_off is deleted without a single check",
+    "location": "core/health_test.odin:811-816",
+    "evidence": "dump_off := state_dump(&s_off, {}, cat, context.temp_allocator)\n\t// the meter_pct u32 100 == 0x64000000 little-endian — must NOT appear as\n\t// a standalone marker... (a weaker but honest pin: the disabled dump is\n\t// byte-identical to the SAME run before the health feature? No — the\n\t// baseline moved. Pin the ENABLED bytes instead below.)\n\tdelete(dump_off)",
+    "detail": "Test header claims pin (a) 'the health section is ABSENT when disabled' — the golden-stability rule — but no assertion touches dump_off; the rule is unpinned and can regress silently.",
+    "recommended_fix": "Assert the disabled dump contains no health marker bytes (e.g. scan for the meter u32 + grace row pattern and expect not-found) before delete(dump_off)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "The E30 exit-hysteresis band (tolerance - margin) is never actually asserted — the band test contains a tautological expectation",
+    "location": "core/health_test.odin:250-251",
+    "evidence": "testing.expectf(t, s.health.grace[0].grace_left > 0 || s.health.grace[0].grace_left == 0,\n\t\t\"grace cell present for email\")",
+    "detail": "The test's own comment admits the band is 'pinned by test_health_windowed_breach_recovers' slide' — that test only shows exit below the margin, never that a ratio inside (27, 30] stays latched. Enter is pinned; the exit threshold is not.",
+    "recommended_fix": "Add a fixture stepping a ratio into the band (e.g. 28%) and assert breach stays set, then below the margin and assert it clears."
+  }
+]

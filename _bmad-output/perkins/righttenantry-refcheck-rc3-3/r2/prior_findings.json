@@ -1,0 +1,648 @@
+{
+  "job": "righttenantry-refcheck-rc3-3-perkins-r1",
+  "pr": 596,
+  "repo": "solarity-services/RightTenantry",
+  "sha": "a0b6910816f119eb8485c3d959419f194d4af820",
+  "round": 1,
+  "chunks": 5,
+  "lenses_per_chunk": 7,
+  "lens_runs": 35,
+  "failed_layers": [],
+  "raw_findings_total": 78,
+  "counts": {
+    "blocker": 1,
+    "warning": 11,
+    "note": 33
+  },
+  "rejected": [
+    {
+      "source": "blind",
+      "severity": "warning",
+      "title": "Character 'would_stand_again' has no 'no' option while landlord/employer equivalents do",
+      "reason": "Spec-pinned UX table: character Q5 is 'Yes / Unsure / Prefer not to say' (ux-reference-checking \u00a76.5, verbatim in the story spec's pinned tables). Re-litigating the UX deck."
+    },
+    {
+      "source": "blind",
+      "severity": "warning",
+      "title": "Wrong-person URL generated but absent from the documented route family and swallowed by the catch-all",
+      "reason": "rc3-4 forward contract, spec-explicit ('rc3-3's landing screen and Q1-No render forward links to them'). Unreachable by real users pre-rc3-5 (no tokens minted). Covered as a note (interim 404 copy)."
+    },
+    {
+      "source": "blind",
+      "severity": "warning",
+      "title": "q_salary lacks the empty-datum fallback every sibling as-stated copy function has",
+      "reason": "monthly_income_cents is NOT NULL in the schema (verified in 00000000000001_initial_schema.sql:74 and 20260419000002_add_household_income.sql:26); the as-stated salary is always present by the data-availability matrix."
+    },
+    {
+      "source": "blind",
+      "severity": "note",
+      "title": "Amount input field name derivation differs between AmountOrDontRemember and AsStatedAmount",
+      "reason": "Internally consistent: each control's renderer and validator agree on its own field names (a_<id> vs a_<id>_amount). Asymmetry is cosmetic naming, not a defect."
+    }
+  ],
+  "rejected_count": 4,
+  "verdict": "NEEDS CHANGES",
+  "findings": [
+    {
+      "source": [
+        "tests",
+        "edge",
+        "architecture"
+      ],
+      "severity": "blocker",
+      "category": "csrf-registry",
+      "title": "/reference/* POST/PUT routes missing from csrf.should_skip: a session-carrying referee gets 403 on every answer save and the resend (answer lost, JS falls back to a 403 native POST)",
+      "location": "server/src/auth/csrf.gleam:79-101 (should_skip) + server/src/router.gleam:80 (unconditional csrf.validate) + server/src/router.gleam:968-973 (new arms)",
+      "evidence": "csrf.should_skip arms: [\"apply\", _] -> True / [\"apply\", _, \"draft\"] -> True / [\"apply\", _, \"continue-link\"] -> True / [\"apply\", _, \"draft-erasure\", _] -> True / [\"dsar\", _] -> True / [\"erase\", _] -> True / _ -> False. No [\"reference\", ..] arm. csrf.validate: 'case req.method { http.Get | http.Head | http.Options -> handler() _ -> case should_skip(path) { True -> handler() False -> validate_token(...) } }'. validate_token: 'case wisp.get_cookie(req, cookie_names.session(), wisp.Signed) { Error(_) -> handler() Ok(access_token) -> ... x-csrf-token required ... csrf_error_response() 403 }'. Router: 'use req <- middleware.apply(...)  use <- csrf.validate(req, ctx.config.secret_key)' before route matching. The SSR form renders no x-csrf-token; reference_form.js PUT adds none.",
+      "detail": "Every sibling public POST family (apply/dsar/erase) is CSRF-skipped; /reference is not. A browser holding a valid rt_session cookie (landlord testing their own link, shared device, referee who is also a landlord) hits 403 CsrfInvalid on POST/PUT answer and POST resend. The no-JS POST then renders the 403 JSON error page; the JS PUT falls back to the same. Answer lost. Same registry-omission class as the rc3-2 redact gap this round was mandated to fix.",
+      "recommended_fix": "Add '[\"reference\", ..] -> True' to csrf.should_skip (the apply/dsar/erase pattern) + a pin in server/test/auth/csrf_test.gleam (reference_route_skips_csrf_test) + a router-stack integration test with a session cookie.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind",
+        "edge",
+        "architecture"
+      ],
+      "severity": "warning",
+      "category": "js-ux",
+      "title": "Desktop JS path never navigates to the review screen after the final answer saves (no-JS POST and mobile JS both do)",
+      "location": "server/priv/static/reference_form.js:onSubmit (markSaved; navigation only under shouldStep(isMobile))",
+      "evidence": "reference_form.js: 'markSaved(section); if (shouldStep(isMobile)) { var nextId = nextQuestionId(orderedIds, questionId); if (nextId) { showOnly(nextId); } else { root.location.assign(\"/reference/\" + tokenFromPath()); } }' - the desktop branch (isMobile false) does nothing after the last save. The form page renders no review link; the page URL carries ?q= so a reload re-renders the form, not the review.",
+      "detail": "A desktop+JS referee who answers every question has no in-page path to the review screen (where the rc3-4 submit lives); only an accidental Back press or manual URL edit reaches it. No-JS desktop (POST 303 to the bare URL) and mobile JS (location.assign) both work.",
+      "recommended_fix": "After the final save, also navigate (or render a 'Review your answers' link on the form page) when not stepping: location.assign('/reference/' + token) on the last question regardless of viewport.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "acceptance",
+        "codebase",
+        "edge"
+      ],
+      "severity": "warning",
+      "category": "ux-data-loss",
+      "title": "Validation-error re-render discards the referee's submitted answer (the /apply view_form_with_errors precedent preserves input)",
+      "location": "server/src/reference_checks/form_handler.gleam:save_answer_from_post Error(reason) branch -> render_form_page(prefill from DB draft only)",
+      "evidence": "form_handler.gleam: 'Error(reason) -> { let message = ...; render_form_page(token:, slot:, vars:, draft:, current_id: q.id, error_question: Some(q.id), error_message: message) }' - draft comes from 'questions.decode_draft(row.draft_answers)', never the submitted values. The cited precedent preserves: application/form_pages.gleam 'pub fn view_form_with_errors(vacancy, errors, values: List(#(String, String)), posthog_api_key) ' - takes the submitted values.",
+      "detail": "On a no-JS POST validation failure the question re-renders from the saved draft: the just-typed value is gone while the inline error says 'Check it and try again'. The /apply precedent preserves submitted values. Reachable via too-long other-text, crafted values, or a browser quirk on type=month.",
+      "recommended_fix": "Thread the submitted field values through the error re-render (prefill the failing question with the submitted values, the view_form_with_errors shape).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "title": "Autosave DOM choreography has zero automated coverage; the JS comment claims bug-hunt E2E scenarios that do not exist",
+      "location": "scripts/js-tests/reference_form.test.js (pure seams only) + .pi/skills/bug-hunt/scenarios/ (no reference scenarios)",
+      "evidence": "reference_form.test.js header: 'Covers the pure seams of the RC3.3 enhancement... The DOM choreography (hide/show, fetch wiring) is covered E2E by bug-hunt scenarios.' - the scenarios directory contains no reference-form scenario (grep: only apply-form/workflow scenarios). Tests cover only nextQuestionId/clampFocusSeconds/shouldStep.",
+      "detail": "The fetch/PUT/409-reload/POST-fallback wiring is the riskiest JS surface and it is unpinned; the claimed E2E coverage does not exist. The form_draft.js wiring-test precedent (form_draft_wiring.test.js) was not followed.",
+      "recommended_fix": "Add a node wiring test (jsdom-style, the form_draft_wiring precedent) or a bug-hunt scenario before relying on this path in production.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "title": "PUT /reference/:token/answer error contract untested: only the 200 happy path is pinned, while the JS keys its reload behavior off 409/404",
+      "location": "server/test/integration/reference_form_integration_test.gleam:answer_put_autosaves_json_test (200 only); form_handler.handle_answer_put branches 400/404/409/bot-200",
+      "evidence": "Integration: only 'answer_put_autosaves_json_test' exercises handle_answer_put, asserting 200 + persisted. No test for decode-fail 400, invalid 400, unknown 404, closed 409, honeypot/timing fake-ok 200. reference_form.js: 'if (res.status === 409 || res.status === 404) { root.location.assign(...) }'.",
+      "detail": "The JS autosave path depends on the 409/404 contract to route closed/unknown states to the truthful reload; a regression there would silently misbehave. Bot-guard branches of the PUT are also unpinned.",
+      "recommended_fix": "Pin the PUT status contract (400/404/409/bot-200 with nothing persisted) in the integration suite.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "acceptance",
+        "edge"
+      ],
+      "severity": "warning",
+      "category": "resilience",
+      "title": "No fetch/FormData capability gate: in a fetch-less JS environment the submit is swallowed with no native-POST fallback (dead answer form)",
+      "location": "server/priv/static/reference_form.js:onSubmit (event.preventDefault() first; fetch/FormData unguarded)",
+      "evidence": "onSubmit: 'event.preventDefault(); ... var data = new root.FormData(form); data.forEach(...); fetch(form.action, {...})' - a synchronous ReferenceError (fetch undefined) after preventDefault kills the submission; the .catch only handles async failures.",
+      "detail": "The file's contract is 'Progressive enhancement ONLY: without this file the form is fully usable' - but WITH the file in a pre-fetch environment the form is dead. Marginal in practice (fetch is universal since ~2017; a connect-src CSP block is caught by .catch and falls back), but the gate is one line.",
+      "recommended_fix": "Guard initBrowser (or onSubmit) with 'typeof root.fetch === \"function\"' and skip interception when absent.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "security"
+      ],
+      "severity": "warning",
+      "category": "data-loss",
+      "title": "Answer-timing stale cap (7 days) is shorter than the link TTL (10 days): a legitimate slow referee's answers are silently dropped with fake success",
+      "location": "server/src/reference_checks/form_handler.gleam:is_answer_timing_suspicious (delta_ms < 500 || delta_ms > 604_800_000)",
+      "evidence": "is_answer_timing_suspicious: 'delta_ms < 500 || delta_ms > 604_800_000' (7 days). Link TTL: remint_form_token.sql 'form_token_expires_at = now() + interval \\'10 days\\''. Silent drop: handle_answer_post/put route timing-suspicious to fake success (303 fake-advance / 200 {'ok':true}) with nothing persisted.",
+      "detail": "A referee who opens the form and answers from a >7-day-old tab (link still valid for 10 days) is classified suspicious: the answer is dropped and the JS shows 'Saved' / the POST fake-advances. Decision 12 adapted the fast floor but the stale cap was carried over unexamined from the /apply one-sitting posture.",
+      "recommended_fix": "Raise the stale cap to cover the link TTL (e.g. >10 days) or re-stamp _form_loaded_at on resume; at minimum document the interaction.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "title": "Resend delivered-path effects unpinned: remint persisting, old token dying, the reference_call_link_resent audit row, and the resent page are never asserted",
+      "location": "server/test/integration/reference_form_integration_test.gleam:resend_all_channels_failed_rolls_back_the_remint_test (rollback branch only)",
+      "evidence": "Integration pins only the all-failed rollback branch. The delivered branch (remint persists + audit row + view_resent) is documented as non-hermetic: 'a Delivered outcome needs a real provider 2xx, which the hermetic test env never produces'. Unit pins cover the seams (any_delivered, resend_audit_details) but never execute audit_resend's create_system write.",
+      "detail": "The compliance-relevant evidence (reference_call_link_resent audit row on a successful resend) is never exercised by any test; a regression dropping the audit write would pass CI.",
+      "recommended_fix": "Pin audit_resend's write with a stubbed provider outcome (inject a fake 2xx path or split the audit from the send), keeping the real-provider seam documented.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "title": "questions.gleam read-side (decode_draft, prefill_for, answer_summary) has zero direct tests: the draft round-trip is pinned write-side only",
+      "location": "server/src/reference_checks/questions.gleam:decode_draft/prefill_for/answer_summary; zero references in server/test/",
+      "evidence": "grep over server/test/: no test references prefill_for, answer_summary, or decode_draft. form_pages_test passes 'prefill: dict.new()'. The resume integration test covers decode_draft + next_unanswered indirectly only.",
+      "detail": "The resume feature's read path - revisiting a question shows the saved answer (prefill_for) and the review screen summarizes it (answer_summary) - is the untested half of the A2 contract; rc3-4's structurer consumes the same shapes.",
+      "recommended_fix": "Unit-pin prefill_for per control kind (round-trip against validate_answer) and answer_summary rendering (incl. the optional free_text empty-string case).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "title": "Employer/character slot renderers never executed by any test: 2 of 3 slots' question rendering is unpinned",
+      "location": "server/test/reference_checks/form_pages_test.gleam:question_views() (LandlordRef only); AsStatedText/AsStatedAmount/ShortTextPair renderers",
+      "evidence": "form_pages_test: 'let slot = LandlordRef ... questions.questions_for(slot)' - the form-page render test builds only landlord question views. The integration seed also uses ref_slot 'landlord_ref' only.",
+      "detail": "The as-stated employer controls (About right / It differs, salary amount) and the character relationship+capacity pair never render in any test; a broken field name or prefill binding there would pass CI.",
+      "recommended_fix": "Parameterize the render test over the three slots (or add employer + character render pins covering the distinctive field names/testids).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "codebase"
+      ],
+      "severity": "warning",
+      "category": "duplication",
+      "title": "form_pages re-implements the pub brand header instead of reusing application/form_view.view_brand_header",
+      "location": "server/src/reference_checks/form_pages.gleam:77-87 (private view_brand_header) vs server/src/application/form_view.gleam:507-515 (pub, byte-identical)",
+      "evidence": "form_view.gleam: 'pub fn view_brand_header() -> element.Element(a) { html.header([attribute.class(\"form-header\")], [ html.div([attribute.class(\"header-brand\")], [...] Right/Tenantry spans ...) ]) }' - identical markup to the private copy in form_pages.gleam:77-87. form_pages already imports application/form_view.",
+      "detail": "A third copy of the wordmark markup; the form_view header even documents 'keep the two in sync' - a future wordmark change must now remember three places.",
+      "recommended_fix": "Delete the private copy and call form_view.view_brand_header() (already imported).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "edge"
+      ],
+      "severity": "warning",
+      "category": "validation",
+      "title": "month_year accepts non-canonical month strings (\"2023-6\", \"2023-006\"), breaking the zero-padded YYYY-MM ordering assumption in validate_month_year",
+      "location": "server/src/reference_checks/questions.gleam:month_year (no 2-digit month-length check) -> validate_month_year from<=to guard",
+      "evidence": "month_year: 'case string.split(value, \"-\") { [year_str, month_str] -> use year <- result.try(parse_int(year_str)); use month <- result.try(parse_int(month_str)); case string.length(year_str) == 4 && year >= 1950 && year <= 2100 && month >= 1 && month <= 12 { True -> Ok(value) ...' - string.length(month_str) is never checked. validate_month_year relies on 'string.compare(from, to) != order.Gt' (lexicographic).",
+      "detail": "Crafted input like from=\"2026-10\" to=\"2026-3\" passes (\"2026-10\" < \"2026-3\" lexicographically), storing a tenancy period with from > to, corrupting the draft contract rc3-4 consumes. Real type=month browsers always zero-pad, so this is crafted-input only.",
+      "recommended_fix": "Require string.length(month_str) == 2 (and canonical re-format) in month_year.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind",
+        "security",
+        "acceptance"
+      ],
+      "severity": "note",
+      "category": "spec-deviation",
+      "title": "Answer-route timing floor is 500ms, not the /apply 2s AC6 prescribes (documented in decision 12, flagged for Perkins in the spec)",
+      "location": "server/src/reference_checks/form_handler.gleam:is_answer_timing_suspicious + spec decision 12",
+      "evidence": "is_answer_timing_suspicious: 'delta_ms < 500 || delta_ms > 604_800_000'; resend keeps the full 2s is_timing_suspicious. Spec AC6: 'timing validation (_form_loaded_at, <2s or >7d suspicious - application_handler helpers reused as-is)'; decision 12: 'Per-question timing floor is 500ms... Flagged for Perkins.'",
+      "detail": "Deliberate, documented, and fail-closed branches intact (missing/unparseable/future/>7d). The 500ms floor only weakens sub-500ms scripted replays on answer routes; the resend keeps the full posture. Disclosed in the spec itself.",
+      "recommended_fix": "None required; recorded as a known, disclosed deviation.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind",
+        "architecture"
+      ],
+      "severity": "note",
+      "category": "docs-mismatch",
+      "title": "_focus_seconds is documented as visibility-gated but implemented as raw wall-clock since page init",
+      "location": "server/priv/static/reference_form.js header comment vs currentFocusSeconds()",
+      "evidence": "Header: 'Maintains the _focus_seconds hidden field (seconds since page init while the tab is visible)'; impl: 'function currentFocusSeconds() { return clampFocusSeconds(Date.now() - initMs); }' - no visibility tracking.",
+      "detail": "The signal is honestly weak (AD-10) and rc3-4 reads it; the comment overclaims what it measures. Harmless today, misleading tomorrow.",
+      "recommended_fix": "Either implement the visibility tracking (document.visibilityState listener) or fix the comment to wall-clock.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "guard-asymmetry",
+      "title": "restore_form_token omits the taken_over_at IS NULL guard its paired remint_form_token enforces",
+      "location": "server/src/reference_checks/sql/restore_form_token.sql",
+      "evidence": "remint: 'AND taken_over_at IS NULL'; restore: only 'AND status = \\'contact_initiated\\''. A takeover landing between remint and rollback lets restore re-attach the old (always-expired) token.",
+      "detail": "Belt-and-braces gap only: the restored token is always expired (old expiry), so the classifier renders LandlordHandling for the taken-over row. Truth preserved.",
+      "recommended_fix": "Add 'AND taken_over_at IS NULL' to restore_form_token.sql for symmetry with the remint guard.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "guard-depth",
+      "title": "stamp_form_opened writes with no status/expiry guard despite its 'first live-form GET' docstring",
+      "location": "server/src/reference_checks/sql/stamp_form_opened.sql",
+      "evidence": "SQL: 'SET form_opened_at = now() WHERE form_token = $1 AND form_opened_at IS NULL' - no status/expiry predicate. Handler only calls it from render_live (Live state), so terminal rows are unreachable today.",
+      "detail": "Defensive-depth gap: the SQL guard is weaker than its docstring implies; a future caller change could stamp terminal rows. Harmless today.",
+      "recommended_fix": "Add the live-row predicates (status + not-expired) to the SQL for defense in depth.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "codebase",
+        "architecture",
+        "acceptance"
+      ],
+      "severity": "note",
+      "category": "dead-code",
+      "title": "get_form_context_by_form_token selects rc.form_token that no handler reads; the comment's justification is false",
+      "location": "server/src/reference_checks/sql/get_form_context_by_form_token.sql (form_token column) + form_handler.gleam",
+      "evidence": "SQL comment: 'form_token itself is selected: the resend flow needs the CURRENT token to build the fresh form URL after a remint.' - grep of form_handler: no read of row.form_token; the resend uses the URL old_token + minted new_token. Generated GetFormContextByFormTokenRow.form_token is dead.",
+      "detail": "Dead column + misleading comment in the load-bearing context query; harmless but confusing for rc3-4 readers.",
+      "recommended_fix": "Drop the column (and the comment) or make the resend actually read it.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "edge"
+      ],
+      "severity": "note",
+      "category": "a11y",
+      "title": "Mobile stepper focus() targets the hidden _question input, so the focus move never lands on a visible control",
+      "location": "server/priv/static/reference_form.js:showOnly (firstControl = first input/textarea/button)",
+      "evidence": "showOnly: 'var firstControl = current.querySelector(\"input, textarea, button\"); if (firstControl && typeof firstControl.focus === \"function\") { firstControl.focus(); }' - the first input in every question form is the hidden _question input (form_question_pages renders it first). focus() on hidden is a no-op.",
+      "detail": "The intended keyboard focus move silently fails; scrollIntoView still runs. Accessibility nit.",
+      "recommended_fix": "Skip hidden inputs when selecting the focus target (query ':not([type=hidden])' or [data-focus-target]).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind",
+        "edge"
+      ],
+      "severity": "note",
+      "category": "responsive",
+      "title": "Mobile gate (matchMedia) is evaluated once at load; viewport changes never re-evaluate it",
+      "location": "server/priv/static/reference_form.js:initBrowser (isMobile computed once)",
+      "evidence": "initBrowser: 'var isMobile = typeof root.matchMedia === \"function\" && root.matchMedia(MOBILE_QUERY).matches;' - computed once; no matchMedia change listener. shouldStep(isMobile) is constant for the session.",
+      "detail": "Rotating a tablet mid-session keeps the initial layout mode. Cosmetic: both layouts remain fully functional.",
+      "recommended_fix": "Optional: listen to matchMedia change and re-apply the stepper.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests",
+        "architecture"
+      ],
+      "severity": "note",
+      "category": "test-quality",
+      "title": "shouldStep unit tests are tautological; the real mobile gate (matchMedia + MOBILE_QUERY) is untested",
+      "location": "server/priv/static/reference_form.js:shouldStep + scripts/js-tests/reference_form.test.js",
+      "evidence": "shouldStep: 'function shouldStep(matchesMedia) { return !!matchesMedia; }' - the test asserts true->true / false->false (identity). MOBILE_QUERY string and the matchMedia call site are untested.",
+      "detail": "The seam test proves nothing; the real gate lives in the untested DOM wiring (see the autosave-choreography warning).",
+      "recommended_fix": "Test MOBILE_QUERY against matchMedia semantics or fold into the wiring tests.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "sync-contract",
+      "title": "SAVED_TEXT / js_saved_indicator cross-file sync is comment-guarded only, with no cross-file pin",
+      "location": "server/priv/static/reference_form.js:27 + server/src/reference_checks/form_copy.gleam:js_saved_indicator",
+      "evidence": "Both sides carry 'KEEP IN SYNC' comments; the em-dash/vocab enumeration includes js_saved_indicator but no test compares the two constants.",
+      "detail": "Same precedent as form_draft.js (comment-guarded); a drift would only show as a wrong 'Saved' label. Low risk.",
+      "recommended_fix": "Optional: a node test that greps form_copy.gleam for the expected constant.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "docs",
+      "title": "Spec Project Structure Notes omit restore_form_token.sql (ships in the File List; the edge-case fix 2 rollback)",
+      "location": "spec-rc3-3-referee-form-session-open-answer-autosave.md (Project Structure Notes vs File List)",
+      "evidence": "Project Structure Notes list four new SQL files (get_form_context, stamp_form_opened, save_draft_answer, remint); restore_form_token.sql appears only in the File List. The module itself is documented in the resend flow section.",
+      "detail": "Docs-only inconsistency in the spec's structure notes.",
+      "recommended_fix": "Add restore_form_token.sql to the Project Structure Notes.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "acceptance"
+      ],
+      "severity": "note",
+      "category": "docs",
+      "title": "JS test count '118+6' overstated: node --test reports 118 total (the 6 new reference_form tests are inside the 118)",
+      "location": "spec-rc3-3-referee-form-session-open-answer-autosave.md (Dev Agent Record)",
+      "evidence": "Ran 'node --test scripts/js-tests/*.test.js': '# tests 118, # pass 118'. The Dev Agent Record says 'node --test 118+6' / '124 JS green'.",
+      "detail": "The 124 figure double-counts; actual JS suite is 118 green.",
+      "recommended_fix": "Correct the record.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage-gap",
+      "title": "Router wiring of the /reference family (incl. the AC7 catch-all arm) has no test: integration tests call handlers directly, bypassing the route table + middleware chain",
+      "location": "server/test/integration/reference_form_integration_test.gleam (handler-direct calls); router.gleam:966-975",
+      "evidence": "Integration tests invoke form_handler.handle_get/handle_answer_post/handle_answer_put/handle_resend directly with simulate requests; no test exercises the router arms or the csrf/middleware chain. handle_unknown_path has zero test references.",
+      "detail": "The middleware-chain gap is exactly what let the CSRF skip-list omission slip past a green suite. The catch-all AC7 arm (typo'd links off the SPA shell) is also unpinned.",
+      "recommended_fix": "Add a router-stack test (route table + csrf + middleware) for the reference family, incl. a session-cookie POST.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage-gap",
+      "title": "clamp_current (?q= deep-link / Back / Change navigation) has no handler-level test",
+      "location": "server/src/reference_checks/form_handler.gleam:clamp_current; no test references",
+      "evidence": "grep over server/test: clamp_current unreferenced. The ?q= clamp (answered-or-first-unanswered else snap) is exercised only by the integration resume test at the bare URL.",
+      "detail": "Deep-link positioning is a shipped behavior (Change links + Back) with no pin; a clamp regression would pass CI.",
+      "recommended_fix": "Unit-pin clamp_current (answered q, unanswered q, unknown q, complete draft).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind",
+        "architecture"
+      ],
+      "severity": "note",
+      "category": "forward-contract",
+      "title": "Escape-route + review-submit links render live while their routes are unregistered: clicks land on the branded unknown-link 404 with generic copy (rc3-4 forward contract; unreachable pre-rc3-5)",
+      "location": "server/src/reference_checks/form_pages.gleam:view_landing/view_review + form_question_pages identity + router catch-all",
+      "evidence": "Landing links: '/reference/' <> token <> '/wrong-person' and '/decline'; review form action '/reference/' <> token (submit); router registers none of these (rc3-4), so GET hits the '[\"reference\", ..]' catch-all -> handle_unknown_path -> view_not_found: 'This link doesn't look right...'. Spec: 'The exit routes ... -> rc3-4. rc3-3's landing screen and Q1-No render forward links to them.'",
+      "detail": "Spec-explicit forward contract (same pattern as rc3-2 templates linking here). No real user can reach it before rc3-5 mints tokens. Flag: rc3-4 must land before rc3-5, and the interim 404 copy ('link may have been replaced') is misleading for a wrong-person/decline click once reachable.",
+      "recommended_fix": "None for rc3-3 (spec'd); rc3-4 registers the routes. Consider routing the interim clicks to a 'coming soon' copy if rc3-3 ships standalone.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "acceptance",
+        "codebase"
+      ],
+      "severity": "note",
+      "category": "spec-deviation",
+      "title": "Pinned chrome 'per-question Save (desktop)' is not rendered: desktop buttons read 'Continue'; save_label is a dead export",
+      "location": "server/src/reference_checks/form_question_pages.gleam:view_actions + form_copy.save_label",
+      "evidence": "view_actions renders continue_label for every non-identity question regardless of viewport; no CSS/JS swap to save_label exists. Spec chrome: 'per-screen primary Continue (mobile) / per-question Save (desktop)'.",
+      "detail": "Minor spec deviation: desktop users see 'Continue' per question (functionally identical - each form saves one question). save_label is dead.",
+      "recommended_fix": "Either implement the desktop label swap (CSS/JS) or drop save_label + note the deviation.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "codebase"
+      ],
+      "severity": "note",
+      "category": "dead-code",
+      "title": "form_copy exports other_option_label that no production code renders",
+      "location": "server/src/reference_checks/form_copy.gleam:other_option_label",
+      "evidence": "grep: other_option_label referenced only in the copy test enumeration; the ChoiceWithOther 'other' option label comes from opt_other.",
+      "detail": "Dead export in the copy module (the em-dash test keeps it enumerated).",
+      "recommended_fix": "Drop it or use it for the reveal label.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "testid",
+      "title": "Hard-coded data-testid 'reference-input-dont_remember' ignores the question id (unlike every sibling testid)",
+      "location": "server/src/reference_checks/form_question_pages.gleam:view_control (AmountOrDontRemember checkbox)",
+      "evidence": "view_checkbox(qv, field: 'a_' <> q.id <> '_dont_remember', label: ..., testid: 'reference-input-dont_remember') - the testid is constant; siblings derive from the field ('reference-input-' <> field).",
+      "detail": "House convention drift; only one such control exists today (rent_amount), so no collision.",
+      "recommended_fix": "Derive the testid from the field name like the siblings.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "codebase"
+      ],
+      "severity": "note",
+      "category": "duplication",
+      "title": "thousands_separated/group_every_three re-implement the codebase's existing thousands-grouping helper",
+      "location": "server/src/reference_checks/form_handler.gleam:format_annual_salary vs content/layout.gleam:405,433",
+      "evidence": "codebase lens cites content/layout.gleam:405/433 as an existing thousands-grouping helper; form_handler implements its own group_every_three.",
+      "detail": "Duplicate formatting logic; the salary copy path is the only consumer here. Minor.",
+      "recommended_fix": "Reuse the existing helper (or extract to a shared formatter).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "edge"
+      ],
+      "severity": "note",
+      "category": "edge-case",
+      "title": "Resend double-submit: the second POST finds the reminted (dead) old token and renders the unknown-link 404 - truthful copy, but an abrupt stop for a double-clicker",
+      "location": "server/src/reference_checks/form_handler.gleam:handle_resend (lookup NotFound -> render_not_found) / resend_fresh_link 0-row -> redirect to old token",
+      "evidence": "handle_resend: 'Error(NotFound) -> render_not_found()'; the 2s timing floor + token-death make repeat resends impossible for real humans within the same page load, but a slow double-click after a completed first send lands on the unknown page. Copy: 'the link may have been replaced by a newer one. Check the most recent message from us' - truthful for this exact case.",
+      "detail": "Handled with truthful copy + contact route; the flow is self-rate-limiting by construction (AD-14). No dead end.",
+      "recommended_fix": "None required; documented behavior.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "architecture"
+      ],
+      "severity": "note",
+      "category": "structure",
+      "title": "form_handler.gleam is ~835 lines against the <200-line logic-module target and mixes HTTP dispatch, SQL orchestration, formatting, and copy assembly",
+      "location": "server/src/reference_checks/form_handler.gleam (whole module)",
+      "evidence": "Module spans classifier + GET dispatch + POST/PUT handlers + resend flow + audit + salary formatting + query-param helpers. The spec's decision 1 split pages into two modules ('if either crosses the 400-line view-module target') but the handler outgrew its target.",
+      "detail": "House line-target drift; the module is still cohesive (one route family). A future story (rc3-4) may warrant a split.",
+      "recommended_fix": "Defer to rc3-4; consider extracting formatting + review-entry helpers.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "architecture"
+      ],
+      "severity": "note",
+      "category": "duplication",
+      "title": "is_answer_timing_suspicious duplicates application_handler.is_timing_suspicious with only the floor constant changed",
+      "location": "server/src/reference_checks/form_handler.gleam:is_answer_timing_suspicious vs application_handler.gleam:is_timing_suspicious",
+      "evidence": "Both implement: missing -> True; unparseable -> True; delta < floor || delta > 604_800_000. Only the floor differs (500 vs 2000). Decision 12 chose the adaptation; the implementation copies the body.",
+      "detail": "Deliberate adaptation, copy-pasted; a future change to one branch (e.g. the stale cap) must remember both.",
+      "recommended_fix": "Parameterize the floor into one shared helper (is_timing_suspicious(values, floor_ms)).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "test-pins",
+      "title": "is_public_path pins omit the /wrong-person and /decline sub-paths the landing page links to",
+      "location": "server/test/middleware/middleware_test.gleam (public-path pins: form/answer/resend only)",
+      "evidence": "Pins: reference_form_is_public_test (/reference/<token>), reference_answer_is_public_test (/answer), reference_resend_is_public_test (/resend). The arm is '[\"reference\", ..]' (prefix), so /wrong-person + /decline are covered by construction - but not pinned.",
+      "detail": "Representative pins suffice for a prefix arm; the omitted sub-paths are rc3-4 routes anyway. Cosmetic.",
+      "recommended_fix": "Optional: extend the pin list when rc3-4 lands.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "test-fixture",
+      "title": "Test fixture 'test-token-48-chars' is 19 characters, not 48",
+      "location": "server/test/reference_checks/form_pages_test.gleam:31 (const token)",
+      "evidence": "const token = \"test-token-48-chars\" - 19 chars. The mint is wisp.random_string(48). Length is irrelevant to the render assertions.",
+      "detail": "Cosmetic naming nit.",
+      "recommended_fix": "Rename the fixture.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "test-fixture",
+      "title": "open_vars fixture inconsistency: questions_test clears employment_duration/job_title but not employer_name (form_copy_test clears all three)",
+      "location": "server/test/reference_checks/questions_test.gleam:29-31 vs form_copy_test.gleam:25-32",
+      "evidence": "questions_test open_vars: 'form_copy.CopyVars(..vars(), employment_duration: \"\", job_title: \"\")'; form_copy_test: also employer_name: \"\". The AsStatedText open variant keys off duration/title only, so the tests still exercise the branch.",
+      "detail": "Fixture drift; the q_works_at fallback copy is covered in form_copy_test only.",
+      "recommended_fix": "Align the two open_vars fixtures.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "blind"
+      ],
+      "severity": "note",
+      "category": "test-quality",
+      "title": "no_banned_error_vocabulary_test matches exact-case 'Error'/'Failed' only; lowercase variants pass",
+      "location": "server/test/reference_checks/form_copy_test.gleam:no_banned_error_vocabulary_test",
+      "evidence": "Test: 'string.contains(s, \"Error\") |> should.be_false; string.contains(s, \"Failed\") |> should.be_false' - case-sensitive. A lowercase 'error' or 'failed' in copy would pass.",
+      "detail": "The brand-voice guard is case-sensitive; hardening opportunity.",
+      "recommended_fix": "Lowercase both sides before contains.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "edge"
+      ],
+      "severity": "note",
+      "category": "validation",
+      "title": "euro_amount accepts leading zeros (\"0001400\") and possibly '+', storing non-canonical amount_eur strings rendered as '\u20ac001400'",
+      "location": "server/src/reference_checks/questions.gleam:euro_amount",
+      "evidence": "euro_amount: 'int.parse(value)' + 'string.length(value) <= 7 && n > 0' - \"0001400\" parses to 1400 with length 7, accepted, stored raw. The review screen renders '\u20ac' <> a. (\"+1400\" acceptance depends on int.parse sign handling - unverified.)",
+      "detail": "Canonicalization gap in the stored draft contract; cosmetic on the review screen, feeds rc3-4's structurer.",
+      "recommended_fix": "Reject leading zeros/signs or canonicalize (int.to_string(n)) before storing.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "architecture"
+      ],
+      "severity": "note",
+      "category": "test-maintenance",
+      "title": "Em-dash/vocabulary guard relies on a hand-maintained enumeration of form_copy's public surface",
+      "location": "server/test/reference_checks/form_copy_test.gleam:all_strings()",
+      "evidence": "no_em_dash_in_any_string_test iterates all_strings() - a hand-maintained list of every public string (incl. interpolated variants). A new string added to form_copy without updating all_strings() escapes the CI-guarded ban.",
+      "detail": "The enumeration is thorough today (constants + interpolated variants); the maintenance burden is the risk.",
+      "recommended_fix": "Optional: reflection-free alternative is not available in Gleam; keep the list updated (add a comment in form_copy header).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "architecture"
+      ],
+      "severity": "note",
+      "category": "test-fixture",
+      "title": "CopyVars test fixtures triplicated across the three new reference_checks test files",
+      "location": "server/test/reference_checks/form_copy_test.gleam:12-26, form_pages_test.gleam:16-30, questions_test.gleam:15-29",
+      "evidence": "Each file defines its own vars()/open_vars() CopyVars fixtures (with the drift noted above).",
+      "detail": "Fixture duplication invites drift (already visible in open_vars); a shared helper module would centralize.",
+      "recommended_fix": "Extract a shared test fixture helper.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "acceptance"
+      ],
+      "severity": "note",
+      "category": "abuse-shape",
+      "title": "Bot fake-advance 303s to the bare token URL (landing for an empty draft), a response shape distinguishable from the legit ?q=<next> advance AC6 prescribes",
+      "location": "server/src/reference_checks/form_handler.gleam:handle_answer_post honeypot/timing branch",
+      "evidence": "Bot branch: 'True -> wisp.redirect(to: \"/reference/\" <> token)'; legit branch 303s to '?q=<next>#q-<next>'. For an empty-draft session the bot redirect renders the LANDING page. AC6: 'silently dropped with a fake-advance (303 to the next question, nothing persisted)'.",
+      "detail": "The silent-drop doctrine (no error signal) holds, but a bot following redirects can distinguish fake (landing) from real (question). The landing is the design's true next state for an empty draft, so the deviation is minor.",
+      "recommended_fix": "Fake-advance to the same ?q=<next> target the legit path uses (rendering identical bytes).",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage-gap",
+      "title": "Landlord compound controls render but their distinctive fields (month-year names, amount, dont_remember) are never asserted",
+      "location": "server/test/reference_checks/form_pages_test.gleam:form_page_renders_every_question_with_forms_test (testids for options only)",
+      "evidence": "The render test pins option-row testids + honeypot/timing/focus fields but no 'name=\"a_tenancy_from\"' / 'a_rent_amount' / 'a_tenancy_ongoing' assertions.",
+      "detail": "A renamed compound-control field would pass the render test (validators would still catch mismatches at the unit level).",
+      "recommended_fix": "Add field-name pins for the compound controls.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage-gap",
+      "title": "Resume pre-fill wiring (checked/value attributes from the draft) is never asserted: the resume test pins only the data-current marker",
+      "location": "server/test/integration/reference_form_integration_test.gleam:reopen_resumes_at_next_unanswered_test + form_pages_test (empty prefill)",
+      "evidence": "The resume integration test asserts data-current + landing absence only; no test renders a question with a populated draft and asserts the pre-filled checked/value attributes.",
+      "detail": "The read-side prefill behavior (see the read-side warning) is unpinned end-to-end.",
+      "recommended_fix": "Extend the resume test to assert a pre-filled control.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage-gap",
+      "title": "Navigation render pins missing: Start href (?q=<first>#q-<first>) and the Back-link branch are unasserted",
+      "location": "server/test/reference_checks/form_pages_test.gleam (landing/Start) + form_question_pages (back_url branch)",
+      "evidence": "landing_renders_art14_and_both_escape_routes_test pins escape routes but not the Start href; view_question is always rendered with back_url: None in tests.",
+      "detail": "The deep-link navigation contract (Start, Back, Change) lacks render pins.",
+      "recommended_fix": "Pin the Start href and one Back link.",
+      "verification": "confirmed"
+    },
+    {
+      "source": [
+        "tests"
+      ],
+      "severity": "note",
+      "category": "coverage-gate",
+      "title": "Advisory test gate: CONCERNS (per-chunk: c1 FAIL, c2 FAIL, c3 PASS, c4 CONCERNS, c5 CONCERNS)",
+      "location": "N/A",
+      "evidence": "Tests-lens gates: chunk1 FAIL (JS DOM wiring zero coverage), chunk2 FAIL (router-stack/CSRF path untested), chunk3 PASS (handler+questions write-side comprehensively pinned), chunk4 CONCERNS (slot renderers unpinned), chunk5 CONCERNS (PUT error contract unpinned).",
+      "detail": "P0 paths of the no-JS first-class flow are well pinned (integration + unit: classifier matrix, guarded SQL, token states, rollback). The JS enhancement path and the middleware/CSRF chain are the drag; both are captured as warnings above. No P0 gap in the first-class path.",
+      "recommended_fix": "Address the JS-wiring and router-stack coverage warnings; the gate then reads PASS.",
+      "verification": "confirmed"
+    }
+  ]
+}

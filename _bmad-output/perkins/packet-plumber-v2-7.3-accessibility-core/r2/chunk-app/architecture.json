@@ -1,0 +1,62 @@
+[
+  {
+    "source": "architecture",
+    "severity": "blocker",
+    "category": "a11y-parity",
+    "title": "delta-0 activate is a no-op on the palette + scale rows — touch/mouse tap, Enter and pad A can never change them",
+    "location": "app/settings.odin:149-152 + app/main.odin:762,770,796 + app/input/types.odin:177-181",
+    "evidence": "cycle_scale :: proc(cur: u8, delta: i32) -> u8 {\n\tn := i32(UI_SCALE_COUNT)\n\treturn u8((i32(cur) + delta + n) % n)\n}\n--- app/main.odin: app.a11y.scale_step = cycle_scale(app.a11y.scale_step, delta)\n--- app/main.odin:796: effect_settings_adjust(app.input.user, &app.input, i32(row), 0)\n--- app/input/types.odin: \"// the row (touch, via the app's ui-press): adjust the focused row. delta 0 =\\n// cycle/next; -1/+1 = step back/forward (palette + scale rows).\"\n--- app/settings_test.odin:148: testing.expect(t, cycle_scale(0, 0) == 0, \"a zero delta holds the step\")",
+    "detail": "(cur+0+n)%n == cur, so delta 0 holds. Every primary activate gesture (row tap, Enter, pad A) delivers delta 0, so palette/scale rows are dead on them; touch has no ±1 path at all. r1 tapped +1; the r2 rework regressed touch to nothing and the test pins the broken contract.",
+    "recommended_fix": "Map delta 0 to +1 for the palette/scale rows (in effect_settings_adjust or the cycle procs) and update settings_test.odin's zero-delta pin."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "single-source-fork",
+    "title": "QoS manual-editor draw positions left unscaled while the rework scaled the hit rects — value text lands inside the scaled [-] button at x1.25/x1.50",
+    "location": "app/qos_panel.odin:351,361 vs app/qos_panel.odin:101",
+    "evidence": "\t\t\tx := QOS_PANEL_X + 8 + lane * 96\n\t\t\ty := qos_row_y(&app.view, 6 + i32(len(app.cat.packet_types)))\n\t\t\tdraw_text(app, short[lane], i32(x), y + rnd.hud(&app.view, 4), rnd.hud(&app.view, 14), cols[lane])\n...\n\t\t\tdraw_text(app, wv, i32(x + 44), y + 4, 14, p.ink)\n--- qos_nudge_rect (the hit + button-draw source): x := rnd.hud(&app.view, QOS_PANEL_X + 8 + lane * 96)\n--- also unscaled: bw := i32((QOS_PANEL_W - 150) * u64(caps[lane]) / max(1, total)) / rl.DrawRectangle(QOS_PANEL_X + 118, y + 7, bw, 8, cols[lane])",
+    "detail": "The r2 rework scaled qos_nudge_rect but not the lane label x, the weight-value position (x+44, unscaled size 14), or the split bar. At x1.50 lane 0's value draws at x=64, inside the scaled minus rect (60..90) — clicking the visible number decrements the lane. r1 was consistently unscaled; r2 forked draw from hit.",
+    "recommended_fix": "Route the nudge-row label x, value offset and the split bar's origin/width through hud()/hud_f(), sharing qos_nudge_rect's scaled x."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "input-ownership",
+    "title": "S cannot close the settings panel while a pipe is selected — the advertised close key is dead in a reachable state",
+    "location": "app/input/mouse.odin:99-105 (collection) vs app/input/mouse.odin:144 (panel-open emit)",
+    "evidence": "\t\t\tcase .S:\n\t\t\t\t// 7.3: the panel toggle — collected ONLY with no pipe selected\n\t\t\t\t// (with a selection S stays the Standard-lane key; the executor's\n\t\t\t\t// Set_Lane sel_pipe gate keeps the paths exclusive).\n\t\t\t\tif inp.sel_pipe < 0 {\n\t\t\t\t\tif keys_n < len(keys) { keys[keys_n] = .S; keys_n += 1 }\n\t\t\t\t}\n--- panel-open emit: case .S, .Esc:\\n\\tappend(out, Intent(Toggle_Settings{}))\n--- app/main.odin:803 (chip open keeps the selection): app.input.panel_open = true",
+    "detail": "Select a pipe, then open the panel via the chip or pad Y (sel_pipe stays >= 0): S is never collected, so the panel-open S->Toggle_Settings emit is unreachable (phase-2 is panel-blocked too). Esc/chip/B still close. The conditional collection forks the key's meaning on invisible selection state.",
+    "recommended_fix": "Collect S unconditionally when inp.panel_open (phase2_blocked already suppresses Set_Lane while open), or clear sel_pipe when the panel opens."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "scale-legibility",
+    "title": "still present since round 1: popover height + text unscaled — the demolish button rides up over the title at x1.25/x1.50",
+    "location": "app/render/popover.odin:26,42,59,66",
+    "evidence": "POPOVER_H_PIPE :: f32(64)\n--- popover_rect: return {x, y, w, h}   // h taken raw, only w scaled\n--- demolish_button_rect: return {pop.x + hud_f(v, 10), pop.y + pop.height - hud_f(v, 36), pop.width - hud_f(v, 20), hud_f(v, 26)}\n--- draw: draw_text_c(v, cat.pipe_tiers[topo.pipe_tier[ps]].display, i32(pop.x) + 10, i32(pop.y) + 8, 15, p.ink)",
+    "detail": "R1 warning 3, verified still present: at x1.50 the pipe popover's button top = y+64-hud_f(36) = y+10 while the 15px title occupies y+8..23 — the button (drawn after) covers the title. The r2 rework scaled the insets/callers but not h or the text.",
+    "recommended_fix": "Scale POPOVER_H_* and the popover text sizes through hud()/hud_f() like the width and insets."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "seam-drift",
+    "title": "still present since round 1: crisis.odin hand-rolls a second reduced-motion gate beside the pulse_read seam",
+    "location": "app/render/crisis.odin:181 vs app/render/view.odin:355-358",
+    "evidence": "--- app/render/crisis.odin:181:\n\t\tif v.reduced_motion {\n\t\t\tfactor = 1.0\n\t\t}\n--- app/render/view.odin:355:\npulse_read :: proc(v: ^View, tick: u64, node_id: u32, advance: u32) -> f32 {\n\tif v.reduced_motion {\n\t\treturn 1.0\n\t}\n\treturn pulse_factor(tick, node_id, advance)\n}",
+    "detail": "R1 note, verified still present: pulse_read is documented as THE motion gate, but the crisis outline swell keeps its own inline gate (its (tick+b)%16 phase differs from pulse_factor, so it couldn't call pulse_read verbatim). A future gate change must be made twice.",
+    "recommended_fix": "Extract a shared static-pin helper both call sites use, or fix the 'ONE seam' comment to name both gates."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "modal-consistency",
+    "title": "still present since round 1: mouse ui-press stays gated on placing<0, so mid-placement the modal panel's rows are dead for the mouse",
+    "location": "app/input/mouse.odin:263",
+    "evidence": "\t\tif placing_eff < 0 && inp.on_ui_press != nil {\n\t\t\t// the demolish popover's buttons swallow the click FIRST (the\n\t\t\t// prototype's popover-first order) — a button press must never\n\t\t\t// start a drag; then the QoS panel (a panel click never\n\t\t\t// deselects, never starts a drag). The app handler returns\n\t\t\t// whether the press was swallowed. Gated on the EFFECTIVE placing\n\t\t\t// (an ESC cancel this frame already cleared placement — the old\n\t\t\t// cancel block ran before the press block).\n\t\t\tui = inp.on_ui_press(inp.user, inp, left_press)\n\t\t}",
+    "detail": "R1 note, verified still present: pad Y opens the panel mid-placement; mouse left-presses then skip on_ui_press (placing gate) while the panel-open branch suppresses the rest — rows/chip unclickable until ESC. Touch's panel branch calls on_ui_press directly, so the modal is not uniformly modal across devices.",
+    "recommended_fix": "While panel_open, run on_ui_press regardless of placing_eff (panel modal outranks placement mode)."
+  }
+]

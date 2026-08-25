@@ -1,0 +1,92 @@
+[
+ {
+  "source": "blind",
+  "severity": "blocker",
+  "category": "hash-integrity",
+  "title": "StateHash uses a fixed 4096-byte buffer; oversized states silently hash to the FNV offset basis",
+  "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:StateHash",
+  "evidence": "inline uint64_t StateHash(const FSimState &State)\n{\n\tstd::vector<uint8_t> Buffer(4096);\n\tconst size_t N = SerializeState(State, Buffer.data(), Buffer.size());\n\treturn Fnv1a64(Buffer.data(), N);\n}\n\n[and the capacity guard inside SerializeState:]\n\tif (Buf.size() > OutCapacity)\n\t{\n\t\treturn 0;\n\t}",
+  "detail": "Any state serializing past 4096 bytes (\u224883 packets at 48 bytes each, plus topology/log) makes SerializeState return 0; StateHash then hashes zero bytes, so every oversized state yields the identical FNV offset basis. Replay-equality silently false-passes with no error.",
+  "recommended_fix": "Grow the buffer until serialization succeeds (or add a vector-based SerializeState overload); treat N==0 from SerializeState as a hard failure in StateHash \u2014 never hash zero bytes."
+ },
+ {
+  "source": "blind",
+  "severity": "warning",
+  "category": "replay-fidelity",
+  "title": "StepScenario silently drops replay commands beyond 16 per tick",
+  "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Scenario.h:StepScenario",
+  "evidence": "\t\tFCommand Cmds[16];\n\t\tint32_t N = 0;\n\t\tfor (const FLoggedCommand &E : State.ActionLog)\n\t\t{\n\t\t\tif (E.ApplyTick == Tick && N < 16)\n\t\t\t{\n\t\t\t\tCmds[N++] = E.Cmd;\n\t\t\t}\n\t\t}\n\t\tStep(State, Tick, Cmds, N);\n\n[while ApplyEdit can append unbounded same-tick entries:]\n\t\tState.ActionLog.push_back(FLoggedCommand{State.Tick + 1, Cmd});",
+  "detail": "Commands beyond 16 sharing an apply_tick are silently dropped \u2014 no latch, no log. ApplyEdit can append unbounded same-tick entries, so a 17th edit between two ticks vanishes on replay, diverging live vs replay undetected.",
+  "recommended_fix": "Drop the fixed cap: collect the tick's entries into a std::vector<FCommand>, or clamp loudly and latch ReplayError on overflow \u2014 never discard logged commands silently."
+ },
+ {
+  "source": "blind",
+  "severity": "warning",
+  "category": "invariant",
+  "title": "Same-tick re-step is unguarded and double-spawns demand packets",
+  "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:Step",
+  "evidence": "\tif (Tick < State.Tick)\n\t{\n\t\tState.ReplayError = true; // the latch arrives with real commands (slice 1)\n\t\treturn;\n\t}\n\tif (State.bTerminal)\n\t{\n\t\treturn;\n\t}\n\tState.Tick = Tick;\n\n[and the spawn pass has no per-tick cursor:]\n\tfor (const FSpawnReq &Req : F.Demand)\n\t{\n\t\tif (Req.Tick != Tick)\n\t\t{\n\t\t\tcontinue;\n\t\t}\n\t\tFlowSpawn(F, Req.Class, Req.Src, Req.Dst, Tick);\n\t}",
+  "detail": "The guard rejects only Tick < State.Tick; calling Step(S, T) twice re-runs the tick: demand entries with Tick==T spawn duplicate packets and score counts twice, silently \u2014 no latch, unlike backward ticks.",
+  "recommended_fix": "Gate spawns on a last-spawned-tick watermark (or reject Tick <= State.Tick re-execution) and latch ReplayError on same-tick re-steps so the divergence is observable."
+ },
+ {
+  "source": "blind",
+  "severity": "warning",
+  "category": "gate-integrity",
+  "title": "Golden probe printf hardcodes nodes=3, pipes=2, spawned=11 \u2014 tautological keys with zero drift detection",
+  "location": "tests/spine_check.cpp:--json printf",
+  "evidence": "\t\tstd::printf(\n\t\t\t\"{\\\"seed\\\":42,\\\"ticks\\\":100,\\\"tick_nonce\\\":%u,\\\"state_hash\\\":\\\"%016llx\\\",\\\"rng_first4\\\":[%u,%u,%u,%u],\"\n\t\t\t\"\\\"save_magic\\\":\\\"PPUE\\\",\\\"save_version\\\":2,\\\"catalog_hash\\\":\\\"%016llx\\\",\"\n\t\t\t\"\\\"topology_summary\\\":{\\\"nodes\\\":3,\\\"pipes\\\":2,\\\"gen\\\":%u},\"\n\t\t\t\"\\\"forwarding_summary\\\":{\\\"reachable_pairs\\\":%u,\\\"total_hops\\\":%u},\"\n\t\t\t\"\\\"flow_summary\\\":{\\\"spawned\\\":11,\\\"delivered\\\":%d,\\\"live\\\":%d,\\\"score\\\":%d}}\\n\",",
+  "detail": "nodes, pipes, and spawned are literal constants while every other key is computed from state; compare-golden.sh then enforces hardcode-vs-hardcode \u2014 a tautology that cannot detect fixture or spawn drift, the exact false-green gates exist to prevent.",
+  "recommended_fix": "Compute the keys: NodeCount(State.Topology), PipeCount(State.Topology); add a spawned counter to FFlowState (or derive from NextPacketId) instead of the literal 11."
+ },
+ {
+  "source": "blind",
+  "severity": "warning",
+  "category": "coverage-gap",
+  "title": "Seed-divergence and non-vacuous-heartbeat conformance checks deleted without replacement",
+  "location": "tests/spine_check.cpp:replay-equality block",
+  "evidence": "-\t\tCHECK(PP::StateHash(C) != HashA, \"different seed must diverge\");\n\n-\t\tPP::FSimState D;\n-\t\tD.Initialize(42);\n-\t\tconst uint64_t HashD0 = PP::StateHash(D);\n-\t\tPP::Step(D, 1);\n-\t\tCHECK(PP::StateHash(D) != HashD0, \"a step must change the state hash (non-vacuous heartbeat)\");",
+  "detail": "The rewrite removes both pinned sensitivity checks and replaces them only with a demand-plan divergence check; seed-sensitivity and heartbeat non-vacuity are no longer asserted anywhere in the conformance runner.",
+  "recommended_fix": "Re-add both against the scenario: run BuildProbeScenario with seed 43 and assert StateHash divergence; assert StateHash changes across at least one step boundary."
+ },
+ {
+  "source": "blind",
+  "severity": "warning",
+  "category": "coverage-gap",
+  "title": "ApplyEdit (the live fast-path) is never exercised by any test in the diff",
+  "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:ApplyEdit",
+  "evidence": "inline FEditResult ApplyEdit(FSimState &State, const FCommand &Cmd)\n{\n\tFEditResult Result = ApplyDraw(State.Topology, Cmd.A, Cmd.B, Cmd.Tier);\n\tif (Result.Error == FEditError::None)\n\t{\n\t\tState.ActionLog.push_back(FLoggedCommand{State.Tick + 1, Cmd});\n\t}\n\treturn Result;\n}",
+  "detail": "ApplyEdit \u2014 the live path and the source of every action-log entry \u2014 is invoked by no test in this diff; the E10 claim that live and replay see identical state at every step boundary has zero coverage.",
+  "recommended_fix": "Add a dual-run test: apply the draws via ApplyEdit (live) in one run and via the logged replay in another, then assert identical StateHash at every step boundary."
+ },
+ {
+  "source": "blind",
+  "severity": "note",
+  "category": "doc-contradiction",
+  "title": "EqualCostHops claims stale-table detection but FRoutingTable carries no generation",
+  "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Routing.h:EqualCostHops",
+  "evidence": "// (offset, count) of the equal-cost next-hop set in Hops. ok=false if the\n// table is stale/not built; count == 0 means no route (the packet waits).\n\n[vs the actual check:]\n\tif (R.N == 0 || R.HopOffset.size() != static_cast<uint64_t>(R.N) * R.N)\n\t{\n\t\treturn false; // table not built / stale shape \u2014 no route\n\t}",
+  "detail": "The comment promises ok=false on a stale table, but the table stores only HopOffset/HopCount/Hops/N \u2014 no gen. A topology change that keeps node count (any draw) leaves a stale table reporting fresh routes with ok=true.",
+  "recommended_fix": "Store the built-for Topology.Gen in FRoutingTable and compare it in EqualCostHops, or delete the stale-detection claim from the comment."
+ },
+ {
+  "source": "blind",
+  "severity": "note",
+  "category": "doc-contradiction",
+  "title": "Serve-pass comment describes repeating windows; the code is a single FIFO pass",
+  "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Flow.h:FlowStep serve pass",
+  "evidence": "\t// 4. SERVE \u2014 per bundle, serve the on-edge packets FIFO in array order\n\t// (the trivial pre-QoS form; work-conserving \u2014 a lone packet gets the\n\t// full bundle capacity). Windows repeat until the bundle's capacity is\n\t// consumed or nothing is ready.\n\n[vs the single pass:]\n\t\tfor (uint32_t I = 0; I < F.Packets.size() && Remaining > 0; ++I)",
+  "detail": "\"Windows repeat until the bundle's capacity is consumed or nothing is ready\" describes no code in the diff \u2014 the serve pass is one linear FIFO sweep per bundle with no repeat loop. Leftover design prose misdescribes the algorithm.",
+  "recommended_fix": "Rewrite the comment to describe the actual single work-conserving pass, or implement the round loop if repeating windows were intended."
+ },
+ {
+  "source": "blind",
+  "severity": "note",
+  "category": "coverage-gap",
+  "title": "Versioned save format has no deserializer and no parse-back test",
+  "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_SimState.h:SAVE_VERSION",
+  "evidence": "// VERSION 2: slice-1 layout \u2014 topology + flow + action-log sections added\n// (deliberate, cause-documented re-bless; readers reject older versions).\n\n[while the only round-trip check compares two serializations:]\n\tTestTrue(TEXT(\"serialize bytes must be stable\"), FMemory::Memcmp(Buffer, Buffer2, N) == 0);",
+  "detail": "\"Readers reject older versions\" cites readers that exist nowhere in the diff, and the round-trip test only compares two serializations of the same state \u2014 it cannot catch field-order or layout mistakes on parse.",
+  "recommended_fix": "Add DeserializeState (rejecting wrong magic/version) plus a parse-back-equality test, or drop the reader language and label the format hash-only."
+ }
+]

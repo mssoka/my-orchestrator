@@ -1,0 +1,32 @@
+[
+  {
+    "source": "architecture",
+    "severity": "blocker",
+    "category": "duplication",
+    "title": "Live fast-path PIPE_DRAWN twin ships unpinned — deleting it passes every gate",
+    "location": "app/input/exec.odin:318-324",
+    "evidence": "exec.odin commit_draw:\n\t\t\t// v2-sound: the live fast-path twin of step's PIPE_DRAWN emission —\n\t\t\t// the SAME event at the SAME apply_tick (inp.tick + 1), so live and\n\t\t\t// replay event streams stay byte-identical (ODN-14). The audio\n\t\t\t// consumer picks it up on the next frame's drain (≤ 1 frame later).\n\t\t\tif inp.sim_events != nil {\n\t\t\t\tappend(inp.sim_events, pp.Event{tick = inp.tick + 1, tag = pp.EVENT_TAG_PIPE_DRAWN})\n\t\t\t}\n\nThe ONLY wiring is app/main.odin:309 `app.input.sim_events = &app.state.events`. harness/parity.odin:202: `// NOTE: sim_events stays NIL here on purpose — the wire-placed cue is an`. run_demo's live leg bypasses the input layer entirely (run.odin: `lower_intents` writes draws into `state.action_log`, then `pp.step(&state, sim_tick, batch[:], cat)`). No *_test.odin in the repo calls commit_draw/apply_intent/dispatch_frame; audio tests hand-build events.",
+    "detail": "ODN-14 byte-identity now rests on two hand-synced sites in different packages. No automated check exercises the exec-side append — deletion is CI-silent, killing the shipped game's wire click and live/replay stream identity (this repo's own r5/r6 'wiring shipped unpinned' blocker class).",
+    "recommended_fix": "Pin the wiring the settings_effect_wiring way: a parity/input test drives a drag-release with sim_events set to a scratch buffer and asserts Event{tick=inp.tick+1, tag=EVENT_TAG_PIPE_DRAWN} lands."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "determinism",
+    "title": "Fast-path event append falls outside the app's per-tick hash window, breaking the documented replay-identity",
+    "location": "app/main.odin:352-385",
+    "evidence": "main.odin step loop:\n\t\t\t\t// 5.7: capture the event-buffer mark BEFORE the step — the app\n\t\t\t\t// NEVER drains state.events (the 4.2 tripwire), so the per-tick\n\t\t\t\t// hash + the stats record take the SAME slice the harness\n\t\t\t\t// drains (this tick's events only; ...\n\t\t\t\tevents_before := len(app.state.events)\n\t\t\t\tapp.tick += 1\n...pp.step(&app.state, app.tick, {}, &cat)...\n\t\t\t\t// ... state_hash — the same derivation the harness pins, so the app\n\t\t\t\t// stream is replay-identical for the same seed + commands.\n\t\t\t\th := pp.state_hash(&app.state, app.state.events[events_before:], &cat, ...)\n\nBut commit_draw's append runs in handle_input (main.odin:441, AFTER the step loop + hash): append(inp.sim_events, pp.Event{tick = inp.tick + 1, ...}). The harness live/replay legs instead feed the command batch into step (run.odin: `pp.step(&state, sim_tick, batch[:], cat)`), where step's emission lands INSIDE `state.events[before:]` — hence the re-blessed tick-11 hashes (e.g. draw.t1 `11 ed1e20e9f2a7e250` → `11 e2d265333feb9edf`).",
+    "detail": "The app appends PIPE_DRAWN between tick windows, so no app per-tick hash/stats window ever contains it, while harness/replay hash it inside the apply tick — the app stream is no longer replay-identical at wire-draw ticks, contradicting both comments.",
+    "recommended_fix": "Defer the fast-path append to the apply tick's step boundary (inside the hashed window), or amend the 'SAME slice'/'replay-identical' comments to document the exclusion at draw ticks."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "documentation",
+    "title": "Coverage comments claim 'ALL FOUR kinds' fire in audio.dem, contradicting themselves and the guards",
+    "location": "harness/run.odin:506-509",
+    "evidence": "run.odin: `// audio.dem: ALL FOUR kinds (crisis +\n// arrival + the v2-sound wire + spawn — the recipe draws pipes at 100 ms,\n// so PIPE_DRAWN fires; add `growth on` for spawn coverage... the spawn\n// coverage lives in audio_spawn.dem instead, which runs growth at era 1).`\n\ndemos/audio.dem: `so the consumer exercises ALL FOUR kinds in this one golden: 1 crisis\n# sting draw + arrival-click draws (throttled at 2 ticks — see\n# ARRIVAL_MIN_GAP_TICKS in app/audio/audio.odin) + wire draws. The spawn\n# chime (NODE_SPAWNED) has its own golden: audio_spawn.dem (growth on).`\n\nThe actual audio.dem guard branch checks only crisis_draws, arrival_draws, wire_draws (no spawn_draws).",
+    "detail": "audio.dem's consumer never sees NODE_SPAWNED (no growth), yet both comments headline 'ALL FOUR kinds' before admitting spawn lives elsewhere. A maintainer trusting the headline could drop audio_spawn.dem believing audio.dem covers spawn.",
+    "recommended_fix": "Reword both: audio.dem proves crisis+arrival+wire; audio_spawn.dem proves spawn+wire. Drop the 'ALL FOUR kinds' phrase."
+  }
+]

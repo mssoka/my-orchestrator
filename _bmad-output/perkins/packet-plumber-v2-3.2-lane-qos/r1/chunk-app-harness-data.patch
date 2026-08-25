@@ -1,0 +1,1088 @@
+diff --git a/.gitignore b/.gitignore
+index 5b69936..3fa9101 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -31,3 +31,6 @@ _bmad/
+ .agents/
+ _bmad-output/**/.build/
+ _bmad-output/**/review/_charter-*.md
++
++# Debug symbol dirs — never commit
++*.dSYM/
+diff --git a/_bmad-output/implementation-artifacts/deferred-work.md b/_bmad-output/implementation-artifacts/deferred-work.md
+new file mode 100644
+index 0000000..1187451
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/deferred-work.md
+@@ -0,0 +1,5 @@
++# Deferred work
++
++- source_spec: `_bmad-output/implementation-artifacts/spec-3-2-lane-qos.md`
++  summary: draw_bundles rescans every pipe for every bundle per frame (O(bundles × pipes)) to sum lane caps + detect non-default emphasis
++  evidence: review finding (Blind Hunter #5, low) — fine at demo/game scale today (dozens of bundles × hundreds of pipes ≈ tens of thousands of float compares/frame); the derived-bundles view already walks members once per gen change, so folding the caps sum + a non-default flag into Bundles at bundles_rebuild is the natural future fix when the render cost ever matters.
+diff --git a/_bmad-output/implementation-artifacts/epic-2-context.md b/_bmad-output/implementation-artifacts/epic-2-context.md
+new file mode 100644
+index 0000000..8d3a703
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/epic-2-context.md
+@@ -0,0 +1,76 @@
++# Epic 2 Context: Packet Types & QoS
++
++<!-- Compiled from planning artifacts. Edit freely. Regenerate with compile-epic-context if planning docs change. -->
++
++## Goal
++
++Deliver the game's core differentiator: packets have needs (class roster), and
++the player engineers link-level QoS. Each pipe carries 3 DiffServ-style priority
++lanes (Express/Standard/Best-effort); the player allocates the pipe's bandwidth
++across lanes (WFQ-style integer weights) via a single "priority emphasis" dial
++in the MVP. The player promotes/demotes per type (all traffic starts Standard);
++the player owns every call — nothing auto-allocates. QoS is bandwidth-on-a-pipe
++(lane scheduling inside a link), strictly orthogonal to routing (next-hop
++selection); a bundled parallel-pipe link pools capacity and carries the same 3
++lanes.
++
++## Stories
++
++- Story 3.1: Packet types + the demand director (weighted-random spawns) — done.
++- Story 3.2: 3-lane QoS + emphasis dial (per-pipe weight presets; allocation).
++- Story 3.3: Node serialization + contention drop ladder (work-conserving, WRR floor).
++- Story 3.4: Per-class SLA accumulators inside Flow.
++
++## Requirements & Constraints
++
++- Each pipe carries exactly 3 lanes; bandwidth partitions by integer WFQ weights
++  via largest-remainder distribution with Express→Standard→Best tie order.
++- Allocation is weight-only: demand is NOT an input.
++- All traffic starts on Standard (the neutral middle); the player promotes what
++  can't drop/lag and demotes what can wait; a type's lane can be overridden
++  per-pipe.
++- MVP exposes the allocation as a single "priority emphasis" dial per pipe
++  mapping to weight presets; full per-lane raw weights are a depth layer.
++- Contention consequence (per-class loss/latency) and serialization are later
++  stories; 3.2 makes the allocation itself visible.
++- Edge contracts: all-zero weights → catalog default preset (E5); a never-drop
++  class lane is floored to a quantum and a zeroing edit is rejected (E6);
++  largest-remainder distribution pinned (E8).
++
++## Technical Decisions
++
++- QoS is NOT a system: pure procs (`qos_allocate`, later `qos_serialize`) in
++  package core's flow files, invoked by `flow_step` [ODN-3]. Lane weights /
++  policies are Topology-owned data.
++- Determinism spine (ODN-1/9/10/11): integer-only math (sums in i64), arrays
++  only (no maps), owned seeded RNG, per-tick T1 state hashes, action-log replay
++  gate with catalog_hash/logic_hz binding. New commands append union variants +
++  wire tags (CMD_TAG_*); LOG_VERSION bumps only on incompatible record shape.
++- Data-driven catalogs (ODN-5): JSON single source in data/*.json, fail-fast
++  validated at load, read-only after. Sim values are ints. balance.json is the
++  tunable-numbers home.
++- Edit authority: core's validate-then-apply is the single legality path (live
++  fast-path + replay converge); typed Edit_Error rejections (never strings).
++- Derived state (routing table, bundles) is rebuilt on Topology.gen change,
++  never serialized — the serialized form is the T1 hash input.
++- Golden verification: T1 hash manifests + T2 pixel goldens via the software
++  raylib shadow (tools/harness.sh); demos are scripted .dem files; drift-check
++  proves the replay gate rejects mutated logs.
++
++## UX & Interaction Patterns
++
++- Mouse-only graybox: drag node→node to draw (1/2/3 picks tier), right-click a
++  pipe cycles its QoS priority (prototype language), click a pipe to inspect.
++- Readability: the pipe shows the allocation (the decision); the node shows
++  serialization (the result, story 3.3). Flow within a pipe shows colored
++  packet dots whose proportion reflects the lane allocation. Color is never the
++  sole encoding — shape + icon reinforce ([UX-DR4]).
++
++## Cross-Story Dependencies
++
++- 3.2 depends on 3.1 (packet roster with default_lane, demand director) and
++  the 2.x spine (draw/demolish, bundles, ECMP).
++- 3.3 consumes 3.2's weights/allocator for serialization + drops.
++- 3.4 consumes the flow's delivery/drop path for SLA accumulators.
++- Placement (story 3.5) is IN FLIGHT on origin/v2 — QoS work must not touch
++  placement files (Cmd_Place_Router, tray).
+diff --git a/_bmad-output/implementation-artifacts/spec-3-2-lane-qos.md b/_bmad-output/implementation-artifacts/spec-3-2-lane-qos.md
+new file mode 100644
+index 0000000..cf5813b
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-3-2-lane-qos.md
+@@ -0,0 +1,193 @@
++---
++title: 'Story 3.2 — 3-lane QoS + emphasis dial'
++type: 'feature'
++created: '2026-08-13'
++status: 'done'
++review_loop_iteration: 0
++baseline_commit: 9a5a35b7a31ea65aaf7f9f28d8d48324450ecfa3
++context:
++  - '{project-root}/_bmad-output/planning-artifacts/architecture/odin-architecture-v1.md'
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** Pipes have no QoS: all traffic shares one undifferentiated pipe, so the player has no lever to prioritize (the story's whole differentiator is missing).
++
++**Approach:** Add per-pipe 3-lane (Express/Standard/Best-effort) integer-WFQ weight state, a pure `qos_allocate` proc (largest-remainder, E→S→B tie order, weight-only), a per-pipe "priority emphasis" dial mapping to weight presets in `balance.json`, and per-pipe per-class lane overrides. The allocation is computed inside `flow_step` (ODN-3: QoS lives in Flow, not a peer) and made visible via a lane-proportions readout + lane-striped pipe rendering. Serialization/drops are story 3.3; SLA is 3.4.
++
++## Boundaries & Constraints
++
++**Always:**
++- `qos_allocate :: proc(capacity: u32, w: [3]i32, default_w: [3]i32) -> [3]u32` — pure, integer, weight-only (demand NOT an input), largest-remainder with E→S→B tie order, sums in i64, all-zero `w` → `default_w` (E5). Lives in `package core` flow files, invoked by `flow_step` — never a peer system.
++- All-zero weights → the catalog default preset (E5). A never-drop class lane (class with `max_loss_pct == 0`) is floored to a quantum of 1 bandwidth-unit after allocation, floors satisfied in lane order E→S→B, capacity exhaustion = defined truncation (E6); the Command_Bus rejects the edit that would zero such a lane (E6).
++- The dial maps to weight presets from `balance.json` (`lane_presets` + `default_lane_preset`), wired through the existing data-driven catalog pattern — no hardcoded weights in code. Presets few + legible: balanced `[1,1,1]`, express_heavy `[4,2,1]`, best_effort_heavy `[1,2,4]`.
++- All traffic starts Standard (`default_lane` already in catalogs); the player promotes/demotes per type with a per-pipe override.
++- Commands are logged (action log) so replay is byte-identical (E10): new union variants + new wire tags appended; LOG_VERSION stays 2 (append-only tags — old logs still parse; existing `goldens/*.log.bin` stay byte-identical).
++- Serialization of new state is SPARSE (only non-default weights / non-empty overrides) so existing T1 manifests + T2 pixels do NOT shift. If any existing golden shifts: STOP and flag — do not re-bless.
++- New state is Topology-owned data (`pipe_weights`, lane overrides); the derived per-pipe allocation buffer lives on `Flow_State` and is rebuilt in `flow_step` on `Topology.gen` change (like routing/bundles), never serialized.
++- Packet advance stays bundle-capacity-based (lane-gated serialization is 3.3). Allocation is computed + visible in 3.2.
++
++**Ask First:** none — presets, keys, colors are delegated (story says "presets are YOUR call").
++
++**Never:** No 3.3 (serialization/contention/drops), no 3.4 (SLA), no 3.5 (placement: `Cmd_Place_Router`, tray). No demand input to allocation. No new peer systems. No maps/globals/float sim state (ODN-10/13). No re-blessing existing goldens.
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| HAPPY_PATH | `qos_allocate(10, {1,1,1}, {1,1,1})` | `{4,3,3}` (floor 3 each, remainder 1 → E) | n/a |
++| E8 tie order | `qos_allocate(5, {1,0,1}, {1,1,1})` | remainder goes to E: `{3,0,2}`; sum always == capacity | n/a |
++| E5 all-zero | `qos_allocate(10, {0,0,0}, {1,1,1})` | identical to `qos_allocate(10, {1,1,1}, {1,1,1})` | n/a |
++| E6 floor | caps `{0,3,2}` with never-drop on E, capacity 5 | floored `{1,3,2}` (quantum added; sum may exceed capacity) | truncation: with capacity 1 + two floored lanes, floors satisfy E first, B truncates |
++| E6 zeroing edit | `Cmd_Set_Emphasis{pipe, preset}` where preset zeroes a lane a never-drop class rides (or `Cmd_Set_Lane` puts a never-drop class on a zero-weight lane) | rejected | `.Invalid_Weights` |
++| Bad command args | unknown pipe / preset / class / lane | rejected | `.Missing_Pipe` / `.Invalid_Preset` / `.Unknown_Class` / `.Invalid_Lane` |
++| Catalog badness | preset with wrong arity / weight > MAX_WEIGHT / all-zero / missing default | rejected at load | named `Catalog_Error` |
++
++## Code Map
++
++- `core/qos.odin` (NEW) -- `qos_allocate` (E5/E8), lane resolution, `qos_apply_floor` (E6), `qos_pipe_caps` (allocate + floor per pipe)
++- `core/types.odin` -- `Cmd_Set_Emphasis` / `Cmd_Set_Lane` variants + `Edit_Error` additions; Flow_State `lane_caps`
++- `core/topology.odin` -- `pipe_weights` + overrides data; validate/apply for the new commands
++- `core/serialize.odin` -- wire tags 4/5 + sparse weights/override sections in `state_writer`; log read/write cases
++- `core/flow.odin` -- `flow_step`: rebuild `lane_caps` on gen change (the E6 floor home)
++- `core/catalog.odin` + `data/balance.json` -- `lane_presets` + `default_lane_preset` parsing/validation; `data/palette.json` lane colors (cosmetic)
++- `core/qos_test.odin` (NEW), `core/catalog_test.odin`, `core/determinism_test.odin` -- pins below
++- `app/main.odin`, `app/render/view.odin` -- select-pipe readout, right-click emphasis cycle, class lane keys, lane-stripe render (default-identical)
++- `harness/demo.odin`, `harness/run.odin` -- `emphasis`/`lane` demo directives + lowering; `demos/qos_emphasis.dem` (NEW)
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `data/balance.json` -- add `lane_presets` (3 presets) + `default_lane_preset` -- data-driven dial wiring
++- [x] `core/catalog.odin` -- parse/validate presets (arity, 0..MAX_WEIGHT, no all-zero, default resolves) -- ODN-5
++- [x] `core/qos.odin` -- allocator + lane resolution + floor + `qos_pipe_caps` -- the ODN-3 procs
++- [x] `core/topology.odin` -- `pipe_weights` (init at draw to default preset) + override list; validate/apply `Cmd_Set_Emphasis`/`Cmd_Set_Lane` incl. E6 rejection; gen bump -- Topology owns QoS data
++- [x] `core/types.odin` -- new command structs, `Edit_Error` values, `Flow_State.lane_caps` -- state model
++- [x] `core/serialize.odin` -- tags 4/5; sparse weights/override sections in `state_writer`; log write/read cases -- replay + golden stability
++- [x] `core/flow.odin` -- rebuild `lane_caps` in `flow_step` on gen change (floor applied) -- "QoS inside Flow"
++- [x] `core/qos_test.odin` (NEW) -- E5/E6/E8 pins, tie order, sum==capacity sweep, floor semantics, bus rejections, round-trip + replay with new commands -- durable pins
++- [x] `core/catalog_test.odin` + `core/determinism_test.odin` -- preset validation rows + test-catalog defaults + never-drop test class -- fail-fast + replay pins
++- [x] `app/render/view.odin` -- lane-stripe render (byte-identical for default weights) + readout geometry -- visible allocation
++- [x] `app/main.odin` -- pipe selection, right-click emphasis cycle, per-class lane keys, HUD readout -- the emphasis dial UI
++- [x] `harness/demo.odin` + `harness/run.odin` -- `at <ms> emphasis <pipe> <preset>` + `at <ms> lane <pipe> <class> <lane>` directives -- golden scripting
++- [x] `demos/qos_emphasis.dem` (NEW) -- draws + emphasis + override + captures (before/after) -- T2 lane-proportions golden
++
++**Acceptance Criteria:**
++- Given the `qos_allocate` proc, when distributing any (capacity, weights) with weights in domain, then caps sum to exactly capacity, remainders go E→S→B, and all-zero weights fall back to the default preset (E5/E8).
++- Given a never-drop class (max_loss_pct 0) bound to a lane, when the pipe's weights would give that lane 0, then the edit is rejected (E6); when allocation otherwise yields 0, `flow_step` floors it to 1 in lane order with capacity-truncation.
++- Given the emphasis dial, when the player sets a pipe's emphasis, then the pipe's `lane_caps` + rendered lane stripes + readout change accordingly, and the change rides the action log (replay byte-identical).
++- Given the new demo `qos_emphasis.dem`, when run through the harness, then its T1 manifest + T2 captures are blessed deliberately and the existing 10 demos' goldens are unchanged.
++- Given the app, when the player right-clicks a pipe, then the emphasis cycles through the balance.json presets and the lane-proportions readout updates.
++
++## Spec Change Log
++
++## Design Notes
++
++- **Sparse serialization is the golden-stability mechanism.** `pipe_weights` serializes only pipes whose weights differ from the default preset; overrides only when non-empty; new commands never appear in old demos. Existing runs produce byte-identical T1 hashes and pixel-identical T2 frames — no re-bless.
++- **Floor semantics:** `qos_apply_floor(caps, never_drop[3]bool, capacity)`: walk lanes E→S→B; a never-drop lane with cap 0 is set to 1 while a floor budget (capacity) remains; exhaustion truncates later floors. On realistic pipes this may oversell the sum by a quantum — defined, 3.3's gap-fill absorbs it.
++- **Lane resolution:** a class rides lane = per-pipe override (last-write-wins over the flat list) else the class's `default_lane`. Never-drop lanes for a pipe = lanes any never-drop class rides on it.
++- **Demo golden:** `qos_emphasis.dem` captures at ~1000ms (default balanced) and ~5000ms (after `emphasis` + `lane` directives) — the T2 diff IS the "lane proportions changing" golden.
++
++## Verification
++
++**Commands:**
++- `odin test core -debug` -- 61 existing + new tests green
++- `tools/lint.sh` -- all 5 gates green
++- `tools/harness.sh run` -- all demos PASS incl. the new `qos_emphasis` (T1 + replay + T2); existing goldens unchanged
++- `tools/harness.sh save qos_emphasis` -- deliberate bless of the new golden (only this demo)
++- `tools/harness.sh run` again -- PASS after bless
++- `tools/harness.sh drift-check` -- every mutation rejected
++- `odin build app` + run: right-click a pipe cycles emphasis; readout updates; stripes render; keys 1/2 + E/S/B set per-class lanes
++
++
++## Suggested Review Order
++
++**The allocator — E5/E6/E8 contracts**
++
++- Weight-only largest-remainder partition; ties break E→S→B; sums in i64
++  [`qos.odin:40`](../../core/qos.odin#L40)
++
++- Never-drop floor: lane order, capacity truncation — the E6 backstop
++  [`qos.odin:155`](../../core/qos.odin#L155)
++
++- The flow-side allocation: allocate + floor, per pipe (the readout's truth)
++  [`qos.odin:173`](../../core/qos.odin#L173)
++
++- Class→lane resolution: per-pipe override else catalog default_lane
++  [`qos.odin:108`](../../core/qos.odin#L108)
++
++**The edit surface — dial + override commands**
++
++- Emphasis validation incl. the E6 zeroing rejection (bus = primary guard)
++  [`topology.odin:294`](../../core/topology.odin#L294)
++
++- Override purge on demolish (dead-pipe hygiene, deterministic)
++  [`topology.odin:242`](../../core/topology.odin#L242)
++
++**Replay + the golden-stability mechanism**
++
++- New wire tags (append-only; LOG_VERSION stays 2)
++  [`serialize.odin:51`](../../core/serialize.odin#L51)
++
++- Sparse + absent-when-empty QoS sections — why existing goldens didn't shift
++  [`serialize.odin:182`](../../core/serialize.odin#L182)
++
++- Derived lane_caps rebuilt in flow_step on gen change (never serialized)
++  [`flow.odin:196`](../../core/flow.odin#L196)
++
++**The data — emphasis presets**
++
++- lane_presets parsing + fail-fast validation (duplicates rejected)
++  [`catalog.odin:481`](../../core/catalog.odin#L481)
++
++- The dial positions (balanced / express_heavy / best_effort_heavy)
++  [`balance.json:7`](../../data/balance.json#L7)
++
++**The UI — dial, keys, readout**
++
++- Right-click dial cycle (fast-path apply + log; rejections toasted)
++  [`main.odin:368`](../../app/main.odin#L368)
++
++- Pipe hit-testing (point-to-segment, ties → lower id)
++  [`main.odin:316`](../../app/main.odin#L316)
++
++- Per-class lane keys (1/2 + E/S/B) on the selected pipe
++  [`main.odin:400`](../../app/main.odin#L400)
++
++- The lane-proportions readout (fresh qos_pipe_caps, temp-arena strings)
++  [`main.odin:514`](../../app/main.odin#L514)
++
++**The render — lane segments**
++
++- Length-proportional Express→Standard→Best segments; default = byte-identical
++  [`view.odin:166`](../../app/render/view.odin#L166)
++
++- The selected-pipe halo (palette-driven)
++  [`view.odin:399`](../../app/render/view.odin#L399)
++
++**The golden + the harness**
++
++- The T2 "lane proportions changing" demo (default → express-heavy → best-effort-heavy)
++  [`qos_emphasis.dem:16`](../../demos/qos_emphasis.dem#L16)
++
++- The new demo directives (emphasis / lane verbs)
++  [`demo.odin:258`](../../harness/demo.odin#L258)
++
++**The pins**
++
++- E8 known-values + sum==capacity sweep; E5 fallback; E6 floor semantics
++  [`qos_test.odin:42`](../../core/qos_test.odin#L42)
++
++- Bus rejections incl. the never-drop zeroing guard
++  [`qos_test.odin:123`](../../core/qos_test.odin#L123)
++
++- The sparse-contract pin (dump walker: zero QoS bytes on default runs)
++  [`qos_test.odin:207`](../../core/qos_test.odin#L207)
++
++- Replay byte-identity with emphasis + lane commands
++  [`qos_test.odin:299`](../../core/qos_test.odin#L299)
++
++- Fail-fast catalog rows (presets incl. duplicates)
++  [`catalog_test.odin:108`](../../core/catalog_test.odin#L108)
+diff --git a/app/main.odin b/app/main.odin
+index c91684a..6cc76d8 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -56,6 +56,14 @@ App :: struct {
+ 	run_live:      bool,   // 1.4: has App.state been run_init'd (the restart destroy guard)
+ 	win_goal:      u32,    // 1.4: the session goal (mirrored into state.goal each run)
+ 	lose_tick_cap: u64,    // 1.4: the session cap (mirrored into state.tick_cap each run)
++	// 3.2: the QoS interaction state — the selected pipe (the readout + the
++	// lane-key target; -1 = none) + the class index the lane keys act on, +
++	// the transient rejection toast (a rejected QoS edit must never be
++	// silent — e.g. E6's never-drop guard).
++	sel_pipe:    i64,
++	sel_class:   u16,
++	last_reject: pp.Edit_Error, // 3.2: the most recent QoS edit rejection (drawn while fresh)
++	reject_tick: u64,           // the tick the rejection landed (toast age)
+ }
+ 
+ main :: proc() {
+@@ -76,6 +84,8 @@ main :: proc() {
+ 	app.std_tier = std
+ 	app.win_goal = WIN_GOAL
+ 	app.lose_tick_cap = LOSE_TICK_CAP
++	app.sel_pipe = -1 // 3.2: no selection at startup (0 is a LIVE pipe id, not a sentinel)
++	app.sel_class = 0
+ 
+ 	// the first run: seed 42 (reproducible — matches the harness fixture). The
+ 	// session goal + cap are applied inside start_run. Restarts mint a fresh
+@@ -123,7 +133,7 @@ main :: proc() {
+ 		rl.BeginDrawing()
+ 		defer rl.EndDrawing()
+ 		rl.ClearBackground(app.palette.canvas)
+-		rnd.draw_world(&app.view, &app.state.topology, &app.state.bundles, &app.state.flow, app.drag)
++		rnd.draw_world(&app.view, &app.state.topology, &app.state.bundles, &app.state.flow, app.drag, app.sel_pipe)
+ 		draw_hud(&app)
+ 	}
+ }
+@@ -145,6 +155,10 @@ start_run :: proc(app: ^App, seed: u64) {
+ 	app.accum = 0
+ 	app.drag = {}
+ 	app.drag_to = 0
++	app.sel_pipe = -1 // 3.2: fresh run, fresh selection (pipe ids recycle from 0)
++	app.sel_class = 0
++	app.last_reject = .None
++	app.reject_tick = 0
+ 	app.mode = .Run
+ 	app.run_live = true
+ }
+@@ -181,6 +195,20 @@ handle_input :: proc(app: ^App) {
+ 	mx, my := rl.GetMouseX(), rl.GetMouseY()
+ 	wx, wy := rnd.from_screen(&app.view, f32(mx), f32(my))
+ 
++	if rl.IsMouseButtonPressed(.RIGHT) {
++		// 3.2: right-click a pipe cycles its emphasis dial (the prototype's
++		// "right-click a pipe to cycle QoS priority" interaction language). The
++		// early return must not strand an in-progress drag's ghost: clear the
++		// drag state first (the release check below would otherwise be missed
++		// this frame and the ghost would stick until the next press-release).
++		app.drag.active = false
++		app.drag_to = 0
++		if pid, ok := pipe_hit(app, wx, wy); ok {
++			cycle_emphasis(app, pid)
++		}
++		return
++	}
++
+ 	if rl.IsMouseButtonPressed(.LEFT) {
+ 		// start a drag only if the press lands on a node
+ 		if id, ok := snap_node(app, wx, wy); ok {
+@@ -191,6 +219,15 @@ handle_input :: proc(app: ^App) {
+ 			app.drag.valid = .None
+ 			app.drag.cost = 0
+ 			app.drag_to = 0
++		} else {
++			// 3.2: a press on empty space selects the nearest pipe within the
++			// hit radius (the emphasis dial's target); a press on pure canvas
++			// clears the selection.
++			if pid, ok := pipe_hit(app, wx, wy); ok {
++				app.sel_pipe = i64(pid)
++			} else {
++				app.sel_pipe = -1
++			}
+ 		}
+ 	} else if app.drag.active {
+ 		app.drag.wx = wx
+@@ -224,6 +261,20 @@ handle_input :: proc(app: ^App) {
+ 			app.drag_to = 0
+ 		}
+ 	}
++
++	// 3.2: the per-type promote/demote keys — with a pipe selected, 1/2 pick
++	// the class, E/S/B assign its lane on that pipe (GDD M2's per-pipe override).
++	if app.sel_pipe >= 0 {
++		for i in 0..<len(app.cat.packet_types) {
++			key := rl.KeyboardKey(int(rl.KeyboardKey.ONE) + i)
++			if rl.IsKeyPressed(key) {
++				app.sel_class = u16(i)
++			}
++		}
++		if rl.IsKeyPressed(.E) { set_lane_key(app, pp.LANE_EXPRESS) }
++		if rl.IsKeyPressed(.S) { set_lane_key(app, pp.LANE_STANDARD) }
++		if rl.IsKeyPressed(.B) { set_lane_key(app, pp.LANE_BEST_EFFORT) }
++	}
+ }
+ 
+ // snap_node — nearest live node to a world-px point within the snap radius
+@@ -258,6 +309,113 @@ snap_node :: proc(app: ^App, wx, wy: f32) -> (u32, bool) {
+ 	return best, found
+ }
+ 
++// pipe_hit — nearest live pipe to a world-px point within PIPE_HIT_RADIUS
++// (world px). Point-to-segment distance², integer-style math on floats (the
++// view's basic-IEEE discipline); ties break to the lower pipe id. Returns the
++// pipe id + ok.
++pipe_hit :: proc(app: ^App, wx, wy: f32) -> (u32, bool) {
++	t := &app.state.topology
++	tile := f32(app.cat.balance.tile_px)
++	radius := f32(10) // world px — comfortably inside the fat-pipe read
++	r2 := radius * radius
++	best: u32 = 0
++	best_d2 := r2
++	found := false
++	for i in 0..<len(t.pipe_alive) {
++		if !t.pipe_alive[i] {
++			continue
++		}
++		a_slot, _ := pp.node_slot(t, t.pipe_a[i])
++		b_slot, _ := pp.node_slot(t, t.pipe_b[i])
++		ax := f32(t.node_pos[a_slot][0]) * tile
++		ay := f32(t.node_pos[a_slot][1]) * tile
++		bx := f32(t.node_pos[b_slot][0]) * tile
++		by := f32(t.node_pos[b_slot][1]) * tile
++		d2 := point_segment_d2(wx, wy, ax, ay, bx, by)
++		if d2 <= best_d2 {
++			if d2 == best_d2 && found && t.pipe_id[i] > best {
++				continue
++			}
++			best = t.pipe_id[i]
++			best_d2 = d2
++			found = true
++		}
++	}
++	return best, found
++}
++
++// point_segment_d2 — squared distance from a point to a segment (basic float
++// math; the projection clamps to the segment's endpoints).
++point_segment_d2 :: proc(px, py, ax, ay, bx, by: f32) -> f32 {
++	dx := bx - ax
++	dy := by - ay
++	len2 := dx*dx + dy*dy
++	if len2 <= 0 {
++		return (px-ax)*(px-ax) + (py-ay)*(py-ay)
++	}
++	t := ((px-ax)*dx + (py-ay)*dy) / len2
++	t = clamp(t, 0, 1)
++	ex := ax + t*dx - px
++	ey := ay + t*dy - py
++	return ex*ex + ey*ey
++}
++
++// cycle_emphasis — the dial: advance a pipe's preset to the next lane_presets
++// position (wrapping; the current position is matched by its weights). The
++// edit lands immediately (fast-path) + is logged at the next tick — the same
++// validate→apply→log convention as draw. A rejection (never-drop zeroing, E6)
++// simply does not move the dial.
++cycle_emphasis :: proc(app: ^App, pipe: u32) {
++	cat := &app.cat
++	ps, ok := pp.pipe_slot(&app.state.topology, pipe)
++	if !ok {
++		return
++	}
++	cur := app.state.topology.pipe_weights[ps]
++	idx := i32(cat.balance.default_preset_idx)
++	for i in 0..<len(cat.balance.lane_presets) {
++		if cat.balance.lane_presets[i].weights == cur {
++			idx = i32(i)
++			break
++		}
++	}
++	next := u16((idx + 1) % i32(len(cat.balance.lane_presets)))
++	cmd := pp.Cmd_Set_Emphasis{pipe = pipe, preset = next}
++	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, cat); err == .None {
++		append(&app.state.action_log, pp.Command{
++			apply_tick = app.tick + 1,
++			kind = cmd,
++		})
++	} else {
++		// a rejected dial move is never silent (e.g. E6's never-drop zeroing
++		// guard once never-drop content exists) — surface it in the HUD.
++		app.last_reject = err
++		app.reject_tick = app.tick
++	}
++}
++
++// set_lane_key — the per-type promote/demote keys: with a pipe selected,
++// 1/2 pick the class, E/S/B assign its lane on that pipe (GDD M2's "override a
++// type's lane per-pipe"). Fast-path apply + log, like every edit.
++set_lane_key :: proc(app: ^App, lane: u8) {
++	if app.sel_pipe < 0 {
++		return
++	}
++	if u32(app.sel_class) >= u32(len(app.cat.packet_types)) {
++		return
++	}
++	cmd := pp.Cmd_Set_Lane{pipe = u32(app.sel_pipe), class = app.sel_class, lane = lane}
++	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {
++		append(&app.state.action_log, pp.Command{
++			apply_tick = app.tick + 1,
++			kind = cmd,
++		})
++	} else {
++		app.last_reject = err
++		app.reject_tick = app.tick
++	}
++}
++
+ node_pos :: proc(app: ^App, id: u32) -> [2]i32 {
+ 	slot, _ := pp.node_slot(&app.state.topology, id)
+ 	return app.state.topology.node_pos[slot]
+@@ -266,7 +424,7 @@ node_pos :: proc(app: ^App, id: u32) -> [2]i32 {
+ draw_hud :: proc(app: ^App) {
+ 	p := app.palette
+ 	// title
+-	draw_text(app, "Packet Plumber — v2 story 1.4 (win/lose loop)", 12, 10, 22, p.ink)
++	draw_text(app, "Packet Plumber — v2 story 3.2 (3-lane QoS + emphasis dial)", 12, 10, 22, p.ink)
+ 
+ 	// the game-over screen: the WIN/LOSE toast (the terminal-event barrier
+ 	// guarantees exactly one outcome). The world still draws behind it; retry hint.
+@@ -288,6 +446,56 @@ draw_hud :: proc(app: ^App) {
+ 	score := fmt.tprintf("delivered %d / %d", app.state.score, app.state.goal)
+ 	draw_text(app, score, 12, 56, 16, p.ink_soft)
+ 
++	// 3.2: the QoS readout — click a pipe to select it (amber halo); the
++	// readout shows the emphasis preset + the lane proportions (the caps the
++	// flow allocated — the visible face of the dial) + each class's lane on
++	// this pipe (default or overridden). Right-click cycles the dial; 1/2 pick
++	// the class, E/S/B assign its lane.
++	if app.sel_pipe >= 0 {
++		if ps, ok := pp.pipe_slot(&app.state.topology, u32(app.sel_pipe)); ok {
++			cur := app.state.topology.pipe_weights[ps]
++			preset_name := app.cat.balance.lane_presets[app.cat.balance.default_preset_idx].display
++			for i in 0..<len(app.cat.balance.lane_presets) {
++				if app.cat.balance.lane_presets[i].weights == cur {
++					preset_name = app.cat.balance.lane_presets[i].display
++					break
++				}
++			}
++			dial := fmt.aprintf("pipe %d — %s [%d:%d:%d]", u32(app.sel_pipe), preset_name, cur[0], cur[1], cur[2], allocator = context.temp_allocator)
++			draw_text(app, dial, 12, 96, 16, p.ink)
++			// the lane proportions — recomputed fresh via the pure qos_pipe_caps
++			// (NOT flow.lane_caps: a fast-path edit this frame has not been
++			// stepped yet, so the flow buffer would be one frame stale; the
++			// pure proc is the same allocation the flow rebuilds, floor + all).
++			caps := pp.qos_pipe_caps(&app.state.topology, &app.cat, ps, u32(app.sel_pipe))
++			props := fmt.aprintf("lanes  E %d%% · S %d%% · B %d%%",
++				percent(caps[0], caps), percent(caps[1], caps), percent(caps[2], caps), allocator = context.temp_allocator)
++			draw_text(app, props, 12, 114, 16, p.lane_express)
++			// per-class lane readout (default_lane or the pipe's override)
++			classes := strings.builder_make(context.temp_allocator)
++			for i in 0..<len(app.cat.packet_types) {
++				lane := pp.qos_lane_of(&app.state.topology, &app.cat, u32(app.sel_pipe), u16(i))
++				if i > 0 {
++					strings.write_string(&classes, "   ")
++				}
++				strings.write_string(&classes, fmt.tprintf("%s→%s",
++					app.cat.packet_types[i].display, lane_label(lane)))
++			}
++			cls_line := strings.to_string(classes)
++			marker := ""
++			if u32(app.sel_class) < u32(len(app.cat.packet_types)) {
++				marker = fmt.aprintf("   [class %d: 1/2 select · E/S/B set lane]", app.sel_class+1, allocator = context.temp_allocator)
++			}
++			cls_out, _ := strings.join({cls_line, marker}, "", context.temp_allocator)
++			draw_text(app, cls_out, 12, 132, 16, p.ink_soft)
++		}
++		// the transient QoS rejection toast (a rejected dial/lane edit is
++		// never silent — e.g. E6's never-drop guard once that content exists)
++		if app.last_reject != .None && app.tick - app.reject_tick < 30 { // ~1.5s at 20Hz
++			draw_text(app, reject_label(app.last_reject), 12, 156, 16, rl.Color{200, 60, 60, 255})
++		}
++	}
++
+ 	// the cost readout on the drag ghost
+ 	if app.drag.active && app.drag_to != 0 {
+ 		cur := rnd.to_screen(&app.view, app.drag.wx, app.drag.wy)
+@@ -300,6 +508,27 @@ draw_hud :: proc(app: ^App) {
+ 	}
+ }
+ 
++// percent — the lane proportion readout: a lane's share of the allocated
++// total, rounded (the caps are the flow's allocation; the sum may exceed
++// capacity by the E6 floor's quantum, so shares are of the allocated total).
++percent :: proc(cap: u32, caps: [3]u32) -> i32 {
++	total := u64(caps[0]) + u64(caps[1]) + u64(caps[2])
++	if total == 0 {
++		return 0
++	}
++	return i32((u64(cap) * 100 + total/2) / total)
++}
++
++// lane_label — the lane index -> the dial's lane names (the readout).
++lane_label :: proc(lane: u8) -> string {
++	switch lane {
++	case pp.LANE_EXPRESS: return "Express"
++	case pp.LANE_STANDARD: return "Standard"
++	case pp.LANE_BEST_EFFORT: return "Best-effort"
++	}
++	return "?"
++}
++
+ reject_label :: proc(e: pp.Edit_Error) -> string {
+ 	#partial switch e {
+ 	case .Self_Loop: return "can't draw a pipe from a node to itself"
+@@ -307,8 +536,13 @@ reject_label :: proc(e: pp.Edit_Error) -> string {
+ 	case .Span_Exceeds_Tier: return "too far for the standard tier"
+ 	case .Missing_Node: return "no node there"
+ 	case .Unknown_Tier: return "unknown tier"
++	case .Missing_Pipe: return "that pipe is gone"
++	case .Invalid_Preset: return "that emphasis preset isn't available"
++	case .Unknown_Class: return "unknown traffic class"
++	case .Invalid_Lane: return "that's not a lane"
++	case .Invalid_Weights: return "that would starve a never-drop lane"
+ 	}
+-	return "can't draw there"
++	return "can't do that"
+ }
+ 
+ draw_text :: proc(app: ^App, txt: string, x, y: i32, size: i32, col: rl.Color) {
+diff --git a/app/render/palette.odin b/app/render/palette.odin
+index 7171ff5..b6476ea 100644
+--- a/app/render/palette.odin
++++ b/app/render/palette.odin
+@@ -28,6 +28,12 @@ Palette :: struct {
+ 	packet_dark: rl.Color,
+ 	ghost_ok:    rl.Color,
+ 	ghost_bad:    rl.Color,
++	// 3.2: the lane-band colors (the emphasis dial's visual) — Express =
++	// warm amber (priority), Standard = steel, Best-effort = muted green.
++	lane_express:     rl.Color,
++	lane_standard:    rl.Color,
++	lane_best_effort: rl.Color,
++	sel_halo:         rl.Color, // 3.2: the selected-pipe halo (translucent amber)
+ }
+ 
+ DEFAULT_PALETTE_JSON :: #load("../../data/palette.json")
+@@ -73,6 +79,10 @@ palette_load :: proc(source: []byte = DEFAULT_PALETTE_JSON) -> Palette {
+ 	p.packet_dark = jcol(obj, "packet_dark", {28, 70, 120, 255})
+ 	p.ghost_ok = jcol(obj, "ghost_ok", {120, 128, 140, 200})
+ 	p.ghost_bad = jcol(obj, "ghost_bad", {232, 69, 69, 200})
++	p.lane_express = jcol(obj, "lane_express", {224, 138, 46, 255})
++	p.lane_standard = jcol(obj, "lane_standard", {108, 122, 142, 255})
++	p.lane_best_effort = jcol(obj, "lane_best_effort", {88, 152, 108, 255})
++	p.sel_halo = jcol(obj, "sel_halo", {232, 181, 68, 90})
+ 	return p
+ }
+ 
+@@ -98,6 +108,10 @@ fallback_palette :: proc() -> Palette {
+ 	p.packet_dark = {28, 70, 120, 255}
+ 	p.ghost_ok = {120, 128, 140, 200}
+ 	p.ghost_bad = {232, 69, 69, 200}
++	p.lane_express = {224, 138, 46, 255}
++	p.lane_standard = {108, 122, 142, 255}
++	p.lane_best_effort = {88, 152, 108, 255}
++	p.sel_halo = {232, 181, 68, 90}
+ 	return p
+ }
+ 
+diff --git a/app/render/view.odin b/app/render/view.odin
+index a081ba7..7937ab8 100644
+--- a/app/render/view.odin
++++ b/app/render/view.odin
+@@ -71,15 +71,19 @@ node_screen :: proc(v: ^View, pos: [2]i32) -> rl.Vector2 {
+ // draw_world :: the world pass: map -> bundles(pipes) -> nodes -> packets ->
+ // drag ghost. Packets draw ON TOP of pipes + nodes so mid-traversal dots are
+ // visible. The view reads ONLY the topology + bundles + flow (ODN-1: never
+-// perturbs sim state).
+-draw_world :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, drag: Drag_State) {
++// perturbs sim state). `sel` is the selected pipe id (app interaction; -1 =
++// none — the harness passes the default, so goldens never carry selection UI).
++draw_world :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, drag: Drag_State, sel: i64 = -1) {
+ 	map_draw(v)
+-	draw_bundles(v, topo, bundles)
++	draw_bundles(v, topo, bundles, flow)
+ 	draw_nodes(v, topo)
+ 	draw_packets(v, topo, flow)
+ 	if drag.active {
+ 		draw_ghost(v, topo, drag)
+ 	}
++	if sel >= 0 {
++		draw_selection(v, topo, bundles, sel)
++	}
+ }
+ 
+ // map_draw — the static 1.2 map: cream canvas + a faint snap lattice. No
+@@ -121,7 +125,17 @@ BUNDLE_EXTRA_WIDTH :: f32(2.5)
+ // bundle renders at exactly its tier width with no extra core — byte-identical
+ // to the 1.2-1.4 per-pipe draw (so the slice-1 goldens are unchanged). The
+ // view reads ONLY the derived bundles + topology (ODN-1).
+-draw_bundles :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles) {
++//
++// Story 3.2 lane stripes: when a bundle's member pipes carry a NON-DEFAULT
++// lane allocation (an emphasis edit), the pooled edge draws 3 lane bands
++// (Express/Standard/Best-effort) whose widths are proportional to the member
++// caps summed across the bundle (the pooled link carries the same 3 lanes —
++// the bundle ruling). Default pipes draw ZERO stripes — byte-identical to the
++// pre-QoS render, so the existing T2 goldens cannot shift. `flow` supplies the
++// derived per-pipe lane caps (Flow_State.lane_caps, computed in flow_step).
++draw_bundles :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State) {
++	p := v.palette
++	def_w := v.catalogs.balance.lane_presets[v.catalogs.balance.default_preset_idx].weights
+ 	for bi in 0..<int(bundles.n) {
+ 		lo, hi := bundles.bundle_lo[bi], bundles.bundle_hi[bi]
+ 		sa, oka := pp.node_slot(topo, lo)
+@@ -139,8 +153,58 @@ draw_bundles :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles) {
+ 		// rounded caps (a clean look + hides the square line ends)
+ 		rl.DrawCircleV(a, width * 0.5, col)
+ 		rl.DrawCircleV(b, width * 0.5, col)
++		// 3.2 lane segments — ONLY when a member pipe's weights deviate from the
++		// default preset. The lane caps are summed across the bundle's members
++		// (slot-order scan of the pipe_bundle map — deterministic, ODN-10); the
++		// pipe then draws as Express→Standard→Best segments whose LENGTHS are
++		// proportional to the caps (the "who gets bandwidth" read — length gives
++		// far better proportion resolution than cross-width bands at fit scale).
++		// A zero-weight lane draws no segment (demoted to nothing). Default pipes
++		// draw zero segments — byte-identical to the pre-QoS render, so the
++		// existing T2 goldens cannot shift.
++		caps_sum: [3]u32
++		non_default := false
++		for ps in 0..<len(topo.pipe_alive) {
++			if !topo.pipe_alive[ps] { continue }
++			if int(ps) >= len(bundles.pipe_bundle) { continue }
++			if bundles.pipe_bundle[ps] != u32(bi) { continue }
++			if topo.pipe_weights[ps] != def_w {
++				non_default = true
++			}
++			if int(ps) < len(flow.lane_caps) {
++				c := flow.lane_caps[ps]
++				caps_sum[0] += c[0]
++				caps_sum[1] += c[1]
++				caps_sum[2] += c[2]
++			}
++		}
++		total_caps := u64(caps_sum[0]) + u64(caps_sum[1]) + u64(caps_sum[2])
++		if non_default && total_caps > 0 {
++			lane_cols := [3]rl.Color{p.lane_express, p.lane_standard, p.lane_best_effort}
++			// segment boundary positions along the pipe (pure float lerp)
++			boundary: [3]f32
++			acc: u64 = 0
++			for lane in 0..<3 {
++				acc += u64(caps_sum[lane])
++				boundary[lane] = f32(acc) / f32(total_caps)
++			}
++			start := f32(0)
++			for lane in 0..<3 {
++				if caps_sum[lane] == 0 { continue }
++				end := boundary[lane]
++				pa := rl.Vector2{a.x + (b.x-a.x)*start, a.y + (b.y-a.y)*start}
++				pb := rl.Vector2{a.x + (b.x-a.x)*end, a.y + (b.y-a.y)*end}
++				rl.DrawLineEx(pa, pb, width, lane_cols[lane])
++				rl.DrawCircleV(pa, width * 0.5, lane_cols[lane])
++				rl.DrawCircleV(pb, width * 0.5, lane_cols[lane])
++				start = end
++			}
++		}
+ 		// the glowing inner core: on fiber (the modernization read, A4) OR on a
+ 		// multi-member bundle (the pooled-link read — one fat edge, not a stack).
++		// Drawn AFTER the lane segments so an emphasized wide-fiber bundle keeps
++		// its core visible over the segment colors. For default pipes there are
++		// no segments, so the draw order is byte-identical to the pre-QoS render.
+ 		is_fiber := v.catalogs.pipe_tiers[tier].id == "wide"
+ 		if is_fiber || count > 1 {
+ 			rl.DrawLineEx(a, b, width * 0.45, v.palette.pipe_fiber)
+@@ -148,6 +212,7 @@ draw_bundles :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles) {
+ 	}
+ }
+ 
++
+ draw_nodes :: proc(v: ^View, topo: ^pp.Topology) {
+ 	for i in 0..<len(topo.node_alive) {
+ 		if !topo.node_alive[i] {
+@@ -328,6 +393,28 @@ draw_ghost :: proc(v: ^View, topo: ^pp.Topology, drag: Drag_State) {
+ 	rl.DrawCircleV(b, 4*v.scale, col)
+ }
+ 
++// draw_selection — the app's selected-pipe indicator (3.2): a soft amber halo
++// around the selected pipe's bundle. Never drawn by the harness (sel defaults
++// to -1 in capture_frame), so goldens are unaffected.
++draw_selection :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, sel: i64) {
++	ps, ok := pp.pipe_slot(topo, u32(sel))
++	if !ok { return }
++	if int(ps) >= len(bundles.pipe_bundle) { return }
++	bi := bundles.pipe_bundle[ps]
++	if bi == pp.NO_BUNDLE { return }
++	lo, hi := bundles.bundle_lo[bi], bundles.bundle_hi[bi]
++	sa, oka := pp.node_slot(topo, lo)
++	sb, okb := pp.node_slot(topo, hi)
++	if !oka || !okb { return }
++	a := node_screen(v, topo.node_pos[sa])
++	b := node_screen(v, topo.node_pos[sb])
++	width := (tier_pipe_width(v, bundles.bundle_tier[bi]) + f32(bundles.bundle_count[bi]-1)*BUNDLE_EXTRA_WIDTH) * v.scale
++	halo := width + 6 * v.scale
++	rl.DrawLineEx(a, b, halo, v.palette.sel_halo)
++	rl.DrawCircleV(a, halo * 0.5, v.palette.sel_halo)
++	rl.DrawCircleV(b, halo * 0.5, v.palette.sel_halo)
++}
++
+ tier_pipe_color :: proc(v: ^View, tier: u16) -> rl.Color {
+ 	switch v.catalogs.pipe_tiers[tier].id {
+ 	case "narrow": return v.palette.pipe_copper
+diff --git a/core/catalog.odin b/core/catalog.odin
+diff --git a/data/balance.json b/data/balance.json
+index 6beb07f..93a142d 100644
+--- a/data/balance.json
++++ b/data/balance.json
+@@ -1,9 +1,27 @@
+ {
+-  "_comment": "Balance catalog (GDD § Numerical Design, ODN-5). Single source for every tunable number. All state-affecting values are int (ODN-10). logic_hz=20 is the fixed-timestep tick rate (ODN-2). snap_radius = inclusive node-snap radius in world px (E4). packet_bandwidth = the bandwidth units a packet must accumulate to cross one edge (1.3 flow; transit ticks = ceil(packet_bandwidth / pipe.capacity_units), so a standard pipe (cap 15) takes 2 ticks). map.* = the design-grid world the camera fits into the 1280x720 window.",
++  "_comment": "Balance catalog (GDD § Numerical Design, ODN-5). Single source for every tunable number. All state-affecting values are int (ODN-10). logic_hz=20 is the fixed-timestep tick rate (ODN-2). snap_radius = inclusive node-snap radius in world px (E4). packet_bandwidth = the bandwidth units a packet must accumulate to cross one edge (1.3 flow; transit ticks = ceil(packet_bandwidth / pipe.capacity_units), so a standard pipe (cap 15) takes 2 ticks). lane_presets = the 3.2 emphasis-dial positions (GDD M2 lever 2): per-pipe lane WFQ weights, data-driven — the dial cycles these; default_lane_preset is the resting position every pipe starts on + the E5 all-zero fallback. map.* = the design-grid world the camera fits into the 1280x720 window.",
+   "logic_hz": 20,
+   "max_ticks": 100000,
+   "snap_radius": 36,
+   "packet_bandwidth": 30,
++  "lane_presets": [
++    {
++      "id": "balanced",
++      "display_name": "Balanced",
++      "weights": [1, 1, 1]
++    },
++    {
++      "id": "express_heavy",
++      "display_name": "Express-heavy",
++      "weights": [4, 2, 1]
++    },
++    {
++      "id": "best_effort_heavy",
++      "display_name": "Best-effort-heavy",
++      "weights": [1, 2, 4]
++    }
++  ],
++  "default_lane_preset": "balanced",
+   "map": {
+     "w_tiles": 40,
+     "h_tiles": 30,
+diff --git a/data/palette.json b/data/palette.json
+index ca5a51b..08eba93 100644
+--- a/data/palette.json
++++ b/data/palette.json
+@@ -23,5 +23,9 @@
+   "packet_dot":    [64, 140, 220, 255],
+   "packet_dark":  [28, 70, 120, 255],
+   "ghost_ok":      [120, 128, 140, 200],
+-  "ghost_bad":     [232, 69, 69, 200]
++  "ghost_bad":     [232, 69, 69, 200],
++  "lane_express":  [224, 138, 46, 255],
++  "lane_standard": [108, 122, 142, 255],
++  "lane_best_effort": [88, 152, 108, 255],
++  "sel_halo":      [232, 181, 68, 90]
+ }
+diff --git a/demos/qos_emphasis.dem b/demos/qos_emphasis.dem
+new file mode 100644
+index 0000000..74f2b3b
+--- /dev/null
++++ b/demos/qos_emphasis.dem
+@@ -0,0 +1,29 @@
++# qos_emphasis.dem — Story 3.2 golden: the emphasis dial changes lane
++# proportions. Era-3 demand (email 4/tick res->res + streaming 2/tick
++# host->res) flows over a res->router->host backbone. At 3000ms the dial on
++# pipe 1 (router->host — draw order: 0=res-router, 1=router-host) is set to
++# express_heavy (4:2:1) and streaming is promoted to Express on that pipe
++# (per-pipe lane override); at 9000ms the dial moves to best_effort_heavy
++# (1:2:4). The T1 manifest pins the whole run; the T2 captures pin the
++# proportions VISIBLY changing (the named golden):
++#   1000ms = default balanced (no lane segments — byte-identical to 3.1's
++#            pipe render), 5000ms = express-heavy segments, 12000ms =
++#            best-effort-heavy segments.
++# fixture qos = the 3-node fixture + residentials 3,4. Node ids: 0=res,
++# 1=router, 2=host, 3=res, 4=res. Pipe ids (draw order): 0=res-router,
++# 1=router-host.
++seed 3003
++run 15000ms
++era 3
++fixture qos
++expect hash stable
++at 100ms draw 0 1 standard
++at 100ms draw 1 2 standard
++at 100ms draw 3 1 standard
++at 100ms draw 4 1 standard
++at 3000ms emphasis 1 express_heavy
++at 3000ms lane 1 streaming express
++at 9000ms emphasis 1 best_effort_heavy
++capture at 1000ms
++capture at 5000ms
++capture at 12000ms
+diff --git a/goldens/boot.log.bin b/goldens/boot.log.bin
+diff --git a/harness/demo.odin b/harness/demo.odin
+index 5888ee8..0452bff 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -46,6 +46,26 @@ Demolish_Intent :: struct {
+ 	id:   u32, // pipe id (kind=.Pipe) or node id (kind=.Node)
+ }
+ 
++// Emphasis_Intent — a 3.2 `at <n>ms emphasis <pipe> <preset>` directive: set a
++// pipe's priority-emphasis dial to a lane preset (resolved by id against
++// balance.json's lane_presets at lowering, like tier names). A LOGGED command
++// (Cmd_Set_Emphasis) — replay-determinate.
++Emphasis_Intent :: struct {
++	at_ms:  i64,
++	pipe:   u32, // pipe id (fixture/draw order)
++	preset: string, // lane_presets id (balanced/express_heavy/best_effort_heavy)
++}
++
++// Lane_Intent — a 3.2 `at <n>ms lane <pipe> <class> <lane>` directive: override
++// a packet class's lane on a pipe (class + lane resolved by name at lowering).
++// A LOGGED command (Cmd_Set_Lane) — replay-determinate.
++Lane_Intent :: struct {
++	at_ms: i64,
++	pipe:  u32, // pipe id (fixture/draw order)
++	class: string, // packet_types id (email/streaming)
++	lane:  string, // express|standard|best_effort
++}
++
+ // Node_Spawn — a `spawn_node` directive: one node of `type_name` (a catalog
+ // node-type id, e.g. "router_basic") at a fixed integer grid position. The
+ // node's ID is NOT authored — it is the spawn ORDER (0-based, monotonic, never
+@@ -72,6 +92,8 @@ Demo :: struct {
+ 	draws:              [dynamic]Draw_Intent,
+ 	spawns:             [dynamic]Spawn_Intent,
+ 	demolishes:         [dynamic]Demolish_Intent,
++	emphasis:           [dynamic]Emphasis_Intent, // 3.2: `at <n>ms emphasis <pipe> <preset>`
++	lanes:              [dynamic]Lane_Intent,     // 3.2: `at <n>ms lane <pipe> <class> <lane>`
+ 	captures:           [dynamic]i64, // T2 capture times (ms)
+ 	win_goal:           u32, // 1.4: packets to deliver for a WIN (0 = win/lose disabled)
+ 	lose_cap_ms:        i64, // 1.4: tick-cap lose time (0 = no cap); lose if run reaches this with score < goal
+@@ -79,8 +101,16 @@ Demo :: struct {
+ 
+ // parse_demo — line-based; `seed <n>`, `run <n>ms`, `expect hash stable`,
+ // `at <n>ms draw <from> <to> <tier>`, `at <n>ms spawn <from> <to>`,
+-// `at <n>ms demolish pipe|node <id>`, `spawn_node <type> <x> <y>`,
++// `at <n>ms demolish pipe|node <id>`, `at <n>ms emphasis <pipe> <preset>`,
++// `at <n>ms lane <pipe> <class> <lane>`, `spawn_node <type> <x> <y>`,
+ // `fixture on|off`, `win goal <n>`, `lose cap <n>ms`, `capture at <n>ms`.
++//
++// VERB ORDERING AT LOWERING (documented): commands are appended to the action
++// log in FIXED GROUP order — draws, then demolishes, then emphasis, then
++// lanes — NOT in file order. Same-tick directives therefore apply in group
++// order regardless of authoring order (e.g. an `at 100ms demolish` always
++// beats an `at 100ms lane` on the same pipe). Deterministic by construction;
++// author same-tick directives on different pipes or accept the group order.
+ // Returns "" on success, a one-line error otherwise.
+ //
+ // STRING LIFETIME: the Node_Spawn type_name is CLONED with the default
+@@ -95,6 +125,8 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 	d.draws = make([dynamic]Draw_Intent, 0, 8, context.allocator)
+ 	d.spawns = make([dynamic]Spawn_Intent, 0, 8, context.allocator)
+ 	d.demolishes = make([dynamic]Demolish_Intent, 0, 8, context.allocator)
++	d.emphasis = make([dynamic]Emphasis_Intent, 0, 4, context.allocator)
++	d.lanes = make([dynamic]Lane_Intent, 0, 4, context.allocator)
+ 	d.captures = make([dynamic]i64, 0, 8, context.allocator)
+ 	for raw in strings.split(text, "\n", context.temp_allocator) {
+ 		line := strings.trim_space(raw)
+@@ -223,8 +255,28 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 				case:
+ 					return {}, fmt.tprintf("bad demolish target %q (want pipe|node): %s", fields[3], line)
+ 				}
++			case "emphasis":
++				// at <n>ms emphasis <pipe> <preset> — the 3.2 dial directive
++				if len(fields) < 5 {
++					return {}, fmt.tprintf("bad emphasis at-line (want: at <n>ms emphasis <pipe> <preset>): %s", line)
++				}
++				fid, okid := strconv.parse_uint(fields[3], 10)
++				if !okid {
++					return {}, fmt.tprintf("bad emphasis pipe id: %s", line)
++				}
++				append(&d.emphasis, Emphasis_Intent{at_ms = ms, pipe = u32(fid), preset = fields[4]})
++			case "lane":
++				// at <n>ms lane <pipe> <class> <lane> — the 3.2 per-pipe override
++				if len(fields) < 6 {
++					return {}, fmt.tprintf("bad lane at-line (want: at <n>ms lane <pipe> <class> <lane>): %s", line)
++				}
++				fid, okid := strconv.parse_uint(fields[3], 10)
++				if !okid {
++					return {}, fmt.tprintf("bad lane pipe id: %s", line)
++				}
++				append(&d.lanes, Lane_Intent{at_ms = ms, pipe = u32(fid), class = fields[4], lane = fields[5]})
+ 			case:
+-				return {}, fmt.tprintf("unknown at-verb %q (want draw|spawn|demolish): %s", fields[2], line)
++				return {}, fmt.tprintf("unknown at-verb %q (want draw|spawn|demolish|emphasis|lane): %s", fields[2], line)
+ 			}
+ 		case "capture":
+ 			// capture at <n>ms
+diff --git a/harness/run.odin b/harness/run.odin
+index 01f812c..75db01b 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -50,9 +50,52 @@ lower_intents :: proc(state: ^pp.Run_State, demo: ^Demo, cat: ^pp.Catalogs) -> s
+ 			})
+ 		}
+ 	}
++	for i in 0..<len(demo.emphasis) {
++		d := &demo.emphasis[i]
++		preset_idx, ok := pp.preset_index(cat, d.preset)
++		if !ok {
++			return fmt.tprintf("demo %s: unknown lane preset %q", demo.name, d.preset)
++		}
++		append(&state.action_log, pp.Command{
++			apply_tick = intent_apply_tick_raw(d.at_ms, cat.balance.logic_hz),
++			kind = pp.Cmd_Set_Emphasis{pipe = d.pipe, preset = preset_idx},
++		})
++	}
++	for i in 0..<len(demo.lanes) {
++		d := &demo.lanes[i]
++		class_idx, okc := pp.class_index(cat, d.class)
++		if !okc {
++			return fmt.tprintf("demo %s: unknown class %q", demo.name, d.class)
++		}
++		lane_idx, okl := lane_from_name(d.lane)
++		if !okl {
++			return fmt.tprintf("demo %s: unknown lane %q (want express|standard|best_effort)", demo.name, d.lane)
++		}
++		append(&state.action_log, pp.Command{
++			apply_tick = intent_apply_tick_raw(d.at_ms, cat.balance.logic_hz),
++			kind = pp.Cmd_Set_Lane{pipe = d.pipe, class = class_idx, lane = lane_idx},
++		})
++	}
+ 	return ""
+ }
+ 
++// intent_apply_tick_raw — the edit fast-path convention for non-draw intents:
++// a command fired at at_ms applies at the NEXT tick boundary (floor + 1), like
++// draw/demolish — live + replay converge at the step boundary.
++intent_apply_tick_raw :: proc(at_ms: i64, logic_hz: i32) -> u64 {
++	return u64(max(0, at_ms * i64(logic_hz) / 1000)) + 1
++}
++
++// lane_from_name — demo directive lane name -> lane index (3.2).
++lane_from_name :: proc(name: string) -> (u8, bool) {
++	switch name {
++	case "express": return pp.LANE_EXPRESS, true
++	case "standard": return pp.LANE_STANDARD, true
++	case "best_effort": return pp.LANE_BEST_EFFORT, true
++	}
++	return 0, false
++}
++
+ // lower_nodes — spawn the demo's spawn_node directives into the topology (run
+ // setup — NOT the action log; re-created identically on every replay, like the
+ // fixture). The type name resolves against the catalog; an unknown type is a
+@@ -94,6 +137,8 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 		delete(demo.draws)
+ 		delete(demo.spawns)
+ 		delete(demo.demolishes)
++		delete(demo.emphasis)
++		delete(demo.lanes)
+ 		delete(demo.captures)
+ 	}
+ 
+@@ -146,7 +191,7 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 			}
+ 		}
+ 		pp.step(&state, tick, batch[:], cat)
+-		append(&hashes, pp.state_hash(&state, state.events[before:], context.temp_allocator))
++		append(&hashes, pp.state_hash(&state, state.events[before:], cat, context.temp_allocator))
+ 		clear(&state.events)
+ 
+ 		// T2 pixel goldens — render the settled topology at each capture tick
+@@ -306,6 +351,8 @@ load_demo_replay :: proc(demo_name: string) -> Demo_Replay {
+ 	cfg.session.goal = demo.win_goal
+ 	cfg.session.cap_ms = demo.lose_cap_ms
+ 	delete(demo.demolishes) // r1 note: the sibling loaders leaked this too
++	delete(demo.emphasis)   // 3.2
++	delete(demo.lanes)      // 3.2
+ 	delete(demo.captures)
+ 	return cfg
+ }
+@@ -365,7 +412,7 @@ replay_hashes :: proc(lpath: string, cat: ^pp.Catalogs, ticks: u64, cfg: ^Demo_R
+ 			}
+ 		}
+ 		pp.step(&state, tick, batch[:], cat)
+-		append(&out, pp.state_hash(&state, state.events[before:], context.temp_allocator))
++		append(&out, pp.state_hash(&state, state.events[before:], cat, context.temp_allocator))
+ 		clear(&state.events)
+ 		free_all(context.temp_allocator)
+ 	}

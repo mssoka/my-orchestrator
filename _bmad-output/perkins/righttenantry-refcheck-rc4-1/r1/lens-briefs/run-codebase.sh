@@ -1,0 +1,4 @@
+#!/bin/bash
+cd /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-rc4-1-r1
+pi -p --model deepseek/deepseek-v4-flash --no-session --name "mm-codebase-r1" "You are the 'codebase' code-review lens (Perkins automated review round 1 of PR #604). Read the lens brief at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1/lens-briefs/_shared.md and then /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1/lens-briefs/codebase.md, and follow their instructions EXACTLY. Verify every claim by reading the actual files in the worktree at /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-rc4-1-r1 (read/grep/bash) — do not assume. Write ONLY your JSON array to /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1/codebase.json and stop. Accuracy over volume; [] is an honest answer when nothing is wrong."
+echo "codebase_DONE_0"

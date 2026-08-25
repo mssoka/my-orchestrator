@@ -1,0 +1,42 @@
+[
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "parity",
+    "title": "Same-frame ESC + popover/QoS click: on_ui_press side effects execute at MAP time, before the queued Cancel — old code deselected FIRST, so no demolish/lane command fired",
+    "location": "app/input/mouse.odin:119,185; app/input/input.odin:117-118; app/main.odin:759,771; app/input/exec.odin:56-57",
+    "evidence": "mouse.odin:119 'append(out, Intent(Cancel{}))' (queued, not executed); mouse.odin:185 'ui = inp.on_ui_press(inp.user, inp, left_press)' (runs synchronously inside mouse_map); input.odin:117-118 'mouse_map(inp, events, &inp.intents)' then 'execute_all(inp, inp.intents[:])'; main.odin:759 'inp.demolish_node(&app.input, u32(app.input.sel_node))' (inside popover_click, reached via effect_ui_press); exec.odin:56-57 'inp.sel_pipe = -1 / inp.sel_node = -1' (Cancel's deselect, executes after mapping). Old handle_input (diff minus-lines): '} else if rl.IsKeyPressed(.ESCAPE) { ... app.sel_pipe = -1; app.sel_node = -1' ran BEFORE 'if app.placing < 0 && popover_click(app, {f32(mx), f32(my)}) {'",
+    "detail": "ESC's Cancel is only queued when popover_click/qos_panel_click run during mapping with the stale selection: same-frame ESC + demolish-button click DEMOLISHES (old: selection cleared first, popover missed, no command); same-frame ESC + QoS row/preset click applies Set_Lane/Set_Weights. Command + action-log delta. Harness cannot catch it: drive_parity leaves on_ui_press nil.",
+    "recommended_fix": "Mirror the deselect into mapping-time state like esc_cancelled (e.g. a sel_cleared flag gating the on_ui_press call, or execute phase-1 intents before the press branch runs side effects) so the UI press sees the post-cancel selection."
+  },
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "parity",
+    "title": "ESC-while-placing + same-frame left release: release branch reads pre-execution drag.active (ghost) and Drag_Release click-selects — old code's cancel block cleared the drag + latched the swallow, so the release was a no-op",
+    "location": "app/input/mouse.odin:233-246; app/input/exec.odin:51-54,105-114",
+    "evidence": "mouse.odin:233-235 '} else if has_release || moves_n > 0 { if inp.drag.active && placing_eff < 0 {' and :246 'append(out, Intent(Drag_Release{pos = release_pos}))' — drag.active is the MAP-TIME ghost (the placing Cursor_Move sets inp.drag.active = true every move frame); placing_eff is -1 via esc_cancelled, routing to the drag branch. exec.odin:51-54 'if inp.placing >= 0 { inp.placing = -1; inp.drag = {}; inp.drag.placing = -1 }' (Cancel clears the drag only at EXECUTION); exec.odin:109-113 'commit_draw(inp) / mouse := v.pos / moved := rl.Vector2Distance(mouse, inp.press) > 6 / if !moved && !release_ui_hit(inp, mouse) { click_select(inp, mouse) }' — no press_swallowed gate. Old code: the cancel block synchronously set 'app.drag.active = false' + 'app.press_swallowed = true', so the release fell to '} else if rl.IsMouseButtonReleased(.LEFT) && !app.press_swallowed {' = swallowed, nothing happened.",
+    "detail": "Reachable: arm placement, ghost active, left-press at world spot S (anchors), then ESC + release at S in one frame. Old: nothing. New: Cancel executes, then Drag_Release click_selects at S (commit_draw no-ops, drag_to==0). Selection-state mouse-path delta the placing_eff fix missed — it mirrors placing but not the cancel's drag.active clear.",
+    "recommended_fix": "When esc_cancelled (or any same-frame Cancel), treat the drag as cleared at mapping time too (e.g. drag_eff := inp.drag.active && !esc_cancelled in the release branch), or gate Drag_Release's click_select on the executor-time press_swallowed latch."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "parity",
+    "title": "Right+left chord mid-drag: Press_Anchor executes AFTER Right_Click and clears the was_dragging swallow latch the old right-branch set last (old final latch=true, new=false — the interrupted drag's release click-selects)",
+    "location": "app/input/mouse.odin:165-171; app/input/exec.odin:66-70,546-550",
+    "evidence": "mouse.odin:165-171 'if has_left { ... append(out, Intent(Press_Anchor{})) }' emitted after Intent(Right_Click); exec.odin:546-550 'was_dragging := inp.drag.active ... if was_dragging { inp.press_swallowed = true // an interrupted drag's release must not re-select }'; exec.odin:66-70 'case Press_Anchor: ... inp.press_swallowed = false'. Old right branch (diff minus-lines): chord ran FIRST — 'app.press = {f32(mx), f32(my)} / app.press_swallowed = false' — then 'if was_dragging { app.press_swallowed = true }' — final latch true.",
+    "detail": "The fix's own comment says the Press_Anchor reproduces 'the old chord ran AFTER the cancel block', but the old was_dragging latch sits AFTER the chord reset inside the right branch; the new order lets Press_Anchor clobber it. Live state-polling can't edge a held left button mid-drag, but the harness's scripted frames can drive it.",
+    "recommended_fix": "Emit Press_Anchor before Right_Click in the chord path (the old chord reset preceded the drag-interrupt latch), or have right_click_select re-apply the latch after any same-frame anchor reset."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "input_parity_reject selection assert is vacuous: sel_node/sel_pipe are mutually exclusive by construction, so the && condition can never fire",
+    "location": "harness/parity.odin:807-810",
+    "evidence": "parity.odin:807-808 'case \"input_parity_reject\": if r, ok := find(runs, devs, .Mouse); ok && r.sel_node != -1 && r.sel_pipe != -1 {' — every writer keeps them mutually exclusive: exec.odin click_select ('inp.sel_node = i64(id) / inp.sel_pipe = -1' or 'inp.sel_pipe = i64(pid) / inp.sel_node = -1'), right_click_select ('inp.sel_pipe = i64(pid) / inp.sel_node = -1'), demolish success clears both, so both >= 0 is unreachable.",
+    "detail": "The comment promises 'a rejected draw must not change the selection' but the assert can never fail; it should use || (fire if EITHER selection changed). The scenario's primary pin (empty expected command stream) is sound and unaffected.",
+    "recommended_fix": "Change the condition to r.sel_node != -1 || r.sel_pipe != -1 so a selection change after the rejected draw actually fails the scenario."
+  }
+]

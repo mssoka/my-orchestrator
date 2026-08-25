@@ -1,0 +1,5 @@
+#!/bin/bash
+cd /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-rc4-2-r2
+export PI_NO_SESSION_HEADLESS=1
+pi -p --model deepseek/deepseek-v4-flash --no-session --name "mm-tests-c1-r2" "You are the 'tests' code-review lens (Perkins automated review round 2 of PR #605, righttenantry-refcheck-rc4-2). Read the lens brief at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-2/r2/lens-briefs/_shared.md FIRST, then /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-2/r2/lens-briefs/tests.md, and follow their instructions EXACTLY. Your diff chunk: /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-2/r2/diff.c1.patch (read ONLY that file's bytes \u2014 do not regenerate or expand). Verify every claim by reading the actual files in the worktree at /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-rc4-2-r2 (read/grep/bash) \u2014 do not assume. Write ONLY your JSON array to /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-2/r2/tests.c1.json and stop. Accuracy over volume; [] is an honest answer when nothing is wrong."
+echo "tests_c1_DONE_0"

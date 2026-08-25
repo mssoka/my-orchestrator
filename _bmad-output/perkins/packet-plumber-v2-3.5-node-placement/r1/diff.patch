@@ -1,0 +1,1123 @@
+diff --git a/app/main.odin b/app/main.odin
+index c91684a..2dd85bf 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -47,11 +47,13 @@ App :: struct {
+ 	drag:          rnd.Drag_State,
+ 	tick:          u64,
+ 	accum:         f64,    // the fixed-timestep accumulator (ODN-2)
+-	std_tier:      u16,    // the tier app draws (the workhorse 'standard')
++	tier:          u16,    // the selected draw tier (3.5: tray link chips; default standard)
++	placing:       i32,    // 3.5: node-type index while placing a router from the tray, else -1
+ 	res_id:        u32,
+ 	rt_id:         u32,
+ 	host_id:       u32,
+ 	drag_to:       u32,    // the node the cursor is currently snapped to (0 = none)
++	press:         rl.Vector2, // 3.5: the placement press position (movement guard)
+ 	mode:          Mode,   // 1.4: the app-layer FSM (ODN-13)
+ 	run_live:      bool,   // 1.4: has App.state been run_init'd (the restart destroy guard)
+ 	win_goal:      u32,    // 1.4: the session goal (mirrored into state.goal each run)
+@@ -73,7 +75,7 @@ main :: proc() {
+ 	app: App
+ 	app.cat = cat
+ 	std, _ := pp.pipe_tier_index(&cat, "standard")
+-	app.std_tier = std
++	app.tier = std
+ 	app.win_goal = WIN_GOAL
+ 	app.lose_tick_cap = LOSE_TICK_CAP
+ 
+@@ -144,7 +146,9 @@ start_run :: proc(app: ^App, seed: u64) {
+ 	app.tick = 0
+ 	app.accum = 0
+ 	app.drag = {}
++	app.drag.placing = -1 // 3.5: not placing (a zero struct would read as type 0)
+ 	app.drag_to = 0
++	app.placing = -1
+ 	app.mode = .Run
+ 	app.run_live = true
+ }
+@@ -166,7 +170,7 @@ fresh_seed :: proc() -> u64 {
+ 	return v
+ }
+ 
+-// --- input: drag-draw with snap-to-node (ODN-12) ----------------------------
++// --- input: drag-draw with snap-to-node + the 3.5 placement mode (ODN-12) ---
+ 
+ handle_input :: proc(app: ^App) {
+ 	// Game_Over: the only input is retry (a fresh run in a fresh context — no
+@@ -181,7 +185,46 @@ handle_input :: proc(app: ^App) {
+ 	mx, my := rl.GetMouseX(), rl.GetMouseY()
+ 	wx, wy := rnd.from_screen(&app.view, f32(mx), f32(my))
+ 
++	// placement cancel: ESC or right-click (click again on the chip cancels
++	// too — handled in the chip hit-test below)
++	if app.placing >= 0 && (rl.IsKeyPressed(.ESCAPE) || rl.IsMouseButtonPressed(.RIGHT)) {
++		app.placing = -1
++		app.drag.active = false
++		app.drag.placing = -1
++	}
++
+ 	if rl.IsMouseButtonPressed(.LEFT) {
++		// the hardware tray first: link chips select the draw tier; router
++		// chips arm placement mode (click again to cancel). Chips swallow the
++		// click — never start a drag from the tray.
++		n_chips := rnd.tray_chip_count(&app.view)
++		for i in 0 ..< n_chips {
++			r := rnd.tray_chip_rect(&app.view, i)
++			if rl.CheckCollisionPointRec({f32(mx), f32(my)}, r) {
++				if i < len(app.cat.pipe_tiers) {
++					app.tier = u16(i)
++					app.placing = -1
++					app.drag = {}
++					app.drag.placing = -1
++				} else {
++					rts: [8]u16
++					nr := rnd.tray_router_types(&app.view, rts[:])
++					k := i - len(app.cat.pipe_tiers)
++					if k < nr {
++						tidx := i32(rts[k])
++						app.placing = (app.placing == tidx) ? -1 : tidx // click again to cancel
++						app.drag = {}
++						app.drag.placing = app.placing
++						app.drag_to = 0
++					}
++				}
++				return
++			}
++		}
++		if app.placing >= 0 {
++			app.press = {f32(mx), f32(my)} // placement clicks land on release
++			return
++		}
+ 		// start a drag only if the press lands on a node
+ 		if id, ok := snap_node(app, wx, wy); ok {
+ 			app.drag.active = true
+@@ -192,16 +235,16 @@ handle_input :: proc(app: ^App) {
+ 			app.drag.cost = 0
+ 			app.drag_to = 0
+ 		}
+-	} else if app.drag.active {
++	} else if app.drag.active && app.placing < 0 {
+ 		app.drag.wx = wx
+ 		app.drag.wy = wy
+ 		// re-snap + re-validate the in-progress draw (live preview, READ-ONLY)
+ 		if id, ok := snap_node(app, wx, wy); ok && id != app.drag.from_node {
+ 			app.drag_to = id
+ 			span := pp.span_between(node_pos(app, app.drag.from_node), node_pos(app, id))
+-			app.drag.cost = pp.draw_cost(span, app.std_tier, &app.cat)
++			app.drag.cost = pp.draw_cost(span, app.tier, &app.cat)
+ 			app.drag.valid = pp.validate_draw(&app.state.topology,
+-				pp.Cmd_Draw_Pipe{app.drag.from_node, id, app.std_tier}, &app.cat)
++				pp.Cmd_Draw_Pipe{app.drag.from_node, id, app.tier}, &app.cat)
+ 		} else {
+ 			app.drag_to = 0
+ 			app.drag.valid = .None
+@@ -210,7 +253,7 @@ handle_input :: proc(app: ^App) {
+ 		if rl.IsMouseButtonReleased(.LEFT) {
+ 			// commit if snapped to a legal target
+ 			if app.drag_to != 0 && app.drag.valid == .None {
+-				cmd := pp.Cmd_Draw_Pipe{app.drag.from_node, app.drag_to, app.std_tier}
++				cmd := pp.Cmd_Draw_Pipe{app.drag.from_node, app.drag_to, app.tier}
+ 				if _, err := pp.topology_apply_edit(&app.state.topology,
+ 					pp.Command{1, cmd}, &app.cat); err == .None {
+ 					// edit fast-path (ODN-2): applied THIS frame, logged at next tick
+@@ -223,9 +266,43 @@ handle_input :: proc(app: ^App) {
+ 			app.drag.active = false
+ 			app.drag_to = 0
+ 		}
++	} else if app.placing >= 0 {
++		// placement mode: the ghost preview tracks the tile under the cursor;
++		// a click drops the router (validated), click again/ESC/right-click
++		// cancels (above + the chip toggle). Never starts a link drag. A press
++		// that DRAGS past 6px is a no-op (not a place intent).
++		app.drag.active = true
++		app.drag.placing = app.placing
++		app.drag.wx = wx
++		app.drag.wy = wy
++		tile := mouse_tile(app)
++		app.drag.valid = pp.validate_place(&app.state.topology,
++			pp.Cmd_Place_Router{u16(app.placing), tile}, &app.cat)
++		if rl.IsMouseButtonReleased(.LEFT) {
++			moved := rl.Vector2Distance({f32(mx), f32(my)}, app.press) > 6
++			if !moved {
++				cmd := pp.Cmd_Place_Router{type_idx = u16(app.placing), pos = tile}
++				if _, err := pp.topology_apply_edit(&app.state.topology,
++					pp.Command{1, cmd}, &app.cat); err == .None {
++					// edit fast-path (ODN-2): applied THIS frame, logged at next tick
++					append(&app.state.action_log, pp.Command{
++						apply_tick = app.tick + 1,
++						kind = cmd,
++					})
++				}
++			}
++		}
+ 	}
+ }
+ 
++// mouse_tile — the tile under the cursor (world px → tile coords).
++mouse_tile :: proc(app: ^App) -> [2]i32 {
++	mx, my := rl.GetMouseX(), rl.GetMouseY()
++	wx, wy := rnd.from_screen(&app.view, f32(mx), f32(my))
++	tile := f32(app.cat.balance.tile_px)
++	return {i32(wx / tile), i32(wy / tile)}
++}
++
+ // snap_node — nearest live node to a world-px point within the snap radius
+ // (INCLUSIVE, E4). Integer-Euclidean² metric (the pinned distance). Ties break
+ // to the lower id.
+@@ -284,10 +361,19 @@ draw_hud :: proc(app: ^App) {
+ 	}
+ 
+ 	// Run HUD: instructions + the score readout (progress toward the goal)
+-	draw_text(app, "draw source->router->sink; deliver a packet to win", 12, 36, 16, p.ink_soft)
++	if app.placing >= 0 {
++		draw_text(app, "placement: click the map to drop the router (ESC / right-click / chip to cancel)", 12, 36, 16, p.ink)
++	} else {
++		draw_text(app, "draw source->router->sink; deliver a packet to win", 12, 36, 16, p.ink_soft)
++	}
+ 	score := fmt.tprintf("delivered %d / %d", app.state.score, app.state.goal)
+ 	draw_text(app, score, 12, 56, 16, p.ink_soft)
+ 
++	// the hardware tray (3.5): link chips select the draw tier; router chips
++	// arm placement. Chip rects come from the render package (single source
++	// with the app's hit-testing).
++	draw_tray(app)
++
+ 	// the cost readout on the drag ghost
+ 	if app.drag.active && app.drag_to != 0 {
+ 		cur := rnd.to_screen(&app.view, app.drag.wx, app.drag.wy)
+@@ -307,8 +393,11 @@ reject_label :: proc(e: pp.Edit_Error) -> string {
+ 	case .Span_Exceeds_Tier: return "too far for the standard tier"
+ 	case .Missing_Node: return "no node there"
+ 	case .Unknown_Tier: return "unknown tier"
++	case .Router_Ports_Full: return "router ports full — demolish a pipe or upgrade"
++	case .Invalid_Placement: return "can't place there — too close to a node or off-map"
++	case .Not_A_Junction: return "only routers are placeable from the tray"
+ 	}
+-	return "can't draw there"
++	return "can't do that"
+ }
+ 
+ draw_text :: proc(app: ^App, txt: string, x, y: i32, size: i32, col: rl.Color) {
+@@ -320,6 +409,43 @@ draw_text :: proc(app: ^App, txt: string, x, y: i32, size: i32, col: rl.Color) {
+ 	rl.DrawText(cstring(raw_data(cbuf)), x, y, size, col)
+ }
+ 
++// draw_tray — the 3.5 hardware tray: link chips (tier select) + router chips
++// (placement arm). No inventory counts in v2 (the economy is a later story) —
++// chips are mode selectors. The rect math is the render package's (single
++// source with the hit-testing in handle_input).
++draw_tray :: proc(app: ^App) {
++	p := app.palette
++	rts: [8]u16
++	nr := rnd.tray_router_types(&app.view, rts[:])
++	i := 0
++	for tier, ti in app.cat.pipe_tiers {
++		r := rnd.tray_chip_rect(&app.view, i)
++		bg := rl.Color{238, 230, 210, 255}
++		if i32(ti) == i32(app.tier) { bg = rl.Color{210, 226, 196, 255} }
++		rl.DrawRectangleRec(r, bg)
++		rl.DrawRectangleLinesEx(r, 1, p.ink_soft)
++		// a little link glyph in the tier color
++		midy := r.y + r.height/2
++		rl.DrawLineEx({r.x + 8, midy}, {r.x + 22, midy}, 3, rnd.tier_pipe_color(&app.view, u16(ti)))
++		draw_text(app, tier.id, i32(r.x) + 26, i32(r.y) + 7, 11, p.ink_soft)
++		i += 1
++	}
++	for k in 0 ..< nr {
++		r := rnd.tray_chip_rect(&app.view, i)
++		tidx := rts[k]
++		nt := app.cat.node_types[tidx]
++		bg := rl.Color{238, 230, 210, 255}
++		if i32(tidx) == app.placing { bg = rl.Color{210, 226, 196, 255} }
++		rl.DrawRectangleRec(r, bg)
++		rl.DrawRectangleLinesEx(r, 1, p.ink_soft)
++		rl.DrawCircle(i32(r.x + 15), i32(r.y + r.height/2), 6, p.router_body)
++		short := nt.id
++		if short == "router_basic" { short = "basic" } else if short == "router_mid" { short = "mid" } else if short == "router_high" { short = "high" }
++		draw_text(app, short, i32(r.x) + 26, i32(r.y) + 7, 11, p.ink_soft)
++		i += 1
++	}
++}
++
+ // --- catalog IO + the 1.2 fixture (shared shape with the harness) -----------
+ 
+ load_catalogs :: proc(cat: ^pp.Catalogs) -> string {
+diff --git a/app/render/tray.odin b/app/render/tray.odin
+new file mode 100644
+index 0000000..162f2ba
+--- /dev/null
++++ b/app/render/tray.odin
+@@ -0,0 +1,45 @@
++package render
++
++// tray.odin — the hardware tray (Story 3.5, ported from the prototype's
++// hud.odin). Chips: one per pipe tier (link chips — select the draw tier),
++// then one per junction node type (router chips — arm placement mode).
++// Bottom-center; the SAME rect math serves hit-testing in the app and the
++// draw here (single source, like the prototype). No inventory counts in v2
++// (the economy is a later story) — chips are mode selectors only.
++
++import rl "vendor:raylib"
++//
++// TRAY_CHIP_W/H — the chip box; TRAY_GAP — spacing. Mirrors the prototype's
++// constants so the port is faithful.
++
++TRAY_CHIP_W :: 96
++TRAY_CHIP_H :: 26
++TRAY_GAP    :: 8
++
++// tray_router_types — the junction node-type indices in catalog order (the
++// placeable hardware roster). Terminals are NEVER player-placed (story 5.1
++// canon) — junction kinds only.
++tray_router_types :: proc(v: ^View, out: []u16) -> int {
++	n := 0
++	for nt, i in v.catalogs.node_types {
++		if nt.kind == .Junction && n < len(out) {
++			out[n] = u16(i)
++			n += 1
++		}
++	}
++	return n
++}
++
++// tray_chip_count — link chips + router chips.
++tray_chip_count :: proc(v: ^View) -> int {
++	rts: [8]u16
++	return len(v.catalogs.pipe_tiers) + tray_router_types(v, rts[:])
++}
++
++// tray_chip_rect — the rect of chip i (link chips first, then router chips).
++tray_chip_rect :: proc(v: ^View, i: int) -> rl.Rectangle {
++	n := tray_chip_count(v)
++	total_w := f32(n*TRAY_CHIP_W + (n-1)*TRAY_GAP)
++	x0 := (f32(v.win_w) - total_w) / 2
++	return {x0 + f32(i) * (TRAY_CHIP_W + TRAY_GAP), f32(v.win_h) - TRAY_CHIP_H - 10, TRAY_CHIP_W, TRAY_CHIP_H}
++}
+diff --git a/app/render/view.odin b/app/render/view.odin
+index a081ba7..656392c 100644
+--- a/app/render/view.odin
++++ b/app/render/view.odin
+@@ -29,13 +29,17 @@ View :: struct {
+ 
+ // Drag_State — the live drag preview state, owned by the app. The view only
+ // reads it (ODN-1). `valid` drives the ghost color; `cost` is drawn near the
+-// cursor (length × tier — the draw verb's cost, M1).
++// cursor (length × tier — the draw verb's cost, M1). `placing` is the
++// node-type index armed for router placement (3.5), or -1; the placement
++// ghost draws ONLY when active && placing >= 0 (the harness passes a zero
++// Drag_State, so goldens never see a ghost).
+ Drag_State :: struct {
+ 	active:    bool,
+ 	from_node: u32, // the node id the drag started on
+ 	wx, wy:    f32, // current cursor in world px
+ 	valid:     pp.Edit_Error,
+ 	cost:      i32,
++	placing:   i32, // 3.5: node-type index in placement mode, else -1
+ }
+ 
+ // view_compute — camera-fit the world (map_w×map_h tiles) into the window like
+@@ -77,9 +81,12 @@ draw_world :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp
+ 	draw_bundles(v, topo, bundles)
+ 	draw_nodes(v, topo)
+ 	draw_packets(v, topo, flow)
+-	if drag.active {
++	if drag.active && drag.placing < 0 {
+ 		draw_ghost(v, topo, drag)
+ 	}
++	if drag.active && drag.placing >= 0 {
++		draw_place_ghost(v, drag)
++	}
+ }
+ 
+ // map_draw — the static 1.2 map: cream canvas + a faint snap lattice. No
+@@ -328,6 +335,20 @@ draw_ghost :: proc(v: ^View, topo: ^pp.Topology, drag: Drag_State) {
+ 	rl.DrawCircleV(b, 4*v.scale, col)
+ }
+ 
++// draw_place_ghost — the router-placement preview (3.5, ported from the
++// prototype): a puck at the cursor, green when the spot would validate, red
++// when it would reject.
++draw_place_ghost :: proc(v: ^View, drag: Drag_State) {
++	p := v.palette
++	b := to_screen(v, drag.wx, drag.wy)
++	col := p.ghost_ok
++	if drag.valid != .None {
++		col = p.ghost_bad
++	}
++	rl.DrawCircleV(b, 13 * v.scale, rl.Color{col.r, col.g, col.b, 110})
++	rl.DrawCircleLines(i32(b.x), i32(b.y), 15 * v.scale, col)
++}
++
+ tier_pipe_color :: proc(v: ^View, tier: u16) -> rl.Color {
+ 	switch v.catalogs.pipe_tiers[tier].id {
+ 	case "narrow": return v.palette.pipe_copper
+diff --git a/core/placement_test.odin b/core/placement_test.odin
+new file mode 100644
+index 0000000..58d9731
+--- /dev/null
++++ b/core/placement_test.odin
+@@ -0,0 +1,259 @@
++package core
++
++// placement_test.odin — Story 3.5: player node placement (Cmd_Place_Router),
++// the edge-case contracts as durable tests. Pins:
++//   (a) validate_place: junction-kind-only (terminals never player-placed —
++//       5.1 canon), map bounds + min-separation (Invalid_Placement),
++//       unknown type;
++//   (b) apply_place: spawns a live junction, monotonic id (E11), gen bump
++//       (rule 1 — the routing-table rebuild trigger);
++//   (c) port limits (canon #14): a junction at port_capacity rejects further
++//       draws (.Router_Ports_Full); terminals are never port-limited; a
++//       demolished pipe frees its port;
++//   (d) replay-equality: a placement + draw in the action log replays
++//       byte-identically (E10);
++//   (e) the binary log round-trip carries Cmd_Place_Router, and a version-2
++//       log rejects cleanly (LOG_VERSION 3, the 1.2→2 precedent).
++
++import "core:testing"
++
++@(test)
++test_place_rejects_terminal_type :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, _, _ := topo_setup(t, cat)
++	defer run_destroy(&s)
++	res_type, _ := node_type_index(cat, "residential")
++	cmd := Command{apply_tick = 1, kind = Cmd_Place_Router{type_idx = res_type, pos = {24, 6}}}
++	_, err := topology_apply_edit(&s.topology, cmd, cat)
++	testing.expect(t, err == .Not_A_Junction, "a terminal type must not be placeable hardware (5.1 canon)")
++	testing.expectf(t, node_count(&s.topology) == 3, "a rejected placement must mutate nothing, got %d nodes", node_count(&s.topology))
++}
++
++@(test)
++test_place_rejects_unknown_type :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, _, _, _ := topo_setup(t, cat)
++	defer run_destroy(&s)
++	cmd := Command{apply_tick = 1, kind = Cmd_Place_Router{type_idx = 99, pos = {24, 6}}}
++	_, err := topology_apply_edit(&s.topology, cmd, cat)
++	testing.expect(t, err == .Unknown_Node_Type, "out-of-range type_idx must reject with .Unknown_Node_Type")
++	testing.expectf(t, node_count(&s.topology) == 3, "a rejected placement must mutate nothing, got %d nodes", node_count(&s.topology))
++}
++
++@(test)
++test_place_rejects_invalid_spots :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, _, _, _ := topo_setup(t, cat)
++	defer run_destroy(&s)
++	basic, _ := node_type_index(cat, "router_basic")
++	// too close to an existing node: fixture router at {20,15} — {22,15} is 2
++	// tiles away (< PLACEMENT_MIN_SEP_TILES = 7)
++	close_cmd := Command{apply_tick = 1, kind = Cmd_Place_Router{type_idx = basic, pos = {22, 15}}}
++	_, err := topology_apply_edit(&s.topology, close_cmd, cat)
++	testing.expect(t, err == .Invalid_Placement, "too-close spot must reject with .Invalid_Placement")
++	// off-map: outside the 40×30 grid
++	offmap := Command{apply_tick = 1, kind = Cmd_Place_Router{type_idx = basic, pos = {-2, 6}}}
++	_, err2 := topology_apply_edit(&s.topology, offmap, cat)
++	testing.expect(t, err2 == .Invalid_Placement, "off-map spot must reject with .Invalid_Placement")
++	offmap2 := Command{apply_tick = 1, kind = Cmd_Place_Router{type_idx = basic, pos = {40, 6}}}
++	_, err3 := topology_apply_edit(&s.topology, offmap2, cat)
++	testing.expect(t, err3 == .Invalid_Placement, "off-map (x = w_tiles) must reject with .Invalid_Placement")
++	testing.expectf(t, node_count(&s.topology) == 3, "rejected placements must mutate nothing, got %d nodes", node_count(&s.topology))
++}
++
++@(test)
++test_place_legal_applies :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, _, _, _ := topo_setup(t, cat)
++	defer run_destroy(&s)
++	basic, _ := node_type_index(cat, "router_basic")
++	gen_before := s.topology.gen
++	nodes_before := node_count(&s.topology)
++	// {24,6} clears the fixture (nearest node {20,15}: dx=4, dy=9 → 9.8 ≥ 7)
++	// and sits inside the 40×30 grid.
++	cmd := Command{apply_tick = 1, kind = Cmd_Place_Router{type_idx = basic, pos = {24, 6}}}
++	res, err := topology_apply_edit(&s.topology, cmd, cat)
++	testing.expectf(t, err == .None, "legal placement must apply, got %v", err)
++	testing.expect(t, res.ok, "legal placement returns ok")
++	testing.expectf(t, node_count(&s.topology) == nodes_before + 1, "placement must spawn a node, got %d nodes", node_count(&s.topology))
++	// the returned id is the new node's (monotonic, E11) + it is a live junction
++	slot, ok := node_slot(&s.topology, res.id)
++	testing.expect(t, ok, "placed node id must resolve")
++	testing.expect(t, s.topology.node_alive[slot], "placed node must be live")
++	testing.expect(t, s.topology.node_kind[slot] == .Junction, "placed node must be a junction")
++	testing.expectf(t, s.topology.node_pos[slot] == [2]i32{24, 6}, "placed node must sit at the requested tile")
++	testing.expectf(t, s.topology.node_type[slot] == basic, "placed node must carry the catalog type")
++	// gen bumps on placement (rule 1: a new node can open new paths)
++	testing.expectf(t, s.topology.gen == gen_before + 1, "placement must bump gen, got %d → %d", gen_before, s.topology.gen)
++}
++
++@(test)
++test_place_min_separation_radius :: proc(t: ^testing.T) {
++	// the separation radius is the pinned 7-tile rule (ported from the
++	// prototype's growth_min_dist_tiles): a spot inside the radius rejects;
++	// a spot exactly AT the radius boundary is ACCEPTED (dist² 49 = 7²).
++	// Fixture: res {8,15}, router {20,15}, host {32,15}.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, _, _, _ := topo_setup(t, cat)
++	defer run_destroy(&s)
++	basic, _ := node_type_index(cat, "router_basic")
++	// just inside: {20,21} vs fixture router {20,15} = 6 tiles (36 < 49)
++	_, err := topology_apply_edit(&s.topology,
++		Command{1, Cmd_Place_Router{type_idx = basic, pos = {20, 21}}}, cat)
++	testing.expect(t, err == .Invalid_Placement, "inside the radius must reject")
++	// exactly at the radius: {20,22} vs the router = 7 tiles (49 = 7²) AND
++	// clear of res {8,15} (d² 193) + host {32,15} (d² 193) — accepted
++	_, err2 := topology_apply_edit(&s.topology,
++		Command{1, Cmd_Place_Router{type_idx = basic, pos = {20, 22}}}, cat)
++	testing.expectf(t, err2 == .None, "at the radius boundary must accept, got %v", err2)
++}
++
++@(test)
++test_port_limits_on_draw :: proc(t: ^testing.T) {
++	// canon #14: a basic router has 4 ports — one per connected pipe. The 5th
++	// draw onto a full junction rejects .Router_Ports_Full; terminals (cap 0)
++	// are never port-limited.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	rt_type, _ := node_type_index(cat, "router_basic")
++	res_type, _ := node_type_index(cat, "residential")
++	rid := topology_spawn_node(&s.topology, rt_type, {20, 20}, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	drew := 0
++	for i in 0 ..< 5 {
++		hid := topology_spawn_node(&s.topology, res_type, {16 + i32(i) * 2, 25}, cat)
++		cmd := Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = rid, b = hid, tier = std}}
++		_, err := topology_apply_edit(&s.topology, cmd, cat)
++		if i < 4 {
++			testing.expectf(t, err == .None, "pipe %d must validate (port %d free), got %v", i, i, err)
++			if err == .None { drew += 1 }
++		} else {
++			testing.expectf(t, err == .Router_Ports_Full, "5th pipe must hit the port cap, got %v", err)
++		}
++	}
++	testing.expectf(t, drew == 4, "drew %d, want 4", drew)
++	// the junction's port count is LIVE pipes only — demolish one, the port frees
++	_, derr := topology_apply_edit(&s.topology,
++		Command{1, Cmd_Demolish_Pipe{pipe = s.topology.pipe_id[0]}}, cat)
++	testing.expectf(t, derr == .None, "demolish must apply, got %v", derr)
++	_, e2 := topology_apply_edit(&s.topology,
++		Command{1, Cmd_Draw_Pipe{a = rid, b = topology_spawn_node(&s.topology, res_type, {26, 25}, cat), tier = std}}, cat)
++	testing.expectf(t, e2 == .None, "a freed port must accept a new draw, got %v", e2)
++}
++
++@(test)
++test_terminal_endpoint_never_port_limited :: proc(t: ^testing.T) {
++	// terminals have port_capacity 0 = unlimited — a house can accept any
++	// number of pipes (parallel pipes bundle, story 2.1).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	rt_type, _ := node_type_index(cat, "router_basic")
++	res_type, _ := node_type_index(cat, "residential")
++	hid := topology_spawn_node(&s.topology, res_type, {20, 20}, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	for i in 0 ..< 8 {
++		rid := topology_spawn_node(&s.topology, rt_type, {10 + i32(i) * 2, 28}, cat)
++		_, err := topology_apply_edit(&s.topology,
++			Command{1, Cmd_Draw_Pipe{a = rid, b = hid, tier = std}}, cat)
++		testing.expectf(t, err == .None, "terminal endpoint must never be port-limited (pipe %d), got %v", i, err)
++	}
++}
++
++@(test)
++test_placement_replays_byte_identical :: proc(t: ^testing.T) {
++	// the E10 keystone for placement: a Cmd_Place_Router in the action log must
++	// re-sim byte-identically from a fresh run + the same log (like draw).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	live: Run_State
++	defer run_destroy(&live)
++	run_init(&live, 42, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&live, cat)
++	basic, _ := node_type_index(cat, "router_basic")
++	std, _ := pipe_tier_index(cat, "standard")
++	append(&live.action_log, Command{apply_tick = 1, kind = Cmd_Place_Router{type_idx = basic, pos = {24, 6}}})
++	append(&live.action_log, Command{apply_tick = 50, kind = Cmd_Draw_Pipe{a = rt, b = 3, tier = std}})
++	append(&live.action_log, Command{apply_tick = 60, kind = Cmd_Draw_Pipe{a = 3, b = host, tier = std}})
++
++	live_hashes := record_run(&live, 300, cat)
++	defer delete(live_hashes)
++
++	testing.expectf(t, node_count(&live.topology) == 4, "placement must spawn a 4th node, got %d", node_count(&live.topology))
++	testing.expectf(t, pipe_count(&live.topology) == 2, "placed router must accept pipes, got %d pipes", pipe_count(&live.topology))
++	testing.expect(t, !live.replay_error, "live run must not latch replay_error")
++	_ = res
++
++	replayed: Run_State
++	defer run_destroy(&replayed)
++	run_init(&replayed, 42, cat.hash, TEST_LOGIC_HZ)
++	test_seed_fixture(&replayed, cat)
++	delete(replayed.action_log)
++	replayed.action_log = clone_log(live.action_log)
++	replay_hashes := record_run(&replayed, 300, cat)
++	defer delete(replay_hashes)
++
++	testing.expect(t, !replayed.replay_error, "replay must not latch replay_error (ODN-11 critical)")
++	testing.expectf(t, node_count(&replayed.topology) == 4, "replay must reproduce the placed node")
++	testing.expectf(t, len(live_hashes) == len(replay_hashes), "tick count mismatch: live %d vs replay %d", len(live_hashes), len(replay_hashes))
++	diverged := false
++	for i in 0..<len(live_hashes) {
++		if live_hashes[i] != replay_hashes[i] { diverged = true }
++	}
++	testing.expectf(t, !diverged, "REPLAY DIVERGENCE: placement + draw hashes differ")
++}
++
++@(test)
++test_place_command_binary_roundtrip :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	state: Run_State
++	defer run_destroy(&state)
++	run_init(&state, 42, cat.hash, TEST_LOGIC_HZ)
++	test_seed_fixture(&state, cat)
++	basic, _ := node_type_index(cat, "router_basic")
++	append(&state.action_log, Command{apply_tick = 1, kind = Cmd_Place_Router{type_idx = basic, pos = {24, 6}}})
++	append(&state.action_log, Command{apply_tick = 2, kind = Cmd_Place_Router{type_idx = basic, pos = {9, 27}}})
++
++	bytes := log_write(&state, context.temp_allocator)
++	header, cmds, ok := log_read(bytes, context.temp_allocator)
++	testing.expect(t, ok, "round-trip must parse")
++	testing.expect(t, header.seed == 42, "header seed mismatch")
++	testing.expectf(t, len(cmds) == 2, "command count: got %d, want 2", len(cmds))
++	for i in 0..<len(cmds) {
++		ca := cmds[i].kind.(Cmd_Place_Router)
++		cb := state.action_log[i].kind.(Cmd_Place_Router)
++		testing.expectf(t, ca.type_idx == cb.type_idx && ca.pos == cb.pos,
++			"cmd %d payload mismatch: {%d,%v} vs {%d,%v}", i, ca.type_idx, ca.pos, cb.type_idx, cb.pos)
++	}
++
++	// a version-2 log must reject cleanly (LOG_VERSION 3 — the 1.2→2 precedent:
++	// old logs are a defined rejection, never a silent partial parse)
++	v2 := make([]u8, len(bytes), context.temp_allocator)
++	copy(v2, bytes)
++	v2[4] = 2 // version field (second u32, little-endian)
++	v2[5], v2[6], v2[7] = 0, 0, 0
++	_, _, old := log_read(v2, context.temp_allocator)
++	testing.expect(t, !old, "a version-2 log must reject cleanly (LOG_VERSION 3)")
++}
+diff --git a/core/serialize.odin b/core/serialize.odin
+index 3d03aad..f7f5b96 100644
+--- a/core/serialize.odin
++++ b/core/serialize.odin
+@@ -15,6 +15,10 @@ package core
+ // Story 1.2 bumps LOG_VERSION to 2: the command record is now Cmd_Draw_Pipe
+ // {a, b, tier} (was the 1.1 placeholder Cmd_Set_Arg{arg}). A v1 log is rejected
+ // by the v2 reader → every 1.1 golden log is re-blessed with this story.
++// Story 3.5 bumps LOG_VERSION to 3: Cmd_Place_Router joins the set (the
++// player-designed network, restored from the prototype). A v2 log is rejected
++// by the v3 reader → the golden logs re-bless with this story (version field
++// only — the sim is additive, so T1 hashes + T2 pixels stay byte-identical).
+ 
+ Writer :: struct {
+ 	buf: [dynamic]u8,
+@@ -48,6 +52,7 @@ w_bool :: proc(w: ^Writer, v: bool) { w_u8(w, 1 if v else 0) }
+ CMD_TAG_DRAW_PIPE :: u8(1)
+ CMD_TAG_DEMOLISH_PIPE :: u8(2) // 2.3 — tombstone a pipe by id (E1)
+ CMD_TAG_DEMOLISH_NODE :: u8(3) // 2.3 — tombstone a junction (E27 atomic batch)
++CMD_TAG_PLACE_ROUTER :: u8(4)  // 3.5 — player-places a junction (E10, 5.1 canon)
+ 
+ // --- the T1 state hash --------------------------------------------------------
+ 
+@@ -163,6 +168,11 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event,
+ 		case Cmd_Demolish_Node:
+ 			w_u8(&w, CMD_TAG_DEMOLISH_NODE)
+ 			w_u32(&w, c.node)
++		case Cmd_Place_Router:
++			w_u8(&w, CMD_TAG_PLACE_ROUTER)
++			w_u16(&w, c.type_idx)
++			w_i32(&w, c.pos[0])
++			w_i32(&w, c.pos[1])
+ 		}
+ 	}
+ 
+@@ -180,7 +190,7 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event,
+ // --- the action log (ODN-11 binary) -------------------------------------------
+ 
+ LOG_MAGIC :: u32(0x314C5050) // "PPL1" little-endian
+-LOG_VERSION :: u32(2)        // 1.2: Cmd_Draw_Pipe payload
++LOG_VERSION :: u32(3)        // 3.5: Cmd_Place_Router payload (was 2: draw/demolish)
+ 
+ // Write the run's action log: versioned header + length-prefixed command
+ // records. catalog_hash + logic_hz ride in the header so the replay gate can
+@@ -208,6 +218,11 @@ log_write :: proc(state: ^Run_State, scratch := context.temp_allocator) -> []u8
+ 		case Cmd_Demolish_Node:
+ 			w_u8(&w, CMD_TAG_DEMOLISH_NODE)
+ 			w_u32(&w, c.node)
++		case Cmd_Place_Router:
++			w_u8(&w, CMD_TAG_PLACE_ROUTER)
++			w_u16(&w, c.type_idx)
++			w_i32(&w, c.pos[0])
++			w_i32(&w, c.pos[1])
+ 		}
+ 	}
+ 	return w.buf[:]
+@@ -281,6 +296,11 @@ log_read :: proc(data: []u8, allocator := context.allocator) -> (Log_Header, []C
+ 			cmd.kind = Cmd_Demolish_Pipe{pipe = r_u32(&r)}
+ 		case CMD_TAG_DEMOLISH_NODE:
+ 			cmd.kind = Cmd_Demolish_Node{node = r_u32(&r)}
++		case CMD_TAG_PLACE_ROUTER:
++			cmd.kind = Cmd_Place_Router{
++				type_idx = r_u16(&r),
++				pos = {r_i32(&r), r_i32(&r)},
++			}
+ 		case:
+ 			return {}, nil, false
+ 		}
+diff --git a/core/topology.odin b/core/topology.odin
+index 9387363..e3340ff 100644
+--- a/core/topology.odin
++++ b/core/topology.odin
+@@ -155,6 +155,12 @@ validate_draw :: proc(t: ^Topology, c: Cmd_Draw_Pipe, cat: ^Catalogs) -> Edit_Er
+ 	if !oka || !okb { return .Missing_Node }
+ 	if is_terminal(t, sa) && is_terminal(t, sb) { return .Terminal_To_Terminal } // E26
+ 	if u32(c.tier) >= u32(len(cat.pipe_tiers)) { return .Unknown_Tier }
++	// 3.5: junction port limits (canon #14, GDD: basic 4 / mid 8 / high 16) —
++	// read from the catalog port_capacity (0 = unlimited — terminals). One port
++	// per connected pipe; a junction at capacity rejects further draws.
++	if !ports_available(t, sa, cat) || !ports_available(t, sb, cat) {
++		return .Router_Ports_Full
++	}
+ 	span := span_between(t.node_pos[sa], t.node_pos[sb])
+ 	if span > cat.pipe_tiers[c.tier].max_span { return .Span_Exceeds_Tier }
+ 	return .None
+@@ -253,11 +259,80 @@ apply_demolish_node :: proc(t: ^Topology, c: Cmd_Demolish_Node) {
+ 	t.gen += 1
+ }
+ 
++// --- player node placement (Story 3.5 — restored from the prototype) ---------
++// Routers are PLAYER-placed from the tray, never director-spawned (story 5.1
++// canon, user ruling 2026-08-12). Placement is a logged command like draw:
++// validate → apply (the single authority), recorded in the action log, replay
++// re-applies it at its apply_tick — so live and replay converge (E10).
++//
++// PLACEMENT_MIN_SEP_TILES — the min-separation radius for a new node (E31's
++// spacing rule, shared so the map never gets two nodes on top of each other
++// regardless of who placed them). PORTED from the prototype's
++// balance.growth_min_dist_tiles = 7 (the tuned prototype value). It CANNOT
++// ride balance.json here: cat.hash folds the balance bytes, and any field
++// addition would shift the hash → every blessed golden rejects at the replay
++// gate (golden-stability rule, briefing). When the balance catalog next
++// legitimately re-blesses, this const should move there (ODN-5).
++PLACEMENT_MIN_SEP_TILES :: i32(7)
++
++// placement_valid — within the map grid + clear of every live node by the
++// min-separation radius. Ported from the prototype's placement_valid (its
++// placement-area rule is the full map grid).
++placement_valid :: proc(t: ^Topology, pos: [2]i32, bal: ^Balance) -> bool {
++	if pos[0] < 0 || pos[0] >= bal.map_w_tiles { return false }
++	if pos[1] < 0 || pos[1] >= bal.map_h_tiles { return false }
++	sep2 := PLACEMENT_MIN_SEP_TILES * PLACEMENT_MIN_SEP_TILES
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		d := t.node_pos[i] - pos
++		if d[0]*d[0] + d[1]*d[1] < sep2 { return false }
++	}
++	return true
++}
++
++// validate_place — the type must be a junction kind in the catalog (terminals
++// are never player-placed — story 5.1), and the spot must clear the map bounds
++// + the min-separation radius.
++validate_place :: proc(t: ^Topology, c: Cmd_Place_Router, cat: ^Catalogs) -> Edit_Error {
++	if u32(c.type_idx) >= u32(len(cat.node_types)) { return .Unknown_Node_Type }
++	if cat.node_types[c.type_idx].kind != .Junction { return .Not_A_Junction }
++	if !placement_valid(t, c.pos, &cat.balance) { return .Invalid_Placement }
++	return .None
++}
++
++// apply_place — assumes validate_place returned .None. Spawns the junction via
++// the same topology_spawn_node the fixture uses (monotonic id, E11) and bumps
++// gen (rule 1 — a new node can open new paths). The new node id is returned.
++apply_place :: proc(t: ^Topology, c: Cmd_Place_Router, cat: ^Catalogs) -> u32 {
++	return topology_spawn_node(t, c.type_idx, c.pos, cat)
++}
++
++// ports_available — canon #14: a junction has port_capacity ports (one per
++// connected pipe). cap <= 0 = unlimited (terminals). Live incident pipes only
++// (a demolished pipe frees its port).
++ports_available :: proc(t: ^Topology, slot: u32, cat: ^Catalogs) -> bool {
++	cap := cat.node_types[t.node_type[slot]].port_capacity
++	if cap <= 0 { return true }
++	return incident_pipe_count(t, t.node_id[slot]) < int(cap)
++}
++
++// incident_pipe_count — live pipes touching a node id (linear; core is map-free
++// — ODN-10). One port per pipe, parallel pipes each count.
++incident_pipe_count :: proc(t: ^Topology, node_id: u32) -> int {
++	n := 0
++	for i in 0 ..< len(t.pipe_alive) {
++		if !t.pipe_alive[i] { continue }
++		if t.pipe_a[i] == node_id || t.pipe_b[i] == node_id { n += 1 }
++	}
++	return n
++}
++
+ // topology_apply_edit — the single validate-then-apply entry. Returns the new
+-// pipe id on a draw / the demolished entity id on a demolish, or the typed
+-// rejection. The app fast-path calls this on mouse-release; the harness/step
+-// path calls this from the replayed log. Demolish (2.3) joins draw behind the
+-// same switch — one legality path, so live edits and replay can never diverge.
++// pipe id on a draw / the demolished entity id on a demolish / the new node id
++// on a placement, or the typed rejection. The app fast-path calls this on
++// mouse-release; the harness/step path calls this from the replayed log.
++// Demolish (2.3) + placement (3.5) join draw behind the same switch — one
++// legality path, so live edits and replay can never diverge.
+ topology_apply_edit :: proc(t: ^Topology, cmd: Command, cat: ^Catalogs) -> (Edit_Result, Edit_Error) {
+ 	#partial switch c in cmd.kind {
+ 	case Cmd_Draw_Pipe:
+@@ -272,6 +347,10 @@ topology_apply_edit :: proc(t: ^Topology, cmd: Command, cat: ^Catalogs) -> (Edit
+ 		if e := validate_demolish_node(t, c); e != .None { return {}, e }
+ 		apply_demolish_node(t, c)
+ 		return {ok = true, id = c.node}, .None
++	case Cmd_Place_Router:
++		if e := validate_place(t, c, cat); e != .None { return {}, e }
++		id := apply_place(t, c, cat)
++		return {ok = true, id = id}, .None
+ 	}
+ 	return {}, .Unknown_Command
+ }
+diff --git a/core/types.odin b/core/types.odin
+index 0525d62..3cfe3f5 100644
+--- a/core/types.odin
++++ b/core/types.odin
+@@ -24,11 +24,15 @@ Edit_Error :: enum u8 {
+ 	Span_Exceeds_Tier,    // span > tier.max_span (M1 distance rule)
+ 	Missing_Pipe,        // 2.3 — demolish target pipe id is not live (E1)
+ 	Terminal_Demolish,   // E2 — a terminal node cannot be demolished
++	Unknown_Node_Type,  // 3.5 — placement type_idx out of catalog range
++	Not_A_Junction,     // 3.5 — a terminal type is not placeable hardware (5.1 canon)
++	Invalid_Placement,  // 3.5 — off-map or inside the min-separation radius
++	Router_Ports_Full,  // 3.5 — junction endpoint at port capacity (canon #14)
+ }
+ 
+ Edit_Result :: struct {
+ 	ok: bool,
+-	id: u32, // the new pipe id on a successful draw
++	id: u32, // the new pipe id on a draw, the new node id on a placement
+ }
+ 
+ // Command — the post-validation, post-snap action-log entry (ODN-11). Tagged
+@@ -40,6 +44,7 @@ Command_Kind :: union {
+ 	Cmd_Draw_Pipe,
+ 	Cmd_Demolish_Pipe,
+ 	Cmd_Demolish_Node,
++	Cmd_Place_Router,
+ }
+ 
+ // Cmd_Draw_Pipe — draw a pipe between two resolved node ids at a tier. The
+@@ -75,6 +80,20 @@ Cmd_Demolish_Node :: struct {
+ 	node: u32, // node id (resolved, live + non-terminal at record time)
+ }
+ 
++// Cmd_Place_Router — player placement of a junction (Story 3.5, restored from
++// the prototype; story 5.1 canon: routers are NEVER director-spawned — the
++// player places them from the tray). type_idx must resolve to a junction kind
++// (terminals are never player-placed — .Not_A_Junction); pos is tile coords,
++// validated within the map grid + clear of every live node by the min-
++// separation radius (.Invalid_Placement). A logged command like draw: applied
++// immediately via the edit fast-path + recorded in the action log, replay
++// re-applies it at its apply_tick (E10). The new node id is returned in
++// Edit_Result.id. Port limits (canon #14) bind what CONNECTS after placement.
++Cmd_Place_Router :: struct {
++	type_idx: u16,   // node_types catalog index (must be a junction kind)
++	pos:      [2]i32, // tile coords
++}
++
+ Command :: struct {
+ 	apply_tick: u64, // replay applies this before stepping apply_tick (ODN-2)
+ 	kind:       Command_Kind,
+diff --git a/demos/place.dem b/demos/place.dem
+new file mode 100644
+index 0000000..1f51714
+--- /dev/null
++++ b/demos/place.dem
+@@ -0,0 +1,20 @@
++# place.dem — Story 3.5: player node placement (the router toolbox). The 1.2
++# fixture is residential(0) at {8,15} ← router(1) at {20,15} → content_host(2)
++# at {32,15}. The player places a router_basic at {20,5} (clear of every
++# fixture node by ≥ the 7-tile separation radius: 10 from the fixture router,
++# ~15.6 from both terminals) — a LOGGED Cmd_Place_Router (apply tick 11, the
++# edit fast-path convention). Then a drag-draw connects the fixture router to
++# the PLACED router (id 3, span 10 ≤ standard max 14) — the placed junction is
++# wireable by the existing drag-draw, exactly the story's launchable increment.
++#
++# T2 captures: 1250ms (t25) pins the settled placement + the new pipe; 3000ms
++# pins the settled topology. T1 hashes + the replay gate pin placement +
++# draw byte-identically (the placement is a logged command, re-applied from
++# the blessed log on every replay — E10).
++seed 42
++run 4000ms
++at 500ms place router_basic 20 5
++at 1500ms draw 1 3 standard
++capture at 2500ms
++capture at 3000ms
++expect hash stable
+diff --git a/goldens/boot.log.bin b/goldens/boot.log.bin
+index a56c826..7fb48d6 100644
+Binary files a/goldens/boot.log.bin and b/goldens/boot.log.bin differ
+diff --git a/goldens/bundle.log.bin b/goldens/bundle.log.bin
+index d02e986..8f61714 100644
+Binary files a/goldens/bundle.log.bin and b/goldens/bundle.log.bin differ
+diff --git a/goldens/demolish.log.bin b/goldens/demolish.log.bin
+index 40cf921..70f88d1 100644
+Binary files a/goldens/demolish.log.bin and b/goldens/demolish.log.bin differ
+diff --git a/goldens/draw.log.bin b/goldens/draw.log.bin
+index d964d23..db4d302 100644
+Binary files a/goldens/draw.log.bin and b/goldens/draw.log.bin differ
+diff --git a/goldens/ecmp.log.bin b/goldens/ecmp.log.bin
+index 79b4655..b70a41e 100644
+Binary files a/goldens/ecmp.log.bin and b/goldens/ecmp.log.bin differ
+diff --git a/goldens/flow.log.bin b/goldens/flow.log.bin
+index d964d23..db4d302 100644
+Binary files a/goldens/flow.log.bin and b/goldens/flow.log.bin differ
+diff --git a/goldens/lose.log.bin b/goldens/lose.log.bin
+index eab3a51..083b4a8 100644
+Binary files a/goldens/lose.log.bin and b/goldens/lose.log.bin differ
+diff --git a/goldens/place.log.bin b/goldens/place.log.bin
+new file mode 100644
+index 0000000..1bdc566
+Binary files /dev/null and b/goldens/place.log.bin differ
+diff --git a/goldens/place.t1 b/goldens/place.t1
+new file mode 100644
+index 0000000..52d41fb
+--- /dev/null
++++ b/goldens/place.t1
+@@ -0,0 +1,87 @@
++# t1 manifest — per-tick FNV-1a-64 state hashes (full sim state)
++t1 1
++demo place
++seed 42
++logic_hz 20
++catalog_hash c59e720ff6ac3fb4
++ticks 80
++1 7297c0d53404dc37
++2 dcbcfe75c4ba86c8
++3 e2196965bb28a729
++4 3ffe4c33fdf4112a
++5 b145ab3ebe7c04d3
++6 5c92476e3e401724
++7 ca34578a42a3d825
++8 72c57f636d04d686
++9 d66b9f9b44c3862f
++10 d4e4b538583baea0
++11 121f991ce6704485
++12 2b63a1a05c43d914
++13 54544122875dad1b
++14 9b498d1f2a31e69a
++15 2f2700723b438619
++16 d43785bcb3cbc138
++17 0d581fa4a7dce02f
++18 7201dddd2d4497fe
++19 ac61637200280aad
++20 f921bc682898fd3c
++21 ee9c6b2d65638ee3
++22 fdcadb569405eae2
++23 d2455fcd86168f61
++24 5959dfe22682fdc0
++25 e2863627a2a10d77
++26 013d6e5be874a0c6
++27 e56b0e2501133895
++28 89b844e9b7b40e24
++29 a022ede2eab3ab6b
++30 8cc426aff961a72a
++31 78db53f0598922bd
++32 1f24e444d9313d3a
++33 999d79c14b337ad7
++34 ab9aec885fffeccc
++35 6d4e674f835a1d19
++36 507ebcfe76578ed6
++37 cdcbe235851ffbd3
++38 8cf471b3060887d8
++39 b8de417b0dd99d25
++40 e5b5c42d8bd3ec42
++41 3cac054b3557b73f
++42 3b543252ad3fb954
++43 9c9a83dca5fd0361
++44 6bcf7cdf7731165e
++45 1cb9b93059a0717b
++46 b2545021536a4720
++47 04b905f14ca35f6d
++48 099ae78dd19932aa
++49 5abc0393fe21dc47
++50 af463d5b9a6b3ebc
++51 dcef3a8b9efe4249
++52 82815930c025e346
++53 50fada242c7b4643
++54 39520410c6ec8f48
++55 41e1235fa67bbc95
++56 1c244cdb2a85f5f2
++57 2dcca987bcdd1b2f
++58 a7d4d68b5a6abb04
++59 8f26e404724b3111
++60 afe03760399ad24e
++61 ac66ad6a90e60d6b
++62 6cca0db3a5483090
++63 7d048f5c38f3d99d
++64 9eb905cf79a03c1a
++65 18f94f5902d9e237
++66 205eef9e25d9542c
++67 7568a902613bcd79
++68 4444e842302c8d36
++69 4112ea92beacd9b3
++70 c6c689e55e747738
++71 674def39a7d84a85
++72 d970c20d212f5a22
++73 b2e5592ba9bcbc1f
++74 d163a86980f0b434
++75 74703954616358c1
++76 f20cc2269f2588be
++77 6f7ea3c5b6be2f5b
++78 c852442627b49780
++79 cbd91e6d25952ecd
++80 b935befe7b8acf8a
+diff --git a/goldens/place/02500ms.png b/goldens/place/02500ms.png
+new file mode 100644
+index 0000000..198b6c0
+Binary files /dev/null and b/goldens/place/02500ms.png differ
+diff --git a/goldens/place/03000ms.png b/goldens/place/03000ms.png
+new file mode 100644
+index 0000000..198b6c0
+Binary files /dev/null and b/goldens/place/03000ms.png differ
+diff --git a/goldens/qos.log.bin b/goldens/qos.log.bin
+index 92f5654..8e6b028 100644
+Binary files a/goldens/qos.log.bin and b/goldens/qos.log.bin differ
+diff --git a/goldens/win.log.bin b/goldens/win.log.bin
+index d964d23..db4d302 100644
+Binary files a/goldens/win.log.bin and b/goldens/win.log.bin differ
+diff --git a/harness/demo.odin b/harness/demo.odin
+index 5888ee8..1e75777 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -60,6 +60,19 @@ Node_Spawn :: struct {
+ 	pos:       [2]i32,
+ }
+ 
++// Place_Intent — a 3.5 `place` directive: `at <n>ms place <type> <x> <y>`.
++// Like a draw, placement is a LOGGED command (the edit fast-path + action
++// log — E10), NOT run setup: the demo's place lines lower into
++// Cmd_Place_Router entries in the action log and replay re-applies them from
++// the blessed log (unlike spawn_node, which is re-created as run setup). The
++// type_name resolves against the catalog at lower time (fail loud, like an
++// unknown tier).
++Place_Intent :: struct {
++	at_ms:     i64,
++	type_name: string,
++	pos:       [2]i32,
++}
++
+ Demo :: struct {
+ 	name:               string,
+ 	seed:               u64,
+@@ -72,6 +85,7 @@ Demo :: struct {
+ 	draws:              [dynamic]Draw_Intent,
+ 	spawns:             [dynamic]Spawn_Intent,
+ 	demolishes:         [dynamic]Demolish_Intent,
++	places:             [dynamic]Place_Intent, // 3.5 — player placements (logged commands, like draws)
+ 	captures:           [dynamic]i64, // T2 capture times (ms)
+ 	win_goal:           u32, // 1.4: packets to deliver for a WIN (0 = win/lose disabled)
+ 	lose_cap_ms:        i64, // 1.4: tick-cap lose time (0 = no cap); lose if run reaches this with score < goal
+@@ -79,8 +93,9 @@ Demo :: struct {
+ 
+ // parse_demo — line-based; `seed <n>`, `run <n>ms`, `expect hash stable`,
+ // `at <n>ms draw <from> <to> <tier>`, `at <n>ms spawn <from> <to>`,
+-// `at <n>ms demolish pipe|node <id>`, `spawn_node <type> <x> <y>`,
+-// `fixture on|off`, `win goal <n>`, `lose cap <n>ms`, `capture at <n>ms`.
++// `at <n>ms demolish pipe|node <id>`, `at <n>ms place <type> <x> <y>`,
++// `spawn_node <type> <x> <y>`, `fixture on|off`, `win goal <n>`,
++// `lose cap <n>ms`, `capture at <n>ms`.
+ // Returns "" on success, a one-line error otherwise.
+ //
+ // STRING LIFETIME: the Node_Spawn type_name is CLONED with the default
+@@ -95,6 +110,7 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 	d.draws = make([dynamic]Draw_Intent, 0, 8, context.allocator)
+ 	d.spawns = make([dynamic]Spawn_Intent, 0, 8, context.allocator)
+ 	d.demolishes = make([dynamic]Demolish_Intent, 0, 8, context.allocator)
++	d.places = make([dynamic]Place_Intent, 0, 8, context.allocator)
+ 	d.captures = make([dynamic]i64, 0, 8, context.allocator)
+ 	for raw in strings.split(text, "\n", context.temp_allocator) {
+ 		line := strings.trim_space(raw)
+@@ -223,8 +239,26 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 				case:
+ 					return {}, fmt.tprintf("bad demolish target %q (want pipe|node): %s", fields[3], line)
+ 				}
++			case "place":
++				// at <n>ms place <type> <x> <y> — 3.5 player placement (a LOGGED
++				// command like draw: the replay re-applies it from the blessed
++				// log). The type name is CLONED (same lifetime rule as
++				// spawn_node — the temp arena recycles per tick).
++				if len(fields) < 6 {
++					return {}, fmt.tprintf("bad place at-line (want: at <n>ms place <type> <x> <y>): %s", line)
++				}
++				px, okx := strconv.parse_int(fields[4], 10)
++				py, oky := strconv.parse_int(fields[5], 10)
++				if !okx || !oky {
++					return {}, fmt.tprintf("bad place position: %s", line)
++				}
++				append(&d.places, Place_Intent{
++					at_ms = ms,
++					type_name = strings.clone(fields[3]),
++					pos = {i32(px), i32(py)},
++				})
+ 			case:
+-				return {}, fmt.tprintf("unknown at-verb %q (want draw|spawn|demolish): %s", fields[2], line)
++				return {}, fmt.tprintf("unknown at-verb %q (want draw|spawn|demolish|place): %s", fields[2], line)
+ 			}
+ 		case "capture":
+ 			// capture at <n>ms
+diff --git a/harness/run.odin b/harness/run.odin
+index 01f812c..8dbf35f 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -50,6 +50,20 @@ lower_intents :: proc(state: ^pp.Run_State, demo: ^Demo, cat: ^pp.Catalogs) -> s
+ 			})
+ 		}
+ 	}
++	for i in 0..<len(demo.places) {
++		p := &demo.places[i]
++		type_idx, ok := pp.node_type_index(cat, p.type_name)
++		if !ok {
++			return fmt.tprintf("demo %s: unknown node type %q", demo.name, p.type_name)
++		}
++		// placement is a LOGGED command like draw: same apply_tick convention
++		// (floor(at_ms*hz/1000) + 1 — the edit fast-path convergence rule).
++		apply_tick := u64(max(0, i64(p.at_ms) * i64(cat.balance.logic_hz) / 1000)) + 1
++		append(&state.action_log, pp.Command{
++			apply_tick = apply_tick,
++			kind = pp.Cmd_Place_Router{type_idx = type_idx, pos = p.pos},
++		})
++	}
+ 	return ""
+ }
+ 
+@@ -90,6 +104,9 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 		for n in demo.nodes {
+ 			delete(n.type_name) // cloned at parse (see parse_demo lifetime note)
+ 		}
++		for p in demo.places {
++			delete(p.type_name) // cloned at parse, same lifetime rule
++		}
+ 		delete(demo.nodes)
+ 		delete(demo.draws)
+ 		delete(demo.spawns)

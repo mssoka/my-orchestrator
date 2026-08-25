@@ -1,0 +1,233 @@
+{
+  "job": "packet-plumber-v2-6.2-advance-trigger",
+  "round": 1,
+  "reviewed_sha": "58dc3bc9fee9642d14ce16332f64d7703732377f",
+  "diff": {
+    "canonical": "/Users/moses/code/_bmad-output/perkins/packet-plumber-v2-6.2-advance-trigger/r1/diff.patch",
+    "note": "gh pr diff 71 exceeded GitHub's 20000-line API limit; canonical diff built locally from the round worktree (base 192468d = merge-base/tip of v2, exactly the 2 PR commits). 56510 lines.",
+    "chunking": [
+      "chunk A: core/ + harness/ + data/balance.json + demos/ + _bmad-output/ (2871 lines) — full 7-lens wave",
+      "chunk B: goldens/ (~53k lines) — mechanical fold verification per Perkins briefing (no lens wave): 35 re-blessed .log.bin header-only (catalog_hash field bytes 17..24, rest byte-identical), 37 re-blessed .t1 catalog-hash-fold-only (structure/tick-count identical), 0 .png churn, 3 new gate demos — 0 fold-discipline breaks"
+    ]
+  },
+  "reviewers": {
+    "completed": ["blind", "edge", "acceptance", "security", "architecture", "codebase", "tests"],
+    "failed_layers": [],
+    "model": "kimi-k3 (kimi-coding) — named explicitly at every spawn; lens tab rooted --cwd at the round worktree"
+  },
+  "verification": {
+    "total_findings": 20,
+    "perkins_originated": 6,
+    "confirmed": 24,
+    "rejected": 1,
+    "unverifiable_speculative": 0,
+    "rejected_detail": "blind#5 (tag-14 payload writer has no reader) — no event-payload reader exists anywhere in the repo; events are hash-only inputs to the T1 state hash (serialize.odin:429 is the only production call site); 6.1's tag-13 follows the identical shape (era_test.odin pins via event-stream assertions, no byte-layout test) — the premise is vacuous.",
+    "independent_checks": [
+      "tools/ci-local.sh --mac run by Perkins in the round worktree: 10/10 PASS (purity, 215 core tests, app build, golden harness + replay gate, palcheck, drift-check, preview, PP_DEBUG, stats replay-identity, input-parity 24/24)",
+      "golden fold discipline (chunk B) mechanically verified byte-level: 0 breaks",
+      "REPRODUCED blocker evidence: `tools/harness.sh replay advance_fire goldens/advance_fire.log.bin` -> 'FIRST DIVERGENCE at tick 600'; a gate-DISABLED replay of advance_block_legacy matches its manifest bit-for-bit (temp demo edit, reverted) -> manifests are blessed gate-off",
+      "REPRODUCED vacuous-flip evidence: instrumented drift-check (probe inserted + reverted) shows the flip's replay_hashes reads a clobbered path '/tmp/pp-drift-<name>-.' (lpath's 30-char len over the last mutation tmp path) -> accepted=false -> vacuous 'rejected (OK)'; leftover /tmp/pp-drift-*-bad_era.bin corroborate the free_all clobbering of os.remove(tmp)"
+    ]
+  },
+  "findings": [
+    {
+      "id": "B1",
+      "source": ["edge", "acceptance"],
+      "severity": "blocker",
+      "category": "golden-integrity",
+      "title": "Gate goldens blessed with the advance gate DISABLED — run_demo never threads demo.advance_gate_on into the live/bless path",
+      "location": "harness/run.odin:269",
+      "evidence": "run_demo's cfg literal sets name/use_fixture/qos_fixture/growth_on/session but NOT advance_gate_on (only load_demo_replay:688 sets it); demo_apply_setup:635 applies state.advance_gate_enabled = cfg.advance_gate_on (false). Empirical: `harness replay advance_fire goldens/advance_fire.log.bin` -> 'FIRST DIVERGENCE at tick 600' (the gate-fire tick); a gate-off replay matches the manifest bit-for-bit.",
+      "detail": "All 3 gate-demo manifests (advance_fire, advance_block_sla, advance_block_legacy) pin gate-OFF runs: era stays 2 for all 1400 ticks, no Era_Advanced, no Era_Advance_Blocked. The demos' header comments, the stories-v2 status fold ('goldens advance_fire.dem (conditions met -> fires)... each block branch T1-pinned'), and the PR body are false in the blessed artifacts. Violates deliverable 3 / acceptance: 'Golden: T1 of the advance (conditions met -> fires); T1 of each block branch'. The standalone ODN-11 replay gate is red on all 3 demos as shipped; harness run's verify_replay uses run_demo's gate-off cfg for both halves so CI gate 4 passes hollow. New-demo T2 pixels (60000ms captures) are equally gate-off renders.",
+      "recommended_fix": "Add advance_gate_on = demo.advance_gate_on to run_demo's cfg literal (run.odin:269) and re-bless the 3 gate goldens (acceptance lens verified the one-line fix produces the tick-600 fire + bit-for-bit replay)."
+    },
+    {
+      "id": "B2",
+      "source": ["perkins", "acceptance"],
+      "severity": "blocker",
+      "category": "test-vacuity",
+      "title": "drift-check flip classes are vacuous — temp-arena clobbering of lpath makes every flip replay fail 'cannot read', counted as a rejection",
+      "location": "harness/drift.odin:113",
+      "evidence": "lpath := log_path(name) (fmt.tprintf temp string, loop top) is invalidated by replay_hashes' per-tick free_all(context.temp_allocator) in the mutation loop and overwritten by the last mutation's tmp tprintf; the flip then reads '/tmp/pp-drift-<name>-.' (lpath's original 30-char length over the tmp path's memory) -> accepted=false -> ok := !accepted || ... -> vacuous 'rejected (OK)'. Confirmed by instrumented probe (Perkins + acceptance lens independently).",
+      "detail": "The advance_gate_flip class — new in 6.2, the shipped guard the Perkins briefing explicitly says to 'verify it bites' — never re-sims anything: it passes vacuously on all 3 gate demos. An honest flip on the actual gate-off manifests would have FAILED (gate-off re-sim matches gate-off manifest), i.e. this vacuity is the mechanism that let B1 ship green. The pre-existing growth_flip (5.1) has the identical defect (same probe result on terminal_types/growth/node_health). Leftover /tmp/pp-drift-*-bad_era.bin corroborate (os.remove(tmp) also clobbered).",
+      "recommended_fix": "Give the flip a stable log path: re-call log_path(name) at the flip sites (or strings.clone lpath with context.allocator at loop top); then the flip honestly re-sims the blessed log gate-off. Audit the same lifetime bug for growth_flip."
+    },
+    {
+      "id": "W1",
+      "source": ["tests"],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "title": "Era_Advance_Blocked enter-edge dedup (anti-chatter) never pinned — block tests assert boolean saw_* only, never event counts",
+      "location": "core/advance_gate_test.odin:206",
+      "evidence": "testing.expect(t, saw_sla, ...) / saw_legacy / saw_crisis — the only count assertion is blocks==0 on the healthy path; era.odin:303 documents 'emit on the ENTER of a blocked state (or a reason change), deduped — never every tick'.",
+      "detail": "An emit-every-tick regression passes every unit test. With the goldens currently hollow (B1), the block-event stream has no pin anywhere; even after re-bless, reason-transition re-emits (Crisis->Legacy->Sla) are unpinned (no transition demo/unit test).",
+      "recommended_fix": "Assert exactly one Era_Advance_Blocked per blocked episode in the SLA/legacy tests; add a reason-transition case asserting one event per distinct reason."
+    },
+    {
+      "id": "W2",
+      "source": ["tests"],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "title": "Scripted Cmd_Era_Advance while the gate is BLOCKED is untested — the latch-held-while-blocked path is unexercised",
+      "location": "core/advance_gate_test.odin:436",
+      "evidence": "test_advance_gate_scripted_request_still_gated uses gate_fixture (healthy); the only other scripted test runs gate-disabled. The PR claims 'a scripted advance still works, gated the same way' and the code comments 'the latch holds' while blocked.",
+      "detail": "No test latches a scripted request into a blocked gate and asserts it does NOT fire, the latch survives, and it fires after the block clears.",
+      "recommended_fix": "Add a test scripting Cmd_Era_Advance with an SLA or legacy block active; assert era stays 2 while blocked, latch survives, fires after recovery."
+    },
+    {
+      "id": "W3",
+      "source": ["architecture"],
+      "severity": "warning",
+      "category": "boundary",
+      "title": "milestone_window_ticks validator cap (10000) rejects the documented full-game tuning (12 min @ 20 Hz = 14400 ticks)",
+      "location": "core/catalog.odin:937",
+      "evidence": "if b.advance.milestone_window_ticks < 1 || b.advance.milestone_window_ticks > 10000 { ... } — vs data/balance.json's own advance _comment: 'the GDD full-game assumption is ~8-12 min/era'; 12*60*20 = 14400 > 10000.",
+      "detail": "The upper half of the documented design range fails catalog load. The MVP value 600 is unaffected; the landmine arms when full-game tuning lands.",
+      "recommended_fix": "Raise the cap to cover the documented range (e.g. 20000) or reconcile the documented range with the ring-memory rationale; keep the foot-gun rationale explicit."
+    },
+    {
+      "id": "W4",
+      "source": ["blind", "tests"],
+      "severity": "warning",
+      "category": "dead-code/test-gap",
+      "title": "E15 crisis test captures fire_tick but never asserts it — the 'fire lands after crisis resolves' ordering is unpinned (dead variable)",
+      "location": "core/advance_gate_test.odin:296",
+      "evidence": "fire_tick: u64 = max(u64) — assigned in the event loop, never read; no resolve_tick captured; the comment claims 'the fire must land AFTER the crisis resolves (E14/E15: never mid-crisis)'.",
+      "detail": "The ordering is structurally guaranteed by era_gate_block (crisis -> return), but the test's claimed pin does not exist and fire_tick is dead code.",
+      "recommended_fix": "Capture resolve_tick and assert fire_tick > resolve_tick (and fire_tick != max(u64)), or delete fire_tick and soften the comment."
+    },
+    {
+      "id": "W5",
+      "source": ["blind", "codebase", "architecture", "acceptance"],
+      "severity": "warning",
+      "category": "churn",
+      "title": "data/balance.json wholesale reformat (1-space indent, \\u-escaped UTF-8, expanded arrays, dropped trailing newline) around a 4-line addition",
+      "location": "data/balance.json:1",
+      "evidence": "-  \"logic_hz\": 20, -> + \"logic_hz\": 20, (2-space -> 1-space); § -> \\u00a7; '\\ No newline at end of file'. Perkins verified via parsed-JSON walk: semantic diff is EXACTLY the added `advance` key (0 other value changes); every sibling data/*.json keeps 2-space raw-UTF-8 formatting.",
+      "detail": "Semantically clean (verified) but pure churn: ~160 lines of diff noise burying the real change, diverges from the repo's JSON formatting convention, loses the trailing newline, pollutes blame.",
+      "recommended_fix": "Re-emit balance.json in the original 2-space/raw-UTF-8 formatting with trailing newline, inserting only the `advance` block."
+    },
+    {
+      "id": "W6",
+      "source": ["perkins"],
+      "severity": "warning",
+      "category": "fold-forward",
+      "title": "6.1 fold (a) not landed: demand_era is validated-at-load but never read by the sim (director keys cat.demand.eras[era-1] directly)",
+      "location": "core/demand.odin:52",
+      "evidence": "de := &cat.demand.eras[era-1] — the Era_Row.demand_era binding (catalog.odin:382, validated in-range at 1184 + used only for the load-time roster invariant) is never consulted at runtime; no eras[i].demand_era == i+1 equality enforcement exists.",
+      "detail": "Named in the 6.1 r1 fold-forward ('enforce equality at load or route through the binding'). Does not break the 6.2 gate (contiguous MVP catalog; the gate never reads demand_era), but the fold remains unlanded.",
+      "recommended_fix": "Either enforce eras[i].demand_era == i+1 at load (the MVP tables are 1:1) or route scripted_plan_demand through the binding."
+    },
+    {
+      "id": "W7",
+      "source": ["perkins"],
+      "severity": "warning",
+      "category": "fold-forward",
+      "title": "6.1 fold (b) not landed: sparse-era gap rows are not rejected — and the 6.2 gate can now fire INTO a gap era",
+      "location": "core/catalog.odin:1276",
+      "evidence": "for len(cat.eras) < int(era) { append(&cat.eras, Era_Row{}) } — gaps pad with empty rows; no contiguity check anywhere in the eras load. era_step latches state.era + 1 directly (bypassing era_advance_validate, which itself only bounds 1..len(cat.eras)).",
+      "detail": "A sparse eras.json (eras 1,3) lets the gate fire 1->2 into an empty row (empty roster -> era_class_unlocked false for all -> era_gate_sla_ok found=false -> .Sla block forever): the advance arc soft-locks. Real catalog is contiguous, so this is content-armor, not a live break — but the gate makes gaps more consequential than 6.1 did.",
+      "recommended_fix": "Reject non-contiguous era tables at load (fail-fast, like the sibling invariants)."
+    },
+    {
+      "id": "W8",
+      "source": ["perkins"],
+      "severity": "warning",
+      "category": "fold-forward",
+      "title": "6.1 fold (d) not landed: ODN-16 arch citation absent from the PR body",
+      "location": "_bmad-output/pr-bodies/6.2.md",
+      "evidence": "grep -c 'ODN-16' = 0 (also 0 in 6.1's body); the body cites E15/3.4/4.2/GDD M4/stories-v2 6.2 but no arch decision for the S6 seam ([ODN-16, §6.6] per stories-v2).",
+      "detail": "Acceptance-required citations (E15, 3.4, 4.2, stories-v2 6.2) are present; the 6.1 fold asked for the ODN-16 citation to be carried. Minor, but named.",
+      "recommended_fix": "Add the [ODN-16, §6.6] citation to the PR body's seam paragraph."
+    },
+    {
+      "id": "N1",
+      "source": ["edge", "architecture", "acceptance"],
+      "severity": "note",
+      "category": "boundary",
+      "title": "Gate ring + window-elapsed precondition keyed to absolute run tick, never re-anchored on fire — chained advances skip the sustain window",
+      "location": "core/era.odin:298",
+      "evidence": "the fire tail (new_era/era/era_advance_to=0/emit) never resets era_gate; the window check is `tick < milestone_window_ticks` on the absolute run tick. An era-1 start (real catalog) fires 1->2 at tick 600 and can fire 2->3 at tick 601 (era-1 deltas still in the ring).",
+      "detail": "Documented as MVP-single-advance ('the run's setup era = tick 0'); era 3 terminal caps the chain today. Latent for eras 4-6 / multi-advance — must be fixed at the 6.3/full-game seam.",
+      "recommended_fix": "On fire, reset the gate ring/prev_*/win sums and record era_start_tick; require (tick - era_start_tick) >= milestone_window_ticks."
+    },
+    {
+      "id": "N2",
+      "source": ["perkins"],
+      "severity": "note",
+      "category": "seam",
+      "title": "Stand-in legacy predicate over-blocks era 1 (narrow is 'legacy' in the era that introduces it) — documented 6.3 seam, named for the record",
+      "location": "core/era.odin:167",
+      "evidence": "data/eras.json: era 1 unlocks pipe_tiers ['narrow','standard'] -> era_newest_tier(1) = standard -> era_pipe_is_legacy(era 1, narrow) = true (tier < newest).",
+      "detail": "Under the stand-in, any in-service narrow blocks the era-1->2 advance even though narrow is era-1's own tech. Moot for the MVP (runs start era 2) and documented as the 6.3 seam, but the seam's semantics differ from 6.3's draw-era model in BOTH directions (era-1 over-block here; era-2-drawn narrow under-block in 6.3).",
+      "recommended_fix": "None for 6.2 (documented seam); 6.3 replaces the predicate with draw-era tracking."
+    },
+    {
+      "id": "N3",
+      "source": ["perkins"],
+      "severity": "note",
+      "category": "seam",
+      "title": "advance_block_legacy.dem cements the stand-in's semantics — 6.3's draw-era model will require re-authoring this golden",
+      "location": "demos/advance_block_legacy.dem",
+      "evidence": "the demo draws the narrow stub IN era 2 ('at 0ms draw 3 1 narrow'); under 6.3's draw-era tracking a pipe drawn in the current era is NOT legacy, so the block would not reproduce.",
+      "detail": "The code seam is clean (single predicate, one call site), but the golden bakes in stand-in semantics 6.3 will replace — expected 6.3 golden churn, named so it isn't a surprise.",
+      "recommended_fix": "6.3: re-author the legacy-block golden for draw-era semantics when the real legacy model lands."
+    },
+    {
+      "id": "N4",
+      "source": ["blind"],
+      "severity": "note",
+      "category": "dead-code/test-gap",
+      "title": "zero-demand test builds a full fixture then destroys it; claims a .Sla block but never asserts the reason",
+      "location": "core/advance_gate_test.odin:test_advance_gate_zero_demand_neutral",
+      "evidence": "gate_fixture(&s, cat) ... run_destroy(&s) ... run_init(&s, ...) — the first fixture is dead work; the header claims 'The gate stays blocked (.Sla)' but the body asserts only fires == 0.",
+      "detail": "Cosmetic test-quality issue; the behavior under test (no vacuous pass) is pinned.",
+      "recommended_fix": "Drop the first run_init/gate_fixture; assert the emitted block reason is .Sla, matching the comment."
+    },
+    {
+      "id": "N5",
+      "source": ["blind"],
+      "severity": "note",
+      "category": "comment-code-mismatch",
+      "title": "SLA-block test comment claims a 6/tick sustained flood; code seeds 1/tick through tick 400 of a 700-tick run",
+      "location": "core/advance_gate_test.odin:test_advance_gate_sla_block",
+      "evidence": "// flood email res1->router with 6/tick (the E9 lane bound is 6, ...) vs for tick in u64(2)..=400 { flow_seed_demand(...) } — 1 packet/tick for 399 ticks; 6 is the lane queue bound, not the seed rate.",
+      "detail": "The comment's rate/duration rationale is not derivable from the code; the test passes (the window at tick 600 still spans the flood), but the prose misleads.",
+      "recommended_fix": "Correct the comment to the actual seed rate/duration."
+    },
+    {
+      "id": "N6",
+      "source": ["tests"],
+      "severity": "note",
+      "category": "boundary",
+      "title": "Per-class SLA term never exercised with multiple active classes (all block tests run era 2, roster {email})",
+      "location": "core/advance_gate_test.odin:183",
+      "evidence": "era 2's roster is email-only; the era_class_unlocked skip branch and the any-active-class-under-bar failure are never load-bearing in tests.",
+      "detail": "A two-active-class run (one class dipping) and a non-active-class-with-completions case are uncovered boundary behavior.",
+      "recommended_fix": "Add an era-3 two-class test (email 100%, streaming flooded) asserting Era_Advance_Blocked{Sla} and no fire."
+    },
+    {
+      "id": "N7",
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage-gate",
+      "title": "Advisory test gate: PASS",
+      "location": "N/A",
+      "evidence": "10 new core tests (fire, replay identity, Sla/Legacy/E15-crisis blocks, window precondition, E24, last-era inertness, scripted-under-gate, disabled back-compat) + catalog fail-fast rows; P0 paths covered at unit level; gaps are boundary-level (W1/W2/N6).",
+      "detail": "P0 100% at unit level, P1 ~95%; but see B1 — the golden leg of P0 is currently hollow.",
+      "recommended_fix": "Raise via W1/W2/N6 fixes."
+    }
+  ],
+  "counts": {
+    "blockers": 2,
+    "warnings": 8,
+    "notes": 7
+  },
+  "reviewer_agreement": [
+    "B1 (edge + acceptance, both with independent empirical verification)",
+    "W4 (blind + tests)",
+    "W5 (blind + codebase + architecture + acceptance)",
+    "N1 (edge + architecture + acceptance)"
+  ],
+  "verdict": "NEEDS CHANGES"
+}

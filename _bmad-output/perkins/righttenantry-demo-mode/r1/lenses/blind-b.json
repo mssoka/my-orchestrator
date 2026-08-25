@@ -1,0 +1,102 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "boundary",
+    "title": "Report download slices analysis_id wrong: 'an-aoife' -> 'aoife', never matches the 'a-aoife' keys it looks up",
+    "location": "client/src/demo/demo_api.gleam (download hunk)",
+    "evidence": "+  let application_id = string.drop_start(analysis_id, 3)\n+  let filename = case\n+    list.find(demo_store.report_filenames(), fn(p) { p.0 == application_id })\n... (doc comment) +/// `analysis_id` (e.g. \"an-aoife\")\n+/// maps to the application id (\"a-aoife\") which keys the baked PDF.\n... (demo_store.gleam) +    #(\"a-aoife\", \"RightTenantry-Report-Aoife-Ni-Riain.pdf\"),",
+    "detail": "drop_start(\"an-aoife\", 3) yields \"aoife\", not \"a-aoife\". The find against report_filenames keys (\"a-aoife\" etc.) therefore always misses, the filename silently falls back, and the URL becomes /static/demo/report-aoife.pdf.",
+    "recommended_fix": "Drop 2 characters (\"an-\") or prepend \"a-\": e.g. \"a-\" <> string.drop_start(analysis_id, 3), so the id matches report_filenames keys."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "behavior",
+    "title": "substitute_reference discards the new referee details and the store wipes the contact to None instead of substituting",
+    "location": "client/src/demo/demo_api.gleam + client/src/demo/demo_store.gleam (apply_refcheck)",
+    "evidence": "+  let _ = name\n+  let _ = email\n+  let _ = phone\n+  #(next, respond_result(result, on_response))\n... +    \"substitute\" ->\n+      ReferenceCallDetail(\n+        ..call,\n+        contact_name: None,\n+        contact_email: None,\n+        contact_phone: None,\n+      )",
+    "detail": "The API mirror takes name/email/phone for a substitute action, throws them away, and the store mutation clears the existing contact rather than recording the substitute referee. The demo shows a contact-less call after substitution.",
+    "recommended_fix": "Thread name/email/phone through refcheck_action and set contact_name/email/phone to Some(new values) in the \"substitute\" branch."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "stale-state",
+    "title": "UserConfirmedApproval refetches the leaderboard from the pre-mutation store",
+    "location": "client/src/demo/demo_update.gleam (UserConfirmedApproval arm)",
+    "evidence": "+    UserConfirmedApproval(vid, aid) -> {\n+      let #(updated, eff) = demo_status(model, vid, aid, \"approved\")\n+      let store = store_of(model)\n+      let leaderboard_eff =\n+        demo_api.fetch_leaderboard(store, vid, ApiReturnedLeaderboard)",
+    "detail": "demo_status returns `updated` carrying the mutated demo_store, but store_of(model) reads the old model, so the leaderboard refetch serves data without the approval the user just confirmed.",
+    "recommended_fix": "Use store_of(updated) (or the `next` store returned inside demo_status) for the leaderboard refetch."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "consistency",
+    "title": "Approval refetches the leaderboard; rejection and backward transitions do not",
+    "location": "client/src/demo/demo_update.gleam (UserConfirmedRejection / UserConfirmedBackwardTransition arms)",
+    "evidence": "+    UserConfirmedRejection(vid, aid) -> {\n+      let #(updated, eff) = demo_status(model, vid, aid, \"rejected\")\n+      #(\n+        Model(..updated, show_reject_confirm: False, pending_rejection: None),\n+        eff,\n+      )\n+    }\n+    UserConfirmedBackwardTransition(vid, aid, target) -> {\n+      let #(updated, eff) = demo_status(model, vid, aid, target)\n+      #(\n+        Model(\n+          ..updated,\n+          show_backward_confirm: False,\n+          pending_backward_transition: None,\n+        ),\n+        eff,\n+      )\n+    }",
+    "detail": "Three sibling confirm arms mutate application status, but only approval batches a leaderboard refetch. Rejection/backward leave the leaderboard rows stale relative to the new status, an inconsistent treatment of identical mutations.",
+    "recommended_fix": "Either refetch the leaderboard in all three arms (from the updated store) or none; make the status-confirm arms symmetric."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "contradiction",
+    "title": "Module header claims everything is derived, yet vacancy_detail hardcodes remindable_count/followup_count for all vacancies",
+    "location": "client/src/demo/demo_store.gleam (vacancy_detail)",
+    "evidence": "+//// DERIVED, NOT SERIALIZED: the dashboard list, vacancy detail, leaderboard,\n+//// application detail, comparison and archived views are all computed on\n+//// demand from the single source of truth\n... +    awaiting_count: awaiting_count_for(vac.id),\n+    remindable_count: 2,\n+    followup_count: 1,",
+    "detail": "awaiting_count varies per vacancy via awaiting_count_for and the awaiting list only exists for v-maples, but remindable_count: 2 and followup_count: 1 are constants for every vacancy — including v-harbour whose awaiting list is empty.",
+    "recommended_fix": "Derive remindable/followup counts from the awaiting fixture list (reminded/followup_due flags) instead of hardcoding."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "behavior",
+    "title": "create_vacancy sets closes_at equal to created_at, ignoring validity_days",
+    "location": "client/src/demo/demo_store.gleam (create_vacancy)",
+    "evidence": "+      validity_days: payload.validity_days,\n+      max_applications: 20,\n+      created_at: now,\n+      closes_at: now,",
+    "detail": "A vacancy the demo user just created is born with closes_at == created_at, and demo_days_remaining returns 0 for any v-demo-* id — the newly created vacancy immediately presents as closing today/zero days remaining.",
+    "recommended_fix": "Compute closes_at as the demo clock plus payload.validity_days, and give v-demo-* ids a sensible days_remaining derivation."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "contradiction",
+    "title": "mark_opened logs event_type 'status_auto_changed' but its details payload says trigger 'manual'",
+    "location": "client/src/demo/demo_store.gleam (mark_opened / change_status)",
+    "evidence": "+pub fn mark_opened(\n... +    \"under_review\",\n+    \"status_auto_changed\",\n+  )\n... +                    audit_trail: list.append(app.audit_trail, [\n+                      AuditEntry(\n+                        event_type:,\n+                        details: Some(\n+                          \"{\\\"to\\\":\\\"\" <> slug <> \"\\\",\\\"trigger\\\":\\\"manual\\\"}\",\n+                        ),",
+    "detail": "change_status hardcodes details trigger \"manual\" for every caller, so the auto-transition emitted by mark_opened carries an audit details payload that contradicts its own event_type.",
+    "recommended_fix": "Pass the trigger label through change_status (\"auto\" for mark_opened, \"manual\" for set_status) and interpolate it into details."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "analytics",
+    "title": "Demo logout fires the demo_reset analytics event, conflating exit with reset",
+    "location": "client/src/demo/demo_update.gleam (UserClickedLogout arm)",
+    "evidence": "+    UserClickedLogout -> {\n+      demo_analytics.capture_event(demo_analytics.demo_reset)\n+      #(\n+        Model(\n+          ..model,\n+          demo_mode: False,",
+    "detail": "Signing out of the demo is tracked as demo_reset, the same event fired by an actual in-demo reset. Two distinct user actions collapse into one metric; the constants list defines no exit event.",
+    "recommended_fix": "Add a demo_exit event constant and fire it on logout, reserving demo_reset for UserClickedResetDemo."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "behavior",
+    "title": "bulk_reject return count is computed from the pre-mutation store and counts already-rejected rows",
+    "location": "client/src/demo/demo_store.gleam (bulk_reject)",
+    "evidence": "+  let rejected = case find_vacancy(store, vacancy_id) {\n+    Ok(v) ->\n+      list.length(\n+        list.filter(v.applications, fn(a) {\n+          set.contains(id_set, a.application.id)\n+        }),\n+      )\n+    Error(_) -> 0\n+  }\n+  #(DemoStore(..store, vacancies: updated), rejected)",
+    "detail": "The count filters `store` (before the update) and counts every id match regardless of prior status, so re-rejecting already-rejected applications is reported as freshly rejected.",
+    "recommended_fix": "Count only applications whose status actually transitioned to Rejected (e.g. filter out a.application.status == Rejected before counting)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Six demo_api refcheck wrappers and most analytics event constants have no call site anywhere in this diff",
+    "location": "client/src/demo/demo_api.gleam + client/src/demo/demo_analytics.gleam",
+    "evidence": "+pub fn start_check(\n... +pub fn skip_reference(\n... +pub fn re_enable_reference(\n... +pub fn take_over_reference(\n... +pub fn correct_reference(\n... +pub const demo_entry = \"demo_entry\"\n+pub const demo_vacancy_open = \"demo_vacancy_open\"\n+pub const demo_application_open = \"demo_application_open\"\n+pub const demo_comparison_open = \"demo_comparison_open\"\n+pub const demo_archived_open = \"demo_archived_open\"\n+pub const demo_report_download = \"demo_report_download\"\n+pub const demo_create_vacancy_open = \"demo_create_vacancy_open\"",
+    "detail": "demo_update dispatches every reference-check action through demo_api.refcheck_action directly; start_check/skip_reference/re_enable_reference/take_over_reference/correct_reference/substitute_reference and seven of the nine event constants are never referenced in the chunk.",
+    "recommended_fix": "Delete the uncalled wrappers and unused constants, or wire the dispatcher through the typed wrappers and fire the surface events at the corresponding views."
+  }
+]

@@ -1,0 +1,1676 @@
+diff --git a/_bmad-output/implementation-artifacts/epic-4-context.md b/_bmad-output/implementation-artifacts/epic-4-context.md
+new file mode 100644
+index 0000000..37b1144
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/epic-4-context.md
+@@ -0,0 +1,78 @@
++# Epic 4 Context: Crisis Model
++
++<!-- Compiled from planning artifacts. Edit freely. Regenerate with compile-epic-context if planning docs change. -->
++
++## Goal
++
++Deliver fair, predictable crises: the player reads warning signs (node 🟡/🔴, pipe pressure,
++demand forecast) with lead times, predicts the Surge, and survives it — "I should have seen
++this coming," never random `[FORGE #3]`. MVP ships the Surge archetype (forecast 10× demand
++spike that cascades into saturation if unprepared). The epic is the fairness contract of the
++whole game: every crisis is the consequence of a topology flaw the player could have
++prevented, foreshadowed by readable warnings, with a structured root cause + a preventive
++redesign.
++
++## Stories
++
++- Story 4.1: Warning signs + forecast (strain metrics → 🟡/🔴 + pipe pressure + demand
++  forecast with lead times; the forecast "weather report" panel).
++- Story 4.2: Surge SetPiece + Crisis Engine (root-cause, fair).
++- Story 4.3: Network Health meter + win/lose/retry.
++- (E3.3/E3.4 health states + readability feed 4.1's warning surface; E4.4 remaining
++  archetypes are E10.)
++
++## Requirements & Constraints
++
++- **Warning-first fairness:** every crisis is foreshadowed by readable warning signs with a
++  lead time ≥ the player's reaction window; no crisis on a healthy within-capacity topology.
++  Lead times (GDD Numerical Design): node strained ~30 s, node critical ~10 s, pipe pressure
++  ~20 s, demand forecast 15–60 s.
++- **Traceable strain:** a 🔴 node is always traceable to a measured strain; health
++  transitions fire on defined thresholds (strain ≥ 70 % strained, ≥ 90 % critical —
++  art-direction §6.1; thresholds live in `balance.json`).
++- **Color is never the sole encoder:** every warning state pairs color with icon + shape +
++  outline (triple-redundant — colorblind-safe, reduced-motion-safe; the ring pulse rate is
++  itself the escalation signal: slow ~1.2 Hz strained, fast ~2.5 Hz critical).
++- **Forecast reads, never fires:** the forecast "weather report" names incoming SetPieces
++  with a countdown; it READS the schedule (set-piece `forecast_lead_ticks`), it does not
++  trigger anything (that is the Crisis Engine, story 4.2).
++- **Root-cause fairness (test contracts):** no crisis without a warning + lead time; every
++  crisis has ≥ 1 topology redesign that would have prevented it; recovery always possible.
++
++## Technical Decisions
++
++- **S4 Crisis Engine** evaluates **downstream of flow** each tick: reads Topology + Flow
++  state, emits `Warning_Raised` / `Crisis_Triggered` / `Crisis_Resolved` events (ODN-14). It
++  never owns the demand timeline — the Director (ODN-7) is upstream and gets a read-only
++  view; a crisis is a consequence, never its own cause (structural, `[REVIEW M1]`).
++- **Data-driven archetypes:** the archetype table lives in `crises.json`
++  (`archetype, root_cause_pattern, warning_curve, lead_time_ticks, failure_effect`); the
++  Surge is content + evaluation procs, not re-architecture (ODN-4). SetPieces already carry
++  `forecast_lead_ticks` in `demand.json` and the demand director already multiplies their
++  class's spawn volume while active.
++- **Run_State owns `Crisis_State (warnings[], active[], forecast[])`** (§8.2) alongside
++  Topology/Flow/Health; all sim state integer-only, no maps, no file/clock reads (ODN-1/10).
++- **Golden discipline:** warning/forecast state rides the T1 hash (replay-equality E10) via
++  append-only serialization (absent-when-empty sections; new event tags append); T2 pixel
++  goldens of the forecast + warning state; deliberate re-blesses carry proof.
++- Strain metrics come from Topology + Flow each tick (utilization vs throughput; node
++  throughput from `node_types.json`; bundle capacity from the static bundle view).
++
++## UX & Interaction Patterns
++
++- Node health is the primary warning surface: a node glows its state color with a ring
++  outline + an icon (check / `!` / `!!`), ring pulses at the state's rate — never color
++  alone.
++- The forecast "weather report" panel is the P3 fairness surface: names the incoming
++  SetPiece with a countdown, so the player sees the surge coming and has time to redesign.
++- Alert tiles use `⚠️ <BRAND>: <STATE>` format — color + glyph + caption, never color alone.
++
++## Cross-Story Dependencies
++
++- 4.1 (warnings + forecast + strain telegraph) precedes 4.2 (Surge firing + root cause) and
++  4.3 (Network Health win/lose) — 4.1 only ever *names* trouble; firing lands in 4.2.
++- 4.1 consumes the 3.1 demand director (SetPiece schedule + `forecast_lead_ticks`), 3.2/3.3
++  QoS + contention (the strain the flow produces), 3.4 SLA accumulators (the same event seam
++  feeds the health layer).
++- E3.3/E3.4 (health states + readability) are design content of the same warning surface;
++  story 5.2 later re-drives them from the growing map.
+diff --git a/_bmad-output/implementation-artifacts/spec-4-1-warning-forecast.md b/_bmad-output/implementation-artifacts/spec-4-1-warning-forecast.md
+new file mode 100644
+index 0000000..4b17627
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-4-1-warning-forecast.md
+@@ -0,0 +1,109 @@
++---
++title: 'Story 4.1 — Warning signs + forecast'
++type: 'feature'
++created: '2026-08-13'
++status: 'in-progress'
++baseline_commit: 9632f83
++review_loop_iteration: 0
++context:
++  - '{project-root}/_bmad-output/planning-artifacts/architecture/odin-architecture-v1.md'
++  - '{project-root}/_bmad-output/implementation-artifacts/epic-4-context.md'
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** The surge-survival fun loop has no telegraph: nothing warns the player before trouble, so the P3 fairness surface ("I should have seen this coming" `[FORGE #3]`) does not exist yet.
++
++**Approach:** Add the warning surface (story 4.1, slice 4): strain metrics from Topology + Flow feed node 🟡/🔴 states + pipe pressure + a demand forecast — all with lead times — plus a forecast "weather report" panel that names incoming SetPieces with a countdown. Telegraph ONLY: the surge firing (4.2) and the health-meter win/lose (4.3) are out of scope; 4.1 only ever *names* trouble.
++
++## Boundaries & Constraints
++
++**Always:**
++- **Core eval** (`core/warnings.odin`, NEW): `warning_evaluate(state, tick, cat)` called inside `core.step` AFTER `flow_step`, BEFORE `win_lose_eval` (arch spine: flow → crisis → win/lose). Pure (ODN-1), integer-only (ODN-10), arrays only (no maps), no new commands (**LOG_VERSION stays 3**).
++- **`Crisis_State` on `Run_State`** (types.odin; arch §8.2): `node_strain: [dynamic]Strain_Level` (parallel to node slots), `pipe_strain: [dynamic]Strain_Level` (parallel to pipe slots — a pipe's level is its bundle's pressure; the bundle is the capacity unit), `forecast: [dynamic]Forecast_Entry`. **All DERIVED per tick** (rebuilt identically on replay from serialized state — same status as `lane_caps`/`sla_breach`; never serialized in full). `Strain_Level { None, Amber, Red }`; `Forecast_Entry { sp_index, class, multiplier, start_tick, countdown_ticks, active }`.
++- **Strain measure (the pinned contract):** node utilization = Σ `packet_bandwidth` of packets RESIDENT at the node that **FAILED a forward attempt** (`Packet.waiting_ticks >= 1` — incremented in flow.odin's forward pass when no route exists, cleared on every successful forward) × 100 ÷ `node_types[node_type].throughput_units` (integer percent). A packet that forwards next tick — fresh spawn OR fresh transit arrival — has `waiting_ticks` 0 and NEVER strains (the no-flicker contract; the transit case was the reason the spawn-tick exclusion alone was insufficient — see the change log). Pipe pressure = the FULLEST lane queue's depth on the bundle vs its E9 bound (`lane_queue_packets × packet_bandwidth`): a lone packet is 1/6 of a bound (17 %, healthy); a lane at its bound (6 packets) is 100 % — the ladder is dropping. "Pressure climbing toward saturation" (GDD M5), not busy-ness.
++- **Thresholds + leads in `balance.json` `warnings` block** (ODN-5; art-direction "Trigger `[balance.json]`"; GDD Numerical Design): `node_amber_pct 70`, `node_red_pct 90`, `pipe_amber_pct 70`, `pipe_red_pct 90`, `node_strained_lead_ticks 600` (30 s), `node_critical_lead_ticks 200` (10 s), `pipe_pressure_lead_ticks 400` (20 s) @20 Hz. Fail-fast validation: amber < red ≤ 100, leads > 0. **Deliberate consequence (documented, 3.2 precedent):** a balance.json content addition folds into `catalog_hash` → ALL `.t1` manifests + `.log.bin` headers re-bless mechanically.
++- **Transitions vs the prior tick's levels emit events** (ODN-14): `EVENT_TAG_WARNING_RAISED :: u8(6)` / `EVENT_TAG_WARNING_CLEARED :: u8(7)`, payload = `sign` (Warning_Sign: Node_Strained / Node_Critical / Pipe_Pressure / Pipe_Critical) + `target` (node id / pipe id). None→Amber raises the amber sign; Amber→Red raises the critical sign; any down-step clears the level that ended (one event per transition). `Event` gains `sign: u8` + `target: u32`, serialized **tag-conditionally** (append-only — pre-4.1 event streams byte-identical). **Forecast emits NO events** (a panel read; the serialized rows are the pin).
++- **Forecast:** rows = era set-pieces with `start_tick - forecast_lead_ticks ≤ tick < start_tick + duration_ticks`; `countdown_ticks = start_tick - tick` (0 once active; `active` flags the in-window/active span). Reads the catalog schedule only — never fires anything (4.2).
++- **Serialization** (serialize.odin): new `warnings` section, **absent-when-empty** (zero traffic → zero bytes, so boot/draw/place shift ONLY via the catalog_hash fold): non-None node strain entries (node id + level, slot order), non-None pipe strain entries (pipe id + level, slot order), forecast rows (sp_index, class, multiplier, start_tick, countdown, active).
++- **Render — warning state is never color alone** (art-direction §6.1): Amber node = amber ring + `!` glyph + slow pulse; Red node = red ring + `!!` glyph + fast pulse; rings render ONLY on non-healthy nodes (the canon's healthy ambient ring is slice-7 juice — flagged). Pulse = pinned 16-step table indexed by `(tick, node id)` — deterministic, no transcendentals (§10.4). Pipe pressure = translucent state-colored overlay stroke on member pipes of a pressured bundle. The forecast panel (`app/render/forecast.odin`, NEW — shared by the app HUD + the harness capture) draws **zero pixels when empty**. Text via `rl.DrawText` (rlsw-verified).
++- **App session:** `start_run` sets `state.era = 3` + **goal 0 / cap 0** (win/lose disabled — the 4.1 sandbox must outlast the forecast window; the real win/lose is 4.3's health meter) — the launchable needs the surge schedule + director traffic. HUD gains the panel + a strain legend; title → story 4.1.
++- **Golden:** NEW `demos/warn.dem` (era 3 + `fixture qos` + draws + lane categorization + burst): T1 pins forecast rows + the warning event stream at exact ticks; T2 captures = forecast countdown frame, amber frame, red/pressure frame (incl. the surge ACTIVE "NOW" frame). Re-bless = ALL `.t1`/`.log.bin` (catalog_hash fold — mechanical, cause-documented) + T2s that shift (a demo that strains at a capture gains rings/halos: sla + qos_contention (the saturated router row), qos_emphasis (era-3 load), qos.dem's 65 s capture (the panel + surge strain), lose.dem (its own stuck packet — the demo's scenario IS the strain: the residential telegraphs 🔴, cause-documented); boot/draw/flow/win/bundle/ecmp/place/demolish T2s stay pixel-identical — the negative proof) + `warn.dem` (new). **STOP + flag any shift beyond the documented set** (e.g. a zero-traffic demo's T2 moving).
++
++**Ask First:** none expected — thresholds/leads are GDD-canon starting points, tunable in balance.json.
++
++**Never:** no crisis firing / root_cause / preventive_redesign (4.2), no Network Health meter or win/lose changes (4.3), no new player commands, no E30 hysteresis/grace machinery (4.3), no windowed strain (the only smoothing is the fresh-spawn exclusion), no new catalogs, no floats in core, no maps in core, no changes to the demand director or the flow's drop ladder.
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| HAPPY_PATH | era-3 traffic + the streaming surge scheduled | amber → red node transitions with `Warning_Raised` at exact ticks; pressure mirrors on the bundle's pipes; forecast panel rows with countdowns | n/a |
++| Fresh spawn | a packet at its spawn tick | excluded from the node's strain (no flicker); the node reads healthy | n/a |
++| Relief | strain drops below amber | one `Warning_Cleared` naming the ended level per transition | n/a |
++| E24-like neutrality | zero demand | no strain, no events, warnings section absent from the hash | n/a |
++| Forecast boundaries | tick before `start-lead` / in window / active / after end | no row → row with exact countdown → countdown 0 + active → no row | n/a |
++| Terminal | run frozen after `Run_Lost` | warning state frozen (barrier — warning_evaluate never runs post-terminal) | n/a |
++| Replay | blessed log re-sim | identical strain levels + identical warning event stream (E10) | replay gate rejects divergence |
++| Catalog validation | amber ≥ red, or a lead ≤ 0 | load aborts with a named error | fail-fast (ODN-5) |
++
++## Code Map
++
++- `core/types.odin` -- `Strain_Level`, `Warning_Sign`, `Forecast_Entry`, `Crisis_State`, `Run_State.crisis`, `Event.sign`/`target`, tags 6/7, `run_init`/`run_destroy` wiring
++- `core/warnings.odin` (NEW) -- `warning_evaluate`: node strain + pipe pressure + forecast rows + transition events
++- `core/step.odin` -- the `warning_evaluate` call (after `flow_step`, before `win_lose_eval`)
++- `core/serialize.odin` -- the warnings section (absent-when-empty) + tag-conditional 6/7 payloads
++- `core/catalog.odin` -- `Balance.warnings` parse + fail-fast rows
++- `data/balance.json` -- the `warnings` block (the catalog_hash fold)
++- `core/warnings_test.odin` (NEW) -- the contract pins (I/O matrix rows + replay)
++- `core/catalog_test.odin` -- the warnings validation rows
++- `app/render/view.odin` -- `draw_world`/`draw_nodes` gain `crisis` + `tick`; health rings + `!`/`!!` glyphs + pulse; pressure overlay strokes
++- `app/render/forecast.odin` (NEW) -- the weather-report panel (app HUD + harness capture share it)
++- `app/main.odin` -- era-3 session, HUD panel call, title
++- `harness/goldens.odin` -- `capture_frame` gains `crisis` + `tick` + the panel draw
++- `demos/warn.dem` (NEW) -- the launchable golden
++- `goldens/*` -- documented re-bless (ALL `.t1`/`.log.bin`; shifted T2s; `warn.dem` new)
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `core/types.odin` -- the enums + `Crisis_State` + `Run_State.crisis` + Event fields/tags + init/destroy wiring
++- [x] `core/warnings.odin` (NEW) -- `warning_evaluate` (strain, pressure, forecast, transitions/events)
++- [x] `core/step.odin` -- the eval call in spine order
++- [x] `core/serialize.odin` -- the warnings section + tag-conditional payloads
++- [x] `core/catalog.odin` + `data/balance.json` -- the warnings block + fail-fast
++- [x] `core/warnings_test.odin` (NEW) -- every I/O-matrix row + the replay pin
++- [x] `core/catalog_test.odin` -- validation rows
++- [x] `app/render/view.odin` + `app/render/forecast.odin` (NEW) -- the warning render + panel
++- [x] `app/main.odin` -- era-3 session + HUD panel
++- [x] `harness/goldens.odin` -- capture signature + panel draw
++- [x] `demos/warn.dem` (NEW) -- author → run → read the actual warning-event stream → pin it in comments + tests
++- [x] Golden pass -- re-bless ALL (catalog_hash fold with proof), re-bless only cause-documented T2 shifts, STOP+flag anything else; `drift-check` green
++
++**Acceptance Criteria:**
++- Given era-3 traffic with the surge scheduled, when strain crosses the balance thresholds, then nodes/pipes transition amber → red with lead times in the data, `Warning_Raised`/`Cleared` events fire at exact ticks, and a 🔴 node is always traceable to a measured strain (ring + glyph + pulse — never color alone).
++- Given the forecast window, when the tick enters `start - lead`, then the forecast state carries the SetPiece with a countdown and the panel names it; the forecast never fires anything.
++- Given any run, when it replays from the action log, then identical warning state + identical event stream (E10).
++- Given the golden pass, when the harness runs, then every shifted golden has a documented cause (catalog_hash fold; the demo's own strain/panel content); zero-traffic demos' T2s are pixel-identical; any other shift STOPS the line.
++
++## Design Notes
++
++- **Why resident-units-excluding-the-spawn-tick:** "waiting = strain" is the honest telegraph. A packet that spawns at a healthy house and forwards next tick is at the node for one tick — counting it would flicker every house to 600 % (residential throughput 5 vs packet_bandwidth 30). Excluding `spawn_tick == tick` leaves only packets that FAILED to move — a stuck house (queue full / unroutable) or a backed-up junction. Router (40 u/s): amber at 1 waiting packet (75 %), red at 2 (150 %); content_host (80): amber at 2, red at 3; residential: red at any waiting packet (600 %) — honest: a stuck house IS critical.
++- **Per-pipe-slot strain mapping:** the render indexes by slot (O(1), no lookup); the pressure value is the BUNDLE's (pooled capacity is the capacity unit — the 2.1 model), replicated to each member pipe.
++- **The golden-shift story (the acceptance's "must not shift" clause):** the ONLY universal shift is the deliberate balance.json content fold into `catalog_hash` (the 3.2 precedent — every `.t1` hash + `.log.bin` header changes by construction). Traffic demos additionally shift where the demo itself strains: sla.dem / qos_contention.dem gain rings in strained captures; qos.dem's 65 s capture gains the panel + surge-strain; qos_emphasis.dem gains rings if its captures strain. Every one is cause-documented; boot/draw/place/flow/win/lose/ecmp/bundle/demolish T2s must stay pixel-identical (the negative proof). A shift with NO cause = STOP + flag.
++- **No forecast events:** the serialized forecast rows ARE the replay-proof pin (like the SLA section); the panel is a read. 4.2's `Crisis_Triggered` lands on the same event seam.
++- **The pulse is cosmetic:** a pinned 16-step table (CIRCLE16 precedent), phase from tick + node id, step-size differs by state (slow/fast) — deterministic in goldens, no transcendentals, never feeds back into state.
++- **warn.dem authoring:** era 3 director traffic + explicit burst spawns; the seeded sim makes every crossing tick exact. Author → run → READ the real event stream (scratch collection) → pin the ticks in the demo narrative + the test (the 3.4 golden-verified pattern).
++
++## Verification
++
++**Commands:**
++- `odin test core` -- all suites green incl. the new warnings_test pins
++- `tools/lint.sh` -- all 5 gates green
++- `tools/harness.sh run` -- green after the documented re-bless; the negative proof = zero-traffic demos' T2 pixels byte-identical
++- `tools/harness.sh save boot draw place flow win lose ecmp bundle demolish` -- must be T2 no-ops (pixel-identical; `.t1`/`.log.bin` re-bless only)
++- `tools/harness.sh save qos qos_emphasis qos_contention sla` -- cause-documented re-bless, then `tools/harness.sh run` -- PASS
++- `tools/harness.sh save warn` -- the new golden; `tools/harness.sh drift-check` -- every mutation rejected
++- `odin build app` + run -- era-3 session: the panel names the surge ~30 s out; oversubscribe → a node shows 🟡 with lead time, then 🔴; pipes show pressure
+\ No newline at end of file
+diff --git a/app/main.odin b/app/main.odin
+index eb41235..e770548 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -23,12 +23,15 @@ import rl "vendor:raylib"
+ WIN_W :: 1280
+ WIN_H :: 720
+ 
+-// 1.4 stub session config (the "hardcoded session": deliver-N win, tick-cap
+-// lose). These are scenario config (like the fixture positions), not tunable
+-// balance — the real win/lose (slice 4) replaces this with the SLA meter (S5).
+-// The harness demos carry their own goal/cap via .dem directives.
+-WIN_GOAL :: u32(1)            // deliver 1 packet to win
+-LOSE_TICK_CAP :: u64(30 * 20) // 30s at 20Hz — the lose cap for the playable loop
++// 1.4 stub session config — SUPERSEDED in the 4.1 session: the era-3 warning
++// sandbox (win/lose disabled — goal 0 + cap 0) so the launchable increment
++// outlasts the forecast window: the panel names the surge ~30 s out, the
++// surge fires (as director demand) at 60 s, and the player watches the strain
++// telegraph while oversubscribing. The real win/lose (4.3's Network Health
++// meter) replaces this stub wholesale.
++WIN_GOAL :: u32(0)            // 0 = win/lose disabled (4.1 session)
++LOSE_TICK_CAP :: u64(0)       // 0 = no cap (4.1 session)
++APP_ERA :: u8(3)              // 4.1: the streaming-surge era (director demand + the forecast schedule)
+ 
+ // Mode — the app-layer FSM (ODN-13, §9.5). Boot is the pre-loop transient; Run
+ // is the playable sim; Game_Over is the terminal screen (driven by the core's
+@@ -135,7 +138,7 @@ main :: proc() {
+ 		rl.BeginDrawing()
+ 		defer rl.EndDrawing()
+ 		rl.ClearBackground(app.palette.canvas)
+-		rnd.draw_world(&app.view, &app.state.topology, &app.state.bundles, &app.state.flow, app.drag, app.sel_pipe)
++		rnd.draw_world(&app.view, &app.state.topology, &app.state.bundles, &app.state.flow, &app.state.crisis, app.tick, app.drag, app.sel_pipe)
+ 		draw_hud(&app)
+ 	}
+ }
+@@ -151,6 +154,7 @@ start_run :: proc(app: ^App, seed: u64) {
+ 	}
+ 	pp.run_init(&app.state, seed, app.cat.hash, app.cat.balance.logic_hz)
+ 	app.res_id, app.rt_id, app.host_id = seed_fixture(&app.state, &app.cat)
++	app.state.era = APP_ERA            // 4.1: the streaming-surge era (run setup — the director + forecast schedule)
+ 	app.state.goal = app.win_goal       // the win/lose session config (run setup)
+ 	app.state.tick_cap = app.lose_tick_cap
+ 	app.tick = 0
+@@ -505,7 +509,7 @@ node_pos :: proc(app: ^App, id: u32) -> [2]i32 {
+ draw_hud :: proc(app: ^App) {
+ 	p := app.palette
+ 	// title
+-	draw_text(app, "Packet Plumber — v2 story 3.4 (per-class SLA + breach)", 12, 10, 22, p.ink)
++	draw_text(app, "Packet Plumber — v2 story 4.1 (warning signs + forecast)", 12, 10, 22, p.ink)
+ 
+ 	// the game-over screen: the WIN/LOSE toast (the terminal-event barrier
+ 	// guarantees exactly one outcome). The world still draws behind it; retry hint.
+@@ -528,8 +532,18 @@ draw_hud :: proc(app: ^App) {
+ 	} else {
+ 		draw_text(app, "draw source->router->sink; deliver a packet to win", 12, 36, 16, p.ink_soft)
+ 	}
+-	score := fmt.tprintf("delivered %d / %d", app.state.score, app.state.goal)
+-	draw_text(app, score, 12, 56, 16, p.ink_soft)
++	if app.state.goal > 0 {
++		score := fmt.tprintf("delivered %d / %d", app.state.score, app.state.goal)
++		draw_text(app, score, 12, 56, 16, p.ink_soft)
++	} else {
++		score := fmt.tprintf("delivered %d", app.state.score)
++		draw_text(app, score, 12, 56, 16, p.ink_soft)
++	}
++	// 4.1: the forecast weather report (top-right) + the strain legend. The
++	// panel draws zero pixels when the forecast is empty; the legend explains
++	// the telegraph (ring + glyph + pulse — never color alone).
++	rnd.draw_forecast_panel(&app.view, &app.state.crisis, &app.cat)
++	draw_text(app, "node: ring + ! glyph · pipe: halo — color is never the only signal", 12, 76, 14, p.ink_soft)
+ 
+ 	// 3.4: the per-class SLA gauges (the launchable increment) — bottom-left
+ 	// block, clear of the top-left run HUD + the QoS readout. Reads the
+diff --git a/app/render/forecast.odin b/app/render/forecast.odin
+new file mode 100644
+index 0000000..9ffd259
+--- /dev/null
++++ b/app/render/forecast.odin
+@@ -0,0 +1,66 @@
++package render
++
++// forecast.odin — the 4.1 forecast "weather report" panel (the P3 fairness
++// surface, GDD M5): names the incoming SetPieces with a countdown, so the
++// player sees the surge coming and has time to redesign. Screen-space HUD,
++// drawn by the app's draw_hud AND the harness's T2 capture (single source —
++// the golden is the panel). It READS the serialized forecast rows only; it
++// never fires anything (that is 4.2's Crisis Engine).
++//
++// Zero pixels when the forecast is empty (the golden-stability rule: demos
++// outside a forecast window keep byte-identical T2 frames). The countdown is
++// the core's countdown_ticks at the last step boundary — the view never
++// samples time (ODN-1: the app steps at logic_hz; the panel shows the sim's
++// own clock, which is what replay sees).
++
++import "core:fmt"
++import "core:strings"
++import pp "../../core"
++import rl "vendor:raylib"
++
++// draw_forecast_panel — the weather report at the top-right. Each row names a
++// set-piece inside its forecast window: "<CLASS> SURGE ×N — 12s" (or "NOW"
++// once active). Color + glyph + caption — never color alone. Draws NOTHING
++// when there are no rows (the capture-stability contract).
++draw_forecast_panel :: proc(v: ^View, crisis: ^pp.Crisis_State, cat: ^pp.Catalogs) {
++	if len(crisis.forecast) == 0 {
++		return
++	}
++	p := v.palette
++	// the panel card (top-right, clear of the top-left run HUD)
++	card_w := i32(230)
++	pad := i32(10)
++	line_h := i32(20)
++	title_h := i32(24)
++	x := v.win_w - card_w - pad
++	y := i32(10)
++	rows := len(crisis.forecast)
++	h := title_h + i32(rows) * line_h + pad
++	// translucent card so the map still reads behind it
++	card := rl.Color{255, 252, 244, 235}
++	rl.DrawRectangle(x - pad, y - pad, card_w + 2 * pad, h, card)
++	border := rl.Color{51, 65, 79, 40}
++	rl.DrawRectangleLines(x - pad, y - pad, card_w + 2 * pad, h, border)
++
++	draw_text_c(v, "WEATHER REPORT", x, y, 16, p.ink)
++	ty := y + title_h - 4
++	for f in crisis.forecast {
++		name := "SETPIECE"
++		if int(f.class) < len(cat.packet_types) {
++			name = cat.packet_types[f.class].display
++		}
++		mult := fmt.aprintf("SURGE x%d", f.multiplier, allocator = context.temp_allocator)
++		col := p.state_strain
++		when_suffix := ""
++		if f.active {
++			when_suffix = "NOW"
++			col = p.state_critical
++		} else {
++			secs := f.countdown_ticks / u64(max(1, cat.balance.logic_hz))
++			when_suffix = fmt.aprintf("-%ds", secs, allocator = context.temp_allocator)
++		}
++		line := strings.join({name, mult, when_suffix}, "  ", context.temp_allocator)
++		draw_text_c(v, line, x, ty, 15, col)
++		ty += line_h
++	}
++}
+diff --git a/app/render/palette.odin b/app/render/palette.odin
+index 0876fc4..c0f5a98 100644
+--- a/app/render/palette.odin
++++ b/app/render/palette.odin
+@@ -34,6 +34,12 @@ Palette :: struct {
+ 	lane_standard:    rl.Color,
+ 	lane_best_effort: rl.Color,
+ 	sel_halo:         rl.Color, // 3.2: the selected-pipe halo (translucent amber)
++	// 4.1: the warning-state triad (art-direction §6.1 — the node-health
++	// telegraph: ring + icon + pulse, never color alone). Loaded from
++	// palette.json like the rest; cosmetic only.
++	state_healthy:  rl.Color,
++	state_strain:   rl.Color,
++	state_critical: rl.Color,
+ 	// 3.3 canon (user ruling 2026-08-12): LANE SPEED = priority — packets
+ 	// move fastest on Express, slowest on Best-effort; motion is a per-lane
+ 	// readout alongside position + stroke width. Per-mille of the true
+@@ -88,6 +94,9 @@ palette_load :: proc(source: []byte = DEFAULT_PALETTE_JSON) -> Palette {
+ 	p.lane_standard = jcol(obj, "lane_standard", {108, 122, 142, 255})
+ 	p.lane_best_effort = jcol(obj, "lane_best_effort", {88, 152, 108, 255})
+ 	p.sel_halo = jcol(obj, "sel_halo", {232, 181, 68, 90})
++	p.state_healthy = jcol(obj, "state_healthy", {55, 214, 122, 255})
++	p.state_strain = jcol(obj, "state_strain", {242, 181, 68, 255})
++	p.state_critical = jcol(obj, "state_critical", {232, 69, 69, 255})
+ 	// 3.3: lane-speed readout (per-mille of the true along-edge fraction).
+ 	// Any non-integer element falls back to the DEFAULTS for the whole array
+ 	// (review: a partial parse would freeze one lane at speed 0 silently).
+@@ -138,6 +147,9 @@ fallback_palette :: proc() -> Palette {
+ 	p.lane_standard = {108, 122, 142, 255}
+ 	p.lane_best_effort = {88, 152, 108, 255}
+ 	p.sel_halo = {232, 181, 68, 90}
++	p.state_healthy = {55, 214, 122, 255}
++	p.state_strain = {242, 181, 68, 255}
++	p.state_critical = {232, 69, 69, 255}
+ 	p.lane_speeds = {1000, 850, 700}
+ 	return p
+ }
+diff --git a/app/render/view.odin b/app/render/view.odin
+index 95f3df4..a2629ec 100644
+--- a/app/render/view.odin
++++ b/app/render/view.odin
+@@ -74,13 +74,17 @@ node_screen :: proc(v: ^View, pos: [2]i32) -> rl.Vector2 {
+ 
+ // draw_world :: the world pass: map -> bundles(pipes) -> nodes -> packets ->
+ // drag ghost. Packets draw ON TOP of pipes + nodes so mid-traversal dots are
+-// visible. The view reads ONLY the topology + bundles + flow (ODN-1: never
+-// perturbs sim state). `sel` is the selected pipe id (app interaction; -1 =
+-// none — the harness passes the default, so goldens never carry selection UI).
+-draw_world :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, drag: Drag_State, sel: i64 = -1) {
++// visible. The view reads ONLY the topology + bundles + flow + the 4.1 crisis
++// snapshot (ODN-1: never perturbs sim state). `crisis` drives the warning
++// telegraph (node rings + pipe pressure overlays) — the DERIVED strain
++// levels, read-only; `tick` drives the ring pulse phase (deterministic — the
++// harness captures at exact ticks, so the pulse is golden-stable). `sel` is
++// the selected pipe id (app interaction; -1 = none — the harness passes the
++// default, so goldens never carry selection UI).
++draw_world :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, crisis: ^pp.Crisis_State, tick: u64, drag: Drag_State, sel: i64 = -1) {
+ 	map_draw(v)
+-	draw_bundles(v, topo, bundles, flow)
+-	draw_nodes(v, topo)
++	draw_bundles(v, topo, bundles, flow, crisis)
++	draw_nodes(v, topo, crisis, tick)
+ 	draw_packets(v, topo, bundles, flow)
+ 	if drag.active && drag.placing < 0 {
+ 		draw_ghost(v, topo, drag)
+@@ -191,7 +195,39 @@ lane_bands :: proc(caps: [3]u32, width: f32) -> Lane_Bands {
+ // by canon. The fiber core draws UNDER the strokes (hidden on allocated
+ // pipes — the lane read always wins; visible only before the first flow_step,
+ // when lane_caps are still empty).
+-draw_bundles :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State) {
++// PULSE16 — the pinned 16-step pulse envelope (the §10.4 no-transcendentals
++// rule — same technique as CIRCLE16). The ring radius scales by this factor;
++// the phase steps through the table at a per-state rate (slow amber ~1.2 Hz,
++// fast red ~2.5 Hz at 20 Hz logic) so the pulse is deterministic from the
++// tick (golden-stable) and reads as motion (reduced-motion toggle is a later
++// accessibility pass; the ring + icon carry the state without it).
++PULSE16 :: [16]f32{0.04, 0.18, 0.38, 0.55, 0.71, 0.84, 0.93, 0.99, 1.0, 0.96, 0.86, 0.71, 0.53, 0.35, 0.18, 0.05}
++
++// pulse_factor — the ring's pulse scale for a node this tick. Phase is seeded
++// by the node id so sibling nodes do not pulse in lockstep; the step size is
++// the per-state rate (amber 1 tick/step = 1.25 Hz, red 2 ticks/step = 2.5 Hz
++// at 20 Hz — the art-direction §6.1 slow/fast language).
++pulse_factor :: proc(tick: u64, node_id: u32, step: u32) -> f32 {
++	table := PULSE16 // local copy — a constant can't be indexed by a runtime index
++	idx := (tick + u64(node_id) * 5) / u64(step) & 15
++	return table[idx]
++}
++
++// bundle_strain_level — a bundle's warning level, read from the per-pipe
++// strain snapshot (all member pipes carry the same level by construction —
++// the level is derived per bundle; the first live member wins).
++bundle_strain_level :: proc(topo: ^pp.Topology, bundles: ^pp.Bundles, crisis: ^pp.Crisis_State, bi: u32) -> pp.Strain_Level {
++	for ps in 0..<len(topo.pipe_alive) {
++		if !topo.pipe_alive[ps] { continue }
++		if int(ps) >= len(crisis.pipe_strain) { continue }
++		if int(ps) >= len(bundles.pipe_bundle) { continue }
++		if bundles.pipe_bundle[ps] != bi { continue }
++		return crisis.pipe_strain[ps]
++	}
++	return .None
++}
++
++draw_bundles :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, crisis: ^pp.Crisis_State) {
+ 	p := v.palette
+ 	for bi in 0..<int(bundles.n) {
+ 		lo, hi := bundles.bundle_lo[bi], bundles.bundle_hi[bi]
+@@ -240,11 +276,31 @@ draw_bundles :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^
+ 			rl.DrawCircleV(pa, bands.widths[lane] * 0.5, lane_cols[lane])
+ 			rl.DrawCircleV(pb, bands.widths[lane] * 0.5, lane_cols[lane])
+ 		}
++
++		// 4.1 pipe-pressure overlay: a translucent state-colored halo stroke
++		// around the whole pooled link when its bundle is pressured/critical
++		// (the telegraph — color + width jump, and the state colors are the
++		// same triad the node rings use). Never color alone: the halo is an
++		// OUTER ring shape beyond the pipe edges (shape + outline), and the
++		// forecast panel names the cause. Healthy bundles draw nothing — the
++		// overlay is the warning, not a decoration.
++		lvl := bundle_strain_level(topo, bundles, crisis, u32(bi))
++		if lvl != .None {
++			halo := p.state_strain
++			if lvl == .Red {
++				halo = p.state_critical
++			}
++			halo.a = 110
++			w := width + 5.0 * v.scale
++			rl.DrawLineEx(a, b, w, halo)
++			rl.DrawCircleV(a, w * 0.5, halo)
++			rl.DrawCircleV(b, w * 0.5, halo)
++		}
+ 	}
+ }
+ 
+ 
+-draw_nodes :: proc(v: ^View, topo: ^pp.Topology) {
++draw_nodes :: proc(v: ^View, topo: ^pp.Topology, crisis: ^pp.Crisis_State, tick: u64) {
+ 	for i in 0..<len(topo.node_alive) {
+ 		if !topo.node_alive[i] {
+ 			continue
+@@ -255,7 +311,56 @@ draw_nodes :: proc(v: ^View, topo: ^pp.Topology) {
+ 		} else {
+ 			draw_building(v, topo.node_id[i], topo.node_role[i], c)
+ 		}
++		// 4.1 health telegraph: the ring + glyph + pulse surface, drawn on top
++		// of the node form. Renders ONLY on non-healthy states (a healthy node
++		// draws nothing — the canon's ambient ring is slice-7 juice; the
++		// warning states are the 4.1 contract). Triple-redundant per
++		// art-direction §6.1: color (state triad) + ring pulse rate + glyph
++		// (never color alone).
++		lvl := pp.Strain_Level.None
++		if i < len(crisis.node_strain) {
++			lvl = crisis.node_strain[i]
++		}
++		if lvl != .None {
++			draw_health_ring(v, lvl, topo.node_id[i], c, tick)
++		}
++	}
++}
++
++// draw_health_ring — the warning-state ring: state-colored ring outline +
++// `!` / `!!` glyph above the node, radius modulated by the pinned pulse table
++// (slow for Amber, fast for Red — art-direction §6.1). Shape + outline +
++// glyph + pulse all carry the state; the color is one of four encoders.
++draw_health_ring :: proc(v: ^View, lvl: pp.Strain_Level, node_id: u32, c: rl.Vector2, tick: u64) {
++	p := v.palette
++	s := v.tile_px * v.scale
++	col := p.state_strain
++	step: u32 = 16 // slow amber pulse ~1.25 Hz @ 20 Hz logic
++	glyph := "!"
++	if lvl == .Red {
++		col = p.state_critical
++		step = 8 // fast critical pulse ~2.5 Hz
++		glyph = "!!"
++	}
++	base := s * 0.62
++	r := base * (0.92 + 0.28 * pulse_factor(tick, node_id, step))
++	// outline: two strokes (outer state ring + inner soft glow) so the ring
++	// reads as a distinct shape, not a color smudge. DrawCircleLinesV has no
++	// thickness — concentric circles fake the stroke (immediate-mode, cheap).
++	th := 2.5 * v.scale
++	for k in 0..<i32(th) {
++		rl.DrawCircleLinesV(c, r - f32(k) * v.scale, col)
+ 	}
++	soft := col
++	soft.a = 90
++	rl.DrawCircleLinesV(c, r + 3.5 * v.scale, soft)
++	// the glyph (icon — the shape encoder; the font is the raylib default,
++	// software-rendered in the harness so T2 goldens carry it)
++	fs := i32(max(14, s * 0.5))
++	cw := i32(len(glyph)) * fs / 2
++	x := i32(c.x) - cw / 2
++	y := i32(c.y - r - s * 0.42) - fs / 2
++	draw_text_c(v, glyph, x, y, fs, col)
+ }
+ 
+ // residential = peaked-roof house (varied cheerful body); content_host = server
+@@ -294,6 +399,18 @@ draw_building :: proc(v: ^View, id: u32, role: pp.Terminal_Role, c: rl.Vector2)
+ 	rl.DrawRectangleV({c.x - dw/2, top + h - s * 0.3}, {dw, s * 0.3}, roof)
+ }
+ 
++// draw_text_c — the render package's small DrawText helper (the app's
++// main.odin has its own; the harness capture uses this one). The render
++// package must not depend on the app package, so the helper lives here.
++draw_text_c :: proc(v: ^View, txt: string, x, y, size: i32, col: rl.Color) {
++	cbuf := make([dynamic]u8, 0, len(txt)+1, context.temp_allocator)
++	for ch in txt {
++		append(&cbuf, u8(ch))
++	}
++	append(&cbuf, 0)
++	rl.DrawText(cstring(raw_data(cbuf)), x, y, size, col)
++}
++
+ // draw_router — the capacity-scaled puck (A3): body disc + dark core + a 4-LED
+ // ring (the basic router's ports — canon #14 made visible). LEDs sit on a
+ // pinned 16-gon (4 ports divide 16); no transcendentals in the geometry.
+diff --git a/core/catalog.odin b/core/catalog.odin
+index 3244802..f43501f 100644
+--- a/core/catalog.odin
++++ b/core/catalog.odin
+@@ -171,6 +171,10 @@ Balance :: struct {
+ 	// fail-fast validated at load (ODN-5), and folded into catalog_hash.
+ 	lane_queue_packets: i32, // E9: a lane queue sheds (drop ladder) at this depth
+ 	pool_max_packets:   i32, // E22: in-flight cap; the spawn-side ladder drops at this depth
++	// 4.1: the warning-sign thresholds + lead times (art-direction §6.1
++	// "Trigger [balance.json]"; GDD Numerical Design). Integer percents +
++	// tick counts — fail-fast validated at load (amber < red <= 100, leads > 0).
++	warnings: Warning_Balance,
+ 	// 3.2: the emphasis-dial presets (GDD M2 lever 2 — "MVP exposes this as a
+ 	// single 'priority emphasis' dial per pipe"). lane_presets are the dial's
+ 	// positions; default_preset_idx is the "balanced" resting position every
+@@ -179,6 +183,22 @@ Balance :: struct {
+ 	default_preset_idx:  u16,
+ }
+ 
++// Warning_Balance — the 4.1 warning thresholds + lead times (balance.json
++// `warnings` block). All integer (ODN-10); the leads are the GDD M5 lead
++// times in ticks (@ logic_hz: strained 30 s = 600, critical 10 s = 200,
++// pressure 20 s = 400). The UI reads the leads from here for the telegraph;
++// the serialized warning state carries the LEVELS only (the catalog_hash fold
++// pins the numbers to the run).
++Warning_Balance :: struct {
++	node_amber_pct:             i32, // strain >= this -> node 🟡 (art-direction: 70)
++	node_red_pct:               i32, // strain >= this -> node 🔴 (art-direction: 90)
++	pipe_amber_pct:             i32, // bundle load >= this -> pipe pressure 🟡 (70)
++	pipe_red_pct:               i32, // bundle load >= this -> pipe critical 🔴 (90)
++	node_strained_lead_ticks:   u64, // 🟡 lead time to failure (GDD: 30 s)
++	node_critical_lead_ticks:   u64, // 🔴 lead time (GDD: 10 s)
++	pipe_pressure_lead_ticks:   u64, // pressure lead time (GDD: 20 s)
++}
++
+ // Lane_Preset — one dial position: a displayable name + 3 integer WFQ weights
+ // (Express/Standard/Best-effort; 0 ≤ w ≤ MAX_WEIGHT, never all-zero — the E5
+ // all-zero fallback belongs to the allocator, a data preset that zeros every
+@@ -499,6 +519,29 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 		if b.pool_max_packets <= 0 {
+ 			return {"balance.json", "pool_max_packets", "pool_max_packets must be > 0 (in-flight pool cap, E22)"}
+ 		}
++		// 4.1: the warning-sign thresholds + lead times (art-direction §6.1
++		// "Trigger [balance.json]"). Fail-fast: amber < red <= 100 (a flat or
++		// inverted ladder would make a state unreachable), leads > 0 (a zero
++		// lead would lie about the reaction window — the FORGE #3 fairness
++		// surface).
++		if wobj, okw := obj["warnings"].(json.Object); okw {
++			b.warnings.node_amber_pct = jint(wobj, "node_amber_pct", 0)
++			b.warnings.node_red_pct = jint(wobj, "node_red_pct", 0)
++			b.warnings.pipe_amber_pct = jint(wobj, "pipe_amber_pct", 0)
++			b.warnings.pipe_red_pct = jint(wobj, "pipe_red_pct", 0)
++			b.warnings.node_strained_lead_ticks = u64(jint(wobj, "node_strained_lead_ticks", 0))
++			b.warnings.node_critical_lead_ticks = u64(jint(wobj, "node_critical_lead_ticks", 0))
++			b.warnings.pipe_pressure_lead_ticks = u64(jint(wobj, "pipe_pressure_lead_ticks", 0))
++		}
++		if b.warnings.node_amber_pct < 0 || b.warnings.node_red_pct <= b.warnings.node_amber_pct ||
++			b.warnings.node_red_pct > 100 || b.warnings.pipe_amber_pct < 0 ||
++			b.warnings.pipe_red_pct <= b.warnings.pipe_amber_pct || b.warnings.pipe_red_pct > 100 {
++			return {"balance.json", "warnings", "strain ladder must satisfy 0 <= amber < red <= 100 (node + pipe)"}
++		}
++		if b.warnings.node_strained_lead_ticks == 0 || b.warnings.node_critical_lead_ticks == 0 ||
++			b.warnings.pipe_pressure_lead_ticks == 0 {
++			return {"balance.json", "warnings", "lead times must be > 0 (the FORGE #3 reaction-window surface)"}
++		}
+ 		if mp, okm := obj["map"].(json.Object); okm {
+ 			b.map_w_tiles = jint(mp, "w_tiles", 0)
+ 			b.map_h_tiles = jint(mp, "h_tiles", 0)
+diff --git a/core/catalog_test.odin b/core/catalog_test.odin
+index c350516..a64a4e4 100644
+--- a/core/catalog_test.odin
++++ b/core/catalog_test.odin
+@@ -10,6 +10,7 @@ package core
+ // set-piece negative-tick u64 wrap, strict integer-only sim fields, duplicate
+ // era rows, and the email/streaming required-content cross-checks.
+ 
++import "core:fmt"
+ import "core:testing"
+ import "core:strings"
+ 
+@@ -37,6 +38,15 @@ TIER_VALID :: `{"entries": [
+ BAL_VALID :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_bandwidth": 30,
+   "lane_queue_packets": 6,
+   "pool_max_packets": 512,
++  "warnings": {
++    "node_amber_pct": 70,
++    "node_red_pct": 90,
++    "pipe_amber_pct": 70,
++    "pipe_red_pct": 90,
++    "node_strained_lead_ticks": 600,
++    "node_critical_lead_ticks": 200,
++    "pipe_pressure_lead_ticks": 400
++  },
+   "lane_presets": [
+     {"id": "balanced", "display_name": "Balanced", "weights": [1, 1, 1]},
+     {"id": "express_heavy", "display_name": "Express-heavy", "weights": [4, 2, 1]},
+@@ -192,9 +202,9 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 	bal_rows := []struct {
+ 		label, doc, rule: string
+ 	}{
+-		{"presets missing", `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_bandwidth": 30, "lane_queue_packets": 6, "pool_max_packets": 512, "map": {"w_tiles": 40, "h_tiles": 30, "tile_px": 26}}`, "missing or empty"},
+-		{"presets empty", `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_bandwidth": 30, "lane_queue_packets": 6, "pool_max_packets": 512, "lane_presets": [], "map": {"w_tiles": 40, "h_tiles": 30, "tile_px": 26}}`, "missing or empty"},
+-		{"empty preset id", `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_bandwidth": 30, "lane_queue_packets": 6, "pool_max_packets": 512, "lane_presets": [{"id": "", "display_name": "X", "weights": [1,1,1]}], "default_lane_preset": "balanced", "map": {"w_tiles": 40, "h_tiles": 30, "tile_px": 26}}`, "preset id empty"},
++		{"presets missing", `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_bandwidth": 30, "lane_queue_packets": 6, "pool_max_packets": 512, "warnings": {"node_amber_pct": 70, "node_red_pct": 90, "pipe_amber_pct": 70, "pipe_red_pct": 90, "node_strained_lead_ticks": 600, "node_critical_lead_ticks": 200, "pipe_pressure_lead_ticks": 400}, "map": {"w_tiles": 40, "h_tiles": 30, "tile_px": 26}}`, "missing or empty"},
++		{"presets empty", `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_bandwidth": 30, "lane_queue_packets": 6, "pool_max_packets": 512, "warnings": {"node_amber_pct": 70, "node_red_pct": 90, "pipe_amber_pct": 70, "pipe_red_pct": 90, "node_strained_lead_ticks": 600, "node_critical_lead_ticks": 200, "pipe_pressure_lead_ticks": 400}, "lane_presets": [], "map": {"w_tiles": 40, "h_tiles": 30, "tile_px": 26}}`, "missing or empty"},
++		{"empty preset id", `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_bandwidth": 30, "lane_queue_packets": 6, "pool_max_packets": 512, "warnings": {"node_amber_pct": 70, "node_red_pct": 90, "pipe_amber_pct": 70, "pipe_red_pct": 90, "node_strained_lead_ticks": 600, "node_critical_lead_ticks": 200, "pipe_pressure_lead_ticks": 400}, "lane_presets": [{"id": "", "display_name": "X", "weights": [1,1,1]}], "default_lane_preset": "balanced", "map": {"w_tiles": 40, "h_tiles": 30, "tile_px": 26}}`, "preset id empty"},
+ 		{"weights wrong arity", replace1(BAL_VALID, `[1, 1, 1]`, `[1, 1]`, 1), "weights must be a 3-int array"},
+ 		{"weights non-int", replace1(BAL_VALID, `[1, 1, 1]`, `[1, "x", 1]`, 1), "weights must be integers"},
+ 		{"weight negative", replace1(BAL_VALID, `[1, 1, 1]`, `[-1, 1, 1]`, 1), "weights must be in 0..MAX_WEIGHT"},
+@@ -209,6 +219,25 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		{"unknown default preset", replace1(BAL_VALID, `"default_lane_preset": "balanced"`, `"default_lane_preset": "nope"`, 1), "default_lane_preset not found"},
+ 		{"duplicate preset id", replace1(BAL_VALID, `"id": "balanced"`, `"id": "express_heavy"`, 1), "duplicate preset id"},
+ 		{"duplicate preset weights", replace1(BAL_VALID, `"id": "express_heavy", "display_name": "Express-heavy", "weights": [4, 2, 1]`, `"id": "express_heavy", "display_name": "Express-heavy", "weights": [1, 1, 1]`, 1), "duplicate preset weights"},
++		// 4.1 warnings rows — the strain ladder + lead-time fail-fasts
++		{"warnings block missing", replace1(BAL_VALID, `  "warnings": {
++    "node_amber_pct": 70,
++    "node_red_pct": 90,
++    "pipe_amber_pct": 70,
++    "pipe_red_pct": 90,
++    "node_strained_lead_ticks": 600,
++    "node_critical_lead_ticks": 200,
++    "pipe_pressure_lead_ticks": 400
++  },`, ``, 1), "strain ladder"},
++		{"node amber negative", replace1(BAL_VALID, `"node_amber_pct": 70`, `"node_amber_pct": -1`, 1), "strain ladder"},
++		{"node red zero", replace1(BAL_VALID, `"node_red_pct": 90`, `"node_red_pct": 0`, 1), "strain ladder"},
++		{"node amber >= red", replace1(BAL_VALID, `"node_amber_pct": 70`, `"node_amber_pct": 95`, 1), "strain ladder"},
++		{"node red over 100", replace1(BAL_VALID, `"node_red_pct": 90`, `"node_red_pct": 101`, 1), "strain ladder"},
++		{"pipe amber >= red", replace1(BAL_VALID, `"pipe_amber_pct": 70`, `"pipe_amber_pct": 95`, 1), "strain ladder"},
++		{"pipe red over 100", replace1(BAL_VALID, `"pipe_red_pct": 90`, `"pipe_red_pct": 101`, 1), "strain ladder"},
++		{"node strained lead zero", replace1(BAL_VALID, `"node_strained_lead_ticks": 600`, `"node_strained_lead_ticks": 0`, 1), "lead times"},
++		{"node critical lead zero", replace1(BAL_VALID, `"node_critical_lead_ticks": 200`, `"node_critical_lead_ticks": 0`, 1), "lead times"},
++		{"pipe pressure lead zero", replace1(BAL_VALID, `"pipe_pressure_lead_ticks": 400`, `"pipe_pressure_lead_ticks": 0`, 1), "lead times"},
+ 	}
+ 	for r in bal_rows {
+ 		check_reject_balance(t, r.doc, r.rule)
+diff --git a/core/determinism_test.odin b/core/determinism_test.odin
+index 4244743..e4bd87d 100644
+--- a/core/determinism_test.odin
++++ b/core/determinism_test.odin
+@@ -43,6 +43,16 @@ test_catalog :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalog
+ 	// queue bound (E9) + the global in-flight pool cap (E22 backstop).
+ 	cat.balance.lane_queue_packets = 6
+ 	cat.balance.pool_max_packets = 512
++	// 4.1: the warning thresholds + lead times (mirrors data/balance.json) —
++	// zeroed thresholds would make ZERO strain read as Red (strain_level is
++	// inclusive), so the tests must carry the real ladder like the loader.
++	cat.balance.warnings = Warning_Balance{
++		node_amber_pct = 70, node_red_pct = 90,
++		pipe_amber_pct = 70, pipe_red_pct = 90,
++		node_strained_lead_ticks = 600,
++		node_critical_lead_ticks = 200,
++		pipe_pressure_lead_ticks = 400,
++	}
+ 	// 3.2: the emphasis-dial presets (mirrors data/balance.json) — balanced is
+ 	// the default every pipe starts on + the E5 all-zero fallback.
+ 	cat.balance.lane_presets = make([dynamic]Lane_Preset, 0, 4, allocator)
+diff --git a/core/flow.odin b/core/flow.odin
+index 3899668..34dd430 100644
+--- a/core/flow.odin
++++ b/core/flow.odin
+@@ -41,6 +41,7 @@ Packet :: struct {
+ 	edge:           u32, // pipe id being traversed (valid when on_edge)
+ 	heading:        u32, // far-endpoint node id of `edge` (valid when on_edge)
+ 	progress_units: u32, // bandwidth units served on the current edge
++	waiting_ticks:  u32, // 4.1: consecutive forward attempts FAILED at the current node (no route); 0 for on-edge/fresh packets
+ 	spawn_tick:     u64,
+ 	delivered:      bool,
+ }
+@@ -665,8 +666,14 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 		}
+ 		offset, count, ok := routing_equal_cost_hops(&state.routing, &state.topology, p.at_node, p.dst)
+ 		if !ok || count == 0 {
+-			continue // no route yet (incomplete graph) — wait here; re-tries
+-			         // next tick once a topology change rebuilds the table
++			// no route yet (incomplete graph) — wait here; re-tries next tick once
++			// a topology change rebuilds the table. 4.1: the wait is COUNTED
++			// (waiting_ticks) — the 4.1 node-strain telegraph measures packets
++			// that FAILED a forward attempt (a fresh arrival that forwards next
++			// tick never strains; an unroutable pile-up does — the honest
++			// "stuck" signal, no healthy-transit flicker).
++			p.waiting_ticks += 1
++			continue
+ 		}
+ 		pick := ecmp_pick(p.src, p.dst, u8(p.class), p.id, count) // 3.1: per-class ECMP hash (flow affinity by class)
+ 		hop := state.routing.hops[int(offset) + int(pick)]
+@@ -708,6 +715,7 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 		p.edge = hop.pipe
+ 		p.heading = hop.node
+ 		p.progress_units = 0
++		p.waiting_ticks = 0 // 4.1: a successful forward clears the stuck counter
+ 		append(&forwarded, p.id)
+ 	}
+ 	// apply the collected drops. The list is in APPEND order (pass order),
+@@ -742,6 +750,7 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 		}
+ 		p.on_edge = false
+ 		p.progress_units = 0
++		p.waiting_ticks = 0 // 4.1: a severed drop-back re-tries fresh next tick
+ 	}
+ 
+ 	// 4. SERVE — 3.3 node serialization (ODN-3): per bundle, serve the on-edge
+diff --git a/core/qos_test.odin b/core/qos_test.odin
+index 8dbcba7..fe98e96 100644
+--- a/core/qos_test.odin
++++ b/core/qos_test.odin
+@@ -295,10 +295,10 @@ qos_first_word_after_topology :: proc(dump: []u8) -> (word: u32, ok: bool) {
+ 	r_u64(&r) // tick_cap
+ 	r_u8(&r)  // terminal
+ 	r_u8(&r)  // outcome
+-	n := r_u32(&r) // flow packets (11 fields each)
++	n := r_u32(&r) // flow packets (12 fields each)
+ 	for i in 0..<int(n) {
+ 		r_u64(&r); r_u16(&r); r_u32(&r); r_u32(&r); r_u8(&r)
+-		r_u32(&r); r_u32(&r); r_u32(&r); r_u32(&r); r_u64(&r); r_u8(&r)
++		r_u32(&r); r_u32(&r); r_u32(&r); r_u32(&r); r_u32(&r); r_u64(&r); r_u8(&r)
+ 	}
+ 	n = r_u32(&r) // flow demand (4 fields each)
+ 	for i in 0..<int(n) {
+diff --git a/core/serialize.odin b/core/serialize.odin
+index 8c23d95..6a58ed9 100644
+--- a/core/serialize.odin
++++ b/core/serialize.odin
+@@ -116,6 +116,7 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event, cat: ^Catalogs,
+ 		w_u32(&w, p.edge)
+ 		w_u32(&w, p.heading)
+ 		w_u32(&w, p.progress_units)
++		w_u32(&w, p.waiting_ticks) // 4.1: the failed-forward counter (the node-strain measure rides the hash)
+ 		w_u64(&w, p.spawn_tick)
+ 		w_bool(&w, p.delivered)
+ 	}
+@@ -165,6 +166,57 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event, cat: ^Catalogs,
+ 		}
+ 	}
+ 
++	// 4.1 warning state — SERIALIZED (the T1 golden contract: "T1 of the
++	// forecast + warning state", E10) but ABSENT-WHEN-EMPTY: while no node/
++	// pipe strains and no set-piece is inside its forecast window the section
++	// is omitted entirely, so zero-traffic ticks hash byte-identically modulo
++	// the catalog_hash fold (the golden-stability rule). The DERIVED per-slot
++	// arrays are never serialized in full — only the non-None entries (node id
++	// + level / pipe id + level, in slot order — deterministic) + the forecast
++	// rows (set-piece order). Replay re-derives identical rows from the
++	// serialized flow + topology + era + tick.
++	c := &state.crisis
++	nt := &state.topology
++	non_none_nodes := 0
++	for i in 0..<len(c.node_strain) {
++		if i < len(nt.node_alive) && nt.node_alive[i] && c.node_strain[i] != .None {
++			non_none_nodes += 1
++		}
++	}
++	non_none_pipes := 0
++	for i in 0..<len(c.pipe_strain) {
++		if i < len(nt.pipe_alive) && nt.pipe_alive[i] && c.pipe_strain[i] != .None {
++			non_none_pipes += 1
++		}
++	}
++	if non_none_nodes > 0 || non_none_pipes > 0 || len(c.forecast) > 0 {
++		w_u32(&w, u32(non_none_nodes))
++		for i in 0..<len(c.node_strain) {
++			if i >= len(nt.node_alive) || !nt.node_alive[i] || c.node_strain[i] == .None {
++				continue
++			}
++			w_u32(&w, nt.node_id[i])
++			w_u8(&w, u8(c.node_strain[i]))
++		}
++		w_u32(&w, u32(non_none_pipes))
++		for i in 0..<len(c.pipe_strain) {
++			if i >= len(nt.pipe_alive) || !nt.pipe_alive[i] || c.pipe_strain[i] == .None {
++				continue
++			}
++			w_u32(&w, nt.pipe_id[i])
++			w_u8(&w, u8(c.pipe_strain[i]))
++		}
++		w_u32(&w, u32(len(c.forecast)))
++		for fe in c.forecast {
++			w_u16(&w, fe.sp_index)
++			w_u16(&w, fe.class)
++			w_i32(&w, fe.multiplier)
++			w_u64(&w, fe.start_tick)
++			w_u64(&w, fe.countdown_ticks)
++			w_bool(&w, fe.active)
++		}
++	}
++
+ 	// the Topology — the network commands mutate. Serialized slot-by-slot
+ 	// (alive flags included so tombstones/id-monotonicity ride in the hash,
+ 	// E11), in insertion order (stable, ODN-10). THIS is what makes the drawn
+@@ -297,6 +349,10 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event, cat: ^Catalogs,
+ 			w_u8(&w, e.metric)
+ 			w_u8(&w, e.direction)
+ 		}
++		if e.tag == EVENT_TAG_WARNING_RAISED || e.tag == EVENT_TAG_WARNING_CLEARED {
++			w_u8(&w, e.sign)
++			w_u32(&w, e.target)
++		}
+ 	}
+ 
+ 	return w
+diff --git a/core/step.odin b/core/step.odin
+index f876aa0..e6f01bf 100644
+--- a/core/step.odin
++++ b/core/step.odin
+@@ -79,6 +79,14 @@ step :: proc(state: ^Run_State, tick: u64, commands: []Command, cat: ^Catalogs)
+ 	// A delivery increments state.score (the win metric).
+ 	flow_step(state, tick, cat)
+ 
++	// 4.1: the warning surface (S4, telegraph only) — strain metrics from the
++	// settled flow -> node 🟡/🔴 + pipe pressure + the demand forecast, all
++	// with lead times (balance.json `warnings`). Evaluated AFTER flow_step
++	// (the counters are final) and BEFORE win_lose_eval (the spine's order:
++	// flow -> crisis -> win/lose). Warning_Raised/Cleared events ride the T1
++	// hash (E10). Firing anything is 4.2; this only ever *names* trouble.
++	warning_evaluate(state, tick, cat)
++
+ 	// the win/lose gate (1.4 stub, §6.5): score >= goal -> Run_Won; tick cap hit
+ 	// with score < goal -> Run_Lost. Appends exactly one terminal event + latches
+ 	// `terminal`/`outcome`; the barrier above freezes subsequent ticks (E17).
+diff --git a/core/types.odin b/core/types.odin
+index 441551d..b7dafd5 100644
+--- a/core/types.odin
++++ b/core/types.odin
+@@ -168,6 +168,53 @@ Sla_Direction :: enum u8 {
+ 	Exit,
+ }
+ 
++// Strain_Level — the tri-state warning level shared by nodes + pipes (4.1).
++// None = healthy (no telegraph); Amber = strained/pressured; Red = critical.
++// The art-direction §6.1 thresholds (70/90 %) live in balance.json `warnings`.
++Strain_Level :: enum u8 {
++	None,
++	Amber,
++	Red,
++}
++
++// Warning_Sign — which warning a Warning_Raised / Warning_Cleared event names
++// (4.1). Carried by the event payload (`sign`) next to the `target` (node id
++// for node signs, pipe id for pipe signs). The GDD M5 lead times (strained
++// 30 s / critical 10 s / pressure 20 s) ride balance.json, not the event.
++Warning_Sign :: enum u8 {
++	Node_Strained,  // a node entered Amber
++	Node_Critical,  // a node entered Red
++	Pipe_Pressure,  // a pipe's bundle entered Amber
++	Pipe_Critical,  // a pipe's bundle entered Red
++}
++
++// Forecast_Entry — one scheduled set-piece inside its forecast window (4.1):
++// the demand director's schedule, read-only (the forecast NEVER fires anything
++// — that is 4.2's Crisis Engine). Window = [start_tick - forecast_lead_ticks,
++// start_tick + duration_ticks); countdown_ticks = start_tick - tick (0 once
++// the set-piece is active — the panel shows "NOW").
++Forecast_Entry :: struct {
++	sp_index:        u16,  // index into the era's set_pieces (catalog)
++	class:           u16,  // packet_types index (the surge's class)
++	multiplier:      i32,  // the set-piece's spawn multiplier (x10 surge)
++	start_tick:      u64,
++	countdown_ticks: u64,
++	active:          bool, // tick >= start_tick (inside the active span)
++}
++
++// Crisis_State — the 4.1 warning surface (arch §8.2: warnings/forecast rows
++// owned by Run_State). ALL fields are DERIVED per tick inside warning_evaluate
++// (warnings.odin) from serialized state (topology + packets + era + tick +
++// catalogs) — rebuilt identically on replay, same status as lane_caps /
++// sla_breach: NEVER serialized in full. The serializer emits only the non-None
++// entries + forecast rows (absent-when-empty) so the T1 golden pins the
++// warning state (E10) without binding replay to the derivation order.
++Crisis_State :: struct {
++	node_strain: [dynamic]Strain_Level, // parallel to Topology node slots (slot i = node slot i)
++	pipe_strain: [dynamic]Strain_Level, // parallel to Topology pipe slots (a pipe's bundle's pressure)
++	forecast:    [dynamic]Forecast_Entry, // era set-pieces in their forecast windows, set-piece order
++}
++
+ // Sla_Accumulator — the per-class SLA counters (ODN-3 §5.2; 3.4). Fields of
+ // Flow_State (indexed by class id), fed inside flow_step — there is no
+ // `state.sla` peer because there is no SLA system, there is a struct of
+@@ -191,11 +238,12 @@ Sla_Accumulator :: struct {
+ // Event — the per-tick event buffer entry (ODN-14). The spine emits none; the
+ // flow emits Packet_Arrived (1.3); win_lose_eval emits Run_Won/Run_Lost (1.4);
+ // 3.3 adds Packet_Dropped (class + reason payload); 3.4 adds
+-// Sla_Threshold_Crossed (class + metric + direction payload). The tag byte is
+-// the serialized discriminator. `class`/`reason`/`metric`/`direction` are
+-// payload fields used ONLY by the tagged events — the serializer writes them
+-// tag-conditionally so pre-3.3/3.4 event streams stay byte-identical (golden
+-// stability).
++// Sla_Threshold_Crossed (class + metric + direction payload); 4.1 adds
++// Warning_Raised / Warning_Cleared (sign + target payload). The tag byte is
++// the serialized discriminator. `class`/`reason`/`metric`/`direction`/
++// `sign`/`target` are payload fields used ONLY by the tagged events — the
++// serializer writes them tag-conditionally so pre-3.3/3.4/4.1 event streams
++// stay byte-identical (golden stability).
+ Event :: struct {
+ 	tick:      u64,
+ 	tag:       u8, // 0 = (none); see the EVENT_TAG_* constants below
+@@ -203,6 +251,8 @@ Event :: struct {
+ 	reason:    u8,  // Packet_Dropped payload: Drop_Reason
+ 	metric:    u8,  // Sla_Threshold_Crossed payload: Sla_Metric
+ 	direction: u8,  // Sla_Threshold_Crossed payload: Sla_Direction
++	sign:      u8,  // Warning_Raised / Warning_Cleared payload: Warning_Sign
++	target:    u32, // Warning_Raised / Warning_Cleared payload: node id / pipe id
+ }
+ 
+ // Event tags (stable across the wire; new variants append). The serialized
+@@ -213,6 +263,8 @@ EVENT_TAG_RUN_WON :: u8(2)        // 1.4: score reached the goal (terminal)
+ EVENT_TAG_RUN_LOST :: u8(3)       // 1.4: tick cap hit with score < goal (terminal)
+ EVENT_TAG_PACKET_DROPPED :: u8(4) // 3.3: a packet dropped (class + Drop_Reason payload — E9/E22)
+ EVENT_TAG_SLA_THRESHOLD_CROSSED :: u8(5) // 3.4: a class crossed an SLA threshold (class + metric + direction payload)
++EVENT_TAG_WARNING_RAISED :: u8(6)  // 4.1: a node/pipe warning level rose (sign + target payload)
++EVENT_TAG_WARNING_CLEARED :: u8(7) // 4.1: a node/pipe warning level ended (sign + target payload)
+ 
+ // Outcome — the latched terminal result (1.4 stub). None while the run is in
+ // play; Won/Lost once win_lose_eval appends the terminal event. The terminal-
+@@ -247,6 +299,7 @@ Run_State :: struct {
+ 	bundles:      Bundles,             // S1 derived (2.1) — parallel-pipe bundles, cap = static sum; DERIVED, rebuilt on change, NOT serialized
+ 	bundles_gen:  u32,                 // the Topology.gen this bundle view was built for (rule 1)
+ 	flow:         Flow_State,          // S2 — the packet flow (1.3): in-flight packets + trivial demand
++	crisis:       Crisis_State,        // 4.1 — the warning surface (node/pipe strain + forecast); DERIVED per tick (warnings.odin)
+ 	score:        u32,                 // 1.4: delivered-packet count (the win metric; incremented in flow_step)
+ 	goal:         u32,                 // 1.4: packets to deliver for a WIN (run setup; 0 = win/lose disabled)
+ 	tick_cap:     u64,                 // 1.4: lose if tick reaches this with score < goal (run setup; 0 = disabled)
+@@ -276,6 +329,7 @@ run_init :: proc(state: ^Run_State, seed: u64, catalog_hash: u64, logic_hz: i32,
+ 	routing_make(&state.routing, allocator)
+ 	bundles_make(&state.bundles, allocator)
+ 	flow_init(&state.flow, allocator)
++	crisis_make(&state.crisis, allocator)
+ 	rng_seed(&state.rng, seed)
+ }
+ 
+@@ -288,4 +342,5 @@ run_destroy :: proc(state: ^Run_State) {
+ 	routing_destroy(&state.routing)
+ 	bundles_destroy(&state.bundles)
+ 	flow_destroy(&state.flow)
++	crisis_destroy(&state.crisis)
+ }
+diff --git a/core/warnings.odin b/core/warnings.odin
+new file mode 100644
+index 0000000..e0f75ec
+--- /dev/null
++++ b/core/warnings.odin
+@@ -0,0 +1,258 @@
++package core
++
++// warnings.odin — Story 4.1: the warning surface (arch §6.4 S4 + ODN-4, the
++// [FORGE #3] fairness contract). Strain metrics from Topology + Flow each tick
++// → warning signs (node 🟡/🔴, pipe pressure) with lead times → the demand
++// forecast. TELEGRAPH ONLY: this file never fires a crisis (that is 4.2's
++// Crisis Engine) and never touches win/lose (that is 4.3). The forecast READS
++// the demand director's set-piece schedule (demand.odin) — it triggers
++// nothing.
++//
++// warning_evaluate runs INSIDE core.step after flow_step (the SLA counters are
++// final) and before win_lose_eval — the architecture's spine data-flow
++// (… Packet_Flow → crisis [warnings] → win_lose_eval → snapshot). The terminal
++// barrier (E17) skips it post-Run_Won/Run_Lost by construction (step returns
++// before any eval).
++//
++// The strain measures (the pinned contracts):
++//   • NODE strain = Σ packet_bandwidth of packets RESIDENT at the node that
++//     FAILED a forward attempt (Packet.waiting_ticks >= 1 — incremented in
++//     flow.odin's forward pass when no route exists, cleared on every
++//     successful forward) ÷ node_types[node_type].throughput_units. A packet
++//     that forwards next tick — fresh spawn or fresh transit — has
++//     waiting_ticks 0 and NEVER strains (the no-flicker contract); an
++//     unroutable pile-up does (the honest "stuck" signal).
++//   • PIPE pressure = the FULLEST lane queue's depth on the bundle vs its E9
++//     bound (lane_queue_packets × packet_bandwidth) — "pressure climbing toward
++//     saturation" (GDD M5): a lone packet on a pipe is 1/6 of a lane bound
++//     (17 %, healthy — no busy-flicker); a lane at its bound (6 packets) is
++//     100 % — the E9 ladder is dropping. Every member pipe carries its
++//     bundle's level (the bundle is the capacity unit, 2.1).
++//   • FORECAST = the era's set-pieces inside [start - lead, start + duration)
++//     — a pure read of the schedule; never fires anything.
++//
++// All warning state is DERIVED (rebuilt identically on replay from serialized
++// state — the same status as lane_caps / sla_breach): the strain LEVELS are a
++// pure function of (packets, topology, bundles, catalogs, tick), the forecast
++// of (era, tick, catalog). The serializer emits only the non-None entries +
++// forecast rows (absent-when-empty), so the T1 golden pins the warning state
++// (E10) without binding replay to this file's iteration order.
++//
++// Integer-only (ODN-10); arrays only, no maps (ODN-10); no file/clock reads
++// (ODN-1). The lead times (strained 30 s / critical 10 s / pressure 20 s —
++// GDD Numerical Design) live in balance.json `warnings`; the UI reads them
++// from there (they are not re-stated here).
++
++// crisis_make / crisis_destroy — Run_State.crisis lifetime (mirrors
++// flow_init/flow_destroy; ODN-18 arena discipline lands later).
++crisis_make :: proc(c: ^Crisis_State, allocator := context.allocator) {
++	c^ = {}
++	c.node_strain = make([dynamic]Strain_Level, 0, 8, allocator)
++	c.pipe_strain = make([dynamic]Strain_Level, 0, 8, allocator)
++	c.forecast = make([dynamic]Forecast_Entry, 0, 2, allocator)
++}
++
++crisis_destroy :: proc(c: ^Crisis_State) {
++	delete(c.node_strain)
++	delete(c.pipe_strain)
++	delete(c.forecast)
++}
++
++// event_emit_warning — append a Warning_Raised / Warning_Cleared event with its
++// payload (4.1, ODN-14). sign names the level boundary crossed; target is the
++// node id (node signs) or pipe id (pipe signs).
++event_emit_warning :: proc(state: ^Run_State, tick: u64, tag: u8, sign: Warning_Sign, target: u32) {
++	append(&state.events, Event{tick = tick, tag = tag, sign = u8(sign), target = target})
++}
++
++// strain_level — map an integer percent to the tri-state level (inclusive
++// lower bounds — art-direction §6.1: strain >= 70 % strained, >= 90 %
++// critical). Thresholds come from the balance warnings block (data-driven).
++strain_level :: proc(pct: i64, amber, red: i32) -> Strain_Level {
++	if pct >= i64(red) do return .Red
++	if pct >= i64(amber) do return .Amber
++	return .None
++}
++
++// node_strain_transition — one node's level change vs its prior level: emit
++// the event for the boundary crossed (one event per transition) and return the
++// new level. Dead node slots never warn (a demolished node is its own
++// resolution — no phantom cleared events).
++node_strain_transition :: proc(state: ^Run_State, tick: u64, old, new: Strain_Level, node_id: u32) -> Strain_Level {
++	if old == new {
++		return new
++	}
++	switch new {
++	case .Red:
++		// entering Red (from None or Amber): the critical alarm raises
++		event_emit_warning(state, tick, EVENT_TAG_WARNING_RAISED, .Node_Critical, node_id)
++	case .Amber:
++		if old == .Red {
++			// Red eased to Amber: the critical level ENDED (strained persists)
++			event_emit_warning(state, tick, EVENT_TAG_WARNING_CLEARED, .Node_Critical, node_id)
++		} else {
++			event_emit_warning(state, tick, EVENT_TAG_WARNING_RAISED, .Node_Strained, node_id)
++		}
++	case .None:
++		// the level that ENDED is the one that was raised last (Red supersedes
++		// Amber): clear the highest raised sign.
++		if old == .Red {
++			event_emit_warning(state, tick, EVENT_TAG_WARNING_CLEARED, .Node_Critical, node_id)
++		} else {
++			event_emit_warning(state, tick, EVENT_TAG_WARNING_CLEARED, .Node_Strained, node_id)
++		}
++	}
++	return new
++}
++
++// pipe_strain_transition — same contract for pipes (signs Pipe_Pressure /
++// Pipe_Critical; target = pipe id).
++pipe_strain_transition :: proc(state: ^Run_State, tick: u64, old, new: Strain_Level, pipe_id: u32) -> Strain_Level {
++	if old == new {
++		return new
++	}
++	switch new {
++	case .Red:
++		event_emit_warning(state, tick, EVENT_TAG_WARNING_RAISED, .Pipe_Critical, pipe_id)
++	case .Amber:
++		if old == .Red {
++			event_emit_warning(state, tick, EVENT_TAG_WARNING_CLEARED, .Pipe_Critical, pipe_id)
++		} else {
++			event_emit_warning(state, tick, EVENT_TAG_WARNING_RAISED, .Pipe_Pressure, pipe_id)
++		}
++	case .None:
++		if old == .Red {
++			event_emit_warning(state, tick, EVENT_TAG_WARNING_CLEARED, .Pipe_Critical, pipe_id)
++		} else {
++			event_emit_warning(state, tick, EVENT_TAG_WARNING_CLEARED, .Pipe_Pressure, pipe_id)
++		}
++	}
++	return new
++}
++
++// warning_evaluate — the per-tick warning pass: rebuild Crisis_State from the
++// current flow + topology + schedule and emit transition events vs the prior
++// tick's levels (read in place before overwriting — the arrays hold last
++// tick's derivation). One event per level boundary crossed; a zero-traffic
++// tick moves nothing (no packets → no strain → no transitions — the E24
++// neutrality pattern, no fabricated signals).
++warning_evaluate :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
++	w := &cat.balance.warnings
++	t := &state.topology
++	cr := &state.crisis
++	f := &state.flow
++
++	// --- 1. per-slot level arrays: resize to cover the current topology
++	// (resize PRESERVES existing elements = the prior tick's derivation; new
++	// slots append as None). The in-place compare-then-write below uses those
++	// old values as the transition baseline.
++	if len(cr.node_strain) != len(t.node_alive) {
++		resize(&cr.node_strain, len(t.node_alive))
++	}
++	if len(cr.pipe_strain) != len(t.pipe_alive) {
++		resize(&cr.pipe_strain, len(t.pipe_alive))
++	}
++
++	// --- 2. accumulate the measured strain (scratch; freed at return)
++	// Node loads: per node SLOT — the stuck-packet backlog (waiting_ticks >= 1)
++	// is the honest node signal (see the header contract). Pipe pressure: per
++	// BUNDLE slot, the FULLEST lane's queue depth vs its E9 bound
++	// (lane_queue_packets x packet_bandwidth) — "pressure climbing toward
++	// saturation" (GDD M5): a lone packet on a pipe is 1/6 of a lane bound
++	// (17 % — healthy, no busy-flicker); a lane at its bound (6 packets) is
++	// 100 % — the E9 ladder is dropping. The pressure levels replicate to
++	// every member pipe of the bundle (the bundle is the capacity unit, 2.1).
++	nload := make([dynamic]i64, len(t.node_alive), len(t.node_alive), context.temp_allocator)
++	defer delete(nload)
++	press := make([dynamic]i64, int(state.bundles.n), int(state.bundles.n), context.temp_allocator)
++	defer delete(press)
++	lane_bound_units := i64(cat.balance.lane_queue_packets) * i64(cat.balance.packet_bandwidth)
++	for bs in 0..<int(state.bundles.n) {
++		if lane_bound_units <= 0 { break }
++		fullest := i64(0)
++		for lane in u8(0)..<LANE_COUNT {
++			depth := i64(bundle_lane_count(state, cat, u32(bs), lane))
++			units := depth * i64(cat.balance.packet_bandwidth)
++			if units > fullest {
++				fullest = units
++			}
++		}
++		press[bs] = fullest
++	}
++
++	// Node loads: count the STUCK packets (waiting_ticks >= 1 — they failed a
++	// forward attempt; fresh spawns + fresh transits have 0 and never strain,
++	// the pinned no-flicker contract) into their node's slot.
++	for i in 0..<len(f.packets) {
++		p := &f.packets[i]
++		if p.delivered || p.on_edge { continue }
++		if p.waiting_ticks == 0 { continue }
++		for ns in 0..<len(t.node_alive) {
++			if t.node_alive[ns] && t.node_id[ns] == p.at_node {
++				nload[ns] += i64(cat.balance.packet_bandwidth)
++				break
++			}
++		}
++	}
++
++	// --- 3. node levels + transition events (slot order; node id targets)
++	for ns in 0..<len(t.node_alive) {
++		if !t.node_alive[ns] {
++			cr.node_strain[ns] = .None // dead slots never warn
++			continue
++		}
++		throughput := i64(cat.node_types[t.node_type[ns]].throughput_units)
++		new := Strain_Level.None
++		if throughput > 0 {
++			new = strain_level(nload[ns] * 100 / throughput, w.node_amber_pct, w.node_red_pct)
++		}
++		cr.node_strain[ns] = node_strain_transition(state, tick, cr.node_strain[ns], new, t.node_id[ns])
++	}
++
++	// --- 4. pipe levels (each pipe carries its bundle's pressure) + events
++	for ps in 0..<len(t.pipe_alive) {
++		if !t.pipe_alive[ps] {
++			cr.pipe_strain[ps] = .None
++			continue
++		}
++		bs := state.bundles.pipe_bundle[ps]
++		new := Strain_Level.None
++		if bs != NO_BUNDLE && lane_bound_units > 0 {
++			new = strain_level(press[bs] * 100 / lane_bound_units, w.pipe_amber_pct, w.pipe_red_pct)
++		}
++		cr.pipe_strain[ps] = pipe_strain_transition(state, tick, cr.pipe_strain[ps], new, t.pipe_id[ps])
++	}
++
++	// --- 5. the demand forecast: every era set-piece inside its window
++	// [start - lead, start + duration) — a pure read of the schedule. The
++	// forecast never fires anything (4.2's job); countdown_ticks = start - tick
++	// (0 once active — the panel shows NOW).
++	clear(&cr.forecast)
++	if state.era > 0 && int(state.era) <= len(cat.demand.eras) {
++		de := &cat.demand.eras[state.era-1]
++		for si in 0..<len(de.set_pieces) {
++			sp := &de.set_pieces[si]
++			lead := sp.forecast_lead_ticks
++			window_start := sp.start_tick
++			if window_start > lead {
++				window_start -= lead
++			} else {
++				window_start = 0
++			}
++			if tick < window_start { continue }
++			if tick >= sp.start_tick + sp.duration_ticks { continue }
++			countdown := u64(0)
++			if tick < sp.start_tick {
++				countdown = sp.start_tick - tick
++			}
++			append(&cr.forecast, Forecast_Entry{
++				sp_index = u16(si),
++				class = sp.class,
++				multiplier = sp.multiplier,
++				start_tick = sp.start_tick,
++				countdown_ticks = countdown,
++				active = tick >= sp.start_tick,
++			})
++		}
++	}
++}
+diff --git a/core/warnings_test.odin b/core/warnings_test.odin
+new file mode 100644
+index 0000000..62bd8f5
+--- /dev/null
++++ b/core/warnings_test.odin
+@@ -0,0 +1,297 @@
++package core
++
++// warnings_test.odin — pins the 4.1 warning surface (warnings.odin):
++//   (a) node strain = the STUCK-packet backlog (waiting_ticks >= 1) vs node
++//       throughput — amber at the balance 70 % ladder, red at 90 %, with
++//       Warning_Raised/Cleared events at exact ticks;
++//   (b) the no-flicker contract — fresh spawns + fresh transit arrivals
++//       (waiting_ticks 0) never strain, so a healthy busy network emits
++//       ZERO warning events;
++//   (c) pipe pressure = the fullest lane's depth vs its E9 bound (6 packets =
++//       100 % — dropping; 5 = 83 % amber; a lone packet = 17 % healthy);
++//   (d) the forecast = the era set-pieces inside their windows (exact
++//       countdowns; active rows; out-of-window rows absent);
++//   (e) zero-traffic neutrality (E24 pattern) — no strain, no events;
++//   (f) replay byte-identity (E10) — the warning state + event stream
++//       reproduce from the action log alone.
++//
++// All expectations are GOLDEN-VERIFIED (the 3.4 pattern): the sim is seeded
++// + deterministic, so the crossing ticks are exact. If a threshold or a
++// spawn lands differently, the ticks here must be re-read from the sim and
++// re-pinned — never guessed.
++
++import "core:testing"
++
++// warn_record_run — step a run collecting the warning event stream (the
++// ODN-14 drain convention: record_run clears the buffer per tick, so
++// event-scans must collect as they step) + the per-tick hashes. Only
++// Warning_Raised / Warning_Cleared events are collected.
++warn_record_run :: proc(s: ^Run_State, ticks: u64, cat: ^Catalogs) -> ([dynamic]u64, [dynamic]Event) {
++	hashes := make([dynamic]u64, 0, ticks)
++	events := make([dynamic]Event, 0, 16)
++	for tick in u64(1)..=ticks {
++		before := len(s.events)
++		batch := make([dynamic]Command, 0, 4, context.temp_allocator)
++		for cmd in s.action_log {
++			if cmd.apply_tick == tick {
++				append(&batch, cmd)
++			}
++		}
++		step(s, tick, batch[:], cat)
++		for e in s.events[before:] {
++			if e.tag == EVENT_TAG_WARNING_RAISED || e.tag == EVENT_TAG_WARNING_CLEARED {
++				append(&events, e)
++			}
++		}
++		append(&hashes, state_hash(s, s.events[before:], cat, context.temp_allocator))
++		clear(&s.events)
++		free_all(context.temp_allocator)
++	}
++	return hashes, events
++}
++
++// warn_assert_stream — the exact-stream pin: every collected event must equal
++// the expected (tick, tag, sign, target) in order, and vice versa.
++warn_assert_stream :: proc(t: ^testing.T, got: []Event, want: []Event) {
++	testing.expectf(t, len(got) == len(want), "warning stream: got %d events, want %d — %v",
++		len(got), len(want), got)
++	for i in 0..<min(len(got), len(want)) {
++		e := got[i]
++		w := want[i]
++		testing.expectf(t, e.tick == w.tick && e.tag == w.tag && e.sign == w.sign && e.target == w.target,
++			"event %d: got (tick %d tag %d sign %d target %d) want (tick %d tag %d sign %d target %d)",
++			i, e.tick, e.tag, e.sign, e.target, w.tick, w.tag, w.sign, w.target)
++	}
++}
++
++// --- (a) node strain transitions + events -------------------------------------
++
++@(test)
++test_node_strain_amber_red_clear :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 7, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&s, cat)
++	sla_draw(&s, cat, res, rt, "standard", 1) // only res->router until relief
++	sla_draw(&s, cat, rt, host, "standard", 8) // the relief draw
++	// host->res packets with no full route pile up AT THE HOST (the routing
++	// table gives complete paths only — the packet waits where the route
++	// fails). Host throughput 80: 1 packet = 37 % (healthy), 2 = 75 % (amber),
++	// 3 = 112 % (red). The relief draw opens host->router->res and drains all.
++	sla_spawn(&s, 1, 0, host, res)
++	sla_spawn(&s, 2, 0, host, res)
++	sla_spawn(&s, 3, 0, host, res)
++	hashes, evs := warn_record_run(&s, 20, cat)
++	defer delete(hashes)
++	defer delete(evs)
++
++	// The hand-verified stream (each spawn tick the forward pass fails the
++	// missing route and increments waiting_ticks; the resident never strains
++	// and pipe 0 never crosses 70 % of a lane bound — max 3 packets = 50 %):
++	//   @2 RAISED Node_Strained, node 2 (A+B: 60/80 = 75 %)
++	//   @3 RAISED Node_Critical, node 2 (A+B+C: 90/80 = 112 %)
++	//   @8 CLEARED Node_Critical, node 2 (the relief draw lets all through)
++	warn_assert_stream(t, evs[:], []Event{
++		{tick = 2, tag = EVENT_TAG_WARNING_RAISED, sign = u8(Warning_Sign.Node_Strained), target = 2},
++		{tick = 3, tag = EVENT_TAG_WARNING_RAISED, sign = u8(Warning_Sign.Node_Critical), target = 2},
++		{tick = 8, tag = EVENT_TAG_WARNING_CLEARED, sign = u8(Warning_Sign.Node_Critical), target = 2},
++	})
++}
++
++// --- (b) the no-flicker contract ----------------------------------------------
++
++@(test)
++test_node_strain_no_flicker_healthy_transit :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 11, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&s, cat)
++	sla_draw(&s, cat, res, rt, "standard", 1)
++	sla_draw(&s, cat, rt, host, "standard", 1)
++	// lone transits, spaced 6 ticks — each packet forwards every tick it is
++	// at a node (healthy path), so waiting_ticks stays 0 and NOTHING strains
++	for k in u64(1)..=25 {
++		if k % 6 == 1 {
++			sla_spawn(&s, k, 0, res, host)
++		}
++	}
++	hashes, evs := warn_record_run(&s, 30, cat)
++	defer delete(hashes)
++	defer delete(evs)
++
++	testing.expectf(t, len(evs) == 0, "healthy transits must never warn, got %v", evs)
++	testing.expect_value(t, s.crisis.node_strain[0], Strain_Level.None)
++	testing.expect_value(t, s.crisis.node_strain[1], Strain_Level.None)
++	testing.expect_value(t, s.crisis.node_strain[2], Strain_Level.None)
++	// every surviving packet that transited has waiting_ticks 0 (the counter
++	// is the strain measure — a healthy run must not accrue it)
++	for p in s.flow.packets {
++		testing.expectf(t, p.waiting_ticks == 0, "packet %d accrued waiting_ticks %d on a healthy path",
++			p.id, p.waiting_ticks)
++	}
++}
++
++// --- (c) pipe pressure vs the E9 lane bound ------------------------------------
++
++@(test)
++test_pipe_pressure_lane_bound :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 13, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&s, cat)
++	sla_draw(&s, cat, res, rt, "standard", 1)
++	sla_draw(&s, cat, rt, host, "standard", 1)
++	// SIX packets in the Standard lane of pipe 0's bundle, ALL spawned at
++	// tick 1: they forward together onto pipe 0 (the lane bound is 6 — they
++	// fit exactly) and the slow service (15 units/tick = 0.5 packets/tick)
++	// drains them one per 2 ticks. Depth: 6/6 = 100 % red @1, 5/6 = 83 %
++	// amber from the first arrival, 4/6 = 67 % healthy from the second.
++	for k in u64(1)..=6 {
++		sla_spawn(&s, 1, 0, res, host)
++	}
++	hashes, evs := warn_record_run(&s, 20, cat)
++	defer delete(hashes)
++	defer delete(evs)
++
++	// The hand-verified stream (FIFO service: packet n arrives at end of tick
++	// 2n+1, so the depth drops 6 -> 5 at tick 3 and 5 -> 4 at tick 5; the
++	// arrivals forward onward on pipe 1 the next tick — the full route exists
++	// — so no node strain):
++	//   @1 RAISED  Pipe_Critical, pipe 0 (6/6 of the E9 bound — dropping)
++	//   @3 CLEARED Pipe_Critical, pipe 0 (5/6 = 83 % — still amber)
++	//   @5 CLEARED Pipe_Pressure, pipe 0 (4/6 = 67 % — healthy again)
++	warn_assert_stream(t, evs[:], []Event{
++		{tick = 1, tag = EVENT_TAG_WARNING_RAISED, sign = u8(Warning_Sign.Pipe_Critical), target = 0},
++		{tick = 3, tag = EVENT_TAG_WARNING_CLEARED, sign = u8(Warning_Sign.Pipe_Critical), target = 0},
++		{tick = 5, tag = EVENT_TAG_WARNING_CLEARED, sign = u8(Warning_Sign.Pipe_Pressure), target = 0},
++	})
++}
++
++// --- (d) the demand forecast ----------------------------------------------------
++
++@(test)
++test_forecast_window_rows :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	// pure schedule reads: no traffic needed (the forecast is a function of
++	// era + tick + catalog). Era 3's surge: start 1200, duration 1800, lead
++	// 600 -> window [600, 3000).
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 3, cat.hash, TEST_LOGIC_HZ)
++	s.era = 3
++
++	check :: proc(t: ^testing.T, s: ^Run_State, cat: ^Catalogs, tick: u64,
++		want_rows: int, want_countdown: u64, want_active: bool) {
++		step(s, tick, {}, cat)
++		testing.expectf(t, len(s.crisis.forecast) == want_rows,
++			"tick %d: forecast rows %d, want %d", tick, len(s.crisis.forecast), want_rows)
++		if len(s.crisis.forecast) == 1 {
++			f := s.crisis.forecast[0]
++			testing.expectf(t, f.sp_index == 0 && f.class == 1 && f.multiplier == 10,
++				"tick %d: row sp %d class %d mult %d", tick, f.sp_index, f.class, f.multiplier)
++			testing.expectf(t, f.countdown_ticks == want_countdown,
++				"tick %d: countdown %d, want %d", tick, f.countdown_ticks, want_countdown)
++			testing.expectf(t, f.active == want_active,
++				"tick %d: active %v, want %v", tick, f.active, want_active)
++		}
++		clear(&s.events)
++	}
++
++	check(t, &s, cat, 599, 0, 0, false)   // before the lead window
++	check(t, &s, cat, 600, 1, 600, false) // window opens at start - lead
++	check(t, &s, cat, 1000, 1, 200, false)
++	check(t, &s, cat, 1199, 1, 1, false)
++	check(t, &s, cat, 1200, 1, 0, true) // active: countdown 0, NOW
++	check(t, &s, cat, 2999, 1, 0, true)
++	check(t, &s, cat, 3000, 0, 0, false) // window closed (start + duration)
++}
++
++// --- (e) zero-traffic neutrality -------------------------------------------------
++
++@(test)
++test_zero_traffic_neutral :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 17, cat.hash, TEST_LOGIC_HZ)
++	test_seed_fixture(&s, cat)
++	hashes, evs := warn_record_run(&s, 30, cat)
++	defer delete(hashes)
++	defer delete(evs)
++
++	testing.expectf(t, len(evs) == 0, "zero traffic must emit no warnings, got %v", evs)
++	testing.expectf(t, len(s.crisis.forecast) == 0, "era 0 must carry no forecast rows")
++	for i in 0..<len(s.crisis.node_strain) {
++		testing.expect_value(t, s.crisis.node_strain[i], Strain_Level.None)
++	}
++	for i in 0..<len(s.crisis.pipe_strain) {
++		testing.expect_value(t, s.crisis.pipe_strain[i], Strain_Level.None)
++	}
++}
++
++// --- (f) replay byte-identity -----------------------------------------------------
++
++@(test)
++test_warning_replay_byte_identical :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	live: Run_State
++	defer run_destroy(&live)
++	run_init(&live, 19, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&live, cat)
++	sla_draw(&live, cat, res, rt, "standard", 1)
++	sla_draw(&live, cat, rt, host, "standard", 8)
++	sla_spawn(&live, 1, 0, host, res)
++	sla_spawn(&live, 2, 0, host, res)
++	sla_spawn(&live, 3, 0, host, res)
++	live_hashes, live_evs := warn_record_run(&live, 20, cat)
++	defer delete(live_hashes)
++	defer delete(live_evs)
++
++	replayed: Run_State
++	defer run_destroy(&replayed)
++	run_init(&replayed, 19, cat.hash, TEST_LOGIC_HZ)
++	res_idx, _ := node_type_index(cat, "residential")
++	rt_idx, _ := node_type_index(cat, "router_basic")
++	host_idx, _ := node_type_index(cat, "content_host")
++	topology_spawn_node(&replayed.topology, res_idx, {8, 15}, cat)
++	topology_spawn_node(&replayed.topology, rt_idx, {20, 15}, cat)
++	topology_spawn_node(&replayed.topology, host_idx, {32, 15}, cat)
++	replayed.action_log = clone_log(live.action_log, context.allocator)
++	sla_spawn(&replayed, 1, 0, 2, 0)
++	sla_spawn(&replayed, 2, 0, 2, 0)
++	sla_spawn(&replayed, 3, 0, 2, 0)
++	replayed_hashes, replayed_evs := warn_record_run(&replayed, 20, cat)
++	defer delete(replayed_hashes)
++	defer delete(replayed_evs)
++
++	testing.expectf(t, len(replayed_hashes) == len(live_hashes), "hash stream lengths must match")
++	for i in 0..<len(live_hashes) {
++		if replayed_hashes[i] != live_hashes[i] {
++			testing.expectf(t, false, "FIRST DIVERGENCE at tick %d: %016x != %016x",
++				i+1, replayed_hashes[i], live_hashes[i])
++			break
++		}
++	}
++	warn_assert_stream(t, replayed_evs[:], live_evs[:])
++}
+diff --git a/data/balance.json b/data/balance.json
+index 5893dcd..4ae60b7 100644
+--- a/data/balance.json
++++ b/data/balance.json
+@@ -6,6 +6,16 @@
+   "packet_bandwidth": 30,
+   "lane_queue_packets": 6,
+   "pool_max_packets": 512,
++  "warnings": {
++    "_comment": "Story 4.1 warning-sign thresholds + lead times (art-direction §6.1 'Trigger [balance.json]'; GDD Numerical Design). Integer percents; leads in ticks @ 20Hz (30s=600, 10s=200, 20s=400). The UI telegraph reads the leads; the T1 pins the levels + the catalog_hash pins these numbers.",
++    "node_amber_pct": 70,
++    "node_red_pct": 90,
++    "pipe_amber_pct": 70,
++    "pipe_red_pct": 90,
++    "node_strained_lead_ticks": 600,
++    "node_critical_lead_ticks": 200,
++    "pipe_pressure_lead_ticks": 400
++  },
+   "lane_presets": [
+     {
+       "id": "balanced",
+diff --git a/demos/lose.dem b/demos/lose.dem
+index 786983b..85230b7 100644
+--- a/demos/lose.dem
++++ b/demos/lose.dem
+@@ -1,10 +1,14 @@
+ # lose.dem — Story 1.4: the thinnest LOSE (the Error 404 stub). The 1.2 fixture;
+ # draw only the FIRST leg (residential(0) → router(1)) — the sink is unreachable.
+-# Spawn residential(0) → content_host(2): the packet flows to the router (t43)
+-# then has no route onward + waits there (per-hop forwarding, E29). The run
+-# reaches the tick cap (lose cap 3000ms = tick 60) with score 0 < goal 1 →
+-# Run_Lost (terminal). The capture at 3000ms pins the terminal/lose frame (T1
+-# hash carries outcome=Lost+Run_Lost; T2 pixel the stuck packet at the router).
++# Spawn residential(0) → content_host(2): the routing table gives COMPLETE
++# paths only, so the packet has no route from its spawn node and waits at the
++# RESIDENTIAL from t41 (E28's spawn-and-wait; the pre-4.1 comment's "waits at
++# the router" described an older routing shape). 4.1: that stuck packet is
++# exactly the measured strain the warning system telegraphs — the T2 capture
++# carries the 🔴 ring + glyph on the residential (deliberate, cause-documented
++# shift). The run reaches the tick cap (lose cap 3000ms = tick 60) with score
++# 0 < goal 1 → Run_Lost (terminal). The capture at 3000ms pins the
++# terminal/lose frame (T1 hash carries outcome=Lost+Run_Lost).
+ # run 3200ms lets a few post-terminal ticks exercise the barrier.
+ seed 42
+ run 3200ms
+diff --git a/demos/warn.dem b/demos/warn.dem
+new file mode 100644
+index 0000000..11b33ef
+--- /dev/null
++++ b/demos/warn.dem
+@@ -0,0 +1,29 @@
++# warn.dem — Story 4.1's launchable golden: the forecast + strain telegraph.
++# Era 3 (the streaming-surge era): the director spawns email 4/tick res->res
++# + streaming 2/tick host->res. Pipe 1-2 (router->host) is DELAYED to 30s, so
++# the streaming packets pile at the HOST (no route — the routing table gives
++# complete paths only): the honest node telegraph. Golden-verified stream:
++#   host Node_Strained @1 (2 waiting = 75% of the 80 u/s host throughput),
++#   host Node_Critical @2 (4 waiting = 150%), red until the 30s draw opens
++#   the route (the pre-draw email spawns briefly redden the residentials too
++#   — no routes exist before the 100ms draws apply at tick 3; they clear the
++#   same tick). The forecast panel appears at 30s (the surge's 600-tick lead)
++#   and counts down (verified: countdown 300 @45s); the surge fires at 60s
++#   (streaming x10 — the director's demand multiplier) and the panel reads
++#   NOW. Pipe 0 (res0->router) saturates under the email load -> the pressure
++#   halo runs red/amber (a lane at its E9 bound = dropping). Captures:
++#   1500ms = the strain telegraph before the forecast; 45000ms = panel
++#   countdown + red pressure; 65000ms = surge ACTIVE (NOW). The T1 pins the
++#   forecast rows + the whole warning event stream (E10).
++seed 4243
++run 75000ms
++era 3
++fixture qos
++expect hash stable
++at 100ms draw 0 1 standard
++at 100ms draw 3 1 standard
++at 100ms draw 4 1 standard
++at 30000ms draw 1 2 standard
++capture at 1500ms
++capture at 45000ms
++capture at 65000ms
+diff --git a/harness/goldens.odin b/harness/goldens.odin
+index 91cd1f8..a03dfb6 100644
+--- a/harness/goldens.odin
++++ b/harness/goldens.odin
+@@ -43,10 +43,14 @@ render_setup :: proc(rc: ^Render_Ctx, cat: ^pp.Catalogs) {
+ 
+ // Render the world pass headless and read back normalized RGBA pixels. The
+ // drag state defaults to {} (no active drag) — the golden frame is a settled
+-// drawn-pipe state, not a mid-drag preview (so no HUD text is captured).
+-capture_frame :: proc(rc: ^Render_Ctx, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State) -> rl.Image {
++// drawn-pipe state, not a mid-drag preview. 4.1: the capture ALSO draws the
++// forecast panel + the warning telegraph (crisis + tick) — the story's T2
++// golden is "of the forecast + warning state"; frames with no forecast rows
++// and no strain draw zero extra pixels (capture-stability).
++capture_frame :: proc(rc: ^Render_Ctx, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, crisis: ^pp.Crisis_State, tick: u64) -> rl.Image {
+ 	rl.BeginDrawing()
+-	rnd.draw_world(&rc.view, topo, bundles, flow, {})
++	rnd.draw_world(&rc.view, topo, bundles, flow, crisis, tick, {})
++	rnd.draw_forecast_panel(&rc.view, crisis, rc.view.catalogs)
+ 	rl.EndDrawing()
+ 	img := rl.LoadImageFromScreen()
+ 	rl.ImageFlipVertical(&img) // framebuffer readback is bottom-up
+diff --git a/harness/run.odin b/harness/run.odin
+index 35be49d..85d062a 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -219,7 +219,7 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 			for cap_ms in demo.captures {
+ 				cap_tick := u64(max(0, i64(cap_ms) * i64(hz) / 1000))
+ 				if cap_tick == tick {
+-					img := capture_frame(rc, &state.topology, &state.bundles, &state.flow)
++					img := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, tick)
+ 					if save {
+ 						write_golden(name, cap_ms, img)
+ 					} else {

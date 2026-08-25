@@ -1,0 +1,32 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "R2-W3's silent telemetry-off guard is bypassed in the app by the `--stats-out=<path>` equals form — argv silently ignored, stream off, exit 0",
+    "location": "app/main.odin:148-157",
+    "evidence": "app/main.odin:148-157:\n\tfor i := 1; i < len(os.args); i += 1 {\n\t\tif os.args[i] == \"--stats-out\" {\n\t\t\tif stats_flag_seen || i+1 >= len(os.args) || os.args[i+1] == \"\" || strings.has_prefix(os.args[i+1], \"-\") {\n\t\t\t\tfmt.eprintln(\"usage: app [--stats-out <path>]\")\n\t\t\t\tos.exit(2)\n\t\t\t}\n\t\t\tstats_flag_seen = true\n\t\t\tstats_path = os.args[i+1]\n\t\t}\n\t}\napp/main.odin:181: app.stats_live = stats_path != \"\" — the loop matches ONLY the exact token \"--stats-out\"; any other argv (e.g. `--stats-out=/tmp/x.csv`) falls through with no else-branch. Pre-PR the app had zero os.args usage (git show 6b09497^:app/main.odin | grep -c os.args → 0), so this exact-match parser is the new boundary. The harness rejects the same argv loudly (the `=` token is treated as a demo name → run_demo 'cannot read' → exit 1); the app is the silent one.",
+    "detail": "`app --stats-out=/tmp/x.csv` runs with stats_live=false: no stream file, no diagnostic, exit 0 — exactly the silent telemetry-off class R2-W3 was fixed to eliminate, reachable via the common `=` token shape.",
+    "recommended_fix": "In the app loop, reject any unrecognized `-`/`--`-prefixed token (usage + exit 2), mirroring the harness's loud failure instead of silently ignoring non-matching argv."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Harness stats-stream write failure is logged but never affects the exit code — 'green' exit 0 with no stream file",
+    "location": "harness/run.odin:300-303, harness/run.odin:798-803, harness/main.odin:198-201",
+    "evidence": "harness/run.odin:300-303 (run_demo defer):\n\tdefer if stats_live {\n\t\twrite_file(stats_out, transmute([]u8)strings.to_string(sb))\nharness/run.odin:798-803:\nwrite_file :: proc(path: string, data: []u8) {\n\tif err := os.write_entire_file(path, data); err != nil {\n\t\tfmt.eprintfln(\"harness: write failed %s: %v\", path, err)\n\t}\n}\nharness/main.odin:198-201:\n\tif failures > 0 {\n\t\tfmt.printf(\"harness: %d demo(s) FAILED\\n\", failures)\n\t\tos.exit(1)\n\t}\n\tfmt.printf(\"harness: %d demo(s) green\\n\", len(names))\nwrite_file's error is logged but run_demo's bool return is unaffected, so an unwritable --stats-out path (or missing parent dir) still exits 0.",
+    "detail": "Scripted/CI consumers of `harness run <demo> --stats-out <path>` that check the exit code see green despite no stream being written; only stderr carries the failure. App-side is exit 1.",
+    "recommended_fix": "Thread the write result out of write_file (return bool or Error) and count a stats-write failure into run_demo's failure set / a non-zero exit in main."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "R2-N8 persists (carry-forward): no automated coverage of the new --stats-out CLI error paths in either parser",
+    "location": "harness/main.odin:127-141; app/main.odin:148-156",
+    "evidence": "harness/main.odin:127-141:\n\t\tif rest[i] == \"--stats-out\" {\n\t\t\tif stats_flag_seen {\n\t\t\t\tusage() // duplicate flag\n\t\t\t}\n\t\t\tstats_flag_seen = true\n\t\t\tif i+1 >= len(rest) {\n\t\t\t\tusage() // dangling flag (no token)\n\t\t\t}\n\t\t\tv := rest[i+1]\n\t\t\tif v == \"\" || strings.has_prefix(v, \"-\") {\n\t\t\t\tusage() // empty token or a flag-shaped value\n\t\t\t}\n(app/main.odin:148-156 mirrors it). Grep of the repo shows test files only under core/ (core/*_test.odin); no test references stats-out, usage(), or os.args — the guards were verified only manually (claimed live), so a future refactor can silently regress them.",
+    "detail": "The exit-2 guards for dangling/duplicate/empty/flag-shaped tokens exist (R2-W3 fix verified in code) but have no pinned regression test; r3 claimed live manual checks only. Matches r2's R2-N8, unclaimed in the rework.",
+    "recommended_fix": "Extract the argv validation into a testable proc (e.g. parse_stats_out(rest) -> (path, Error)) and pin the four rejection shapes plus the one-demo guard with @(test) cases."
+  }
+]

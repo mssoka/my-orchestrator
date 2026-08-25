@@ -1,0 +1,62 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "toctou-backstop",
+    "title": "STILL PRESENT (r3): wrong-person awaiting UPDATE still runs via unguarded update_reference_call_status — the guarded SQL is never wired, and the race pin is vacuous",
+    "location": "server/src/reference_checks/form_handler.gleam:1250; server/test/integration/reference_checks_actions_integration_test.gleam:1746",
+    "evidence": "form_handler.gleam:1235-1250: \"case row.taken_over_at != \"\" { True -> wisp.redirect(to: \"/reference/\" <> token) False -> case row.correction_cycles >= 1 { True -> exhaust_wrong_person(...) False -> case sql.update_reference_call_status( config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated, )\" — update_reference_call_status.sql:22-24: \"WHERE id = $1 AND status = $5::reference_call_status\" (no taken_over_at clause); mark_awaiting_correction_wrong_person.sql carries \"AND taken_over_at IS NULL\" but grep shows zero src callers; test:1744-1746: \"// Take-over lands between the wrong-person read and the UPDATE. actions_handler.do_take_over(...) |> should.equal(200) ... let assert Ok(returned) = rc_sql.mark_awaiting_correction_wrong_person(db, call)\" — the guarded SQL invoked DIRECTLY, never via the POST route",
+    "detail": "The executed wrong-person transition still calls the unguarded update_reference_call_status (WHERE id + status only); the guarded SQL exists but is never called by the handler, and the pin calls it directly, so rewiring to the unguarded path keeps CI green. Both blocker conditions unmet.",
+    "recommended_fix": "Call sql.mark_awaiting_correction_wrong_person in apply_wrong_person's awaiting branch; rewrite the pin to drive the POST /reference/:token/wrong-person route with a take-over committing between lookup and UPDATE (neutralizing the backstop must turn it red)."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "robustness",
+    "title": "webhooks exhaust_row swallows a DB error on the exhaustion UPDATE — same swallow class r3 N13 fixed in form_handler, never fixed here",
+    "location": "server/src/reference_checks/webhooks.gleam:502-505",
+    "evidence": "_ ->\n      // 0 rows: someone transitioned first (sticky terminals / a concurrent\n      // writer) — stand down, no stamp/audit/notification.\n      Nil",
+    "detail": "The catch-all `_` arm conflates a 0-row (concurrent writer, correct stand-down) with a DB Error: a failing exhaust_reference_call is acked silently — no Sentry capture, no log, no notification. Provider retries self-heal, but the error is invisible.",
+    "recommended_fix": "Split the arm: Ok(Returned(_, [])) -> Nil; Error(err) -> capture a ReferenceWebhookExhaustFailed Sentry event, mirroring exhaust_wrong_person's r3 N13 fix."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage",
+    "title": "W3 co-nudge producer side unpinned — nothing asserts the sweep writes the kind tag; only the consumer exclusion is pinned (hand-written shape)",
+    "location": "server/src/reference_checks/sweep.gleam:380-388; server/test/integration/reference_checks_sweep_integration_test.gleam:301",
+    "evidence": "sweep.gleam: \"json.array([co_nudge_entry(outcome, now_iso)], fn(e) { e })\" — sweep integration test: \"summary.co_nudged |> should.equal(1) row_attempt_count(db, row_id) |> should.equal(2) // One co-nudge attempt entry (email channel, to the applicant). attempts_length(db, row_id) |> should.equal(1)\" — no kind assertion; co_nudge_bounce_stands_down_test hand-writes '{\"detail\":\"co_nudge_send_1\",\"kind\":\"co_nudge\"}' into attempts",
+    "detail": "co_nudge_bounce_stands_down_test writes the kind-tagged entry itself, so a regression dropping `kind` from co_nudge_entry (reopening the W3 exhaust-on-applicant-bounce hole) passes all suites silently.",
+    "recommended_fix": "Extend co_nudge_fires_when_form_unopened_no_draft_test (or a unit test of co_nudge_entry) to assert the attempts entry carries \"kind\":\"co_nudge\"."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage",
+    "title": "W4 pin covers only sweep_terminal — sweep_mark_failed's taken_over_at guard is unwritten-pin territory",
+    "location": "server/test/integration/reference_checks_actions_integration_test.gleam:1903-1935",
+    "evidence": "sweep_terminal_writers_respect_taken_over_test body: \"let assert Ok(returned) = rc_sql.sweep_terminal( db, call, rc_sql.Unreachable, \"unreachable\", \"sequence_exhausted\", json.null(), \"\" ) list.length(returned.rows) |> should.equal(0)\" — only sweep_terminal exercised; sweep_mark_failed.sql:21-22 guard \"AND taken_over_at IS NULL\" present in SQL but no test calls rc_sql.sweep_mark_failed on a taken-over row",
+    "detail": "Both SQL writers carry the W4 guard, but the test title says writers plural while only sweep_terminal is pinned. A regression deleting the guard from sweep_mark_failed (T+144h mark-failed leg) would go green.",
+    "recommended_fix": "Add a second assertion block driving rc_sql.sweep_mark_failed on a taken-over row (0 rows, status unchanged), or rename the test and add the missing half."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage",
+    "title": "Rewritten find_reference_call_by_send_ref: malformed-'at' regex branch (r3 N14sql fix) has no test",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:38-46",
+    "evidence": "\"COALESCE(( SELECT CASE WHEN e->>'at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}' THEN (e->>'at')::timestamptz >= rc.corrected_at ELSE false END ...), false) AS send_is_post_correction\" — no test constructs an attempts entry with a malformed at value; all integration fixtures use valid RFC3339 strings",
+    "detail": "The guarded cast is the r3 N14sql fix (a malformed 'at' must stand the event down, not raise). Untested: a regression to the unguarded cast (or to 'raise on malformed') would not be caught, and a malformed-at post-correction bounce silently never exhausts.",
+    "recommended_fix": "Add an integration case seeding an attempts entry with a malformed 'at' (e.g. 'not-a-date') and assert the delivery-failure event stands down without raising or exhausting."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "P0 = the r3 TOCTOU wrong-person race: executed UPDATE is update_reference_call_status (no taken_over_at clause, form_handler.gleam:1250) and the race pin calls rc_sql.mark_awaiting_correction_wrong_person directly (integration test:1746) — vacuous; therefore P0 coverage < 100%. All other behaviours traced: webhooks exhaustion matrix (stale/genuine/fallback/co-nudge/taken-over), per-slot start + re-arm + 400, authz negatives, §8.6 late completion, sweep exclusion, substitute idempotence + fraud stamp, shared back-compat decode, expand-only migration, audit keys — all pinned (FULL).",
+    "detail": "Gate FAIL per standing orders: the vacuous race pin + unwired backstop place the wrong-person race at P0 uncovered. Secondary gaps are P3 notes (co-nudge producer tag, sweep_mark_failed half, malformed-at branch, exhaust_row error arm).",
+    "recommended_fix": "Wire mark_awaiting_correction_wrong_person into apply_wrong_person and drive the race through the real POST route with a mid-request take-over; once the blocker pin bites, re-evaluate (all else supports PASS)."
+  }
+]

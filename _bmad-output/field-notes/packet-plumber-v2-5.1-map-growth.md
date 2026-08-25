@@ -1,0 +1,5 @@
+# Field notes — packet-plumber-v2-5.1-map-growth
+
+- The write/edit TOOLS resolved relative paths against the MAIN checkout (`/Users/moses/code/packet-plumber`, branch `v2`), NOT my worktree — ALL my growth code + goldens landed there; recovered by cmp-verified copy into the worktree + `git checkout --` restore of the main tree. Absolute worktree paths for every file tool, ALWAYS — the 2026-08-07 relative-path trap, re-bit on PP.
+- Odin cannot index a file-scope `::` const array at runtime ("Cannot index a constant") — and core keeps ZERO file-scope vars (lint gate 2): use a proc-local value array for small tables (the growth direction LUT).
+- Growth is the one branch where a same-tick re-step (the step_once test convention) is NOT idempotent — the rng hasn't advanced, so a re-plan can find a second valid spot and double-spawn. Any future tick-gated, rng-drawing branch in step needs the same non-serialized last-tick guard (`growth_last_tick`). rng_range draws NOTHING when hi <= lo — per-attempt draw counts vary with deterministic state; keep draw order + count pure functions of state or re-bless goldens.

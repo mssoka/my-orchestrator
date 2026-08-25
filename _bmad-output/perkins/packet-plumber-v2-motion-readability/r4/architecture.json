@@ -1,0 +1,62 @@
+[
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "fix-audit",
+    "title": "[fixed since r3] W4: motion-strip now has a real T1 drift net (check_manifest_prefix) wired where the strip path runs",
+    "location": "harness/manifest.odin:153 + harness/motion_strip.odin:153,205",
+    "evidence": "manifest.odin:153 `check_manifest_prefix :: proc(demo_name: string, demo: ^Demo, catalog_hash: u64, logic_hz: i32,` ... motion_strip.odin:153 `append(&hashes, pp.state_hash(&state, state.events[before:], cat, context.temp_allocator))` ... motion_strip.odin:205 `check_manifest_prefix(demo_name, &demo, cat.hash, hz, hashes[:], &fails)`",
+    "detail": "The r3 gap (no mechanical net on the strip path) is closed: per-stepped-tick hashes are collected during the strip run and prefix-checked against the blessed manifest, exit 2 on mismatch. Verified empirically both ways.",
+    "recommended_fix": "N/A — fixed. Residual defect in the fix's hash-index convention reported separately as a fresh warning."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "correctness-of-fix",
+    "title": "W4 fix misindexes: strip collects one hash per STEPPED tick but the manifest has one per WALL tick (paused ticks included) — false STATE DIVERGENCE on any paused demo",
+    "location": "harness/motion_strip.odin:141-153 + harness/manifest.odin:174-186 vs harness/run.odin:400-408",
+    "evidence": "motion_strip.odin:141-153: `if !paused {` ... `append(&hashes, pp.state_hash(&state, state.events[before:], cat, context.temp_allocator))` (paused ticks append nothing). run.odin:400-406: `paused := paused_at(cfg.pauses[:], w, hz)` / `if paused {` ... `append(&hashes, pp.state_hash(&state, state.events[before:], cat, context.temp_allocator))` (paused wall ticks DO append the stable hash). manifest.odin compares positionally: `if hashes[i] != m.hashes[i] { append(fails, fmt.tprintf(\"T1: STATE DIVERGENCE at tick %d: ...\"`. Empirically reproduced: `./bin/harness motion-strip pause 65000 71000 500 <dir>` → `motion-strip: T1 drift — T1: STATE DIVERGENCE at tick 1211: 568780a239c47780 != golden 09bbc05e1b830b64` — yet grep proves 568780a239c47780 IS the blessed hash at goldens/pause.t1 tick 1401 (the post-resume step); the timeline is not divergent. Also the frames are exported before the check runs (render_strip_frame at line 184 inside the loop; check at 205 after), so `refusing to emit a strip` is not literally true — all 12 PNGs were on disk after the failure.",
+    "detail": "Any demo whose window extends past a resume (pause.dem, future paused demos) gets a false divergence verdict: the verb becomes unusable there and teaches operators the gate's STATE DIVERGENCE verdicts can be false alarms — undermining the exact trust the W4 net was built for.",
+    "recommended_fix": "Match run_demo's per-wall-tick convention: append the paused-stability hash for paused wall ticks too (5-line fix), then the prefix aligns; optionally run the manifest check before exporting or delete the outdir on failure so 'refusing to emit' is true."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "duplication",
+    "title": "check_manifest_prefix duplicates check_manifest's header-verification block verbatim (~40 lines) and the copies already diverge",
+    "location": "harness/manifest.odin:153-176 vs harness/manifest.odin:95-141",
+    "evidence": "check_manifest (95): `if m.seed != demo.seed { append(fails, fmt.tprintf(\"T1: seed drift — manifest %d vs demo %d\", m.seed, demo.seed))` ... `if m.ticks != i64(len(m.hashes)) { append(fails, fmt.tprintf(\"T1: manifest corrupt — ticks header %d but %d hash lines\",`. check_manifest_prefix (153-176) repeats the version/seed/catalog_hash/logic_hz checks character-for-character but omits the `m.ticks != i64(len(m.hashes))` corruption check.",
+    "detail": "Same-file copy-paste of the header checks; a future manifest header field must be remembered in both procs, and the copies have already drifted (corruption check present in one only).",
+    "recommended_fix": "Extract a shared header-check helper (or a `prefix: bool` param on check_manifest) so the header logic lives once."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "doc-drift",
+    "title": "motion_strip.odin file header still claims the T1 manifest is NOT re-verified by the verb — contradicting the W4 code added in this commit",
+    "location": "harness/motion_strip.odin:24-26",
+    "evidence": "harness/motion_strip.odin:24-26: `// pure function of the wall ms. T1 manifest + replay gate are NOT re-verified` / `// here (run_demo does that) — this verb is a RENDER-ONLY evidence tool; it` — while lines 149-153 and 203-212 of the same file collect per-tick hashes and call check_manifest_prefix with `fmt.eprintln(\"motion-strip: refusing to emit a strip from a divergent timeline (re-bless deliberately)\")`.",
+    "detail": "The stale header comment directly contradicts the W4 verification the same commit added; a maintainer reading top-down concludes the timeline is unchecked on this path.",
+    "recommended_fix": "Update the header comment to state the manifest PREFIX is verified per strip run (paused-window caveat per the warning)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "code-hygiene",
+    "title": "motion_pixel.odin ships dead scratch the r3 round already flagged as a class: `_ = bw`, a 'hmm, no:' mid-thought comment, and a NEGATIVE CONTROL block pasted twice",
+    "location": "harness/motion_pixel.odin:90,96,150-161",
+    "evidence": "line 90: `_ = bw` (dead — bw is used above at `pk.progress_units = (bw * 3) / 8`). line 96: `// alpha=1 the T position (frac 0.5) — hmm, no: the row rolls per tick, so`. lines 150-161: `// NEGATIVE CONTROL (the B1 failure mode): a dropped interp_alpha at the` appears verbatim at both line 150 and line 156 (two 6-line blocks back-to-back, differing only in the final sentence).",
+    "detail": "The fix commit removed r3 N1's 'hmm' scratch from motion_test.odin but reintroduced the identical class in the new 181-line verb — reads as unreviewed scratch in CI-gated code.",
+    "recommended_fix": "Delete `_ = bw`; rewrite the 'hmm, no' sentence as a flat statement; keep one NEGATIVE CONTROL block (the second, which has the COMBINED-distance rationale)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "doc-attachment",
+    "title": "interp_alpha_from_accum's doc comment is glued onto interp_continuous's doc block, and interp_continuous's proc is separated from its own doc by the whole helper",
+    "location": "app/render/view.odin:135-166",
+    "evidence": "view.odin:135 `// interp_continuous — may the render lerp between the row's anchor (the` runs to 142 `// the edge's endpoint), so the glide stays honest there.` then IMMEDIATELY 143 `// interp_alpha_from_accum — the ONE interpolation-activation derivation` (no separator) through 152, then 153 `interp_alpha_from_accum :: proc(running: bool, accum, tick_seconds: f64) -> f32 {` ... and only at 166 `interp_continuous :: proc(` — its doc comment now sits 30 lines away across another definition.",
+    "detail": "The helper was inserted inside interp_continuous's comment/proc pair; doc tooling and maintainers attach the combined 18-line comment to the wrong proc and interp_continuous loses its doc.",
+    "recommended_fix": "Move interp_alpha_from_accum (proc + comment) below interp_continuous, or add a blank comment line and reorder so each doc attaches to its own proc."
+  }
+]

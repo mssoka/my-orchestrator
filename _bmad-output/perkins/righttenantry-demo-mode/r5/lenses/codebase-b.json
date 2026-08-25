@@ -1,0 +1,132 @@
+[
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "error-handling",
+    "title": "still present since round 4: vacancy/status mutations return Ok unconditionally — nonexistent ids report success",
+    "location": "client/src/demo/demo_store.gleam:1245 (archive), 1259 (restore), 1273 (close), 1356 (change_status); contrast 1215-1216 (update_vacancy)",
+    "evidence": "archive_vacancy ends: `  #(DemoStore(..store, vacancies: updated), Ok(vacancy_id))` (identical at 1259 restore_vacancy and 1273 close_vacancy); change_status ends: `  #(DemoStore(..store, vacancies: updated), Ok(slug))` — all four mutate via list.map and return Ok with no find check, while update_vacancy does: `  let next = DemoStore(..store, vacancies: updated)\n  #(next, find_vacancy(next, vacancy_id) |> result.map(fn(v) { v.vacancy }))` (1215-1216) and publish_vacancy the same at 1231.",
+    "detail": "list.map leaves the store unchanged when no id matches yet Ok is returned — the error channel is dead; UI toasts success for ids that don't exist.",
+    "recommended_fix": "Mirror update/publish: bind `let next = DemoStore(..store, vacancies: updated)` and return find_vacancy/find_application-derived Results instead of unconditional Ok."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "fidelity",
+    "title": "still present since round 4: send_reminder / remind_applicant / send_bulk_invite mutate nothing and return canned counts",
+    "location": "client/src/demo/demo_api.gleam:117-118, 131-132, 140-141; client/src/demo/demo_store.gleam:1407-1434",
+    "evidence": "demo_api.gleam: `  let #(next, result) = demo_store.send_reminder(store, vacancy_id)\n  let _ = next` (same `let _ = next` pattern in remind_applicant and send_bulk_invite); demo_store.gleam: `pub fn remind_applicant(\n  store: DemoStore,\n  _vacancy_id: String,\n) -> #(DemoStore, #(Int, Int)) {\n  #(store, #(1, 0))\n}` — send_reminder returns `#(store, #(2, 1))`, send_bulk_invite a fixed `BulkInviteResult(\n      sent: 2,\n      invalid: 1,` for every vacancy.",
+    "detail": "Reminders never persist (awaiting rows' reminded/followed_up never flip) and the canned counts fire even for vacancies with zero awaiting rows, contradicting the seeded pool.",
+    "recommended_fix": "Thread the mutated store back like other mutations, flip reminded/followed_up on static_awaiting rows, and derive counts per vacancy."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "fidelity",
+    "title": "still present since round 4: create_vacancy derives ids from an 8-char slug with no uniqueness check — the doc comment claims collisions can't happen",
+    "location": "client/src/demo/demo_store.gleam:1121-1124, 1683-1696",
+    "evidence": "create_vacancy: `pub fn create_vacancy(\n  store: DemoStore,\n  payload: CreateVacancyPayload,\n) -> #(DemoStore, Vacancy) {\n  let suffix = id_suffix(payload.property_name)\n  let id = \"v-demo-\" <> suffix` — id_suffix: `/// Stable short id suffix from a property name (lowercase alphanumeric,\n/// up to 8 chars) so re-created demo vacancies don't collide.` then `  case string.length(cleaned) {\n    n if n <= 8 -> cleaned\n    n -> string.drop_end(cleaned, n - 8)\n  }` — the derived id is never checked against store.vacancies.",
+    "detail": "Two creates with names sharing an 8-char prefix (\"Test Cottage A\"/\"Test Cottage B\") produce the same id — the second silently shadows the first in every lookup, contradicting the comment.",
+    "recommended_fix": "After deriving the id, append a counter while find_vacancy(store, id) is Ok (id-2, id-3…) before inserting."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "still present since round 4 (narrowed — W13 fixed load-more/comparison/awaiting/scoring only): demo dispatch arms unpinned — refcheck trio, single mark-read, report download, edit deep-link get_for_edit boot, mark-opened threading",
+    "location": "client/src/demo/demo_update.gleam:501, 808, 845; client/test/demo/demo_flow_test.gleam:471-473, 548-566; client/test/client_test.gleam:6372-6384",
+    "evidence": "fire_demo_refcheck/substitute thread `          demo_store: Some(next),` (demo_update.gleam:808, 845) — reverting to plain `model` stays green: the only refcheck demo pins are store-level, demo_flow_test.gleam:471-473: `  let #(after_skip, _) =\n    demo_store.refcheck_action(\n      store,` (no client.update in either refcheck demo test), and every client_test refcheck test builds `  model.Model(\n    ..model.initial(),` (6375-6376, demo_mode False). demo_deep_link_boot_state_test (548-566) covers only the detail-route NotAsked→Loading flip from a hand-built demo model. No test drives UserClickedNotification, UserClickedDownloadReport, the VacancyEdit get_for_edit entry boot, or the mark-opened store threading via client.update from a demo model.",
+    "detail": "Reverting these arms' interception or `demo_store: Some(next)` threading keeps the client suite green — the r3-W2 pin pattern was applied to only four of the arms.",
+    "recommended_fix": "Add dispatch pins (demo model + client.update) for UserSavedRefcheckEdit, UserChoseRefcheckAction(Skip), UserClickedNotification, UserClickedDownloadReport, and the edit deep-link boot."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "doc-drift",
+    "title": "still present since round 4: mark_opened doc claims idempotent Submitted→UnderReview but applies to any status",
+    "location": "client/src/demo/demo_store.gleam:1276-1291",
+    "evidence": "`/// POST /open - idempotently moves a Submitted application to UnderReview\n/// and returns the post-transition status slug.\npub fn mark_opened(\n  store: DemoStore,\n  vacancy_id: String,\n  application_id: String,\n) -> #(DemoStore, Result(String, Nil)) {\n  change_status(\n    store,\n    vacancy_id,\n    application_id,\n    \"under_review\",\n    \"status_auto_changed\",\n  )\n}` — change_status sets `status: target` on whatever the current status is, with no Submitted guard.",
+    "detail": "Doc/behaviour mismatch: a viewed, shortlisted, approved or rejected application 'opened' again snaps back to under_review and logs a second auto event.",
+    "recommended_fix": "Guard mark_opened: no-op returning the current status unless status == Submitted, or fix the doc."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "fidelity",
+    "title": "still present since round 4: for_edit reports updated_at: vac.created_at and update_vacancy never bumps any timestamp",
+    "location": "client/src/demo/demo_store.gleam:953; client/src/demo/demo_store.gleam:1174-1217",
+    "evidence": "for_edit: `    total_applications: list.length(v.applications),\n    status: vac.status,\n    updated_at: vac.created_at,\n  ))` — update_vacancy's record update `Vacancy(\n              ..old,` writes property_name..status fields but sets no updated_at anywhere in its body (1174-1217).",
+    "detail": "Editing a demo vacancy shows updated_at equal to created_at forever; the edit-save surface can never demonstrate a fresh timestamp.",
+    "recommended_fix": "Bump an updated_at on the mutation (e.g. the demo 'now' 2026-08-19) and have for_edit report it."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "error-handling",
+    "title": "still present since round 4: status_from_slug silently coerces unknown slugs to Submitted",
+    "location": "client/src/demo/demo_store.gleam:182-193",
+    "evidence": "`fn status_from_slug(slug: String) -> ApplicationStatus {\n  case slug {\n    \"submitted\" -> Submitted\n    \"under_review\" -> UnderReview\n    \"shortlisted\" -> Shortlisted\n    \"viewed\" -> Viewed\n    \"approved\" -> Approved\n    \"rejected\" -> Rejected\n    _ -> Submitted\n  }\n}`",
+    "detail": "A typo'd slug from UserChangedApplicationStatus/backward-transition silently 'succeeds' as Submitted — an unknown backward stop regresses the row instead of erroring.",
+    "recommended_fix": "Return Result(ApplicationStatus, Nil) and route Errors through respond_result like the other mutations."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "fidelity",
+    "title": "still present since round 4: fetch_leaderboard_page ignores its page parameter",
+    "location": "client/src/demo/demo_api.gleam:217-227",
+    "evidence": "`pub fn fetch_leaderboard_page(\n  store: DemoStore,\n  vacancy_id: String,\n  _page: Int,\n  on_response: fn(Result(LeaderboardResponse, ApiError)) -> msg,\n) -> Effect(msg) {\n  case demo_store.leaderboard(store, vacancy_id) {\n    Ok(response) -> deliver(on_response, response)\n    Error(_) -> deliver_err(on_response)\n  }\n}` — the underscore parameter is never read.",
+    "detail": "Demo 'Load more' (UserClickedLoadMoreApplications passes leaderboard_page + 1) always re-delivers the full first page — pagination is cosmetic.",
+    "recommended_fix": "Slice demo_store.leaderboard's entries by page (page size matching the real API) or document the single-page cap at the call site."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "coupling",
+    "title": "still present since round 4: store_of's None fallback re-seeds on every call without writing back to the model",
+    "location": "client/src/demo/demo_update.gleam:686-698",
+    "evidence": "`pub fn store_of(model: Model) -> DemoStore {\n  case model.demo_store {\n    Some(store) -> store\n    None ->\n      // Unreachable while demo_mode is True (entry/reset always seed first);\n      // fall back to a fresh seed so the demo can never crash on a None.\n      case demo_store.seed() {\n        Ok(store) -> store\n        Error(_) -> demo_store.empty_store()\n      }\n  }\n}` — read-only arms (e.g. AppRequestedDashboardData) call store_of and never set demo_store on the returned model.",
+    "detail": "A None demo_store (invariant-break path) silently re-seeds on every dispatch instead of surfacing once; each seed is wasted work and masks the corruption.",
+    "recommended_fix": "Persist the fallback (demo_store: Some(store) on first hit) or telemetry-log it so the invariant break is visible."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "correctness",
+    "title": "still present since round 4: demo_not_in_demo_toast's id convention is off by one vs add_toast — toast ids can collide",
+    "location": "client/src/demo/demo_update.gleam:645-660; client/src/client.gleam:7143-7151",
+    "evidence": "demo_update.gleam: `  let toast_id = model.next_toast_id + 1` ... `      next_toast_id: toast_id,` — client.gleam add_toast: `  let id = model.next_toast_id` ... `  #(Model(..model, toasts: capped_toasts, next_toast_id: id + 1), dismiss_eff)`.",
+    "detail": "The fallback toast consumes next+1 but leaves next_toast_id equal to the toast's id, so the NEXT add_toast reuses it — two live toasts share one id and AppDismissToast dismisses both.",
+    "recommended_fix": "Use add_toast's convention: `let toast_id = model.next_toast_id` and `next_toast_id: toast_id + 1` (or route through a shared toast helper)."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "still present since round 4 (narrowed — the fixtures half now has callers): zero-caller export demo_store.notifications",
+    "location": "client/src/demo/demo_store.gleam:1532-1534",
+    "evidence": "`pub fn notifications(store: DemoStore) -> List(Notification) {\n  store.notifications\n}` — repo-wide grep for `demo_store.notifications(` returns no callers; every consumer uses the unread variant: `deliver(on_response, demo_store.notifications_unread(store))` (demo_api.gleam:366) and `let #(notifications, unread) = demo_store.notifications_unread(store)` (demo_flow_test.gleam:597).",
+    "detail": "Unused pub export shipped in the demo store; readers must check which of the two read paths is real. (r4 also cited demo_fixtures.result_to_seed_error — the current seed_error_from_result IS wired at demo_store.gleam:151-163, so only this half remains.)",
+    "recommended_fix": "Delete the wrapper (callers read store.notifications via notifications_unread)."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "lint-gap",
+    "title": "still present since round 4 (narrowed — the rsvp half now bans verbs file-wide): CI fetch ban exempts the whole demo_api.gleam file while its header claims a single documented exception",
+    "location": ".github/workflows/test.yml:137; client/src/demo/demo_api.gleam:12-13; client/src/demo/demo_update.gleam:14-16",
+    "evidence": "test.yml: `FETCH_VIOLATIONS=$(grep -rln \"gleam/fetch\" client/src/demo/ --include=\"*.gleam\" | grep -v \"demo_api.gleam\" || true)` — a file-level -v exemption, while demo_api's header claims \"the CI grep lint enforces the no-network rule by banning the API-client modules and fetch imports across demo/ — except this one documented static-asset fetch in `download`.\" (The rsvp half WAS narrowed: `RSVP_VERBS=$(grep -rnE \"rsvp\\.(send|get|post|put|patch|delete)\" client/src/demo/ ...)` bans the verbs everywhere; demo_api's only rsvp use is `case rsvp.parse_relative_uri(url)` at :413.)",
+    "detail": "A new gleam/fetch usage anywhere else in demo_api.gleam passes CI, contradicting the documented single-function exception; both headers overstate the guard.",
+    "recommended_fix": "Scope the exemption to the download function (line range or its own module), or reword both headers to 'exempt: demo_api.gleam'."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "duplication",
+    "title": "still present since round 4 (narrowed — the store_of half is now centralized): download_timeout duplicated between client.gleam and demo_update.gleam",
+    "location": "client/src/client.gleam:6923; client/src/demo/demo_update.gleam:858-866",
+    "evidence": "client.gleam:6923: `fn download_timeout(analysis_id: String, delay_ms: Int) -> Effect(Msg) {` vs demo_update.gleam: `/// 90s download timeout — mirrors client.gleam's \\`download_timeout\\` so a\n/// slow static asset (unlikely) still surfaces the brand-voice toast.\nfn download_timeout(id: String) -> Effect(Msg) {\n  effect.from(fn(dispatch) {\n    global.set_timeout(90_000, fn() {\n      dispatch(msg.AppTimedOutDownloadReport(id))\n    })\n    Nil\n  })\n}` — (the store_of half of the r4 duplication WAS fixed: client.gleam's demo_store_of now delegates `demo_update.store_of(model)`).",
+    "detail": "The timeout wrapper exists twice with diverging signatures (parameterised vs hardcoded 90s); changes to the real one's delay won't reach the demo copy.",
+    "recommended_fix": "Export the parameterised download_timeout from one module and call it with 90_000 from the demo path."
+  }
+]

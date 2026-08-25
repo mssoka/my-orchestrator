@@ -1,0 +1,334 @@
+### F1 [blind] warning | evidence-consistency
+TITLE: PR's own motion measurements are arithmetically impossible: 3×30.6px vs 14×11.2px over the same 24 frames
+LOC: _bmad-output/pr-bodies/v2-motion-readability.md:hunk (measurement table + summary)
+EVIDENCE: +holds (<0.5px): BEFORE=21/24  AFTER=10/24 (post-arrival)
++mean jump when moving: BEFORE=30.6px  AFTER=11.2px
+[table rows]
++2200  |     0.0     |     0.0
++2217  |     0.0     |    10.2
++2234  |     0.0     |    10.7
++2251  |    30.7     |    10.3
++2268  |     0.0     |    10.1
++2285  |     0.0     |    10.7
++2302  |    30.8     |    10.2
+DETAIL: Same 24 timestamps, same deterministic sim: BEFORE total = 3×30.6 ≈ 92px, AFTER total = 14×11.2 ≈ 157px. Render-behind lag bounds the difference at ~one tick (~31px). Both summaries cannot be correct.
+FIX: Re-run tools/measure_packet_motion.py on fresh strips and paste the unedited output; reconcile holds/moving counts and means so totals match within one tick.
+
+### F2 [blind] note | boundary
+TITLE: measure_packet_motion.py counts a lost packet track as a 'hold', silently inflating the headline metric
+LOC: tools/measure_packet_motion.py:51-60 (new file)
+EVIDENCE: +            c = live_centroid(os.path.join(d, f), xmax=xmax)
++            if prev and c:
++                disp = ((c[0] - prev[0]) ** 2 + (c[1] - prev[1]) ** 2) ** 0.5
++            else:
++                disp = 0.0
++            rows.append((f, disp))
+...
++    b_holds = sum(1 for _, d in before if d < 0.5)
+DETAIL: When no exact-color cluster is found (c is None), displacement records 0.0 and counts as a hold. A lost track is indistinguishable from a stationary packet in the PR-evidence metric.
+FIX: Track found/lost per frame; exclude lost frames from holds (or report them separately) instead of recording disp = 0.0.
+
+### F3 [blind] note | doc-contradiction
+TITLE: demos/motion.dem claims the strip window has 'no arrivals', but the PR's own data says 10 of 24 AFTER frames are post-arrival
+LOC: demos/motion.dem:9-11 (new file)
+EVIDENCE: +# takes 8 ticks/edge = 400 ms: the packet crosses edge0 from ~t42 to ~t50,
++# so the strip window 2200..2600 ms is a pure mid-edge glide, no hops, no
++# arrivals — the displacement delta (steps vs glide) reads unmixed.
+[vs pr-body]
++holds (<0.5px): BEFORE=21/24  AFTER=10/24 (post-arrival)
+DETAIL: t50 = 2500ms; the window runs to 2600ms, so ~100ms is post-arrival by the demo's own timeline, and the PR annotates 10 frames '(post-arrival)'. The comment misdescribes the measurement scene.
+FIX: Fix the motion.dem comment (window includes arrival), or narrow the strip window to end before ~2500ms if a pure mid-edge read is intended.
+
+### F4 [blind] note | coupling
+TITLE: Trail ring shift path hardcodes capacity 3 (trail[2]) while the append path is length-generic
+LOC: app/render/view.odin:hunk @@ -88,6 +100,243 @@ (packet_interp_pos)
+EVIDENCE: +		if row.trail_n < len(trail) {
++			// append at [n] — 0 is the oldest, n-1 the newest
++			trail[row.trail_n] = {dwx, dwy}
++			row.trail_n += 1
++		} else {
++			// full — drop the oldest, shift, newest at [2]
++			for k in 0..<len(trail) - 1 {
++				trail[k] = trail[k + 1]
++			}
++			trail[2] = {dwx, dwy}
++		}
+[capacity 3 also hardcoded in]
++TRAIL_FADES :: [3]f32{0.30, 0.20, 0.12}
++	trail:   [3]rl.Vector2,
+DETAIL: Echo capacity 3 is restated in three places; changing TRAIL_FADES or the array size without editing trail[2] silently drops the newest echo or misaligns fades.
+FIX: Use trail[len(trail)-1] = {dwx, dwy} (or a named ECHO_N constant) so the shift path derives capacity like the append path does.
+
+### F5 [blind] note | cli-validation
+TITLE: motion-strip silently ignores a 6th argument that isn't the literal 'snapshot'
+LOC: harness/main.odin:hunk @@ -125,6 +125,33 @@
+EVIDENCE: +		if len(rest) < 5 || len(rest) > 6 {
++			usage()
++		}
+...
++		code := run_motion_strip(rest[0], rest[1], rest[2], rest[3], rest[4], len(rest) == 6 && rest[5] == "snapshot", &cat, &rc)
+DETAIL: A typo'd mode argument (e.g. 'snapshott') is accepted and quietly runs interp mode, producing the opposite evidence strip of what was asked for.
+FIX: Validate rest[5] when present: if len(rest) == 6 && rest[5] != "snapshot" { usage(); os.exit(2) }.
+
+### F6 [blind] note | robustness
+TITLE: measure_packet_motion.py: ZeroDivisionError when AFTER strip has no moving frames; zip() silently truncates mismatched dirs
+LOC: tools/measure_packet_motion.py:62-72 (new file)
+EVIDENCE: +    for (fb, db), (fa, da) in zip(before, after):
++        print(f"{fb} | {db:6.1f} | {da:6.1f}")
+...
++    if b_steps:
++        print(f"mean jump when moving: BEFORE={sum(b_steps)/len(b_steps):.1f}px  AFTER={sum(a_steps)/len(a_steps):.1f}px")
+DETAIL: Guard checks only b_steps; empty a_steps crashes. zip drops extra frames silently when the two strip dirs differ, misaligning the printed before/after table.
+FIX: Guard a_steps separately; assert len(before) == len(after) (or pad/report) before zipping.
+
+### F7 [blind] note | dead-code
+TITLE: render_strip_frame's `cat` parameter is never used
+LOC: harness/motion_strip.odin:186-199 (new file)
+EVIDENCE: +render_strip_frame :: proc(
++	rc: ^Render_Ctx,
++	state: ^pp.Run_State,
++	cat: ^pp.Catalogs,
++	outdir, demo_name: string,
++	ms: i64,
++	sim_tick: u64,
++	alpha: f32,
++	frames: ^int,
++) {
++	img := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,
++		state.health_enabled, sim_tick, state.era, state.seed, nil, alpha)
++	path := fmt.tprintf("%s/%s-%06dms.png", outdir, demo_name, ms)
++	rl.ExportImage(img, strings.clone_to_cstring(path, context.temp_allocator))
++	rl.UnloadImage(img)
++	frames^ += 1
++}
+DETAIL: The body never reads `cat`; the parameter is dead weight and misleads readers into thinking the render depends on the catalogs.
+FIX: Drop the `cat` parameter from render_strip_frame and update its single call site.
+
+### F8 [edge] warning | error-path
+TITLE: measure_packet_motion.py: ZeroDivisionError when the after-strip has no moving frames
+LOC: tools/measure_packet_motion.py:72
+EVIDENCE:         print(f"mean jump when moving: BEFORE={sum(b_steps)/len(b_steps):.1f}px  AFTER={sum(a_steps)/len(a_steps):.1f}px")
+DETAIL: The mean line is guarded only by `if b_steps:`. If the after dir has zero moving frames (window fully post-arrival, packet off-frame), len(a_steps)==0 and the tool crashes. Reproduced: after-dir of all-holds frames → ZeroDivisionError.
+FIX: Guard the AFTER mean on a_steps too: print BEFORE only, or `AFTER=n/a` when a_steps is empty.
+
+### F9 [edge] warning | input-validation
+TITLE: measure_packet_motion.py: zip(before, after) silently truncates on frame-count mismatch
+LOC: tools/measure_packet_motion.py:64
+EVIDENCE:     for (fb, db), (fa, da) in zip(before, after):
+        print(f"{fb} | {db:6.1f} | {da:6.1f}")
+    b_holds = sum(1 for _, d in before if d < 0.5)
+    a_holds = sum(1 for _, d in after if d < 0.5)
+DETAIL: Dirs with different frame counts (different end_ms/step_ms) pair positionally and drop the tail silently; the holds/mean stats still use full lengths. Reproduced: before=3/after=4 frames printed a 3-row table with 'AFTER=3/4' — misleading evidence with no warning.
+FIX: Compare len(before)/len(after) (and frame-name sequences) before printing; exit 2 on mismatch.
+
+### F10 [edge] note | error-path
+TITLE: measure_packet_motion.py: missing dir or stray non-PNG file crashes with a raw traceback
+LOC: tools/measure_packet_motion.py:25
+EVIDENCE:     img = Image.open(path).convert("RGB")
+...
+        for f in sorted(os.listdir(d)):
+DETAIL: No existence or format validation: a missing/misspelled dir raises FileNotFoundError; a stray non-PNG entry (e.g. macOS .DS_Store) raises PIL UnidentifiedImageError. Both reproduced. Loud but unhandled input paths in new code.
+FIX: Guard os.path.isdir and filter entries to *.png (skip others or fail with a clean message).
+
+### F11 [edge] note | input-validation
+TITLE: motion-strip: a 6th arg other than exactly "snapshot" is silently ignored (interp mode runs)
+LOC: harness/main.odin:150
+EVIDENCE: 		code := run_motion_strip(rest[0], rest[1], rest[2], rest[3], rest[4], len(rest) == 6 && rest[5] == "snapshot", &cat, &rc)
+DETAIL: Any 6th token except the exact string "snapshot" (typo, casing) is accepted and silently selects interpolated mode; only the final stdout line discloses the mode. Unvalidated CLI input path in new code.
+FIX: Reject a 6th arg that isn't "snapshot": `if len(rest) == 6 && rest[5] != "snapshot" { usage() }`.
+
+### F12 [edge] warning | error-path
+TITLE: render_strip_frame ignores rl.ExportImage's failure and still counts the frame — verb reports success with an empty/partial outdir
+LOC: harness/motion_strip.odin:196
+EVIDENCE: 	path := fmt.tprintf("%s/%s-%06dms.png", outdir, demo_name, ms)
+	rl.ExportImage(img, strings.clone_to_cstring(path, context.temp_allocator))
+	rl.UnloadImage(img)
+	frames^ += 1
+DETAIL: On a failed write (unwritable outdir, disk full) every export can fail yet `frames` increments and the verb exits 0 printing "N frame(s)". Sibling evidence verbs check the bool (goldens.odin:146 `ok := rl.ExportImage(...)`, map_preview.odin:117, overlay.odin:122, wire_preview.odin:108).
+FIX: Bind and check the result like map_preview: `if !rl.ExportImage(img, ...) { fmt.eprintfln("motion-strip: export failed: %s", path); return 2 }`.
+
+### F13 [acceptance] note | spec-letter-deviation
+TITLE: Literal AC 'motion strip captures at 100 ms show continuous progression' is unsatisfiable — evidence substituted with 60 Hz (17 ms) captures
+LOC: diff.patch: _bmad-output/pr-bodies/v2-motion-readability.md:hunk
+EVIDENCE: Briefing acceptance: "Sub-tick interpolation live; packets glide between ticks (motion strip captures at 100 ms show continuous progression, no 50 ms jumps)."  Diff field notes: "motion strips must render mid-tick (25ms/16.7ms cadence), not tick-aligned (100ms) — a 100ms strip samples only tick boundaries and shows the same stepping in both modes; the 60Hz displacement table is the decisive before/after proof."  PR body reproduce: "./bin/harness motion-strip motion 2200 2600 17 bin/m60-before snapshot"
+DETAIL: No artifact demonstrates the AC as written: 100 ms cadence is tick-aligned (2×50 ms) and steps identically before/after. The intent is met by the 17 ms strip + displacement table (21/24→10/24 holds, 30.6→11.2 px), and the deviation is documented.
+FIX: Amend the acceptance line to '60 Hz (17 ms cadence) strip captures show continuous progression'; drop or re-caption the 100 ms juice strips in the PR reproduce block.
+
+### F14 [architecture] note | duplication
+TITLE: Trail echo ring duplicates the live packet shape geometry in a second switch
+LOC: app/render/view.odin:1357
+EVIDENCE: view.odin:1357 (echo block): "			#partial switch shape {
+			case .Triangle:
+				half := r * 0.866
+				rl.DrawTriangle(
+					rl.Vector2{e.x, e.y - r},
+					rl.Vector2{e.x - half, e.y + r * 0.5},
+					rl.Vector2{e.x + half, e.y + r * 0.5},
+					eout,
+				)" ... "			case:
+				rl.DrawCircleV(e, r, eout)
+				rl.DrawCircleV(e, r * 0.78, ebody)"; view.odin:1378 (live block): "		#partial switch shape {
+		case .Triangle:
+			// streaming: an equilateral triangle (apex up), outline + body like the dot
+			half := r * 0.866" — the same 0.866/0.5/0.78 geometry restated. Contrast the project's one-definition
+DETAIL: The echo ring re-implements the live shape geometry in a second #partial switch. A new Packet_Shape case added to the live draw would silently render circle trails — the two blocks must be hand-synced.
+FIX: Extract a shared draw_packet_shape(center, r, outline, body) proc and call it from both the echo loop and the live packet draw.
+
+### F15 [architecture] note | coupling
+TITLE: run_motion_strip adds a third hand-copied demo setup/driver orchestration
+LOC: harness/motion_strip.odin:59
+EVIDENCE: motion_strip.odin:59-73: "	// run setup — the SAME pieces run_demo applies (fixture + nodes + spawns
+	// + session + growth + era), so the strip's sim timeline is the blessed
+	// one (the T1 manifest pins it; this verb just renders it).
+	state: pp.Run_State
+	defer pp.run_destroy(&state)
+	pp.run_init(&state, demo.seed, cat.hash, cat.balance.logic_hz)
+	state.era = demo.era
+	cfg := Demo_Replay{
+		name = demo_name,
+		use_fixture = demo.use_fixture,
+		qos_fixture = demo.qos_fixture,
+		growth_on = demo.growth_on,
+		advance_gate_on = demo.advance_gate_on,
+		session = {goal = demo.win_goal, cap_ms = d
+DETAIL: Third copy of the Demo_Replay setup (run_demo, overlay_check, run_motion_strip). A future run-setup directive added to run_demo but missed here silently renders strips off the blessed timeline; no manifest cross-check in the verb catches it.
+FIX: Extract a shared demo_begin(demo, cat) helper that builds Demo_Replay and applies setup; call it from run_demo, overlay_check, and run_motion_strip.
+
+### F16 [codebase] note | leak
+TITLE: motion-strip prime render discards capture_frame's image without UnloadImage
+LOC: harness/motion_strip.odin:146
+EVIDENCE: harness/motion_strip.odin:143-148 (the internal prime render — the returned rl.Image is dropped):
+			if (win_start - start_ms) % step_ms != 0 || win_start < start_ms {
+				alpha: f32 = 1.0
+				if !snapshot && !paused {
+					alpha = 0.0
+				}
+				capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,
+					state.health_enabled, sim_tick, state.era, state.seed, nil, alpha)
+
+harness/motion_strip.odin:193-197 (the exported path, by contrast, unloads):
+	img := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,
+		state.
+DETAIL: capture_frame returns LoadImageFromScreen (a heap-allocated 1280×720 buffer). Every prime tick leaks ~3.5MB; a strip window primes ~17+ times. Every other capture_frame call site (harness/goldens.odin) unloads.
+FIX: Bind and free the prime image: `img := capture_frame(...); rl.UnloadImage(img)` — mirroring render_strip_frame.
+
+### F17 [codebase] note | untestable-gate
+TITLE: a11y_reduced golden cannot exercise the new trail echo-off gate — trail_n is always 0 in golden captures
+LOC: app/render/view.odin:1349
+EVIDENCE: app/render/view.odin:1306-1308 (trail_n only becomes non-zero on the interp path):
+		if interp_alpha < 1.0 {
+			pos, trail_world, trail_n = packet_interp_pos(v, topo, p, pos, tick, interp_alpha)
+		}
+app/render/view.odin:1349:
+		if trail_n > 0 && !v.reduced_motion {
+harness/run.odin:489-490 (golden capture — no interp_alpha argument, so the default 1.0 applies):
+				img := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,
+					state.health_enabled, sim_tick, state.era, state.seed, prev)
+DETAIL: The claim that the a11y_reduced golden exercises echo-off is false as stated: its T2 captures render snapshot-exact, so the `!v.reduced_motion` branch never evaluates. The reduced pin is verified only for pulse_read; the trail gate is app/motion-strip-only.
+FIX: Verify echo suppression via `harness motion-strip a11y_reduced <win>` (interp mode applies a11y pins) asserting zero echo pixels, or a unit test of the predicate.
+
+### F18 [codebase] note | duplication
+TITLE: run_motion_strip re-implements run_demo's wall-tick walk + action-log command batching
+LOC: harness/motion_strip.odin:126
+EVIDENCE: harness/motion_strip.odin:124-133:
+		paused := paused_at(cfg.pauses[:], w, hz)
+		if !paused {
+			sim_tick += 1
+			batch := make([dynamic]pp.Command, 0, 4, context.temp_allocator)
+			for cmd in state.action_log {
+				if cmd.apply_tick == sim_tick {
+					append(&batch, cmd)
+				}
+
+harness/run.odin:413-420 (the blessed-timeline original):
+		} else {
+			sim_tick += 1
+			batch := make([dynamic]pp.Command, 0, 4, context.temp_allocator)
+			for cmd in state.action_log {
+				if cmd.apply_tick == sim_tick {
+					append(&batch, cmd)
+				}
+			}
+			pp.step(&state, sim_tick, batch[:], cat)
+DETAIL: The blessed sim-timeline walk now exists in two copies. If run_demo's loop later changes (new command source, pause semantics), the strip silently diverges from the T1-pinned timeline and its evidence misleads.
+FIX: Extract a shared step-once helper (paused_at + action_log batch + pp.step + event clear) used by run_demo, replay, and run_motion_strip.
+
+### F19 [tests] blocker | coverage-gap
+TITLE: Sub-tick interpolation core (interp_continuous guard + packet_interp_pos row-roll/snap) has zero automated coverage — manual evidence only
+LOC: app/render/view.odin:1306
+EVIDENCE: app/render/view.odin:1306-1308:
+		if interp_alpha < 1.0 {
+			pos, trail_world, trail_n = packet_interp_pos(v, topo, p, pos, tick, interp_alpha)
+		}
+
+tools/ci-local.sh:56 (the CI gate that already tests app/render):
+  "Core unit tests (the determinism + topology contracts)|mkdir -p bin && odin test core && for i in 1 2 3; do odin test app -out:bin/app-test || exit 1; done && odin test app/render -out:bin/render-test && odin test app/audio -out:bin/audio-test && odin test harness -out:bin/harness-test"
+
+repo-wide grep for interp_continuous|packet_interp_pos|packet_interp_reset|packet_interp_prun
+DETAIL: P0 critical path of this round's hard bar (identity-guarded snap on spawn/sever/reroute, no ghosts). Traceable only to manual artifacts: motion-strip verb is in no CI gate (.github/workflows/ci.yml has no motion entry); T1/T2/replay run at alpha=1.0 and never execute it.
+FIX: Add app/render/motion_test.odin pinning interp_continuous's four continuous kinds + every teleport snap + row-roll alpha 0/1 endpoints; it joins the existing `odin test app/render` CI gate (hud_test.odin precedent).
+
+### F20 [tests] warning | coverage-gap
+TITLE: Trail ring push/shift invariants untested anywhere
+LOC: app/render/view.odin:315-331
+EVIDENCE: app/render/view.odin:315-331:
+	if moved {
+		// the DRAWN world position (the lerped one — echoes lag the live
+		// packet by the same glide)
+		dwx, dwy := from_screen(v, out.x, out.y)
+		trail := row.trail
+		if row.trail_n < len(trail) {
+			// append at [n] — 0 is the oldest, n-1 the newest
+			trail[row.trail_n] = {dwx, dwy}
+			row.trail_n += 1
+		} else {
+			// full — drop the oldest, shift, newest at [2]
+			for k in 0..<len(trail) - 1 {
+				trail[k] = trail[k + 1]
+			}
+			trail[2] = {dwx, dwy}
+DETAIL: P2 gap: ring ordering (oldest [0], newest [2]), capacity handoff, and the 0.5px moved-gate are pinned by no @(test) and no golden (trails never render at alpha=1.0). A shift regression mis-orders or smears echoes silently.
+FIX: Unit-test via packet_interp_pos across ≥4 consecutive pushes: assert trail_n ≤ 3, slot order oldest→newest, and that a stationary packet pushes nothing.
+
+### F21 [tests] warning | coverage-gap
+TITLE: Reduced-motion echo-off gate is unreachable by every automated gate — a11y_reduced golden cannot exercise it
+LOC: app/render/view.odin:1349
+EVIDENCE: app/render/view.odin:1306-1308:
+		if interp_alpha < 1.0 {
+			pos, trail_world, trail_n = packet_interp_pos(v, topo, p, pos, tick, interp_alpha)
+		}
+app/render/view.odin:1349:
+		if trail_n > 0 && !v.reduced_motion {
+harness/run.odin:489-490 (the golden capture — interp_alpha defaulted to 1.0, so trail_n is always 0):
+				img := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,
+					state.health_enabled, sim_tick, state.era, state.seed, prev)
+DETAIL: P2 gap: the E9.2/7.3 canon contract (echoes off, glide stays) is only exercisable via manual `motion-strip` of an a11y demo; the a11y_reduced T2 golden pins pulse_read's reduced path only, never the trail branch.
+FIX: Add a unit assertion of the draw predicate (trail_n>0 && !reduced_motion), or gate a motion-strip a11y_reduced interp run asserting zero echo pixels appear.
+
+### F22 [tests] note | coverage-gap
+TITLE: packet_interp_prune bound and run-start cache reset have no coverage
+LOC: app/render/view.odin:186-198
+EVIDENCE: app/render/view.odin:186-198:
+	live := len(flow.packets)
+	if len(v.pkt_interp) <= max(128, live*2+64) {
+		return
+	}
+	fresh := make(map[u64]Packet_Interp_Entry, live+16)
+	for p in flow.packets {
+		if e, ok := v.pkt_interp[p.id]; ok {
+			fresh[p.id] = e
+		}
+	}
+	delete(v.pkt_interp)
+	v.pkt_interp = fresh
+app/main.odin:614:	rnd.packet_interp_reset(&app.view)
+DETAIL: P3 gap: the monotonic-id row bound and the stale-row reset across runs are app-path hygiene with no test; a prune regression grows the map unboundedly in long sessions.
+FIX: Extend the motion unit test: prune keeps only live ids and no-ops under threshold; reset empties the map.
+
+### F23 [tests] blocker | coverage-gate
+TITLE: Advisory test gate: FAIL
+LOC: N/A
+EVIDENCE: N/A
+DETAIL: P0 (sub-tick interpolation + identity guard) 0% automated — manual evidence only. P1 snapshot-exact default path 100% (46/46 demos green, verified by running the harness). Packet-size re-bless + motion T1/replay 100%. Overall ≈43% (3/7 behaviors gated). P0 <100% → FAIL.
+FIX: Ship app/render/motion_test.odin (interp_continuous identity cases, row-roll endpoints, trail ring order, prune/reset) in the existing `odin test app/render` CI gate — raises P0/P2 to 100%, gate flips to PASS.
+

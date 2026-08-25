@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "input-state",
+    "title": "Pan latch strands across the settings modal; stale-anchor Pan intent lurches the camera on close",
+    "location": "app/input/mouse.odin:368-380 | app/input/exec.odin:47-56 | app/input/poll.odin:88-95",
+    "evidence": "mouse.odin: `if inp.panel_open {`\n`// suppressed — the panel owns the surface`\n`} else if inp.panning && !drag_eff && placing_eff < 0 {` ... `for i in 0 ..< moves_n {`\n`append(out, Intent(Pan{dx = moves[i].x - inp.pan_last.x, dy = moves[i].y - inp.pan_last.y}))`\nexec.odin Toggle_Settings: `inp.panel_open = !inp.panel_open` (no panning reset; begin_draw/start_run are the only other clears, both unreachable while the modal is open)\npoll.odin: `} else if inp.panning && !rl.IsMouseButtonDown(.LEFT) {` (synthesizes a release every frame while the latch survives)",
+    "detail": "S key (sel_pipe<0) or pad Y opens the panel mid-pan; the suppressed branch never closes the latch nor updates pan_last. On close, the per-frame Mouse_Move hits the pan branch and emits Pan with the full stale cursor displacement — a one-frame camera lurch.",
+    "recommended_fix": "Clear inp.panning (and the latch anchor) when Toggle_Settings opens the panel, or in the panel_open-suppressed branch of mouse_map when panning is set."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "Floor-clamped pullback keeps an off-center center; the new district can remain off-screen after convergence",
+    "location": "app/main.odin:1656-1661 | app/render/camera.odin:137-143,164-166 | app/main.odin:1587-1595",
+    "evidence": "main.odin pullback_feed: `app.cam_zoom_to = z_to`\n`app.cam_wx_to = cx_to`\n`app.cam_wy_to = cy_to`\n`app.pullback = true` (no camera_clamp_center call; cx_to/cy_to are the unchanged live center)\ncamera.odin: `z_to = clamp(min(z_x, z_y), CAM_ZOOM_MIN, CAM_ZOOM_MAX)` ... `// the fit floor: at 1.0 the full world rect is visible (the center pins` `// to the world center), so a floor-clamped target always includes the` `// district` — but the proc returns `center_x, center_y` unchanged, and camera_update applies no clamp",
+    "detail": "Real map 1040x780 on 1280x720: at zoom 1.0 the y half-extent is exactly 390 = world_h/2 (zero slack). Pan to the top clamp (center_y≈97.5) at 4x, then a far SEED: z_to floors at 1.0, active, center unchanged — the district stays outside the converged viewport.",
+    "recommended_fix": "In pullback_feed, pass the returned target through camera_clamp_center (as camera_zoom_at/effect_pan do) so a floor-clamped target re-pins the center to the world center."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "state-coverage",
+    "title": "camera_set_selection pipe leg (and camera_focus_pair) never clear the in-flight pullback flag",
+    "location": "app/main.odin:1527-1539 | app/main.odin:1549-1562",
+    "evidence": "node leg: `app.cam_zoom_to = 2.3`\n`app.pullback = false`\n`return`\npipe leg: `app.cam_wx_to = (ax + bx) / 2`\n`app.cam_wy_to = (ay + by) / 2`\n`app.cam_zoom_to = 2.6`\n`return` (no pullback clear; camera_focus_pair sets `app.cam_zoom_to = 2.6` likewise without clearing)\nFunction comment: \"Any selection change ends an in-flight pullback (the player's nav owns the camera).\"",
+    "detail": "Pullback in flight + pipe click-select (or crisis-banner focus) leaves pullback=true, so the selection focus eases at 0.05 (~1.5-2 s) instead of 0.14 — contradicting the function's own stated guard.",
+    "recommended_fix": "Add `app.pullback = false` to the pipe leg of camera_set_selection and to camera_focus_pair."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "input-validation",
+    "title": "Fractional wheel deltas (< 1 per frame) never zoom — no cross-frame accumulator despite the PR-body claim",
+    "location": "app/render/camera.odin:44-53 | app/input/poll.odin:79-82 | app/input/mouse.odin:229-232",
+    "evidence": "camera.odin: `f := f32(1)`\n`for d := i32(delta); d > 0; d -= 1 {`\n`f *= CAM_ZOOM_STEP`\n`}`\n`for d := i32(delta); d < 0; d += 1 {`\n`f /= CAM_ZOOM_STEP`\n`}`\npoll.odin: `if w := rl.GetMouseWheelMove(); w != 0 {` (per-frame value; no accumulator state anywhere in poll/mouse_map/exec)",
+    "detail": "Trackpads deliver fractional per-frame deltas (e.g. 0.1-0.5). i32 truncation makes every such frame a no-op, so slow trackpad scrolling never zooms at all; multi-notch fractional flicks (1.9) lose the fraction. The PR claims deltas \"accumulate per frame and fire whole notches\" — no such accumulator exists.",
+    "recommended_fix": "Accumulate fractional wheel delta in Input state across frames; emit the Zoom intent with the whole-notch carry and retain the remainder."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "interleaving",
+    "title": "SEED during an active pan drag: per-frame zero-delta Pan clears the pullback flag but the zoom-out target survives",
+    "location": "app/input/mouse.odin:378-380 | app/main.odin:1731-1737 | app/main.odin:1575-1577",
+    "evidence": "mouse.odin pan branch (runs every frame while dragging — poll emits a Mouse_Move unconditionally): `for i in 0 ..< moves_n {`\n`append(out, Intent(Pan{dx = moves[i].x - inp.pan_last.x, dy = moves[i].y - inp.pan_last.y}))`\nmain.odin effect_pan: `app.cam_wx_to = nx`\n`app.cam_wy_to = ny`\n`app.pullback = false // the pan owns the camera — a pullback yields to the player` (unconditional, even at dx=dy=0; cam_zoom_to untouched)",
+    "detail": "A SEED arms the pullback at frame top; the same frame's drag emits Pan{0,0}, clearing the flag. The zoom-out target survives, so the breathe-out runs at the normal 0.14 rate (~0.5 s), not the ruled 1.5-2 s band — neither a clean yield nor a clean pullback.",
+    "recommended_fix": "In effect_pan, when the pullback was armed this frame and the delta is zero, either fully yield (revert the zoom target) or keep the flag; define the intended behavior explicitly."
+  }
+]

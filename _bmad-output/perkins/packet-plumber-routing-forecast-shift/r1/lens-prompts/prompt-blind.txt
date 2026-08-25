@@ -1,0 +1,1355 @@
+You are a cynical, jaded reviewer with zero patience for sloppy work. The diff below is ALL the context you have — no project files, no spec. Assume problems exist. Be skeptical. Look for what's missing, not just what's wrong. Precise, professional tone — no profanity, no personal attacks.
+
+Focus on:
+- Obvious bugs visible from the diff alone
+- Dead code, unused symbols
+- Inconsistent changes across hunks (one place updated, another missed)
+- Broken invariants visible in the diff
+- Suspicious control flow
+- Contradictions within the diff itself
+- Changes that don't match their claimed purpose (commit message, file header comment, etc.)
+
+ISOLATION RULE (blindness is your value): you must NOT open the repository, read any other file, run git or grep, or consult any external context — the diff alone is your universe. Reading anything beyond the diff invalidates your lens and your findings will be discarded.
+
+--- DIFF ---
+diff --git a/_bmad-output/implementation-artifacts/spec-routing-forecast-shift.md b/_bmad-output/implementation-artifacts/spec-routing-forecast-shift.md
+new file mode 100644
+index 0000000..ec321c1
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-routing-forecast-shift.md
+@@ -0,0 +1,86 @@
++---
++status: ready-for-dev
++slug: routing-forecast-shift
++job: packet-plumber-routing-forecast-shift
++base: v2 @ 69fc2e5 (post-#37, Job A merged)
++canon: _bmad-output/problem-solution-2026-08-13.md (R4, thundering-herd analysis, M7/M8)
++---
++
++# Spec — R4 forecast flow-shift prediction (Job C)
++
++## Goal
++
++The thundering-herd trap, made legible: when the player considers upgrading a
++pipe's tier, the forecast panel shows the PREDICTED post-upgrade routing BEFORE
++commitment ("traffic will reroute to X" / "equal-cost — flow will split").
++Prediction is a PURE look — never a write, never a sim command.
++
++## Acceptance (from the briefing, pinned as tests)
++
++1. **Predictive helper (core, PURE)** — `core/forecast_shift.odin`:
++   `forecast_shift(t: ^Topology, cat: ^Catalogs, pipe: u32, new_tier: u16,
++   allocator) -> ([dynamic]Route_Shift, Forecast_Error)`. Re-runs Job A's
++   Dijkstra against the hypothetical tier (one shared code path — the
++   honest-prediction construction) and diffs the per-pair next-hop sets.
++   Integer-only, array-only, no rng, no mutation of anything passed in.
++2. **Forecast panel integration** — when a pipe's upgrade is being considered
++   (pipe selected + U key — a view-only look, no command), `app/render/forecast.odin`
++   draws an UPGRADE PREVIEW card: per-kind rows ("N flows reroute to node X",
++   "N flows split — equal cost", "N flows consolidate on node X") + the
++   magnet telegraph ("this upgrade attracts N flows"). Zero pixels when no
++   preview (harness passes nil → existing T2 goldens byte-identical).
++3. **Honest-prediction pin** — core test: helper prediction == actual sim
++   outcome after the upgrade is applied FOR REAL (demolish + redraw at the
++   higher tier through `topology_apply_edit`, the player's real action today),
++   asserted per (from,dst) next-hop set.
++4. **Golden discipline** — NEW demo `forecast_shift.dem` + NEW golden files
++   only; every existing golden must stay byte-identical (harness run green on
++   all demos; any shift = STOP and flag).
++
++## Files
++
++- `core/routing.odin` — extract the Dijkstra body into
++  `routing_rebuild_with_tiers(r, t, cat, tiers: []u16, allocator)`;
++  `routing_rebuild` becomes a one-line wrapper passing `t.pipe_tier[:]`.
++  Behavior byte-identical (tables are derived, never serialized → zero T1
++  impact). Sim path untouched.
++- `core/forecast_shift.odin` (NEW) — `Forecast_Error` (None/Missing_Pipe/
++  Unknown_Tier/Span_Exceeds_Tier), `Shift_Kind` (Reroute/Split/Merge),
++  `Route_Shift{from, dst, kind, old_next, new_next, old_count, new_count,
++  old_pipe, new_pipe}`, `forecast_shift`. Before + after tables built by the
++  SAME `routing_rebuild_with_tiers`; pairs scanned in (from-slot, dst-slot)
++  order; sets equal → no entry.
++- `core/forecast_shift_test.odin` (NEW) — split / reroute / merge geometries
++  (ladder 20/10/5; sums 30/40/25), the honest-prediction pin (real
++  demolish+redraw, table-level equality + flow-level hop assertion), purity
++  (topology byte-unchanged, twice-called determinism), error cases, idempotent
++  no-change.
++- `app/render/forecast.odin` — `Upgrade_Preview{pipe, from_tier, to_tier,
++  shifts: []pp.Route_Shift}`; `draw_forecast_panel(..., preview: ^Upgrade_Preview
++  = nil)`; preview card below the weather card, ASCII-only strings (lint gate 6).
++- `app/main.odin` — `preview_shifts: [dynamic]pp.Route_Shift` (owned) +
++  `preview_active/preview_pipe/preview_to_tier/preview_gen`; U key toggles the
++  preview on the selected pipe (next tier; widest tier → no preview);
++  recompute on (pipe, tier, topology.gen) change; clear on deselect/restart.
++  Never enters the action log.
++- `demos/forecast_shift.dem` (NEW) — two diamonds; the "real upgrade" =
++  demolish + redraw at the higher tier (the player's actual action; no new
++  command per the scope guard). Captures pin pre-upgrade (traffic on the old
++  unique path) + post-upgrade (rerouted / split) behavior. `expect hash stable`.
++- `harness/goldens.odin` — `capture_frame` unchanged (default nil param).
++
++## Verify
++
++`odin test core` green (incl. new pins) · `tools/lint.sh` green ·
++`odin build app -out:app.bin` links · `tools/harness.sh run` all demos green
++(existing goldens byte-identical; forecast_shift new) · drift-check green ·
++launchable increment: select a pipe → U → panel predicts → demolish+redraw →
++the predicted reroute/split happens.
++
++## Scope guard
++
++Prediction ONLY. No auto-routing, no new player sim commands (the preview is
++view-only), no LOG_VERSION change (nothing serialized — flag: derived data),
++no `app/render/view.odin`/`tray.odin` (Job B's ghost/glow files). W2 per-class
++routing preferences remain out. app/main.odin is shared-risk with Job B —
++flagged to Silas in the PR.
+diff --git a/app/main.odin b/app/main.odin
+index bb96fb4..ae88a34 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -69,6 +69,19 @@ App :: struct {
+ 	sel_class:   u16,
+ 	last_reject: pp.Edit_Error, // 3.2: the most recent QoS edit rejection (drawn while fresh)
+ 	reject_tick: u64,           // the tick the rejection landed (toast age)
++	// R4 (Job C): the upgrade-preview look — the forecast flow-shift
++	// prediction (canon R4: "this upgrade attracts everything"). U with a
++	// pipe selected arms it: the PURE core helper (forecast_shift) runs on
++	// (selection, next tier, topology.gen) changes and the panel renders the
++	// predicted reroute BEFORE commitment. A LOOK: never a command, never in
++	// the action log (ODN-12). Shifts are app-owned (freed on recompute/run
++	// end).
++	preview_shifts:    [dynamic]pp.Route_Shift,
++	preview_active:    bool,
++	preview_pipe:      u32, // the pipe the armed preview names
++	preview_from_tier: u16, // its current tier at preview time
++	preview_to_tier:   u16, // the hypothetical target tier
++	preview_gen:       u32, // topology.gen the shifts were computed for (an edit recomputes)
+ }
+ 
+ main :: proc() {
+@@ -174,6 +187,14 @@ start_run :: proc(app: ^App, seed: u64) {
+ 	app.sel_class = 0
+ 	app.last_reject = .None
+ 	app.reject_tick = 0
++	// R4: a fresh run drops any armed preview (the shifts die with the run)
++	delete(app.preview_shifts)
++	app.preview_shifts = {}
++	app.preview_active = false
++	app.preview_pipe = 0
++	app.preview_from_tier = 0
++	app.preview_to_tier = 0
++	app.preview_gen = 0
+ 	app.mode = .Run
+ 	app.run_live = true
+ }
+@@ -349,6 +370,13 @@ handle_input :: proc(app: ^App) {
+ 	// 3.2: the per-type promote/demote keys — with a pipe selected, 1/2 pick
+ 	// the class, E/S/B assign its lane on that pipe (GDD M2's per-pipe override).
+ 	if app.sel_pipe >= 0 {
++		if rl.IsKeyPressed(.U) {
++			// R4: arm/disarm the upgrade preview — a VIEW-ONLY look (the core
++			// helper never writes; nothing enters the action log). The next
++			// draw recomputes the prediction for the selected pipe.
++			app.preview_active = !app.preview_active
++			app.preview_gen = 0 // force a recompute (the draw keyed on gen)
++		}
+ 		for i in 0..<len(app.cat.packet_types) {
+ 			key := rl.KeyboardKey(int(rl.KeyboardKey.ONE) + i)
+ 			if rl.IsKeyPressed(key) {
+@@ -513,6 +541,47 @@ node_pos :: proc(app: ^App, id: u32) -> [2]i32 {
+ 	return app.state.topology.node_pos[slot]
+ }
+ 
++// update_preview — recompute the R4 upgrade preview when its inputs changed:
++// the selected pipe, its next tier, or the topology (an edit this frame bumps
++// gen — the fresh table the helper reads is the CURRENT topology, so a stale
++// preview would be a lie). A pure look: forecast_shift reads the topology +
++// catalog and writes nothing; the result never enters the action log. The
++// preview disarms itself when the selection clears, the pipe dies, or the
++// pipe is already the widest tier (nothing to preview).
++update_preview :: proc(app: ^App) {
++	if !app.preview_active || app.sel_pipe < 0 {
++		app.preview_active = false
++		return
++	}
++	pipe := u32(app.sel_pipe)
++	ps, ok := pp.pipe_slot(&app.state.topology, pipe)
++	if !ok {
++		app.preview_active = false // the selected pipe is gone — drop the preview
++		return
++	}
++	cur := app.state.topology.pipe_tier[ps]
++	if u32(cur) + 1 >= u32(len(app.cat.pipe_tiers)) {
++		app.preview_active = false // already the widest tier — nothing to preview
++		return
++	}
++	to := u16(cur) + 1
++	if app.preview_gen == app.state.topology.gen && app.preview_pipe == pipe && app.preview_to_tier == to {
++		return // inputs unchanged — the computed shifts stay fresh
++	}
++	sh, err := pp.forecast_shift(&app.state.topology, &app.cat, pipe, to)
++	if err != .None {
++		delete(sh) // the look refused (an illegal hypothetical) — disarm, never guess
++		app.preview_active = false
++		return
++	}
++	delete(app.preview_shifts) // swap in the fresh look (app-owned storage)
++	app.preview_shifts = sh
++	app.preview_pipe = pipe
++	app.preview_from_tier = cur
++	app.preview_to_tier = to
++	app.preview_gen = app.state.topology.gen
++}
++
+ draw_hud :: proc(app: ^App) {
+ 	p := app.palette
+ 	// title
+@@ -537,7 +606,7 @@ draw_hud :: proc(app: ^App) {
+ 	if app.placing >= 0 {
+ 		draw_text(app, "placement: click the map to drop the router (ESC / right-click / chip to cancel)", 12, 36, 16, p.ink)
+ 	} else {
+-		draw_text(app, "draw source->router->sink; watch the forecast; keep the network from straining", 12, 36, 16, p.ink_soft)
++		draw_text(app, "draw source->router->sink; select a pipe + U previews its upgrade; watch the forecast", 12, 36, 16, p.ink_soft)
+ 	}
+ 	if app.state.goal > 0 {
+ 		score := fmt.tprintf("delivered %d / %d", app.state.score, app.state.goal)
+@@ -553,7 +622,20 @@ draw_hud :: proc(app: ^App) {
+ 	// the player's reaction window: strained 30 s / critical 10 s / pressure
+ 	// 20 s at logic_hz; the player must see the leads, or they are dead
+ 	// config). Seconds = lead_ticks / logic_hz (integer).
+-	rnd.draw_forecast_panel(&app.view, &app.state.crisis, &app.cat, app.state.era)
++	// R4: the armed upgrade preview rides the same panel (below the weather
++	// card) — the pure look is recomputed here, where the panel draws.
++	update_preview(app)
++	if app.preview_active {
++		prev := rnd.Upgrade_Preview{
++			pipe = app.preview_pipe,
++			from_tier = app.preview_from_tier,
++			to_tier = app.preview_to_tier,
++			shifts = app.preview_shifts[:],
++		}
++		rnd.draw_forecast_panel(&app.view, &app.state.crisis, &app.cat, app.state.era, &prev)
++	} else {
++		rnd.draw_forecast_panel(&app.view, &app.state.crisis, &app.cat, app.state.era)
++	}
+ 	// 4.2: the crisis banner (top-center) — names the ACTIVE surge + the WHY
+ 	// (bottleneck bundle + pipe) + the preventive redesign. Zero pixels when
+ 	// no crisis is active.
+diff --git a/app/render/forecast.odin b/app/render/forecast.odin
+index 68e6c1c..b2e025f 100644
+--- a/app/render/forecast.odin
++++ b/app/render/forecast.odin
+@@ -7,26 +7,50 @@ package render
+ // the golden is the panel). It READS the serialized forecast rows only; it
+ // never fires anything (that is 4.2's Crisis Engine).
+ //
+-// Zero pixels when the forecast is empty (the golden-stability rule: demos
+-// outside a forecast window keep byte-identical T2 frames). The countdown is
+-// the core's countdown_ticks at the last step boundary — the view never
+-// samples time (ODN-1: the app steps at logic_hz; the panel shows the sim's
+-// own clock, which is what replay sees).
++// Job C / R4 (2026-08-13): the panel also carries the UPGRADE PREVIEW — the
++// forecast flow-shift prediction (canon R4: "this upgrade attracts
++// everything" made legible BEFORE commitment). When the app arms a preview
++// (pipe selected + U), the core's PURE predictive helper
++// (core/forecast_shift.odin) has computed the predicted post-upgrade
++// next-hop-set deltas; this panel renders them as the acceptance's messages
++// ("traffic will reroute to X" / "equal-cost — flow will split") + the
++// thundering-herd telegraph ("this upgrade attracts N flows"). A preview is
++// a LOOK: it never enters the action log, never mutates state (ODN-12), and
++// the harness never builds one — a nil preview draws ZERO extra pixels (the
++// golden-stability rule: every existing T2 capture stays byte-identical).
++//
++// Zero pixels when the forecast is empty AND no preview is armed (the
++// capture-stability contract). The countdown is the core's countdown_ticks at
++// the last step boundary — the view never samples time (ODN-1: the app steps
++// at logic_hz; the panel shows the sim's own clock, which is what replay
++// sees).
+ 
+ import "core:fmt"
+ import "core:strings"
+ import pp "../../core"
+ import rl "vendor:raylib"
+ 
+-// draw_forecast_panel — the weather report at the top-right. Each row names a
+-// set-piece inside its forecast window: "<set-piece id> x<N> -12s" (or "NOW"
+-// once active). The label is the set-piece's CATALOG id (resolved via the era
+-// + sp_index — review r1 N2: the first cut hardcoded "SURGE", which would
+-// mislabel any future non-surge archetype; the catalog id is honest for
+-// every archetype). Color + glyph + caption — never color alone. Draws
+-// NOTHING when there are no rows (the capture-stability contract).
+-draw_forecast_panel :: proc(v: ^View, crisis: ^pp.Crisis_State, cat: ^pp.Catalogs, era: u8) {
+-	if len(crisis.forecast) == 0 {
++// Upgrade_Preview — the R4 preview payload (app-owned; the harness never
++// builds one). `shifts` is the core helper's output — caller-owned storage,
++// read-only here. The panel is a pure reader: it renders the predicted
++// flow-shift rows + the magnet count, nothing more.
++Upgrade_Preview :: struct {
++	pipe:      u32, // the pipe the player considers upgrading
++	from_tier: u16, // its current catalog tier index
++	to_tier:   u16, // the hypothetical target tier index
++	shifts:    []pp.Route_Shift, // the predicted flow shift (core helper output)
++}
++
++// draw_forecast_panel — the weather report at the top-right, and (R4) the
++// upgrade-preview card directly below it. Each weather row names a set-piece
++// inside its forecast window: "<set-piece id> x<N> -12s" (or "NOW" once
++// active). The label is the set-piece's CATALOG id (resolved via the era +
++// sp_index — review r1 N2: the first cut hardcoded "SURGE", which would
++// mislabel any future non-surge archetype; the catalog id is honest for every
++// archetype). Color + glyph + caption — never color alone. Draws NOTHING when
++// there are no rows AND no preview (the capture-stability contract).
++draw_forecast_panel :: proc(v: ^View, crisis: ^pp.Crisis_State, cat: ^pp.Catalogs, era: u8, preview: ^Upgrade_Preview = nil) {
++	if len(crisis.forecast) == 0 && preview == nil {
+ 		return
+ 	}
+ 	p := v.palette
+@@ -38,35 +62,181 @@ draw_forecast_panel :: proc(v: ^View, crisis: ^pp.Crisis_State, cat: ^pp.Catalog
+ 	x := v.win_w - card_w - pad
+ 	y := i32(10)
+ 	rows := len(crisis.forecast)
+-	h := title_h + i32(rows) * line_h + pad
+-	// translucent card so the map still reads behind it
++	// the weather card draws ONLY when it has rows (the zero-pixels-when-
++	// empty contract) — a preview below it never drags an empty card along.
++	if rows > 0 {
++		h := title_h + i32(rows) * line_h + pad
++		// translucent card so the map still reads behind it
++		card := rl.Color{255, 252, 244, 235}
++		rl.DrawRectangle(x - pad, y - pad, card_w + 2 * pad, h, card)
++		border := rl.Color{51, 65, 79, 40}
++		rl.DrawRectangleLines(x - pad, y - pad, card_w + 2 * pad, h, border)
++
++		draw_text_c(v, "WEATHER REPORT", x, y, 16, p.ink)
++		ty := y + title_h - 4
++		for f in crisis.forecast {
++			name := "setpiece"
++			if era > 0 && int(era) <= len(cat.demand.eras) {
++				de := &cat.demand.eras[era-1]
++				if int(f.sp_index) < len(de.set_pieces) {
++					name = de.set_pieces[f.sp_index].id
++				}
++			}
++			mult := fmt.aprintf("x%d", f.multiplier, allocator = context.temp_allocator)
++			col := p.state_strain
++			when_suffix := ""
++			if f.active {
++				when_suffix = "NOW"
++				col = p.state_critical
++			} else {
++				secs := f.countdown_ticks / u64(max(1, cat.balance.logic_hz))
++				when_suffix = fmt.aprintf("-%ds", secs, allocator = context.temp_allocator)
++			}
++			line := strings.join({name, mult, when_suffix}, "  ", context.temp_allocator)
++			draw_text_c(v, line, x, ty, 15, col)
++			ty += line_h
++		}
++	}
++
++	// R4: the upgrade-preview card sits below the weather report (same right
++	// edge). Nil preview (the harness's captures) -> zero extra pixels.
++	if preview != nil {
++		preview_y := y + 6
++		if rows > 0 {
++			preview_y = y + title_h + i32(rows) * line_h + pad + 6
++		}
++		draw_upgrade_preview(v, cat, preview, x, preview_y, card_w, pad, line_h, title_h)
++	}
++}
++
++// preview_row — one aggregated preview line: a (kind, target-node) bucket.
++// The per-pair shifts collapse into per-kind rows so the panel stays a glance
++// ("3 flows reroute to node 2"), never a candidate spreadsheet (the R2a
++// single-number doctrine, mirrored here).
++Preview_Row :: struct {
++	kind:  pp.Shift_Kind,
++	node:  u32,
++	count: i32,
++}
++
++MAX_PREVIEW_ROWS :: 12
++
++// draw_upgrade_preview — the R4 prediction card. Header ("UPGRADE PREVIEW" +
++// "pipe <id>: <from> -> <to>"), then the aggregated rows: the magnet
++// telegraph first ("attracts N flows" — the thundering-herd headline), then
++// one row per (kind, target node): "N flows reroute to node X" (Reroute),
++// "N flows split - equal cost" (Split), "N flows consolidate on node X"
++// (Merge). Zero shifts -> the honest "no reroute predicted" (upgrading a pipe
++// that moves no next-hop set changes nothing). ASCII-only strings (the
++// byte-truncating draw_text_c, lint gate 6).
++draw_upgrade_preview :: proc(v: ^View, cat: ^pp.Catalogs, prev: ^Upgrade_Preview,
++                             x, y, card_w, pad, line_h, title_h: i32) {
++	p := v.palette
++	rows: [MAX_PREVIEW_ROWS]Preview_Row
++	nrows := 0
++	overflow := 0
++	magnet: i32 = 0
++	for s in prev.shifts {
++		if s.attract {
++			magnet += 1
++		}
++		idx := -1
++		for i in 0..<nrows {
++			if rows[i].kind == s.kind && rows[i].node == s.new_next {
++				idx = i
++				break
++			}
++		}
++		if idx >= 0 {
++			rows[idx].count += 1
++		} else if nrows < MAX_PREVIEW_ROWS {
++			rows[nrows] = Preview_Row{kind = s.kind, node = s.new_next, count = 1}
++			nrows += 1
++		} else {
++			overflow += 1
++		}
++	}
++	// card height: header + the pipe sub-line + the rows (+ the magnet line +
++	// any overflow tail). Zero shifts still draws the header + "no reroute".
++	lines := 2 + nrows
++	if magnet > 0 {
++		lines += 1
++	}
++	if overflow > 0 {
++		lines += 1
++	}
++	h := title_h + i32(lines) * line_h + pad
+ 	card := rl.Color{255, 252, 244, 235}
+ 	rl.DrawRectangle(x - pad, y - pad, card_w + 2 * pad, h, card)
+ 	border := rl.Color{51, 65, 79, 40}
+ 	rl.DrawRectangleLines(x - pad, y - pad, card_w + 2 * pad, h, border)
+ 
+-	draw_text_c(v, "WEATHER REPORT", x, y, 16, p.ink)
++	draw_text_c(v, "UPGRADE PREVIEW", x, y, 16, p.ink)
+ 	ty := y + title_h - 4
+-	for f in crisis.forecast {
+-		name := "setpiece"
+-		if era > 0 && int(era) <= len(cat.demand.eras) {
+-			de := &cat.demand.eras[era-1]
+-			if int(f.sp_index) < len(de.set_pieces) {
+-				name = de.set_pieces[f.sp_index].id
++	from_id := "?"
++	to_id := "?"
++	if u32(prev.from_tier) < u32(len(cat.pipe_tiers)) {
++		from_id = cat.pipe_tiers[prev.from_tier].id
++	}
++	if u32(prev.to_tier) < u32(len(cat.pipe_tiers)) {
++		to_id = cat.pipe_tiers[prev.to_tier].id
++	}
++	sub := fmt.aprintf("pipe %d: %s -> %s", prev.pipe, from_id, to_id, allocator = context.temp_allocator)
++	draw_text_c(v, sub, x, ty, 14, p.ink_soft)
++	ty += line_h
++
++	if len(prev.shifts) == 0 {
++		draw_text_c(v, "no reroute predicted", x, ty, 14, p.ink_soft)
++		ty += line_h
++	} else {
++		if magnet > 0 {
++			m := fmt.aprintf("attracts %d %s", magnet, flow_word(magnet), allocator = context.temp_allocator)
++			draw_text_c(v, m, x, ty, 14, p.state_strain)
++			ty += line_h
++		}
++		for i in 0..<nrows {
++			line := preview_row_line(rows[i])
++			col := p.ink
++			if rows[i].kind == .Split {
++				col = p.state_strain // the tie message is the "look twice" row
+ 			}
++			draw_text_c(v, line, x, ty, 14, col)
++			ty += line_h
+ 		}
+-		mult := fmt.aprintf("x%d", f.multiplier, allocator = context.temp_allocator)
+-		col := p.state_strain
+-		when_suffix := ""
+-		if f.active {
+-			when_suffix = "NOW"
+-			col = p.state_critical
+-		} else {
+-			secs := f.countdown_ticks / u64(max(1, cat.balance.logic_hz))
+-			when_suffix = fmt.aprintf("-%ds", secs, allocator = context.temp_allocator)
++		if overflow > 0 {
++			tail := fmt.aprintf("+%d more", overflow, allocator = context.temp_allocator)
++			draw_text_c(v, tail, x, ty, 14, p.ink_soft)
+ 		}
+-		line := strings.join({name, mult, when_suffix}, "  ", context.temp_allocator)
+-		draw_text_c(v, line, x, ty, 15, col)
+-		ty += line_h
+ 	}
+ }
++
++// preview_row_line — one aggregated row's text (the acceptance-2 messages),
++// with the verb conjugated to the count.
++preview_row_line :: proc(r: Preview_Row) -> string {
++	switch r.kind {
++	case .Reroute:
++		verb := "reroute"
++		if r.count == 1 {
++			verb = "reroutes"
++		}
++		return fmt.aprintf("%d %s %s to node %d", r.count, flow_word(r.count), verb, r.node, allocator = context.temp_allocator)
++	case .Split:
++		return fmt.aprintf("%d %s split - equal cost", r.count, flow_word(r.count), allocator = context.temp_allocator)
++	case .Merge:
++		verb := "consolidate"
++		if r.count == 1 {
++			verb = "consolidates"
++		}
++		return fmt.aprintf("%d %s %s on node %d", r.count, flow_word(r.count), verb, r.node, allocator = context.temp_allocator)
++	case:
++		return "?"
++	}
++}
++
++// flow_word — the singular/plural noun for a flow count ("1 flow" / "2 flows").
++flow_word :: proc(n: i32) -> string {
++	if n == 1 {
++		return "flow"
++	}
++	return "flows"
++}
+diff --git a/core/forecast_shift.odin b/core/forecast_shift.odin
+new file mode 100644
+index 0000000..ba9e3b8
+--- /dev/null
++++ b/core/forecast_shift.odin
+@@ -0,0 +1,204 @@
++package core
++
++// forecast_shift.odin — Job C / R4: the forecast flow-shift PREDICTIVE HELPER
++// (canon: _bmad-output/problem-solution-2026-08-13.md, R4 — "this upgrade
++// attracts everything"). The thundering-herd trap defused by prediction: given
++// the current Topology + a hypothetical tier change on ONE pipe, this computes
++// the predicted post-upgrade routing (Job A's Dijkstra re-run against the
++// hypothetical tier view) and the predicted flow shift (the per-pair
++// next-hop-set deltas between the current routing and the predicted routing).
++//
++// CONTRACT — a LOOK, never a write (acceptance 1: PURE):
++//   • reads the Topology + Catalogs; mutates NOTHING passed in (no gen bump,
++//     no action log, no Run_State involvement — the app calls this straight
++//     from the render path; a preview never becomes a command);
++//   • no rng (ODN-9), integer-only (ODN-10), array-only — no map iteration
++//     (ODN-10);
++//   • deterministic: identical (Topology, pipe, new_tier) -> identical shifts
++//     on every target + every call (pair scan in slot order — insertion
++//     order);
++//   • the before/after tables are BOTH built by routing_rebuild_with_tiers —
++//     the SAME Dijkstra the sim runs (routing_rebuild is a one-line wrapper
++//     over it), so prediction == actual is constructional; the empirical pin
++//     (test_forecast_honest_prediction_pin) proves it through the real edit
++//     path (demolish + redraw) anyway.
++//
++// The predicted flow shift is the routing-table delta, pair by pair: for every
++// (from, dst) live node pair whose equal-cost next-hop SET changes, one
++// Route_Shift entry. Reachability cannot change (the graph is identical — only
++// a pipe cost changed), so a shift is exactly one of:
++//   Split   — the ECMP set GREW (new_count > old_count): an equal-cost tie
++//             appeared — "equal-cost — flow will split" (acceptance 2).
++//   Merge   — the ECMP set SHRANK (new_count < old_count): a tie broke —
++//             flows consolidate on the surviving path.
++//   Reroute — the set changed with equal counts: flows move to a different
++//             next hop — "traffic will reroute to X" (acceptance 2).
++// The entry carries the representative next hop (node + pipe) on each side so
++// the panel can name the target node AND spot flows whose new first hop rides
++// the upgraded pipe itself (the magnet telegraph — "this upgrade attracts N
++// flows").
++//
++// Scope (the canon's scope guard): routing/path-choice shift ONLY. The
++// capacity effect of a tier change (a fatter bundle carries packets faster) is
++// the bundles view (2.1), not a routing shift — out of R4's prediction, by
++// canon. No auto-routing, no new player command: the app treats this as a
++// view-only preview (never lowered into the action log).
++
++// Forecast_Error — the typed rejections (§7.1: never silent). Mirrors the
++// edit errors a real upgrade would hit: an unknown/missing pipe or tier, or a
++// hypothetical tier whose max_span is below the pipe's span (the real draw
++// would reject it, so a prediction for it would be a lie).
++Forecast_Error :: enum u8 {
++	None,
++	Missing_Pipe,      // pipe id does not resolve to a live pipe
++	Unknown_Tier,      // new_tier index out of catalog range
++	Span_Exceeds_Tier, // the hypothetical tier's max_span < the pipe's span (validate_draw would reject)
++}
++
++// Shift_Kind — the three possible next-hop-set deltas (see the header: the
++// graph is unchanged, so a shift is exactly Split / Merge / Reroute).
++Shift_Kind :: enum u8 {
++	Reroute, // the set changed, counts equal — flows move to a different next hop
++	Split,   // the set GREW — an equal-cost tie appeared ("flow will split")
++	Merge,   // the set SHRANK — a tie broke (flows consolidate)
++}
++
++// Route_Shift — one (from, dst) pair whose predicted post-upgrade next-hop set
++// differs from the current one. `new_*` describe the PREDICTED state; the
++// panel renders the acceptance's messages from kind + new_next, and the
++// magnet telegraph ("this upgrade attracts N flows") from `attract`.
++Route_Shift :: struct {
++	from:      u32, // pair source node id
++	dst:       u32, // pair destination node id
++	kind:      Shift_Kind,
++	old_next:  u32, // representative next-hop NODE before (0 = unroutable)
++	new_next:  u32, // representative next-hop NODE after (0 = unroutable)
++	old_count: u32, // ECMP set size before
++	new_count: u32, // ECMP set size after
++	old_pipe:  u32, // representative pipe id before (0 = none)
++	new_pipe:  u32, // representative pipe id after (0 = none)
++	attract:   bool, // any member of the NEW set rides the UPGRADED pipe (the magnet telegraph — first-hop signal, never overcounts)
++}
++
++// forecast_shift — the R4 predictive helper. Given the current Topology + a
++// hypothetical tier change on one live pipe, the predicted post-upgrade
++// routing and the predicted flow shift. See the header contract: PURE look,
++// deterministic, integer-only, array-only. Returns the shift list (caller
++// owns + frees) or the typed rejection. An empty list is an honest
++// "no routing change" (the hypothetical does not move any next-hop set).
++forecast_shift :: proc(t: ^Topology, cat: ^Catalogs, pipe: u32, new_tier: u16,
++                       allocator := context.allocator) -> (shifts: [dynamic]Route_Shift, err: Forecast_Error) {
++	context.allocator = allocator
++	shifts = make([dynamic]Route_Shift, 0, 8)
++	ps, ok := pipe_slot(t, pipe)
++	if !ok {
++		return shifts, .Missing_Pipe
++	}
++	if u32(new_tier) >= u32(len(cat.pipe_tiers)) {
++		return shifts, .Unknown_Tier
++	}
++	if cat.pipe_tiers[new_tier].max_span < t.pipe_span[ps] {
++		// the real draw would reject this tier for this pipe's span — a
++		// prediction for an illegal upgrade would be a lie (honest prediction)
++		return shifts, .Span_Exceeds_Tier
++	}
++	if new_tier == t.pipe_tier[ps] {
++		// the identical tier: the look is a no-op by construction (the same
++		// cost on the same edge -> the identical routing; a same-cost
++		// DIFFERENT tier is handled honestly by the diff below — it can only
++		// produce an empty list, since the tables only read costs).
++		return shifts, .None
++	}
++
++	// the hypothetical tier view: copy the live per-slot tiers, patch ONE slot
++	// (the look's scratch — array-only, ODN-10; freed on return).
++	tiers := make([]u16, len(t.pipe_alive))
++	defer delete(tiers)
++	for i in 0..<len(t.pipe_tier) {
++		tiers[i] = t.pipe_tier[i]
++	}
++	tiers[ps] = new_tier
++
++	// before + after tables — the SAME Dijkstra core (the honest-prediction
++	// construction: the prediction runs the sim's own algorithm).
++	before: Routing_Table
++	after: Routing_Table
++	routing_make(&before)
++	routing_make(&after)
++	defer {
++		routing_destroy(&before)
++		routing_destroy(&after)
++	}
++	routing_rebuild_with_tiers(&before, t, cat, t.pipe_tier[:])
++	routing_rebuild_with_tiers(&after, t, cat, tiers)
++
++	// the per-pair diff (slot-order scan — deterministic, array-only):
++	// a pair shifts iff its next-hop NODE set changed (nodes are the routing
++	// behavior; pipe ids are display refs carried by the reps).
++	n := len(t.node_alive)
++	for fs in 0..<n {
++		if !t.node_alive[fs] {
++			continue
++		}
++		for ds in 0..<n {
++			if ds == fs || !t.node_alive[ds] {
++				continue
++			}
++			from_id := t.node_id[fs]
++			dst_id := t.node_id[ds]
++			bo, bc, _ := routing_equal_cost_hops(&before, t, from_id, dst_id)
++			ao, ac, _ := routing_equal_cost_hops(&after, t, from_id, dst_id)
++			same := bc == ac
++			if same {
++				for k in 0..<int(bc) {
++					if before.hops[int(bo)+k].node != after.hops[int(ao)+k].node {
++						same = false
++						break
++					}
++				}
++			}
++			if same {
++				continue
++			}
++			kind := Shift_Kind.Reroute
++			if ac > bc {
++				kind = .Split
++			} else if ac < bc {
++				kind = .Merge
++			}
++			old_next, old_pipe := shift_rep(&before, bo, bc)
++			new_next, new_pipe := shift_rep(&after, ao, ac)
++			attract := false
++			for k in 0..<int(ac) {
++				if after.hops[int(ao)+k].pipe == pipe {
++					attract = true
++					break
++				}
++			}
++			append(&shifts, Route_Shift{
++				from = from_id,
++				dst = dst_id,
++				kind = kind,
++				old_next = old_next,
++				new_next = new_next,
++				old_count = bc,
++				new_count = ac,
++				old_pipe = old_pipe,
++				new_pipe = new_pipe,
++				attract = attract,
++			})
++		}
++	}
++	return shifts, .None
++}
++
++// shift_rep — the representative (node, pipe) of a hop set: the FIRST member
++// (insertion order — slot order — the same representative routing_next_hop
++// resolves). Zeroes when the set is empty (unroutable).
++shift_rep :: proc(r: ^Routing_Table, offset, count: u32) -> (node, pipe: u32) {
++	if count == 0 {
++		return 0, 0
++	}
++	h := r.hops[int(offset)]
++	return h.node, h.pipe
++}
+diff --git a/core/forecast_shift_test.odin b/core/forecast_shift_test.odin
+new file mode 100644
+index 0000000..cdcf957
+--- /dev/null
++++ b/core/forecast_shift_test.odin
+@@ -0,0 +1,376 @@
++package core
++
++// forecast_shift_test.odin — Job C / R4: the forecast flow-shift PREDICTION
++// pinned as durable tests (canon: problem-solution-2026-08-13.md R4). Pins:
++//   (a) SPLIT — a hypothetical one-pipe upgrade creates an equal-cost tie:
++//       "equal-cost — flow will split" (acceptance 2's message, verbatim);
++//   (b) REROUTE — a hypothetical upgrade flips the unique path onto the
++//       upgraded pipe: "traffic will reroute to X" (acceptance 2, verbatim),
++//       with the magnet signal (attract == true);
++//   (c) MERGE — a hypothetical upgrade breaks a true tie: flows consolidate;
++//   (d) THE HONEST-PREDICTION PIN (acceptance 3): the helper's predicted
++//       post-upgrade routing == the sim's ACTUAL post-upgrade routing after
++//       the upgrade is applied FOR REAL (demolish + redraw at the higher tier
++//       through the real edit path — the player's actual upgrade action, no
++//       new command per the scope guard), asserted per-pair next-hop set,
++//       PLUS a flow-level proof (a packet spawned after the real upgrade
++//       departs over the predicted path);
++//   (e) PURITY — the helper mutates nothing it is given (topology + catalog
++//       byte-unchanged, no gen bump) and is deterministic (twice-called ->
++//       identical shifts);
++//   (f) error + no-change cases: missing pipe / unknown tier / span-exceeds
++//       (a hypothetical the real draw would reject), the identical tier
++//       (idempotent look), and a single-path topology (honest "no routing
++//       change" — nothing to reroute).
++//
++// Geometry: the compact cost diamond (res(8,15), m1(16,11), m2(16,19),
++// host(24,15); spans 9 <= narrow max 10) shared with routing_cost_test.
++// Ladder 20/10/5 (narrow/standard/wide). Cost sums used here:
++//   std+narrow = 30   narrow+narrow = 40   wide+narrow = 25
++//   std+wide   = 15 (not used)             wide+wide = 10 (not used)
++
++import "core:testing"
++
++// shift_by_pair — find a shift entry by its (from, dst) pair.
++shift_by_pair :: proc(shifts: []Route_Shift, from, dst: u32) -> (^Route_Shift, bool) {
++	for i in 0..<len(shifts) {
++		if shifts[i].from == from && shifts[i].dst == dst {
++			return &shifts[i], true
++		}
++	}
++	return nil, false
++}
++
++// forecast_shift_setup — the cost diamond with a custom per-leg tier pattern
++// (the stock cost_draw_diamond mirrors tiers per side; these pins need
++// asymmetric legs). Draws at apply_tick 1 + steps once (table built).
++// Returns the run + the four node ids + the pipe ids (0=res-m1, 1=res-m2,
++// 2=m1-host, 3=m2-host — draw order).
++forecast_shift_setup :: proc(cat: ^Catalogs, t_a, t_b, t_c, t_d: u16) -> (Run_State, u32, u32, u32, u32) {
++	s, res, m1, m2, host := cost_diamond_setup(cat)
++	draw(&s, 1, res, m1, t_a) // pipe 0
++	draw(&s, 1, res, m2, t_b) // pipe 1
++	draw(&s, 1, m1, host, t_c) // pipe 2
++	draw(&s, 1, m2, host, t_d) // pipe 3
++	step_n(&s, 1, cat)
++	return s, res, m1, m2, host
++}
++
++@(test)
++test_forecast_split_equal_cost :: proc(t: ^testing.T) {
++	// SPLIT: a-side std(10)+narrow(20) = 30 (unique m1); b-side
++	// narrow(20)+narrow(20) = 40. Upgrade res->m2 narrow->STANDARD: b-side
++	// becomes 10+20 = 30 == 30 -> an equal-cost tie appears where there was a
++	// unique hop: "equal-cost — flow will split" (acceptance 2).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	narrow, _ := pipe_tier_index(cat, "narrow")
++	s, res, m1, m2, host := forecast_shift_setup(cat, std, narrow, narrow, narrow)
++	defer run_destroy(&s)
++
++	shifts, err := forecast_shift(&s.topology, cat, 1, std) // pipe 1 = res->m2 -> standard
++	defer delete(shifts)
++	testing.expectf(t, err == .None, "upgrade must be accepted, got err %d", err)
++	testing.expectf(t, len(shifts) == 2, "exactly the two symmetric pairs shift, got %d", len(shifts))
++
++	rs, ok := shift_by_pair(shifts[:], res, host)
++	testing.expectf(t, ok, "(res,host) must have a shift")
++	if ok {
++		testing.expectf(t, rs.kind == .Split, "(res,host) kind must be Split, got %d", rs.kind)
++		testing.expectf(t, rs.old_count == 1 && rs.new_count == 2,
++			"(res,host) count must grow 1 -> 2, got %d -> %d", rs.old_count, rs.new_count)
++		testing.expectf(t, rs.old_next == m1, "(res,host) old unique hop must be m1, got %d", rs.old_next)
++		// the predicted set is {m1, m2} — the flow will split across BOTH paths
++		testing.expectf(t, rs.new_next == m1, "(res,host) new set starts at m1 (slot order), got %d", rs.new_next)
++	}
++	hs, okh := shift_by_pair(shifts[:], host, res)
++	testing.expectf(t, okh, "(host,res) must have the symmetric shift")
++	if okh {
++		testing.expectf(t, hs.kind == .Split && hs.old_count == 1 && hs.new_count == 2,
++			"(host,res) symmetric split, got kind %d count %d -> %d", hs.kind, hs.old_count, hs.new_count)
++	}
++}
++
++@(test)
++test_forecast_reroute_to_upgraded :: proc(t: ^testing.T) {
++	// REROUTE: a-side std(10)+narrow(20) = 30 (unique m1); b-side
++	// narrow(20)+narrow(20) = 40. Upgrade res->m2 narrow->WIDE: b-side becomes
++	// 5+20 = 25 < 30 -> the unique path FLIPS onto the upgraded pipe: "traffic
++	// will reroute to X" (acceptance 2) + the magnet signal (attract).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	narrow, _ := pipe_tier_index(cat, "narrow")
++	wide, _ := pipe_tier_index(cat, "wide")
++	s, res, m1, m2, host := forecast_shift_setup(cat, std, narrow, narrow, narrow)
++	defer run_destroy(&s)
++
++	shifts, err := forecast_shift(&s.topology, cat, 1, wide) // pipe 1 = res->m2 -> wide
++	defer delete(shifts)
++	testing.expectf(t, err == .None, "upgrade must be accepted, got err %d", err)
++	testing.expectf(t, len(shifts) == 2, "exactly the two symmetric pairs shift, got %d", len(shifts))
++
++	rs, ok := shift_by_pair(shifts[:], res, host)
++	testing.expectf(t, ok, "(res,host) must have a shift")
++	if ok {
++		testing.expectf(t, rs.kind == .Reroute, "(res,host) kind must be Reroute, got %d", rs.kind)
++		testing.expectf(t, rs.old_count == 1 && rs.new_count == 1, "(res,host) stays unique, got %d -> %d", rs.old_count, rs.new_count)
++		testing.expectf(t, rs.old_next == m1 && rs.new_next == m2,
++			"(res,host) must reroute m1 -> m2, got %d -> %d", rs.old_next, rs.new_next)
++		testing.expectf(t, rs.new_pipe == 1, "(res,host) new first hop must ride the upgraded pipe (id 1), got %d", rs.new_pipe)
++		testing.expectf(t, rs.attract, "(res,host) must carry the magnet signal (upgraded pipe in the new set)")
++	}
++	hs, okh := shift_by_pair(shifts[:], host, res)
++	testing.expectf(t, okh, "(host,res) must have the symmetric shift")
++	if okh {
++		testing.expectf(t, hs.kind == .Reroute && hs.new_next == m2,
++			"(host,res) symmetric reroute to m2, got kind %d next %d", hs.kind, hs.new_next)
++		// host's first hop toward res rides the m2->host leg (pipe 3) — NOT the
++		// upgraded pipe: the magnet signal must stay honest per side
++		testing.expectf(t, !hs.attract, "(host,res) must NOT claim the upgraded pipe (it rides pipe 3)")
++	}
++}
++
++@(test)
++test_forecast_merge_tie_breaks :: proc(t: ^testing.T) {
++	// MERGE: a-side std(10)+narrow(20) = 30; b-side narrow(20)+std(10) = 30 —
++	// a TRUE different-tier tie (ECMP 2, the "3+8 vs 8+3" shape). Upgrade
++	// res->m1 std->WIDE: a-side becomes 5+20 = 25 < 30 -> the tie breaks, flows
++	// consolidate on m1 (count 2 -> 1).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	narrow, _ := pipe_tier_index(cat, "narrow")
++	wide, _ := pipe_tier_index(cat, "wide")
++	s, res, m1, m2, host := forecast_shift_setup(cat, std, narrow, narrow, std)
++	defer run_destroy(&s)
++
++	// sanity: the pre-upgrade state IS the tie (the Job A pin's shape)
++	off, count, ok := routing_equal_cost_hops(&s.routing, &s.topology, res, host)
++	testing.expectf(t, ok && count == 2, "pre-upgrade must be an ECMP tie (count 2), got ok=%v count=%d", ok, count)
++	_ = off
++
++	shifts, err := forecast_shift(&s.topology, cat, 0, wide) // pipe 0 = res->m1 -> wide
++	defer delete(shifts)
++	testing.expectf(t, err == .None, "upgrade must be accepted, got err %d", err)
++	// FOUR pairs shift: (res,host)+(host,res) — the tie to host breaks — AND
++	// (m1,m2)+(m2,m1) — the mid-router tie ALSO breaks (both routes to the
++	// other mid router go via res at 5+20=25 instead of the 30 tie). All four
++	// are honest predictions of the same cost drop.
++	testing.expectf(t, len(shifts) == 4, "four pairs shift (host + mid-router ties break), got %d", len(shifts))
++
++	rs, okr := shift_by_pair(shifts[:], res, host)
++	testing.expectf(t, okr, "(res,host) must have a shift")
++	if okr {
++		testing.expectf(t, rs.kind == .Merge, "(res,host) kind must be Merge, got %d", rs.kind)
++		testing.expectf(t, rs.old_count == 2 && rs.new_count == 1,
++			"(res,host) count must shrink 2 -> 1, got %d -> %d", rs.old_count, rs.new_count)
++		testing.expectf(t, rs.new_next == m1, "(res,host) must consolidate on m1, got %d", rs.new_next)
++	}
++	// the mid-router tie breaks the same way: unique via res (the wide leg)
++	mm, okm := shift_by_pair(shifts[:], m1, m2)
++	testing.expectf(t, okm, "(m1,m2) must have a shift (its tie breaks)")
++	if okm {
++		testing.expectf(t, mm.kind == .Merge && mm.new_next == res,
++			"(m1,m2) must merge onto res, got kind %d next %d", mm.kind, mm.new_next)
++	}
++}
++
++@(test)
++test_forecast_honest_prediction_pin :: proc(t: ^testing.T) {
++	// ACCEPTANCE 3 — the honest-prediction pin (the determinism twin of
++	// `expect hash stable`): the helper's predicted post-upgrade routing equals
++	// the sim's ACTUAL post-upgrade routing after the upgrade is applied FOR
++	// REAL. The real action today = demolish the pipe + redraw it at the higher
++	// tier (logged commands through the real edit path — the same lowering the
++	// demo/replay gate uses); the helper never saw the edit.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	narrow, _ := pipe_tier_index(cat, "narrow")
++	wide, _ := pipe_tier_index(cat, "wide")
++	s, res, m1, m2, host := forecast_shift_setup(cat, std, narrow, narrow, narrow)
++	defer run_destroy(&s)
++	pipe_b1 := u32(1) // res->m2 (narrow) — the pipe the player upgrades
++
++	// --- the prediction (a look — the topology is untouched) ---
++	shifts, err := forecast_shift(&s.topology, cat, pipe_b1, wide)
++	defer delete(shifts)
++	testing.expectf(t, err == .None, "forecast_shift must accept the upgrade, got err %d", err)
++	rs, ok := shift_by_pair(shifts[:], res, host)
++	testing.expectf(t, ok && rs.new_next == m2, "prediction must name m2 as the new hop, got ok=%v next=%d", ok, rs.new_next)
++
++	// the PREDICTED post-upgrade table, built via the same seam the helper
++	// uses (a tier-view rebuild on the PRE-EDIT topology — one slot patched)
++	tiers := make([]u16, len(s.topology.pipe_alive))
++	defer delete(tiers)
++	for i in 0..<len(s.topology.pipe_tier) {
++		tiers[i] = s.topology.pipe_tier[i]
++	}
++	tiers[1] = wide // pipe slot 1 (res->m2) becomes wide
++	predicted: Routing_Table
++	routing_make(&predicted)
++	defer routing_destroy(&predicted)
++	routing_rebuild_with_tiers(&predicted, &s.topology, cat, tiers)
++
++	// --- apply the upgrade FOR REAL (the player's action, the real path) ---
++	// demolish the narrow res->m2 pipe at tick 2; redraw it WIDE at tick 3
++	append(&s.action_log, Command{apply_tick = 2, kind = Cmd_Demolish_Pipe{pipe = pipe_b1}})
++	draw(&s, 3, res, m2, wide)
++	step_n(&s, 2, cat)
++	testing.expectf(t, !s.replay_error, "the real edit must replay clean (no replay_error)")
++	new_pipe := u32(4) // next_pipe_id: ids 0..3 drawn, the redraw mints 4
++
++	// --- ACTUAL == PREDICTED, per-pair next-hop NODE sets (the pin) ---
++	n := len(s.topology.node_alive)
++	mismatches := 0
++	for fs in 0..<n {
++		if !s.topology.node_alive[fs] {
++			continue
++		}
++		for ds in 0..<n {
++			if ds == fs || !s.topology.node_alive[ds] {
++				continue
++			}
++			from_id := s.topology.node_id[fs]
++			dst_id := s.topology.node_id[ds]
++			po, pc, _ := routing_equal_cost_hops(&predicted, &s.topology, from_id, dst_id)
++			ao, ac, _ := routing_equal_cost_hops(&s.routing, &s.topology, from_id, dst_id)
++			if pc != ac {
++				mismatches += 1
++				testing.expectf(t, false, "pair (%d->%d): predicted count %d != actual %d", from_id, dst_id, pc, ac)
++				continue
++			}
++			for k in 0..<int(pc) {
++				pn := predicted.hops[int(po)+k].node
++				an := s.routing.hops[int(ao)+k].node
++				if pn != an {
++					mismatches += 1
++					testing.expectf(t, false, "pair (%d->%d): predicted hop %d = node %d, actual %d",
++						from_id, dst_id, k, pn, an)
++				}
++			}
++		}
++	}
++	testing.expectf(t, mismatches == 0, "PREDICTION != ACTUAL: %d pair mismatches (the honest-prediction pin)", mismatches)
++
++	// --- the flow-level proof: a packet spawned AFTER the real upgrade
++	// departs over the PREDICTED path (the new wide pipe toward m2) ---
++	flow_seed_demand(&s.flow, 6, res, host)
++	step_n(&s, 3, cat) // ticks 4, 5, 6: the demand fires at 6 (spawn + forward onto the fresh table)
++	found := false
++	for i in 0..<len(s.flow.packets) {
++		p := &s.flow.packets[i]
++		if p.src != res || p.dst != host || p.delivered {
++			continue
++		}
++		if !p.on_edge {
++			continue
++		}
++		testing.expectf(t, p.heading == m2, "post-upgrade packet %d must head to m2 (the prediction), got %d", p.id, p.heading)
++		testing.expectf(t, p.edge == new_pipe, "post-upgrade packet %d must ride the new wide pipe %d, got %d", p.id, new_pipe, p.edge)
++		found = true
++	}
++	testing.expectf(t, found, "no in-flight res->host packet after the real upgrade")
++}
++
++@(test)
++test_forecast_pure_no_mutation_and_deterministic :: proc(t: ^testing.T) {
++	// PURITY + determinism (acceptance 1): the helper mutates NOTHING it is
++	// given (topology + catalog untouched, no gen bump) and is a pure function
++	// (twice-called -> byte-identical shift lists).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	narrow, _ := pipe_tier_index(cat, "narrow")
++	wide, _ := pipe_tier_index(cat, "wide")
++	s, res, m1, m2, host := forecast_shift_setup(cat, std, narrow, narrow, narrow)
++	defer run_destroy(&s)
++
++	// snapshot the topology + catalog (contents, not just lengths)
++	gen_before := s.topology.gen
++	alive_before := len(s.topology.pipe_alive)
++	tiers_before := make([]u16, len(s.topology.pipe_tier))
++	defer delete(tiers_before)
++	for i in 0..<len(s.topology.pipe_tier) {
++		tiers_before[i] = s.topology.pipe_tier[i]
++	}
++	cost_before := cat.pipe_tiers[int(wide)].cost
++
++	a, err_a := forecast_shift(&s.topology, cat, 1, wide)
++	defer delete(a)
++	b, err_b := forecast_shift(&s.topology, cat, 1, wide)
++	defer delete(b)
++	testing.expectf(t, err_a == .None && err_b == .None, "both calls must succeed")
++
++	// no mutation
++	testing.expectf(t, s.topology.gen == gen_before, "PURITY: topology.gen moved (a write!) — %d -> %d", gen_before, s.topology.gen)
++	testing.expectf(t, len(s.topology.pipe_alive) == alive_before, "PURITY: pipe count changed")
++	for i in 0..<len(s.topology.pipe_tier) {
++		testing.expectf(t, s.topology.pipe_tier[i] == tiers_before[i], "PURITY: pipe tier %d changed", i)
++	}
++	testing.expectf(t, cat.pipe_tiers[int(wide)].cost == cost_before, "PURITY: catalog mutated")
++
++	// determinism: identical outputs
++	testing.expectf(t, len(a) == len(b), "determinism: shift count differs across calls (%d vs %d)", len(a), len(b))
++	for i in 0..<min(len(a), len(b)) {
++		testing.expectf(t, a[i] == b[i], "determinism: shift %d differs across calls", i)
++	}
++	// the pair domain + kind sanity on one call
++	_, ok := shift_by_pair(a[:], res, host)
++	_, okm := shift_by_pair(a[:], m1, host)
++	testing.expectf(t, ok, "(res,host) must shift")
++	testing.expectf(t, !okm, "(m1,host) must NOT shift (its path is untouched)")
++}
++
++@(test)
++test_forecast_errors_and_no_change :: proc(t: ^testing.T) {
++	// ERROR + no-change cases: the look fails loudly on a missing pipe /
++	// unknown tier / span-exceeding hypothetical (the real draw would reject
++	// it, so a prediction would be a lie), is idempotent on the identical
++	// tier, and honestly reports "no routing change" on a single-path network.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	narrow, _ := pipe_tier_index(cat, "narrow")
++	wide, _ := pipe_tier_index(cat, "wide")
++
++	// the fixture line: res(8,15) -> rt(20,15) -> host(32,15), span 12 each
++	s, res, rt, host := flow_setup(cat)
++	defer run_destroy(&s)
++	draw(&s, 1, res, rt, std) // pipe 0, span 12 (> narrow max_span 10)
++	draw(&s, 1, rt, host, std) // pipe 1
++	step_n(&s, 1, cat)
++
++	// missing pipe / unknown tier
++	sh, e1 := forecast_shift(&s.topology, cat, 999, wide)
++	defer delete(sh)
++	testing.expectf(t, e1 == .Missing_Pipe, "unknown pipe must reject with .Missing_Pipe, got %d", e1)
++	sh2, e2 := forecast_shift(&s.topology, cat, 0, 99)
++	defer delete(sh2)
++	testing.expectf(t, e2 == .Unknown_Tier, "unknown tier must reject with .Unknown_Tier, got %d", e2)
++	// a hypothetical the real draw would reject: standard(12-span) down to
++	// narrow (max_span 10) — the helper must refuse to predict a lie
++	sh3, e3 := forecast_shift(&s.topology, cat, 0, narrow)
++	defer delete(sh3)
++	testing.expectf(t, e3 == .Span_Exceeds_Tier, "span-exceeding tier must reject with .Span_Exceeds_Tier, got %d", e3)
++
++	// the identical tier: idempotent look (zero shifts, no error)
++	sh4, e4 := forecast_shift(&s.topology, cat, 0, std)
++	defer delete(sh4)
++	testing.expectf(t, e4 == .None && len(sh4) == 0, "identical tier must be a zero-shift no-op, got err %d shifts %d", e4, len(sh4))
++
++	// single-path network: upgrading a pipe on the ONLY path changes no next-
++	// hop set — the honest "no routing change" (nothing to reroute)
++	sh5, e5 := forecast_shift(&s.topology, cat, 0, wide)
++	defer delete(sh5)
++	testing.expectf(t, e5 == .None && len(sh5) == 0, "single-path upgrade must predict no routing change, got err %d shifts %d", e5, len(sh5))
++	_ = host
++}
+diff --git a/core/routing.odin b/core/routing.odin
+index c765e49..830643c 100644
+--- a/core/routing.odin
++++ b/core/routing.odin
+@@ -70,7 +70,11 @@ routing_destroy :: proc(r: ^Routing_Table) {
+ // routing_rebuild — recompute every node's equal-cost next-hop sets from the
+ // current Topology. Called by step ONLY when the topology changed (Topology.gen
+ // moved — 4-rule spine rule 1). Pure w.r.t. the Topology: identical Topology ->
+-// identical table on every target (ODN-10).
++// identical table on every target (ODN-10). The tier view is the topology's
++// own (t.pipe_tier) — see routing_rebuild_with_tiers for the hypothetical-
++// tier seam (Job C / R4: the forecast flow-shift prediction re-runs THIS same
++// Dijkstra against a one-pipe tier override, so the prediction and the sim's
++// real rebuild share one code path — the honest-prediction construction).
+ //
+ // Method: one DIJKSTRA PER DESTINATION (the graph is undirected — pipes have
+ // no direction) over INTEGER pipe costs — the capacity-cost ladder, user
+@@ -96,6 +100,20 @@ routing_destroy :: proc(r: ^Routing_Table) {
+ // then indexes this stable array. No rng, no map iteration (ODN-10);
+ // integer-only (ODN-10).
+ routing_rebuild :: proc(r: ^Routing_Table, t: ^Topology, cat: ^Catalogs, allocator := context.allocator) {
++	routing_rebuild_with_tiers(r, t, cat, t.pipe_tier[:], allocator)
++}
++
++// routing_rebuild_with_tiers — the shared Dijkstra core behind routing_rebuild
++// (Job C / R4). `tiers` is the per-PIPE-SLOT tier view the rebuild prices
++// edges with: the live view (t.pipe_tier[:] — the sim path) or a hypothetical
++// one-slot override (the forecast_shift look — a pure read of the topology
++// against a "what if this pipe were tier T" cost view). One code path for both
++// means the predicted post-upgrade routing is BY CONSTRUCTION the same
++// algorithm the sim runs — the honest-prediction pin is constructional, then
++// asserted empirically by forecast_shift_test. Determinism + array-only
++// discipline are identical to routing_rebuild (the table is DERIVED, never
++// serialized, so the tier view is a pure input like the topology itself).
++routing_rebuild_with_tiers :: proc(r: ^Routing_Table, t: ^Topology, cat: ^Catalogs, tiers: []u16, allocator := context.allocator) {
+ 	context.allocator = allocator
+ 	n := u32(len(t.node_alive))
+ 	need := int(n) * int(n)
+@@ -175,7 +193,7 @@ routing_rebuild :: proc(r: ^Routing_Table, t: ^Topology, cat: ^Catalogs, allocat
+ 				if !ok || settled[ns] {
+ 					continue
+ 				}
+-				nd := dist[cur] + cat.pipe_tiers[t.pipe_tier[pi]].cost
++				nd := dist[cur] + cat.pipe_tiers[tiers[pi]].cost
+ 				if dist[ns] == UNREACHABLE || nd < dist[ns] {
+ 					dist[ns] = nd
+ 				}
+@@ -214,7 +232,7 @@ routing_rebuild :: proc(r: ^Routing_Table, t: ^Topology, cat: ^Catalogs, allocat
+ 				if !ok || dist[ns] == UNREACHABLE {
+ 					continue
+ 				}
+-				c := cat.pipe_tiers[t.pipe_tier[pi]].cost
++				c := cat.pipe_tiers[tiers[pi]].cost
+ 				if !seen[ns] {
+ 					seen[ns] = true // first (lowest-slot) pipe to this neighbor wins the representative slot
+ 					min_cost[ns] = c
+diff --git a/demos/forecast_shift.dem b/demos/forecast_shift.dem
+new file mode 100644
+index 0000000..61aeb14
+--- /dev/null
++++ b/demos/forecast_shift.dem
+@@ -0,0 +1,86 @@
++# forecast_shift.dem — Job C / R4: the forecast flow-shift prediction, proven
++# against the REAL sim. Two compact diamonds (spans 9 <= narrow max 10):
++#   Diamond A (the REROUTE prediction) — ids 0..3:
++#     id 0 = residential res   at (8, 15)  — the source
++#     id 1 = router_basic m1   at (16, 11) — mid router (upper)
++#     id 2 = router_basic m2   at (16, 19) — mid router (lower)
++#     id 3 = content_host host at (24, 15) — the sink
++#     res->m1 STANDARD(10) + m1->host narrow(20) = 30  <- the current unique path
++#     res->m2 narrow(20) + m2->host narrow(20) = 40
++#     THE UPGRADE (the player's real action — demolish + redraw at the higher
++#     tier; no new command): at 1500ms demolish pipe 1 (res->m2 narrow), at
++#     1600ms redraw it WIDE (5). The R4 helper predicts: "traffic will reroute
++#     to node 2 (m2)" — b-side becomes 5+20 = 25 < 30. The 2800ms capture pins
++#     the prediction coming TRUE: post-upgrade packets ride ONLY the m2 legs;
++#     the m1 path carries nothing.
++#   Diamond B (the SPLIT prediction) — ids 4..7:
++#     id 4 = residential res2 at (32, 15)  — the source
++#     id 5 = router_basic r1  at (40, 11)  — mid router (upper)
++#     id 6 = router_basic r2  at (40, 19)  — mid router (lower)
++#     id 7 = content_host host2 at (48, 15) — the sink
++#     res2->r1 standard(10) + r1->host2 narrow(20) = 30 <- the current unique path
++#     res2->r2 narrow(20) + r2->host2 narrow(20) = 40
++#     THE UPGRADE: at 1500ms demolish pipe 5 (res2->r2 narrow), at 1600ms
++#     redraw it STANDARD (10). The R4 helper predicts: "equal-cost — flow will
++#     split" — b-side becomes 10+20 = 30 == 30. The 2800ms capture pins the
++#     tie: packets ride BOTH paths (the pure ECMP hash mod 2 splits them: odd
++#     packet ids -> r1, even -> r2).
++#
++# Transit (FIFO-serialized lane queues — a packet on a shared edge is served
++# in queue order at the edge's capacity: packet_bandwidth 30 -> wide = 1
++# tick/edge, standard = 2, narrow = 6; a packet waits its queue turn):
++#   pre-upgrade wave (ticks 20-23) clears the upper paths by tick 47 — the
++#   2800ms capture's upper-path emptiness is the reroute pin;
++#   post-upgrade: A spawns only at ticks 33-36, so at tick 56 (2800ms) its
++#   last wave is mid-edge on m2->host (deliveries at 41/47/53 clear the queue
++#   ahead of it; the queue never hits the E9 bound); B spawns at ticks 33-36
++#   (deliveries by 55) PLUS a two-packet wave at ticks 48/49 (2400/2450ms) —
++#   the ECMP hash sends tick-48 to r1 and tick-49 to r2, so at tick 56 ONE
++#   packet is mid-edge on EACH narrow leg: the split, both paths live.
++# The predictions themselves are pinned by core/forecast_shift_test.odin (the
++# honest-prediction pin asserts helper == sim table); this demo + `expect hash
++# stable` pin the REAL post-upgrade behavior + its replay determinism.
++seed 42
++run 2900ms
++fixture off
++spawn_node residential 8 15
++spawn_node router_basic 16 11
++spawn_node router_basic 16 19
++spawn_node content_host 24 15
++spawn_node residential 32 15
++spawn_node router_basic 40 11
++spawn_node router_basic 40 19
++spawn_node content_host 48 15
++at 500ms draw 0 1 standard
++at 500ms draw 0 2 narrow
++at 500ms draw 1 3 narrow
++at 500ms draw 2 3 narrow
++at 500ms draw 4 5 standard
++at 500ms draw 4 6 narrow
++at 500ms draw 5 7 narrow
++at 500ms draw 6 7 narrow
++at 1000ms spawn 0 3
++at 1050ms spawn 0 3
++at 1100ms spawn 0 3
++at 1150ms spawn 0 3
++at 1000ms spawn 4 7
++at 1050ms spawn 4 7
++at 1100ms spawn 4 7
++at 1150ms spawn 4 7
++capture at 1300ms
++at 1500ms demolish pipe 1
++at 1500ms demolish pipe 5
++at 1600ms draw 0 2 wide
++at 1600ms draw 4 6 standard
++at 1650ms spawn 0 3
++at 1700ms spawn 0 3
++at 1750ms spawn 0 3
++at 1800ms spawn 0 3
++at 1650ms spawn 4 7
++at 1700ms spawn 4 7
++at 1750ms spawn 4 7
++at 1800ms spawn 4 7
++at 2400ms spawn 4 7
++at 2450ms spawn 4 7
++capture at 2800ms
++expect hash stable
+diff --git a/goldens/forecast_shift.log.bin b/goldens/forecast_shift.log.bin
+new file mode 100644
+index 0000000..55267a4
+Binary files /dev/null and b/goldens/forecast_shift.log.bin differ
+diff --git a/goldens/forecast_shift.t1 b/goldens/forecast_shift.t1
+new file mode 100644
+index 0000000..f767979
+--- /dev/null
++++ b/goldens/forecast_shift.t1
+@@ -0,0 +1,65 @@
++# t1 manifest — per-tick FNV-1a-64 state hashes (full sim state)
++t1 1
++demo forecast_shift
++seed 42
++logic_hz 20
++catalog_hash 0a6324230ab9dcba
++ticks 58
++1 2fcd39c23d442d86
++2 43c6da6a395cb10b
++3 f080f84d6108ed80
++4 09b6f6f3035fdf9d
++5 cf34cd390f22b252
++6 f26c74c59f148cf7
++7 b69364ab7b3a3a4c
++8 852ab0bba3991169
++9 3e0d7ee6f3ff9c8e
++10 7897ae71c0601493
++11 92ee3f59054ad0e8
++12 d854b3e2609d840d
++13 c09020fd48ed37c2
++14 66d7753e1923652f
++15 2c3302e151e38864
++16 e183c3eedd610799
++17 8a224e47fdb7c3fe
++18 3b038aadbd2127db
++19 01a02a06de31eb70
++20 61e0cf45069348f1
++21 7a4562af307ec14b
++22 cdf73a354ed66e63
++23 401070273a4034e9
++24 71bc9d12a09b7668
++25 aa37610d73beb703
++26 ac2a494055d7e1d2
++27 11d39f226032ecb9
++28 561f9c43de604a14
++29 10044b4967077c95
++30 acd8c05152ef4916
++31 841776ac1b3fac31
++32 7dd15e3cf0adbe40
++33 201520eaa782ba23
++34 cc8d6d0d7eb1232a
++35 fe6cb695b08f2caa
++36 2834594c792d8313
++37 7c66e2f5fcd39cbb
++38 df97f0cc2090175b
++39 16b304f0a739b9f4
++40 8523e993cf2f54af
++41 506cd9a055897688
++42 cdc4101a60445b64
++43 15f3858594a32e9b
++44 cee01a6342bd52d8
++45 2cb3dd960c9e6725
++46 6ce4ae6ccb3cfada
++47 71f80ec1231a17fb
++48 2931ebe9e7ac0d8d
++49 8098c2a4ec39f1d7
++50 579b9422da05b7cd
++51 d87d96c50eaee27e
++52 e2f960c32cd139b6
++53 2fe6f677486f9446
++54 0eca5f794cce2da4
++55 0c0adf8285422b46
++56 5d3a4f84a5616442
++57 88510f9007e8f0de
++58 263c420834f6fbb2
+diff --git a/goldens/forecast_shift/01300ms.png b/goldens/forecast_shift/01300ms.png
+new file mode 100644
+index 0000000..ca24025
+Binary files /dev/null and b/goldens/forecast_shift/01300ms.png differ
+diff --git a/goldens/forecast_shift/02800ms.png b/goldens/forecast_shift/02800ms.png
+new file mode 100644
+index 0000000..1294a06
+Binary files /dev/null and b/goldens/forecast_shift/02800ms.png differ
+
+--- OUTPUT ---
+Return ONE valid JSON array. Each element must match this schema exactly:
+{
+  "source": "blind",
+  "severity": "blocker" | "warning" | "note",
+  "category": "<short tag>",
+  "title": "<one-line summary>",
+  "location": "<file:line | file:hunk | N/A>",
+  "evidence": "<the exact diff lines that prove the claim, pasted verbatim from the diff above. Use 'N/A' only when the claim is about something genuinely absent from the diff (e.g. a missing test file). Paraphrased or reconstructed evidence is hallucination — drop the finding instead.>",
+  "detail": "<≤40 words>",
+  "recommended_fix": "<≤40 words>"
+}
+
+Output contract: ONLY the JSON array. No prose, no fencing, no preamble. `[]` is valid.
+
+ACCURACY MANDATE: no claim you make will be taken at face value. Every finding will be cross-checked against the actual diff before reporting. Findings whose `evidence` cannot be located in the diff above, or whose claims contradict what the diff actually shows, are DISCARDED silently. Quote the exact diff lines in `evidence`. Speculation without quoted evidence is dropped. Accuracy > volume — an empty array is an honest answer when nothing is wrong.
+
+FILE-OUTPUT CONTRACT:
+- When your analysis is complete, write ONLY your JSON findings array (nothing else — no prose, no markdown) to this EXACT file path: /Users/moses/code/_bmad-output/perkins/packet-plumber-routing-forecast-shift/r1/blind.json
+- The file content must be a single valid JSON array, or `[]` if you found nothing.
+- After writing the file, send one short message ("done — wrote blind.json") and stop. Do not do any further work.

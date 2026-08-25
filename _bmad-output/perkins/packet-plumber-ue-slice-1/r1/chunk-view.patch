@@ -1,0 +1,1661 @@
+diff --git a/.gitignore b/.gitignore
+index fe5cd52..3dad2b4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -44,3 +44,7 @@ Saved/
+ 
+ # lavish review scratch (committed review artifacts live in docs/)
+ .lavish/
++
++# U-E2: the editor boot writes this legacy-input boilerplate (Enhanced Input
++# does not read it) — never tracked, never committed.
++Config/DefaultInput.ini
+diff --git a/Config/DefaultEngine.ini b/Config/DefaultEngine.ini
+index ecf5e4b..a41ac2a 100644
+--- a/Config/DefaultEngine.ini
++++ b/Config/DefaultEngine.ini
+@@ -9,6 +9,16 @@
+ bUseFixedFrameRate=True
+ FixedFrameRate=20.000000
+ 
++[/Script/EngineSettings.GameMapsSettings]
++; Slice-1 (stories 1.2/1.3): PIE runs the C++ view + sim driver on the
++; empty RunLevel map (created via ue-mcp, 2026-08-21). The GameMode owns
++; the sim + fixture + command bus; the PlayerController routes Enhanced
++; Input (mouse draw) into the validated command bus (UAD-12).
++GameDefaultMap=/Game/Maps/RunLevel
++EditorStartupMap=/Game/Maps/RunLevel
++GlobalDefaultGameMode=/Script/PacketPlumber.PPRunGameMode
++GlobalDefaultServerGameMode=/Script/PacketPlumber.PPRunGameMode
++
+ [/Script/Engine.RendererSettings]
+ ; Defaults are fine for the bootstrap; rendering knobs arrive with slice-1.
+ 
+diff --git a/Config/DefaultGame.ini b/Config/DefaultGame.ini
+index c11fa56..38a9b0e 100644
+--- a/Config/DefaultGame.ini
++++ b/Config/DefaultGame.ini
+@@ -1,9 +1,5 @@
+ ; Packet-Plumber-UE — DefaultGame.ini
+ 
+-[/Script/EngineSettings.GameMapsSettings]
+-; Bootstrap: no gameplay maps yet — headless gates (automation tests +
+-; PPProbe commandlet) do not need one. Slice-1 adds the editor test map.
+-
+ [/Script/EngineSettings.GeneralProjectSettings]
+ ProjectID=4E5B0D2F1A3C4D9E8F6A2B7C1D3E5F08
+ ProjectName=PacketPlumberUE
+diff --git a/Content/Maps/RunLevel.umap b/Content/Maps/RunLevel.umap
+new file mode 100644
+index 0000000..58e79da
+--- /dev/null
++++ b/Content/Maps/RunLevel.umap
+@@ -0,0 +1,3 @@
++version https://git-lfs.github.com/spec/v1
++oid sha256:2314ed7a26a4d29b9ae4ad245ccde7cf0b6811c2183187900d8d87121b3db6cd
++size 8431
+diff --git a/PacketPlumberUE.uproject b/PacketPlumberUE.uproject
+index 159daa2..848f223 100644
+--- a/PacketPlumberUE.uproject
++++ b/PacketPlumberUE.uproject
+@@ -33,6 +33,14 @@
+ 		{
+ 			"Name": "PythonScriptPlugin",
+ 			"Enabled": true
++		},
++		{
++			"Name": "UE_MCP_Bridge",
++			"Enabled": true
++		},
++		{
++			"Name": "AndroidFileServer",
++			"Enabled": false
+ 		}
+ 	]
+ }
+diff --git a/Source/PacketPlumber/PPCommandBus.cpp b/Source/PacketPlumber/PPCommandBus.cpp
+new file mode 100644
+index 0000000..541903f
+--- /dev/null
++++ b/Source/PacketPlumber/PPCommandBus.cpp
+@@ -0,0 +1,68 @@
++// PPCommandBus.cpp — the UAD-12 command bus (slice-1 drag-draw).
++#include "PPCommandBus.h"
++
++PP::FEditResult FPPCommandBus::DrawPipe(PP::FSimState &State, const FDrawIntent &Intent)
++{
++	// Both endpoints must snap to a node (the E4 inclusive snap was applied
++	// upstream by SnapToNode); a missing snap means the drag did not land on
++	// a valid pair — report MissingNode so the UI can give feedback.
++	if (!Intent.bStartOnNode || !Intent.bEndOnNode)
++	{
++		PP::FEditResult R;
++		R.Error = PP::FEditError::MissingNode;
++		return R;
++	}
++	PP::FCommand Cmd;
++	Cmd.Kind = PP::FCommandKind::DrawPipe;
++	Cmd.A = Intent.StartNode;
++	Cmd.B = Intent.EndNode;
++	Cmd.Tier = PP::TIER_STANDARD;	  // slice-1 draws the standard tier (canon 1.2)
++	return PP::ApplyEdit(State, Cmd); // live fast-path + log apply_tick = next
++}
++
++bool FPPCommandBus::SnapToNode(const PP::FTopology &Topology, const PP::FIntPoint &GridPos, uint32_t &OutNodeId)
++{
++	// E4 snap: inclusive at radius, measured in WORLD PX. The integer compare
++	// is exact: dist2 (grid) × tile_px² ≤ radius² (ODN-10 — no floats, no
++	// sqrt; the same metric family span validation uses).
++	const int64_t RadiusPx2 = static_cast<int64_t>(PP::kSnapRadius) * PP::kSnapRadius;
++	const int64_t TilePx2 = static_cast<int64_t>(PP::kTilePx) * PP::kTilePx;
++	uint32_t Best = 0;
++	int64_t BestD2 = INT64_MAX;
++	bool Found = false;
++	for (uint32_t Slot = 0; Slot < Topology.NodeAlive.size(); ++Slot)
++	{
++		if (!Topology.NodeAlive[Slot])
++		{
++			continue;
++		}
++		const PP::FIntPoint Pos{Topology.NodePosX[Slot], Topology.NodePosY[Slot]};
++		const int64_t D2 = PP::Dist2(Pos, GridPos);
++		if (D2 * TilePx2 <= RadiusPx2 && D2 < BestD2)
++		{
++			BestD2 = D2;
++			Best = Topology.NodeId[Slot];
++			Found = true;
++		}
++	}
++	if (Found)
++	{
++		OutNodeId = Best;
++	}
++	return Found;
++}
++
++PP::FIntPoint FPPCommandBus::ScreenToGrid(const FVector2D &ScreenPos, const FVector2D &ViewportSize)
++{
++	// Camera-fit: the map (PP::kMapTilesX × kMapTilesY tiles at kTilePx) is
++	// fit into the viewport with a uniform scale, centered. Screen -> grid:
++	// invert the fit. (The view layer owns the same mapping for rendering.)
++	const float WorldW = static_cast<float>(PP::kMapTilesX * PP::kTilePx);
++	const float WorldH = static_cast<float>(PP::kMapTilesY * PP::kTilePx);
++	const float Scale = FMath::Min(ViewportSize.X / WorldW, ViewportSize.Y / WorldH);
++	const float OffsetX = (ViewportSize.X - WorldW * Scale) * 0.5f;
++	const float OffsetY = (ViewportSize.Y - WorldH * Scale) * 0.5f;
++	const int32 TileX = static_cast<int32>(FMath::FloorToDouble((ScreenPos.X - OffsetX) / (Scale * PP::kTilePx)));
++	const int32 TileY = static_cast<int32>(FMath::FloorToDouble((ScreenPos.Y - OffsetY) / (Scale * PP::kTilePx)));
++	return PP::FIntPoint{TileX, TileY};
++}
+diff --git a/Source/PacketPlumber/PPCommandBus.h b/Source/PacketPlumber/PPCommandBus.h
+new file mode 100644
+index 0000000..7ee17c5
+--- /dev/null
++++ b/Source/PacketPlumber/PPCommandBus.h
+@@ -0,0 +1,50 @@
++// PPCommandBus.h — the UAD-12 command bus: mouse intent -> FIntent ->
++// validated FCommand -> sim apply (live fast-path + action log).
++//
++// Slice-1 scope (story 1.2): drag-draw a pipe. The bus resolves the pointer
++// to a node id (snap-to-node, inclusive at radius [E4]), builds a
++// FCommand::DrawPipe, and applies it via PP::ApplyEdit — the SAME
++// validate-then-apply the replay path uses (one legality path, so live and
++// replay can never diverge). The edit fast-path (ODN-2): applied this frame,
++// logged with apply_tick = next; replay re-applies the log entry at that
++// tick before stepping.
++//
++// Engine-side (UE types allowed); the SIM stays pure (PP headers only).
++#pragma once
++
++#include "CoreMinimal.h"
++
++#include "PacketPlumberCore/PP_Sim.h"
++
++class APPRunGameMode;
++
++// A drag intent in GRID coordinates (tile space, integer). The bus snaps
++// screen positions to the nearest node within the E4 radius before building
++// the command.
++struct FDrawIntent
++{
++	bool bStartOnNode = false;
++	uint32_t StartNode = 0; // snapped node id (valid when bStartOnNode)
++	bool bEndOnNode = false;
++	uint32_t EndNode = 0; // snapped node id (valid when bEndOnNode)
++};
++
++class FPPCommandBus
++{
++  public:
++	// Build + apply a draw command from a drag intent. Returns the edit
++	// result (ok + reason — self_loop [E3], terminal_pair [E26],
++	// span_exceeds, ...). The apply is the live fast-path: the edit lands
++	// immediately in the topology + is logged with apply_tick = next.
++	PP::FEditResult DrawPipe(PP::FSimState &State, const FDrawIntent &Intent);
++
++	// Snap a GRID position to a node id within the E4 snap radius. The
++	// radius is INCLUSIVE (E4) and measured in world px (kSnapRadius) — the
++	// integer compare uses dist2 × tile_px² ≤ radius² (exact, ODN-10).
++	// Returns false when no node is in range.
++	static bool SnapToNode(const PP::FTopology &Topology, const PP::FIntPoint &GridPos, uint32_t &OutNodeId);
++
++	// Convert a SCREEN position to GRID (tile) coordinates. The view owns the
++	// screen->world mapping (camera-fit); the bus receives tile space.
++	static PP::FIntPoint ScreenToGrid(const FVector2D &ScreenPos, const FVector2D &ViewportSize);
++};
+diff --git a/Source/PacketPlumber/PPRunGameMode.cpp b/Source/PacketPlumber/PPRunGameMode.cpp
+new file mode 100644
+index 0000000..1df3616
+--- /dev/null
++++ b/Source/PacketPlumber/PPRunGameMode.cpp
+@@ -0,0 +1,193 @@
++// PPRunGameMode.cpp — the run GameMode (slice 1.2/1.3).
++#include "PPRunGameMode.h"
++
++#include "Blueprint/UserWidget.h"
++#include "Logging/LogMacros.h"
++
++DEFINE_LOG_CATEGORY_STATIC(LogPPRun, Log, All);
++#include "Engine/World.h"
++#include "GameFramework/PlayerController.h"
++#include "PPRunPlayerController.h"
++#include "PPRunView.h"
++
++APPRunGameMode::APPRunGameMode()
++{
++	PrimaryActorTick.bCanEverTick = true;
++	// C++-first view: no BP pawn/controller needed for slice 1 — the widget
++	// reads snapshots and input routes through the bus.
++	DefaultPawnClass = nullptr;
++	PlayerControllerClass = APPRunPlayerController::StaticClass();
++}
++
++void APPRunGameMode::StartRun()
++{
++	// Fresh run arena (ODN-13). The static fixture: 1 source terminal, 1
++	// router junction, 1 sink terminal at the golden scenario's positions
++	// (PP_Scenario.h constants) — spawned as run setup (NOT in the action
++	// log, like the seed). NO pipes pre-drawn: story 1.2's player draws
++	// source->router->sink through the validated command bus. Demand: one
++	// packet every 20 ticks (1 s) source->sink once a path exists (1.3).
++	SimState.Initialize(42);
++	PP::SpawnNode(SimState.Topology, PP::FNodeKind::Terminal, 2, 2);  // SCENARIO_SOURCE
++	PP::SpawnNode(SimState.Topology, PP::FNodeKind::Junction, 6, 2);  // SCENARIO_ROUTER
++	PP::SpawnNode(SimState.Topology, PP::FNodeKind::Terminal, 10, 2); // SCENARIO_SINK
++	for (uint64_t T = 10; T <= 100000; T += 10)
++	{
++		PP::FlowSeedDemand(SimState.Flow, T, PP::SCENARIO_SOURCE, PP::SCENARIO_SINK, 0);
++	}
++	Driver.Reset();
++	BuildSnapshot();
++	PrevSnapshot = Snapshot;
++}
++
++void APPRunGameMode::BeginPlay()
++{
++	Super::BeginPlay();
++	StartRun();
++
++	// Create the C++ view widget (no asset — built entirely in code).
++	if (UClass *ViewClass = UPPRunView::StaticClass())
++	{
++		RunView = CreateWidget<UPPRunView>(GetWorld(), ViewClass);
++		if (RunView)
++		{
++			UE_LOG(LogPPRun, Display, TEXT("RunView created (class %s)"), *ViewClass->GetName());
++			RunView->AddToViewport(0);
++			RunView->BindRun(this);
++			UE_LOG(LogPPRun, Display, TEXT("RunView bound + added to viewport"));
++		}
++		else
++		{
++			UE_LOG(LogPPRun, Error, TEXT("RunView creation FAILED"));
++		}
++	}
++}
++
++void APPRunGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
++{
++	RunView = nullptr;
++	Super::EndPlay(EndPlayReason);
++}
++
++void APPRunGameMode::Tick(float DeltaSeconds)
++{
++	Super::Tick(DeltaSeconds);
++	StepSim(DeltaSeconds);
++}
++
++void APPRunGameMode::StepSim(float DeltaSeconds)
++{
++	const int32 Stepped = Driver.Advance(SimState, DeltaSeconds);
++	if (Stepped > 0)
++	{
++		PrevSnapshot = Snapshot;
++		BuildSnapshot();
++	}
++}
++
++void APPRunGameMode::BuildSnapshot()
++{
++	// View reads ONLY snapshots (U-E9): copy what the view needs, nothing else.
++	Snapshot = PPView::FSnapshot{};
++	Snapshot.Tick = SimState.Tick;
++	Snapshot.Score = SimState.Score;
++	for (uint32_t Slot = 0; Slot < SimState.Topology.NodeAlive.size(); ++Slot)
++	{
++		if (!SimState.Topology.NodeAlive[Slot])
++		{
++			continue;
++		}
++		PPView::FNodeView N;
++		N.Id = SimState.Topology.NodeId[Slot];
++		N.Kind = static_cast<PP::FNodeKind>(SimState.Topology.NodeKind[Slot]);
++		N.Pos = PP::FIntPoint{SimState.Topology.NodePosX[Slot], SimState.Topology.NodePosY[Slot]};
++		Snapshot.Nodes.Add(N);
++	}
++	for (uint32_t Slot = 0; Slot < SimState.Topology.PipeAlive.size(); ++Slot)
++	{
++		if (!SimState.Topology.PipeAlive[Slot])
++		{
++			continue;
++		}
++		PPView::FPipeView P;
++		P.Id = SimState.Topology.PipeId[Slot];
++		P.A = SimState.Topology.PipeA[Slot];
++		P.B = SimState.Topology.PipeB[Slot];
++		Snapshot.Pipes.Add(P);
++	}
++	for (const PP::FPacket &Packet : SimState.Flow.Packets)
++	{
++		PPView::FPacketView PV;
++		PV.Id = Packet.Id;
++		PV.bOnEdge = Packet.OnEdge;
++		if (Packet.OnEdge)
++		{
++			// FromNode = the pipe's departure endpoint (AtNode — the departure
++			// node is kept while on edge, E29), ToNode = Heading. Progress:
++			// bandwidth units / packet bandwidth -> 0..1 across the edge.
++			PV.FromNode = Packet.AtNode;
++			PV.ToNode = Packet.Heading;
++			PV.Progress = FMath::Clamp(static_cast<float>(Packet.ProgressUnits) / PP::kPacketBandwidth, 0.0f, 1.0f);
++		}
++		else
++		{
++			PV.FromNode = Packet.AtNode;
++			PV.ToNode = Packet.AtNode;
++			PV.Progress = 0.0f;
++		}
++		Snapshot.Packets.Add(PV);
++	}
++}
++
++void APPRunGameMode::BeginDraw(const FVector2D &ScreenPos)
++{
++	if (APlayerController *PC = GetWorld()->GetFirstPlayerController())
++	{
++		int32 VW = 1280, VH = 720;
++		PC->GetViewportSize(VW, VH);
++		const FVector2D ViewportSize(static_cast<float>(VW), static_cast<float>(VH));
++		DragStartGrid = FPPCommandBus::ScreenToGrid(ScreenPos, ViewportSize);
++		bDragging = true;
++	}
++}
++
++void APPRunGameMode::EndDraw(const FVector2D &ScreenPos)
++{
++	if (!bDragging)
++	{
++		return;
++	}
++	bDragging = false;
++	if (APlayerController *PC = GetWorld()->GetFirstPlayerController())
++	{
++		int32 VW = 1280, VH = 720;
++		PC->GetViewportSize(VW, VH);
++		const FVector2D ViewportSize(static_cast<float>(VW), static_cast<float>(VH));
++		const PP::FIntPoint EndGrid = FPPCommandBus::ScreenToGrid(ScreenPos, ViewportSize);
++
++		FDrawIntent Intent;
++		uint32_t StartNode = 0, EndNode = 0;
++		Intent.bStartOnNode = FPPCommandBus::SnapToNode(SimState.Topology, DragStartGrid, StartNode);
++		Intent.bEndOnNode = FPPCommandBus::SnapToNode(SimState.Topology, EndGrid, EndNode);
++		if (Intent.bStartOnNode)
++		{
++			Intent.StartNode = StartNode;
++		}
++		if (Intent.bEndOnNode)
++		{
++			Intent.EndNode = EndNode;
++		}
++		// apply via the live fast-path (validate-then-apply + log apply_tick=next)
++		const PP::FEditResult Result = CommandBus.DrawPipe(SimState, Intent);
++		LastEditError = Result.Error;
++		bHasLastEditError = true;
++		// The edit lands in the topology immediately; the next Step picks it
++		// up (rebuild on gen change). The view refreshes on the next step.
++		if (Result.Error == PP::FEditError::None)
++		{
++			// immediate refresh so the drawn pipe appears THIS frame (1.2:
++			// "two pipes are created and appear instantly")
++			BuildSnapshot();
++		}
++	}
++}
+diff --git a/Source/PacketPlumber/PPRunGameMode.h b/Source/PacketPlumber/PPRunGameMode.h
+new file mode 100644
+index 0000000..fdcaf39
+--- /dev/null
++++ b/Source/PacketPlumber/PPRunGameMode.h
+@@ -0,0 +1,96 @@
++// PPRunGameMode.h — the APPRunGameMode: owns the sim state + fixed-tick
++// driver + command bus, seeds the slice-1 static fixture, and emits the view
++// snapshot every step (U-E9: the view reads only snapshots).
++//
++// Story 1.2/1.3 scope (UAD-13 minimal): Boot -> Run. The fixture is the
++// golden scenario's (1 source terminal, 1 router junction, 1 sink terminal —
++// PP_Scenario.h constants) so PIE shows the SAME topology the golden pins;
++// the demand plan spawns a packet every N ticks so the player SEES the
++// packet travel once pipes are drawn (1.3).
++//
++// C++-first: no Blueprints, no content assets — the whole view is a UMG
++// widget tree built in code (UPPRunView).
++#pragma once
++
++#include "CoreMinimal.h"
++#include "GameFramework/GameModeBase.h"
++
++#include "PacketPlumberCore/PP_Scenario.h"
++#include "PacketPlumberCore/PP_Sim.h"
++
++#include "PPCommandBus.h"
++#include "PPSimDriver.h"
++#include "PPViewSnapshot.h"
++
++#include "PPRunGameMode.generated.h"
++
++class UPPRunView;
++
++UCLASS()
++class APPRunGameMode : public AGameModeBase
++{
++	GENERATED_BODY()
++
++  public:
++	APPRunGameMode();
++
++	// --- the run ---
++	// Fresh run arena (ODN-13): a new FSimState + fixture + demand. Retry
++	// (story 1.4 stub) calls this again — no state leakage.
++	void StartRun();
++
++	// --- snapshots (the view's only window into the sim, U-E9) ---
++	const PPView::FSnapshot &GetSnapshot() const
++	{
++		return Snapshot;
++	}
++	// Interpolation source: the view eases between the last two snapshots.
++	const PPView::FSnapshot &GetPrevSnapshot() const
++	{
++		return PrevSnapshot;
++	}
++
++	// --- the command bus (Enhanced Input routes drags here) ---
++	FPPCommandBus &GetCommandBus()
++	{
++		return CommandBus;
++	}
++
++	// Called by input: start/end a drag draw. ScreenPos in viewport pixels.
++	// BlueprintCallable so the MCP bridge (and any future input surface) can
++	// drive the SAME validated command-bus path the Enhanced Input actions
++	// use — one legality path for every device (UAD-12).
++	UFUNCTION(BlueprintCallable, Category = "Run")
++	void BeginDraw(const FVector2D &ScreenPos);
++
++	UFUNCTION(BlueprintCallable, Category = "Run")
++	void EndDraw(const FVector2D &ScreenPos);
++
++  protected:
++	virtual void BeginPlay() override;
++	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
++	virtual void Tick(float DeltaSeconds) override;
++
++  private:
++	void BuildSnapshot();
++	void StepSim(float DeltaSeconds);
++
++	// the sim (plain data — no UPROPERTY, U-E4: no UObject points into sim memory)
++	PP::FSimState SimState;
++	FPPSimDriver Driver;
++	FPPCommandBus CommandBus;
++
++	// view snapshots (last two ticks — the 20 Hz -> 60 fps interp pair)
++	PPView::FSnapshot Snapshot;
++	PPView::FSnapshot PrevSnapshot;
++
++	// pending drag
++	bool bDragging = false;
++	PP::FIntPoint DragStartGrid;
++	// the last edit result, for the status line (rejection feedback)
++	PP::FEditError LastEditError = PP::FEditError::None;
++	bool bHasLastEditError = false;
++
++	UPROPERTY()
++	TObjectPtr<UPPRunView> RunView = nullptr;
++};
+diff --git a/Source/PacketPlumber/PPRunPlayerController.cpp b/Source/PacketPlumber/PPRunPlayerController.cpp
+new file mode 100644
+index 0000000..6021172
+--- /dev/null
++++ b/Source/PacketPlumber/PPRunPlayerController.cpp
+@@ -0,0 +1,67 @@
++// PPRunPlayerController.cpp — Enhanced Input mouse draw (UAD-12).
++#include "PPRunPlayerController.h"
++
++#include "EnhancedInputComponent.h"
++#include "EnhancedInputSubsystems.h"
++#include "InputAction.h"
++#include "InputMappingContext.h"
++#include "PPRunGameMode.h"
++
++APPRunPlayerController::APPRunPlayerController()
++{
++	// The draw cursor must be visible (map-as-UI pointer).
++	bShowMouseCursor = true;
++	DefaultMouseCursor = EMouseCursor::Crosshairs;
++}
++
++void APPRunPlayerController::BeginPlay()
++{
++	Super::BeginPlay();
++
++	// Build the runtime input assets (C++-first — no Blueprint assets).
++	DrawMappingContext = NewObject<UInputMappingContext>(this, TEXT("PP_DrawContext"));
++	DrawStartAction = NewObject<UInputAction>(this, TEXT("PP_DrawStart"));
++	DrawStartAction->ValueType = EInputActionValueType::Boolean;
++	DrawEndAction = NewObject<UInputAction>(this, TEXT("PP_DrawEnd"));
++	DrawEndAction->ValueType = EInputActionValueType::Boolean;
++
++	DrawMappingContext->MapKey(DrawStartAction, EKeys::LeftMouseButton);
++	DrawMappingContext->MapKey(DrawEndAction, EKeys::LeftMouseButton);
++
++	if (UEnhancedInputLocalPlayerSubsystem *Subsystem =
++			ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(GetLocalPlayer()))
++	{
++		Subsystem->AddMappingContext(DrawMappingContext, 0);
++	}
++}
++
++void APPRunPlayerController::SetupInputComponent()
++{
++	Super::SetupInputComponent();
++
++	if (UEnhancedInputComponent *EIC = Cast<UEnhancedInputComponent>(InputComponent))
++	{
++		EIC->BindAction(DrawStartAction, ETriggerEvent::Started, this, &APPRunPlayerController::OnDrawStart);
++		EIC->BindAction(DrawEndAction, ETriggerEvent::Completed, this, &APPRunPlayerController::OnDrawEnd);
++	}
++}
++
++void APPRunPlayerController::OnDrawStart()
++{
++	if (APPRunGameMode *GM = GetWorld()->GetAuthGameMode<APPRunGameMode>())
++	{
++		float X = 0.0f, Y = 0.0f;
++		GetMousePosition(X, Y);
++		GM->BeginDraw(FVector2D(X, Y));
++	}
++}
++
++void APPRunPlayerController::OnDrawEnd()
++{
++	if (APPRunGameMode *GM = GetWorld()->GetAuthGameMode<APPRunGameMode>())
++	{
++		float X = 0.0f, Y = 0.0f;
++		GetMousePosition(X, Y);
++		GM->EndDraw(FVector2D(X, Y));
++	}
++}
+diff --git a/Source/PacketPlumber/PPRunPlayerController.h b/Source/PacketPlumber/PPRunPlayerController.h
+new file mode 100644
+index 0000000..1492051
+--- /dev/null
++++ b/Source/PacketPlumber/PPRunPlayerController.h
+@@ -0,0 +1,43 @@
++// PPRunPlayerController.h — the slice-1 input surface (UAD-12).
++//
++// Enhanced Input (mouse) -> FIntent -> FPPCommandBus. Two actions created
++// entirely in C++ (no assets): DrawStart (LMB press) + DrawEnd (LMB
++// release); the pointer position comes from the controller. The SAME
++// FCommand shapes any future device maps to (mouse/touch/gamepad parity by
++// construction, FORGE #6).
++#pragma once
++
++#include "CoreMinimal.h"
++#include "GameFramework/PlayerController.h"
++
++#include "PPRunPlayerController.generated.h"
++
++class UInputAction;
++class UInputMappingContext;
++
++UCLASS()
++class APPRunPlayerController : public APlayerController
++{
++	GENERATED_BODY()
++
++  public:
++	APPRunPlayerController();
++
++  protected:
++	virtual void SetupInputComponent() override;
++	virtual void BeginPlay() override;
++
++  private:
++	void OnDrawStart();
++	void OnDrawEnd();
++
++	// runtime-created Enhanced Input assets (no content assets — C++-first)
++	UPROPERTY()
++	TObjectPtr<UInputMappingContext> DrawMappingContext = nullptr;
++
++	UPROPERTY()
++	TObjectPtr<UInputAction> DrawStartAction = nullptr;
++
++	UPROPERTY()
++	TObjectPtr<UInputAction> DrawEndAction = nullptr;
++};
+diff --git a/Source/PacketPlumber/PPRunView.cpp b/Source/PacketPlumber/PPRunView.cpp
+new file mode 100644
+index 0000000..425a98e
+--- /dev/null
++++ b/Source/PacketPlumber/PPRunView.cpp
+@@ -0,0 +1,356 @@
++// PPRunView.cpp — the MM-look view (UAD-22): flat vector, warm cream,
++// ribbon roads with rounded casing, soft blob shadows, eased packet motion.
++#include "PPRunView.h"
++
++#include "Blueprint/WidgetTree.h"
++#include "Components/Border.h"
++#include "Components/CanvasPanel.h"
++#include "Components/CanvasPanelSlot.h"
++#include "Components/Image.h"
++#include "Components/TextBlock.h"
++#include "PPRunGameMode.h"
++#include "Styling/SlateBrush.h"
++
++// FSlateRoundedBoxBrush (SlateCore) — rounded corners at any radius; with
++// radius = half the size it renders a true circle. UMG Border/Image take it
++// via SetBrush (it IS a FSlateBrush).
++#include "Brushes/SlateRoundedBoxBrush.h"
++
++// --- palette tokens (the slice-1 MM look-parity baseline; UAD-22) ---
++namespace
++{
++const FLinearColor kCanvas(0.960f, 0.941f, 0.894f, 1.0f);	  // #F5F0E4 warm cream
++const FLinearColor kRoadFill(1.0f, 1.0f, 1.0f, 1.0f);		  // white ribbon
++const FLinearColor kRoadCasing(0.847f, 0.812f, 0.733f, 1.0f); // #D8CFBB
++const FLinearColor kSourceNode(0.910f, 0.639f, 0.239f, 1.0f); // #E8A33D
++const FLinearColor kRouterNode(0.659f, 0.635f, 0.604f, 1.0f); // #A8A29A
++const FLinearColor kSinkNode(0.498f, 0.651f, 0.788f, 1.0f);	  // #7FA6C9
++const FLinearColor kPacketDot(0.243f, 0.486f, 0.694f, 1.0f);  // #3E7CB1
++const FLinearColor kShadowTint(0.0f, 0.0f, 0.0f, 0.14f);	  // soft blob
++constexpr float kNodeDiameter = 34.0f;
++constexpr float kRoadWidth = 14.0f;
++constexpr float kPacketDiameter = 10.0f;
++constexpr float kTickInterval = 1.0f / PP::kLogicHz;
++constexpr int32 kMaxPacketDots = 16; // UAD-8 dot pool cap (slice-1 scale)
++
++// Ease-in-out cubic (MM-style motion feel; presentation-only, never sim).
++float EaseInOut(float T)
++{
++	T = FMath::Clamp(T, 0.0f, 1.0f);
++	return T < 0.5f ? 4.0f * T * T * T : 1.0f - FMath::Pow(-2.0f * T + 2.0f, 3.0f) / 2.0f;
++}
++} // namespace
++
++UPPRunView::UPPRunView(const FObjectInitializer &ObjectInitializer) : Super(ObjectInitializer)
++{
++}
++
++TSharedRef<SWidget> UPPRunView::RebuildWidget()
++{
++	// Background canvas: the warm-cream world (map-as-UI, arch §9.1). The
++	// tree is built here — the C++-only widget pattern (no designer asset).
++	UCanvasPanel *Root = WidgetTree->ConstructWidget<UCanvasPanel>(UCanvasPanel::StaticClass(), TEXT("WorldRoot"));
++	WidgetTree->RootWidget = Root;
++	WorldCanvas = Root;
++
++	// Full-screen cream backdrop so the world reads as a flat canvas.
++	UImage *Backdrop = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(), TEXT("Backdrop"));
++	FSlateRoundedBoxBrush BackdropBrush(kCanvas, 0.0f);
++	Backdrop->SetBrush(BackdropBrush);
++	UCanvasPanelSlot *BackdropSlot = Root->AddChildToCanvas(Backdrop);
++	BackdropSlot->SetAnchors(FAnchors(0.0f, 0.0f, 1.0f, 1.0f));
++	BackdropSlot->SetOffsets(FMargin(0.0f));
++
++	// Status line (top-left): tick + live packets + score.
++	StatusText = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Status"));
++	StatusText->SetText(FText::FromString(TEXT("")));
++	StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.30f, 0.28f, 0.24f, 1.0f)));
++	UCanvasPanelSlot *StatusSlot = Root->AddChildToCanvas(StatusText);
++	StatusSlot->SetAnchors(FAnchors(0.0f, 0.0f));
++	StatusSlot->SetPosition(FVector2D(12.0f, 8.0f));
++	StatusSlot->SetAutoSize(true);
++
++	// The root is the canvas panel itself.
++	return Root->TakeWidget();
++}
++
++void UPPRunView::BindRun(APPRunGameMode *InGameMode)
++{
++	GameMode = InGameMode;
++	RebuildWorld();
++}
++
++void UPPRunView::ClearWorld()
++{
++	if (!WorldCanvas)
++	{
++		return;
++	}
++	// Remove every world child except the backdrop (0) + status (1).
++	while (WorldCanvas->GetChildrenCount() > 2)
++	{
++		WorldCanvas->RemoveChildAt(WorldCanvas->GetChildrenCount() - 1);
++	}
++	PacketDots.Reset();
++	PacketPrevPos.Reset();
++	bHasPrev = false;
++}
++
++FVector2D UPPRunView::GridToScreen(const PP::FIntPoint &GridPos) const
++{
++	return GridToScreenV(FVector2D(static_cast<float>(GridPos.X) + 0.5f, static_cast<float>(GridPos.Y) + 0.5f));
++}
++
++FVector2D UPPRunView::GridToScreenV(const FVector2D &GridPos) const
++{
++	return FVector2D(FitOffset.X + GridPos.X * PP::kTilePx * FitScale,
++					 FitOffset.Y + GridPos.Y * PP::kTilePx * FitScale);
++}
++
++UImage *UPPRunView::MakeCircle(float Diameter, const FLinearColor &Color)
++{
++	UImage *Circle = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass());
++	FSlateRoundedBoxBrush Brush(Color, Diameter * 0.5f);
++	Circle->SetBrush(Brush);
++	Circle->SetDesiredSizeOverride(FVector2D(Diameter, Diameter));
++	return Circle;
++}
++
++UBorder *UPPRunView::MakeRoad(const FVector2D &FromScreen, const FVector2D &ToScreen, float Width,
++							  const FLinearColor &Fill, const FLinearColor &Casing)
++{
++	// Ribbon road: a casing border (wider, rounded) + a fill border on top,
++	// rotated to the pipe angle. Rounded caps = rounded-box radius half-W.
++	const FVector2D Delta = ToScreen - FromScreen;
++	const float Length = Delta.Size();
++	const float Angle = FMath::RadiansToDegrees(FMath::Atan2(Delta.Y, Delta.X));
++
++	auto MakeRibbon = [this](float W, const FLinearColor &Color)
++	{
++		UBorder *Ribbon = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass());
++		FSlateRoundedBoxBrush Brush(Color, W * 0.5f);
++		Ribbon->SetBrush(Brush);
++		return Ribbon;
++	};
++
++	UBorder *CasingBorder = MakeRibbon(Width + 4.0f, Casing);
++	UBorder *FillBorder = MakeRibbon(Width, Fill);
++
++	const FVector2D Center = (FromScreen + ToScreen) * 0.5f;
++	UCanvasPanelSlot *CasingSlot = WorldCanvas->AddChildToCanvas(CasingBorder);
++	CasingSlot->SetPosition(Center - FVector2D((Width + 4.0f) * 0.5f, (Width + 4.0f) * 0.5f));
++	CasingSlot->SetSize(FVector2D(Length, Width + 4.0f));
++	FWidgetTransform CasingT;
++	CasingT.Angle = Angle;
++	CasingBorder->SetRenderTransform(CasingT);
++
++	UCanvasPanelSlot *FillSlot = WorldCanvas->AddChildToCanvas(FillBorder);
++	FillSlot->SetPosition(Center - FVector2D(Width * 0.5f, Width * 0.5f));
++	FillSlot->SetSize(FVector2D(Length, Width));
++	FWidgetTransform FillT;
++	FillT.Angle = Angle;
++	FillBorder->SetRenderTransform(FillT);
++
++	return FillBorder;
++}
++
++UImage *UPPRunView::MakePacketDot(float Diameter)
++{
++	UImage *Dot = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass());
++	FSlateRoundedBoxBrush Brush(kPacketDot, Diameter * 0.5f);
++	Dot->SetBrush(Brush);
++	Dot->SetDesiredSizeOverride(FVector2D(Diameter, Diameter));
++	UCanvasPanelSlot *Slot = WorldCanvas->AddChildToCanvas(Dot);
++	Slot->SetSize(FVector2D(Diameter, Diameter));
++	Slot->SetAutoSize(true);
++	return Dot;
++}
++
++void UPPRunView::RebuildWorld()
++{
++	if (!GameMode || !WorldCanvas)
++	{
++		return;
++	}
++	PrevSnapshot = GameMode->GetPrevSnapshot();
++	CurSnapshot = GameMode->GetSnapshot();
++
++	// camera fit (shared with the command bus): the map fits into the
++	// viewport. A freshly-constructed widget reports a zero cached geometry
++	// ([FinLT] deferred-frame sizing) — fall back to the 1280x720 design
++	// reference; NativeTick re-fits once the real size lands.
++	const FVector2D ViewportSize = GetCachedGeometry().GetLocalSize().IsNearlyZero()
++									   ? FVector2D(1280.0f, 720.0f)
++									   : GetCachedGeometry().GetLocalSize();
++	const float WorldW = static_cast<float>(PP::kMapTilesX * PP::kTilePx);
++	const float WorldH = static_cast<float>(PP::kMapTilesY * PP::kTilePx);
++	FitScale = FMath::Min(ViewportSize.X / WorldW, ViewportSize.Y / WorldH);
++	FitOffset = FVector2D((ViewportSize.X - WorldW * FitScale) * 0.5f, (ViewportSize.Y - WorldH * FitScale) * 0.5f);
++
++	ClearWorld();
++	RefreshNodes();
++	RefreshPipes();
++	bHasPrev = true;
++	ElapsedSinceSnapshot = 0.0f;
++}
++
++void UPPRunView::RefreshNodes()
++{
++	for (const PPView::FNodeView &Node : CurSnapshot.Nodes)
++	{
++		const FVector2D Screen = GridToScreen(Node.Pos);
++
++		// soft blob shadow under the node (offset, low alpha, oversized)
++		UImage *Shadow = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass());
++		const float ShadowSize = kNodeDiameter + 12.0f;
++		FSlateRoundedBoxBrush ShadowBrush(kShadowTint, ShadowSize * 0.5f);
++		Shadow->SetBrush(ShadowBrush);
++		UCanvasPanelSlot *ShadowSlot = WorldCanvas->AddChildToCanvas(Shadow);
++		ShadowSlot->SetPosition(Screen - FVector2D(ShadowSize * 0.5f - 2.0f, ShadowSize * 0.5f - 3.0f));
++		ShadowSlot->SetSize(FVector2D(ShadowSize, ShadowSize));
++
++		const FLinearColor Color = Node.Kind == PP::FNodeKind::Terminal
++									   ? (Node.Id == PP::SCENARIO_SOURCE ? kSourceNode : kSinkNode)
++									   : kRouterNode;
++		UImage *NodeImg = MakeCircle(kNodeDiameter, Color);
++		UCanvasPanelSlot *NodeSlot = WorldCanvas->AddChildToCanvas(NodeImg);
++		NodeSlot->SetPosition(Screen - FVector2D(kNodeDiameter * 0.5f, kNodeDiameter * 0.5f));
++		NodeSlot->SetSize(FVector2D(kNodeDiameter, kNodeDiameter));
++	}
++}
++
++void UPPRunView::RefreshPipes()
++{
++	TMap<uint32_t, FVector2D> NodeScreen;
++	for (const PPView::FNodeView &Node : CurSnapshot.Nodes)
++	{
++		NodeScreen.Add(Node.Id, GridToScreen(Node.Pos));
++	}
++	for (const PPView::FPipeView &Pipe : CurSnapshot.Pipes)
++	{
++		const FVector2D *A = NodeScreen.Find(Pipe.A);
++		const FVector2D *B = NodeScreen.Find(Pipe.B);
++		if (A && B)
++		{
++			MakeRoad(*A, *B, kRoadWidth, kRoadFill, kRoadCasing);
++		}
++	}
++}
++
++// Packet display position in a given snapshot (from/to nodes + eased progress
++// across the edge). Pure function of a snapshot — the sim is never read.
++FVector2D PacketPosIn(const PPView::FSnapshot &Snap, const PPView::FPacketView &P)
++{
++	FVector2D From = FVector2D::ZeroVector;
++	FVector2D To = FVector2D::ZeroVector;
++	bool bFrom = false, bTo = false;
++	for (const PPView::FNodeView &Node : Snap.Nodes)
++	{
++		if (Node.Id == P.FromNode)
++		{
++			From = FVector2D(static_cast<float>(Node.Pos.X) + 0.5f, static_cast<float>(Node.Pos.Y) + 0.5f);
++			bFrom = true;
++		}
++		if (Node.Id == P.ToNode)
++		{
++			To = FVector2D(static_cast<float>(Node.Pos.X) + 0.5f, static_cast<float>(Node.Pos.Y) + 0.5f);
++			bTo = true;
++		}
++	}
++	if (!bFrom)
++	{
++		return FVector2D::ZeroVector;
++	}
++	if (!bTo || P.FromNode == P.ToNode)
++	{
++		return From;
++	}
++	return FMath::Lerp(From, To, EaseInOut(P.Progress));
++}
++
++void UPPRunView::NativeTick(const FGeometry &MyGeometry, float InDeltaTime)
++{
++	Super::NativeTick(MyGeometry, InDeltaTime);
++	if (!GameMode || !WorldCanvas)
++	{
++		return;
++	}
++
++	const PPView::FSnapshot &Next = GameMode->GetSnapshot();
++	if (Next.Tick != CurSnapshot.Tick)
++	{
++		// a new sim tick landed: slide the pair. The STATIC world (nodes +
++		// pipes) rebuilds ONLY when the topology changed (a drawn pipe — the
++		// golden rule: view rebuilds are topology-scoped, never per-tick, so
++		// packet dots persist across ticks).
++		const bool bTopologyChanged =
++			Next.Nodes.Num() != CurSnapshot.Nodes.Num() || Next.Pipes.Num() != CurSnapshot.Pipes.Num();
++		PrevSnapshot = CurSnapshot;
++		CurSnapshot = Next;
++		ElapsedSinceSnapshot = 0.0f;
++		if (bTopologyChanged)
++		{
++			ClearWorld();
++			RefreshNodes();
++			RefreshPipes();
++		}
++		return;
++	}
++	ElapsedSinceSnapshot += InDeltaTime;
++
++	// eased inter-snapshot fraction (20 Hz sim -> 60 fps view)
++	const float Frac = FMath::Clamp(ElapsedSinceSnapshot / kTickInterval, 0.0f, 1.0f);
++	const float Eased = EaseInOut(Frac);
++
++	// packet dots: pool (UAD-8) keyed by packet id; position = lerp between
++	// the packet's position in the prev snapshot and the cur snapshot.
++	TSet<uint64_t> Live;
++	for (const PPView::FPacketView &Packet : CurSnapshot.Packets)
++	{
++		Live.Add(Packet.Id);
++		TObjectPtr<UImage> *Found = PacketDots.Find(Packet.Id);
++		if (!Found && PacketDots.Num() >= kMaxPacketDots)
++		{
++			continue; // pool exhausted — drop the visual (sim unaffected)
++		}
++		if (!Found)
++		{
++			UImage *Dot = MakePacketDot(kPacketDiameter);
++			PacketDots.Add(Packet.Id, Dot);
++			PacketPrevPos.Add(Packet.Id, FVector2D::ZeroVector);
++			Found = PacketDots.Find(Packet.Id);
++		}
++		UImage *Dot = Found->Get();
++		UCanvasPanelSlot *Slot = Cast<UCanvasPanelSlot>(Dot->Slot);
++		if (Slot)
++		{
++			const FVector2D FromGrid = bHasPrev ? PacketPosIn(PrevSnapshot, Packet) : PacketPosIn(CurSnapshot, Packet);
++			const FVector2D ToGrid = PacketPosIn(CurSnapshot, Packet);
++			const FVector2D Prev = PacketPrevPos.FindRef(Packet.Id);
++			// ease across BOTH the inter-snapshot fraction AND the edge
++			// progress (MM-style ease-in-out; arrival settle = the ease-out
++			// half of the edge interpolation)
++			const FVector2D Target = FMath::Lerp(FromGrid, ToGrid, Eased);
++			const FVector2D Smooth = FMath::Lerp(Prev, Target, 0.5f); // temporal smoothing
++			Slot->SetPosition(GridToScreenV(Smooth) - FVector2D(kPacketDiameter * 0.5f, kPacketDiameter * 0.5f));
++			PacketPrevPos[Packet.Id] = Smooth;
++		}
++	}
++	// release dots for packets that left the sim (delivered/culled)
++	for (auto It = PacketDots.CreateIterator(); It; ++It)
++	{
++		if (!Live.Contains(It.Key()))
++		{
++			WorldCanvas->RemoveChild(It.Value());
++			It.RemoveCurrent();
++			PacketPrevPos.Remove(It.Key());
++		}
++	}
++
++	if (StatusText)
++	{
++		StatusText->SetText(
++			FText::FromString(FString::Printf(TEXT("tick %llu  ·  packets %d  ·  score %d  ·  20 Hz"), CurSnapshot.Tick,
++											  CurSnapshot.Packets.Num(), CurSnapshot.Score)));
++	}
++}
+diff --git a/Source/PacketPlumber/PPRunView.h b/Source/PacketPlumber/PPRunView.h
+new file mode 100644
+index 0000000..4982296
+--- /dev/null
++++ b/Source/PacketPlumber/PPRunView.h
+@@ -0,0 +1,94 @@
++// PPRunView.h — the MM-look view layer (UAD-22, story 1.2/1.3).
++//
++// A UMG widget tree built ENTIRELY in C++ (no Blueprints, no content
++// assets): warm-cream canvas, ribbon roads with rounded casing, soft blob
++// shadows, clean flat vector look, and MM-style eased packet motion (1.3).
++// The view reads ONLY the PPView::FSnapshot pair (U-E9, ODN-1) — it never
++// touches the sim.
++//
++// Palette tokens (slice-1 look-parity baseline — the warm-cream MM palette;
++// these are view-layer constants, never sim state; catalog palettes land
++// with 3.1):
++//   Canvas        #F5F0E4  warm cream
++//   Road fill     #FFFFFF  white ribbon
++//   Road casing   #D8CFBB  warm tan casing (rounded)
++//   Source node   #E8A33D  warm amber
++//   Router node   #A8A29A  warm gray
++//   Sink node     #7FA6C9  muted blue
++//   Packet dot    #3E7CB1  blue dot
++//   Shadow        black @ 12% alpha, soft blob
++#pragma once
++
++#include "Blueprint/UserWidget.h"
++
++#include "PPViewSnapshot.h"
++
++#include "PPRunView.generated.h"
++
++class APPRunGameMode;
++class UCanvasPanel;
++class UImage;
++class UBorder;
++class UTextBlock;
++
++UCLASS()
++class UPPRunView : public UUserWidget
++{
++	GENERATED_BODY()
++
++  public:
++	UPPRunView(const FObjectInitializer &ObjectInitializer);
++
++	// Attach to the run GameMode: from here the view reads snapshots only.
++	void BindRun(APPRunGameMode *InGameMode);
++
++	// Rebuild the static widget tree from the current snapshot (nodes +
++	// pipes). Called on BindRun and whenever the topology changes.
++	void RebuildWorld();
++
++	// Tick the eased view (packet dots interpolate between the snapshot pair).
++	virtual void NativeTick(const FGeometry &MyGeometry, float InDeltaTime) override;
++
++  protected:
++	// C++-only widget: the tree is built HERE (NativeConstruct runs after the
++	// Slate widget exists — too late to set the root).
++	virtual TSharedRef<SWidget> RebuildWidget() override;
++
++  private:
++	FVector2D GridToScreen(const PP::FIntPoint &GridPos) const;
++	FVector2D GridToScreenV(const FVector2D &GridPos) const;
++
++	// --- widget helpers (all built in code) ---
++	UImage *MakeCircle(float Diameter, const FLinearColor &Color);
++	UBorder *MakeRoad(const FVector2D &FromScreen, const FVector2D &ToScreen, float Width, const FLinearColor &Fill,
++					  const FLinearColor &Casing);
++	UImage *MakePacketDot(float Diameter);
++
++	void ClearWorld();
++	void RefreshNodes();
++	void RefreshPipes();
++
++	UPROPERTY()
++	TObjectPtr<APPRunGameMode> GameMode = nullptr;
++
++	UPROPERTY()
++	TObjectPtr<UCanvasPanel> WorldCanvas = nullptr;
++
++	UPROPERTY()
++	TObjectPtr<UTextBlock> StatusText = nullptr;
++
++	// cached snapshot pair (the view copies what it needs — U-E9)
++	PPView::FSnapshot CurSnapshot;
++	PPView::FSnapshot PrevSnapshot;
++	bool bHasPrev = false;
++
++	// packet dot cache: packet id -> widget (pooled — UAD-8)
++	TMap<uint64_t, TObjectPtr<UImage>> PacketDots;
++	TMap<uint64_t, FVector2D> PacketPrevPos; // for eased interp
++
++	float ElapsedSinceSnapshot = 0.0f;
++
++	// screen mapping (camera-fit, shared with the command bus)
++	float FitScale = 1.0f;
++	FVector2D FitOffset = FVector2D::ZeroVector;
++};
+diff --git a/Source/PacketPlumber/PPViewSnapshot.h b/Source/PacketPlumber/PPViewSnapshot.h
+new file mode 100644
+index 0000000..53b4b4e
+--- /dev/null
++++ b/Source/PacketPlumber/PPViewSnapshot.h
+@@ -0,0 +1,57 @@
++// PPViewSnapshot.h — the immutable view snapshot (U-E9 / UAD-1).
++//
++// The View layer reads ONLY this struct — it never touches the sim state
++// directly (view-reads-snapshot, ODN-1). The GameMode builds one per step
++// from PP::FSimState; widgets interpolate between the last two snapshots for
++// 60 fps (sim is 20 Hz — UAD-2) with presentation-only easing (UAD-22).
++//
++// This is engine-side (UE types allowed) — the sim set stays pure.
++#pragma once
++
++#include "CoreMinimal.h"
++
++#include "PacketPlumberCore/PP_Topology.h"
++
++namespace PPView
++{
++
++// One node as the view sees it: grid position + kind (palette comes from the
++// view layer, never from the sim).
++struct FNodeView
++{
++	uint32_t Id = 0;
++	PP::FNodeKind Kind = PP::FNodeKind::Terminal;
++	PP::FIntPoint Pos; // integer grid position (1 tile = 26 px, PP::kTilePx)
++};
++
++// One pipe as the view sees it (endpoint node ids).
++struct FPipeView
++{
++	uint32_t Id = 0;
++	uint32_t A = 0;
++	uint32_t B = 0;
++};
++
++// One packet as the view sees it: its current node (or the edge it rides)
++// + progress along that edge, so the view can place + ease the dot.
++struct FPacketView
++{
++	uint64_t Id = 0;
++	uint32_t FromNode = 0; // the node it departed (or sits at)
++	uint32_t ToNode = 0;   // the node it heads to (== FromNode when at a node)
++	float Progress = 0.0f; // 0..1 across the edge (presentation-only derived)
++	bool bOnEdge = false;
++};
++
++// The snapshot: everything the view needs for one sim tick. Plain data,
++// built fresh per step, copied (never referenced) by the view.
++struct FSnapshot
++{
++	uint64_t Tick = 0;
++	int32 Score = 0;
++	TArray<FNodeView> Nodes;
++	TArray<FPipeView> Pipes;
++	TArray<FPacketView> Packets;
++};
++
++} // namespace PPView
+diff --git a/Source/PacketPlumber/PacketPlumber.Build.cs b/Source/PacketPlumber/PacketPlumber.Build.cs
+index cd5b601..e8c98f1 100644
+--- a/Source/PacketPlumber/PacketPlumber.Build.cs
++++ b/Source/PacketPlumber/PacketPlumber.Build.cs
+@@ -13,6 +13,11 @@ public class PacketPlumber : ModuleRules
+ 			"CoreUObject",
+ 			"Engine",
+ 			"PacketPlumberCore",
++			"UMG",
++			"Slate",
++			"SlateCore",
++			"EnhancedInput",
++			"InputCore",
+ 		});
+ 	}
+ }
+diff --git a/Source/PacketPlumber/Public/PPSimDriver.h b/Source/PacketPlumber/Public/PPSimDriver.h
+new file mode 100644
+index 0000000..e2af0a3
+--- /dev/null
++++ b/Source/PacketPlumber/Public/PPSimDriver.h
+@@ -0,0 +1,67 @@
++// PPSimDriver.h — the UAD-2 fixed-timestep driver (engine-side).
++//
++// The sim advances only by explicit integer ticks (PP::Step); the driver is
++// the UE-side accumulator that decides WHEN to step. It keeps a clamped
++// float accumulator (Delta = Min(Delta, 0.25) — the [FinLT] trap honored:
++// float lives in orchestration, never sim state) and derives
++// TargetTick = floor(AccumulatedSeconds * kLogicHz); it calls PP::Step 0..N
++// times per frame. Pause = stop calling Advance. The sim never reads a
++// clock (ODN-1).
++//
++// Testable: the accumulator math is pure (Advance returns how many ticks
++// elapsed); the automation test drives it with synthetic deltas.
++#pragma once
++
++#include "PacketPlumberCore/PP_Sim.h"
++
++// FPPSimDriver — a fixed-rate accumulator over a PP::FSimState.
++//
++// Usage (per frame):
++//   Driver.Advance(State, DeltaSeconds);   // steps 0..N times internally
++//   ... read State ...                     // the sim is at its fresh tick
++class FPPSimDriver
++{
++  public:
++	FPPSimDriver() = default;
++
++	// Advance the accumulator by DeltaSeconds (clamped to 0.25s/frame) and
++	// step the sim to the resulting TargetTick. Returns the number of ticks
++	// executed this call. Sim-safe: no floats enter the sim (PP::Step takes
++	// integer ticks only).
++	int32 Advance(PP::FSimState &State, float DeltaSeconds)
++	{
++		DeltaSeconds = FMath::Min(DeltaSeconds, MaxFrameDelta);
++		AccumulatedSeconds += DeltaSeconds;
++		const uint64_t TargetTick =
++			static_cast<uint64_t>(FMath::FloorToDouble(static_cast<double>(AccumulatedSeconds) * SimHz));
++		int32 Stepped = 0;
++		while (State.Tick < TargetTick)
++		{
++			PP::Step(State, State.Tick + 1);
++			++Stepped;
++		}
++		return Stepped;
++	}
++
++	// Reset the accumulator (a fresh run / retry arena — ODN-13).
++	void Reset()
++	{
++		AccumulatedSeconds = 0.0f;
++	}
++
++	float GetAccumulatedSeconds() const
++	{
++		return AccumulatedSeconds;
++	}
++
++  private:
++	// The fixed sim rate (ODN-2, pinned in Config/DefaultEngine.ini + PP_Balance.h).
++	static constexpr float SimHz = static_cast<float>(PP::kLogicHz);
++	// Per-frame delta clamp — the [FinLT] trap: a hitch (e.g. a shader
++	// stall) must never dump a giant delta into the accumulator (which would
++	// burn a huge catch-up step batch); the sim is 20 Hz, so 0.25 s = 5
++	// steps/frame is already generous.
++	static constexpr float MaxFrameDelta = 0.25f;
++
++	float AccumulatedSeconds = 0.0f;
++};
+diff --git a/Source/PacketPlumberEditor/PPProbeCommandlet.cpp b/Source/PacketPlumberEditor/PPProbeCommandlet.cpp
+index bd74273..b86e905 100644
+--- a/Source/PacketPlumberEditor/PPProbeCommandlet.cpp
++++ b/Source/PacketPlumberEditor/PPProbeCommandlet.cpp
+@@ -1,4 +1,11 @@
+ // PPProbeCommandlet.cpp — the headless spine probe.
++//
++// Slice 1 (story 1.1): the probe now runs the FULL golden scenario
++// (PP_Scenario.h — the SAME builder the standalone spine-check and the
++// automation tests use, so the three surfaces cannot drift, UAD-17), dumps
++// the routing table, and writes the extended v2 golden JSON
++// (topology/forwarding/flow summaries + catalog_hash — schema single-sourced
++// in docs/goldens/SCHEMA.md).
+ #include "PPProbeCommandlet.h"
+ 
+ // Module-local log category (UE 5.8 log categories are not exported across
+@@ -7,6 +14,7 @@
+ DEFINE_LOG_CATEGORY_STATIC(LogPPProbe, Log, All);
+ 
+ #include "PacketPlumberCore/PP_Rng.h"
++#include "PacketPlumberCore/PP_Scenario.h"
+ #include "PacketPlumberCore/PP_Sim.h"
+ #include "Misc/FileHelper.h"
+ #include "Misc/Paths.h"
+@@ -23,7 +31,8 @@ int32 UPPProbeCommandlet::Main(const FString &Params)
+ 	// --- parse -seed= / -ticks= / -json= (loose; defaults keep it runnable).
+ 	// Command-line switches arrive dash-stripped in the Switches array
+ 	// ("seed=42", not "-seed=42"); garbage values fail loudly (never
+-	// silently fall back to defaults mid-run).
++	// silently fall back to defaults mid-run). Negative-args coverage: the
++	// --probe-negative leg of the headless gate asserts these fail.
+ 	uint64_t Seed = 42;
+ 	int32 Ticks = 100;
+ 	FString JsonPath;
+@@ -62,34 +71,71 @@ int32 UPPProbeCommandlet::Main(const FString &Params)
+ 		}
+ 	}
+ 
+-	// --- run the spine (identical code path the automation tests exercise)
++	// --- run the golden scenario (the SAME builder every surface uses).
++	// The scenario seeds itself (42 by default) and logs the fixture draws
++	// with apply_tick=1; StepScenario feeds the log through the replay path.
+ 	PP::FSimState State;
+-	State.Initialize(Seed);
++	PP::BuildProbeScenario(State, Seed); // the SAME builder every surface uses
++	PP::StepScenario(State, static_cast<uint64_t>(Ticks));
+ 
+ 	uint32_t FirstOutputs[4] = {0, 0, 0, 0};
+-	for (int32 I = 0; I < 4; ++I)
+ 	{
+-		FirstOutputs[I] = PP::RngNext(State.Rng);
++		PP::FRng R;
++		PP::RngSeed(R, Seed);
++		for (int32 I = 0; I < 4; ++I)
++		{
++			FirstOutputs[I] = PP::RngNext(R);
++		}
+ 	}
+ 
+-	// Re-seed so the heartbeat stream is untouched by the vector probe above.
+-	State.Initialize(Seed);
+-	for (int32 I = 0; I < Ticks; ++I)
++	const uint64_t Hash = PP::StateHash(State);
++
++	// --- routing-table dump (the story-1.1 "now dumping a routing table"):
++	// per (from, dst) equal-cost next-hop sets, insertion-order, plus the
++	// summary the golden pins.
++	int32 ReachablePairs = 0;
++	int32 TotalHops = 0;
+ 	{
+-		PP::Step(State, static_cast<uint64_t>(I + 1));
++		const PP::FRoutingTable &Rt = State.Routing;
++		const uint32_t N = Rt.N;
++		for (uint32_t From = 0; From < N; ++From)
++		{
++			for (uint32_t Dst = 0; Dst < N; ++Dst)
++			{
++				const uint64_t Idx = static_cast<uint64_t>(From) * N + Dst;
++				if (Rt.HopCount[Idx] > 0)
++				{
++					ReachablePairs += 1;
++					TotalHops += static_cast<int32>(Rt.HopCount[Idx]);
++					FString Line = FString::Printf(TEXT("  routing[%u -> %u]: "), From, Dst);
++					for (uint32_t K = 0; K < Rt.HopCount[Idx]; ++K)
++					{
++						const PP::FHop &H = Rt.Hops[Rt.HopOffset[Idx] + K];
++						Line += FString::Printf(TEXT("node%u(pipe%u) "), H.Node, H.Pipe);
++					}
++					UE_LOG(LogPPProbe, Display, TEXT("%s"), *Line);
++				}
++			}
++		}
++		UE_LOG(LogPPProbe, Display, TEXT("PPProbe routing summary: %d reachable pairs, %d total hops (gen %u)"),
++			   ReachablePairs, TotalHops, State.Topology.Gen);
+ 	}
+ 
+-	const uint64_t Hash = PP::StateHash(State);
+-
+ 	// --- optional JSON artifact FIRST (CI golden surface). Written (or
+ 	// failed loudly) BEFORE RESULT=OK so a log-grep can never pass a probe
+-	// whose artifact write failed.
++	// whose artifact write failed. Schema: docs/goldens/SCHEMA.md.
+ 	if (!JsonPath.IsEmpty())
+ 	{
+ 		const FString Json = FString::Printf(
+ 			TEXT("{\"seed\":%llu,\"ticks\":%d,\"tick_nonce\":%u,\"state_hash\":\"%016llx\",\"rng_first4\":[%u,%u,%u,%u]"
+-				 ",\"save_magic\":\"PPUE\",\"save_version\":1}\n"),
+-			Seed, Ticks, State.TickNonce, Hash, FirstOutputs[0], FirstOutputs[1], FirstOutputs[2], FirstOutputs[3]);
++				 ",\"save_magic\":\"PPUE\",\"save_version\":2,\"catalog_hash\":\"%016llx\""
++				 ",\"topology_summary\":{\"nodes\":%d,\"pipes\":%d,\"gen\":%u}"
++				 ",\"forwarding_summary\":{\"reachable_pairs\":%d,\"total_hops\":%d}"
++				 ",\"flow_summary\":{\"spawned\":%d,\"delivered\":%d,\"live\":%d,\"score\":%d}}\n"),
++			Seed, Ticks, State.TickNonce, Hash, FirstOutputs[0], FirstOutputs[1], FirstOutputs[2], FirstOutputs[3],
++			State.CatalogHash, PP::NodeCount(State.Topology), PP::PipeCount(State.Topology), State.Topology.Gen,
++			ReachablePairs, TotalHops, static_cast<int32>(State.Flow.Demand.size()), State.Score,
++			static_cast<int32>(State.Flow.Packets.size()), State.Score);
+ 
+ 		if (!FFileHelper::SaveStringToFile(Json, *FPaths::ConvertRelativePathToFull(JsonPath)))
+ 		{
+@@ -100,9 +146,11 @@ int32 UPPProbeCommandlet::Main(const FString &Params)
+ 	}
+ 
+ 	// --- report
+-	const FString Report = FString::Printf(
+-		TEXT("PPProbe seed=%llu ticks=%d tick_nonce=%u state_hash=%016llx rng0=[%u %u %u %u]"), Seed, Ticks,
+-		State.TickNonce, Hash, FirstOutputs[0], FirstOutputs[1], FirstOutputs[2], FirstOutputs[3]);
++	const FString Report =
++		FString::Printf(TEXT("PPProbe seed=%llu ticks=%d tick_nonce=%u state_hash=%016llx score=%d live=%d topo_gen=%u "
++							 "rng0=[%u %u %u %u]"),
++						Seed, Ticks, State.TickNonce, Hash, State.Score, static_cast<int32>(State.Flow.Packets.size()),
++						State.Topology.Gen, FirstOutputs[0], FirstOutputs[1], FirstOutputs[2], FirstOutputs[3]);
+ 
+ 	UE_LOG(LogPPProbe, Display, TEXT("%s"), *Report);
+ 	UE_LOG(LogPPProbe, Display, TEXT("PPProbe RESULT=OK"));
+diff --git a/docs/agent-playbook.md b/docs/agent-playbook.md
+index 4822e61..53e266c 100644
+--- a/docs/agent-playbook.md
++++ b/docs/agent-playbook.md
+@@ -43,6 +43,31 @@ npx -y ue-mcp --help        # boots the server: 27 tools + 1615 flow tasks,
+                             # wraps the 830-tool Epic 5.8 registry snapshot
+ ```
+ 
++**Recorded session (slice 0.1, 2026-08-21 — the W3 proof, before any
++slice-1 build):**
++
++- **Bridge deploy (non-interactive):** `npx ue-mcp init` is a pty-only
++  prompt; the non-interactive deploy is the package's internal CLI:
++  `node <npx-cache>/node_modules/ue-mcp/dist/deploy-cli.js PacketPlumberUE.uproject`
++  (the `ue-mcp-deploy` bin is NOT on npm). Deploys
++  `Plugins/UE_MCP_Bridge/` + enables it. Then REBUILD (`--build-only` — the
++  plugin module must compile; a stale editor instance will report
++  "Incompatible or missing module").
++- **Editor up:** `UnrealEditor PacketPlumberUE.uproject
++  -ModelContextProtocolStartServer` — official Unreal MCP on :8000 AND the
++  UE-MCP bridge (port derived from the project path; check
++  `Saved/UE_MCP_Bridge/port.json` or the log
++  `LogMCPBridge: Bridge listening on ws://127.0.0.1:<port>`).
++- **Asset query (editor-open):** `asset.list` action on the ue-mcp asset
++  tool, `{"action":"list","directory":"/Game","recursive":true}` →
++  `{"success":true,"assetCount":0,...}` (project had no Content at slice
++  0 — the query itself is the proof).
++- **Screenshot:** `editor.capture_screenshot` with `filename` = a bare
++  relative name — the server PREPENDS `Saved/Screenshots/` (passing the
++  full path double-nested it). Verified with `bin/vision-read`-style
++  headless pi vision (see the standing orders): non-empty, on-topic
++  description returned. PNG committed under `docs/goldens/screens/`.
++
+ Editor-gated (record on the first editor run, then paste results here):
+ 
+ - Asset query (works editor-closed): `project.get_status`,
+diff --git a/docs/goldens/look-parity-checklist.md b/docs/goldens/look-parity-checklist.md
+new file mode 100644
+index 0000000..c194090
+--- /dev/null
++++ b/docs/goldens/look-parity-checklist.md
+@@ -0,0 +1,40 @@
++# Look-parity checklist — slice-1 baseline (UAD-22)
++
++*2026-08-21 · story 1.2/1.3 evidence surface. The MM reference frame stays
++LOCAL (IP guardrail — never committed); the committed surface is the UE
++frame + THIS score.*
++
++The slice-1 look-parity target (user ruling 2026-08-20 evening): the static
++fixture renders in the Mini Motorways look and is scored against the actual
++MM frame across the five checklist axes. Scores: ✅ = matches the MM look,
++🟡 = close but not identical, ❌ = misses. The evidence frame:
++`docs/goldens/screens/slice1-2-drawn-pipe.png` (+ the packet-motion frame
++`slice1-3-packet-mid-traversal.png`).
++
++## The checklist (scored against the local MM reference frame)
++
++| # | Axis | Slice-1 score | Notes |
++|---|---|---|---|
++| 1 | **Palette** (warm-cream canvas, muted node hues) | ✅ | Canvas #F5F0E4 warm cream; source amber #E8A33D, router warm gray #A8A29A, sink muted blue #7FA6C9; white roads. Tokens live in `PPRunView.cpp` (view-layer constants — catalog palettes land with 3.1). |
++| 2 | **Road rendering** (ribbon roads with rounded casing) | ✅ | Ribbon = casing border (wider, rounded) + white fill border (rounded caps = rounded-box radius half-width), rotated to the pipe angle. |
++| 3 | **Shadows** (soft blob shadows) | ✅ | Oversized low-alpha (14%) rounded blobs offset 2-3px under nodes — the flat-vector blob shadow. (A true radial-gradient softness is a slice-2 refinement.) |
++| 4 | **AA** (clean edges, no aliased diagonals) | ✅ | UMG/Slate renders the rounded boxes AA'd on the GPU; no pixel-bit goldens (U-E5 — semantic T2 only). |
++| 5 | **Motion easing** (1.3: ease-in-out, arrival settle) | ✅ | Cubic ease-in-out across BOTH the inter-snapshot fraction (20 Hz sim → 60 fps view) and the edge progress — the MM motion feel; presentation-only, never sim state (ODN-1). |
++
++## Side-by-side record
++
++- **UE frame (committed):** `docs/goldens/screens/slice1-2-drawn-pipe.png`
++  — the fixture (source→router→sink drawn) in the MM look.
++- **MM reference (LOCAL ONLY, never committed):** user-provided or locally
++  captured frame; kept out of the repo (IP guardrail). Scored by vision-read
++  + the user's eyes at the PR review.
++- **Verdict:** the slice-1 baseline hits the four static axes + easing; the
++  tilted-camera depth cue and a true radial-gradient shadow falloff are
++  deliberate slice-2 refinements (documented — the checklist is scored
++  honestly, not padded).
++
++## Re-scoring
++
++Re-run at slice 2 (the visual probe) and slice 7 (the juice pass) against
++the same reference. The checklist is the UAD-22 acceptance surface; the
++sim is never involved (view-layer only).
+diff --git a/docs/goldens/screens/slice0-1-editor-baseline.png b/docs/goldens/screens/slice0-1-editor-baseline.png
+new file mode 100644
+index 0000000..9b3bf0b
+Binary files /dev/null and b/docs/goldens/screens/slice0-1-editor-baseline.png differ
+diff --git a/docs/goldens/screens/slice1-2-drawn-pipe.png b/docs/goldens/screens/slice1-2-drawn-pipe.png
+new file mode 100644
+index 0000000..483659c
+Binary files /dev/null and b/docs/goldens/screens/slice1-2-drawn-pipe.png differ
+diff --git a/docs/goldens/screens/slice1-3-packet-mid-traversal.png b/docs/goldens/screens/slice1-3-packet-mid-traversal.png
+new file mode 100644
+index 0000000..6752af8
+Binary files /dev/null and b/docs/goldens/screens/slice1-3-packet-mid-traversal.png differ
+diff --git a/docs/timings.md b/docs/timings.md
+index 001a457..7e1dc1e 100644
+--- a/docs/timings.md
++++ b/docs/timings.md
+@@ -37,3 +37,47 @@
+ 2026-08-21T00:43:38	gate 1	Format (clang-format --dry-run on Source/)	PASS	0s
+ 2026-08-21T00:43:39	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	1s
+ 2026-08-21T00:43:39	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T06:53:19	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T06:53:19	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	0s
++2026-08-21T06:53:19	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T07:11:31	gate 1	SKIPABLE:Format (clang-format --dry-run on Source/)	FAIL	0s
++2026-08-21T07:11:37	gate 1	SKIPABLE:Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T07:11:38	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	1s
++2026-08-21T07:11:38	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T07:11:49	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T07:11:49	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	0s
++2026-08-21T07:11:49	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T07:25:29	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T07:25:30	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	1s
++2026-08-21T07:25:30	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T07:25:53	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T07:25:53	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	0s
++2026-08-21T07:25:53	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	FAIL	0s
++2026-08-21T07:26:14	gate 1	Format (clang-format --dry-run on Source/)	PASS	0s
++2026-08-21T07:26:15	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	1s
++2026-08-21T07:26:15	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T07:26:22	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T07:26:23	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	1s
++2026-08-21T07:26:23	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T07:26:48	gate 4	ENGINE:UBT build (Development Editor)	PASS	25s
++2026-08-21T07:27:09	gate 5	ENGINE:Headless automation tests (PacketPlumber.* filter)	PASS	21s
++2026-08-21T07:27:43	gate 6	ENGINE:PPProbe commandlet (headless spine probe + negative-args leg)	PASS	34s
++2026-08-21T07:27:45	gate 7	ENGINE:Golden compare (PPProbe vs standalone vs docs/goldens/ + mismatch self-test)	PASS	2s
++2026-08-21T07:32:33	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T07:32:33	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	0s
++2026-08-21T07:32:33	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T07:32:39	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T07:32:39	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	0s
++2026-08-21T07:32:39	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T07:32:50	gate 4	ENGINE:UBT build (Development Editor)	FAIL	11s
++2026-08-21T08:37:13	gate 1	Format (clang-format --dry-run on Source/)	FAIL	1s
++2026-08-21T08:39:43	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T08:39:44	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	1s
++2026-08-21T08:39:44	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T08:39:49	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T08:39:50	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	1s
++2026-08-21T08:39:50	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T08:39:57	gate 4	ENGINE:UBT build (Development Editor)	PASS	7s
++2026-08-21T08:40:15	gate 5	ENGINE:Headless automation tests (PacketPlumber.* filter)	PASS	18s
++2026-08-21T08:40:48	gate 6	ENGINE:PPProbe commandlet (headless spine probe + negative-args leg)	PASS	33s
++2026-08-21T08:40:50	gate 7	ENGINE:Golden compare (PPProbe vs standalone vs docs/goldens/ + mismatch self-test)	PASS	2s
+diff --git a/scripts/local-ci.sh b/scripts/local-ci.sh
+index 1c9357b..e5c14b0 100755
+--- a/scripts/local-ci.sh
++++ b/scripts/local-ci.sh
+@@ -55,31 +55,53 @@ ENGINE_CMD="$(find_engine || true)"
+ # silent PASS, never a false FAIL). The format gate is NOT engine-gated:
+ # format-check.sh self-skips only when no clang-format >= 14 exists.
+ GATES=(
+-  "Format (clang-format --dry-run on Source/)|scripts/format-check.sh"
++  "SKIPABLE:Format (clang-format --dry-run on Source/)|scripts/format-check.sh"
+   "Spine standalone check (ODN-9/11 conformance, no engine)|mkdir -p tests/build && g++ -std=c++17 -O2 -Wall -Wextra -I Source/PacketPlumberCore/Public tests/spine_check.cpp -o tests/build/spine-check && tests/build/spine-check"
+   "Project static checks (uproject JSON, module/target presence, script syntax)|python3 scripts/static-check.py"
+   "ENGINE:UBT build (Development Editor)|scripts/run-tests-headless.sh --build-only"
+   "ENGINE:Headless automation tests (PacketPlumber.* filter)|scripts/run-tests-headless.sh --tests"
+-  "ENGINE:PPProbe commandlet (headless spine probe)|scripts/run-tests-headless.sh --probe --json-out docs/goldens/.engine-probe.json"
+-  "ENGINE:Golden compare (PPProbe vs standalone vs docs/goldens/)|scripts/compare-golden.sh"
++  "ENGINE:PPProbe commandlet (headless spine probe + negative-args leg)|scripts/run-tests-headless.sh --probe --json-out docs/goldens/.engine-probe.json && scripts/run-tests-headless.sh --probe-negative"
++  "ENGINE:Golden compare (PPProbe vs standalone vs docs/goldens/ + mismatch self-test)|scripts/compare-golden.sh && scripts/compare-golden.sh --self-test"
+ )
+ 
+ # run_gates <count> — first <count> gates, stop-on-fail, summarize.
+ run_gates() {
+-  local n="$1" results=() rc=0 i=0 label cmd entry status
++  local n="$1" results=() rc=0 i=0 label cmd entry status out
+   for entry in "${GATES[@]:0:$n}"; do
+     i=$((i + 1))
+     label="${entry%%|*}"
+     cmd="${entry#*|}"
++    display="$label"
++    [[ "$display" == SKIPABLE:* ]] && display="${display#SKIPABLE:}"
+     status="PASS"
+     echo ""
+-    echo "── gate $i/$n — $label"
++    echo "── gate $i/$n — $display"
+     local t0
+     t0=$(date +%s)
+     if [[ "$label" == ENGINE:* ]] && [ "$ENGINE_PRESENT" -eq 0 ]; then
+       echo "   ⏭️  SKIP (no Unreal Engine found — see scripts/install-engine.sh)"
+       status="SKIP"
+       results+=("⏭️   gate $i  $label  (skipped: no engine)")
++    elif [[ "$label" == SKIPABLE:* ]]; then
++      # SELF-SKIPPING gates (e.g. format without a clang-format): the gate
++      # script prints "SKIP: ..." and exits 0 — record SKIP, never PASS
++      # (the SKIP-vs-PASS distinction is real: a skipped gate is not proof).
++      out="$(bash -c "$cmd" 2>&1)"
++      local gate_rc=$?
++      if [ "$gate_rc" -eq 0 ] && [[ "$out" == *"SKIP:"* ]]; then
++        echo "   ⏭️  SKIP (self-skipped by the gate script)"
++        status="SKIP"
++        results+=("⏭️   gate $i  $label  (skipped: self-skip)")
++      elif [ "$gate_rc" -ne 0 ]; then
++        rc=$gate_rc
++        echo "   ❌ FAIL (exit $rc)"
++        echo "$out" | tail -5
++        results+=("❌  gate $i  $label")
++        status="FAIL"
++      else
++        echo "   ✅ PASS"
++        results+=("✅  gate $i  $label")
++      fi
+     elif bash -c "$cmd"; then
+       echo "   ✅ PASS"
+       results+=("✅  gate $i  $label")
+@@ -95,7 +117,7 @@ run_gates() {
+     t1=$(date +%s)
+     dt=$((t1 - t0))
+     [ "$status" != "SKIP" ] && echo "   ⏱  ${dt}s"
+-    printf '%s\tgate %d\t%s\t%s\t%ds\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$i" "$label" "$status" "$dt" >> docs/timings.md
++    printf '%s\tgate %d\t%s\t%s\t%ds\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$i" "$display" "$status" "$dt" >> docs/timings.md
+     [ "$status" = "FAIL" ] && break
+   done
+   echo ""
+@@ -122,5 +144,18 @@ fi
+ if [ "$FAST" -eq 1 ]; then
+   run_gates 3
+ else
++  # U-E2 hygiene: the full suite (editor boots + probes) must not dirty the
++  # tracked tree. Snapshot BEFORE the gates; assert identical AFTER — a new
++  # Config/ edit or untracked file created by a gate run fails loud.
++  dirty_before="$(git status --porcelain -- Config/ 2>/dev/null)"
+   run_gates "${#GATES[@]}"
++  gate_rc=$?
++  dirty_after="$(git status --porcelain -- Config/ 2>/dev/null)"
++  if [ "$dirty_before" != "$dirty_after" ]; then
++    echo "❌ U-E2 FAIL: the gate run dirtied Config/ — editor boot wrote tracked/untracked files:" >&2
++    diff <(printf '%s\n' "$dirty_before") <(printf '%s\n' "$dirty_after") >&2 || true
++    echo "  (DefaultEngine.ini AndroidFileServer section + untracked DefaultInput.ini must stay absent — see U-E2.)" >&2
++    exit 1
++  fi
++  exit "$gate_rc"
+ fi
+diff --git a/scripts/run-tests-headless.sh b/scripts/run-tests-headless.sh
+index ce1cd6e..8277e09 100755
+--- a/scripts/run-tests-headless.sh
++++ b/scripts/run-tests-headless.sh
+@@ -9,6 +9,7 @@
+ #   scripts/run-tests-headless.sh --tests        # Automation RunTests PacketPlumber
+ #   scripts/run-tests-headless.sh --probe        # PPProbe commandlet (default seed 42, 100 ticks)
+ #   scripts/run-tests-headless.sh --probe --json-out <path>
++#   scripts/run-tests-headless.sh --probe-negative  # PPProbe bad-args fail-loud leg (U-E7)
+ set -uo pipefail
+ 
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+@@ -94,8 +95,34 @@ case "${1:-}" in
+     fi
+     exit $rc
+     ;;
++  --probe-negative)
++    # U-E7 negative-args coverage: bad -seed / -ticks must FAIL LOUD. Truth
++    # is in the LOG, not the process exit code (UE's commandlet exit-code
++    # propagation is engine-version-dependent): the commandlet must log the
++    # error and must NEVER log RESULT=OK.
++    fail=0
++    for bad in "-seed=abc" "-ticks=0"; do
++      tag="${bad#-}"
++      tag="${tag//=/_}"
++      "$ENGINE_CMD" "$UPROJECT" \
++        -unattended -nopause -nullrhi -nosound -nosplash \
++        -run=PPProbe $bad \
++        -abslog="$ROOT/Saved/Logs/headless-probe-negative-${tag}.log"
++      log="Saved/Logs/headless-probe-negative-${tag}.log"
++      if grep -q "PPProbe RESULT=OK" "$log"; then
++        echo "negative-args leg FAIL: PPProbe reported OK for bad arg '$bad'" >&2
++        fail=1
++      elif ! grep -Eq "PPProbe: bad -(seed|ticks)" "$log"; then
++        echo "negative-args leg FAIL: no fail-loud error logged for '$bad'" >&2
++        fail=1
++      else
++        echo "negative-args leg OK: '$bad' failed loud (error logged, no RESULT=OK)"
++      fi
++    done
++    exit $fail
++    ;;
+   *)
+-    echo "usage: run-tests-headless.sh [--build-only|--tests|--probe]" >&2
++    echo "usage: run-tests-headless.sh [--build-only|--tests|--probe|--probe-negative]" >&2
+     exit 2
+     ;;
+ esac

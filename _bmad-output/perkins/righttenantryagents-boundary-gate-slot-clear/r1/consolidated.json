@@ -1,0 +1,133 @@
+{
+  "round": 1,
+  "round_kind": "full-review",
+  "reviewed_sha": "062c3fff63c8f70ee188bbde94b386d54acbe78f",
+  "head_sha_at_review": "062c3fff63c8f70ee188bbde94b386d54acbe78f",
+  "diff_source": "gh pr diff 174 --repo solarity-services/RightTenantryAgents (258 lines: tenant_scorer/agent.py +2 pop lines, tests/unit/test_gate_state_marshalling.py +stale_seed param +2 multi-attempt test classes)",
+  "spec": "briefings/perkins-righttenantryagents-boundary-gate-slot-clear-r1.md + righttenantryagents-boundary-gate-slot-clear.md (issue #172 residual, closed by #173)",
+  "reviewers_completed": ["blind", "edge", "acceptance", "security", "architecture", "codebase", "tests"],
+  "reviewers_total": 7,
+  "failed_layers_retries": {"edge": "first pane (w1T:pRD, deepseek-v4-flash) spun for 16+ min with no JSON output; closed + re-dispatched once (w1T:pRK) per the one-retry rule; retry succeeded with []"},
+  "failed_layers": [],
+  "total_findings": 11,
+  "verified_count": 8,
+  "rejected_count": 3,
+  "speculative_count": 0,
+
+  "verification_log": "Verified 8/11; rejected 3 (all blind) as false-positive/prompt-artifact: blind-W1 (recovery mechanism 'not visible' — CONFIRMED PRESENT at boundary_compliance_remediation.py:324-345; the cross-check + stamp read is real), blind-W2 ('wrong-key pop risk, maybe STATE_COMPLIANCE_REVIEW_VERDICT' — output_key='verification_compliance_review'==STATE_VERIFICATION_COMPLIANCE_REVIEW==popped key; _AGENT_REVIEW_KEY confirms; STATE_COMPLIANCE_REVIEW_VERDICT is the STAMP slot, a different thing), blind-N2 ('test bodies elided' — artifact of the blind prompt's [...] elision; the canonical diff.patch contains the full test bodies).",
+
+  "findings": [
+    {
+      "title": "Regression tests model an UNREACHABLE window: the clean verdict stamp derives from the SAME slot whose write the test claims is 'lost', so a clean stamp (passed=True) cannot co-occur with a lost slot write in production — the test hand-seeds the stamp",
+      "sources": ["codebase"],
+      "severity": "warning",
+      "category": "test-fidelity",
+      "location": "tests/unit/test_gate_state_marshalling.py:468-477 (_multi_attempt_judge_run_node attempt-1 branch) + :583-597 (final-gate mirror); tenant_scorer/callbacks/compliance_enforcement.py:376-386 (log_boundary_compliance_review), :293-364 (_emit_review_telemetry), :251-291 (_emit_failed_review_rollup), :215-247 (_read_review)",
+      "verification": "confirmed",
+      "evidence": "compliance_enforcement.py:376-386: 'review = _read_review(callback_context); if review is None: _emit_failed_review_rollup(callback_context); return None; _emit_review_telemetry(callback_context, review.value, review.review_key)'. :360-364 stamps 'passed=review.passed, parseable=True, violation_count=len(review.violations)' where review is the NON-None result of _read_review(callback_context.state[review_key]). :280-287 (_emit_failed_review_rollup) stamps 'passed=False, parseable=False'. test :472-477 hand-seeds 'live[STATE_COMPLIANCE_REVIEW_VERDICT] = {passed: True, violation_count: 0}' DIRECTLY in the attempt-1 branch, bypassing the real _read_review->passed derivation.",
+      "detail": "The clean stamp (passed=True) requires _read_review to return a parseable CLEAN review from the slot — i.e. the output_key WAS written — in which case the gate (reading ctx.session.state) ALSO sees it and returns, never reaching finalize. A lost write (slot empty/prior) yields a passed=False failed-rollup stamp. So the clean-stamp + lost-write combo the test models cannot occur via real telemetry; the test hand-seeds the stamp to manufacture it.",
+      "recommended_fix": "Keep the pop (correct hygiene). Re-scope the new comments + _multi_attempt_judge_run_node docstring to the real guarantee: 'the slot is authoritative per-attempt — a stale DIRTY review from a prior attempt can never survive into the next attempt's slot' (the comments' 'rescue a clean verdict from a lost write' narrative is unreachable). Optionally add a test that drives the REACHABLE window honestly (dirty/failed-rollup stamp on lost write) and asserts the honest fail-close path."
+    },
+    {
+      "title": "The `review is None` cross-check that makes this fix safe lives outside the diff — confirmed PRESENT and correct (resolves the blind lens's open question)",
+      "sources": ["blind"],
+      "severity": "note",
+      "category": "confirmed-present",
+      "location": "tenant_scorer/callbacks/boundary_compliance_remediation.py:324-345; tenant_scorer/callbacks/final_compliance_remediation.py:272-291",
+      "verification": "confirmed (blind could not see it; Perkins verified)",
+      "evidence": "boundary_compliance_remediation.py:323-345: 'raw = state.get(STATE_VERIFICATION_COMPLIANCE_REVIEW); review = ComplianceReviewResult.coerce(raw); if review is None: verdict = read_review_verdict(state, \"boundary\"); if verdict is not None and verdict.get(\"passed\") is True and verdict.get(\"violation_count\") == 0: ... return' (final gate mirror :272-291).",
+      "detail": "The safety property the pop relies on (a None review falls into the existing cross-check) is real and verified in both finalize guards. Not a defect — confirmation that the fix's premise holds.",
+      "recommended_fix": "None."
+    },
+    {
+      "title": "New comments frame the lost-write trigger as a 'state-prop failure' / state-view snapshot divergence that the acceptance lens could not reproduce on the pinned google-adk==2.2.0; the real, verified trigger is the output_key write-skip",
+      "sources": ["acceptance"],
+      "severity": "note",
+      "category": "doc-accuracy",
+      "location": "tenant_scorer/agent.py:584-596 (boundary comment) + :676-686 (final comment); tests/unit/test_gate_state_marshalling.py:63-77 (_DivergentCtx docstring)",
+      "verification": "confirmed (substance); out of scope to re-derive the #172 base mechanism",
+      "evidence": "agent.py:586-589: 'so a DIRTY review from an earlier attempt can survive a state-prop failure on a clean final attempt'. acceptance lens empirical harness on pinned ADK 2.2.0: the parent's ctx.state.get(<child output_key>) returns the child's write one call after run_node (Context._state wraps invocation_context.session.state live dict; append_event mutates in place). The write-skip trigger IS real + verified: LlmAgent._save_output returns without writing on no-text/empty-final-chunk (.venv/.../llm_agent.py:940-949); after_agent_callback fires every turn.",
+      "detail": "The output_key write-skip reachability is real (matches anonymizer.py:313 + pii_reviewer.py:248). The 'state-view snapshot divergence' framing repeated in this PR's new comments is the #173-era mechanism narrative; re-deriving #172's base premise is out of scope (do not re-open #173). The comments could name the write-skip mechanism but are consistent with the existing #173 comments.",
+      "recommended_fix": "Optional: tighten the new comments to name the output_key write-skip as the trigger (not state-view divergence). No code change."
+    },
+    {
+      "title": "Carry-forward (#173 r2): the cross-check authority stamp STATE_COMPLIANCE_REVIEW_VERDICT is absent from state_init._COMPLIANCE_REVIEW_KEYS entry-clearing — a reused InMemory session could carry a prior invocation's clean stamp",
+      "sources": ["security"],
+      "severity": "note",
+      "category": "state-hygiene",
+      "location": "tenant_scorer/callbacks/state_init.py:55-62, 236-238; tenant_scorer/constants.py:83",
+      "verification": "confirmed (carry-forward since #173 r2; pre-existing, not introduced by this delta)",
+      "evidence": "state_init.py:55-62 _COMPLIANCE_REVIEW_KEYS = (STATE_VERIFICATION_COMPLIANCE_REVIEW, STATE_FINAL_COMPLIANCE_REVIEW, STATE_COMPLIANCE_REPAIR_REQUEST, STATE_COMPLIANCE_REPAIR_RESULT, STATE_COMPLIANCE_REPAIR_META, STATE_COMPLIANCE_JUDGE_META) — STATE_COMPLIANCE_REVIEW_VERDICT NOT in the tuple. :236 clears each to ''. constants.py:83 STATE_COMPLIANCE_REVIEW_VERDICT='temp:compliance_review_verdict'.",
+      "detail": "Same as #173 r2's stamp-slot note. Production (Vertex/Database) is safe — ADK trims temp: keys from persisted deltas. InMemorySessionService (tests/dev) reuses the session dict, so a prior invocation's clean stamp could theoretically survive. Defense-in-depth only; not introduced by this PR.",
+      "recommended_fix": "Add STATE_COMPLIANCE_REVIEW_VERDICT to _COMPLIANCE_REVIEW_KEYS in state_init.py (independent follow-up)."
+    },
+    {
+      "title": "Gate asymmetry verified CORRECT: STATE_FINAL_OUTPUT is rightly NOT popped (the reviewer auto-passes on empty input); both pops target the key their finalize reads",
+      "sources": ["architecture"],
+      "severity": "note",
+      "category": "positive-confirmation",
+      "location": "tenant_scorer/agent.py:596, 686",
+      "verification": "confirmed (Perkins independent)",
+      "evidence": "agent.py:596 ctx.session.state.pop(STATE_VERIFICATION_COMPLIANCE_REVIEW, None); :686 ctx.session.state.pop(STATE_FINAL_COMPLIANCE_REVIEW, None); :680-683 comment documents STATE_FINAL_OUTPUT is the scrubber-mutated payload (NOT popped). verification_compliance_judge.py:225 output_key='verification_compliance_review'; final_compliance_reviewer.py:241 output_key='final_compliance_review'; _AGENT_REVIEW_KEY maps match.",
+      "detail": "Lens-guard (1) holds from every angle: both gates pop the exact key their judge writes + their finalize reads. STATE_FINAL_OUTPUT correctly untouched.",
+      "recommended_fix": "None."
+    },
+    {
+      "title": "All FOUR re-judge loops now clear their per-iteration slot before re-judge — no other gate-loop re-judges without clearing (lens-guard 4)",
+      "sources": ["architecture"],
+      "severity": "note",
+      "category": "positive-confirmation",
+      "location": "tenant_scorer/agent.py:266 (inline branch), :596 (boundary), :686 (final); tenant_scorer/agents/pii_reviewer.py before-callback",
+      "verification": "confirmed (Perkins independent — grep of all ctx.run_node call sites)",
+      "evidence": "agent.py:264-266 inline branch: 'ctx.session.state[fb_key] = \"\"' before 'await ctx.run_node(judge)'. pii_reviewer.py before-callback clears STATE_PII_VIOLATIONS each pass (documented at pii_reviewer.py docstring 'Clearing the slot at the start of every pass'). boundary :596 + final :686 pop (this PR). The 4 ctx.run_node sites that are NOT re-judge loops (verifier :257, repair :414, doc-extractor :764, risk-scorer :813-814) don't write a review slot.",
+      "detail": "This PR brings the two compliance gates in line with the established clear-before-re-judge pattern the inline-branch + anonymizer loops already use. No loop re-judges without clearing.",
+      "recommended_fix": "None."
+    },
+    {
+      "title": "Briefing suite claim '11 integration' does not match the actual run — 34 passed + 15 xfailed (the 15 are model-access xfails); unit 2051 is exact",
+      "sources": ["codebase"],
+      "severity": "note",
+      "category": "suite-claim-nit",
+      "location": "tests/integration/ (21 files); briefings/perkins-righttenantryagents-boundary-gate-slot-clear-r1.md",
+      "verification": "confirmed (Perkins re-ran)",
+      "evidence": "uv run pytest tests/integration -q -> '34 passed, 15 xfailed, 16 warnings in 0.50s'. uv run pytest tests/unit -q -> '2051 passed, 10 warnings'. uv run ruff check . -> All checks passed!.",
+      "detail": "Green either way. The '11 integration' in the briefing is a file/approximation count, not a passing-test count. Unit (2051) + ruff claims exact and verified. Not a PR property — a briefing-accuracy nit.",
+      "recommended_fix": "None for the PR. Briefings could state '34 passed + 15 xfailed (model-access)' for precision."
+    },
+    {
+      "title": "Advisory test gate: PASS",
+      "sources": ["tests"],
+      "severity": "note",
+      "category": "coverage-gate",
+      "location": "tests/unit/test_gate_state_marshalling.py:510, :559 (new); :145, :292, :119, :236 (existing inverse + clean)",
+      "verification": "confirmed (Perkins ran the negative control independently)",
+      "evidence": "New tests drive the REAL _run_boundary_compliance_gate / _run_final_compliance_gate loops via _DivergentCtx (real scrub + real finalize + real cross-check; only judge state-writes + repair stubbed). NEGATIVE CONTROL (Perkins): neutralized BOTH pop lines in agent.py -> exactly the 2 new tests FAILED (stale dirty review reached finalize, fail-closed), 18 passed; restored -> 20/20 green. Inverse (genuinely-missing judge fail-close) + #173 single-attempt clean covered by existing tests. P0 0 gaps, P1 0 gaps, overall 100%.",
+      "detail": "Both per-attempt pops covered FULL by real-path tests; negative control empirically bites (not a #599-style mask).",
+      "recommended_fix": "None — gate passes. Optional: caplog-assert the clean_verdict_state_prop_failure warning to pin the cross-check mechanism positively (note: this is the modelled, not reachable, window — see codebase-W1)."
+    }
+  ],
+
+  "advisory_gate": {
+    "source": "tests",
+    "title": "Advisory test gate: PASS",
+    "detail": "20/20 in test_gate_state_marshalling.py (18 + 2 new); full unit 2051 passed; integration 34 passed + 15 xfailed; ruff clean. Negative control bites empirically. P0=100%, P1=100%, overall=100%."
+  },
+
+  "reviewer_agreement": [
+    "No formal multi-source finding survived (the 3 blind findings that touched the cross-check/reachability theme were rejected as false-positive/prompt-artifact). Three single-source findings form a THEMATIC cluster on 'comments/cross-check accuracy': codebase-W1 (warning — test models unreachable clean-stamp+lost-write window), acceptance-N1 (note — comment mechanism framing), blind-N1 (note — cross-check confirmed present). They are complementary, not duplicates, and are kept separate."
+  ],
+
+  "perkins_independent_checks": {
+    "both_gates_pop_right_key": "CONFIRMED: boundary pops STATE_VERIFICATION_COMPLIANCE_REVIEW (agent.py:596); final pops STATE_FINAL_COMPLIANCE_REVIEW (agent.py:686). output_key='verification_compliance_review' (verification_compliance_judge.py:225) == STATE_VERIFICATION_COMPLIANCE_REVIEW (constants.py:42); output_key='final_compliance_review' (final_compliance_reviewer.py:241) == STATE_FINAL_COMPLIANCE_REVIEW (constants.py:43). _AGENT_REVIEW_KEY (compliance_enforcement.py:77-80) maps both judges to the same keys the gates pop + the finalize guards read. STATE_FINAL_OUTPUT (the scrubber-mutated v4 payload) correctly NOT popped.",
+    "negative_control_bites": "CONFIRMED: neutralized BOTH pop lines (replaced with 'pass') in a temp copy -> uv run pytest TestBoundaryGateMultiAttemptStaleDirtySlot TestFinalGateMultiAttemptStaleDirtySlot -> 2 FAILED (stale dirty review reached finalize, fail-closed via the dirty-review path); restored -> 2 passed. The fix is load-bearing for the modelled scenario (not a #599 mask).",
+    "carry_forward_173_invariants": "CONFIRMED: (1) cross-check both directions — clean stamp + None review does NOT abort (test_none_review_with_clean_stamp_does_not_abort); genuinely-missing judge fail-closes (test_missing_judge_fail_closes_non_retryable). (2) state-view reads — all gate reads use ctx.session.state (agent.py:603,628,677,693,713). (3) W2 hardening — both finalize guards require 'verdict.get(\"passed\") is True AND verdict.get(\"violation_count\") == 0' (boundary:335-338, final:281-284); test_passed_true_with_violations_still_fail_closes green for both gates. (4) producer-path stamp tests green. No invariant regressed by the 2-line delta.",
+    "no_other_gate_loop_re_judges_without_clearing": "CONFIRMED: all 4 re-judge loops clear before re-judge — inline-branch ctx.session.state[fb_key]='' (agent.py:264-266); anonymizer loop via pii_reviewer before-callback (clears STATE_PII_VIOLATIONS each pass); boundary pop (agent.py:596, this PR); final pop (agent.py:686, this PR). The other ctx.run_node sites (verifier :257, repair :414, doc-extractor :764, risk-scorer :813-814) are not re-judge loops.",
+    "reachability_claim": "PARTIALLY CONFIRMED / OVERTAKEN: the ADK output_key write-skip is REAL and verified in-codebase (anonymizer.py:307 'ADK does NOT write output_key' on schema-fail; pii_reviewer.py before-callback docstring on tool-call-only; LlmAgent._save_output no-text/empty-chunk path). after_agent_callback fires every turn. BUT the relevant 'CLEAN stamp + lost slot write' window is UNREACHABLE: the stamp's passed=review.passed is derived from _read_review(slot) (compliance_enforcement.py:360-364); a lost write yields a passed=False failed-rollup stamp (_emit_failed_review_rollup:280-287), never a clean one. So the fix does not 'rescue a clean verdict from a lost write' as the comments claim — it is correct PER-ATTEMPT-HYGIENE (slot authoritative; stale dirty review can't survive) and ships regardless. See codebase-W1.",
+    "suite_claims": "CONFIRMED: uv run pytest tests/unit -q -> '2051 passed, 10 warnings in 11.44s'. uv run ruff check . -> All checks passed!. uv run pytest tests/integration -q -> '34 passed, 15 xfailed, 16 warnings' (briefing's '11 integration' is a file/approx count, not passing-test count — see codebase-N1). uv run pytest tests/unit/test_gate_state_marshalling.py -q -> 20 passed (18 + 2 new).",
+    "worktree_clean_post_checks": "CONFIRMED: git status --porcelain empty; git rev-parse HEAD == 062c3ff after all verification (negative-control temp edit restored)."
+  },
+
+  "verdict": "READY TO MERGE",
+  "verdict_reason": "0 blockers. The 2-line fix is correct per-attempt slot hygiene: both gates pop the exact key their judge writes + their finalize reads (STATE_VERIFICATION_COMPLIANCE_REVIEW / STATE_FINAL_COMPLIANCE_REVIEW; STATE_FINAL_OUTPUT correctly untouched), bringing the two compliance gates in line with the established clear-before-re-judge pattern the inline-branch + anonymizer loops already use. All #173 invariants hold (cross-check both directions, ctx.session.state reads, W2 passed AND violation_count==0 hardening, producer-path tests). The regression test drives the REAL gate loops through the production state-view divergence and the negative control empirically BITES (neutralized pops -> 2 new tests fail). The one WARNING (codebase-W1) is non-blocking doc/test-fidelity: the test models an UNREACHABLE window (the clean verdict stamp derives from the same slot via _read_review, so a clean stamp cannot co-occur with a lost write; the test hand-seeds the stamp) and the comments over-claim a 'rescue a clean verdict' harm that cannot occur — the fix is correct hygiene regardless (briefing: 'ship it either way'). 4 notes are carry-forward (#173 r2 stamp-slot hygiene), positive confirmations (asymmetry correct, all loops clear), doc-accuracy (mechanism framing), and a briefing suite-count nit. Approve.",
+  "review_event": "approve"
+}

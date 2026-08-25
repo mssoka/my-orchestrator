@@ -1,0 +1,92 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "demo-data",
+    "title": "still present since round 3: send_reminder / remind_applicant / send_bulk_invite mutate nothing and return canned counts that contradict the seeded awaiting list",
+    "location": "client/src/demo/demo_store.gleam:1396-1422; client/src/demo/demo_api.gleam:116,128,140",
+    "evidence": "demo_store.gleam: pub fn remind_applicant(\n  store: DemoStore,\n  _vacancy_id: String,\n) -> #(DemoStore, #(Int, Int)) {\n  #(store, #(1, 0))\n}\n\npub fn send_reminder(\n  store: DemoStore,\n  _vacancy_id: String,\n) -> #(DemoStore, #(Int, Int)) {\n  #(store, #(2, 1))\n}\n\npub fn send_bulk_invite(\n  store: DemoStore,\n  _vacancy_id: String,\n) -> #(DemoStore, BulkInviteResult) {\n  #(\n    store,\n    BulkInviteResult(\n      sent: 2,\n      invalid: 1,\n      invalid_emails: [\"bad@example.ie\"],\n      trimmed: 0,\n    ),\n  )\n}  // demo_api.gleam:116,128,140 each: 'let _ = next'",
+    "detail": "Bulk-invite ignores the typed emails and returns a canned 'bad@example.ie'; reminders return hardcoded counts and discard the store. The demo teaches an outcome that never happened.",
+    "recommended_fix": "Parse the submitted emails, compute the result from actual input, and thread the mutated store (or drop the fake mutation)."
+  },
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "error-channel",
+    "title": "still present since round 3: Vacancy/status mutations return Ok unconditionally - nonexistent ids report success; the Result error channel is dead",
+    "location": "client/src/demo/demo_store.gleam:1245,1259,1273,1345",
+    "evidence": "demo_store.gleam:1245 (archive_vacancy), :1259 (restore_vacancy), :1273 (close_vacancy): '#(DemoStore(..store, vacancies: updated), Ok(vacancy_id))'; demo_store.gleam:1345 (change_status): '#(DemoStore(..store, vacancies: updated), Ok(slug))'",
+    "detail": "The list.map no-ops when no id matches yet Ok is returned; callers cannot distinguish a miss from a mutation. Four mutation fns share the shape.",
+    "recommended_fix": "Check the match after the map and return Error on miss, or drop the Result and simplify the call chain."
+  },
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "demo-data",
+    "title": "still present since round 3: mark_opened doc claims an idempotent Submitted->UnderReview transition but applies it to any status",
+    "location": "client/src/demo/demo_store.gleam:1276-1291",
+    "evidence": "/// POST /open - idempotently moves a Submitted application to UnderReview\n/// and returns the post-transition status slug.\npub fn mark_opened(\n  store: DemoStore,\n  vacancy_id: String,\n  application_id: String,\n) -> #(DemoStore, Result(String, Nil)) {\n  change_status(\n    store,\n    vacancy_id,\n    application_id,\n    \"under_review\",\n    \"status_auto_changed\",\n  )\n}",
+    "detail": "The store-side transition has no status guard; change_status overwrites whatever status the application has. Idempotency rests entirely on the dispatch-layer open_dispatched set.",
+    "recommended_fix": "Transition only when the current status is Submitted; otherwise leave the store unchanged."
+  },
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "id-uniqueness",
+    "title": "still present since round 3: create_vacancy derives the id from an 8-char-truncated name slug with no uniqueness check",
+    "location": "client/src/demo/demo_store.gleam:1124-1125,1674-1686",
+    "evidence": "let suffix = id_suffix(payload.property_name)\n  let id = \"v-demo-\" <> suffix  // id_suffix: 'case string.length(cleaned) {\n    n if n <= 8 -> cleaned\n    n -> string.drop_end(cleaned, n - 8)\n  }' (no uniqueness check anywhere in create_vacancy)",
+    "detail": "Two demo-created vacancies whose property names share an 8-char cleaned prefix get the same id; the second silently shadows the first in store lookups.",
+    "recommended_fix": "Append a disambiguator (sequence or count) or extend the suffix until unique."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "latent",
+    "title": "still present since round 3: fetch_leaderboard_page ignores its page parameter",
+    "location": "client/src/demo/demo_api.gleam:217-227",
+    "evidence": "pub fn fetch_leaderboard_page(\n  store: DemoStore,\n  vacancy_id: String,\n  _page: Int,\n  on_response: fn(Result(LeaderboardResponse, ApiError)) -> msg,\n) -> Effect(msg) {\n  case demo_store.leaderboard(store, vacancy_id) {",
+    "detail": "Latent today (load-more hidden in demo) but the parameter is discarded; the full leaderboard returns for every page.",
+    "recommended_fix": "Slice by page or drop the parameter."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "toast-ids",
+    "title": "still present since round 3: demo_not_in_demo_toast diverges from add_toast's id convention - ids can collide and one timeout dismisses both",
+    "location": "client/src/demo/demo_update.gleam:634-651",
+    "evidence": "demo_update.gleam:638: 'let toast_id = model.next_toast_id + 1' ... 'next_toast_id: toast_id'; client.gleam add_toast:7115 uses 'let id = model.next_toast_id' then 'next_toast_id: id + 1'",
+    "detail": "The demo toast helper allocates ids outside add_toast's scheme and skips the 5-toast cap; divergent conventions can collide ids.",
+    "recommended_fix": "Reuse add_toast's id allocation (or call add_toast with ToastInfo)."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "duplication",
+    "title": "still present since round 3 (store_of half fixed): download_timeout still duplicated between client.gleam and demo_update.gleam with divergent signatures",
+    "location": "client/src/demo/demo_update.gleam:838-845; client/src/client.gleam:6890-6897",
+    "evidence": "demo_update.gleam: 'fn download_timeout(id: String) -> Effect(Msg) {\n  effect.from(fn(dispatch) {\n    global.set_timeout(90_000, fn() {'; client.gleam: 'fn download_timeout(analysis_id: String, delay_ms: Int) -> Effect(Msg) {\n  effect.from(fn(dispatch) {\n    global.set_timeout(delay_ms, fn() {'  (client.gleam:5919 demo_store_of now delegates to demo_update.store_of - that half is fixed)",
+    "detail": "The store_of duplicate was deduplicated (client.gleam:5919 delegates), but the two download_timeout variants persist and still diverge in signature.",
+    "recommended_fix": "Lift download_timeout to the shared demo helper module with one signature."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "still present since round 3: zero-caller export demo_store.notifications shipped",
+    "location": "client/src/demo/demo_store.gleam:1521-1523",
+    "evidence": "pub fn notifications(store: DemoStore) -> List(Notification) {\n  store.notifications\n}  (grep 'demo_store.notifications\\b' over client/src + client/test, excluding notifications_unread: zero hits)",
+    "detail": "Export with no callers; dead surface in the demo store.",
+    "recommended_fix": "Delete or wire it."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "demo-data",
+    "title": "still present since round 3: status_from_slug silently coerces any unknown status slug to Submitted",
+    "location": "client/src/demo/demo_store.gleam:190",
+    "evidence": "    \"approved\" -> Approved\n    \"rejected\" -> Rejected\n    _ -> Submitted",
+    "detail": "Typos in demo action wires silently land as Submitted rather than failing loudly.",
+    "recommended_fix": "Return a Result or panic on unknown slugs in the demo store."
+  }
+]

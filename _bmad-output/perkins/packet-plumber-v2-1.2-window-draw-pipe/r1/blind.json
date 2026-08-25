@@ -1,0 +1,112 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "claim-vs-code",
+    "title": "Drag ghost shows green (would-validate) even when no snap target exists",
+    "location": "app/render/view.odin (draw_ghost); app/main.odin (handle_input else branch)",
+    "evidence": "+// draw_ghost — the drag preview: a line from the source node to the cursor,\n+// green when the in-progress draw would validate, red when it would reject.\ndraw_ghost :: proc(v: ^View, topo: ^Topology, drag: Drag_State) {\n...\n+\tcol := p.ghost_ok\n+\tif drag.valid != .None {\n+\t\tcol = p.ghost_bad\n+\t}\n...\n+\t\t} else {\n+\t\t\tapp.drag_to = 0\n+\t\t\tapp.drag.valid = .None\n+\t\t\tapp.drag.cost = 0\n+\t\t}",
+    "detail": "valid == .None doubles as 'legal target' and 'no target' (drag_to == 0). Dragging over empty space or back over the source renders the green ghost_ok line although nothing would validate — the comment's promise is false mid-drag.",
+    "recommended_fix": "Introduce a distinct untargeted state; keep .None only for snapped-legal, and color the ghost neutral/gray until a target snaps."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "no-op",
+    "title": "Fiber 'glowing inner core' draws with the same color as the pipe — no glow; palette.json's pipe_core is never read",
+    "location": "app/render/view.odin (draw_pipes, tier_pipe_color); app/render/palette.odin; data/palette.json",
+    "evidence": "+\t\t// the glowing inner core on fiber (the modernization read, A4)\n+\t\tif v.catalogs.pipe_tiers[topo.pipe_tier[i]].id == \"wide\" {\n+\t\t\trl.DrawLineEx(a, b, width * 0.45, v.palette.pipe_fiber)\n+\t\t}\n...\n+\tswitch v.catalogs.pipe_tiers[tier].id {\n+\tcase \"narrow\": return v.palette.pipe_copper\n+\tcase \"standard\": return v.palette.pipe_steel\n+\tcase \"wide\": return v.palette.pipe_fiber\n+\t}\n...\n+  \"pipe_core\":     [122, 168, 230, 255],",
+    "detail": "tier_pipe_color maps wide→pipe_fiber, so the inner 0.45-width line has the identical color to the outer line: visually a no-op. data/palette.json defines a distinct pipe_core glow color that the Palette struct and palette_load never read.",
+    "recommended_fix": "Add pipe_core to the Palette struct and palette_load (jcol default {122,168,230,255}) and draw the inner core with v.palette.pipe_core."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "validation-gap",
+    "title": "Catalog cross-check omits content_host, yet all three seed_fixture copies spawn it ignoring the lookup's ok",
+    "location": "core/catalog.odin (catalogs_load); harness/catalogs.odin (seed_fixture); app/main.odin (seed_fixture)",
+    "evidence": "+\t// PROTO required content (fail-fast cross-checks)\n+\tif _, ok := node_type_index(cat, \"residential\"); !ok {\n+\t\treturn {\"node_types.json\", \"residential\", \"1.2 requires the residential type\"}\n+\t}\n+\tif _, ok := node_type_index(cat, \"router_basic\"); !ok {\n+\t\treturn {\"node_types.json\", \"router_basic\", \"1.2 requires the router_basic type\"}\n+\t}\n...\n+\thost_idx, _ := pp.node_type_index(cat, \"content_host\")\n+\th := pp.topology_spawn_node(&state.topology, host_idx, {32, 15}, cat)",
+    "detail": "A catalog missing content_host makes node_type_index return (0,false); the ignored ok spawns node_types[0] (residential) at the host position via topology_spawn_node's unchecked index. Deterministic but silently wrong; only the two enforced types are protected.",
+    "recommended_fix": "Require content_host in catalogs_load's cross-checks, and/or make seed_fixture propagate the ok and abort when a required type is missing."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "bug",
+    "title": "draw_text truncates UTF-8 runes to u8 — the em dash in the window title renders as a garbage byte",
+    "location": "app/main.odin (draw_text, main)",
+    "evidence": "+\tcbuf := make([dynamic]u8, 0, len(txt)+1, context.temp_allocator)\n+\tfor c in txt {\n+\t\tappend(&cbuf, u8(c))\n+\t}\n+\tappend(&cbuf, 0)\n+\trl.DrawText(cstring(raw_data(cbuf)), x, y, size, col)\n...\n+\ttitle := \"Packet Plumber — v2 story 1.2\"",
+    "detail": "for c in txt iterates runes; u8(c) keeps only the low byte, so the multi-byte em dash (U+2014) becomes one invalid byte. The HUD title, the app's first visible text, renders garbled.",
+    "recommended_fix": "Encode runes as UTF-8 (utf8_encode / core:utf8) before DrawText, or drop non-ASCII characters from the title."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "verification-gap",
+    "title": "W1 drift-check's six mutations never exercise the validation-failure class that step.odin's replay_error latch exists for",
+    "location": "harness/drift.odin (make_drift_mutations); core/step.odin (step)",
+    "evidence": "+\t// catalog_hash occupies bytes 17..24 (after magic4 + ver4 + seed8 + era1).\n+\tif len(src) > 24 {\n+\t\tappend(&out, mutated(src, \"catalog_hash\", proc(b: []u8) { b[17] ~= 0xFF }))\n+\t}\n+\t// logic_hz occupies bytes 25..28.\n+\tif len(src) > 28 {\n+\t\tappend(&out, mutated(src, \"logic_hz\", proc(b: []u8) { b[25] ~= 0x01 }))\n+\t}\n+\tif len(src) > 0 {\n+\t\tappend(&out, mutated(src, \"bad_magic\", proc(b: []u8) { b[0] ~= 0xFF }))\n+\t}\n+\tif len(src) > 4 {\n+\t\tappend(&out, mutated(src, \"bad_version\", proc(b: []u8) { b[4] = 99 }))\n+\t}\n+\t// unknown command tag (byte 41 = header 33 + apply_tick 8).\n+\tif len(src) > 41 {\n+\t\tappend(&out, mutated(src, \"bad_tag\", proc(b: []u8) { b[41] = 0xFF }))\n+\t}\n+\t// truncation — drop the last byte.\n...\n+\t\t_, err := topology_apply_edit(&state.topology, cmd, cat)\n+\t\tif err != .None {\n+\t\t\t// a replayed command that fails validation is a CRITICAL divergence\n+\t\t\t// (the log stores post-validation truth — this should never happen\n+\t\t\t// for a honestly-recorded log). Latch + let the gate reject.\n+\t\t\tstate.replay_error = true\n+\t\t}",
+    "detail": "All six mutations fail at parse/header level inside log_read. None produces a header-valid, parse-valid log whose command fails topology validation (unknown/dead node id, self-loop, over-span) — precisely the class step.odin's replay_error latch detects. That latch path is never tested.",
+    "recommended_fix": "Add a seventh mutation that flips a command payload field (e.g. a node id) so the log parses but fails validate_draw, and assert the gate rejects it."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "artifact",
+    "title": "diff.patch is truncated — it ends mid-hunk inside run_replay, so the tail of replay_hashes is not reviewable",
+    "location": "harness/run.odin (final hunk, file end)",
+    "evidence": "@@ -225,7 +235,7 @@ run_replay :: proc(demo_name, lpath: string) -> i32 {\n \t}\n \tfails := make([dynamic]string, context.temp_allocator)\n \tdefer delete(fails)\n-\treplayed, ok := replay_hashes(lpath, &catalogs, u64(man.ticks), &fails)\n+\treplayed, ok := replay_hashes(lpath, cat, u64(man.ticks), &fails)\n \tdefer delete(replayed)\n \tif !ok {\n \t\tfor f in fails {",
+    "detail": "The patch ends at this line — the remainder of run_replay, and replay_hashes's post-loop return (including whether a latched replay_error forces ok=false), is absent. The gate's rejection semantics cannot be fully verified from this diff.",
+    "recommended_fix": "Re-emit the complete patch; reviewers need replay_hashes's tail to confirm ok reflects a latched replay_error."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "missing-dependency",
+    "title": "CI invokes tools/harness.sh (run + drift-check) but no tools/* file appears in this diff",
+    "location": ".github/workflows/ci.yml (Golden harness / W1 steps)",
+    "evidence": "+      - name: Golden harness (T1 hashes + T2 software pixels + replay gate)\n+        run: tools/harness.sh run\n+\n+      # W1 carry-forward from #21: a deliberately-drifted action log must be\n+      # REJECTED by the replay gate — proven in CI, not just locally (the\n+      # #599-r2 / verification-gap lesson).\n+      - name: W1 drift-rejection negative test\n+        run: tools/harness.sh drift-check",
+    "detail": "The replaced 1.1 comment says this path was to 're-enable in story 1.2+', yet this diff adds no tools/harness.sh or rlsw build script. If the script is not already committed, CI fails at the golden-harness step; unverifiable under lens isolation.",
+    "recommended_fix": "Confirm tools/harness.sh and the rlsw shadow build script are committed with this story; otherwise include them in the PR."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "comment-vs-code",
+    "title": "Draw_Intent.tier comment promises a 'default standard' the parser never applies",
+    "location": "harness/demo.odin (Draw_Intent, parse_demo)",
+    "evidence": "+\tDraw_Intent :: struct {\n+\t\tat_ms: i64,\n+\t\ta:     u32, // fixture node id (0=residential, 1=router, 2=content_host)\n+\t\tb:     u32,\n+\t\ttier:  string, // pipe_tiers id (narrow/standard/wide); default \"standard\"\n+\t}\n...\n+\t\t\t// at <n>ms draw <from> <to> <tier>\n+\t\t\tif len(fields) < 6 || fields[2] != \"draw\" {\n+\t\t\t\treturn {}, fmt.tprintf(\"bad at-line (want: at <n>ms draw <from> <to> <tier>): %s\", line)\n+\t\t\t}",
+    "detail": "The parser requires all six fields and errors when the tier is absent — no defaulting exists anywhere. The doc comment describes behavior the code does not implement.",
+    "recommended_fix": "Either drop the 'default' claim from the comment, or default tier to 'standard' when the field is missing."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "App.res_id / rt_id / host_id are write-only — seeded but never read",
+    "location": "app/main.odin (App struct, main)",
+    "evidence": "+\tstd_tier:  u16, // the tier app draws (the workhorse 'standard')\n+\tres_id:    u32,\n+\trt_id:     u32,\n+\thost_id:   u32,\n...\n+\tapp.res_id, app.rt_id, app.host_id = seed_fixture(&app.state, &cat)",
+    "detail": "The three ids are assigned from seed_fixture and never referenced again anywhere in the new app/main.odin — input and rendering work from snap results, not these ids. Dead fields carrying fixture info the app ignores.",
+    "recommended_fix": "Remove the fields and discard the tuple (_, _, _ = seed_fixture(...)), or actually use them (e.g. seed the initial view)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "leak",
+    "title": "app/main.odin never calls run_destroy on its Run_State",
+    "location": "app/main.odin (main)",
+    "evidence": "+\tpp.run_init(&app.state, 42, cat.hash, cat.balance.logic_hz)\n...\n+\tdefer pp.catalogs_destroy(&cat)",
+    "detail": "run_init allocates the topology arrays, action_log and events; the app defers only catalogs_destroy. The Run_State buffers leak at window close (process exit reclaims them, so impact is cosmetic).",
+    "recommended_fix": "Add `defer pp.run_destroy(&app.state)` beside the catalogs_destroy defer."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "duplication",
+    "title": "load_catalogs is duplicated verbatim in app/main.odin and harness/catalogs.odin",
+    "location": "app/main.odin (load_catalogs); harness/catalogs.odin (load_catalogs)",
+    "evidence": "+load_catalogs :: proc(cat: ^pp.Catalogs) -> string {\n+\tsrc: pp.Catalog_Sources\n+\tnt, e1 := os.read_entire_file_from_path(\"data/node_types.json\", context.temp_allocator)\n+\tif e1 != nil {\n+\t\treturn fmt.tprintf(\"cannot read data/node_types.json: %v\", e1)\n+\t}\n+\tpt, e2 := os.read_entire_file_from_path(\"data/pipe_tiers.json\", context.temp_allocator)\n+\tif e2 != nil {\n+\t\treturn fmt.tprintf(\"cannot read data/pipe_tiers.json: %v\", e2)\n+\t}\n+\tbal, e3 := os.read_entire_file_from_path(\"data/balance.json\", context.temp_allocator)\n+\tif e3 != nil {\n+\t\treturn fmt.tprintf(\"cannot read data/balance.json: %v\", e3)\n+\t}\n+\tsrc.node_types = nt\n+\tsrc.pipe_tiers = pt\n+\tsrc.balance = bal\n+\tcerr := pp.catalogs_load(cat, &src)\n+\tif cerr.file != \"\" {\n+\t\treturn pp.catalog_error_string(cerr)\n+\t}\n+\treturn \"\"\n+}",
+    "detail": "Two byte-identical copies of the catalog-loading proc in two packages. When 1.3 adds packet/demand catalogs, one copy will be updated and the other missed, silently diverging app vs harness catalog hashes.",
+    "recommended_fix": "Share one implementation (core-owned bytes-to-Catalogs helper or a small shared package) instead of copying."
+  }
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "source": "architecture",
+    "severity": "blocker",
+    "category": "layering",
+    "title": "Ungated wheel policy reads overlay_on, which release builds can still set via the ungated D-key chain — wheel dead-zones over the invisible NOC panel in release",
+    "location": "app/main.odin:964 + app/input/mouse.odin:173 + app/main.odin:1704",
+    "evidence": "app/input/mouse.odin:173-174 (no PP_DEBUG gate anywhere in the key map):\n\t\tcase .D:\n\t\t\tappend(out, Intent(Toggle_Overlay{}))\n\napp/main.odin:961-967 (registration at :388 is also ungated; only the draw at :669 is gated):\n// effect_overlay — D: the v2-noc debug-surface toggle (the merged 5.7 + NOC\n// overlay; PP_DEBUG builds only — the toggle + the draw are compile-gated,\n// release builds carry nothing).\neffect_overlay :: proc(user: rawptr, ictx: ^inp.Input) {\n\tapp := cast(^App)user\n\tapp.overlay_on = !app.overlay_on\n}\n\napp/main.odin:1703-1705 (runs in every build):\n// every build.\neffect_zoom :: proc(user: rawptr, ictx: ^inp.Input, delta: f32, pos: rl.Vector2) {\n\tapp := cast(^App)user\n\t#partial switch rnd.camera_wheel_policy(app.overlay_on, app.input.panel_open, pos) {",
+    "detail": "Hoisting camera_wheel_policy out of the gate made release input routing depend on overlay_on — but effect_overlay's comment lies: the D toggle is ungated. Release: D sets overlay_on, camera_wheel_policy returns .Noc_Scroll over NOC_PANEL rect, effect_zoom's gated body compiles to a bare return — zoom silently dies over ~23% of the window.",
+    "recommended_fix": "Make the comment true: wrap the on_overlay registration (main.odin:388) or the .D mapping in `when #config(PP_DEBUG)`; or pass overlay_on=false in non-PP_DEBUG builds at the effect_zoom policy call."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "premature-complexity",
+    "title": "W7 same-window exclusion's correctness silently depends on terminal_spawn_interval_ticks (data, floor 1) exceeding the 5-tick frame cap — inert today, wrong when reachable",
+    "location": "app/main.odin:1646-1647",
+    "evidence": "app/main.odin:436-438:\n\t\t\tmax_steps := 5\n\t\t\tsteps := 0\n\t\t\tfor app.accum >= tick_seconds && steps < max_steps {\n\ndata/balance.json:7:\n  \"terminal_spawn_interval_ticks\": 80,\n\ncore/catalog.odin:841-842:\n\t\tif tsi < 1 || tms < 1 {\n\t\t\treturn {\"balance.json\", \"terminal_spawn_interval_ticks/terminal_min_sep_tiles\", \"must be >= 1 with all keys present (the growth cadence + the E31 packing floor)\"}\n\napp/main.odin:1646-1647:\n\twindow_lo := ids[n_spawns - 1]\n\twindow_hi := ids[0] + 1\n\ncore/step.odin:117-123 (each window applies BEFORE the next plans, so earlier same-frame siblings DID exist at plan time):\n\t\tif intent.spawn {\n\t\t\tgrowth_apply(state, intent, cat)\n\t\t\t...\n\t\t\tevent_emit(state, tick, EVENT_TAG_NODE_SPAWNED)",
+    "detail": "The feed's window is the frame slice; the core's window is one plan (interval 80 ticks vs 5-tick frame cap — one spawn per frame forever). At interval ≤5 the exclusion diverges from the core's real per-window classification, yielding false SEEDs/pullbacks. Unreachable generality plus an unstated data invariant, nothing asserts it.",
+    "recommended_fix": "Either drop the window params and the multi-event walk (assert n_spawns ≤ 1 via the interval>max_steps invariant), or document + runtime-assert the invariant the exclusion actually needs: terminal_spawn_interval_ticks > max frame steps."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "duplication",
+    "title": "N1 'ONE source' fit claim still false: the fit derivation lives in both view_compute (render) and camera_fit (main)",
+    "location": "app/render/view.odin:401 vs app/main.odin:1690",
+    "evidence": "app/render/view.odin:401-403 (inside view_compute):\n\tsx := f32(win_w) / v.world_w\n\tsy := f32(win_h) / v.world_h\n\tv.scale = min(sx, sy)\n\napp/main.odin:1688-1691:\n// camera_fit — the current camera-fit scale (min of the window/world ratios;\n// the same derivation view_compute + camera_update use — ONE source).\ncamera_fit :: proc(v: ^rnd.View) -> f32 {\n\treturn min(f32(v.win_w)/v.world_w, f32(v.win_h)/v.world_h)",
+    "detail": "The r2 N1 fix consolidated main.odin's three sites, but the same expression still exists in view_compute. If the fit rule ever changes (margins, letterboxing), the two must change in lockstep or zoom anchors and clamps drift from the rendered transform.",
+    "recommended_fix": "Move the fit helper into app/render (view.odin, e.g. view_fit(v)) so view_compute and main's camera math call one proc; then the ONE-source comment is true."
+  }
+]

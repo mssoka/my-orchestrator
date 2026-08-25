@@ -1,0 +1,62 @@
+[
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "No negative/validation-rejection scenario: the executor's error paths are happy-path-only covered",
+    "location": "harness/parity.odin:340-545 (build_scenarios, scenarios 1-11) vs app/input/exec.odin:254-262",
+    "evidence": "app/input/exec.odin:254-262 — \"if inp.drag_to != 0 && inp.drag.valid == .None {\n\t\tcmd := pp.Cmd_Draw_Pipe{a = inp.drag.from_node, b = inp.drag_to, tier = inp.tier}\n\t\tif _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {\n\t\t\tappend(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})\" and the equivalent gates in demolish_pipe/demolish_node/qos_apply_auto/set_lane_class (all else-branches set inp.last_reject/inp.reject_tick). grep 'last_reject|reject_tick|Edit_Error|validate_draw|validate_place|err ==' harness/parity.odin -> 0 matches: every scenario drives a valid interaction and every expected stream is a valid command; no scenario ever asserts a rejected edit (no terminal-to-terminal draw, occupied-tile placement, or invalid demolish).",
+    "detail": "All 11 scenarios are happy paths. A regression that logs an invalid command, or silently drops a rejection instead of surfacing the toast, passes CI. Validation exists at the Command stage but its input-layer plumbing is unpinned.",
+    "recommended_fix": "Add negative scenarios in parity.odin: a terminal-to-terminal draw and an occupied-tile placement asserting no log entry and last_reject/reject_tick set (the toast state)."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Pad B never driven: Cancel_Drag (brand-new executor branch, one of the round's review fixes) has zero coverage",
+    "location": "app/input/controller.odin:45-53; app/input/exec.odin:61-67; harness/parity.odin (pad scripts)",
+    "evidence": "app/input/controller.odin:45-53 — \"case .B:\n\t\t\tif inp.drag.active {\n\t\t\t\t// abandon the in-progress draw (the pad's escape hatch — see\n\t\t\t\t// Cancel_Drag)\n\t\t\t\tappend(out, Intent(Cancel_Drag{}))\n\t\t\t} else {\n\t\t\t\tappend(out, Intent(Cancel{}))\n\t\t\t}\" and app/input/exec.odin:61-66 — \"case Cancel_Drag:\n\t\t// pad B with a draw in progress: abandon it (no command — the draw was\n\t\t// never committed). The release-side swallow prevents a stray select.\n\t\tinp.drag.active = false\n\t\tinp.drag_to = 0\n\t\tinp.press_swallowed = true\". grep 'Pad_Button_Press{button = .B' harness/parity.odin -> 0 matches; the pad scripts drive only Dpad_Down, A, L_Bumper, R_Bumper (7/4/1/1 occurrences).",
+    "detail": "Cancel_Drag is new executor code — the pad's only escape from a stuck draw — and a listed review-swarm fix. A broken B (drag stranded, no cancel) would ship untested.",
+    "recommended_fix": "Add a pad scenario: A begins a draw, B aborts it, then A again — assert no command logged, drag cleared, and no stray release-select."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Right-click mouse edge transcriptions unpinned: right-while-placing (W3 quirk) and drag-interrupt never execute in a scenario",
+    "location": "app/input/mouse.odin:111-119; harness/parity.odin:527-536 (input_parity_right_click)",
+    "evidence": "app/input/mouse.odin:111-119 — \"if inp.placing >= 0 {\n\t\t\t// REVIEW FIX (blind-hunter W3): the OLD code's cancel block set\n\t\t\t// placing = -1 BEFORE the right branch, making the branch's\n\t\t\t// `if placing >= 0 { return }` dead code — a right-click while\n\t\t\t// placing cancelled placement AND then selected a pipe under the\n\t\t\t// cursor (the QoS path). Transcribed bug-for-bug...\n\t\t\tif !esc_cancelled {\n\t\t\t\tappend(out, Intent(Cancel{}))\n\t\t\t}\n\t\t\tappend(out, Intent(Right_Click{pos = right_press}))\". harness/parity.odin:527-536 — the right press is its own frame: \"evs(inp.Mouse_Press{pos = mid01, button = .Right}),\" after release already committed the draw (commit_draw clears drag), so parity_right_click_effect's \"was_dragging := ictx.drag.active\" (parity.odin:115) is always false and placing is always < 0 there.",
+    "detail": "Scenario 11 pins only the post-commit right-select. The W3-transcribed right-while-placing path (Cancel + Right_Click, a click-target behavior on the hard-blocker mouse surface) and the drag-interrupt swallow branch never execute.",
+    "recommended_fix": "Extend right_click: a variant with a right press while placing (assert placement cleared + pipe selected) and one with a right press mid-drag (assert swallow + no re-select)."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Demolish: node flavor, Delete key, and the same-frame executor gate (X mid-drag suppression) untested at the input layer",
+    "location": "app/input/exec.odin:134-145; harness/parity.odin:481-496 (input_parity_demolish)",
+    "evidence": "app/input/exec.odin:134-145 — \"case Demolish:\n\t\t// X/DEL: demolish the selected entity...\n\t\tif inp.placing < 0 && !inp.drag.active {\n\t\t\tif inp.sel_node >= 0 {\n\t\t\t\tdemolish_node(inp, u32(inp.sel_node))\n\t\t\t} else if inp.sel_pipe >= 0 {\n\t\t\t\tdemolish_pipe(inp, u32(inp.sel_pipe))\n\t\t\t}\n\t\t}\". harness/parity.odin:481-496 — the demolish scenario selects pipe 0 at mid01 and presses X only: \"evs(inp.Key_Press{key = .X})\", expected = \"{1, pp.Cmd_Demolish_Pipe{pipe = 0}}\". Keys driven across all scenarios: .E, .Esc, .One, .X only — no .Delete, no .Two, no .S, no .B.",
+    "detail": "The Demolish intent is pinned for the pipe flavor only; demolish_node, the Delete key, and the same-frame gate (a press starting a drag must suppress same-frame X) are transcription-unpinned.",
+    "recommended_fix": "Add a junction demolish scenario (select router, X -> Cmd_Demolish_Node) and a same-frame press+X case asserting the demolish is suppressed."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Toggle_Pause (P/Space/Start) and Retry (R/Enter, pad A at Game_Over) never driven; Game_Over unreachable in the parity fixture",
+    "location": "app/input/exec.odin:35-38; harness/parity.odin:139-158 (drive_parity setup)",
+    "evidence": "app/input/exec.odin:35-39 — \"case Retry:\n\t\tif inp.on_retry != nil { inp.on_retry(inp.user, inp) }\n\tcase Toggle_Pause:\n\t\t// 5.3: the pause toggle — the executor flips the mode...\n\t\tinp.mode = .Paused if inp.mode == .Run else .Run\". drive_parity (harness/parity.odin:139-158) sets \"ictx.mode = .Run\" and steps only PARITY_TICKS 12 ticks of a seed-42 fixture with no health pressure — Game_Over is unreachable. Keys driven across all scenarios: .E, .Esc, .One, .X only; pad buttons: Dpad_Down, A, L_Bumper, R_Bumper only (no .Start, no .B). Existing demos (harness/demo.odin) lower Draw_Intent directly to the action log — they do not exercise the input layer either.",
+    "detail": "The pause and retry transcriptions (mode flip, Game_Over gate in mouse_map/controller_map) could regress silently: no test drives P/Space/Start, R/Enter, or pad A at Game_Over through the intent layer.",
+    "recommended_fix": "Add two scenarios: dispatch P then P (assert mode toggles) and dispatch R with ictx.mode = .Game_Over (assert a Retry intent reaches on_retry)."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "Local execution of the reviewed tree: `odin build harness` (ODIN_ROOT=raylib-sw shadow) then `./bin/harness input-parity` -> \"PASS input-parity   11 scenario(s) green — mouse == touch == controller (ODN-12 / FORGE #6)\", exit 0. goldens/input_parity_draw.t1 + draw_wide.t1 carry catalog_hash 8f94df8eb817dddb — identical to the whole existing golden family; check_manifest (harness/manifest.odin:117-129) compares per-tick FNV-1a-64 hashes and fails on any divergence, so the two blessed mouse-baseline pins are live, not re-blessed placeholders (the rebase re-bless tracks the #55 catalog-hash fold: state_hash serializes state.catalog_hash, core/serialize.odin:79). Coverage census of the intent layer (24 grouped behaviors): FULL 8 (Select_Tier, Arm_Placement, Begin_Draw, Drag_Release, Cycle_Class, Pan, cross-device equality, golden pins), PARTIAL 11 (Cancel, Cursor_Move, Place_Release, Select, Demolish, Set_Class, Set_Lane, Cycle_Tier, Node_Select, Confirm, Right_Click), NONE 5 (Retry, Toggle_Pause, Cancel_Drag, validation rejection, mouse chord/ESC+right combos).",
+    "detail": "P0 100% (critical happy paths, 11/11 green locally); P1 ~80% (rejection paths + mouse edge transcriptions untested); overall ~60-70% of the intent surface (8 FULL / 11 PARTIAL / 5 NONE of 24) — under 80%; several review fixes (Cancel_Drag, right-while-placing) unpinned.",
+    "recommended_fix": "Add negative scenarios (invalid draw/place -> no command + last_reject), pad-B cancel/abort, pause + Game_Over retry, right-while-placing, and same-frame executor-gate cases in harness/parity.odin; deliberately re-bless goldens after."
+  }
+]

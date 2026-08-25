@@ -1,0 +1,42 @@
+[
+  {
+    "source": "architecture-a",
+    "severity": "blocker",
+    "category": "boundary",
+    "title": "Three demo-reachable mutation paths bypass demo_api and hit the REAL api modules (bulk-reject x2, confirmed vacancy update)",
+    "location": "client/src/client.gleam:4841",
+    "evidence": "    UserClickedMarkAllRejected(vid) ->\n      case model.application_detail {\n        Success(detail) -> {\n          let ids =\n            sweep_nudge_banner.open_ids(detail.application, model.leaderboard)\n          case ids {\n            [] -> #(model, effect.none())\n            _ -> #(\n              Model(..model, bulk_reject_loading: True),\n              application_api.bulk_reject_applications(\n                vid,\n                ids,\n                \"sweep_nudge\",\n                model.csrf_token,\n                ApiReturnedBulkReject,\n              ),\n            )\n          }\n        }\n        _ -> #(model, effect.none())\n      }\n    UserClickedMarkSelectedRejected(vid) -> {\n      let ids = set.to_list(model.selected_for_rejection)\n      case ids {\n        [] -> #(model, effect.none())\n        _ -> #(\n          Model(..model, bulk_reject_loading: True),\n          application_api.bulk_reject_applications(\n            vid,\n            ids,\n            \"leaderboard_select\",\n            model.csrf_token,\n            ApiReturnedBulkReject,\n          ),\n        )\n      }\n    }",
+    "detail": "demo_update.handle does not intercept UserClickedMarkAllRejected/UserClickedMarkSelectedRejected/UserConfirmedVacancyUpdate (line 1831 calls vacancy_api.update_vacancy with no demo branch), so these fall through to update_inner and fire real HTTP writes with csrf \"demo-csrf-token\". demo_api.bulk_reject_applications/demo_store.bulk_reject exist but are never called. The CI lint only greps client/src/demo/, so it cannot catch leaks from client.gleam. Reachable in demo: select mode (?mode=select) and editing The Maples (active, 8 applicants, tier-2 change → warning modal → confirm). Violates the 'demo issues no writes to real endpoints' pillar.",
+    "recommended_fix": "Intercept UserClickedMarkAllRejected/UserClickedMarkSelectedRejected in demo_update (wire demo_api.bulk_reject_applications, threading the returned store) and add a demo branch (or demo_update arm) for UserConfirmedVacancyUpdate."
+  },
+  {
+    "source": "architecture-a",
+    "severity": "blocker",
+    "category": "correctness",
+    "title": "Demo create/edit-vacancy and mark-opened discard the mutated store (`let _ = next`) — mutations silently lost",
+    "location": "client/src/client.gleam:5959",
+    "evidence": "  case model.demo_mode {\n    True -> {\n      let #(next, eff) =\n        demo_api.create_vacancy(\n          demo_store_of(model),\n          payload,\n          \"\",\n          ApiReturnedVacancyCreate,\n        )\n      let _ = next\n      eff\n    }\n    False ->",
+    "detail": "DemoStore is an immutable Gleam record; demo_api.create_vacancy/update_vacancy/mark_application_opened return #(next_store, eff) and all three client.gleam demo branches (5959, 6161, 6275, plus mark-opened at 2537) discard next_store. Consequences: creating a draft never appears on the demo dashboard; creating active navigates to /vacancies/v-demo-*/handoff whose get_detail against the stale store returns Error; edits refetch pre-edit data under a 'Vacancy updated.' toast; opening a Submitted application never transitions it to UnderReview. Breaks acceptance item 1 (create/edit clickable in demo). The #(DemoStore, Effect) return shape (unlike the real api's Effect-only) is what invited the misuse.",
+    "recommended_fix": "Set Model(..model, demo_store: Some(next)) in each of the four demo branches (submit_vacancy, both handle_vacancy_update sites, mark_application_opened), or route these submissions through demo_update which already threads the store correctly."
+  },
+  {
+    "source": "architecture-a",
+    "severity": "note",
+    "category": "coupling",
+    "title": "Duplicated store-fallback helper (demo_store_of in client.gleam, store_of in demo_update.gleam) silently re-seeds on invariant violation",
+    "location": "client/src/demo/demo_update.gleam:441",
+    "evidence": "fn store_of(model: Model) -> DemoStore {\n  case model.demo_store {\n    Some(store) -> store\n    None ->\n      // Unreachable while demo_mode is True (entry/reset always seed first);\n      // fall back to a fresh seed so the demo can never crash on a None.\n      case demo_store.seed() {\n        Ok(store) -> store\n        Error(_) -> demo_store.empty_store()\n      }\n  }\n}",
+    "detail": "Identical logic exists as demo_store_of in client.gleam. Two copies of an invariant-repair helper drift independently, and the silent re-seed would wipe a user's demo session rather than surfacing the broken invariant. DRY rule (2+ places) applies.",
+    "recommended_fix": "Export one helper from demo_store (or demo_api) and call it from both sites; consider logging on the None path so the invariant violation is visible."
+  },
+  {
+    "source": "architecture-a",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Demo mode still reads/writes the real app's localStorage (sweep-nudge dismissals, comparison ids)",
+    "location": "client/src/client.gleam:4878",
+    "evidence": "    UserDismissedSweepNudge(application_id) -> {\n      let updated_dismissed =\n        set.insert(model.dismissed_sweep_nudges, application_id)\n      save_dismissed_sweep_nudges(set.to_list(updated_dismissed))\n      #(\n        Model(..model, dismissed_sweep_nudges: updated_dismissed),\n        effect.none(),\n      )\n    }",
+    "detail": "demo_update does not intercept UserDismissedSweepNudge, so demo dismissals persist to rt_dismissed_sweep_nudges beyond refresh (harmless ids, but contradicts the pure in-memory claim). Similarly demo_entry_effects uses load_comparison_ids() for a /compare deep link, bleeding real comparison ids into the demo fetch, and navigation clears comparison ids via save_comparison_ids([]).",
+    "recommended_fix": "Intercept UserDismissedSweepNudge in demo_update (model-only, no save), and use [] instead of load_comparison_ids() in demo_entry_effects' Comparison branch."
+  }
+]

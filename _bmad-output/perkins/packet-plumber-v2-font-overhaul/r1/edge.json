@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "blocker",
+    "category": "error-path",
+    "title": "Fail-loud font guard is dead code: load failure returns rl.GetFontDefault() which passes rl.IsFontValid, so app + harness silently run on the raylib default",
+    "location": "app/render/view.odin:1432-1461 (font_from_glyphs/load_font_file); guards at app/main.odin:317, harness/goldens.odin:76",
+    "evidence": "app/render/view.odin:1432-1438 — `font_from_glyphs :: proc(glyphs: [^]rl.GlyphInfo, count: c.int, size: i32) -> rl.Font {\\n\\tf: rl.Font\\n\\tif glyphs == nil || count == 0 {\\n\\t\\treturn rl.GetFontDefault()\\n\\t}` (same at 1438 for `atlas.data == nil`). load_font_file:1456-1460 — `f := font_from_glyphs(glyphs, count, FONT_BASE_SIZE)\\n\\tif rl.IsFontValid(f) {\\n\\t\\treturn f\\n\\t}\\n\\treturn rl.GetFontDefault()`. app/main.odin:317 — `if !rl.IsFontValid(app.view.font) || !rl.IsFontValid(app.view.font_header) || !rl.IsFontValid(app.view.font_mono) { ... os.exit(2) }`. Vendored raylib tools/raylib-sw/src/src/rtext.c:593-599 — IsFontValid returns `((font.baseSize > 0) && (font.glyphCount > 0) && (font.recs != NULL) && (font.glyphs != NULL))`; LoadFontDefault (rtext.c:166 `defaultFont.glyphCount = 224`, :273-274 recs/glyphs CALLOC'd, :313 `defaultFont.baseSize = (int)defaultFont.recs[0].height`) is called from InitWindow (rcore.c:710), and every harness verb calls InitWindow BEFORE render_setup (harness/main.odin:246-248, 347-351; app/main.odin InitWindow ~241 before load_fonts ~311).",
+    "detail": "Missing/corrupt assets/fonts/*.ttf -> font_load_data returns nil -> font_from_glyphs returns GetFontDefault -> IsFontValid is true (default font fully initialized post-InitWindow) -> the refusal guards never fire -> silent raylib-default rendering/capture, the exact 'silent-fallback lie' lens-guard (c) requires be impossible.",
+    "recommended_fix": "Propagate failure instead of substituting: make load_font_file/font_from_glyphs return (Font, bool) with ok=false on nil glyphs/atlas (return zero Font{}, never GetFontDefault) so the main.odin:317 and goldens.odin:76 guards actually exit(2)."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "bounds",
+    "title": "glyph_probe indexes f.glyphs[i] by requested-codepoint index, but raylib compacts the glyph array — out-of-bounds read + garbage U+26A0 verdict on any font missing a probe codepoint",
+    "location": "harness/font_check.odin:53-72",
+    "evidence": "harness/font_check.odin — `n := build_probe_set(&cps)` (96 codepoints: ASCII 32-126 + 0x26A0), `f := rl.LoadFontEx(..., &cps[0], c.int(n))`, then `for i in 0..<n {\\n\\t\\tcp := cps[i]\\n\\t\\tg := f.glyphs[i]\\n\\t\\tpresent := g.advanceX > 0 || (g.image.width > 0 && g.image.height > 0)`. Vendored raylib tools/raylib-sw/src/src/rtext.c (LoadFontData): `for (int i = 0, index; i < codepointCount; i++) { index = stbtt_FindGlyphIndex(&fontInfo, requiredCodepoints[i]); if (index > 0) glyphCounter++; }` then `glyphs = (GlyphInfo *)RL_CALLOC(glyphCounter, sizeof(GlyphInfo));` and glyphs[k] filled only `if (index > 0)` — missing codepoints are skipped and the allocation is sized to the FOUND count.",
+    "detail": "For a candidate lacking any of the 96 probe codepoints — including the shipped IBM Plex Sans, which lacks U+26A0 per font_test.odin's negative control — glyphCount=95 and the loop reads f.glyphs[95], one element past the CALLOC'd block; the printed U+26A0 verdict uses out-of-bounds memory (present= can read true). A mid-range miss also shifts every later verdict line onto the wrong codepoint.",
+    "recommended_fix": "Look glyphs up by value, not index: scan f.glyphs[0..<f.glyphCount] matching .value == cps[i] (the pattern font_probe_warning in app/render/font_test.odin already uses) and print present=false when no entry matches."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "ordering",
+    "title": "noc_e2e TakeScreenshot reordered BEFORE rl.EndDrawing() in PP_DEBUG builds; added comment falsely claims the block runs after the flush",
+    "location": "app/main.odin:676-699",
+    "evidence": "app/main.odin — the noc_e2e block (lines 676-688: `when #config(PP_DEBUG, false) { if app.noc_e2e { switch app.noc_e2e_frame { case NOC_E2E_CAPTURE_ON: rl.TakeScreenshot(\"bin/noc-e2e-on.png\") ... if app.noc_e2e_frame >= NOC_E2E_EXIT { break } } } }`) now precedes the frame end (lines 691-698: `when #config(PP_DEBUG, false) { rl.EndDrawing()\\n\\t\\tif gallery_frame(&app) { break } } else { rl.EndDrawing() }`). The diff deleted the standalone `-\\t\\trl.EndDrawing()` that previously sat before this block. The new comment (672-675) claims `The frame's END is explicit below ... so this block runs after the flush in both.` — it runs BEFORE the flush. Upstream raylib 5.5 rcore.c TakeScreenshot (verified from the 5.5 tag): `unsigned char *imgData = rlReadScreenPixels(...)` with no rlDrawRenderBatchActive() flush; the vendored 6.0 fork's TakeScreenshot (tools/raylib-sw/src/src/rcore.c) likewise calls rlReadScreenPixels without flushing.",
+    "detail": "The pre-existing comment documents why capture must follow EndDrawing: 'a mid-frame TakeScreenshot can miss the unflushed rlgl batch on the GPU build'. The reorder reintroduces exactly that path — the on/off e2e captures can read the previously presented frame. The `break` at noc_e2e_frame >= NOC_E2E_EXIT now also exits the loop with the final frame's BeginDrawing never matched by EndDrawing.",
+    "recommended_fix": "Restore one EndDrawing before the noc_e2e capture block (or move the captures after the new end block) so PP_DEBUG builds flush before TakeScreenshot; fix the comment to match the actual order."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Gallery stage machine polls unbounded: Draw_Release/Select_Release/Noc/Deselect/Settings reset gallery.wait forever with no retry cap when a scripted event never lands",
+    "location": "app/gallery.odin (gallery_frame)",
+    "evidence": "app/gallery.odin — `case .Draw_Release:\\n\\t\\tif !pipe_live(app) {\\n\\t\\t\\tgallery.wait = 5 // the commit lands via the executor — poll\\n\\t\\t\\treturn false\\n\\t\\t}`; `case .Select_Release:\\n\\t\\tif app.input.sel_pipe < 0 {\\n\\t\\t\\tgallery.wait = 3\\n\\t\\t\\treturn false\\n\\t\\t}`; `case .Noc:\\n\\t\\tif !app.overlay_on || !app.stats_valid { ... gallery.wait = 5\\n\\t\\t\\treturn false\\n\\t\\t}`; `case .Deselect:\\n\\t\\tif app.input.sel_pipe >= 0 {\\n\\t\\t\\tgallery.wait = 5 ... return false\\n\\t\\t}`; `case .Settings:\\n\\t\\tif !app.input.panel_open {\\n\\t\\t\\tgallery.wait = 5\\n\\t\\t\\treturn false\\n\\t\\t}`. No branch increments a retry counter or bounds total wait.",
+    "detail": "If any scripted input misses (pipe never commits, midpoint click misses, overlay/stats never validate, ESC deselect never lands, settings never opens), the capture run spins indefinitely with no timeout or abort. PP_DEBUG tooling, so impact is a hung capture run, not shipped behavior.",
+    "recommended_fix": "Add a per-stage retry budget (e.g. poll_ticks > N -> eprintf + gallery.done=true / non-zero exit) so a failed script precondition terminates the run loudly instead of polling forever."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "resource-lifetime",
+    "title": "font_merge_fallback never frees the fallback font's glyph array block (fg) after copying it into the merged array",
+    "location": "app/render/view.odin:1411-1423 (font_merge_fallback)",
+    "evidence": "app/render/view.odin — `fg := rl.LoadFontData(raw_data(fdata), c.int(len(fdata)), size,\\n\\t\\traw_data(missing[:missing_n]), c.int(missing_n), .DEFAULT, &ng)` ... `for j in 0..<ng {\\n\\t\\tmerged[count + j] = fg[j]\\n\\t}\\n\\trl.MemFree(glyphs) // the block is free; the glyph image data lives on in merged\\n\\treturn merged, total`. Only the MAIN block (glyphs) is MemFree'd; the fg block (RL_CALLOC'd by LoadFontData) is never freed. Same on the early-exit paths: `if merged == nil { return glyphs, count }` leaks fg too.",
+    "detail": "The fallback merge runs on every launch (Plex lacks U+26A0, so missing_n>=1 for each of the 3 family loads), leaking missing_n * sizeof(GlyphInfo) per family — tiny and init-time only, but it contradicts the block's own ownership comment ('freed exactly once, by UnloadFont, via the merged array' covers image data, not the fg array block).",
+    "recommended_fix": "After copying fg[j] into merged, call rl.MemFree(fg) (the array block only — image data ownership moves with the copied structs to UnloadFont via the merged array)."
+  }
+]

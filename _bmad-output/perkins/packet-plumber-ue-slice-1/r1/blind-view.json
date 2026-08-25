@@ -1,0 +1,162 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "ordering",
+    "title": "Input actions created in BeginPlay but bound in SetupInputComponent, which runs earlier — binds null actions",
+    "location": "Source/PacketPlumber/PPRunPlayerController.cpp:18-50",
+    "evidence": "+void APPRunPlayerController::BeginPlay()\n+{\n+\tSuper::BeginPlay();\n+\n+\t// Build the runtime input assets (C++-first — no Blueprint assets).\n+\tDrawMappingContext = NewObject<UInputMappingContext>(this, TEXT(\"PP_DrawContext\"));\n+\tDrawStartAction = NewObject<UInputAction>(this, TEXT(\"PP_DrawStart\"));\n ... \n+\tif (UEnhancedInputComponent *EIC = Cast<UEnhancedInputComponent>(InputComponent))\n+\t{\n+\t\tEIC->BindAction(DrawStartAction, ETriggerEvent::Started, this, &APPRunPlayerController::OnDrawStart);",
+    "detail": "UE calls SetupInputComponent during controller initialization, before BeginPlay. DrawStartAction/DrawEndAction are null when BindAction runs, so mouse draw never binds (or ensures) in PIE.",
+    "recommended_fix": "Create the UInputActions in the constructor (or in SetupInputComponent before binding); keep only AddMappingContext in BeginPlay."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "contradiction",
+    "title": "Comment claims NativeTick re-fits the camera; NativeTick never recomputes FitScale/FitOffset",
+    "location": "Source/PacketPlumber/PPRunView.cpp:200-215",
+    "evidence": "+\t// ([FinLT] deferred-frame sizing) — fall back to the 1280x720 design\n+\t// reference; NativeTick re-fits once the real size lands.\n ... \n+\tFitScale = FMath::Min(ViewportSize.X / WorldW, ViewportSize.Y / WorldH);\n+\tFitOffset = FVector2D((ViewportSize.X - WorldW * FitScale) * 0.5f, (ViewportSize.Y - WorldH * FitScale) * 0.5f);\n ... \n+void UPPRunView::NativeTick(const FGeometry &MyGeometry, float InDeltaTime)\n+{\n+\tSuper::NativeTick(MyGeometry, InDeltaTime);\n+\tif (!GameMode || !WorldCanvas)\n+\t{\n+\t\treturn;\n+\t}",
+    "detail": "FitScale/FitOffset are computed only in RebuildWorld with the 1280x720 fallback. NativeTick contains no re-fit code, so any viewport other than the design size renders mis-scaled forever.",
+    "recommended_fix": "Recompute FitScale/FitOffset in NativeTick (or on geometry change) from MyGeometry.GetLocalSize(); drop the false comment."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "coupling",
+    "title": "Camera-fit mapping duplicated between command bus and view with different size sources — diverges under DPI",
+    "location": "Source/PacketPlumber/PPCommandBus.cpp:55-66",
+    "evidence": "+\tconst float Scale = FMath::Min(ViewportSize.X / WorldW, ViewportSize.Y / WorldH);\n ... \n+\t\tint32 VW = 1280, VH = 720;\n+\t\tPC->GetViewportSize(VW, VH);\n ... \n+\tconst FVector2D ViewportSize = GetCachedGeometry().GetLocalSize().IsNearlyZero()\n+\t\t\t\t\t\t\t\t   ? FVector2D(1280.0f, 720.0f)\n+\t\t\t\t\t\t\t\t   : GetCachedGeometry().GetLocalSize();\n ... \n+\t// screen mapping (camera-fit, shared with the command bus)\n ... \n+\t// invert the fit. (The view layer owns the same mapping for rendering.)",
+    "detail": "Input maps screen→grid from GetViewportSize pixels; rendering maps grid→screen from widget geometry (DPI-scaled Slate units, plus a 1280x720 fallback). Under DPI≠1 or fallback they disagree; drags land on wrong tiles.",
+    "recommended_fix": "Single-source the fit: one function computing scale/offset from one size source, used by both ScreenToGrid and GridToScreenV."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "logic",
+    "title": "bHasPrev cleared on topology change and never restored — snapshot interpolation permanently disabled after first draw",
+    "location": "Source/PacketPlumber/PPRunView.cpp:117-127",
+    "evidence": "+\tPacketDots.Reset();\n+\tPacketPrevPos.Reset();\n+\tbHasPrev = false;\n ... \n+\t\tif (bTopologyChanged)\n+\t\t{\n+\t\t\tClearWorld();\n+\t\t\tRefreshNodes();\n+\t\t\tRefreshPipes();\n+\t\t}\n ... \n+\tbHasPrev = true;",
+    "detail": "After the first drawn pipe, ClearWorld sets bHasPrev=false and nothing in the NativeTick path sets it true again (only RebuildWorld does); FromGrid then always uses CurSnapshot, so the promised prev/cur eased interpolation stops working.",
+    "recommended_fix": "Set bHasPrev = true after the topology rebuild in NativeTick — PrevSnapshot/CurSnapshot remain a valid interpolation pair there."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "contradiction",
+    "title": "Demand seeded every 10 ticks but comment and story 1.3 say every 20 ticks",
+    "location": "Source/PacketPlumber/PPRunGameMode.cpp:20-32",
+    "evidence": "+\t// packet every 20 ticks (1 s) source->sink once a path exists (1.3).\n ... \n+\tfor (uint64_t T = 10; T <= 100000; T += 10)\n+\t{\n+\t\tPP::FlowSeedDemand(SimState.Flow, T, PP::SCENARIO_SOURCE, PP::SCENARIO_SINK, 0);\n+\t}",
+    "detail": "The loop steps T by 10 (0.5 s at 20 Hz), contradicting the 20-tick (1 s) cadence stated in the same comment. Also hardcodes a 100000-tick demand horizon as a magic number.",
+    "recommended_fix": "Step by kLogicHz (20) or a named kDemandIntervalTicks constant; replace 100000 with a named bound matching the story."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "geometry",
+    "title": "Road borders rotated about widget origin (default pivot 0,0), not center — non-horizontal roads displace",
+    "location": "Source/PacketPlumber/PPRunView.cpp:150-170",
+    "evidence": "+\tUCanvasPanelSlot *CasingSlot = WorldCanvas->AddChildToCanvas(CasingBorder);\n+\tCasingSlot->SetPosition(Center - FVector2D((Width + 4.0f) * 0.5f, (Width + 4.0f) * 0.5f));\n+\tCasingSlot->SetSize(FVector2D(Length, Width + 4.0f));\n+\tFWidgetTransform CasingT;\n+\tCasingT.Angle = Angle;\n+\tCasingBorder->SetRenderTransform(CasingT);",
+    "detail": "RenderTransform rotates about RenderTransformPivot, default (0,0) top-left. The slot position centers the box pre-rotation; any non-zero angle swings the road off its segment. Masked only because the fixture nodes are collinear (y=2).",
+    "recommended_fix": "Call SetRenderTransformPivot(FVector2D(0.5f, 0.5f)) on both borders before SetRenderTransform."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "false-green",
+    "title": "U-E2 hygiene check can never see the gitignored DefaultInput.ini it explicitly names",
+    "location": "scripts/local-ci.sh:147-160",
+    "evidence": "+# U-E2: the editor boot writes this legacy-input boilerplate (Enhanced Input\n+# does not read it) — never tracked, never committed.\n+Config/DefaultInput.ini\n ... \n+  dirty_before=\"$(git status --porcelain -- Config/ 2>/dev/null)\"\n ... \n+    echo \"  (DefaultEngine.ini AndroidFileServer section + untracked DefaultInput.ini must stay absent — see U-E2.)\" >&2",
+    "detail": "git status --porcelain omits ignored files, and this same diff adds Config/DefaultInput.ini to .gitignore — exactly the file the failure message says must stay absent. That leg of the check is dead assurance.",
+    "recommended_fix": "Use git status --ignored (or test -e Config/DefaultInput.ini) so an editor-boot-written ignored file still fails loud."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Golden v2 schema, SCHEMA.md, compare-golden --self-test, and committed-golden re-bless all absent from this diff",
+    "location": "Source/PacketPlumberEditor/PPProbeCommandlet.cpp:1-11",
+    "evidence": "+\t// (topology/forwarding/flow summaries + catalog_hash — schema single-sourced\n+\t// in docs/goldens/SCHEMA.md).\n ... \n+\tPP::BuildProbeScenario(State, Seed); // the SAME builder every surface uses\n ... \n+  \"ENGINE:Golden compare (PPProbe vs standalone vs docs/goldens/ + mismatch self-test)|scripts/compare-golden.sh && scripts/compare-golden.sh --self-test\"",
+    "detail": "PPProbe now emits save_version 2 with new fields and gate 7 invokes compare-golden.sh --self-test, yet this diff contains no SCHEMA.md, no compare-golden.sh change, no committed-golden update, and no PP_Scenario.h definition.",
+    "recommended_fix": "Ship the schema doc, the self-test support, and the re-blessed committed golden (both surfaces) in the same change set."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "suspicious",
+    "title": "flow_summary 'delivered' and 'score' both emit State.Score",
+    "location": "Source/PacketPlumberEditor/PPProbeCommandlet.cpp:105-125",
+    "evidence": "+\t\t\t ,\"flow_summary\":{\"spawned\":%d,\"delivered\":%d,\"live\":%d,\"score\":%d}}\\n\"),\n ... \n+\t\t\tReachablePairs, TotalHops, static_cast<int32>(State.Flow.Demand.size()), State.Score,\n+\t\t\tstatic_cast<int32>(State.Flow.Packets.size()), State.Score);",
+    "detail": "Argument order maps State.Score into both 'delivered' and 'score'. If delivered is meant as a delivery counter it must come from Flow; as written the golden pins two always-identical fields.",
+    "recommended_fix": "Source 'delivered' from an actual delivery counter (e.g. State.Flow.Delivered) or drop the duplicate field."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "LastEditError/bHasLastEditError written but never read; claimed status-line rejection feedback not implemented",
+    "location": "Source/PacketPlumber/PPRunGameMode.h:88-90",
+    "evidence": "+\t// the last edit result, for the status line (rejection feedback)\n+\tPP::FEditError LastEditError = PP::FEditError::None;\n+\tbool bHasLastEditError = false;\n ... \n+\t\tLastEditError = Result.Error;\n+\t\tbHasLastEditError = true;\n ... \n+\t\t\tFText::FromString(FString::Printf(TEXT(\"tick %llu  ·  packets %d  ·  score %d  ·  20 Hz\"), CurSnapshot.Tick,",
+    "detail": "The rejection-reason state is stored after every DrawPipe but nothing reads it; the status line renders tick/packets/score only, so rejected drags give no feedback despite the header's claim.",
+    "recommended_fix": "Render LastEditError in the status text (or expose it to the view), or delete the dead members."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Unused accessors and snapshot field: GetCommandBus(), GetAccumulatedSeconds(), FPacketView::bOnEdge",
+    "location": "Source/PacketPlumber/PPRunGameMode.h:52-55",
+    "evidence": "+\tFPPCommandBus &GetCommandBus()\n+\t{\n+\t\treturn CommandBus;\n+\t}\n ... \n+\tfloat GetAccumulatedSeconds() const\n ... \n+\tbool bOnEdge = false;",
+    "detail": "No caller in the diff uses GetCommandBus or GetAccumulatedSeconds; bOnEdge is set in BuildSnapshot but never read by the view layer. Speculative API surface.",
+    "recommended_fix": "Delete until a caller exists, or note them as deliberate extension points in the PR description."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-mismatch",
+    "title": "Header documents shadow at 12% alpha; code uses 0.14",
+    "location": "Source/PacketPlumber/PPRunView.h:15-22",
+    "evidence": "+//   Shadow        black @ 12% alpha, soft blob\n ... \n+const FLinearColor kShadowTint(0.0f, 0.0f, 0.0f, 0.14f);\t  // soft blob",
+    "detail": "The palette token comment and the constant disagree (0.12 vs 0.14); the look-parity checklist scores 14%. Documentation drift inside the declared look-parity baseline.",
+    "recommended_fix": "Align the header comment to 14% (or change the code to 12%) — one source of truth for the palette."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "logic",
+    "title": "Topology-change detection compares element counts only — same-count changes rebuild nothing",
+    "location": "Source/PacketPlumber/PPRunView.cpp:268-271",
+    "evidence": "+\t\tconst bool bTopologyChanged =\n+\t\t\tNext.Nodes.Num() != CurSnapshot.Nodes.Num() || Next.Pipes.Num() != CurSnapshot.Pipes.Num();",
+    "detail": "A tick that removes one pipe and adds another (equal counts) skips the static-world rebuild, leaving stale roads on screen. Only safe while slice-1 edits are draw-only.",
+    "recommended_fix": "Carry Topology.Gen (or a content hash) in the snapshot and compare that instead of element counts."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "logic",
+    "title": "EndDraw's 'appears THIS frame' refresh never reaches the view — change detection keys on Tick",
+    "location": "Source/PacketPlumber/PPRunGameMode.cpp:176-184",
+    "evidence": "+\t\tif (Result.Error == PP::FEditError::None)\n+\t\t{\n+\t\t\t// immediate refresh so the drawn pipe appears THIS frame (1.2:\n+\t\t\t// \"two pipes are created and appear instantly\")\n+\t\t\tBuildSnapshot();\n+\t\t}\n ... \n+\tconst PPView::FSnapshot &Next = GameMode->GetSnapshot();\n+\tif (Next.Tick != CurSnapshot.Tick)\n+\t{",
+    "detail": "The edit does not advance SimState.Tick and the view ingests snapshots only when Tick changes, so the rebuilt Snapshot sits unread until the next 20 Hz step; PrevSnapshot is also not rotated.",
+    "recommended_fix": "Have the view compare a snapshot revision (or Gen) that EndDraw bumps, or accept the one-tick delay and fix the comment."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "consistency",
+    "title": "PIE fixture hand-rolls the scenario with magic positions despite claiming PP_Scenario.h single-sourcing",
+    "location": "Source/PacketPlumber/PPRunGameMode.cpp:23-27",
+    "evidence": "+\tPP::SpawnNode(SimState.Topology, PP::FNodeKind::Terminal, 2, 2);  // SCENARIO_SOURCE\n+\tPP::SpawnNode(SimState.Topology, PP::FNodeKind::Junction, 6, 2);  // SCENARIO_ROUTER\n+\tPP::SpawnNode(SimState.Topology, PP::FNodeKind::Terminal, 10, 2); // SCENARIO_SINK\n ... \n+// golden scenario's (1 source terminal, 1 router junction, 1 sink terminal —\n+// PP_Scenario.h constants) so PIE shows the SAME topology the golden pins;",
+    "detail": "The header claims the fixture uses PP_Scenario.h constants; the code inlines 2/6/10 literals as trailing comments — a second fixture builder that can silently drift from the golden scenario.",
+    "recommended_fix": "Call the shared scenario builder (or real position constants) instead of duplicated literals."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "polish-bug",
+    "title": "New packet dots initialize smoothing position to (0,0) — every spawn flies in from the top-left",
+    "location": "Source/PacketPlumber/PPRunView.cpp:305-320",
+    "evidence": "+\t\t\tPacketPrevPos.Add(Packet.Id, FVector2D::ZeroVector);\n ... \n+\t\t\tconst FVector2D Smooth = FMath::Lerp(Prev, Target, 0.5f); // temporal smoothing",
+    "detail": "First frame after creation: Smooth = lerp(ZeroVector, Target, 0.5), so each new dot visibly teleports halfway toward screen origin before converging over several frames — on every packet spawn.",
+    "recommended_fix": "Seed PacketPrevPos with the dot's current target position (PacketPosIn of the current snapshot) on creation."
+  }
+]

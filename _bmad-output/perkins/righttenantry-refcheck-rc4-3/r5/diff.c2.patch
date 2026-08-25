@@ -1,0 +1,1178 @@
+diff --git a/client/test/api/reference_checks_api_test.gleam b/client/test/api/reference_checks_api_test.gleam
+new file mode 100644
+index 00000000..d8df737b
+--- /dev/null
++++ b/client/test/api/reference_checks_api_test.gleam
+@@ -0,0 +1,56 @@
++//// reference_checks_api wire-format tests (r3 N1) — the client's `?slot=`
++//// per-row start variant and the action URLs are pinned (the server-side
++//// 400 for an invalid slot is pinned in the integration suite).
++
++import api/reference_checks_api
++import gleam/option
++import gleeunit/should
++
++pub fn start_url_without_slot_test() {
++  reference_checks_api.start_check_url("vac-1", "app-1", option.None)
++  |> should.equal(
++    "/api/v1/vacancies/vac-1/applications/app-1/reference-checks/start",
++  )
++}
++
++pub fn start_url_with_slot_test() {
++  reference_checks_api.start_check_url(
++    "vac-1",
++    "app-1",
++    option.Some("employer_ref"),
++  )
++  |> should.equal(
++    "/api/v1/vacancies/vac-1/applications/app-1/reference-checks/start?slot=employer_ref",
++  )
++}
++
++pub fn slot_action_urls_test() {
++  reference_checks_api.slot_action_url("vac-1", "app-1", "landlord_ref", "skip")
++  |> should.equal(
++    "/api/v1/vacancies/vac-1/applications/app-1/reference-checks/landlord_ref/skip",
++  )
++  reference_checks_api.slot_action_url(
++    "vac-1",
++    "app-1",
++    "employer_ref",
++    "re-enable",
++  )
++  |> should.equal(
++    "/api/v1/vacancies/vac-1/applications/app-1/reference-checks/employer_ref/re-enable",
++  )
++}
++
++pub fn call_action_urls_test() {
++  reference_checks_api.call_action_url("vac-1", "app-1", "call-9", "take-over")
++  |> should.equal(
++    "/api/v1/vacancies/vac-1/applications/app-1/reference-checks/call-9/take-over",
++  )
++  reference_checks_api.call_action_url("vac-1", "app-1", "call-9", "correct")
++  |> should.equal(
++    "/api/v1/vacancies/vac-1/applications/app-1/reference-checks/call-9/correct",
++  )
++  reference_checks_api.call_action_url("vac-1", "app-1", "call-9", "substitute")
++  |> should.equal(
++    "/api/v1/vacancies/vac-1/applications/app-1/reference-checks/call-9/substitute",
++  )
++}
+diff --git a/client/test/client_test.gleam b/client/test/client_test.gleam
+index 0cd6c1fb..46d133c1 100644
+--- a/client/test/client_test.gleam
++++ b/client/test/client_test.gleam
+@@ -17,6 +17,7 @@ import components/status_pill
+ import components/toast
+ import components/vacancy_card
+ import components/viewing_message_popover
++import copy
+ import gleam/dict
+ import gleam/int
+ import gleam/list
+@@ -6150,6 +6151,14 @@ fn refcheck_call(
+     next_attempt_at: option.None,
+     form_opened_at: option.None,
+     submitted_at: option.None,
++    taken_over_at: option.None,
++    contact_name: option.None,
++    contact_email: option.None,
++    contact_phone: option.None,
++    corrected_name: option.None,
++    corrected_email: option.None,
++    corrected_phone: option.None,
++    correction_cycles: 0,
+     attempts: [],
+     result: option.None,
+     display_disclaimer: option.None,
+@@ -6157,6 +6166,7 @@ fn refcheck_call(
+       can_record_manual: True,
+       can_substitute_referee: False,
+       can_retry: False,
++      can_take_over: False,
+     ),
+   )
+ }
+@@ -6267,3 +6277,386 @@ pub fn refcheck_route_change_resets_expanded_rows_test() {
+   updated.refcheck_explainer_open |> should.be_false
+   updated.refcheck_auto_expanded |> set.contains("aid-1") |> should.be_true
+ }
++
++// -- Reference panel (RC4.3) row-action handler tests ------------------------
++
++/// A model whose loaded detail carries the given reference calls (the
++/// action handlers look the row up in the detail payload).
++fn refcheck_detail_model(
++  calls: List(reference_call.ReferenceCallDetail),
++) -> model.Model {
++  model.Model(
++    ..model.initial(),
++    application_detail: remote_data.Success(
++      application_detail.ApplicationDetail(
++        ..test_detail(),
++        reference_calls: calls,
++      ),
++    ),
++    route: routes.ApplicationDetail(vacancy_id: "uuid-vac-1", id: "uuid-app-1"),
++  )
++}
++
++/// The overflow menu toggles open and closed (one at a time).
++pub fn refcheck_menu_toggles_test() {
++  let m = refcheck_detail_model([refcheck_call("rc-1", reference_call.Queued)])
++  let #(opened, _eff) = client.update(m, msg.UserToggledRefcheckMenu("rc-1"))
++  opened.refcheck_menu_open |> should.equal(option.Some("rc-1"))
++  let #(closed, _eff2) =
++    client.update(opened, msg.UserToggledRefcheckMenu("rc-1"))
++  closed.refcheck_menu_open |> should.equal(option.None)
++}
++
++/// Choosing "Start this check now" opens the inline confirm (never a modal)
++/// and closes the menu.
++pub fn refcheck_start_choice_opens_inline_confirm_test() {
++  let m = refcheck_detail_model([refcheck_call("rc-1", reference_call.Queued)])
++  let #(updated, _eff) =
++    client.update(m, msg.UserChoseRefcheckAction("rc-1", model.RefcheckStart))
++  updated.refcheck_menu_open |> should.equal(option.None)
++  // r1 (W7): the confirm renders inside the row detail — the choice expands
++  // the row so a collapsed row never swallows the surface.
++  updated.refcheck_expanded |> set.contains("rc-1") |> should.be_true
++  updated.refcheck_confirm
++  |> should.equal(
++    option.Some(model.RefcheckConfirm(
++      call_id: "rc-1",
++      kind: model.RefcheckConfirmStart,
++    )),
++  )
++}
++
++/// Skip fires the API immediately (no confirm step — §7.4 wireframe).
++pub fn refcheck_skip_fires_immediately_test() {
++  let m = refcheck_detail_model([refcheck_call("rc-1", reference_call.Queued)])
++  let #(updated, _eff) =
++    client.update(m, msg.UserChoseRefcheckAction("rc-1", model.RefcheckSkip))
++  // The slot-scoped fire marks the row in-flight (the observable state
++  // change; the request effect itself is not inspectable).
++  updated.refcheck_action_inflight |> set.contains("rc-1") |> should.be_true
++}
++
++/// Editing the trio opens a prefilled edit state and applies the keystroke.
++pub fn refcheck_trio_editing_updates_live_values_test() {
++  let call =
++    reference_call.ReferenceCallDetail(
++      ..refcheck_call("rc-1", reference_call.AwaitingCorrection),
++      contact_name: option.Some("Larry"),
++      contact_email: option.Some("larry@example.com"),
++      contact_phone: option.None,
++    )
++  let m = refcheck_detail_model([call])
++  let #(updated, _eff) =
++    client.update(
++      m,
++      msg.UserEditedRefcheckTrio("rc-1", "email", "larry@new.ie"),
++    )
++  case dict.get(updated.refcheck_edit, "rc-1") {
++    Ok(edit) -> {
++      edit.call_id |> should.equal("rc-1")
++      edit.kind |> should.equal(model.RefcheckEditCorrect)
++      edit.name |> should.equal("Larry")
++      edit.email |> should.equal("larry@new.ie")
++    }
++    Error(_) -> should.fail()
++  }
++}
++
++/// Save with an empty name shows the inline error, fires nothing.
++pub fn refcheck_save_validation_blocks_empty_name_test() {
++  let call =
++    reference_call.ReferenceCallDetail(
++      ..refcheck_call("rc-1", reference_call.AwaitingCorrection),
++      contact_name: option.Some(""),
++      contact_email: option.Some("larry@example.com"),
++    )
++  let m = refcheck_detail_model([call])
++  let #(updated, eff) = client.update(m, msg.UserSavedRefcheckEdit("rc-1"))
++  case dict.get(updated.refcheck_edit, "rc-1") {
++    Ok(edit) ->
++      edit.error |> should.equal(option.Some(copy.refcheck_edit_need_name))
++    Error(_) -> should.fail()
++  }
++}
++
++/// Save with no reachable channel shows the channel error, fires nothing.
++pub fn refcheck_save_validation_blocks_no_channel_test() {
++  let call =
++    reference_call.ReferenceCallDetail(
++      ..refcheck_call("rc-1", reference_call.AwaitingCorrection),
++      contact_name: option.Some("Larry"),
++    )
++  let m = refcheck_detail_model([call])
++  let #(updated, eff) = client.update(m, msg.UserSavedRefcheckEdit("rc-1"))
++  case dict.get(updated.refcheck_edit, "rc-1") {
++    Ok(edit) ->
++      edit.error |> should.equal(option.Some(copy.refcheck_edit_need_channel))
++    Error(_) -> should.fail()
++  }
++}
++
++/// A successful action clears the pending surfaces, toasts, and refetches
++/// the detail.
++pub fn refcheck_action_success_toasts_and_refetches_test() {
++  let m = refcheck_detail_model([refcheck_call("rc-1", reference_call.Queued)])
++  let #(updated, eff) =
++    client.update(m, msg.ApiReturnedRefcheckAction("rc-1", "take-over", Ok("")))
++  updated.refcheck_edit |> should.equal(dict.new())
++  updated.refcheck_confirm |> should.equal(option.None)
++  updated.refcheck_action_inflight |> set.contains("rc-1") |> should.be_false
++  updated.toasts |> list.length() |> should.equal(1)
++}
++
++/// r1 (W8): a stale action response after the landlord navigated away is
++/// dropped — the detail no longer shows the call, so no toast fires.
++pub fn refcheck_late_response_is_dropped_test() {
++  let m = model.Model(..model.initial())
++  let #(updated, _eff) =
++    client.update(
++      m,
++      msg.ApiReturnedRefcheckAction("rc-gone", "take-over", Ok("")),
++    )
++  updated.toasts |> list.length() |> should.equal(0)
++  updated.refcheck_action_inflight
++  |> set.contains("rc-gone")
++  |> should.be_false
++}
++
++/// A failed action keeps the surfaces (the landlord can retry) and toasts
++/// the brand error copy.
++/// r1 (W5): a failed correct/substitute re-enables the edit-trio save
++/// button — the form stays open with the landlord's values.
++pub fn refcheck_action_failure_reenables_save_button_test() {
++  let call =
++    reference_call.ReferenceCallDetail(
++      ..refcheck_call("rc-1", reference_call.AwaitingCorrection),
++      contact_name: option.Some("Larry"),
++      contact_email: option.Some("larry@example.com"),
++    )
++  let m = refcheck_detail_model([call])
++  let m =
++    model.Model(
++      ..m,
++      refcheck_edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditCorrect,
++            name: "Larry",
++            email: "larry@example.com",
++            phone: "",
++            saving: True,
++            error: option.None,
++          ),
++        ),
++      ]),
++    )
++  let #(updated, _eff) =
++    client.update(
++      m,
++      msg.ApiReturnedRefcheckAction(
++        "rc-1",
++        "correct",
++        Error(api_error.new_for_test(error_code.Conflict, dict.new())),
++      ),
++    )
++  case dict.get(updated.refcheck_edit, "rc-1") {
++    Ok(edit) -> edit.saving |> should.be_false
++    Error(_) -> should.fail()
++  }
++}
++
++pub fn refcheck_action_failure_toasts_error_test() {
++  let m = refcheck_detail_model([refcheck_call("rc-1", reference_call.Queued)])
++  let #(updated, eff) =
++    client.update(
++      m,
++      msg.ApiReturnedRefcheckAction(
++        "rc-1",
++        "correct",
++        Error(api_error.new_for_test(error_code.Conflict, dict.new())),
++      ),
++    )
++  updated.refcheck_action_inflight |> set.contains("rc-1") |> should.be_false
++  updated.toasts |> list.length() |> should.equal(1)
++}
++
++/// r2 (W9 pin): the four RC4.3 row-action fields reset on route change — a
++/// pending edit's typed referee PII never leaks across applicants.
++pub fn refcheck_action_state_resets_on_route_change_test() {
++  let m =
++    model.Model(
++      ..model.initial(),
++      refcheck_menu_open: option.Some("rc-1"),
++      refcheck_confirm: option.Some(model.RefcheckConfirm(
++        call_id: "rc-1",
++        kind: model.RefcheckConfirmStart,
++      )),
++      refcheck_edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditCorrect,
++            name: "Larry",
++            email: "larry@example.com",
++            phone: "",
++            saving: True,
++            error: option.None,
++          ),
++        ),
++      ]),
++      refcheck_action_inflight: set.from_list(["rc-1"]),
++    )
++  let #(updated, _eff) =
++    client.update(
++      m,
++      msg.BrowserChangedUrl(uri.Uri(
++        scheme: option.Some("http"),
++        userinfo: option.None,
++        host: option.Some("localhost"),
++        port: option.None,
++        path: "/vacancies/v1/applications/a1",
++        query: option.None,
++        fragment: option.None,
++      )),
++    )
++  updated.refcheck_menu_open |> should.equal(option.None)
++  updated.refcheck_confirm |> should.equal(option.None)
++  updated.refcheck_edit |> should.equal(dict.new())
++  updated.refcheck_action_inflight |> set.contains("rc-1") |> should.be_false
++}
++
++/// r3 (N7): confirming the take-over dispatches the action (the row is
++/// marked in-flight).
++pub fn refcheck_take_over_confirm_dispatches_test() {
++  let m = refcheck_detail_model([refcheck_call("rc-1", reference_call.Queued)])
++  let m =
++    model.Model(
++      ..m,
++      refcheck_confirm: option.Some(model.RefcheckConfirm(
++        call_id: "rc-1",
++        kind: model.RefcheckConfirmTakeOver,
++      )),
++    )
++  let #(updated, _eff) =
++    client.update(m, msg.UserConfirmedRefcheckAction("rc-1"))
++  updated.refcheck_confirm |> should.equal(option.None)
++  updated.refcheck_action_inflight
++  |> set.contains("rc-1")
++  |> should.be_true
++}
++
++/// r3 (N7): saving a valid correction trio dispatches the endpoint (the row
++/// is marked in-flight).
++pub fn refcheck_save_resend_dispatches_test() {
++  let m =
++    refcheck_detail_model([
++      refcheck_call("rc-1", reference_call.AwaitingCorrection),
++    ])
++  let m =
++    model.Model(
++      ..m,
++      refcheck_edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditCorrect,
++            name: "Larry Byrne",
++            email: "larry.byrne@example.com",
++            phone: "",
++            saving: False,
++            error: option.None,
++          ),
++        ),
++      ]),
++    )
++  let #(updated, _eff) = client.update(m, msg.UserSavedRefcheckEdit("rc-1"))
++  updated.refcheck_action_inflight
++  |> set.contains("rc-1")
++  |> should.be_true
++  case dict.get(updated.refcheck_edit, "rc-1") {
++    Ok(edit) -> edit.saving |> should.be_true
++    Error(_) -> should.fail()
++  }
++}
++
++/// r4 (N15): confirming the per-row START dispatches (inflight marked).
++pub fn refcheck_start_confirm_dispatches_test() {
++  let m = refcheck_detail_model([refcheck_call("rc-1", reference_call.Queued)])
++  let m =
++    model.Model(
++      ..m,
++      refcheck_confirm: option.Some(model.RefcheckConfirm(
++        call_id: "rc-1",
++        kind: model.RefcheckConfirmStart,
++      )),
++    )
++  let #(updated, _eff) =
++    client.update(m, msg.UserConfirmedRefcheckAction("rc-1"))
++  updated.refcheck_confirm |> should.equal(option.None)
++  updated.refcheck_action_inflight
++  |> set.contains("rc-1")
++  |> should.be_true
++}
++
++/// r4 (N15): saving a SUBSTITUTE trio dispatches (inflight marked).
++pub fn refcheck_substitute_save_dispatches_test() {
++  let objected =
++    reference_call.ReferenceCallDetail(
++      ..refcheck_call("rc-1", reference_call.Objected),
++      hooks: reference_call.ReferenceCallHooks(
++        can_record_manual: False,
++        can_substitute_referee: True,
++        can_retry: False,
++        can_take_over: False,
++      ),
++    )
++  let m = refcheck_detail_model([objected])
++  let m =
++    model.Model(
++      ..m,
++      refcheck_edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditSubstitute,
++            name: "Niamh Newref",
++            email: "niamh@example.com",
++            phone: "",
++            saving: False,
++            error: option.None,
++          ),
++        ),
++      ]),
++    )
++  let #(updated, _eff) = client.update(m, msg.UserSavedRefcheckEdit("rc-1"))
++  updated.refcheck_action_inflight
++  |> set.contains("rc-1")
++  |> should.be_true
++}
++
++/// r4 (N15): the export handler sets the clipboard-copied state.
++pub fn refcheck_export_handler_marks_clipboard_test() {
++  let m =
++    refcheck_detail_model([
++      reference_call.ReferenceCallDetail(
++        ..refcheck_call("rc-1", reference_call.Queued),
++        contact_name: option.Some("Larry"),
++        contact_email: option.Some("larry@example.com"),
++        attempts: [
++          reference_call.ReferenceCallAttempt(
++            at: "2026-08-01T08:00:00Z",
++            channel: "email",
++            outcome: "delivered",
++            detail: "",
++          ),
++        ],
++      ),
++    ])
++  let #(updated, _eff) = client.update(m, msg.UserClickedRefcheckExport("rc-1"))
++  updated.clipboard_copied |> should.equal(option.Some("refcheck_export"))
++}
+diff --git a/client/test/components/reference_panel_test.gleam b/client/test/components/reference_panel_test.gleam
+index 7671f226..74a009fe 100644
+--- a/client/test/components/reference_panel_test.gleam
++++ b/client/test/components/reference_panel_test.gleam
+@@ -8,12 +8,14 @@
+ 
+ import components/reference_panel
+ import copy
++import gleam/dict.{type Dict}
+ import gleam/list
+ import gleam/option.{type Option, None, Some}
+ import gleam/set
+ import gleam/string
+ import gleeunit/should
+ import lustre/element
++import model.{type RefcheckConfirm, type RefcheckEdit}
+ import shared/application.{type Application}
+ import shared/reference_call.{
+   type ReferenceCallAttempt, type ReferenceCallDetail, type ReferenceCallStatus,
+@@ -41,6 +43,14 @@ fn row(
+     next_attempt_at: None,
+     form_opened_at: None,
+     submitted_at: None,
++    taken_over_at: None,
++    contact_name: None,
++    contact_email: None,
++    contact_phone: None,
++    corrected_name: None,
++    corrected_email: None,
++    corrected_phone: None,
++    correction_cycles: 0,
+     attempts: attempts,
+     result: result,
+     display_disclaimer: None,
+@@ -51,10 +61,20 @@ fn row(
+       can_record_manual: !is_terminal_status(status),
+       can_substitute_referee: False,
+       can_retry: False,
++      can_take_over: False,
+     ),
+   )
+ }
+ 
++fn base_hooks() -> reference_call.ReferenceCallHooks {
++  reference_call.ReferenceCallHooks(
++    can_record_manual: False,
++    can_substitute_referee: False,
++    can_retry: False,
++    can_take_over: False,
++  )
++}
++
+ fn is_terminal_status(status: ReferenceCallStatus) -> Bool {
+   case status {
+     FormCompleted
+@@ -170,6 +190,30 @@ fn render(
+   off off: Bool,
+   attestation_on_file attestation_on_file: Bool,
+   expanded expanded: List(String),
++) -> String {
++  render_with_actions(
++    calls:,
++    off:,
++    attestation_on_file:,
++    expanded:,
++    menu_open: None,
++    confirm: None,
++    edit: dict.new(),
++    inflight: [],
++  )
++}
++
++/// The full action-state renderer (RC4.3) — the row-action tests drive the
++/// overflow menu, inline confirms, and edit-trio through it.
++fn render_with_actions(
++  calls calls: List(ReferenceCallDetail),
++  off off: Bool,
++  attestation_on_file attestation_on_file: Bool,
++  expanded expanded: List(String),
++  menu_open menu_open: Option(String),
++  confirm confirm: Option(model.RefcheckConfirm),
++  edit edit: Dict(String, model.RefcheckEdit),
++  inflight inflight: List(String),
+ ) -> String {
+   reference_panel.view(
+     calls: calls,
+@@ -178,6 +222,10 @@ fn render(
+     app: test_application(),
+     expanded: set.from_list(expanded),
+     explainer_open: False,
++    menu_open: menu_open,
++    confirm: confirm,
++    edit: edit,
++    inflight: set.from_list(inflight),
+   )
+   |> element.to_string
+ }
+@@ -190,6 +238,10 @@ fn render_explainer_open(calls: List(ReferenceCallDetail)) -> String {
+     app: test_application(),
+     expanded: set.new(),
+     explainer_open: True,
++    menu_open: None,
++    confirm: None,
++    edit: dict.new(),
++    inflight: set.new(),
+   )
+   |> element.to_string
+ }
+@@ -1096,3 +1148,506 @@ fn search_index(haystack: String, needle: String, from: Int) -> Int {
+       }
+   }
+ }
++
++// -- RC4.3 row actions --------------------------------------------------------
++
++/// A queued row with a contact snapshot (the payload additions).
++fn contact_row(
++  id id: String,
++  status status: ReferenceCallStatus,
++) -> ReferenceCallDetail {
++  reference_call.ReferenceCallDetail(
++    ..row(id, status, None, []),
++    contact_name: Some("Maeve O'Brien"),
++    contact_email: Some("maeve@example.ie"),
++    contact_phone: Some("+353 87 123 4567"),
++  )
++}
++
++/// r2 (W6): queued rows offer take-over too (the server hook says so).
++pub fn overflow_menu_queued_lists_take_over_when_hook_test() {
++  let queued =
++    reference_call.ReferenceCallDetail(
++      ..contact_row("rc-1", Queued),
++      hooks: reference_call.ReferenceCallHooks(
++        ..base_hooks(),
++        can_take_over: True,
++      ),
++    )
++  let html =
++    render_with_actions(
++      calls: [queued],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++      menu_open: Some("rc-1"),
++      confirm: None,
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-action-take-over-landlord_ref")
++  |> should.be_true
++}
++
++/// The overflow menu opens with the right entries for a queued row (§7.4).
++pub fn overflow_menu_queued_lists_start_and_skip_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", Queued)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: Some("rc-1"),
++      confirm: None,
++      edit: dict.new(),
++      inflight: [],
++    )
++  html |> string.contains("refcheck-menu-landlord_ref") |> should.be_true
++  html
++  |> string.contains("refcheck-action-start-landlord_ref")
++  |> should.be_true
++  html
++  |> string.contains("refcheck-action-skip-landlord_ref")
++  |> should.be_true
++  html |> string.contains("Start this check now") |> should.be_true
++  html |> string.contains("Skip this reference") |> should.be_true
++}
++
++/// The skipped row's menu offers the re-enable entry (§7.4).
++pub fn overflow_menu_skipped_lists_re_enable_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", Skipped)],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++      menu_open: Some("rc-1"),
++      confirm: None,
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-action-re-enable-landlord_ref")
++  |> should.be_true
++  html |> string.contains("Start this check") |> should.be_true
++}
++
++/// The awaiting-correction row carries NO overflow control — its action
++/// surface is the §8.3 edit-trio in the row body.
++pub fn awaiting_correction_row_has_no_overflow_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", AwaitingCorrection)],
++      off: False,
++      attestation_on_file: False,
++      expanded: [],
++      menu_open: None,
++      confirm: None,
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-overflow-landlord_ref")
++  |> should.be_false
++}
++
++/// §7.4 start confirm renders inline (never a modal) with the verbatim copy.
++pub fn start_confirm_renders_inline_with_verbatim_copy_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", Queued)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: Some(model.RefcheckConfirm(
++        call_id: "rc-1",
++        kind: model.RefcheckConfirmStart,
++      )),
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-confirm-start-landlord_ref")
++  |> should.be_true
++  html
++  |> string.contains(
++    "Start the reference check for Maeve O&#39;Brien? We&#39;ll email and text them the form now.",
++  )
++  |> should.be_true
++  html |> string.contains("Start check") |> should.be_true
++  html |> string.contains("Never mind") |> should.be_true
++}
++
++/// r3 (W1): the queued arm renders the take-over confirm too — the menu
++/// offers it there, so the control must never be dead.
++pub fn queued_row_renders_take_over_confirm_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", Queued)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: Some(model.RefcheckConfirm(
++        call_id: "rc-1",
++        kind: model.RefcheckConfirmTakeOver,
++      )),
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-confirm-take-over-landlord_ref")
++  |> should.be_true
++  html
++  |> string.contains("Take over this reference yourself?")
++  |> should.be_true
++}
++
++/// §7.7 take-over confirm renders inline with the verbatim copy.
++pub fn take_over_confirm_renders_inline_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", ContactInitiated)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: Some(model.RefcheckConfirm(
++        call_id: "rc-1",
++        kind: model.RefcheckConfirmTakeOver,
++      )),
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-confirm-take-over-landlord_ref")
++  |> should.be_true
++  html
++  |> string.contains("Take over this reference yourself?")
++  |> should.be_true
++  html |> string.contains("Take over") |> should.be_true
++}
++
++/// A confirm for a DIFFERENT row does not render (call-id matched).
++pub fn confirm_is_scoped_to_its_call_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", Queued)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: Some(model.RefcheckConfirm(
++        call_id: "rc-other",
++        kind: model.RefcheckConfirmStart,
++      )),
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-confirm-start-landlord_ref")
++  |> should.be_false
++}
++
++/// A taken-over row shows the §7.7 label + the referee's chips + the export
++/// affordance, and loses the overflow menu.
++pub fn taken_over_row_shows_label_chips_and_export_test() {
++  let taken =
++    reference_call.ReferenceCallDetail(
++      ..contact_row("rc-1", ContactInitiated),
++      taken_over_at: Some("2026-08-03T08:00:00Z"),
++    )
++  let html =
++    render_with_actions(
++      calls: [taken],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: None,
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-taken-over-landlord_ref")
++  |> should.be_true
++  html |> string.contains("You&#39;re handling this one") |> should.be_true
++  html
++  |> string.contains("refcheck-taken-over-phone-landlord_ref")
++  |> should.be_true
++  html
++  |> string.contains("refcheck-taken-over-email-landlord_ref")
++  |> should.be_true
++  html |> string.contains("refcheck-export-landlord_ref") |> should.be_true
++  html
++  |> string.contains("refcheck-overflow-landlord_ref")
++  |> should.be_false
++}
++
++/// r2 (N5): the §8.3 correction surface opens behind a button — the form is
++/// never silently always-open (Cancel is meaningful).
++pub fn awaiting_correction_renders_edit_trio_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", AwaitingCorrection)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: None,
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-correct-open-landlord_ref")
++  |> should.be_true
++  html |> string.contains("Correct details") |> should.be_true
++  // The form itself is NOT rendered until the landlord opens it.
++  html
++  |> string.contains("refcheck-edit-save-landlord_ref")
++  |> should.be_false
++
++  // With the edit state open the trio + Save & resend + applicant chips
++  // render.
++  let open_html =
++    render_with_actions(
++      calls: [contact_row("rc-1", AwaitingCorrection)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: None,
++      edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditCorrect,
++            name: "Larry Byrne",
++            email: "larry.byrne@example.com",
++            phone: "",
++            saving: False,
++            error: None,
++          ),
++        ),
++      ]),
++      inflight: [],
++    )
++  open_html
++  |> string.contains("refcheck-edit-name-landlord_ref")
++  |> should.be_true
++  open_html |> string.contains("Save &amp; resend") |> should.be_true
++  open_html |> string.contains("refcheck-applicant-phone") |> should.be_true
++  open_html |> string.contains("refcheck-applicant-email") |> should.be_true
++}
++
++/// The edit trio carries the corrected effective contact (A1) once the
++/// landlord opens the form.
++pub fn edit_trio_prefills_effective_contact_test() {
++  let corrected =
++    reference_call.ReferenceCallDetail(
++      ..contact_row("rc-1", AwaitingCorrection),
++      corrected_name: Some("Maeve Byrne"),
++      corrected_email: Some("maeve.byrne@example.ie"),
++      corrected_phone: None,
++    )
++  let html =
++    render_with_actions(
++      calls: [corrected],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: None,
++      edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditCorrect,
++            name: "Maeve Byrne",
++            email: "maeve.byrne@example.ie",
++            phone: "",
++            saving: False,
++            error: None,
++          ),
++        ),
++      ]),
++      inflight: [],
++    )
++  html |> string.contains("value=\"Maeve Byrne\"") |> should.be_true
++  html
++  |> string.contains("value=\"maeve.byrne@example.ie\"")
++  |> should.be_true
++  // The snapshot email is NOT the prefill (A1 effective contact).
++  html |> string.contains("value=\"maeve@example.ie\"") |> should.be_false
++}
++
++/// r2 (W5): the SUBSTITUTE trio starts EMPTY — the terminal referee's own
++/// contact is never the prefill (§8.2: another referee).
++pub fn substitute_trio_never_prefills_terminal_contact_test() {
++  let objected =
++    reference_call.ReferenceCallDetail(
++      ..contact_row("rc-1", Objected),
++      hooks: reference_call.ReferenceCallHooks(
++        ..base_hooks(),
++        can_substitute_referee: True,
++      ),
++    )
++  let html =
++    render_with_actions(
++      calls: [objected],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: None,
++      edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditSubstitute,
++            name: "",
++            email: "",
++            phone: "",
++            saving: False,
++            error: None,
++          ),
++        ),
++      ]),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-edit-save-landlord_ref")
++  |> should.be_true
++  html |> string.contains("value=\"Maeve O&#39;Brien\"") |> should.be_false
++  html |> string.contains("value=\"maeve@example.ie\"") |> should.be_false
++}
++
++/// The objected row's substitute affordance opens the §8.2 edit-trio —
++/// gated on the server hook (r1 B3, AR-RC13).
++pub fn objected_row_substitute_surface_test() {
++  let base_hooks =
++    reference_call.ReferenceCallHooks(
++      can_record_manual: False,
++      can_substitute_referee: False,
++      can_retry: False,
++      can_take_over: False,
++    )
++  let objected =
++    reference_call.ReferenceCallDetail(
++      ..contact_row("rc-1", Objected),
++      hooks: reference_call.ReferenceCallHooks(
++        ..base_hooks,
++        can_substitute_referee: True,
++      ),
++    )
++  let html =
++    render_with_actions(
++      calls: [objected],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: None,
++      edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditSubstitute,
++            name: "New Referee",
++            email: "new@example.ie",
++            phone: "",
++            saving: False,
++            error: None,
++          ),
++        ),
++      ]),
++      inflight: [],
++    )
++  html |> string.contains("Substitute referee") |> should.be_true
++  html
++  |> string.contains("refcheck-edit-save-landlord_ref")
++  |> should.be_true
++  html |> string.contains("Save &amp; send invite") |> should.be_true
++  html |> string.contains("value=\"New Referee\"") |> should.be_true
++}
++
++/// B3 (r1): a terminal objected row WITHOUT the hook renders NO substitute
++/// affordance — the panel never re-derives the rule client-side.
++pub fn substitute_surface_hidden_when_hook_off_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", Objected)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: None,
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-substitute-open-landlord_ref")
++  |> should.be_false
++  html |> string.contains("Substitute referee") |> should.be_false
++}
++
++/// In-flight actions disable the confirm buttons (double-click guard).
++pub fn inflight_disables_confirm_buttons_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", Queued)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: Some(model.RefcheckConfirm(
++        call_id: "rc-1",
++        kind: model.RefcheckConfirmStart,
++      )),
++      edit: dict.new(),
++      inflight: ["rc-1"],
++    )
++  html
++  |> string.contains("refcheck-confirm-start-yes-landlord_ref")
++  |> should.be_true
++  // B2: the busy state renders the PRESENT attribute — serialized attributes
++  // sort by name, so the testid is directly followed by ` disabled` (the CSS
++  // class `disabled:opacity-50` inside class= would otherwise false-positive).
++  html
++  |> string.contains("refcheck-confirm-start-yes-landlord_ref\" disabled")
++  |> should.be_true
++}
++
++/// B2 (r1): the ENABLED state must OMIT the attribute entirely — an
++/// empty-string value would render as a present boolean attribute and
++/// permanently disable the control.
++pub fn enabled_confirm_omits_disabled_attribute_test() {
++  let html =
++    render_with_actions(
++      calls: [contact_row("rc-1", Queued)],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: Some(model.RefcheckConfirm(
++        call_id: "rc-1",
++        kind: model.RefcheckConfirmStart,
++      )),
++      edit: dict.new(),
++      inflight: [],
++    )
++  html
++  |> string.contains("refcheck-confirm-start-yes-landlord_ref")
++  |> should.be_true
++  // The enabled state OMITS the attribute: the testid is directly followed
++  // by ` type=` (sorted adjacency), never by a bare ` disabled`.
++  html
++  |> string.contains("refcheck-confirm-start-yes-landlord_ref\" disabled")
++  |> should.be_false
++}
+diff --git a/client/test/copy_test.gleam b/client/test/copy_test.gleam
+index 7ba8e9cf..33970108 100644
+--- a/client/test/copy_test.gleam
++++ b/client/test/copy_test.gleam
+@@ -302,16 +302,72 @@ fn for_each_copy(body: fn(String) -> Nil) -> Nil {
+   })
+ }
+ 
++/// The RC4.3 implementer-authored strings the toast/page scan cannot reach
++/// (they are consts, not toast/page arms). The spec-verbatim refcheck copy
++/// (state lines, signals, explainer — §7.4/§7.5/§7.8) legitimately carries
++/// em-dashes and is deliberately NOT scanned; anything listed here must stay
++/// dash-free (r1 W1 — the RC4.2 r2 pin gap, live again).
++fn refcheck_action_strings() -> List(String) {
++  [
++    copy.refcheck_action_start_now,
++    copy.refcheck_action_skip,
++    copy.refcheck_action_re_enable,
++    copy.refcheck_action_take_over,
++    copy.refcheck_action_substitute,
++    copy.refcheck_action_correct_details,
++    copy.refcheck_start_confirm("Test Referee"),
++    copy.refcheck_start_confirm_yes,
++    copy.refcheck_start_confirm_no,
++    copy.refcheck_take_over_confirm_title,
++    copy.refcheck_take_over_confirm_body("Test Referee"),
++    copy.refcheck_take_over_confirm_yes,
++    copy.refcheck_take_over_confirm_no,
++    copy.refcheck_taken_over_label,
++    copy.refcheck_correction_heading("Test Referee"),
++    copy.refcheck_correction_body("Test Applicant"),
++    copy.refcheck_save_resend,
++    copy.refcheck_contact_applicant("Test"),
++    copy.refcheck_substitute_heading,
++    copy.refcheck_substitute_body,
++    copy.refcheck_substitute_save,
++    copy.refcheck_field_name,
++    copy.refcheck_field_email,
++    copy.refcheck_field_phone,
++    copy.refcheck_edit_need_name,
++    copy.refcheck_edit_need_channel,
++    copy.refcheck_edit_cancel,
++    copy.refcheck_export_log,
++    copy.refcheck_toast_started,
++    copy.refcheck_toast_skipped,
++    copy.refcheck_toast_re_enabled,
++    copy.refcheck_toast_taken_over,
++    copy.refcheck_toast_corrected,
++    copy.refcheck_toast_substituted,
++    copy.refcheck_toast_exported,
++    copy.refcheck_toast_export_failed,
++  ]
++}
++
+ /// Global em-dash ban (2026-08-05 user ruling): no em-dash may appear in
+ /// any landlord-facing copy string. Pins the ban durably so a single
+-/// reintroduced dash fails CI instead of shipping.
++/// reintroduced dash fails CI instead of shipping. Covers the toast/page
++/// arms AND the RC4.3 implementer-authored refcheck strings (the verbatim
++/// spec copy is excluded by construction).
+ pub fn no_em_dash_test() {
+   for_each_copy(fn(s) {
+-    case string.contains(s, "\u{2014}") || string.contains(s, "—") {
++    // r4 (N6): "\u{2014}" and "—" are the SAME character — one check.
++    case string.contains(s, "\u{2014}") {
+       True -> panic as "em-dash in copy"
+       False -> Nil
+     }
+   })
++  list.each(refcheck_action_strings(), fn(s) {
++    // r3 (N13): "\u{2014}" and "—" are the SAME character — one check.
++    case string.contains(s, "\u{2014}") {
++      True -> panic as "em-dash in refcheck action copy"
++      False -> Nil
++    }
++  })
+ }
+ 
+ /// Forbidden-word check that ignores "_<word>" substrings — those only

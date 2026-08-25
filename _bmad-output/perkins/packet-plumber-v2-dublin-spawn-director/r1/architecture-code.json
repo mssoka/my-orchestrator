@@ -1,0 +1,42 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "duplication",
+    "title": "run_dublin_grown forks the harness's shared demo-replay path instead of extending it",
+    "location": "harness/dublin_shot.odin:129-183",
+    "evidence": "dublin_shot.odin:129-183 hand-rolls the whole parse->cfg->apply->step path verbatim: `demo, perr := parse_demo(\"dublin_board\", string(text_bytes))` ... `cfg := Demo_Replay{ name = demo.name, use_fixture = demo.use_fixture, qos_fixture = demo.qos_fixture, growth_on = demo.growth_on, advance_gate_on = demo.advance_gate_on, map_source = demo.map_source, session = {goal = demo.win_goal, cap_ms = demo.lose_cap_ms, health_on = demo.health_on, surge_win_pct = demo.surge_win_pct}, }` ... `for n in demo.nodes { append(&cfg.nodes, n) }` ... `if e := demo_apply_setup(&state, &cfg, cat); e != \"\" {` ... `for sim_tick in 0..<ticks { batch := make([dynamic]pp.Command, 0, 4, context.temp_allocator) for cmd in state.action_log { if cmd.apply_tick == sim_tick { append(&batch, cmd) } } pp.step(&state, sim_tick, batch[:], cat) free_all(context.temp_allocator) }`. The same package already documents this exact drift class: overlay.odin:153-156 `// demo_replay_setup — the SHARED parse+apply block (W7/r4: the three PP_DEBUG / render verbs — overlay_check, overlay_pixels_check, font_check — used three / verbatim copies of this ~25-line setup; the drift class that already bit / once).` and overlay.odin:121 `run_demo_to_ms :: proc(...) — the SHARED replay driver (W4)`. The copy has ALREADY diverged from the canonical loop: dublin_shot.odin:181 `for sim_tick in 0..<ticks {` (0-based, no pause handling) vs run.odin:425/441 `for w in u64(1)..=ticks {` ... `sim_tick += 1` (1-based, paused ticks step nothing in run_demo_to_ms).",
+    "detail": "The new gate verb duplicates ~60 lines the same package maintains as documented shared helpers (created because this drift class already bit once). The fork already diverges on pauses and tick numbering; future driver changes won't reach it.",
+    "recommended_fix": "Thread growth_on/map_source into demo_replay_setup's cfg and add a demo-horizon override to run_demo_to_ms; make run_dublin_grown consume both, deleting the hand-rolled copy."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "complexity",
+    "title": "District live counts re-derived O(districts^2 x nodes) per spawn attempt instead of once per window",
+    "location": "core/growth.odin:563-576,850-851",
+    "evidence": "growth.odin:534-541 `growth_district_live_count :: proc(board: ^Map_Board, t: ^Topology, d: u16) -> i32 { n: i32 = 0 for i in 0..<len(t.node_alive) { if !t.node_alive[i] || t.node_kind[i] != .Terminal { continue } if map_district_assign(board, t.node_pos[i]) == d {` (every call rescans all nodes, each node re-scanning all 52 anchors). It is called per district per seed attempt — growth.odin:563-566 `for d in 0..<len(board.districts) { if len(board.district_tiles[d]) == 0 { continue } if growth_district_live_count(board, t, u16(d)) >= growth_district_cap(board, cat, u16(d)) { continue }` — and per eligible cluster per attach attempt — growth.odin:850-851 `d := map_district_assign(board, t.node_pos[i]) if growth_district_live_count(board, t, d) >= growth_district_cap(board, cat, d) { continue }` — under growth.odin:122/802 `GROWTH_MAX_ATTEMPTS :: i32(8)` / `for attempt in 0..<GROWTH_MAX_ATTEMPTS {`. The attempt loop returns on first success (growth.odin:1070 `return {spawn = true, type_idx = type_idx, pos = pos}`), so counts cannot change within one window.",
+    "detail": "Counts are a pure function of (topology, board) and are stable across a window's attempts; recomputing them per district and per cluster is ~100x redundant work that grows quadratically with map size.",
+    "recommended_fix": "Build a counts[0..districts) array once per growth_plan_demand call (one node scan, temp allocator); both eligibility predicates and the harness audit read it."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "doctrine",
+    "title": "map_district_assign quantizes f32 anchors via f64 math on every call — ODN-10 gray zone in a state-affecting sim path",
+    "location": "core/map.odin:465-471",
+    "evidence": "map.odin:465-471 `map_district_assign :: proc(b: ^Map_Board, pos: [2]i32) -> u16 { best_d: u16 = 0 best_d2: i64 = 0 for d in 0..<len(b.districts) { ax := i32(math.round(f64(b.districts[d].pos[0]) * MAP_ANCHOR_SCALE)) ay := i32(math.round(f64(b.districts[d].pos[1]) * MAP_ANCHOR_SCALE))` while its own doc comment (map.odin:459-461) claims `// scaled Euclidean squared distance (MAP_ANCHOR_SCALE = 10 — the anchor's / f32 tile pos scales to tenths before the compare; ODN-10: pure integer / math, no transcendentals).` project-context.md: \"All state-affecting math is integer or explicit fixed-point (ODN-10). Floats exist only in the view ... and never flow back into state.\"",
+    "detail": "The float conversion is exact and deterministic today (no bug), but the district assignment drives spawn decisions and re-rounds floats per anchor per call — contradicting both ODN-10's wording and the proc's own comment.",
+    "recommended_fix": "Quantize anchors once in map_board_load into a [][2]i32 scaled table on Map_Board; map_district_assign then compares pure integers with no per-call rounding."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "code-hygiene",
+    "title": "Statically dead board predicate left in the procedural cluster re-walk after the restructure",
+    "location": "core/growth.odin:885-897",
+    "evidence": "growth.odin:866/885 place the re-walk in the else of `if board != nil { ... } else { cluster_k := rng_range(rng, 0, i32(eligible) - 1) // SKIPPED when 1 for i in 0..<len(gview.id) {`, yet inside it growth.odin:892-897 keeps `// the SAME board predicate as the count loop (a mismatched / seen counter would index a different cluster than eligible / counted — and could pick an ineligible one with an empty ring) if board != nil && !growth_board_cluster_has_room(board, t, &gview, u32(i), cat.balance.terminal_min_sep_tiles, cat.balance.growth_groups.radius_tiles, span) { continue }` — here board is always nil, so the guard never fires.",
+    "detail": "Residue of the pre-restructure shared walk: the guard is statically dead and the count-loop-sync comment now misleads readers of the procedural branch. Pure hygiene; behavior unchanged.",
+    "recommended_fix": "Delete the `board != nil &&` guard and its comment from the procedural re-walk; the board branch's collected elig_firsts list is already authoritative."
+  }
+]

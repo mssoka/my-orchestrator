@@ -1,0 +1,5 @@
+# Field notes — packet-plumber-v2-5.5-demolish-input
+
+- 5.5 redispatch on the intent layer: the demolish surface (click-select + popover + X/DEL) already rode the 5.4 executor — the REAL work was the controller leg (pad X = RIGHT_FACE_LEFT, the keyboard X twin; Node_Select mirrors the cursor onto the selection junction->select/terminal->clear), the W1-r4 positive pins (the ui hook was ONLY wired to the negative esc_ui scenario — wire it for positive button scenarios too), and the r3-N7 gate leg (bad-arg -> exit 2, `[ -x ]` guard against the 127->`!`->0 false-green).
+- Parity scenarios can drive the demolish BUTTON press on mouse AND touch through the SAME parity_ui_press_effect hook, and the pad leg rides the Demolish intent — one 3-device scenario asserts Cmd_Demolish_Node with mouse == touch == pad.
+- Mutation discipline paid twice: my first negative-control mutation (`if false`) was vacuous — a pin that can't fail isn't a pin; the second (`if true`) proved both button scenarios bite. Always verify a mutation actually flips the scenario red.

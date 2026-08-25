@@ -1,0 +1,32 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "fail-open-query",
+    "title": "Per-row start silently degrades to whole-application start for any unrecognized `?slot=` query shape — the wider action runs without the requested slot ever being validated",
+    "location": "server/src/reference_checks/trigger.gleam:fn slot_query / handle_start",
+    "evidence": "+fn slot_query(req: Request) -> Option(String) {\n+  case req.query {\n+    None -> None\n+    Some(query_string) ->\n+      query_string\n+      |> string.split(\"&\")\n+      |> list.fold(None, fn(acc, pair) {\n+        case acc {\n+          Some(_) -> acc\n+          None ->\n+            case pair {\n+              \"slot=\" <> slot -> Some(slot)\n+              _ -> None\n+            }\n+        }\n+      })\n+  }\n+}\n...\n+    None ->\n+      run_start_action(\n+        req,\n+        config,\n+        landlord,\n+        vacancy_id,\n+        application_id,\n+        requested_slot,\n+      )",
+    "detail": "Only an invalid VALUE of a correctly-named `slot=` is rejected (400). A mistyped/mis-encoded param (e.g. `?ref_slot=`), a URL-encoded value, or a repeated param (first wins) yields None and silently runs the whole-application start — creating + re-arming BOTH slots, the exact side effect the per-slot feature claims to prevent (\"the other slot is untouched\").",
+    "recommended_fix": "Reject non-empty queries that contain no parseable `slot=` param (400) instead of defaulting to the whole-app path; only a genuinely absent query should mean whole-app start. Decode the value and consider last-wins on repeats."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-branch-stale-comment",
+    "title": "The `matched_send_at == \"\"` \"genuine\" exhaust branch is unreachable for corrected rows — the in-diff comment describes a path the find SQL no longer provides",
+    "location": "server/src/reference_checks/webhooks.gleam:apply_delivery_failure (True branch)",
+    "evidence": "+              // re-tried. The comparison is a TIMESTAMPTZ compare done in\n+              // SQL (r2: the string-format mix made same-day sends compare\n+              // as post-correction). The contact-fallback match (no send id\n+              // — the crash-mid-tick edge) is treated as genuine.\n+              case row.matched_send_at == \"\" || row.send_is_post_correction {\n+                True ->\n+                  exhaust_row(",
+    "detail": "The find's contact fallback is disabled once correction_cycles >= 1 (r3 W2), so a corrected row can only be found via the send-ref match, which always yields a non-empty matched_send_at (every attempt-entry writer stamps `at`). The comment's \"crash-mid-tick fallback treated as genuine\" path cannot reach this branch; the `||` is dead and the comment misdocuments the gate.",
+    "recommended_fix": "Drop the `matched_send_at == \"\"` disjunct (or keep it but correct the comment) so the code and the SQL-side fallback-disabled rule tell the same story."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "silent-stand-down",
+    "title": "Stale-bounce stand-down on a corrected row writes no audit, Sentry, or log — the stand-down decision is indistinguishable from a silently broken webhook",
+    "location": "server/src/reference_checks/webhooks.gleam:apply_delivery_failure (correction_cycles >= 1, False arm)",
+    "evidence": "+              case row.matched_send_at == \"\" || row.send_is_post_correction {\n+                True ->\n+                  exhaust_row(\n+                    db,\n+                    sentry,\n+                    reference_call_id,\n+                    row,\n+                    source,\n+                    terminal_reason,\n+                  )\n+                False -> Nil\n+              }",
+    "detail": "Every other branch of this handler writes an AD-16 audit or a Sentry capture; the deliberate \"redelivered pre-correction bounce\" classification returns Nil with zero trace. Ops cannot distinguish a correctly stood-down stale event from a webhook event being silently swallowed (no audit row, no log line).",
+    "recommended_fix": "Emit a low-noise observability signal (audit note or log line) when the stand-down decision is made, tagged as deliberate so it is not mistaken for a processing failure."
+  }
+]

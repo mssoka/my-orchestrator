@@ -1,0 +1,32 @@
+[
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "data-integrity",
+    "title": "balance.json `health` block parsed with non-strict jint — decimals truncate and out-of-range ints wrap silently",
+    "location": "core/catalog.odin:714-721",
+    "evidence": "jint :: proc(o: json.Object, key: string, def: i32) -> i32 {\n\tif v, ok := o[key]; ok {\n\t\t#partial switch x in v {\n\t\tcase json.Integer: return i32(x)\n\t\tcase json.Float:   return i32(x)\n\n// jint_strict — like jint but a json.Float (a decimal in the file) is a\n// fail-fast rejection (ok=false), never a silent truncation — the 3.1\n// integer-only bar for the NEW catalogs (ODN-5; the old loaders keep jint).\n\n\t\t\tb.health.window_ticks = jint(hobj, \"window_ticks\", -1)\n\t\t\tb.health.exit_margin_pct = jint(hobj, \"exit_margin_pct\", -1)\n\t\t\tb.health.exit_margin_ms = jint(hobj, \"exit_margin_ms\", -1)\n\t\t\tb.health.drain_cap_pct_per_tick = jint(hobj, \"drain_cap_pct_per_tick\", -1)\n\n\t\t\thg, okhg := jint_strict(eo, \"health_grace_ticks\", 0)\n\t\t\thd, okhd := jint_strict(eo, \"health_drain_pct_per_tick\", 0)",
+    "detail": "The 4.3 health block is new catalog data yet uses legacy jint: `\"drain_cap_pct_per_tick\": 2.9` silently becomes 2 and an out-of-i32-range integer silently wraps — contradicting the jint_strict wrap/truncation rationale the same feature's packet_types fields enforce.",
+    "recommended_fix": "Parse the health block with jint_strict and reject on any ok==false (\"sim fields must be integers\"), mirroring the packet_types health fields."
+  },
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "dead-data",
+    "title": "balance.health.win_uptime_pct is documented as the win threshold but the sim never reads it — win threshold is dual-sourced",
+    "location": "core/win_lose.odin:62-66",
+    "evidence": "// recharge_pct_per_tick is the healthy recovery rate; win_uptime_pct is the\n// GDD MVP surge-survival threshold (overall uptime through the surge)\n\n\tif state.surge_win_pct != 0 && state.health.surge_done {\n\t\ttotal := state.health.surge_delivered + state.health.surge_dropped\n\t\tif total > 0 {\n\t\t\tuptime := state.health.surge_delivered * 100 / total\n\t\t\tif uptime >= u64(state.surge_win_pct) {\n\n\t\tb.health.win_uptime_pct = jint(hobj, \"win_uptime_pct\", -1)\n\n\t\tif b.health.win_uptime_pct < 1 || b.health.win_uptime_pct > 100 {\n\t\t\treturn {\"balance.json\", \"health.win_uptime_pct\", \"must be 1..100 (the surge-survival win threshold)\"}",
+    "detail": "win_uptime_pct is load-validated and folded into the catalog hash (shifting every golden) but is referenced nowhere in the sim — win_lose_eval compares against run-setup surge_win_pct. ODN-5 single-source broken; balance.json's threshold cannot affect gameplay.",
+    "recommended_fix": "Single-source the threshold: either delete balance.health.win_uptime_pct (validation + data + tests) or have win_lose_eval read the catalog value instead of surge_win_pct."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Grace_Expired event silently dropped when the expired class's severity is 0 (drain == 0)",
+    "location": "core/health.odin:329-344",
+    "evidence": "\tif drain > 0 {\n\t\tif h.meter_pct <= drain {\n\n\t\t} else {\n\t\t\th.meter_pct -= drain\n\t\t\tfor c in expired {\n\t\t\t\tevent_emit_health(state, tick, EVENT_TAG_GRACE_EXPIRED, c)\n\t\t\t}\n\t\t\tevent_emit_meter(state, tick, h.meter_pct)\n\t\t}\n\t} else if !any_breach && h.meter_pct < 100 {\n\n\t\tif hg < 0 || hd < 0 {\n\t\t\treturn {\"packet_types.json\", pt.id, \"health_grace_ticks/health_drain_pct_per_tick must be >= 0\"}",
+    "detail": "Validation permits health_drain_pct_per_tick == 0. If the only post-grace class has severity 0, drain stays 0, the `expired` collection is never emitted, and the arch's `Grace_Expired{class}` event contract (§6.5 interface) never fires for that expiry.",
+    "recommended_fix": "Emit the collected Grace_Expired events regardless of drain, or tighten validation to require health_drain_pct_per_tick >= 1."
+  }
+]

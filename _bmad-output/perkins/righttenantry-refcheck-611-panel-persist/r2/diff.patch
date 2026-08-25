@@ -1,0 +1,283 @@
+diff --git a/client/src/components/reference_panel.gleam b/client/src/components/reference_panel.gleam
+index 252389a9..cec2adfe 100644
+--- a/client/src/components/reference_panel.gleam
++++ b/client/src/components/reference_panel.gleam
+@@ -1108,21 +1108,21 @@ fn view_edit_trio(
+   html.div([class("space-y-2")], [
+     html.div([class("grid grid-cols-1 sm:grid-cols-3 gap-2")], [
+       text_input(
+-        slot,
++        call.reference_call_id,
+         "name",
+         copy.refcheck_field_name,
+         name,
+         "refcheck-edit-name-" <> slot,
+       ),
+       text_input(
+-        slot,
++        call.reference_call_id,
+         "email",
+         copy.refcheck_field_email,
+         email,
+         "refcheck-edit-email-" <> slot,
+       ),
+       text_input(
+-        slot,
++        call.reference_call_id,
+         "phone",
+         copy.refcheck_field_phone,
+         phone,
+diff --git a/client/test/client_test.gleam b/client/test/client_test.gleam
+index 1998c2ec..1a1ac3e9 100644
+--- a/client/test/client_test.gleam
++++ b/client/test/client_test.gleam
+@@ -29,6 +29,9 @@ import gleeunit
+ import gleeunit/should
+ import helpers/format
+ import helpers/leaderboard as leaderboard_helpers
++import lustre/dev/query
++import lustre/dev/simulate
++import lustre/effect
+ import lustre/element
+ import model
+ import msg
+@@ -6722,3 +6725,239 @@ pub fn refcheck_export_success_toasts_dash_free_oq5_test() {
+     [] -> panic as "export success must toast"
+   }
+ }
++
++/// #611 keystroke-swallow pin: typing into the refcheck edit-trio must land
++/// in the `refcheck_edit` dict under the ROW's `reference_call_id` and render
++/// back into the field. The bug was a key mismatch — the trio inputs sent
++/// `UserEditedRefcheckTrio` keyed by the ref SLOT ("landlord_ref") while the
++/// view/update/save all key by `reference_call_id` ("rc-1"), so keystrokes
++/// wrote to a dict entry the view never read: the field snapped back to the
++/// prefill on every render and Save persisted the ORIGINAL contact with a
++/// success toast (the #611 repro). This drives the REAL runtime path —
++/// `simulate.input` → `cache.handle` (decode2) → `client.update` → view —
++/// and asserts all three field branches (W2), the dict writes, the
++/// re-rendered values, AND the SAVE half (Perkins r1 B1): the save click
++/// must read the same dict entry the keystrokes wrote and fire with the
++/// typed values retained.
++pub fn refcheck_trio_keystroke_lands_in_field_test() {
++  let detail =
++    application_detail.ApplicationDetail(..test_detail(), reference_calls: [
++      reference_call.ReferenceCallDetail(
++        ..refcheck_call("rc-1", reference_call.AwaitingCorrection),
++        contact_name: option.Some("Maeve O'Brien"),
++        contact_email: option.Some("maeve@example.ie"),
++        contact_phone: option.Some("+353 87 123 4567"),
++      ),
++    ])
++  let m =
++    model.Model(
++      ..model.initial(),
++      route: routes.ApplicationDetail(
++        vacancy_id: "uuid-vac-1",
++        id: "uuid-app-1",
++      ),
++      application_detail: remote_data.Success(detail),
++      refcheck_expanded: set.from_list(["rc-1"]),
++      refcheck_edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditCorrect,
++            name: "Maeve O'Brien",
++            email: "maeve@example.ie",
++            phone: "+353 87 123 4567",
++            saving: False,
++            error: None,
++          ),
++        ),
++      ]),
++    )
++  let sim =
++    simulate.start(
++      simulate.application(
++        init: fn(_) { #(m, effect.none()) },
++        update: client.update,
++        view: application_detail_page.view,
++      ),
++      Nil,
++    )
++  // W2: every field branch of UserEditedRefcheckTrio lands in the dict under
++  // the ROW's id — name, email, AND phone (a mistyped literal would hit the
++  // silent `_ -> edit` fallback and drop keystrokes; each branch is typed).
++  let sim =
++    simulate.input(
++      sim,
++      on: query.element(matching: query.attribute(
++        "data-testid",
++        "refcheck-edit-name-landlord_ref",
++      )),
++      value: "Maeve Fixed",
++    )
++  let sim =
++    simulate.input(
++      sim,
++      on: query.element(matching: query.attribute(
++        "data-testid",
++        "refcheck-edit-email-landlord_ref",
++      )),
++      value: "maeve.fixed@example.ie",
++    )
++  let sim =
++    simulate.input(
++      sim,
++      on: query.element(matching: query.attribute(
++        "data-testid",
++        "refcheck-edit-phone-landlord_ref",
++      )),
++      value: "+353 87 999 0000",
++    )
++  let edited = simulate.model(sim).refcheck_edit |> dict.get("rc-1")
++  case edited {
++    Ok(edit) -> {
++      edit.name |> should.equal("Maeve Fixed")
++      edit.email |> should.equal("maeve.fixed@example.ie")
++      edit.phone |> should.equal("+353 87 999 0000")
++    }
++    Error(_) -> panic as "edit state must exist for rc-1"
++  }
++  // And the re-rendered inputs carry the typed values (no snap-back).
++  let html = simulate.view(sim) |> element.to_string
++  html |> string.contains("value=\"Maeve Fixed\"") |> should.be_true
++  html
++  |> string.contains("value=\"maeve.fixed@example.ie\"")
++  |> should.be_true
++  html |> string.contains("value=\"+353 87 999 0000\"") |> should.be_true
++
++  // B1 (Perkins r1): the SAVE half — the save click must read the SAME dict
++  // entry the keystrokes wrote and fire with the typed values. The #611
++  // harm class was save persisting the ORIGINAL contact with a success
++  // toast; a future re-key of the save path must fail here.
++  let sim =
++    simulate.click(
++      sim,
++      on: query.element(matching: query.attribute(
++        "data-testid",
++        "refcheck-edit-save-landlord_ref",
++      )),
++    )
++  let saved = simulate.model(sim).refcheck_edit |> dict.get("rc-1")
++  case saved {
++    Ok(edit) -> {
++      edit.saving |> should.be_true
++      edit.name |> should.equal("Maeve Fixed")
++      edit.email |> should.equal("maeve.fixed@example.ie")
++      edit.phone |> should.equal("+353 87 999 0000")
++    }
++    Error(_) -> panic as "edit state must survive the save click"
++  }
++}
++
++/// #611 W1 (Perkins r1): the SUBSTITUTE trio is the same `view_edit_trio`
++/// component — keystrokes must land under `reference_call_id` there too —
++/// and a detail REFETCH (background poll) with a reordered call list must
++/// not drop the in-progress edit. Acceptance 2's reorder clause: the typed
++/// substitute survives a server re-sort of the rows.
++pub fn refcheck_substitute_trio_keystroke_survives_refetch_test() {
++  let detail =
++    application_detail.ApplicationDetail(..test_detail(), reference_calls: [
++      reference_call.ReferenceCallDetail(
++        ..refcheck_call("rc-1", reference_call.Objected),
++        hooks: reference_call.ReferenceCallHooks(
++          ..reference_call.ReferenceCallHooks(
++            can_record_manual: False,
++            can_substitute_referee: False,
++            can_retry: False,
++            can_take_over: False,
++          ),
++          can_substitute_referee: True,
++        ),
++        contact_name: option.Some("Denis O'Shea"),
++        contact_email: option.Some("denis@example.ie"),
++        contact_phone: option.Some("+353 87 555 6666"),
++      ),
++      refcheck_call("rc-2", reference_call.Queued),
++    ])
++  let m =
++    model.Model(
++      ..model.initial(),
++      route: routes.ApplicationDetail(
++        vacancy_id: "uuid-vac-1",
++        id: "uuid-app-1",
++      ),
++      application_detail_request_id: option.Some("uuid-app-1"),
++      application_detail: remote_data.Success(detail),
++      refcheck_expanded: set.from_list(["rc-1"]),
++      // Substitute starts EMPTY (r2 W5) — the trio is open, nothing typed yet.
++      refcheck_edit: dict.from_list([
++        #(
++          "rc-1",
++          model.RefcheckEdit(
++            call_id: "rc-1",
++            kind: model.RefcheckEditSubstitute,
++            name: "",
++            email: "",
++            phone: "",
++            saving: False,
++            error: None,
++          ),
++        ),
++      ]),
++    )
++  let sim =
++    simulate.start(
++      simulate.application(
++        init: fn(_) { #(m, effect.none()) },
++        update: client.update,
++        view: application_detail_page.view,
++      ),
++      Nil,
++    )
++  let sim =
++    simulate.input(
++      sim,
++      on: query.element(matching: query.attribute(
++        "data-testid",
++        "refcheck-edit-email-landlord_ref",
++      )),
++      value: "new.referee@example.ie",
++    )
++  let typed = simulate.model(sim).refcheck_edit |> dict.get("rc-1")
++  case typed {
++    Ok(edit) -> edit.email |> should.equal("new.referee@example.ie")
++    Error(_) -> panic as "substitute edit state must exist for rc-1"
++  }
++  // Refetch with the rows REORDERED (rc-2 first) — the poll's refetch must
++  // preserve the in-progress edit keyed by reference_call_id.
++  let reordered =
++    application_detail.ApplicationDetail(..test_detail(), reference_calls: [
++      refcheck_call("rc-2", reference_call.Queued),
++      reference_call.ReferenceCallDetail(
++        ..refcheck_call("rc-1", reference_call.Objected),
++        hooks: reference_call.ReferenceCallHooks(
++          ..reference_call.ReferenceCallHooks(
++            can_record_manual: False,
++            can_substitute_referee: False,
++            can_retry: False,
++            can_take_over: False,
++          ),
++          can_substitute_referee: True,
++        ),
++        contact_name: option.Some("Denis O'Shea"),
++        contact_email: option.Some("denis@example.ie"),
++        contact_phone: option.Some("+353 87 555 6666"),
++      ),
++    ])
++  let sim =
++    simulate.message(sim, msg.ApiReturnedApplicationDetail(Ok(reordered)))
++  let survived = simulate.model(sim).refcheck_edit |> dict.get("rc-1")
++  case survived {
++    Ok(edit) -> edit.email |> should.equal("new.referee@example.ie")
++    Error(_) -> panic as "typed substitute must survive the reordered refetch"
++  }
++  // And the field still renders the typed value after the refetch.
++  simulate.view(sim)
++  |> element.to_string
++  |> string.contains("value=\"new.referee@example.ie\"")
++  |> should.be_true
++}

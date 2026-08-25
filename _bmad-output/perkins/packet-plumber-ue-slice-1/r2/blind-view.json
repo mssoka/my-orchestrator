@@ -1,0 +1,112 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "coordinate-space",
+    "title": "Input snap and view render use different size sources (viewport px vs DPI-scaled widget px); diff's own debug shows 1.48x divergence",
+    "location": "Source/PacketPlumber/PPRunGameMode.cpp:BeginDraw/EndDraw vs Source/PacketPlumber/PPRunView.cpp:NativeTick",
+    "evidence": "PPRunGameMode.cpp:\n+\tif (APlayerController *PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)\n+\t{\n+\t\tint32 VW = 1280, VH = 720;\n+\t\tPC->GetViewportSize(VW, VH);\n+\t\tViewportSize = FVector2D(static_cast<float>(VW), static_cast<float>(VH));\n+\t}\nPPRunView.cpp:\n+\t// re-fit when the WIDGET's layout size lands/changes. The canvas renders\n+\t// in the widget's local space (DPI-scaled — r2 debug: geo=1896x1081 for\n+\t// a 1280x730 window), so the fit MUST use the widget's geometry.",
+    "detail": "The r2 DPI fix was applied to the view only. Snap math still fits on GetViewportSize while nodes render on the 1.48x-divergent widget geometry; click-vs-node alignment and the visual snap radius are unverified and likely inconsistent.",
+    "recommended_fix": "Feed the snap path the same DPI-reconciled size the view uses (or convert mouse coords into widget-local space) so one fit drives both render and snap."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "stale-view",
+    "title": "EndDraw's 'appears THIS frame' refresh is a no-op: view only pulls snapshots when Tick changes, so TopologyGen-only edits are invisible",
+    "location": "Source/PacketPlumber/PPRunGameMode.cpp:EndDraw vs Source/PacketPlumber/PPRunView.cpp:NativeTick",
+    "evidence": "EndDraw:\n+\t\t// The edit lands in the topology immediately; the next Step picks it\n+\t\t// up (rebuild on gen change). The view refreshes on the next step.\n+\t\tif (Result.Error == PP::FEditError::None)\n+\t\t{\n+\t\t\t// immediate refresh so the drawn pipe appears THIS frame (1.2:\n+\t\t\t// \"two pipes are created and appear instantly\")\n+\t\t\tBuildSnapshot();\n+\t\t}\nNativeTick:\n+\tconst PPView::FSnapshot &Next = GameMode->GetSnapshot();\n+\tif (Next.Tick != CurSnapshot.Tick)\n...\n+\t\tconst bool bTopologyChanged = Next.TopologyGen != CurSnapshot.TopologyGen;",
+    "detail": "BuildSnapshot keeps Tick unchanged; the view reads GetSnapshot() only inside the Tick-change gate, so the rebuilt snapshot is never consumed this frame. The two comments in EndDraw contradict each other; the 'instant' claim is false.",
+    "recommended_fix": "Gate the view on TopologyGen as well as Tick, or notify the view from EndDraw; delete whichever comment describes the behavior that doesn't exist."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "missing-plugin",
+    "title": ".uproject enables UE_MCP_Bridge but no Plugins/UE_MCP_Bridge files are committed in the diff",
+    "location": "PacketPlumberUE.uproject:hunk",
+    "evidence": "+\t\t{\n+\t\t\t\"Name\": \"UE_MCP_Bridge\",\n+\t\t\t\"Enabled\": true\n+\t\t},\nand docs/agent-playbook.md:\n+\t(the `ue-mcp-deploy` bin is NOT on npm). Deploys\n+\t`Plugins/UE_MCP_Bridge/` + enables it. Then REBUILD (`--build-only` — the",
+    "detail": "The playbook documents the bridge as a locally-deployed plugin directory. Enabling it in committed .uproject without committing (or documenting the absence of) the plugin breaks clean checkouts and CI builds with a missing-module error.",
+    "recommended_fix": "Either commit Plugins/UE_MCP_Bridge or gate the enable behind a local, uncommitted project override; document the dependency in the playbook."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "golden-rebless",
+    "title": "SCHEMA.md demands three-writer mirroring and a golden re-bless, but this diff updates only the probe writer",
+    "location": "docs/goldens/SCHEMA.md:hunk",
+    "evidence": "+three writers — `tests/spine_check.cpp` (`--json` printf), the `PPProbe`\n+commandlet (`PPProbeCommandlet.cpp`), and `scripts/compare-golden.sh`\n+(KEYS) — all derive from this document; a key added/renamed here must be\n+mirrored in all three, and the golden + the inline spine-check CHECKs\n+re-blessed together (deliberate + cause-documented, AGENTS.md golden\n+discipline).*\nand:\n+- **Both surfaces updated together:** this golden + the inline CHECKs in\n+  `tests/spine_check.cpp` (+ the mirrored `PacketPlumber.*` automation\n+  asserts and the engine probe, which derives from the same scenario).",
+    "detail": "The diff re-blesses save_version 2 and a new state_hash in the probe and SCHEMA.md, yet contains no changes to spine_check.cpp, compare-golden.sh, or docs/goldens/probe-seed42-ticks100.json. If not in another chunk, the contract is broken.",
+    "recommended_fix": "Verify the golden JSON, spine-check CHECKs, and compare-golden KEYS are updated in this PR; if they live in another chunk, cross-reference it here."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "snap-semantics",
+    "title": "Snap radius claimed 'measured in world px' but applied unscaled in screen px",
+    "location": "Source/PacketPlumber/PPCommandBus.cpp:SnapToNode / Source/PacketPlumber/Public/PPCommandBus.h",
+    "evidence": "PPCommandBus.h:\n+\t// radius is INCLUSIVE (E4) and measured in world px (kSnapRadius) — the\nPPCommandBus.cpp:\n+\tconst FPPScreenFit Fit = MakeScreenFit(ViewportSize);\n+\tconst float RadiusPx = static_cast<float>(PP::kSnapRadius);",
+    "detail": "kSnapRadius is compared directly against screen-space squared distance with no division by Fit.Scale, so the effective world-unit radius varies with viewport size, contradicting the documented world-px semantics.",
+    "recommended_fix": "Divide the radius by Fit.Scale (or document that E4 radius is defined in screen px) and make comment and code agree."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "DragStartGrid stored and EndGrid computed but never read",
+    "location": "Source/PacketPlumber/PPRunGameMode.cpp:BeginDraw/EndDraw; Source/PacketPlumber/Public/PPRunGameMode.h",
+    "evidence": "PPRunGameMode.h:\n+\tPP::FIntPoint DragStartGrid;\nPPRunGameMode.cpp BeginDraw:\n+\tDragStartGrid = MakeScreenFit(ViewportSize).ScreenToGrid(ScreenPos);\nEndDraw:\n+\t\tconst PP::FIntPoint EndGrid = MakeScreenFit(ViewportSize).ScreenToGrid(ScreenPos);",
+    "detail": "After the screen-space snap redesign, the grid-position fields are vestigial: DragStartGrid is written and never read; EndGrid is computed inside EndDraw and immediately discarded.",
+    "recommended_fix": "Delete DragStartGrid from the header and drop the EndGrid computation (or use them if a future consumer exists)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "bHasLastEditError written but never read; header claims status-line rejection feedback that doesn't exist",
+    "location": "Source/PacketPlumber/PPRunGameMode.cpp:EndDraw; Source/PacketPlumber/Public/PPRunGameMode.h; Source/PacketPlumber/PPRunView.cpp:NativeTick",
+    "evidence": "PPRunGameMode.h:\n+\t// the last edit result, for the status line (rejection feedback)\n+\tPP::FEditError LastEditError = PP::FEditError::None;\n+\tbool bHasLastEditError = false;\nPPRunGameMode.cpp:\n+\t\tbHasLastEditError = true;\nPPRunView.cpp:\n+\t\t\tFText::FromString(FString::Printf(TEXT(\"tick %llu  ·  packets %d  ·  score %d  ·  20 Hz\"), CurSnapshot.Tick,",
+    "detail": "The flag is set on every edit and never consumed; the status line renders only tick/packets/score, so the claimed rejection feedback was never implemented.",
+    "recommended_fix": "Either surface LastEditError in the view's status line or remove the flag and correct the header comment."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "golden-semantics",
+    "title": "Probe JSON 'delivered' is hardcoded to State.Score and 'spawned' to Demand.size(), fudging the schema's semantics",
+    "location": "Source/PacketPlumberEditor/PPProbeCommandlet.cpp:hunk; docs/goldens/SCHEMA.md",
+    "evidence": "+\t\t\t\t \",\\\"flow_summary\\\":{\\\"spawned\\\":%d,\\\"delivered\\\":%d,\\\"live\\\":%d,\\\"score\\\":%d}}\\n\"),\n...\n+\t\t\tReachablePairs, TotalHops, static_cast<int32>(State.Flow.Demand.size()), State.Score,\n+\t\t\tstatic_cast<int32>(State.Flow.Packets.size()), State.Score);\nSCHEMA.md:\n+| `flow_summary.delivered` | int | packets delivered at the sink |",
+    "detail": "delivered and score are the same variable, so the golden cannot detect divergence between them; spawned counts seeded demand entries, not fired ones, differing whenever ticks < demand horizon.",
+    "recommended_fix": "Write delivered from an actual flow-delivered counter and spawned from a fired counter; keep score separate."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-mismatch",
+    "title": "Shadow alpha disagrees across the diff: header says 12%, code uses 0.14, checklist says 14%",
+    "location": "Source/PacketPlumber/Public/PPRunView.h:hunk vs Source/PacketPlumber/PPRunView.cpp vs docs/goldens/look-parity-checklist.md",
+    "evidence": "PPRunView.h:\n+//   Shadow        black @ 12% alpha, soft blob\nPPRunView.cpp:\n+const FLinearColor kShadowTint(0.0f, 0.0f, 0.0f, 0.14f);\t  // soft blob\nlook-parity-checklist.md:\n+| 3 | **Shadows** (soft blob shadows) | ✅ | Oversized low-alpha (14%) rounded blobs offset 2-3px under nodes",
+    "detail": "Three surfaces in the same diff state two different shadow alphas; the header comment is stale relative to the shipped constant.",
+    "recommended_fix": "Correct the header comment to 14% (or change the constant if 12% was intended)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "unsafe-pattern",
+    "title": "UObjects created via NewObject in the PlayerController constructor (CDO construction path)",
+    "location": "Source/PacketPlumber/PPRunPlayerController.cpp:APPRunPlayerController()",
+    "evidence": "+\t// Create the runtime input assets in the CONSTRUCTOR, not BeginPlay:\n...\n+\tDrawMappingContext = NewObject<UInputMappingContext>(this, TEXT(\"PP_DrawContext\"));\n+\tDrawStartAction = NewObject<UInputAction>(this, TEXT(\"PP_DrawStart\"));",
+    "detail": "NewObject during CDO construction runs before the class is fully registered and re-runs on every reinstantiation; the safety argument lives only in a comment. Engine reinstancing/cooking edge cases are untested here.",
+    "recommended_fix": "Create the assets lazily (e.g., in BeginPlay before input setup or via a SubobjectFactory) and null-check in SetupInputComponent as defense."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "scope-creep",
+    "title": "AndroidFileServer plugin disabled with no rationale anywhere in the diff",
+    "location": "PacketPlumberUE.uproject:hunk",
+    "evidence": "+\t\t{\n+\t\t\t\"Name\": \"AndroidFileServer\",\n+\t\t\t\"Enabled\": false\n+\t\t}",
+    "detail": "A slice-1 view/input change silently disables an unrelated shipping plugin; nothing in the diff or docs explains why, and config changes are declared review surface by project convention.",
+    "recommended_fix": "Remove the hunk or add a comment/PR note explaining the disabling rationale."
+  }
+]

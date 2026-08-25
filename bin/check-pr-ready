@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""check-pr-ready — the merge gate: is this job's PR ready to merge?
+
+Reads the orchestrator job ledger for a job, inspects its PR on GitHub, and
+BLOCKS the close-out/merge unless:
+  - the job is in `in-review` (or `done` with a verdict) and has a `pr`;
+  - the PR is OPEN, mergeable, not a draft;
+  - CI is green (no failed checks; `--allow-pending` tolerates in-flight);
+  - a REVIEW VERDICT is on record — no outstanding CHANGES_REQUESTED, and at
+    least one APPROVED review (prefer the `perkins-review[bot]`, but any
+    APPROVED review counts; `--require-perkins` makes the bot mandatory).
+  - `pr_review=1` if the job was flagged for Perkins review (warn-only when
+    0 — small changes may rely on the minion's built-in review).
+
+This is the control that turns "everyone remembers to review" into a check
+that blocks close-out. Exit 0 = ready; non-zero = a blocker or a failure.
+
+Usage:
+  check-pr-ready <job-id>
+  check-pr-ready <job-id> --ledger <bin/ledger>     # default ~/code/bin/ledger
+  check-pr-ready <job-id> --require-perkins --allow-pending
+
+Env overrides: LEDGER_BIN (absolute ledger CLI), GH (gh path).
+"""
+import argparse, json, os, shlex, subprocess, sys
+
+DEFAULT_LEDGER = os.path.expanduser("~/code/bin/ledger")
+
+def run(cmd, cwd=None):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+def gh_json(args, cwd=None):
+    """gh <args> -> parsed JSON, or None on failure."""
+    rc, out, err = run(["gh", *args], cwd=cwd)
+    if rc != 0:
+        return None, f"gh {args[0]} failed: {err or out}"
+    try:
+        return json.loads(out), None
+    except json.JSONDecodeError as e:
+        return None, f"gh {args[0]} non-JSON: {e}"
+
+def git_owner_repo(repo_root):
+    """Derive owner/repo from the repo_root's origin remote."""
+    if not repo_root:
+        return None
+    rc, out, err = run(["git", "-C", repo_root, "remote", "get-url", "origin"])
+    if rc != 0 or not out:
+        return None
+    url = out
+    # git@github.com:owner/repo.git  |  https://github.com/owner/repo.git
+    url = url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    for sep in (":", "/"):
+        if sep in url:
+            url = url.rsplit(sep, 1)[1]
+    parts = url.split("/")
+    return "/".join(parts[-2:]) if len(parts) >= 2 else None
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("job_id")
+    ap.add_argument("--ledger", default=os.environ.get("LEDGER_BIN", DEFAULT_LEDGER))
+    ap.add_argument("--require-perkins", action="store_true", help="the approval must come from perkins-review[bot]")
+    ap.add_argument("--allow-pending", action="store_true", help="tolerate a still-running CI check")
+    args = ap.parse_args()
+
+    fails, warns = [], []
+
+    # 1. the job from the ledger (JSON is machine-readable; use the same CLI).
+    rc, out, err = run([args.ledger, "json", "all"])
+    if rc != 0:
+        print(f"FAIL  ledger 'json all' errored: {err or out}")
+        return 2
+    try:
+        jobs = json.loads(out)
+    except json.JSONDecodeError:
+        print("FAIL  ledger 'json all' returned non-JSON")
+        return 2
+    job = next((j for j in jobs if j.get("id") == args.job_id), None)
+
+    print(f"== check-pr-ready: {args.job_id} ==")
+    if job is None:
+        print(f"  ✘ job '{args.job_id}' not found in ledger")
+        return 1
+    status = job.get("status")
+    pr = job.get("pr")
+    pr_review = int(job.get("pr_review") or 0)
+    repo_root = job.get("repo_root") or job.get("worktree")
+
+    print(f"  job: status={status}  pr={pr}  pr_review={pr_review}  repo_root={repo_root}")
+    if status not in ("in-review", "done"):
+        fails.append(f"job status is '{status}', expected 'in-review' or 'done'")
+    if not pr:
+        fails.append("no 'pr' recorded for this job (was it dispatched with pr=PR-number?)")
+
+    # Resolve the PR arg + owner/repo. `pr` may be stored as a bare number OR a
+    # full GitHub URL. gh resolves a full URL itself; a bare number needs --repo.
+    pr_str = str(pr or "")
+    pr_is_url = pr_str.startswith("http")
+    oslug = None
+    if pr_is_url:
+        try:
+            parts = pr_str.split("/")
+            i = parts.index("pull")
+            if i >= 2:
+                oslug = "/".join(parts[i - 2:i])
+        except ValueError:
+            oslug = None
+    if not oslug:
+        oslug = git_owner_repo(repo_root) or job.get("repo")
+    if not oslug and not pr_is_url:
+        fails.append("cannot derive owner/repo from repo_root's origin remote (and pr is a bare number)")
+    print(f"  repo slug: {oslug}   pr arg: {pr_str}")
+
+    # 2. the PR from GitHub.
+    if pr:
+        view = ["pr", "view", pr_str,
+                "--json", "state,mergeable,isDraft,reviewDecision,statusCheckRollup"]
+        if not pr_is_url and oslug:
+            view += ["--repo", oslug]
+        pr_json, err = gh_json(view)
+        if pr_json is None:
+            fails.append(f"PR lookup: {err}")
+        else:
+            if pr_json.get("state") != "OPEN":
+                fails.append(f"PR state is '{pr_json.get('state')}', not OPEN")
+            if pr_json.get("mergeable") not in (True, "MERGEABLE", None):
+                fails.append(f"PR mergeable='{pr_json.get('mergeable')}' — has conflicts")
+            if pr_json.get("isDraft"):
+                fails.append("PR is a draft")
+            rolls = pr_json.get("statusCheckRollup") or []
+            for c in rolls:
+                concl = (c.get("conclusion") or "").lower()
+                st = (c.get("status") or "").lower()
+                if concl in ("failure", "cancelled", "timed_out", "error") or st == "failure":
+                    fails.append(f"CI check '{c.get('name')}' is {concl or st}")
+                elif st in ("pending", "in_progress", "queued") and not args.allow_pending:
+                    warns.append(f"CI check '{c.get('name')}' is {st} (queued/in-progress)")
+
+    # 3. the review verdict.
+    if pr:
+        view = ["pr", "view", pr_str, "--json", "reviews"]
+        if not pr_is_url and oslug:
+            view += ["--repo", oslug]
+        reviews, err = gh_json(view)
+        if reviews is None:
+            fails.append(f"reviews lookup: {err}")
+        else:
+            rs = reviews.get("reviews") or []
+            approved = any(r.get("state") == "APPROVED" for r in rs)
+            perkins_approved = any(r.get("state") == "APPROVED" and "perkins" in (r.get("author", {}).get("login", "")).lower()
+                                  for r in rs)
+            changes_req = any(r.get("state") == "CHANGES_REQUESTED" for r in rs)
+            if changes_req:
+                fails.append("an outstanding CHANGES_REQUESTED review exists")
+            if args.require_perkins:
+                if not perkins_approved:
+                    fails.append("no perkins-review[bot] APPROVED verdict on record (--require-perkins)")
+            elif not approved:
+                fails.append("no APPROVED review verdict on record — the minion's step-04 review must have posted one, or run Perkins")
+
+    # 4. the pr_review flag (warn-only).
+    if pr_review == 0:
+        warns.append("pr_review=0 — this job wasn't flagged for Perkins; if it's a large/risky change it should be 1")
+
+    # ---- verdict -----------------------------------------------------------
+    print()
+    for w in warns:
+        print(f"  !  {w}")
+    for f in fails:
+        print(f"  ✘  {f}")
+    print()
+    if fails:
+        print(f"== NOT READY — {len(fails)} blocker(s) ==")
+        return 1
+    print(f"== READY to merge ({len(warns)} warning(s)) ==")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

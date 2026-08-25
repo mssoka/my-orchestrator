@@ -1,0 +1,331 @@
+{
+  "pr": 600,
+  "round": 1,
+  "reviewed_sha": "cc1b041",
+  "failed_layers": [],
+  "lenses_completed": [
+    "blind",
+    "edge",
+    "acceptance",
+    "security",
+    "architecture",
+    "codebase",
+    "tests"
+  ],
+  "raw_findings": 31,
+  "surviving_findings": 15,
+  "rejected": [
+    {
+      "title": "Cadence horizon computed from current next_attempt_at, not created_at",
+      "source": "blind",
+      "reason": "Deliberate, documented deviation. Under normal operation next_attempt_at starts at created_at, so next_attempt_at+increment == created_at+offset at every step (manually verified: +24/+24/+48/+48h). The relative form additionally follows a re-enabled row's re-armed clock (rc2-3 re_enable sets next_attempt_at=now()). Sound engineering decision, not a defect."
+    }
+  ],
+  "blockers": 1,
+  "warnings": 5,
+  "notes": 9,
+  "verdict": "NEEDS CHANGES",
+  "reviewer_agreement": [
+    {
+      "severity": "blocker",
+      "sources": [
+        "blind",
+        "edge",
+        "tests"
+      ],
+      "category": "exactly-once / failure-path / liveness",
+      "title": "Persistent guarded-update error silently re-sends every 15 min (AC7 + AD-15 unmet for this path)",
+      "location": "server/src/reference_checks/sweep.gleam:317-321 (also :365-367, :406, :448, :508-511)",
+      "evidence": "step_t0 sends THEN claims:\n    send.send_invite(...)   // line 306 \u2014 invite already sent\n    ...\n    case sql.sweep_claim_t0(...) {\n      Ok(pog.Returned(_, [_])) -> Invited\n      Ok(_) -> StoodDown\n      // A claim query error is transient (the SELECT worked) \u2014 leave the row\n      // queued so the next tick re-sends + re-claims ...\n      Error(_) -> StoodDown      // line 321 \u2014 NO capture, NO mark_failed, row untouched",
+      "detail": "A guarded UPDATE that errors (not 0-row) is swallowed: no Sentry, no `failed`, row stays due. Because sends run before the claim, a row whose UPDATE persistently errors (CHECK/trigger violation, poison data) re-sends its invite/reminder every 15 min forever, silently. Violates AC7 (DB failure -> failed + Sentry) + AD-15 (fail loudly) + exactly-once under failure.",
+      "recommended_fix": "Sentry-capture every guarded-update Error, and either mark_failed on Error or cap consecutive stand-downs (e.g. N retries) before terminalising \u2014 so a poison row escalates instead of looping.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "warning",
+      "sources": [
+        "blind",
+        "edge",
+        "acceptance",
+        "architecture",
+        "codebase"
+      ],
+      "category": "data-quality / audit",
+      "title": "Production attempt-log entries are stamped `at: \"\"` (no real timestamp)",
+      "location": "server/src/reference_checks/sweep.gleam:164, :702-718; server/src/reference_checks/sweep_handler.gleam:39",
+      "evidence": "bootstrap():  Ok(run(db_conn, deps, \"\", sentry, default_batch_limit))   // now_iso=\"\"  (line 164)\nhandler:      sweep.run(config.db, deps, now_iso: \"\", ...)               // (sweep_handler:39)\noutcome_entry stamps #(\"at\", json.string(at)) verbatim \u2014 nothing substitutes now() for the `at` field.",
+      "detail": "Both production entry points pass now_iso=\"\". Every attempts[] entry (and the result JSON re-emit, and the warm-handoff render) gets a blank `at`. Cadence timing itself is unaffected (next_attempt_at uses SQL now()), but the audit/display log loses timestamps. Five independent lenses agreed.",
+      "recommended_fix": "In production paths, compute a real ISO now (bssg_time / a now() helper) and pass it as now_iso, OR have the SQL/encoder stamp `at` from now() when the Gleam value is empty.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "warning",
+      "sources": [
+        "blind",
+        "acceptance",
+        "architecture",
+        "codebase"
+      ],
+      "category": "warm-handoff / correctness-of-render",
+      "title": "Warm-handoff email renders a fabricated single email/reminder_2 entry from the stale pre-advance log",
+      "location": "server/src/reference_checks/sweep.gleam:530-536 (dispatch_warm_handoff)",
+      "evidence": "let attempts =\n    parse_attempts_entries(row.attempts)        // line 530 \u2014 STALE snapshot (pre-advance; this tick's reminder_2 already committed to DB but not in `row`)\n    |> list.append([\n      AttemptEntry(at: now_iso, channel: \"email\", outcome: \"reminder_2\", detail: \"T+96h reminder\"),  // line 534 \u2014 hardcoded 'email' only",
+      "detail": "send_reminder(ReminderTwo) sends on BOTH email and SMS, producing 2 real entries this tick. The render instead appends ONE hardcoded email/reminder_2 entry built from the stale in-memory row, misrepresenting the actual sends to the landlord.",
+      "recommended_fix": "Re-read the row's attempts after the guarded advance (or pass this tick's real `entries`/`outcomes` into dispatch_warm_handoff and merge with the prior log) instead of fabricating the entry.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "warning",
+      "sources": [
+        "blind",
+        "edge",
+        "architecture"
+      ],
+      "category": "warm-handoff / reliability",
+      "title": "Warm-handoff notification can be permanently lost \u2014 dispatch Result discarded, no retry, no Sentry",
+      "location": "server/src/reference_checks/sweep.gleam:555-556; server/src/notification/notification_dispatch.gleam:498-501 (notify_reference_unreachable)",
+      "evidence": "      let _ =\n        notification_dispatch.notify_reference_unreachable(...)   // line 556 \u2014 Result discarded\n      Nil",
+      "detail": "dispatch_warm_handoff runs AFTER the guarded advance (so the row is now at T+144-due and won't be re-selected) and discards the dispatch Result with `let _ =`. If the in-app insert fails, the \u00a78.3 notification (the ONLY unreachable notification \u2014 T+144 is silent) is lost with no log and no Sentry.",
+      "recommended_fix": "At minimum log + Sentry-capture an Error from notify_reference_unreachable; consider a small retry or a reconciliation since the T+96 warm-handoff is the sole signal.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "warning",
+      "sources": [
+        "blind",
+        "acceptance"
+      ],
+      "category": "spec-deviation",
+      "title": "Manual-fire handler threads live config.sentry, not spec item 7's pinned sentry_client.Disabled",
+      "location": "server/src/reference_checks/sweep_handler.gleam:33, :40",
+      "evidence": "        send.SendDeps(resend_api_key: config.resend_api_key, twilio: config.twilio, sentry: config.sentry)   // :33\n        ...\n          sentry: config.sentry,   // :40 \u2014 live, not Disabled",
+      "detail": "Spec OWNS #7 explicitly pins `sentry_client.Disabled` for the manual route ('manual runs don't escalate'). The handler uses live config.sentry, so a manual fire to drain broken rows captures row failures to Sentry (potential noise / masks scheduled-tick signals).",
+      "recommended_fix": "Either thread sentry_client.Disabled (match spec) or update the spec item 7 wording to record the decision \u2014 reconcile intent with implementation.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "blind",
+        "acceptance"
+      ],
+      "category": "liveness / observability",
+      "title": "Due-SELECT failure exits 0 ('sweep complete: due=0') \u2014 Sentry captures but Cloud Run sees success",
+      "location": "server/src/reference_checks/sweep.gleam:188-193",
+      "evidence": "    Error(err) -> {\n      capture(sentry, \"\", \"due-select failed: \" <> query_error(err), \"select\")\n      empty_summary(0)   // due=0 -> main() logs 'sweep complete', exits 0",
+      "detail": "AD-15's letter is met (Sentry capture happens), but the job exits successfully so Cloud Run's job-failure alerting/retry won't fire; observability rests entirely on the Sentry event (which is Disabled if SENTRY_DSN is unset).",
+      "recommended_fix": "Consider exiting non-zero (or logging 'sweep FAILED') when the due-SELECT errors, so Cloud Run treats it as a failed tick.",
+      "verification": "confirmed"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "blocker",
+      "sources": [
+        "blind",
+        "edge",
+        "tests"
+      ],
+      "category": "exactly-once / failure-path / liveness",
+      "title": "Persistent guarded-update error silently re-sends every 15 min (AC7 + AD-15 unmet for this path)",
+      "location": "server/src/reference_checks/sweep.gleam:317-321 (also :365-367, :406, :448, :508-511)",
+      "evidence": "step_t0 sends THEN claims:\n    send.send_invite(...)   // line 306 \u2014 invite already sent\n    ...\n    case sql.sweep_claim_t0(...) {\n      Ok(pog.Returned(_, [_])) -> Invited\n      Ok(_) -> StoodDown\n      // A claim query error is transient (the SELECT worked) \u2014 leave the row\n      // queued so the next tick re-sends + re-claims ...\n      Error(_) -> StoodDown      // line 321 \u2014 NO capture, NO mark_failed, row untouched",
+      "detail": "A guarded UPDATE that errors (not 0-row) is swallowed: no Sentry, no `failed`, row stays due. Because sends run before the claim, a row whose UPDATE persistently errors (CHECK/trigger violation, poison data) re-sends its invite/reminder every 15 min forever, silently. Violates AC7 (DB failure -> failed + Sentry) + AD-15 (fail loudly) + exactly-once under failure.",
+      "recommended_fix": "Sentry-capture every guarded-update Error, and either mark_failed on Error or cap consecutive stand-downs (e.g. N retries) before terminalising \u2014 so a poison row escalates instead of looping.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "warning",
+      "sources": [
+        "blind",
+        "edge",
+        "acceptance",
+        "architecture",
+        "codebase"
+      ],
+      "category": "data-quality / audit",
+      "title": "Production attempt-log entries are stamped `at: \"\"` (no real timestamp)",
+      "location": "server/src/reference_checks/sweep.gleam:164, :702-718; server/src/reference_checks/sweep_handler.gleam:39",
+      "evidence": "bootstrap():  Ok(run(db_conn, deps, \"\", sentry, default_batch_limit))   // now_iso=\"\"  (line 164)\nhandler:      sweep.run(config.db, deps, now_iso: \"\", ...)               // (sweep_handler:39)\noutcome_entry stamps #(\"at\", json.string(at)) verbatim \u2014 nothing substitutes now() for the `at` field.",
+      "detail": "Both production entry points pass now_iso=\"\". Every attempts[] entry (and the result JSON re-emit, and the warm-handoff render) gets a blank `at`. Cadence timing itself is unaffected (next_attempt_at uses SQL now()), but the audit/display log loses timestamps. Five independent lenses agreed.",
+      "recommended_fix": "In production paths, compute a real ISO now (bssg_time / a now() helper) and pass it as now_iso, OR have the SQL/encoder stamp `at` from now() when the Gleam value is empty.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "warning",
+      "sources": [
+        "blind",
+        "acceptance",
+        "architecture",
+        "codebase"
+      ],
+      "category": "warm-handoff / correctness-of-render",
+      "title": "Warm-handoff email renders a fabricated single email/reminder_2 entry from the stale pre-advance log",
+      "location": "server/src/reference_checks/sweep.gleam:530-536 (dispatch_warm_handoff)",
+      "evidence": "let attempts =\n    parse_attempts_entries(row.attempts)        // line 530 \u2014 STALE snapshot (pre-advance; this tick's reminder_2 already committed to DB but not in `row`)\n    |> list.append([\n      AttemptEntry(at: now_iso, channel: \"email\", outcome: \"reminder_2\", detail: \"T+96h reminder\"),  // line 534 \u2014 hardcoded 'email' only",
+      "detail": "send_reminder(ReminderTwo) sends on BOTH email and SMS, producing 2 real entries this tick. The render instead appends ONE hardcoded email/reminder_2 entry built from the stale in-memory row, misrepresenting the actual sends to the landlord.",
+      "recommended_fix": "Re-read the row's attempts after the guarded advance (or pass this tick's real `entries`/`outcomes` into dispatch_warm_handoff and merge with the prior log) instead of fabricating the entry.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "warning",
+      "sources": [
+        "blind",
+        "edge",
+        "architecture"
+      ],
+      "category": "warm-handoff / reliability",
+      "title": "Warm-handoff notification can be permanently lost \u2014 dispatch Result discarded, no retry, no Sentry",
+      "location": "server/src/reference_checks/sweep.gleam:555-556; server/src/notification/notification_dispatch.gleam:498-501 (notify_reference_unreachable)",
+      "evidence": "      let _ =\n        notification_dispatch.notify_reference_unreachable(...)   // line 556 \u2014 Result discarded\n      Nil",
+      "detail": "dispatch_warm_handoff runs AFTER the guarded advance (so the row is now at T+144-due and won't be re-selected) and discards the dispatch Result with `let _ =`. If the in-app insert fails, the \u00a78.3 notification (the ONLY unreachable notification \u2014 T+144 is silent) is lost with no log and no Sentry.",
+      "recommended_fix": "At minimum log + Sentry-capture an Error from notify_reference_unreachable; consider a small retry or a reconciliation since the T+96 warm-handoff is the sole signal.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "warning",
+      "sources": [
+        "blind",
+        "acceptance"
+      ],
+      "category": "spec-deviation",
+      "title": "Manual-fire handler threads live config.sentry, not spec item 7's pinned sentry_client.Disabled",
+      "location": "server/src/reference_checks/sweep_handler.gleam:33, :40",
+      "evidence": "        send.SendDeps(resend_api_key: config.resend_api_key, twilio: config.twilio, sentry: config.sentry)   // :33\n        ...\n          sentry: config.sentry,   // :40 \u2014 live, not Disabled",
+      "detail": "Spec OWNS #7 explicitly pins `sentry_client.Disabled` for the manual route ('manual runs don't escalate'). The handler uses live config.sentry, so a manual fire to drain broken rows captures row failures to Sentry (potential noise / masks scheduled-tick signals).",
+      "recommended_fix": "Either thread sentry_client.Disabled (match spec) or update the spec item 7 wording to record the decision \u2014 reconcile intent with implementation.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "warning",
+      "sources": [
+        "tests"
+      ],
+      "category": "coverage-gap (cadence math)",
+      "title": "Cadence offsets (24/24/48/48h) never asserted \u2014 fake-clock pin mechanism exists but tests pass \"\" and re-arm with raw SQL",
+      "location": "server/test/integration/reference_checks_sweep_integration_test.gleam:37, :141-149, :248-260; server/src/reference_checks/sweep.gleam:56-65",
+      "evidence": "run_sweep:  sweep.run(db, no_key_deps(), now_iso: \"\", ...)   // :37 \u2014 lets Postgres default\nrearm_due: UPDATE reference_call SET next_attempt_at = now() - interval '1 hour'  // forces due regardless of offset\nconsts: step_to_co_nudge=24.0, step_to_reminder_1=24.0, step_to_reminder_2=48.0, step_to_terminal=48.0  // :56-65",
+      "detail": "No test pins now_iso to a fake clock and asserts next_attempt_at = created_at + N h after each step. A typo in any offset constant (e.g. 42 instead of 48) ships undetected \u2014 a reminder fires at the wrong time. The math is correct (manually verified), but it is untested.",
+      "recommended_fix": "Add a fake-clock test per step: pin now_iso, run the step, assert the resulting next_attempt_at equals the prior horizon + the expected offset.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "blind",
+        "acceptance"
+      ],
+      "category": "liveness / observability",
+      "title": "Due-SELECT failure exits 0 ('sweep complete: due=0') \u2014 Sentry captures but Cloud Run sees success",
+      "location": "server/src/reference_checks/sweep.gleam:188-193",
+      "evidence": "    Error(err) -> {\n      capture(sentry, \"\", \"due-select failed: \" <> query_error(err), \"select\")\n      empty_summary(0)   // due=0 -> main() logs 'sweep complete', exits 0",
+      "detail": "AD-15's letter is met (Sentry capture happens), but the job exits successfully so Cloud Run's job-failure alerting/retry won't fire; observability rests entirely on the Sentry event (which is Disabled if SENTRY_DSN is unset).",
+      "recommended_fix": "Consider exiting non-zero (or logging 'sweep FAILED') when the due-SELECT errors, so Cloud Run treats it as a failed tick.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "blind"
+      ],
+      "category": "observability",
+      "title": "mark_failed writes only the generic 'sweep_processing_error' slug to terminal_reason \u2014 specific reason is Sentry-only",
+      "location": "server/src/reference_checks/sweep.gleam:587",
+      "evidence": "      let _ = sql.sweep_mark_failed(db, row_uuid, reason_processing_error)   // constant, not the per-call `reason`",
+      "detail": "The caller's specific reason (bad id / out-of-range) reaches the Sentry message but the DB terminal_reason is always the same slug, making DB-side triage less specific.",
+      "recommended_fix": "Pass the specific reason (or a narrower slug) to sweep_mark_failed, or document that terminal_reason is intentionally a single slug.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "blind"
+      ],
+      "category": "spec-wording",
+      "title": "Draft detection for '{}' deviates from Dev Note 5's literal wording (code: empty decoded map -> unreachable)",
+      "location": "server/src/reference_checks/sweep.gleam has_draft_answers() (~:665); spec Dev Note 5",
+      "evidence": "Dev Note 5: draft_answers non-empty (!= '' AND != 'null') -> partial\ncode: has_draft_answers = !dict.is_empty(questions.decode_draft(row.draft_answers))  // '{}' decodes to empty map -> False -> unreachable",
+      "detail": "A draft_answers of '{}' (form opened, no answers saved) is a non-empty string per Dev Note 5 (-> partial) but decodes to an empty map in code (-> unreachable). Code behavior is arguably more sensible; reconcile the wording.",
+      "recommended_fix": "Update Dev Note 5 to 'non-empty decoded answer map' or make the gate match the literal string check.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "tests"
+      ],
+      "category": "coverage-gap",
+      "title": "awaiting_correction exclusion untested (only objected + taken-over pinned)",
+      "location": "server/test/integration/reference_checks_sweep_integration_test.gleam (objected_terminal_not_reswept_test, taken_over_row_skipped_test)",
+      "evidence": "Only 'objected' and taken_over seeds exist; no awaiting_correction seed asserts the NULL next_attempt_at + status exclusion.",
+      "detail": "awaiting_correction is excluded by construction (status not in queued/contact_initiated AND NULL next_attempt_at), but no test pins it; a future change to the due-SELECT could silently re-select such rows.",
+      "recommended_fix": "Add a seed at status='awaiting_correction' with a past next_attempt_at and assert it is not selected.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "tests"
+      ],
+      "category": "coverage-gap",
+      "title": "Guarded-update concurrent race + 0-row StoodDown path untested (only sequential retry)",
+      "location": "server/test/integration/reference_checks_sweep_integration_test.gleam:257-283; sweep.gleam:317,365,406,448,508",
+      "evidence": "no_duplicate_t0_across_retry_test runs the sweep twice sequentially; the 0-row Ok(_) -> StoodDown branch is never exercised by any test.",
+      "detail": "The SQL WHERE attempt_count=$n guard makes a concurrent double-advance impossible at the DB level (so the invariant holds), but the Gleam StoodDown branch has zero coverage. A flaky concurrent test is impractical; a targeted 0-row assertion would pin the branch.",
+      "recommended_fix": "Add a test that pre-advances a row then runs the sweep, asserting StoodDown (0-row) with no second send.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "codebase"
+      ],
+      "category": "DRY",
+      "title": "sweep.gleam duplicates result.gleam's {at,channel,outcome,detail} attempt decoder",
+      "location": "server/src/reference_checks/sweep.gleam:725-745 (parse_attempts_entries + attempt_decoder); server/src/reference_checks/result.gleam:489-522",
+      "evidence": "Both modules define a decode.list decoder for the same AttemptEntry shape; messages.AttemptEntry is the shared type but no shared decoder.",
+      "detail": "Two copies of the same decoder for the same JSONB shape; a future schema change must be edited in both.",
+      "recommended_fix": "Hoist one attempt_decoder into messages.gleam (next to AttemptEntry) and import it from both.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "codebase"
+      ],
+      "category": "DRY",
+      "title": "standard_sender const duplicated verbatim (send.gleam and notification_dispatch.gleam)",
+      "location": "server/src/reference_checks/send.gleam:34; server/src/notification/notification_dispatch.gleam:18",
+      "evidence": "const standard_sender: String = \"RightTenantry <noreply@app.righttenantry.ie>\"  // identical in both modules",
+      "detail": "Same sender string defined in two modules; a sender change must be edited in both.",
+      "recommended_fix": "Define the sender once (a shared notification consts module, or have notification_dispatch import send's) and reuse.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "codebase"
+      ],
+      "category": "DRY / consistency",
+      "title": "sweep.gleam re-implements messages.first_name (subtly different: no string.trim)",
+      "location": "server/src/reference_checks/sweep.gleam:686-691; server/src/reference_checks/messages.gleam:139-144",
+      "evidence": "messages.first_name: case string.split(string.trim(name), \" \") { [first,..]->first; []->name }\nsweep.first_name:    case string.split(full, \" \") { [first,..]->first; _->full }  // no trim",
+      "detail": "messages.first_name is already public and used by the send helpers; sweep rolls its own that skips the trim, so leading whitespace yields an empty first token.",
+      "recommended_fix": "Call messages.first_name from sweep instead of the local copy.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": [
+        "security"
+      ],
+      "category": "test-hygiene",
+      "title": "Integration-test helpers build SQL by raw string concatenation of row ids",
+      "location": "server/test/integration/reference_checks_sweep_integration_test.gleam:127 (and :98-99, :135-189)",
+      "evidence": "\"SELECT status::text FROM reference_call WHERE id = '\" <> row_id <> \"'\"",
+      "detail": "row_ids originate from DB RETURNING (controlled UUIDs, not user input), so there is no real injection vector. The pattern is inconsistent with the parameterised pog.query used for the inserts in the same file.",
+      "recommended_fix": "Use pog.parameter(pog.text(row_id)) for the assertion helpers to match the rest of the test and avoid the pattern spreading.",
+      "verification": "confirmed"
+    }
+  ]
+}

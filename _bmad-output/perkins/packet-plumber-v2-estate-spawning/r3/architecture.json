@@ -1,0 +1,32 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "memory",
+    "title": "strict_spawn_class frees temp-allocator slices via delete() — 134 bad frees per test run",
+    "location": "core/growth_test.odin:527-528,556-557",
+    "evidence": "core/growth_test.odin:527-528:\n\tparent := make([]i32, n, context.temp_allocator)\n\tdefer delete(parent)\ncore/growth_test.odin:556-557:\n\tsize := make([]i32, n, context.temp_allocator)\n\tdefer delete(size)\nEmpirical: `odin test core` emits 67× \"+++ bad free @ 0x… [growth_test.odin:528:strict_spawn_class()]\" and 67× \"…[:557:strict_spawn_class()]\" (134 total). Root cause reproduced in a scratch Odin test: `delete` on a plain slice frees through context.allocator, not the temp allocator make() used; the codebase's own convention (group_cluster_view_build, core/growth.odin:196-198) uses [dynamic] arrays whose delete frees via the stored allocator and produces zero bad frees.",
+    "detail": "Every strict_spawn_class call frees slices through the wrong allocator — invalid frees the test tracking allocator rejects, flooding each run with 134 bad-free diagnostics that can mask genuine memory defects. Tests still pass only because the temp allocator is arena-reset.",
+    "recommended_fix": "Use make([dynamic]i32, n, n, context.temp_allocator) + delete (stored-allocator free, mirroring group_cluster_view_build), or free via free(raw_data(parent), context.temp_allocator) instead of delete()."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "Seed-floor diameter check uses w²+h² but valid tiles span [0,w-1]×[0,h-1] — seed 49 loads yet permanently stalls growth",
+    "location": "core/catalog.odin:1016-1018",
+    "evidence": "core/catalog.odin:1016-1018:\n\t\tif i64(b.growth_groups.new_area_seed_tiles)*i64(b.growth_groups.new_area_seed_tiles) >=\n\t\t\ti64(b.map_w_tiles)*i64(b.map_w_tiles) + i64(b.map_h_tiles)*i64(b.map_h_tiles) {\n\t\t\treturn {\"balance.json\", \"growth_groups.new_area_seed_tiles\", \"must be < the map diameter (w² + h² — an absurd seed floor would stall every growth window)\"}\ncore/growth.odin:349-352 (the position bounds the diameter must respect):\n\tif pos[0] < 0 || pos[0] >= bal.map_w_tiles {\n\t\treturn false\n\t}\n\tif pos[1] < 0 || pos[1] >= bal.map_h_tiles {\n\t\treturn false\n\t}\nArithmetic on the default 40×30 map: loader rejects only seed ≥ √2500 = 50; true max spacing between valid tiles is √(39²+29²) = √2362 ≈ 48.6. seed_tiles = 49 passes load (2401 < 2500) but 49² = 2401 > 2362 — growth_seed_sep_ok can never pass once any terminal exists.",
+    "detail": "The check exists to fail-fast exactly this stall (its own comment: \"could never be cleared by any candidate … silently stall growth forever\"), yet seed_tiles=49 on the default map slips through: after the first vacuous spawn, every window exhausts the rejection budget and growth stalls silently. The gap widens on squarer maps (e.g. 10×10: seed 14 loads, max spacing ≈12.7).",
+    "recommended_fix": "Bound by the valid-tile diagonal: reject when seed² > (map_w_tiles-1)² + (map_h_tiles-1)²; re-pin the loader rows so 49 rejects on the 40×30 fixture (48 stays valid)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "coupling",
+    "title": "growth_groups seed-floor validated inside the map block — cross-block ordering dependency with no structural enforcement",
+    "location": "core/catalog.odin:1009-1016",
+    "evidence": "core/catalog.odin:1009-1016:\n\t\t// 08-21 (the estate ruling): the new-area seed floor must also be < the\n\t\t// MAP DIAMETER — checked HERE, after the map dims load (the growth_groups\n\t\t// block parses earlier). An absurd floor (>= the map's widest possible\n\t\t// spacing) could never be cleared by any candidate, so EVERY growth\n\t\t// window would exhaust the 8-attempt rejection budget and silently\n\t\t// stall growth forever. Fail-fast naming the key (ODN-5): seed² < w² + h²\n\t\t// in i64 (the tile distance must never wrap).\n\t\tif i64(b.growth_groups.new_area_seed_tiles)*i64(b.growth_groups.new_area_seed_tiles) >=",
+    "detail": "A growth_groups key is validated 100 lines from its block, correct only because earlier growth_groups checks return early. If block parsing is ever reordered, the check silently reads the zero-value (0² < 2500 → passes) and becomes dead stall protection.",
+    "recommended_fix": "Hoist cross-key bounds into a post-parse validation pass at the end of balance loading, where all fields are provably populated; keep the explanatory comment."
+  }
+]

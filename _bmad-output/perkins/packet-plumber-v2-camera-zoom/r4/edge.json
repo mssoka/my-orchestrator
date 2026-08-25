@@ -1,0 +1,62 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "test-hygiene",
+    "title": "CARRY-FORWARD r3-W2: pullback_yields app7 leg still drives effect_settings_adjust on a zeroed App - settings_save_app writes the dev's real HOME dotfile on every native test run",
+    "location": "app/pullback_test.odin:281-287 + app/settings.odin:241-247",
+    "evidence": "app7: App\n\tpullback_test_app(&app7)\n\tdefer pp.run_destroy(&app7.state)\n\tdefer pp.catalogs_destroy(&app7.cat)\n\tarm_pullback(&app7)\n\teffect_settings_adjust(&app7, &app7.input, rnd.SETTINGS_ROW_PULLBACK, 0)\n--- settings.odin ---\nsettings_save_app :: proc(app: ^App) {\n\tp := app.settings_path_override\n\tif p == \"\" {\n\t\tp = settings_path()\n\t}\n\tsettings_save_at(p, app.a11y)\n}",
+    "detail": "The zeroed fixture leaves settings_path_override empty, so the toggle persists auto_pullback=OFF to the real ~/.pp-settings.bin — the exact write settings_save_app's own comment forbids. Deterministic, not hypothetical.",
+    "recommended_fix": "Set app7.settings_path_override to a temp path (the exec-level adjust-test pattern) before effect_settings_adjust; delete the temp on exit."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "CARRY-FORWARD r3-W3: pullback_feed caps the spawn-event mapping at ids[8] - a frame with 9+ NODE_SPAWNED events hits found != n_spawns and silently skips the pullback",
+    "location": "app/main.odin:1646-1649 + app/render/camera.odin:101-108",
+    "evidence": "\tids: [8]u32\n\tfound := rnd.camera_newest_terminals(&app.state.topology, n_spawns, ids[:])\n\tif found != n_spawns {\n\t\treturn // defensive — every spawn event has a live terminal by construction\n\t}\n--- camera.odin ---\n\tfor id := topo.next_node_id; id > 0 && found < n; id -= 1 {\n\t\tif int(found) >= len(ids) {\n\t\t\tbreak\n\t\t}",
+    "detail": "camera_newest_terminals breaks at len(ids)=8, found returns 8 != n_spawns, and the whole frame's seeds are dropped with no log. Unreachable at interval 80, but the interval is balance.json data.",
+    "recommended_fix": "Clamp n_spawns to the buffer size and map the OLDEST 8 (newest-first walk order keeps a truncated mapping correct for the newest seed), or size the buffer to the max same-frame spawns."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "data-invariant",
+    "title": "CARRY-FORWARD r3-W4: the same-window exclusion's correctness still silently depends on terminal_spawn_interval_ticks exceeding the per-frame tick cap - no assertion anywhere",
+    "location": "app/main.odin:1654-1655 + core/growth.odin:522",
+    "evidence": "\twindow_lo := ids[n_spawns - 1]\n\twindow_hi := ids[0] + 1\n--- growth.odin ---\n\t// (terminal_spawn_interval_ticks — 80 = 4 s @ 20 Hz, the 2× reduction).",
+    "detail": "At interval <= ticks-per-frame two spawns share a frame; the frame-level exclusion then hides the first spawn from the second's classification, diverging view SEED detection from plan-time. Inert today, wrong when the data knob moves.",
+    "recommended_fix": "Assert the invariant where balance loads (interval > max ticks per frame), or derive the exclusion window from the interval instead of the frame slice."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "state",
+    "title": "CARRY-FORWARD r3-N10: wheel residue advances in poll_mouse before the ownership decision - notches consumed as Noc_Scroll/Blocked pre-charge the accumulator",
+    "location": "app/input/poll.odin:83-90",
+    "evidence": "\tif w := rl.GetMouseWheelMove(); w != 0 {\n\t\tnotch, residue := wheel_accumulate(inp.wheel_accum, w)\n\t\tinp.wheel_accum = residue\n\t\tif notch != 0 {\n\t\t\tappend(&inp.events, Device_Event(Mouse_Wheel{delta = notch, pos = pos}))\n\t\t}\n\t}",
+    "detail": "The only residue write is the poll; a notch scrolled over the NOC panel or blocked by the modal leaves residue 0.2-0.9 armed, so the first map wheel afterwards fires one notch early. Cosmetic bias, never spontaneous.",
+    "recommended_fix": "Reset wheel_accum to 0 when the policy consumes a notch as Noc_Scroll or Blocked, or document the carry as accepted."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "latch-loop",
+    "title": "CARRY-FORWARD r3-N1: the stale-latch guard appends a synthetic Mouse_Release without clearing inp.panning - with placement armed the pan branch is gated off and a release is synthesized every frame",
+    "location": "app/input/poll.odin:97-106 + app/input/mouse.odin:373",
+    "evidence": "\t} else if pan_latch_stale(inp.panning, rl.IsMouseButtonDown(.LEFT)) {\n\t\t// ... the mapping clears the latch on release; this synthesizes the missing\n\t\t// edge at the real device state ...\n\t\tappend(&inp.events, Device_Event(Mouse_Release{pos = pos, button = .Left}))\n\t}\n--- mouse.odin ---\n\t\t} else if inp.panning && !drag_eff && placing_eff < 0 {",
+    "detail": "The only latch-clearing path (pan branch) requires placing_eff < 0; a stranded latch plus an armed placement (pad tray arm + missed release) emits a synthetic release every frame, feeding Place_Release intents repeatedly.",
+    "recommended_fix": "Clear inp.panning inside the stale-guard branch before appending the synthesized release — the release's purpose is closing the latch."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "input-validation",
+    "title": "CARRY-FORWARD r3-N9: the Pan executor case still has no drag guard - a two-finger pan fires mid touch-draw and pans the camera under the live gesture",
+    "location": "app/input/exec.odin:259-267",
+    "evidence": "\tcase Pan:\n\t\t// the camera-pan intent — two-finger touch (touch_map) OR the mouse\n\t\t// empty-ground drag (mouse_map's pan branch). ...\n\t\tif inp.on_pan != nil {\n\t\t\tinp.on_pan(inp.user, inp, v.dx, v.dy)\n\t\t}",
+    "detail": "mouse_map emits Pan only when !drag_eff; the executor routes every Pan unconditionally, so a second finger during a touch draw pans mid-gesture (preview re-snaps; commit uses node ids — worst case jitter). The new comment still doesn't declare co-fire intent.",
+    "recommended_fix": "Either suppress Pan while inp.drag.active in the executor or extend the case comment to declare the co-fire intentional."
+  }
+]

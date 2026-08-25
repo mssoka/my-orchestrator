@@ -1,0 +1,82 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "doc-code-mismatch",
+    "title": "Reduced-motion placement highlight is dropped entirely, contradicting the 'highlight steady' claim in three places",
+    "location": "app/render/spawn_fx.odin:spawn_fx_draw_highlight",
+    "evidence": "+// alpha, the reveal is instant (no scale/fade), the highlight is steady.\n+// Reduced-motion pins the steady band.\n+spawn_fx_draw_highlight :: proc(v: ^View, topo: ^pp.Topology, tick: u64) {\n+\tif v.reduced_motion {\n+\t\treturn",
+    "detail": "The proc returns before drawing anything under reduced motion, yet the file header, the proc comment, and the PR body all promise a steady highlight (E9.2 'presence, not motion'). The placement feedback is silently absent.",
+    "recommended_fix": "Draw the band at a fixed full alpha when v.reduced_motion (skip only the fade), or amend the PR body and both comments to state the highlight is disabled under reduced motion."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "rendering-inconsistency",
+    "title": "Reveal fades the type-chip hairline through DrawRectangleLinesEx — violating the diff's own rlsw line-alpha rule",
+    "location": "app/render/view.odin:draw_type_chip",
+    "evidence": " \t// the paper chip + ink hairline (full-alpha — the rlsw line-alpha trap)\n-\tout.a = 255\n-\trl.DrawRectangleLinesEx({x0, y0, cw, ch}, max(1.0, s * 0.02), out)\n+\tout.a = u8(255 * fade)\n+\trl.DrawRectangleLinesEx({x0, y0, cw, ch}, max(1.0, s * 0.02 * reveal_scale), out)",
+    "detail": "During the reveal fade<1 feeds partial alpha into a LINE primitive. Per this diff's own repeated rule, the rlsw software renderer ignores line alpha, so golden captures render a solid hairline while the GPU app fades it.",
+    "recommended_fix": "Keep out.a = 255 for the hairline (fade only the fills), or replace DrawRectangleLinesEx with thin filled quads so the fade survives the software renderer."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "memory-hygiene",
+    "title": "run_destroy deletes temp-arena shadow arrays — the same invalid-free pattern this PR removes from strict_spawn_class",
+    "location": "app/render/spawn_fx.odin:spawn_fx_predict",
+    "evidence": "+\tshadow := shadow_clone(state, context.temp_allocator)\n+\tdefer pp.run_destroy(&shadow)\n+\t// TEMP allocator — the `defer delete`s were invalid frees (the temp arena\n \tparent := make([]i32, n, context.temp_allocator)\n-\tdefer delete(parent)",
+    "detail": "shadow_clone allocates every shadow array from context.temp_allocator, then run_destroy deletes them — exactly the 'temp arena owns the memory' bad-free pattern the W2 fold eliminates. The clone test repeats it; bad-free counts are only quoted for core.",
+    "recommended_fix": "Check app/render tracker output; clone with context.allocator so run_destroy is legitimate, or skip run_destroy for temp-allocated shadows, mirroring the W2 fold."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Unreachable dedup reset inside the lead > SPAWN_LEAD_TICKS early return",
+    "location": "app/render/spawn_fx.odin:spawn_fx_predict",
+    "evidence": "+\tif lead > SPAWN_LEAD_TICKS {\n+\t\tif fx.predicted_window == window {\n+\t\t\tfx.predicted_window = 0\n+\t\t}\n+\tif !force && fx.predicted_window == window && fx.predicted_gen == state.topology.gen {\n+\tfx.predicted_window = window",
+    "detail": "predicted_window is only ever assigned while lead <= SPAWN_LEAD_TICKS for that same window; the reset sits behind lead > SPAWN_LEAD_TICKS, so predicted_window == window can never hold there. Unreachable by construction.",
+    "recommended_fix": "Delete the dead reset block, or implement the intended rollover where the telegraph timeline actually expires."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "spawn_fx_init and spawn_fx_destroy are never called — only spawn_fx_reset is wired",
+    "location": "app/render/spawn_fx.odin:spawn_fx_init",
+    "evidence": "+spawn_fx_init :: proc(fx: ^Spawn_FX, allocator := context.allocator) {\n+spawn_fx_destroy :: proc(fx: ^Spawn_FX) {\n+\trnd.spawn_fx_reset(&app.view.spawn_fx)\n+\trnd.spawn_fx_reset(&rc.view.spawn_fx)",
+    "detail": "No call site exists for either proc; the app and harness only call spawn_fx_reset, so reveals grows from nil via append and the capacity-4 pre-allocation plus cleanup never run.",
+    "recommended_fix": "Wire spawn_fx_init/spawn_fx_destroy into the View lifecycle, or delete both procs and rely on append-from-nil plus the per-run reset."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "comment-accuracy",
+    "title": "Dem comment misstates the t82 reveal envelope (~0.75/~0.8 vs actual ~0.49/~0.41)",
+    "location": "demos/spawn_feel.dem:1521",
+    "evidence": "+#   4100 ms (t82)  — reveal mid-envelope (scale ~0.75, fade ~0.8)\n+\t\tk := f32(tick - r.spawn_tick) / f32(SPAWN_REVEAL_TICKS)\n+\t\te := smoothstep01(k)\n+\t\treturn 0.4 + 0.6 * e, 0.3 + 0.7 * e, true",
+    "detail": "At t82 the reveal age is 2 of 8 ticks: k=0.25, smoothstep 0.156, giving scale ~0.49 and fade ~0.41 — not the quoted '~0.75, ~0.8', which matches roughly t85.",
+    "recommended_fix": "Correct the 4100ms comment to scale ~0.49 / fade ~0.41, or move that capture to 4400ms if the quoted envelope was the intent."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "comment-accuracy",
+    "title": "Test comment says '2 tiles from the fixture router' — (13,10) to (12,10) is 1 tile",
+    "location": "app/render/spawn_fx_test.odin:test_spawn_fx_predict_pending_commands",
+    "evidence": "+\t// negative\"): an OUT-OF-SEPARATION pending place (2 tiles from the\n+\t// fixture router - below the 4-tile router_router floor) is rejected by\n+\tpp.topology_spawn_node(&s.topology, rt, {12, 10}, cat)    // id 1\n+\tbad := []pp.Command{{kind = pp.Cmd_Place_Router{type_idx = rt_idx, pos = {13, 10}}, apply_tick = 77}}",
+    "detail": "The bad place (13,10) is 1 tile from the fixture router at (12,10), not 2; the assertion message '(2 < 4)' repeats the error. The rejection conclusion still holds either way.",
+    "recommended_fix": "Fix the comment and assert message to say 1 tile, or move the bad place to a genuine 2-tile offset if that was intended."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "perf-nit",
+    "title": "Ring table copied per segment inside the draw loop",
+    "location": "app/render/spawn_fx.odin:draw_ring_annulus",
+    "evidence": "+\tfor i in 0 ..< SPAWN_RING_SEGS {\n+\t\ttable := SPAWN_RING_TABLE // local copy — a constant can't be indexed by a runtime index",
+    "detail": "The 36x2 f32 table is copied inside the per-segment loop — 36 copies per annulus, two annuli per ring, every frame in the raster path. One hoisted copy per call suffices.",
+    "recommended_fix": "Hoist 'table := SPAWN_RING_TABLE' above the for loop; the runtime-index workaround needs only a single stack copy per call."
+  }
+]

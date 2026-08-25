@@ -1,0 +1,52 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "determinism",
+    "title": "RngRange signed-overflow UB for spans > 2^31 violates the ODN-10 well-defined-math contract the header itself claims",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Rng.h:84",
+    "evidence": "PP_Rng.h:75-76:\n// The span is computed in int64 (NOT int32) so spans > INT32_MAX don't\n// overflow (ODN-10: integer math must be well-defined on every target).\nPP_Rng.h:83-84:\n\tconst uint64_t Span = static_cast<uint64_t>(static_cast<int64_t>(Hi) - static_cast<int64_t>(Lo)) + 1;\n\treturn Lo + static_cast<int32_t>((static_cast<uint64_t>(RngNext(R)) * Span) >> 32);\nUBSan run against the header (g++ -std=c++17 -fsanitize=undefined): \nSource/PacketPlumberCore/Public/PacketPlumberCore/PP_Rng.h:84:12: runtime error: signed integer overflow: -2147483648 + -355689187 cannot be represented in type 'int32_t' (aka 'int')\nspine_check.cpp:110 exercises the same call:\n\t\tconst int32_t Wide = PP::RngRange(F, INT32_MIN, INT32_MAX);",
+    "detail": "For spans > 2^31 the draw can exceed INT32_MAX; the int32_t cast wraps negative and Lo + negative overflows — UB the spine explicitly forbids. spine_check.cpp:110 exercises this exact span; it passes only via benign wrap.",
+    "recommended_fix": "Do the add-back in int64 and cast once: return static_cast<int32_t>(static_cast<int64_t>(Lo) + ((static_cast<uint64_t>(RngNext(R)) * Span) >> 32)); — result is always value-preserving, UB-free."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "tech-debt",
+    "title": "StateHash's fixed 64-byte stack buffer silently degrades to a constant hash once slice-1 grows serialization past 64 bytes",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:75-79",
+    "evidence": "PP_Sim.h:41-45:\n\tconst size_t Needed = 4 + 4 + 8 + 8 + 4 + 8 + 8 + 1;\n\tif (OutCapacity < Needed)\n\t{\n\t\treturn 0;\n\t}\nPP_Sim.h:75-80:\ninline uint64_t StateHash(const FSimState &State)\n{\n\tuint8_t Buffer[64];\n\tconst size_t N = SerializeState(State, Buffer, sizeof(Buffer));\n\treturn Fnv1a64(Buffer, N);\n}",
+    "detail": "Slice-1 adds topology/packet pools to the state; once Needed > 64, SerializeState returns 0 and every state hashes to FNV64_OFFSET. Replay-equality still 'passes'; only divergence tests catch it, indirectly and confusingly.",
+    "recommended_fix": "Tie buffer size to the format: one shared constexpr (e.g. PP_SERIALIZED_STATE_MAX) used by SerializeState's Needed and StateHash's buffer, or make StateHash fail loudly when SerializeState returns 0."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "coupling",
+    "title": "PacketPlumberEditor declares an unused UnrealEd dependency",
+    "location": "Source/PacketPlumberEditor/PacketPlumberEditor.Build.cs:15",
+    "evidence": "PacketPlumberEditor.Build.cs:10-17:\n\t\tPublicDependencyModuleNames.AddRange(new string[]\n\t\t{\n\t\t\t\"Core\",\n\t\t\t\"CoreUObject\",\n\t\t\t\"Engine\",\n\t\t\t\"UnrealEd\",\n\t\t\t\"PacketPlumberCore\",\n\t\t});\nAll includes in the module:\nSource/PacketPlumberEditor/PPProbeCommandlet.h:15:#include \"Commandlets/Commandlet.h\"\nSource/PacketPlumberEditor/PPProbeCommandlet.cpp:11:#include \"Misc/FileHelper.h\"\nSource/PacketPlumberEditor/PPProbeCommandlet.cpp:12:#include \"Misc/Paths.h\"",
+    "detail": "Nothing in the module includes UnrealEd headers (UCommandlet is Engine; FileHelper/Paths are Core). The heavyweight editor dependency adds build cost and coupling the headless commandlet module does not need.",
+    "recommended_fix": "Drop UnrealEd from PublicDependencyModuleNames; re-add only when a real UnrealEd include lands (future editor toolset wrappers)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "docs",
+    "title": "CoreTests module comment mislabels the module type as 'Developer' while the uproject declares UncookedOnly",
+    "location": "Source/PacketPlumberCoreTests/PacketPlumberCoreTests.cpp:1-2",
+    "evidence": "PacketPlumberCoreTests.cpp:1-2:\n// PacketPlumberCoreTests — the automation-test module (Developer type:\n// loads in editor + commandlet targets, never ships in the game).\nPacketPlumberUE.uproject:18-19:\n\t\t\t\"Name\": \"PacketPlumberCoreTests\",\n\t\t\t\"Type\": \"UncookedOnly\",",
+    "detail": "Declared type is UncookedOnly, not Developer — and Developer-type modules DO load in packaged Development builds. The mislabel misleads future module-type decisions about where the tests can load.",
+    "recommended_fix": "Fix the comment to state UncookedOnly (loads in editor and uncooked targets, never cooked/shipped)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "coupling",
+    "title": "Golden-probe JSON schema is defined independently in three places",
+    "location": "tests/spine_check.cpp:252",
+    "evidence": "tests/spine_check.cpp:252:\n\t\tstd::printf(\"{\\\"seed\\\":42,\\\"ticks\\\":100,\\\"tick_nonce\\\":%u,\\\"state_hash\\\":\\\"%016llx\\\",\\\"rng_first4\\\":[%u,%u,%u,%u],\\\"save_magic\\\":\\\"PPUE\\\",\\\"save_version\\\":1}\\n\",\nPPProbeCommandlet.cpp:89-91:\n\t\tconst FString Json = FString::Printf(\n\t\t\tTEXT(\"{\\\"seed\\\":%llu,\\\"ticks\\\":%d,\\\"tick_nonce\\\":%u,\\\"state_hash\\\":\\\"%016llx\\\",\\\"rng_first4\\\":[%u,%u,%u,%u]\"\n\t\t\t\t\t \",\\\"save_magic\\\":\\\"PPUE\\\",\\\"save_version\\\":1}\\n\"),\nscripts/compare-golden.sh:32:\nKEYS = (\"seed\", \"ticks\", \"tick_nonce\", \"state_hash\", \"save_magic\", \"save_version\", \"rng_first4\")",
+    "detail": "The cross-runner contract schema lives in spine_check.cpp, PPProbeCommandlet.cpp, and compare-golden.sh KEYS. Adding a field requires three synchronized edits; drift surfaces only as a gate-7 mismatch (engine-gated).",
+    "recommended_fix": "Emit the probe JSON from one shared spine-header helper (both runners compile the same headers by design), or document the KEYS tuple as the canonical schema."
+  }
+]

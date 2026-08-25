@@ -1,0 +1,42 @@
+[
+  {
+    "source": "security-a",
+    "severity": "blocker",
+    "category": "boundary",
+    "title": "Demo unlock CTA on v-harbour fires a real payment_api.check_consent request (payment surface is NOT hidden in demo)",
+    "location": "client/src/client.gleam:3650",
+    "evidence": "client.gleam:3650-3656:\n    msg.UserClickedPayCheckout(vid) ->\n      case model.checkout_loading, model.unlock_consent_modal_open {\n        Some(_), _ | _, Some(_) -> #(model, effect.none())\n        None, None -> #(\n          Model(..model, checkout_loading: Some(vid)),\n          payment_api.check_consent(vacancy_id: vid, on_response: fn(res) {\n            msg.ApiReturnedConsentCheck(vid, res)\n          })\n\nleaderboard_view.gleam:160: `        view_vacancy_unlock_cta(v, model.checkout_loading, model.pricing),` and :601-602 `case v.is_paid, unscored_count > 0 {` / `False, True ->` (renders the unlock-vacancy-btn with `event.on_click(msg.UserClickedPayCheckout(v.id))`).\n\ndemo_store.gleam:283: `\"a-ciara\" -> Some(analysis_pending(\"an-ciara\", app_id))` — v-harbour is_paid=false with 0 analysed of 1 application, so unscored_count=1 and the CTA renders. demo_update.gleam does not intercept UserClickedPayCheckout (grep finds no match); its fallthrough is `_ -> fallback(model, msg)`.",
+    "detail": "The PR body claims 'payment surfaces are hidden in demo ... no unlock CTAs appear' — false: the Harbour vacancy leaderboard renders the unlock CTA, and clicking it issues a real network request to the live consent-check endpoint. Violates the 'no Stripe endpoint invocation from demo mode' scope guard. A logged-in landlord's session cookie would even make it succeed.",
+    "recommended_fix": "Intercept UserClickedPayCheckout (and UserConfirmedUnlockConsent) in demo_update.handle as no-ops, or gate view_vacancy_unlock_cta on !model.demo_mode."
+  },
+  {
+    "source": "security-a",
+    "severity": "blocker",
+    "category": "boundary",
+    "title": "Sweep-nudge 'Mark all as Rejected' and select-mode 'Mark selected rejected' issue a real bulk-reject POST from demo mode",
+    "location": "client/src/client.gleam:4841",
+    "evidence": "client.gleam:4841-4859:\n    UserClickedMarkAllRejected(vid) ->\n      case model.application_detail {\n        Success(detail) -> {\n          let ids =\n            sweep_nudge_banner.open_ids(detail.application, model.leaderboard)\n          case ids {\n            [] -> #(model, effect.none())\n            _ -> #(\n              Model(..model, bulk_reject_loading: True),\n              application_api.bulk_reject_applications(\n                vid,\n                ids,\n                \"sweep_nudge\",\n                model.csrf_token,\n                ApiReturnedBulkReject,\n              )\n\n(same for UserClickedMarkSelectedRejected at :4862-4877 with application_api.bulk_reject_applications). No demo_mode branch in either arm, and demo_update.gleam intercepts neither message (fallthrough `_ -> fallback(model, msg)`). Reachability: application_detail.gleam:127-144 renders the banner with no demo guard (`sweep_nudge_banner.view(...)` via `show_sweep`); banner buttons dispatch the messages (sweep_nudge_banner.gleam:144 `event.on_click(msg.UserClickedMarkAllRejected(vacancy_id))`, select_mode_action_bar.gleam:67 `event.on_click(msg.UserClickedMarkSelectedRejected(vacancy_id))`).",
+    "detail": "Approving a demo applicant (demo-handled) then returning to their detail page shows the sweep-nudge banner (v-maples has non-terminal under_review/submitted entries). Clicking either bulk-reject action sends a real POST to the live bulk-reject endpoint with csrf 'demo-csrf-token'. Server-side CSRF blocks it, but demo mode provably issues a write attempt to a real endpoint — breaking the acceptance pillar.",
+    "recommended_fix": "Intercept UserClickedMarkAllRejected and UserClickedMarkSelectedRejected in demo_update.handle (mutate the store like demo_status), or add demo_mode branches in the two update_inner arms."
+  },
+  {
+    "source": "security-a",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "Closing a demo vacancy surfaces the 'Extend for €99' button, whose click fires a real payment_api.check_consent / create_extension_checkout call",
+    "location": "client/src/pages/vacancy_detail.gleam:369",
+    "evidence": "vacancy_detail.gleam:367-372 (view_actions_closed):\n    False -> [\n      view_extend_button(v.id, is_extending, any_loading),\n      view_archive_button_primary(v.id, is_archiving, any_loading),\n    ]\nand view_extend_button dispatches `event.on_click(msg.UserClickedExtendVacancy(vacancy_id))` (:402). client.gleam:3845-3856:\n    msg.UserClickedExtendVacancy(vid) ->\n      ...\n        None, None -> #(\n          Model(..model, extension_checkout_loading: Some(vid)),\n          payment_api.check_consent(vacancy_id: vid, on_response: fn(res) {\n            msg.ApiReturnedExtensionConsentCheck(vid, res)\n          }),\nNeither UserClickedExtendVacancy nor UserConfirmedExtensionConsent is intercepted by demo_update.gleam. demo_update handles UserConfirmedCloseVacancy (store mutation), so a demo user can close The Maples and reach the closed-not-archived state where the extend button renders.",
+    "detail": "Two-click path in demo (close vacancy, then Extend) reaches a live Stripe-related endpoint with the demo CSRF token. Server rejects it, but it is another real endpoint contact from demo mode that the CI grep lint (demo/ modules only) cannot catch.",
+    "recommended_fix": "Intercept UserClickedExtendVacancy / UserConfirmedExtensionConsent in demo_update.handle as no-ops (or hide view_extend_button when model.demo_mode)."
+  },
+  {
+    "source": "security-a",
+    "severity": "note",
+    "category": "defense-in-depth",
+    "title": "Demo seeds a literal csrf_token \"demo-csrf-token\"; server-side CSRF rejection is the only barrier for the leaked write paths above",
+    "location": "client/src/client.gleam:enter_demo",
+    "evidence": "From the diff (enter_demo in client.gleam):\n          auth: Success(landlord),\n          csrf_token: \"demo-csrf-token\",\n          demo_mode: True,\n          demo_store: Some(store),",
+    "detail": "Harmless in itself (the token can never match a real session, so the leaked bulk-reject/checkout POSTs fail closed server-side), but it means the demo's no-write guarantee rests entirely on server middleware rather than client-side gating. Worth a comment cross-reference or the demo_update interceptions above.",
+    "recommended_fix": "No code change required once findings 1-3 are intercepted client-side; optionally document that the sentinel token is deliberate fail-closed design."
+  }
+]

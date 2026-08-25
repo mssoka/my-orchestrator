@@ -1,0 +1,32 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "input-validation",
+    "title": "decline_reason free text has no server-side bound — unauthenticated POST stores unbounded text into result JSONB",
+    "location": "server/src/reference_checks/form_handler.gleam:926-930 (+ form_pages.gleam:447, result.gleam:95)",
+    "evidence": "server/src/reference_checks/form_handler.gleam:926-930\n  let reason = application_handler.get_form_value(values, \"decline_reason\")\n  let note = case reason {\n    \"\" -> option.None\n    text -> option.Some(text)\n  }\nserver/src/reference_checks/form_pages.gleam:447\n            attribute(\"maxlength\", \"200\"),\nserver/src/reference_checks/result.gleam:95\n    Some(text) -> [#(\"decline_reason\", json.string(text))]\nserver/src/application/application_handler.gleam:1553-1555 (the /apply precedent the new route skips)\n      let personal_statement =\n        values\n        |> get_form_value(\"personal_statement\")\n        |> truncate(2000)",
+    "detail": "The only length cap on the reason is the client-side maxlength=\"200\" attribute; a crafted POST bypasses it. The value is persisted verbatim (json.string escapes JSON but not size) into reference_call.result JSONB, bounded only by the 10MB middleware body gate (middleware.gleam:34 const max_body_size = 10_485_760). The /apply path truncates identical free text to 2000 graphemes (truncate at application_handler.gleam:2284); decline has no equivalent. Not re-rendered in this diff (static confirm page), but the text rides the compliance-relevant result store that RC4's landlord panel and DSAR exports will consume.",
+    "recommended_fix": "Server-side bound the reason before persisting: reject or truncate to 200 graphemes (mirror the truncate() pattern used on /apply free text) in apply_decline."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "evidence-integrity",
+    "title": "Art 21 evidence insert is not atomic with the objected transition — an insert failure permanently loses the evidence row",
+    "location": "server/src/reference_checks/form_handler.gleam:1070-1081, 1126-1131",
+    "evidence": "server/src/reference_checks/form_handler.gleam:1070-1081\n        Ok(pog.Returned(_, [_, ..])) -> {\n          // The transition happened — write the Art 21 evidence (once).\n          insert_objection_evidence(\n            config.db,\n            config.sentry,\n            id_uuid,\n            app_uuid,\n            row.ref_slot,\n            channel,\n            payload_ref,\n          )\nserver/src/reference_checks/form_handler.gleam:1126-1131\n    Error(err) -> {\n      wisp.log_error(\n        \"reference objection: evidence log failed: \" <> string.inspect(err),\n      )\n      sentry_client.capture(",
+    "detail": "The terminalize UPDATE commits first (autocommit; no transaction), then the evidence insert runs best-effort. If the insert fails, the row is already objected and every later tap hits the 0-row branch (form_handler.gleam:1083 Ok(pog.Returned(_, [])) -> wisp.redirect) — the insert is never retried, so the Art 21 evidence row is permanently absent for that objection. Documented as best-effort, but the evidence is the DPC-compliance trail.",
+    "recommended_fix": "Wrap the guarded UPDATE + evidence insert in a single pog transaction, or on insert failure retry once before giving up."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "input-validation",
+    "title": "parse_focus_seconds accepts negative and unbounded client values, stored verbatim into fraud_signals",
+    "location": "server/src/reference_checks/form_handler.gleam:1262-1271",
+    "evidence": "server/src/reference_checks/form_handler.gleam:1262-1271\nfn parse_focus_seconds(values: List(#(String, String))) -> Int {\n  case application_handler.get_form_value(values, \"_focus_seconds\") {\n    \"\" -> 0\n    text ->\n      case int.parse(text) {\n        Ok(n) -> n\n        Error(_) -> 0\n      }\n  }\n}",
+    "detail": "Gleam int.parse accepts a leading minus, so _focus_seconds=-7 (or any 64-bit value) is stored as focus_seconds_reported in the result's fraud_signals.form_session block with no floor/ceiling. The field is client-reported fraud input that rc3-7 builds on; negative or absurd values poison the signal and the stored evidence record.",
+    "recommended_fix": "Clamp the parsed value (e.g. 0..=86400, or None/0 when out of range) before it reaches StructureContext."
+  }
+]

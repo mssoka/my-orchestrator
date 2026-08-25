@@ -1,0 +1,4620 @@
+diff --git a/app/main.odin b/app/main.odin
+index d944694..c91684a 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -336,9 +336,19 @@ load_catalogs :: proc(cat: ^pp.Catalogs) -> string {
+ 	if e3 != nil {
+ 		return fmt.tprintf("cannot read data/balance.json: %v", e3)
+ 	}
++	pkt, e4 := os.read_entire_file_from_path("data/packet_types.json", context.temp_allocator)
++	if e4 != nil {
++		return fmt.tprintf("cannot read data/packet_types.json: %v", e4)
++	}
++	dem, e5 := os.read_entire_file_from_path("data/demand.json", context.temp_allocator)
++	if e5 != nil {
++		return fmt.tprintf("cannot read data/demand.json: %v", e5)
++	}
+ 	src.node_types = nt
+ 	src.pipe_tiers = pt
+ 	src.balance = bal
++	src.packet_types = pkt // 3.1
++	src.demand = dem       // 3.1
+ 	cerr := pp.catalogs_load(cat, &src)
+ 	if cerr.file != "" {
+ 		return pp.catalog_error_string(cerr)
+diff --git a/app/render/view.odin b/app/render/view.odin
+index cf32119..a081ba7 100644
+--- a/app/render/view.odin
++++ b/app/render/view.odin
+@@ -271,8 +271,42 @@ draw_packets :: proc(v: ^View, topo: ^pp.Topology, flow: ^pp.Flow_State) {
+ 			pos = node_screen(v, topo.node_pos[ns])
+ 		}
+ 		r := v.tile_px * v.scale * 0.24
+-		rl.DrawCircleV(pos, r, v.palette.packet_dark)    // outline (readable on any pipe)
+-		rl.DrawCircleV(pos, r * 0.78, v.palette.packet_dot) // body
++		// 3.1: per-class packet rendering — SHAPE is the primary distinguisher
++		// ([UX-DR4]: never color alone; accessibility), the catalog color_rgba the
++		// secondary cue. Unknown/absent classes fall back to the 1.3 dot.
++		shape := pp.Packet_Shape.Circle
++		body := v.palette.packet_dot
++		if int(p.class) < len(v.catalogs.packet_types) {
++			pt := v.catalogs.packet_types[p.class]
++			shape = pt.shape
++			body = rl.Color{pt.color_rgba[0], pt.color_rgba[1], pt.color_rgba[2], pt.color_rgba[3]}
++		}
++		outline := rl.Color{
++			u8(f32(body.r) * 0.55),
++			u8(f32(body.g) * 0.55),
++			u8(f32(body.b) * 0.55),
++			body.a,
++		}
++		#partial switch shape {
++		case .Triangle:
++			// streaming: an equilateral triangle (apex up), outline + body like the dot
++			half := r * 0.866
++			rl.DrawTriangle(
++				rl.Vector2{pos.x, pos.y - r},
++				rl.Vector2{pos.x - half, pos.y + r * 0.5},
++				rl.Vector2{pos.x + half, pos.y + r * 0.5},
++				outline,
++			)
++			rl.DrawTriangle(
++				rl.Vector2{pos.x, pos.y - r * 0.78},
++				rl.Vector2{pos.x - half * 0.78, pos.y + r * 0.5 * 0.78},
++				rl.Vector2{pos.x + half * 0.78, pos.y + r * 0.5 * 0.78},
++				body,
++			)
++		case: // Circle + the not-yet-rendered shapes fall back to the 1.3 dot
++			rl.DrawCircleV(pos, r, outline)
++			rl.DrawCircleV(pos, r * 0.78, body)
++		}
+ 	}
+ }
+ 
+diff --git a/core/catalog.odin b/core/catalog.odin
+index 0778845..544751a 100644
+--- a/core/catalog.odin
++++ b/core/catalog.odin
+@@ -30,6 +30,7 @@ Node_Type :: struct {
+ 	terminal_role:    Terminal_Role,
+ 	throughput_units: i32,
+ 	port_capacity:    i32, // 0 = unlimited (terminals); 4/8/16 for router tiers
++	demand_weight:    i32, // 3.1: relative attractor weight for weighted-random dst selection (v1 §3.3); terminals only, default 1
+ 	era_introduced:   i32,
+ }
+ 
+@@ -43,6 +44,120 @@ Pipe_Tier :: struct {
+ 	era_introduced: i32,
+ }
+ 
++// Packet_Shape — the primary visual distinguisher (never color alone, [UX-DR4]).
++// The render maps each variant to a raylib primitive (circle/triangle/...).
++// 3.1 implements Circle (email) + Triangle (streaming); the rest are carried as
++// data for later eras (the shape SYSTEM scales to all 9 — art-direction §5).
++Packet_Shape :: enum u8 {
++	Circle,        // email
++	Triangle,      // streaming
++	Rounded_Square,// web
++	Diamond,       // gaming
++	Hexagon,       // banking
++	Pill,          // voice
++	Star,          // multicast
++	Tiny_Square,   // IoT
++	Blob,          // AI
++}
++
++// shape_from_name — catalog string -> Packet_Shape. Unknown shape -> fail-fast
++// (returns ok=false; the caller rejects the row). Locked canon (look-book).
++shape_from_name :: proc(name: string) -> (Packet_Shape, bool) {
++	switch name {
++	case "circle":         return .Circle, true
++	case "triangle":       return .Triangle, true
++	case "rounded_square": return .Rounded_Square, true
++	case "diamond":        return .Diamond, true
++	case "hexagon":        return .Hexagon, true
++	case "pill":           return .Pill, true
++	case "star":           return .Star, true
++	case "tiny_square":    return .Tiny_Square, true
++	case "blob":           return .Blob, true
++	}
++	return .Circle, false
++}
++
++// Packet_Type — a packet class (GDD § M2, art-direction §5). color_rgba is
++// cosmetic (the secondary cue; the render reads it); shape is the PRIMARY
++// distinguisher. Sim values are int (ODN-10): latency_tol_ms / max_loss_pct /
++// bandwidth_demand are the SLA + flow inputs (slice 3.3/3.4 consume them;
++// 3.1 carries them validated). default_lane is Standard (1) game-wide. The
++// class INDEX (this array's slot) is the Packet.class discriminator carried in
++// the spawn sequence + the T1 hash.
++Packet_Type :: struct {
++	id:               string,
++	display:          string,
++	shape:            Packet_Shape,
++	icon:             string,        // cosmetic glyph id (mail/play/...); font render is [LATER]
++	color_rgba:       [4]u8,         // cosmetic — the secondary cue (never sole)
++	latency_tol_ms:   i32,
++	max_loss_pct:     i32,
++	bandwidth_demand: i32,           // 3.3/3.4: per-edge service multiplier on packet_bandwidth
++	default_lane:     u8,            // 0=Express/1=Standard/2=Best-effort; MVP = Standard
++	demand_weight:    i32,           // relative weight vs sibling classes (NOT the per-sink dst weight)
++	era_introduced:   i32,
++}
++
++// Demand_Selection — how a DemandSpec chooses dst from its sink set (v1 §3.3).
++// WEIGHTED_RANDOM is the MVP default (seeded weighted-random, weighted by each
++// sink terminal's demand_weight). A rotation variant was dropped: the routing-
++// ruling lens-guard (tools/lint.sh gate 5) deliberately forbids the round-robin
++// identifier in core, and no MVP data uses it — a future deterministic rotation
++// picker must add a scoped gate carve-out + a name outside the LB lexicon.
++// NEAREST_HOPS is REJECTED for demand (routing is the player's job — v1 §3.3).
++// Unknown selection strings fail-fast at load (never a silent default).
++Demand_Selection :: enum u8 { Weighted_Random }
++
++selection_from_name :: proc(name: string) -> (Demand_Selection, bool) {
++	switch name {
++	case "weighted_random": return .Weighted_Random, true
++	}
++	return .Weighted_Random, false
++}
++
++// Demand_Entry — a per-source-class demand spec (v1 §3.1 DemandSpec): WHAT
++// traffic flows (class + volume) and WHERE it wants to go (typed source/sink
++// role selectors + the dst selection rule). class/source_role/sink_role are
++// resolved to indices at load (fail-fast on unknown refs). The flow resolves
++// the selectors against the LIVE topology at spawn time (map-agnostic).
++Demand_Entry :: struct {
++	class:       u16,              // packet_types index (resolved at load)
++	source_role: Terminal_Role,    // WHICH terminal role originates it
++	sink_role:   Terminal_Role,    // the eligible sink role
++	volume:      i32,              // base packets spawned per tick (pre-surge)
++	default_lane: u8,
++	selection:   Demand_Selection,
++	demand_weight: i32,            // relative weight vs sibling specs (informational in 3.1)
++}
++
++// Set_Piece — a scheduled demand event (v1 §3.1): amplifies its class's spawn
++// volume by `multiplier` while active (start_tick..start_tick+duration_ticks).
++// The Streaming Surge (streaming x10) is the MVP one. class is resolved at load.
++// 3.1 carries the DATA + the effective_volume multiplier; the crisis engine +
++// forecast UI that consume the same set-pieces land in slice 4.
++Set_Piece :: struct {
++	id:                 string,
++	class:              u16,        // packet_types index (resolved at load)
++	multiplier:         i32,
++	start_tick:         u64,
++	duration_ticks:     u64,
++	forecast_lead_ticks: u64,
++}
++
++// Demand_Era — one era's base demand (always-active entries + set-pieces).
++// Stored in Demand_Catalog.eras at index era-1 (array, map-free — ODN-10).
++Demand_Era :: struct {
++	entries:   [dynamic]Demand_Entry,
++	set_pieces: [dynamic]Set_Piece,
++}
++
++// Demand_Catalog — the per-era demand content. eras is indexed by era-1; an era
++// beyond the array (or era 0) reads as empty (no demand). growth_roles (map
++// growth) is [LATER] (slice 5.1) + omitted here.
++Demand_Catalog :: struct {
++	eras: [dynamic]Demand_Era,
++}
++
+ Balance :: struct {
+ 	logic_hz:        i32,
+ 	max_ticks:       i32,
+@@ -54,18 +169,22 @@ Balance :: struct {
+ }
+ 
+ Catalogs :: struct {
+-	node_types: [dynamic]Node_Type,
+-	pipe_tiers: [dynamic]Pipe_Tier,
+-	balance:    Balance,
+-	hash:       u64, // FNV-1a-64 over the sim-relevant source bytes (fixed order)
++	node_types:   [dynamic]Node_Type,
++	pipe_tiers:   [dynamic]Pipe_Tier,
++	packet_types: [dynamic]Packet_Type, // 3.1: the packet class roster (email + streaming)
++	demand:       Demand_Catalog,       // 3.1: per-era DemandSpecs + SetPieces (the demand director's data)
++	balance:      Balance,
++	hash:         u64, // FNV-1a-64 over the sim-relevant source bytes (fixed order)
+ }
+ 
+ // The bytes the app/harness hand the core (it never opens files). Order is
+ // fixed so catalog_hash is stable.
+ Catalog_Sources :: struct {
+-	node_types: []byte,
+-	pipe_tiers: []byte,
+-	balance:    []byte,
++	node_types:   []byte,
++	pipe_tiers:   []byte,
++	packet_types: []byte, // 3.1
++	demand:       []byte, // 3.1
++	balance:      []byte,
+ }
+ 
+ Catalog_Error :: struct {
+@@ -109,8 +228,16 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 			nt.terminal_role = role_from_name(jstr(eo, "terminal_role"))
+ 			nt.throughput_units = jint(eo, "throughput_units", 0)
+ 			nt.port_capacity = jint(eo, "port_capacity", 0)
++			dw, okd := jint_strict(eo, "demand_weight", 1) // 3.1: terminals default 1
+ 			nt.era_introduced = jint(eo, "era_introduced", 1)
+ 			if nt.id == "" { return {"node_types.json", "id", "empty id"} }
++			if !okd {
++				return {"node_types.json", nt.id, "demand_weight must be an integer (no decimals)"}
++			}
++			nt.demand_weight = dw
++			if nt.demand_weight < 0 {
++				return {"node_types.json", nt.id, "demand_weight must be >= 0"}
++			}
+ 			if nt.kind == .Terminal && nt.terminal_role == .None {
+ 				return {"node_types.json", nt.id, "terminal without a role"}
+ 			}
+@@ -146,6 +273,162 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 		if len(cat.pipe_tiers) == 0 { return {"pipe_tiers.json", "entries", "empty"} }
+ 	}
+ 
++	// packet_types (3.1)
++	{
++		v, e := json.parse(src.packet_types, parse_integers = true)
++		if e != nil { return {"packet_types.json", "$", "invalid JSON"} }
++		obj, ok := v.(json.Object)
++		if !ok { return {"packet_types.json", "$", "root must be an object"} }
++		entries, oke := obj["entries"].(json.Array)
++		if !oke { return {"packet_types.json", "entries", "missing array"} }
++		cat.packet_types = make([dynamic]Packet_Type, 0, 8, allocator)
++		for ev in entries {
++			eo := ev.(json.Object) or_continue
++			pt: Packet_Type
++			pt.id = jstr(eo, "id")
++			pt.display = jstr(eo, "display_name")
++			pt.icon = jstr(eo, "icon")
++			shp, oks := shape_from_name(jstr(eo, "shape"))
++			if pt.id == "" || !oks {
++				return {"packet_types.json", pt.id, "id empty or unknown shape"}
++			}
++			pt.shape = shp
++			if arr, oka := eo["color_rgba"].(json.Array); oka && len(arr) == 4 {
++				for c in 0..<4 {
++					n, okc := arr[c].(json.Integer)
++					if !okc || n < 0 || n > 255 {
++						return {"packet_types.json", pt.id, "color_rgba must be 4 ints in 0..255"}
++					}
++					pt.color_rgba[c] = u8(n)
++				}
++			} else {
++				return {"packet_types.json", pt.id, "color_rgba must be a 4-int array"}
++			}
++			// strict ints (a decimal in the file is a rejection, not a truncation),
++			// and the lane/weight bounds are checked BEFORE the narrowing casts
++			// (u8(256) == 0 would silently pass a post-cast check).
++			lt, okl := jint_strict(eo, "latency_tol_ms", 0)
++			lp, okp := jint_strict(eo, "max_loss_pct", 0)
++			bw, okb := jint_strict(eo, "bandwidth_demand", 1)
++			lane, okl2 := jint_strict(eo, "default_lane", 1)
++			dw, okd := jint_strict(eo, "demand_weight", 1)
++			ei, oke := jint_strict(eo, "era_introduced", 1)
++			if !okl || !okp || !okb || !okl2 || !okd || !oke {
++				return {"packet_types.json", pt.id, "sim fields must be integers (no decimals)"}
++			}
++			if lt <= 0 || lp < 0 || lp > 100 || bw < 1 {
++				return {"packet_types.json", pt.id, "latency_tol_ms/max_loss_pct/bandwidth_demand invalid"}
++			}
++			if lane < 0 || lane > 2 {
++				return {"packet_types.json", pt.id, "default_lane must be 0..2 (Express/Standard/Best-effort)"}
++			}
++			if dw < 0 {
++				return {"packet_types.json", pt.id, "demand_weight must be >= 0"}
++			}
++			pt.latency_tol_ms = lt
++			pt.max_loss_pct = lp
++			pt.bandwidth_demand = bw
++			pt.default_lane = u8(lane)
++			pt.demand_weight = dw
++			pt.era_introduced = ei
++			append(&cat.packet_types, pt)
++		}
++		if len(cat.packet_types) == 0 { return {"packet_types.json", "entries", "empty"} }
++	}
++
++	// demand (3.1) — per-era DemandSpecs + SetPieces. eras is an ARRAY
++	// (insertion-ordered, map-free — ODN-10). Each row carries its `era`; the
++	// catalog stores it indexed by era-1 (padded). class refs in entries +
++	// set_pieces resolve to packet_types indices here (fail-fast on unknown).
++	{
++		v, e := json.parse(src.demand, parse_integers = true)
++		if e != nil { return {"demand.json", "$", "invalid JSON"} }
++		obj, ok := v.(json.Object)
++		if !ok { return {"demand.json", "$", "root must be an object"} }
++		eras, oke := obj["eras"].(json.Array)
++		if !oke { return {"demand.json", "eras", "missing array"} }
++		cat.demand.eras = make([dynamic]Demand_Era, 0, 4, allocator)
++		seen: [64]bool // duplicate-era fail-fast (map-free — ODN-10)
++		for ev in eras {
++			eo := ev.(json.Object) or_continue
++			era, oke := jint_strict(eo, "era", 0)
++			if !oke {
++				return {"demand.json", "eras", "era must be an integer (no decimals)"}
++			}
++			if era < 1 || era > 64 {
++				return {"demand.json", "eras", "era must be in 1..64"}
++			}
++			if seen[era-1] {
++				return {"demand.json", "eras", "duplicate era row"}
++			}
++			seen[era-1] = true
++			de: Demand_Era
++			de.entries = make([dynamic]Demand_Entry, 0, 4, allocator)
++			de.set_pieces = make([dynamic]Set_Piece, 0, 2, allocator)
++			if es, okes := eo["entries"].(json.Array); okes {
++				for ee in es {
++					eeo := ee.(json.Object) or_continue
++					de2: Demand_Entry
++					cls, okc := class_index(cat, jstr(eeo, "class_id"))
++					if !okc { return {"demand.json", jstr(eeo, "class_id"), "entry unknown class_id"} }
++					de2.class = cls
++					de2.source_role = role_from_name(jstr(eeo, "source_role"))
++					de2.sink_role = role_from_name(jstr(eeo, "sink_role"))
++					if de2.source_role == .None { return {"demand.json", jstr(eeo, "class_id"), "entry unknown source_role"} }
++					if de2.sink_role == .None { return {"demand.json", jstr(eeo, "class_id"), "entry unknown sink_role"} }
++					sel, oksel := selection_from_name(jstr(eeo, "selection"))
++					if !oksel { return {"demand.json", jstr(eeo, "class_id"), "entry unknown selection"} }
++					de2.selection = sel
++					vol, okv := jint_strict(eeo, "volume", 0)
++					lane, okl := jint_strict(eeo, "default_lane", 1)
++					dw, okd := jint_strict(eeo, "demand_weight", 1)
++					if !okv || !okl || !okd {
++						return {"demand.json", jstr(eeo, "class_id"), "entry sim fields must be integers (no decimals)"}
++					}
++					de2.volume = vol
++					de2.default_lane = u8(lane)
++					de2.demand_weight = dw
++					if de2.volume < 0 || de2.demand_weight < 1 || lane < 0 || lane > 2 {
++						return {"demand.json", jstr(eeo, "class_id"), "entry volume/demand_weight/default_lane invalid"}
++					}
++					append(&de.entries, de2)
++				}
++			}
++			if sps, oksps := eo["set_pieces"].(json.Array); oksps {
++				for se in sps {
++					seo := se.(json.Object) or_continue
++					sp: Set_Piece
++					sp.id = jstr(seo, "id")
++					cls, okc := class_index(cat, jstr(seo, "class_id"))
++					if sp.id == "" || !okc { return {"demand.json", sp.id, "set-piece id/class_id invalid"} }
++					sp.class = cls
++					mult, okm := jint_strict(seo, "multiplier", 1)
++					st, okst := jint_strict(seo, "start_tick", 0)
++					dt, okdt := jint_strict(seo, "duration_ticks", 0)
++					fl, okfl := jint_strict(seo, "forecast_lead_ticks", 0)
++					if !okm || !okst || !okdt || !okfl {
++						return {"demand.json", sp.id, "set-piece sim fields must be integers (no decimals)"}
++					}
++					// tick fields are validated as i32 BEFORE the u64 casts — a
++					// negative JSON value must reject, never wrap to ~2^64 (the
++					// surge would silently never fire).
++					if mult < 1 || st < 0 || dt < 1 || fl < 0 {
++						return {"demand.json", sp.id, "set-piece multiplier/tick fields invalid"}
++					}
++					sp.multiplier = mult
++					sp.start_tick = u64(st)
++					sp.duration_ticks = u64(dt)
++					sp.forecast_lead_ticks = u64(fl)
++					append(&de.set_pieces, sp)
++				}
++			}
++			// store at index era-1 (pad with empty eras so index == era-1)
++			for len(cat.demand.eras) < int(era) { append(&cat.demand.eras, Demand_Era{}) }
++			cat.demand.eras[era-1] = de
++		}
++		if len(cat.demand.eras) == 0 { return {"demand.json", "eras", "empty"} }
++	}
++
+ 	// balance
+ 	{
+ 		v, e := json.parse(src.balance, parse_integers = true)
+@@ -184,6 +467,13 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 	if _, ok := node_type_index(cat, "router_basic"); !ok {
+ 		return {"node_types.json", "router_basic", "1.2 requires the router_basic type"}
+ 	}
++	// 3.1: the MVP packet-type roster (email + streaming)
++	if _, ok := class_index(cat, "email"); !ok {
++		return {"packet_types.json", "email", "3.1 requires the email class"}
++	}
++	if _, ok := class_index(cat, "streaming"); !ok {
++		return {"packet_types.json", "streaming", "3.1 requires the streaming class"}
++	}
+ 	return {}
+ }
+ 
+@@ -192,6 +482,12 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ catalogs_destroy :: proc(cat: ^Catalogs) {
+ 	delete(cat.node_types)
+ 	delete(cat.pipe_tiers)
++	delete(cat.packet_types)
++	for i in 0..<len(cat.demand.eras) {
++		delete(cat.demand.eras[i].entries)
++		delete(cat.demand.eras[i].set_pieces)
++	}
++	delete(cat.demand.eras)
+ }
+ 
+ // FNV-1a-64 over the sim-relevant catalog bytes in fixed order (hash.odin).
+@@ -205,6 +501,8 @@ catalogs_hash_sources :: proc(src: ^Catalog_Sources) -> u64 {
+ 	}
+ 	fold(&h, src.node_types)
+ 	fold(&h, src.pipe_tiers)
++	fold(&h, src.packet_types) // 3.1: sim-relevant (drives spawns) — folds into the replay-binding hash
++	fold(&h, src.demand)       // 3.1: sim-relevant (the demand director's data)
+ 	fold(&h, src.balance)
+ 	return h
+ }
+@@ -225,6 +523,15 @@ pipe_tier_index :: proc(cat: ^Catalogs, id: string) -> (u16, bool) {
+ 	return 0, false
+ }
+ 
++// class_index — packet_types id -> index (the Packet.class discriminator).
++// Linear; core is map-free (ODN-10).
++class_index :: proc(cat: ^Catalogs, id: string) -> (u16, bool) {
++	for pt, i in cat.packet_types {
++		if pt.id == id { return u16(i), true }
++	}
++	return 0, false
++}
++
+ role_from_name :: proc(name: string) -> Terminal_Role {
+ 	switch name {
+ 	case "residential":  return .Residential
+@@ -249,3 +556,17 @@ jint :: proc(o: json.Object, key: string, def: i32) -> i32 {
+ 	}
+ 	return def
+ }
++
++// jint_strict — like jint but a json.Float (a decimal in the file) is a
++// fail-fast rejection (ok=false), never a silent truncation — the 3.1
++// integer-only bar for the NEW catalogs (ODN-5; the old loaders keep jint).
++// Missing -> (def, true).
++jint_strict :: proc(o: json.Object, key: string, def: i32) -> (i32, bool) {
++	if v, ok := o[key]; ok {
++		#partial switch x in v {
++		case json.Integer: return i32(x), true
++		case json.Float:   return 0, false
++		}
++	}
++	return def, true
++}
+diff --git a/core/catalog_test.odin b/core/catalog_test.odin
+new file mode 100644
+index 0000000..be6b06a
+--- /dev/null
++++ b/core/catalog_test.odin
+@@ -0,0 +1,178 @@
++package core
++
++// catalog_test.odin — the ODN-5 fail-fast contract for the 3.1 catalogs
++// (packet_types + demand): every malformed input rejects with the NAMED
++// Catalog_Error (file + rule substring), never a silent default. Table-driven:
++// each row feeds full packet_types.json/demand.json documents (the other three
++// catalogs are the fixed valid baselines below) into catalogs_load and asserts
++// the rejection. This suite pins the r1 Perkins findings: the color_rgba
++// element-type guard, the lane/weight range checks BEFORE narrowing casts, the
++// set-piece negative-tick u64 wrap, strict integer-only sim fields, duplicate
++// era rows, and the email/streaming required-content cross-checks.
++
++import "core:testing"
++import "core:strings"
++
++// replace1 — strings.replace returns (string, bool) in this Odin; the test
++// rows only need the string (first occurrence, count=1).
++replace1 :: proc(s, old, new: string, count: int = 1) -> string {
++	out, _ := strings.replace(s, old, new, count)
++	return out
++}
++
++// --- valid baseline documents (mirror data/*.json values) -------------------
++
++NT_VALID :: `{"entries": [
++  {"id": "residential", "kind": "terminal", "terminal_role": "residential", "throughput_units": 5, "demand_weight": 1, "era_introduced": 1, "port_capacity": 0},
++  {"id": "content_host", "kind": "terminal", "terminal_role": "content_host", "throughput_units": 80, "demand_weight": 1, "era_introduced": 3, "port_capacity": 0},
++  {"id": "router_basic", "kind": "junction", "terminal_role": "none", "throughput_units": 40, "era_introduced": 1, "port_capacity": 4}
++]}`
++
++TIER_VALID :: `{"entries": [
++  {"id": "narrow", "capacity_units": 5, "clean_span": 8, "max_span": 10, "cost_per_tile": 5, "era_introduced": 1},
++  {"id": "standard", "capacity_units": 15, "clean_span": 10, "max_span": 14, "cost_per_tile": 12, "era_introduced": 1},
++  {"id": "wide", "capacity_units": 40, "clean_span": 14, "max_span": 18, "cost_per_tile": 30, "era_introduced": 3}
++]}`
++
++BAL_VALID :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_bandwidth": 30,
++  "map": {"w_tiles": 40, "h_tiles": 30, "tile_px": 26}}`
++
++EMAIL_ENTRY :: `{"id": "email", "display_name": "Email", "color_rgba": [90, 98, 112, 255], "shape": "circle", "icon": "mail", "latency_tol_ms": 500, "max_loss_pct": 30, "bandwidth_demand": 1, "default_lane": 1, "era_introduced": 1, "demand_weight": 1}`
++STREAM_ENTRY :: `{"id": "streaming", "display_name": "Streaming", "color_rgba": [30, 74, 152, 255], "shape": "triangle", "icon": "play", "latency_tol_ms": 300, "max_loss_pct": 10, "bandwidth_demand": 2, "default_lane": 1, "era_introduced": 3, "demand_weight": 1}`
++PKT_VALID :: string(`{"entries": [` + EMAIL_ENTRY + `, ` + STREAM_ENTRY + `]}`)
++
++// DEM_VALID — era 1, one email spec (res -> res), no set-pieces.
++DEM_SPEC :: `{"class_id": "email", "source_role": "residential", "sink_role": "residential", "volume": 2, "default_lane": 1, "selection": "weighted_random", "demand_weight": 1}`
++DEM_ERA :: string(`{"era": 1, "entries": [` + DEM_SPEC + `], "set_pieces": []}`)
++DEM_VALID :: string(`{"eras": [` + DEM_ERA + `]}`)
++
++// SP_DEM_VALID — era 1 with a streaming surge set-piece (streaming exists in
++// PKT_VALID). Used by the set-piece negative rows.
++SP_ERA :: string(`{"era": 1, "entries": [` + DEM_SPEC + `], "set_pieces": [
++  {"id": "surge", "class_id": "streaming", "multiplier": 10, "start_tick": 1200, "duration_ticks": 1800, "forecast_lead_ticks": 600}]}`)
++SP_DEM_VALID :: string(`{"eras": [` + SP_ERA + `]}`)
++
++// check_reject — feed (pkt, dem) into catalogs_load and assert the NAMED
++// rejection: file must match + rule must be a substring of the reason.
++check_reject :: proc(t: ^testing.T, pkt, dem, want_file, want_rule: string) {
++	cat_storage: Catalogs
++	cat := &cat_storage
++	defer catalogs_destroy(cat)
++	src := Catalog_Sources{
++		node_types   = transmute([]u8)string(NT_VALID),
++		pipe_tiers   = transmute([]u8)string(TIER_VALID),
++		balance      = transmute([]u8)string(BAL_VALID),
++		packet_types = transmute([]u8)pkt,
++		demand       = transmute([]u8)dem,
++	}
++	cerr := catalogs_load(cat, &src)
++	testing.expectf(t, cerr.file != "", "expected a rejection (rule %q) — catalog loaded clean", want_rule)
++	if cerr.file == "" {
++		return
++	}
++	testing.expectf(t, cerr.file == want_file, "rejection file: got %q want %q", cerr.file, want_file)
++	testing.expectf(t, strings.contains(cerr.rule, want_rule),
++		"rejection rule: got %q want substring %q", cerr.rule, want_rule)
++}
++
++// check_ok — the positive control: the valid documents load clean with the
++// required content resolved (email/streaming classes + era 1 demand).
++check_ok :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := &cat_storage
++	defer catalogs_destroy(cat)
++	src := Catalog_Sources{
++		node_types   = transmute([]u8)string(NT_VALID),
++		pipe_tiers   = transmute([]u8)string(TIER_VALID),
++		balance      = transmute([]u8)string(BAL_VALID),
++		packet_types = transmute([]u8)string(PKT_VALID),
++		demand       = transmute([]u8)string(DEM_VALID),
++	}
++	cerr := catalogs_load(cat, &src)
++	testing.expectf(t, cerr.file == "", "valid docs must load clean, got %q %q", cerr.file, cerr.rule)
++	_, ok := class_index(cat, "email")
++	testing.expect(t, ok, "email class must resolve")
++	_, ok = class_index(cat, "streaming")
++	testing.expect(t, ok, "streaming class must resolve")
++	testing.expectf(t, len(cat.demand.eras) == 1 && len(cat.demand.eras[0].entries) == 1,
++		"era 1 demand must parse, got %d eras", len(cat.demand.eras))
++}
++
++@(test)
++test_catalogs_load_failfast :: proc(t: ^testing.T) {
++	check_ok(t)
++
++	// --- packet_types.json negative rows ------------------------------------
++	pkt_rows := []struct {
++		label, doc, rule: string
++	}{
++		{"bad json", `{`, "invalid JSON"},
++		{"root not object", `[1]`, "root must be an object"},
++		{"missing entries", `{}`, "missing array"},
++		{"empty entries", `{"entries": []}`, "empty"},
++		{"unknown shape", replace1(PKT_VALID, `"shape": "circle"`, `"shape": "square"`, 1), "unknown shape"},
++		{"empty id", replace1(PKT_VALID, `"id": "email"`, `"id": ""`, 1), "id empty or unknown shape"},
++		{"color wrong length", replace1(PKT_VALID, `[90, 98, 112, 255]`, `[90, 98, 112]`, 1), "color_rgba must be a 4-int array"},
++		// r1 warning #1: a non-integer element must REJECT, not silently become 0
++		{"color non-int element", replace1(PKT_VALID, `[90, 98, 112, 255]`, `[90, "x", 112, 255]`, 1), "color_rgba must be 4 ints in 0..255"},
++		{"color out of range", replace1(PKT_VALID, `[30, 74, 152, 255]`, `[30, 74, 152, 256]`, 1), "color_rgba must be 4 ints in 0..255"},
++		{"latency zero", replace1(PKT_VALID, `"latency_tol_ms": 500`, `"latency_tol_ms": 0`, 1), "latency_tol_ms/max_loss_pct/bandwidth_demand invalid"},
++		{"latency decimal", replace1(PKT_VALID, `"latency_tol_ms": 500`, `"latency_tol_ms": 2.5`, 1), "sim fields must be integers"},
++		{"loss over 100", replace1(PKT_VALID, `"max_loss_pct": 30`, `"max_loss_pct": 101`, 1), "latency_tol_ms/max_loss_pct/bandwidth_demand invalid"},
++		{"bandwidth zero", replace1(PKT_VALID, `"bandwidth_demand": 1`, `"bandwidth_demand": 0`, 1), "latency_tol_ms/max_loss_pct/bandwidth_demand invalid"},
++		// r1 warning #3: 256 wraps to 0 through the u8 cast — must reject pre-cast
++		{"lane 3", replace1(PKT_VALID, `"default_lane": 1`, `"default_lane": 3`, 1), "default_lane must be 0..2"},
++		{"lane 256 wraps", replace1(PKT_VALID, `"default_lane": 1`, `"default_lane": 256`, 1), "default_lane must be 0..2"},
++		{"lane negative", replace1(PKT_VALID, `"default_lane": 1`, `"default_lane": -1`, 1), "default_lane must be 0..2"},
++		// r1 warning #4: Packet_Type.demand_weight bounds
++		{"weight negative", replace1(PKT_VALID, `"demand_weight": 1`, `"demand_weight": -3`, 1), "demand_weight must be >= 0"},
++		{"weight decimal", replace1(PKT_VALID, `"demand_weight": 1`, `"demand_weight": 1.5`, 1), "sim fields must be integers"},
++	}
++	for r in pkt_rows {
++		check_reject(t, r.doc, DEM_VALID, "packet_types.json", r.rule)
++	}
++
++	// required-content cross-checks (the 3.1 MVP roster) — an entry-less
++	// demand doc so the demand block's class resolution doesn't reject first
++	DEM_NO_REF :: `{"eras": [{"era": 1, "entries": [], "set_pieces": []}]}`
++	check_reject(t, replace1(PKT_VALID, EMAIL_ENTRY + `, `, ``, 1), DEM_NO_REF, "packet_types.json", "requires the email class")
++	check_reject(t, replace1(PKT_VALID, `, ` + STREAM_ENTRY, ``, 1), DEM_NO_REF, "packet_types.json", "requires the streaming class")
++
++	// --- demand.json negative rows ------------------------------------------
++	dem_rows := []struct {
++		label, doc, rule: string
++	}{
++		{"bad json", `{`, "invalid JSON"},
++		{"root not object", `[1]`, "root must be an object"},
++		{"missing eras", `{}`, "missing array"},
++		{"empty eras", `{"eras": []}`, "empty"},
++		{"era zero", replace1(DEM_VALID, `"era": 1`, `"era": 0`, 1), "era must be in 1..64"},
++		{"era 65", replace1(DEM_VALID, `"era": 1`, `"era": 65`, 1), "era must be in 1..64"},
++		{"era decimal", replace1(DEM_VALID, `"era": 1`, `"era": 1.5`, 1), "era must be an integer"},
++		// r1 note #1: duplicate era rows must reject (last-wins silently leaked)
++		{"duplicate era", `{"eras": [` + DEM_ERA + `, ` + DEM_ERA + `]}`, "duplicate era row"},
++		{"unknown class_id", replace1(DEM_VALID, `"class_id": "email"`, `"class_id": "voip"`, 1), "entry unknown class_id"},
++		{"unknown source_role", replace1(DEM_VALID, `"source_role": "residential"`, `"source_role": "farm"`, 1), "entry unknown source_role"},
++		{"unknown sink_role", replace1(DEM_VALID, `"sink_role": "residential"`, `"sink_role": "farm"`, 1), "entry unknown sink_role"},
++		{"unknown selection", replace1(DEM_VALID, `"selection": "weighted_random"`, `"selection": "nearest_hops"`, 1), "entry unknown selection"},
++		{"volume negative", replace1(DEM_VALID, `"volume": 2`, `"volume": -1`, 1), "entry volume/demand_weight/default_lane invalid"},
++		{"volume decimal", replace1(DEM_VALID, `"volume": 2`, `"volume": 2.9`, 1), "entry sim fields must be integers"},
++		{"demand_weight zero", replace1(DEM_VALID, `"demand_weight": 1`, `"demand_weight": 0`, 1), "entry volume/demand_weight/default_lane invalid"},
++		{"lane 3", replace1(DEM_VALID, `"default_lane": 1`, `"default_lane": 3`, 1), "entry volume/demand_weight/default_lane invalid"},
++		// r1 warning #3 (demand site): 256 wraps through the u8 cast
++		{"lane 256 wraps", replace1(DEM_VALID, `"default_lane": 1`, `"default_lane": 256`, 1), "entry volume/demand_weight/default_lane invalid"},
++		// set-piece rows — the SP_DEM_VALID baseline has a streaming surge
++		{"sp unknown class", replace1(SP_DEM_VALID, `"class_id": "streaming"`, `"class_id": "gaming"`, 1), "set-piece id/class_id invalid"},
++		{"sp empty id", replace1(SP_DEM_VALID, `"id": "surge"`, `"id": ""`, 1), "set-piece id/class_id invalid"},
++		{"sp multiplier zero", replace1(SP_DEM_VALID, `"multiplier": 10`, `"multiplier": 0`, 1), "set-piece multiplier/tick fields invalid"},
++		{"sp multiplier decimal", replace1(SP_DEM_VALID, `"multiplier": 10`, `"multiplier": 2.5`, 1), "set-piece sim fields must be integers"},
++		{"sp duration zero", replace1(SP_DEM_VALID, `"duration_ticks": 1800`, `"duration_ticks": 0`, 1), "set-piece multiplier/tick fields invalid"},
++		// r1 warning #2: a negative start_tick must reject, never wrap to ~2^64
++		{"sp start_tick negative", replace1(SP_DEM_VALID, `"start_tick": 1200`, `"start_tick": -5`, 1), "set-piece multiplier/tick fields invalid"},
++		{"sp duration negative", replace1(SP_DEM_VALID, `"duration_ticks": 1800`, `"duration_ticks": -1`, 1), "set-piece multiplier/tick fields invalid"},
++		{"sp forecast negative", replace1(SP_DEM_VALID, `"forecast_lead_ticks": 600`, `"forecast_lead_ticks": -1`, 1), "set-piece multiplier/tick fields invalid"},
++	}
++	for r in dem_rows {
++		check_reject(t, PKT_VALID, r.doc, "demand.json", r.rule)
++	}
++}
+diff --git a/core/demand.odin b/core/demand.odin
+new file mode 100644
+index 0000000..a246a23
+--- /dev/null
++++ b/core/demand.odin
+@@ -0,0 +1,87 @@
++package core
++
++// demand.odin — the scripted demand director (ODN-7, v1 §3). The director owns
++// the demand timeline UPSTREAM of the flow; it takes a READ-ONLY catalog view
++// (era + tick) and emits a PressurePlan. It never receives a handle to
++// Run_State — the "[ODN-7] read-only on topology" rule is STRUCTURAL here, not
++// discipline: scripted_plan_pressure mutates nothing.
++//
++// The plan carries the active era's DemandSpecs (base, always-on demand) as a
++// read-only slice into the catalog + the indices of any set-piece ACTIVE this
++// tick. flow_step (flow.odin) consumes the plan: for each DemandSpec it
++// resolves the typed source/sink selectors against the LIVE topology, picks
++// src+dst via seeded weighted-random, and spawns `effective_volume` packets.
++//
++// Determinism (the spine lesson): the plan is a pure function of (catalog, era,
++// tick). flow_step computes it every tick INSIDE step — both live + replay run
++// the same step, so the rng-weighted dst picks are byte-identical across runs
++// for a fixed seed [E10]. No run-setup threading is needed for the director
++// (unlike flow_seed_demand spawns): the era (which the plan depends on) rides
++// the log header + the T1 hash, threaded through BOTH run_demo + replay_hashes.
++//
++// The full ODN-7 seam (a plan_pressure proc field on a Run_Config, swappable
++// for the V2 AI auditor) is [LATER] — 3.1 binds the scripted impl directly.
++// PROTO note carried: the scripted plan consumes NO rng (the dst picks that DO
++// draw rng happen downstream in flow_step, inside the deterministic stream).
++
++// Pressure_Plan — one tick's demand. `entries` is a READ-ONLY slice into the
++// catalog's era entries (the director owns no packet state); `era_sp` is the
++// read-only slice of that era's set-pieces; `active_sp` are the indices (within
++// era_sp) of set-pieces active this tick. All scratch-owned except the two
++// catalog slices (which alias the catalog — valid for the catalog's lifetime).
++Pressure_Plan :: struct {
++	tick:      u64,
++	entries:   []Demand_Entry,  // read-only alias into cat.demand.eras[era-1].entries (empty if era absent)
++	era_sp:    []Set_Piece,     // read-only alias into cat.demand.eras[era-1].set_pieces
++	active_sp: [dynamic]u16,    // indices into era_sp active this tick (scratch-owned)
++}
++
++// scripted_plan_pressure — the PROTO director: return this tick's plan for the
++// given era. Pure w.r.t. sim state (reads the catalog only). An era of 0, or an
++// era beyond the catalog, yields an empty plan (no demand) — so legacy era-0
++// runs (the slice-1 demos using flow_seed_demand) spawn nothing from the
++// director and their rng stream is untouched.
++scripted_plan_pressure :: proc(cat: ^Catalogs, era: u8, tick: u64,
++                               scratch := context.temp_allocator) -> Pressure_Plan {
++	plan: Pressure_Plan
++	plan.tick = tick
++	plan.active_sp = make([dynamic]u16, 0, 4, scratch)
++	if era == 0 || int(era) > len(cat.demand.eras) {
++		return plan // empty — no demand content for this era
++	}
++	de := &cat.demand.eras[era-1]
++	plan.entries = de.entries[:]
++	plan.era_sp = de.set_pieces[:]
++	for i in 0..<len(de.set_pieces) {
++		sp := &de.set_pieces[i]
++		if set_piece_active(sp, tick) {
++			append(&plan.active_sp, u16(i))
++		}
++	}
++	return plan
++}
++
++// set_piece_active — a set-piece is active on [start_tick, start_tick+duration).
++set_piece_active :: proc(sp: ^Set_Piece, tick: u64) -> bool {
++	return tick >= sp.start_tick && tick < sp.start_tick + sp.duration_ticks
++}
++
++// effective_volume — a DemandSpec's spawn volume this tick, multiplied by every
++// active set-piece that targets its class (the Surge = streaming x10). base is
++// the spec's catalog volume; the product is the packets to spawn this tick.
++effective_volume :: proc(plan: ^Pressure_Plan, class: u16, base: i32) -> i32 {
++	v := base
++	for idx in plan.active_sp {
++		sp := &plan.era_sp[idx]
++		if sp.class == class {
++			v *= sp.multiplier
++		}
++	}
++	return v
++}
++
++// pressure_plan_destroy — free the plan's scratch-owned active_sp slice (the
++// entries/era_sp slices ALIAS the catalog and are NOT freed here).
++pressure_plan_destroy :: proc(plan: ^Pressure_Plan) {
++	delete(plan.active_sp)
++}
+diff --git a/core/demand_test.odin b/core/demand_test.odin
+new file mode 100644
+index 0000000..68feca9
+--- /dev/null
++++ b/core/demand_test.odin
+@@ -0,0 +1,309 @@
++package core
++
++// demand_test.odin — pins the 3.1 demand director (ODN-7, v1 §3):
++//   (a) weighted_pick is seeded + distribution-correct (v1 §3.3: the dst pick
++//       follows the sink demand_weights — here all 1, so UNIFORM over the
++//       sink set at the data level, and [1,2,3] at the unit level);
++//   (b) flow_step spawns per-spec: right class, right typed src/sink roles,
++//       dst != src (no self-loop), per-tick volume, and the set-piece
++//       multiplier (the Streaming Surge x10) amplifies ONLY its class;
++//   (c) era 0 (legacy runs) spawns nothing from the director AND draws no rng
++//       (legacy demos' rng stream stays at its post-seed value — the
++//       briefing's "keep both" decision);
++//   (d) same seed => byte-identical director spawn sequence (the replay spine
++//       holds for the director's rng draws).
++//
++// qa_fixture spawns EXTRA terminals (the §3.3 rule needs multiple sinks);
++// test_catalog mirrors data/*.json exactly (era 1/2 email-only, era 3 email +
++// streaming + the streaming_surge set-piece).
++
++import "core:testing"
++
++// qa_fixture — the §3.3 topology: residentials at node ids 0, 1, 3 (all
++// demand_weight 1), router at 2, content host at 4. No pipes (spawns don't
++// need them; routing/ECMP are not under test). Returns the three residential
++// node ids in spawn order.
++qa_fixture :: proc(state: ^Run_State, cat: ^Catalogs) -> (u32, u32, u32) {
++	res_idx, _ := node_type_index(cat, "residential")
++	rt_idx, _ := node_type_index(cat, "router_basic")
++	host_idx, _ := node_type_index(cat, "content_host")
++	a := topology_spawn_node(&state.topology, res_idx, {6, 15}, cat)
++	b := topology_spawn_node(&state.topology, res_idx, {12, 15}, cat)
++	topology_spawn_node(&state.topology, rt_idx, {20, 15}, cat)
++	c := topology_spawn_node(&state.topology, res_idx, {26, 15}, cat)
++	topology_spawn_node(&state.topology, host_idx, {34, 15}, cat)
++	return a, b, c
++}
++
++// spawn_histogram — the spawned-packet fingerprint: per-class counts, per-class
++// (dst, src) histograms, and self-loop count. Deterministic; the whole
++// histogram is compared byte-wise for the same-seed reproducibility pin.
++// Node ids are small in tests (< 64) so fixed arrays suffice.
++spawn_histogram :: proc(f: ^Flow_State) -> (by_class: [8]u64, dst_hist: [8][64]u64, src_hist: [8][64]u64, self_loops: u64) {
++	for p in f.packets {
++		by_class[p.class] += 1
++		dst_hist[p.class][p.dst] += 1
++		src_hist[p.class][p.src] += 1
++		if p.src == p.dst { self_loops += 1 }
++	}
++	return
++}
++
++// tick_class_count — how many packets of `class` spawned at exactly `tick`
++// (pins per-tick volume — the surge window boundaries).
++tick_class_count :: proc(f: ^Flow_State, tick: u64, class: u16) -> u64 {
++	n: u64
++	for p in f.packets {
++		if p.spawn_tick == tick && p.class == class { n += 1 }
++	}
++	return n
++}
++
++@(test)
++test_weighted_pick_distribution :: proc(t: ^testing.T) {
++	weights := []i32{1, 2, 3}
++	DRAWS :: 18000
++
++	// (a) determinism: same seed -> identical pick sequence, draw by draw
++	r1: Rng; rng_seed(&r1, 1337)
++	r2: Rng; rng_seed(&r2, 1337)
++	c1: [3]u64; c2: [3]u64
++	for i in 0..<DRAWS {
++		p1, ok1 := weighted_pick(&r1, weights)
++		p2, ok2 := weighted_pick(&r2, weights)
++		testing.expect(t, ok1 && ok2, "weighted_pick must succeed on positive weights")
++		testing.expect(t, p1 == p2, "weighted_pick must be deterministic for a fixed seed")
++		c1[p1] += 1
++		c2[p2] += 1
++	}
++	total := c1[0] + c1[1] + c1[2]
++	testing.expectf(t, total == DRAWS, "total picks: got %d, want %d", total, DRAWS)
++	// ratio ~ 1:2:3 (3000/6000/9000); 3-sigma over the binomial (sigma ~50/63)
++	// — a >3-sigma miss means the weights are not driving the pick
++	testing.expectf(t, c1[0] >= 3000-170 && c1[0] <= 3000+170, "bucket 0: got %d, want ~3000 (weight 1)", c1[0])
++	testing.expectf(t, c1[1] >= 6000-210 && c1[1] <= 6000+210, "bucket 1: got %d, want ~6000 (weight 2)", c1[1])
++	testing.expectf(t, c1[2] >= 9000-210 && c1[2] <= 9000+210, "bucket 2: got %d, want ~9000 (weight 3)", c1[2])
++
++	// zero-weight is never picked (but counts toward nothing)
++	z: Rng; rng_seed(&z, 7)
++	zc: [2]u64
++	for i in 0..<1000 {
++		p, ok := weighted_pick(&z, []i32{0, 5})
++		testing.expect(t, ok, "nonzero total must succeed")
++		zc[p] += 1
++	}
++	testing.expectf(t, zc[0] == 0, "zero-weight bucket must never be picked, got %d", zc[0])
++	testing.expectf(t, zc[1] == 1000, "all picks must land in the nonzero bucket, got %d", zc[1])
++
++	// all-zero weights -> no pick (callers skip the spec)
++	a: Rng; rng_seed(&a, 8)
++	_, ok := weighted_pick(&a, []i32{0, 0})
++	testing.expect(t, !ok, "all-zero weights must fail the pick")
++}
++
++@(test)
++test_set_piece_active_window :: proc(t: ^testing.T) {
++	sp := Set_Piece{class = 1, multiplier = 10, start_tick = 1200, duration_ticks = 1800}
++	testing.expect(t, !set_piece_active(&sp, 1199), "before the window must be inactive")
++	testing.expect(t, set_piece_active(&sp, 1200), "window start must be active")
++	testing.expect(t, set_piece_active(&sp, 2999), "window end-1 must be active")
++	testing.expect(t, !set_piece_active(&sp, 3000), "window end must be inactive")
++
++	// effective_volume multiplies ONLY the matching class
++	plan := Pressure_Plan{tick = 1500, era_sp = []Set_Piece{sp}}
++	plan.active_sp = make([dynamic]u16, 0, 2, context.temp_allocator)
++	defer pressure_plan_destroy(&plan)
++	append(&plan.active_sp, 0)
++	testing.expectf(t, effective_volume(&plan, 1, 2) == 20, "surge class volume: got %d, want 20", effective_volume(&plan, 1, 2))
++	testing.expectf(t, effective_volume(&plan, 0, 2) == 2, "other class must be unamplified: got %d", effective_volume(&plan, 0, 2))
++}
++
++@(test)
++test_weighted_pick_excluding :: proc(t: ^testing.T) {
++	// the §3.3 dst pick EXCLUDES the src (no self-loop). Non-uniform weights
++	// pin the weighting through the exclusion (the flow-level pin uses uniform
++	// sink weights, so a weights-ignoring pick would pass it — this catches
++	// that). ids/weights 1:2:3 with id 11 excluded -> remaining ratio 1:3.
++	ids := []u32{10, 11, 12}
++	weights := []i32{1, 2, 3}
++	DRAWS :: 12000
++
++	// determinism: same seed -> identical picks, draw by draw
++	r1: Rng; rng_seed(&r1, 99)
++	r2: Rng; rng_seed(&r2, 99)
++	c1: [3]u64; c2: [3]u64
++	for i in 0..<DRAWS {
++		p1, ok1 := weighted_pick_excluding(&r1, ids, weights, 11)
++		p2, ok2 := weighted_pick_excluding(&r2, ids, weights, 11)
++		testing.expect(t, ok1 && ok2, "positive remaining total must succeed")
++		testing.expect(t, p1 == p2, "weighted_pick_excluding must be deterministic for a fixed seed")
++		c1[p1] += 1
++		c2[p2] += 1
++	}
++	// excluded slot is never picked
++	testing.expectf(t, c1[1] == 0, "excluded slot must never be picked, got %d", c1[1])
++	// remaining ratio 1:3 -> 3000/9000; sigma ~47 -> 3-sigma ~142, use +-170
++	testing.expectf(t, c1[0] >= 3000-170 && c1[0] <= 3000+170, "slot 0: got %d, want ~3000 (1:3 after exclusion)", c1[0])
++	testing.expectf(t, c1[2] >= 9000-170 && c1[2] <= 9000+170, "slot 2: got %d, want ~9000 (1:3 after exclusion)", c1[2])
++
++	// exclude an id NOT in the list -> no-op: full 1:2:3 distribution
++	r3: Rng; rng_seed(&r3, 5)
++	c3: [3]u64
++	for i in 0..<DRAWS {
++		p, ok := weighted_pick_excluding(&r3, ids, weights, 999)
++		testing.expect(t, ok, "exclude-not-present must succeed")
++		c3[p] += 1
++	}
++	testing.expectf(t, c3[1] >= 4000-170 && c3[1] <= 4000+170, "no-op exclude slot 1: got %d, want ~4000", c3[1])
++
++	// all-excluded (a lone sink == src) -> ok=false, callers skip the packet
++	r4: Rng; rng_seed(&r4, 6)
++	_, ok4 := weighted_pick_excluding(&r4, []u32{7}, []i32{3}, 7)
++	testing.expect(t, !ok4, "sole sink excluded must fail the pick")
++
++	// zero-weight + exclusion interact: only the excluded slot has weight
++	r5: Rng; rng_seed(&r5, 7)
++	_, ok5 := weighted_pick_excluding(&r5, []u32{1, 2}, []i32{0, 5}, 1)
++	testing.expect(t, ok5, "nonzero remaining total must succeed")
++	_, ok6 := weighted_pick_excluding(&r5, []u32{1, 2}, []i32{0, 5}, 2)
++	testing.expect(t, !ok6, "only the excluded slot had weight -> must fail")
++
++	// lone-sink FLOW pin: era 3 on the 3-node fixture (ONE residential). The
++	// email spec (res->res) can never spawn — its only sink IS its src, so
++	// every dst pick is excluded (silently spawns nothing, by design). The
++	// streaming spec (host->res) has a real sink and spawns normally.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	state: Run_State
++	defer run_destroy(&state)
++	run_init(&state, 11, cat.hash, TEST_LOGIC_HZ)
++	state.era = 3
++	test_seed_fixture(&state, cat) // res0, router1, host2 — ONE residential
++	TICKS :: 120
++	for tick in u64(1)..=TICKS {
++		step(&state, tick, {}, cat)
++	}
++	by_class, _, _, _ := spawn_histogram(&state.flow)
++	testing.expectf(t, by_class[0] == 0, "lone-sink email must spawn nothing, got %d", by_class[0])
++	testing.expectf(t, by_class[1] == 2*TICKS, "streaming (host->res, 1 sink) must spawn 2/tick, got %d", by_class[1])
++}
++
++@(test)
++test_director_spawns_by_spec :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	email_idx, _ := class_index(cat, "email")
++	stream_idx, _ := class_index(cat, "streaming")
++	testing.expectf(t, email_idx == 0 && stream_idx == 1, "test catalog class order: email=%d streaming=%d (want 0,1)", email_idx, stream_idx)
++
++	TICKS :: 600 // era 1 = email 2/tick -> 1200 email packets
++
++	state: Run_State
++	defer run_destroy(&state)
++	run_init(&state, 42, cat.hash, TEST_LOGIC_HZ)
++	state.era = 1
++	_, _, _ = qa_fixture(&state, cat)
++	for tick in u64(1)..=TICKS {
++		step(&state, tick, {}, cat)
++	}
++
++	by_class, dst_hist, src_hist, self_loops := spawn_histogram(&state.flow)
++	testing.expectf(t, by_class[0] == 2*TICKS, "email volume: got %d, want %d", by_class[0], 2*TICKS)
++	testing.expectf(t, by_class[1] == 0, "era 1 must spawn no streaming, got %d", by_class[1])
++
++	// §3.3: the dst distribution matches the sink demand_weights (all 1 ->
++	// uniform over the 3 residentials; sigma ~16 -> 3-sigma ~49, use +-60)
++	email := by_class[0]
++	res := dst_hist[0][0] + dst_hist[0][1] + dst_hist[0][3]
++	testing.expectf(t, res == email, "every email must land on a residential sink: %d/%d", res, email)
++	for i in u32(0)..<4 {
++		want := email / 3
++		if i != 2 { // ids 0,1,3 are the residentials
++			got := dst_hist[0][i]
++			testing.expectf(t, got >= want-60 && got <= want+60,
++				"email dst distribution: sink %d got %d, want ~%d (uniform)", i, got, want)
++		}
++	}
++	testing.expectf(t, dst_hist[0][2] == 0 && dst_hist[0][4] == 0,
++		"email dst must never be the router or host (role selector): router=%d host=%d", dst_hist[0][2], dst_hist[0][4])
++	// the src selector: email originates from residentials only
++	testing.expectf(t, src_hist[0][0] + src_hist[0][1] + src_hist[0][3] == email,
++		"every email must originate from a residential (role selector)")
++	testing.expectf(t, self_loops == 0, "no packet may be its own dst (self-loop), got %d", self_loops)
++
++	// (d) same seed -> byte-identical spawn sequence (histograms compare equal)
++	state2: Run_State
++	defer run_destroy(&state2)
++	run_init(&state2, 42, cat.hash, TEST_LOGIC_HZ)
++	state2.era = 1
++	_, _, _ = qa_fixture(&state2, cat)
++	for tick in u64(1)..=TICKS {
++		step(&state2, tick, {}, cat)
++	}
++	by2, d2, s2, sl2 := spawn_histogram(&state2.flow)
++	testing.expect(t, by2 == by_class, "same seed must reproduce per-class spawn counts")
++	testing.expect(t, d2 == dst_hist, "same seed must reproduce dst picks")
++	testing.expect(t, s2 == src_hist, "same seed must reproduce src picks")
++	testing.expect(t, sl2 == self_loops, "same seed must reproduce the self-loop count")
++}
++
++@(test)
++test_director_surge_amplifies_class :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	// shrink the streaming surge window to [400, 600) for test speed (semantics
++	// identical to the data file's [1200, 3000) window)
++	surge := &cat.demand.eras[2].set_pieces[0]
++	surge.start_tick = 400
++	surge.duration_ticks = 200
++
++	state: Run_State
++	defer run_destroy(&state)
++	run_init(&state, 7, cat.hash, TEST_LOGIC_HZ)
++	state.era = 3
++	_, _, _ = qa_fixture(&state, cat)
++	for tick in u64(1)..=800 {
++		step(&state, tick, {}, cat)
++	}
++
++	by_class, _, _, _ := spawn_histogram(&state.flow)
++	// email: 4/tick x 800 (era 3 base volume; the surge targets streaming only)
++	testing.expectf(t, by_class[0] == 4*800, "email volume under surge: got %d, want %d", by_class[0], 4*800)
++	// streaming: 2/tick x 399 before [1,400) + 20/tick x 200 during [400,600)
++	// + 2/tick x 201 after (600,800]
++	want_stream := u64(2*399 + 20*200 + 2*201)
++	testing.expectf(t, by_class[1] == want_stream, "streaming volume (surge x10): got %d, want %d", by_class[1], want_stream)
++
++	// exact window boundaries (set_piece_active semantics through the director)
++	testing.expectf(t, tick_class_count(&state.flow, 399, 1) == 2, "surge must NOT be active at tick 399, got %d", tick_class_count(&state.flow, 399, 1))
++	testing.expectf(t, tick_class_count(&state.flow, 400, 1) == 20, "surge must be active at tick 400, got %d", tick_class_count(&state.flow, 400, 1))
++	testing.expectf(t, tick_class_count(&state.flow, 599, 1) == 20, "surge must be active at tick 599, got %d", tick_class_count(&state.flow, 599, 1))
++	testing.expectf(t, tick_class_count(&state.flow, 600, 1) == 2, "surge must end at tick 600, got %d", tick_class_count(&state.flow, 600, 1))
++}
++
++@(test)
++test_era0_legacy_no_rng_draws :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	state: Run_State
++	defer run_destroy(&state)
++	run_init(&state, 42, cat.hash, TEST_LOGIC_HZ)
++	// era stays 0 (run_init default) — the director's plan is empty
++	_, _, _ = qa_fixture(&state, cat)
++	// legacy path: one trivial request (the slice-1 flow_seed_demand)
++	flow_seed_demand(&state.flow, 3, 0, 1, 0)
++
++	rng_snapshot := state.rng
++	for tick in u64(1)..=10 {
++		step(&state, tick, {}, cat)
++	}
++	testing.expectf(t, len(state.flow.packets) == 1, "era 0 must spawn only the legacy request, got %d packets", len(state.flow.packets))
++	testing.expect(t, state.rng == rng_snapshot,
++		"era 0 must not draw rng (director inactive; legacy demos' rng stream stays put)")
++}
+diff --git a/core/determinism_test.odin b/core/determinism_test.odin
+index 4d22081..a664330 100644
+--- a/core/determinism_test.odin
++++ b/core/determinism_test.odin
+@@ -16,6 +16,7 @@ package core
+ // drawn pipe changes the hash; replay reproduces it byte-identically.
+ 
+ import "core:testing"
++import "core:mem"
+ 
+ TEST_LOGIC_HZ :: i32(20)
+ 
+@@ -30,14 +31,36 @@ TEST_CATALOG_HASH :: u64(0x0123456789ABCDEF)
+ test_catalog :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalogs {
+ 	cat.hash = TEST_CATALOG_HASH
+ 	cat.node_types = make([dynamic]Node_Type, 0, 8, allocator)
+-	append(&cat.node_types, Node_Type{id = "residential", display = "Residential", kind = .Terminal, terminal_role = .Residential, throughput_units = 5, port_capacity = 0, era_introduced = 1})
+-	append(&cat.node_types, Node_Type{id = "content_host", display = "Content Host", kind = .Terminal, terminal_role = .Content_Host, throughput_units = 80, port_capacity = 0, era_introduced = 3})
++	append(&cat.node_types, Node_Type{id = "residential", display = "Residential", kind = .Terminal, terminal_role = .Residential, throughput_units = 5, port_capacity = 0, demand_weight = 1, era_introduced = 1})
++	append(&cat.node_types, Node_Type{id = "content_host", display = "Content Host", kind = .Terminal, terminal_role = .Content_Host, throughput_units = 80, port_capacity = 0, demand_weight = 1, era_introduced = 3})
+ 	append(&cat.node_types, Node_Type{id = "router_basic", display = "Basic Router", kind = .Junction, terminal_role = .None, throughput_units = 40, port_capacity = 4, era_introduced = 1})
+ 	cat.pipe_tiers = make([dynamic]Pipe_Tier, 0, 8, allocator)
+ 	append(&cat.pipe_tiers, Pipe_Tier{id = "narrow", display = "Narrow Copper", capacity_units = 5, clean_span = 8, max_span = 10, cost_per_tile = 5, era_introduced = 1})
+ 	append(&cat.pipe_tiers, Pipe_Tier{id = "standard", display = "Standard Line", capacity_units = 15, clean_span = 10, max_span = 14, cost_per_tile = 12, era_introduced = 1})
+ 	append(&cat.pipe_tiers, Pipe_Tier{id = "wide", display = "Wide Fiber", capacity_units = 40, clean_span = 14, max_span = 18, cost_per_tile = 30, era_introduced = 3})
+ 	cat.balance = Balance{logic_hz = TEST_LOGIC_HZ, max_ticks = 100000, snap_radius = 36, map_w_tiles = 40, map_h_tiles = 30, tile_px = 26, packet_bandwidth = 30}
++	// 3.1: the packet-class roster (mirrors data/packet_types.json — email = 0,
++	// streaming = 1; the class index is the Packet.class discriminator).
++	cat.packet_types = make([dynamic]Packet_Type, 0, 4, allocator)
++	append(&cat.packet_types, Packet_Type{id = "email", display = "Email", shape = .Circle, icon = "mail", color_rgba = {90, 98, 112, 255}, latency_tol_ms = 500, max_loss_pct = 30, bandwidth_demand = 1, default_lane = 1, demand_weight = 1, era_introduced = 1})
++	append(&cat.packet_types, Packet_Type{id = "streaming", display = "Streaming", shape = .Triangle, icon = "play", color_rgba = {30, 74, 152, 255}, latency_tol_ms = 300, max_loss_pct = 10, bandwidth_demand = 2, default_lane = 1, demand_weight = 1, era_introduced = 3})
++	// 3.1: the per-era demand (mirrors data/demand.json — eras 1/2 email-only,
++	// era 3 email + streaming + the streaming_surge set-piece).
++	cat.demand.eras = make([dynamic]Demand_Era, 0, 4, allocator)
++	make_era := proc(cat: ^Catalogs, volume: i32, streaming: bool, allocator: mem.Allocator) {
++		e: Demand_Era
++		e.entries = make([dynamic]Demand_Entry, 0, 4, allocator)
++		e.set_pieces = make([dynamic]Set_Piece, 0, 2, allocator)
++		append(&e.entries, Demand_Entry{class = 0, source_role = .Residential, sink_role = .Residential, volume = volume, default_lane = 1, selection = .Weighted_Random, demand_weight = 1})
++		if streaming {
++			append(&e.entries, Demand_Entry{class = 1, source_role = .Content_Host, sink_role = .Residential, volume = 2, default_lane = 1, selection = .Weighted_Random, demand_weight = 1})
++			append(&e.set_pieces, Set_Piece{id = "streaming_surge", class = 1, multiplier = 10, start_tick = 1200, duration_ticks = 1800, forecast_lead_ticks = 600})
++		}
++		append(&cat.demand.eras, e)
++	}
++	make_era(cat, 2, false, allocator) // era 1
++	make_era(cat, 2, false, allocator) // era 2
++	make_era(cat, 4, true, allocator)  // era 3 — the streaming surge era
+ 	return cat
+ }
+ 
+diff --git a/core/flow.odin b/core/flow.odin
+index 6e177b6..3afecce 100644
+--- a/core/flow.odin
++++ b/core/flow.odin
+@@ -33,6 +33,7 @@ package core
+ // (if not dst) forwards again from there next tick.
+ Packet :: struct {
+ 	id:             u64,
++	class:          u16, // 3.1: packet_types index (email=0, streaming=1, ...); the type discriminator
+ 	src, dst:       u32, // node ids
+ 	on_edge:        bool, // true = traversing `edge` toward `heading`; false = resident at `at_node`
+ 	at_node:        u32, // the node the packet sits at (valid when !on_edge)
+@@ -45,12 +46,14 @@ Packet :: struct {
+ 
+ // Spawn_Req — a trivial hardcoded demand entry (1.3: run setup, like the
+ // fixture; NOT part of the action log). The flow spawns a packet at `tick`
+-// from `src` to `dst`. The pressure-plan director (weighted src/dst picks)
+-// lands in slice 3; 1.3 carries one trivial entry.
++// from `src` to `dst` of packet `class`. The pressure-plan director (weighted
++// src/dst picks) is the real demand model (3.1); Spawn_Req is the legacy
++// slice-1 path kept for existing demos + the determinism test (no rng draw).
+ Spawn_Req :: struct {
+-	tick: u64,
+-	src:  u32,
+-	dst:  u32,
++	tick:  u64,
++	class: u16, // packet_types index (default 0 = email)
++	src:   u32,
++	dst:   u32,
+ }
+ 
+ Flow_State :: struct {
+@@ -70,11 +73,90 @@ flow_destroy :: proc(f: ^Flow_State) {
+ 	delete(f.demand)
+ }
+ 
+-// flow_seed_demand — append a trivial demand entry (run setup; the harness
+-// lowers a demo's spawn intents, the app hardcodes one). Re-created identically
+-// on every replay (NOT in the action log — like the fixture + seed).
+-flow_seed_demand :: proc(f: ^Flow_State, tick: u64, src, dst: u32) {
+-	append(&f.demand, Spawn_Req{tick = tick, src = src, dst = dst})
++// flow_seed_demand — append a trivial legacy demand entry (run setup; the
++// harness lowers a demo's spawn intents, the app/determinism-test hardcode
++// one). Re-created identically on every replay (NOT in the action log — like
++// the fixture + seed). class defaults to 0 (email) for back-compat with the
++// slice-1 callers that pass no class.
++flow_seed_demand :: proc(f: ^Flow_State, tick: u64, src, dst: u32, class: u16 = 0) {
++	append(&f.demand, Spawn_Req{tick = tick, class = class, src = src, dst = dst})
++}
++
++// flow_spawn — the single packet-construction path (legacy + director both
++// route through it). A freshly-spawned packet is resident at its source,
++// ready to forward next tick.
++flow_spawn :: proc(f: ^Flow_State, class: u16, src, dst: u32, tick: u64) {
++	f.next_packet_id += 1
++	append(&f.packets, Packet{
++		id = f.next_packet_id,
++		class = class,
++		src = src,
++		dst = dst,
++		on_edge = false,
++		at_node = src,
++		spawn_tick = tick,
++	})
++}
++
++// weighted_pick — seeded weighted-random index into weights[:], proportional
++// to weights[i] (Lemire draw over the cumulative sum, ONE rng draw per pick).
++// Array-order walk (no map-iter — ODN-10). A zero/negative weight is never
++// picked and does NOT count toward the total (total <= 0 -> ok=false). The
++// ONE draw per pick is what makes the (class, src, dst) spawn sequence byte-
++// identical across runs for a fixed seed [E10, v1 §3.3].
++weighted_pick :: proc(rng: ^Rng, weights: []i32) -> (u32, bool) {
++	total: u64 = 0
++	for w in weights {
++		if w > 0 { total += u64(w) }
++	}
++	if total == 0 { return 0, false }
++	draw := (u64(rng_next(rng)) * total) >> 32
++	acc: u64 = 0
++	for i in 0..<len(weights) {
++		if weights[i] <= 0 { continue }
++		acc += u64(weights[i])
++		if draw < acc { return u32(i), true }
++	}
++	return 0, false // unreachable (draw < total)
++}
++
++// weighted_pick_excluding — weighted_pick but a packet's dst must differ from
++// its src (no self-loop): skip the slot whose id == exclude. One rng draw.
++weighted_pick_excluding :: proc(rng: ^Rng, ids: []u32, weights: []i32, exclude: u32) -> (u32, bool) {
++	total: u64 = 0
++	excl := -1
++	for i in 0..<len(weights) {
++		if ids[i] == exclude { excl = i; continue }
++		if weights[i] > 0 { total += u64(weights[i]) }
++	}
++	if total == 0 { return 0, false }
++	draw := (u64(rng_next(rng)) * total) >> 32
++	acc: u64 = 0
++	for i in 0..<len(weights) {
++		if i == excl { continue }
++		if weights[i] <= 0 { continue }
++		acc += u64(weights[i])
++		if draw < acc { return u32(i), true }
++	}
++	return 0, false
++}
++
++// collect_terminals — gather live terminal node ids with the given role, in
++// slot order (insertion-stable — ODN-10), plus each one's demand_weight (from
++// its node_type). Scratch-allocated; the caller frees both arrays. Resolves a
++// DemandSpec's typed source/sink selectors against the live topology.
++collect_terminals :: proc(t: ^Topology, cat: ^Catalogs, role: Terminal_Role,
++                          alloc := context.temp_allocator) -> (ids: [dynamic]u32, weights: [dynamic]i32) {
++	ids = make([dynamic]u32, 0, 8, alloc)
++	weights = make([dynamic]i32, 0, 8, alloc)
++	for i in 0..<len(t.node_alive) {
++		if !t.node_alive[i] { continue }
++		if t.node_kind[i] != .Terminal { continue }
++		if t.node_role[i] != role { continue }
++		append(&ids, t.node_id[i])
++		append(&weights, cat.node_types[t.node_type[i]].demand_weight)
++	}
++	return
+ }
+ 
+ // flow_step — the deterministic tick: spawn from demand, then advance every
+@@ -92,21 +174,47 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 	f := &state.flow
+ 	bandwidth := u32(cat.balance.packet_bandwidth)
+ 
+-	// 1. SPAWN from this tick's demand. (1.3: trivial — one packet per req.)
++	// 1. SPAWN — two coexisting sources (the briefing's "keep both" decision):
++	//   (a) legacy flow_seed_demand (slice-1 trivial path; the existing demos +
++	//       the determinism test use it). Fixed src/dst, NO rng draw — so legacy
++	//       runs' rng stream stays at its post-seed value (their T1 hashes change
++	//       only via the Packet.class byte + the catalog_hash, not rng draws).
++	//   (b) the director plan (3.1 — the real demand model, ODN-7/v1 §3): per
++	//       DemandSpec, resolve the typed source/sink selectors against the LIVE
++	//       topology, pick src+dst via seeded weighted-random (state.rng — the
++	//       §3.3 rule), spawn effective_volume packets. One rng draw per src pick
++	//       + one per dst pick, in (spec, packet) order — byte-identical replay.
++	// An era of 0 (legacy runs) yields an empty plan -> no director spawns.
++
++	// 1a. legacy demand (flow_seed_demand).
+ 	for req in f.demand {
+-		if req.tick != tick {
+-			continue
++		if req.tick != tick { continue }
++		flow_spawn(f, req.class, req.src, req.dst, tick)
++	}
++
++	// 1b. director plan (the demand director — ODN-7). Every MVP spec uses
++	// Weighted_Random selection (the §3.3 rule); a rotation variant is excluded
++	// by the routing-ruling lens-guard (see Demand_Selection).
++	plan := scripted_plan_pressure(cat, state.era, tick)
++	for spec in plan.entries {
++		vol := effective_volume(&plan, spec.class, spec.volume)
++		if vol <= 0 { continue }
++		src_ids, src_w := collect_terminals(&state.topology, cat, spec.source_role)
++		sink_ids, sink_w := collect_terminals(&state.topology, cat, spec.sink_role)
++		if len(src_ids) > 0 && len(sink_ids) > 0 {
++			for k in 0..<vol {
++				sidx, oks := weighted_pick(&state.rng, src_w[:])
++				if !oks { continue }
++				src := src_ids[sidx]
++				didx, okd := weighted_pick_excluding(&state.rng, sink_ids[:], sink_w[:], src)
++				if !okd { continue } // sink set was just src (no valid dst) — skip this packet
++				flow_spawn(f, spec.class, src, sink_ids[didx], tick)
++			}
+ 		}
+-		f.next_packet_id += 1
+-		append(&f.packets, Packet{
+-			id = f.next_packet_id,
+-			src = req.src,
+-			dst = req.dst,
+-			on_edge = false,
+-			at_node = req.src, // resident at the source, ready to forward
+-			spawn_tick = tick,
+-		})
++		delete(src_ids); delete(src_w)
++		delete(sink_ids); delete(sink_w)
+ 	}
++	pressure_plan_destroy(&plan)
+ 
+ 	// 2. ADVANCE in-flight packets one step (per-hop). Iterate by index (we
+ 	// mutate fields; no array structural change in this loop — the cull is a
+@@ -182,7 +290,7 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 				continue // no route yet (incomplete graph) — wait here; re-tries
+ 				         // next tick once a topology change rebuilds the table
+ 			}
+-			pick := ecmp_pick(p.src, p.dst, 0, p.id, count) // class=0 until slice 3 packet types
++			pick := ecmp_pick(p.src, p.dst, u8(p.class), p.id, count) // 3.1: per-class ECMP hash (flow affinity by class)
+ 			hop := state.routing.hops[int(offset) + int(pick)]
+ 			p.on_edge = true
+ 			p.edge = hop.pipe
+diff --git a/core/serialize.odin b/core/serialize.odin
+index 79976fb..3d03aad 100644
+--- a/core/serialize.odin
++++ b/core/serialize.odin
+@@ -99,6 +99,7 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event,
+ 	for i in 0 ..< len(f.packets) {
+ 		p := &f.packets[i]
+ 		w_u64(&w, p.id)
++		w_u16(&w, p.class) // 3.1: the packet-type discriminator rides the T1 hash
+ 		w_u32(&w, p.src)
+ 		w_u32(&w, p.dst)
+ 		w_bool(&w, p.on_edge)
+@@ -112,6 +113,7 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event,
+ 	w_u32(&w, u32(len(f.demand)))
+ 	for i in 0 ..< len(f.demand) {
+ 		w_u64(&w, f.demand[i].tick)
++		w_u16(&w, f.demand[i].class) // 3.1
+ 		w_u32(&w, f.demand[i].src)
+ 		w_u32(&w, f.demand[i].dst)
+ 	}
+diff --git a/data/demand.json b/data/demand.json
+new file mode 100644
+index 0000000..64bbc03
+--- /dev/null
++++ b/data/demand.json
+@@ -0,0 +1,68 @@
++{
++  "_comment": "Demand catalog (v1 §3, ODN-5) — per-era DemandSpecs (base, always active) + SetPieces (forecast events). The Surge = streaming x10 (the Era-3 climax the slice-4 crisis engine fires on schedule). Ported from the Godot prototype's tuned demand.json (prototype-fun-gate); eras are an ARRAY (insertion-ordered, map-free per ODN-10 — Odin-native vs the prototype's object-keyed form). selection = weighted_random (the MVP default — seeded weighted-random dst pick, v1 §3.3). Story 3.1: scripted_plan_pressure returns the active era's entries + any active set-piece each tick; flow_step spawns per spec. set_piece.multiplier amplifies its class's spawn volume while active (effective_volume). growth_roles is [LATER] (map growth, slice 5.1).",
++  "eras": [
++    {
++      "era": 1,
++      "entries": [
++        {
++          "class_id": "email",
++          "source_role": "residential",
++          "sink_role": "residential",
++          "volume": 2,
++          "default_lane": 1,
++          "selection": "weighted_random",
++          "demand_weight": 1
++        }
++      ],
++      "set_pieces": []
++    },
++    {
++      "era": 2,
++      "entries": [
++        {
++          "class_id": "email",
++          "source_role": "residential",
++          "sink_role": "residential",
++          "volume": 2,
++          "default_lane": 1,
++          "selection": "weighted_random",
++          "demand_weight": 1
++        }
++      ],
++      "set_pieces": []
++    },
++    {
++      "era": 3,
++      "entries": [
++        {
++          "class_id": "email",
++          "source_role": "residential",
++          "sink_role": "residential",
++          "volume": 4,
++          "default_lane": 1,
++          "selection": "weighted_random",
++          "demand_weight": 1
++        },
++        {
++          "class_id": "streaming",
++          "source_role": "content_host",
++          "sink_role": "residential",
++          "volume": 2,
++          "default_lane": 1,
++          "selection": "weighted_random",
++          "demand_weight": 1
++        }
++      ],
++      "set_pieces": [
++        {
++          "id": "streaming_surge",
++          "class_id": "streaming",
++          "multiplier": 10,
++          "start_tick": 1200,
++          "duration_ticks": 1800,
++          "forecast_lead_ticks": 600
++        }
++      ]
++    }
++  ]
++}
+diff --git a/data/node_types.json b/data/node_types.json
+index 865e88d..f8880ae 100644
+--- a/data/node_types.json
++++ b/data/node_types.json
+@@ -1,5 +1,5 @@
+ {
+-  "_comment": "Node-type catalog (GDD § M3, ODN-5). Story 1.2 ships a minimal roster: residential (terminal source), content_host (terminal sink), router_basic (junction). kind: terminal | junction. terminal_role: residential | content_host | none. throughput_units = node throughput ceiling. port_capacity 0 = unlimited (terminals); routers are port-scaled (canon #14).",
++  "_comment": "Node-type catalog (GDD § M3, ODN-5). Story 1.2 ships a minimal roster: residential (terminal source), content_host (terminal sink), router_basic (junction). kind: terminal | junction. terminal_role: residential | content_host | none. throughput_units = node throughput ceiling. port_capacity 0 = unlimited (terminals); routers are port-scaled (canon #14). demand_weight (Story 3.1) = the terminal's relative attractor weight for weighted-random dst selection (v1 §3.3); terminals only, default 1 (uniform).",
+   "entries": [
+     {
+       "id": "residential",
+@@ -7,6 +7,7 @@
+       "kind": "terminal",
+       "terminal_role": "residential",
+       "throughput_units": 5,
++      "demand_weight": 1,
+       "lb_mode_capable": false,
+       "era_introduced": 1,
+       "port_capacity": 0
+@@ -17,6 +18,7 @@
+       "kind": "terminal",
+       "terminal_role": "content_host",
+       "throughput_units": 80,
++      "demand_weight": 1,
+       "lb_mode_capable": false,
+       "era_introduced": 3,
+       "port_capacity": 0
+diff --git a/data/packet_types.json b/data/packet_types.json
+new file mode 100644
+index 0000000..e54ac17
+--- /dev/null
++++ b/data/packet_types.json
+@@ -0,0 +1,33 @@
++{
++  "_comment": "Packet-type catalog (GDD § M2, art-direction §5, ODN-5). Story 3.1 ships the MVP roster: email + streaming. The other 7 (web/gaming/banking/voice/multicast/IoT/AI) are full-game content that arrive with later eras. shape = the primary visual distinguisher (never colour alone, [UX-DR4]); color_rgba = the secondary cue (look-book render shades, cosmetic — RGBA quad). icon = the disambiguator glyph ([LATER] font render). All sim values are int (ODN-10): latency_tol_ms (SLA threshold, ms), max_loss_pct (SLA drop threshold, %), bandwidth_demand (units a packet of this class consumes crossing an edge, × the base packet_bandwidth), default_lane (0=Express/1=Standard/2=Best-effort; MVP = Standard), demand_weight (relative weight vs sibling classes — NOT the per-sink dst weight, which lives on node_types).",
++  "entries": [
++    {
++      "id": "email",
++      "display_name": "Email",
++      "color_rgba": [90, 98, 112, 255],
++      "shape": "circle",
++      "icon": "mail",
++      "latency_tol_ms": 500,
++      "max_loss_pct": 30,
++      "bandwidth_demand": 1,
++      "default_lane": 1,
++      "era_introduced": 1,
++      "sla_fail_effect": "queued mail bounces; users refresh",
++      "demand_weight": 1
++    },
++    {
++      "id": "streaming",
++      "display_name": "Streaming",
++      "color_rgba": [30, 74, 152, 255],
++      "shape": "triangle",
++      "icon": "play",
++      "latency_tol_ms": 300,
++      "max_loss_pct": 10,
++      "bandwidth_demand": 2,
++      "default_lane": 1,
++      "era_introduced": 3,
++      "sla_fail_effect": "buffers stall; viewers rage-quit",
++      "demand_weight": 1
++    }
++  ]
++}
+diff --git a/demos/qos.dem b/demos/qos.dem
+new file mode 100644
+index 0000000..0ebbc60
+--- /dev/null
++++ b/demos/qos.dem
+@@ -0,0 +1,19 @@
++# qos.dem — Story 3.1 golden: two packet types flowing. Era 3 demand
++# (email 4/tick res->res + streaming 2/tick host->res) spawns via the
++# scripted_plan_pressure director with seeded weighted-random (class, src, dst)
++# picks; the streaming_surge set-piece (x10, window [60s, 150s)) is live from
++# 60s. The T1 hash manifest + the T2 captures pin the era-3 run bit-for-bit;
++# pixel fidelity of the render is deferred per the rlsw-harness gap.
++# fixture qos = the 3-node fixture + residentials 3,4 (so the email spec has a
++# real sink set). Node ids: 0=res, 1=router, 2=host, 3=res, 4=res.
++seed 3003
++run 75000ms
++era 3
++fixture qos
++expect hash stable
++at 100ms draw 0 1 standard
++at 100ms draw 1 2 standard
++at 100ms draw 3 1 standard
++at 100ms draw 4 1 standard
++capture at 1000ms
++capture at 65000ms
+diff --git a/goldens/boot.log.bin b/goldens/boot.log.bin
+index 268d925..a56c826 100644
+Binary files a/goldens/boot.log.bin and b/goldens/boot.log.bin differ
+diff --git a/goldens/boot.t1 b/goldens/boot.t1
+index eec8b1c..613035c 100644
+--- a/goldens/boot.t1
++++ b/goldens/boot.t1
+@@ -3,105 +3,105 @@ t1 1
+ demo boot
+ seed 42
+ logic_hz 20
+-catalog_hash 99a32393078e0cca
++catalog_hash c59e720ff6ac3fb4
+ ticks 100
+-1 d003e484b4405f14
+-2 a4dc117acb5d5c2b
+-3 2ac6979ed5cb55ee
+-4 cf644c97e44f7395
+-5 0a7bd75366498510
+-6 e57a58c6d0e910e7
+-7 453c716d5853934a
+-8 f002d02f068aea31
+-9 cbf9eb7344884bec
+-10 28c50e0be2874483
+-11 cfc2ea16b758ebc6
+-12 1c64742bcb4bb0cd
+-13 68f08eb2451daa68
+-14 dab32054be8a7f9f
+-15 d424d29750acca22
+-16 2fa5df97405aa609
+-17 619cb76ddf1c0c44
+-18 2b0e7c3dd7ebcbdb
+-19 15dd01b5a05f981e
+-20 705ef2c181593905
+-21 fe19206793a37640
+-22 0a28fc9b9b951017
+-23 215992a1a8f431fa
+-24 56ca17424c6f93a1
+-25 22927d366d939e1c
+-26 d39bbe0a2429e4f3
+-27 811b6a8c21c7bbb6
+-28 f467c79f8db723fd
+-29 ca6bef84bd0b9b58
+-30 de2c778888e7210f
+-31 7856217c2ebdbf92
+-32 439d2e2dac9e3439
+-33 643bb8a0674557b4
+-34 4ee2e782080b284b
+-35 ff041c205aa2808e
+-36 5dbfd43d228e9db5
+-37 9fcf87e1d9f5dd30
+-38 6f359cc945f63307
+-39 ac96db02cb4735ea
+-40 030134f4a7e72351
+-41 46326821b3948a8c
+-42 d160e666ad696923
+-43 e8bafbc6f97e2066
+-44 e6dcb1ca9e2c53ed
+-45 90e420e4dca1e388
+-46 f384cf7618bacfbf
+-47 4e281d5a402cab42
+-48 96da839745b8ada9
+-49 09e484e098a504e4
+-50 f1e0d5fcd7b8627b
+-51 f9033a941350a53e
+-52 66ecfd75995a67a5
+-53 868a7984127966e0
+-54 851a24613e4fc937
+-55 b36b9ac8bc8a1b9a
+-56 903c08424e78d341
+-57 02d0e2d3700a81bc
+-58 f4faeff8c4d22413
+-59 fbce63522fcf87d6
+-60 3f0d812f3f313a9d
+-61 0d65ab0dc3193978
+-62 a06497d6db6e232f
+-63 c51bc48f4e478cb2
+-64 6dee99afead663d9
+-65 a27aef244bd65fd4
+-66 047fca3e694d34eb
+-67 c0331b604e02fdae
+-68 28e09f5472361d55
+-69 1353aadadfe2d1d0
+-70 8edc6172c063cea7
+-71 1cdf9b61d42de70a
+-72 a4d6680e7a1dfff1
+-73 0e14d667afee5fac
+-74 2873a1bc537e4843
+-75 93c5153e279dde86
+-76 f41edd2020b6b88d
+-77 cd402a3f8ece1028
+-78 e42ae3050c8a6f5f
+-79 03ea0d656269a2e2
+-80 83ad426b15f5dfc9
+-81 b7ca5234c6fa2e04
+-82 10898f62ce3b5b9b
+-83 c22ae49c35fd94de
+-84 1ac036ed771abcc5
+-85 dcf8df9fa4a6f100
+-86 bc2e23596d7babd7
+-87 961172b31c7d1eba
+-88 8bd2eabcc66e9161
+-89 f2e366a31ffd7fdc
+-90 b9fc209aaf9cd3b3
+-91 fdae68d45ddb1b76
+-92 ab77a59afbb51fbd
+-93 acfd61c44ee12318
+-94 601a5ea7f51e82cf
+-95 79b8949dc3947052
+-96 a7178f892f19c9f9
+-97 059522924d021d74
+-98 46f6db6f05c1470b
+-99 96408c5f0e67174e
+-100 80a16f690f20c075
++1 487704a18d68f444
++2 5b587856af2ba663
++3 25ca2b34e1e69942
++4 4fea6b39b66c8b81
++5 24e9fe11f93cfa80
++6 3c5221f56da38aff
++7 fa04c38d5a99101e
++8 fa63e184d942cd1d
++9 8a7977c43e16337c
++10 f4b1bb3d243be8bb
++11 dabc5a9bf2c8395a
++12 69ade6e497b10d59
++13 931e379d29fd26b8
++14 2235af8ca1d14cf7
++15 dc250f6920c6f2d6
++16 a8d218d6d49a4c95
++17 19e8be9264774854
++18 94015bd6200ba2b3
++19 2bd66d296bb7f0d2
++20 d8688ee9a4f80ad1
++21 c935a8a2b899cdd0
++22 749dbeb3b225870f
++23 dc883c7775d4c7ae
++24 23884d4ac38924ed
++25 011b5a0dbc6f128c
++26 cb967ac8d21a6d0b
++27 b8a42831052f542a
++28 b0038a271158a6a9
++29 3f3300cc06fe4a88
++30 40257e0f0a117a87
++31 a2e987db36758826
++32 6e9546683e7caa25
++33 cca2b2b9ec4efc24
++34 0e1ec9cb1336ee43
++35 731dae682d7b6822
++36 3e6e60eab2074361
++37 a110daf05b6fd260
++38 8cde66d4abc8d7df
++39 a2689c2197143bfe
++40 3aa29f70a2c864fd
++41 6d41dcd54774a05c
++42 7ad144166f6e541b
++43 1f7db58447a3d23a
++44 00627b7f9da5e4b9
++45 df2b4449f3fc8b98
++46 0e2f821b19efd5d7
++47 e3fbc61be9d412b6
++48 4a5f411bcffdfe75
++49 4627223874e72d34
++50 17b46f5c2083c393
++51 161460c9b5fbaf32
++52 117a305041eac0b1
++53 6889f65c3f1be0b0
++54 e3e8f604ac4471ef
++55 2daf1ff15f377c0e
++56 ffd04ed28afb75cd
++57 d18e15ad82c5a4ec
++58 94a55338d89db9eb
++59 10bc6c96f84f7c8a
++60 a0f8e9cacf237e89
++61 1d396bb13902df68
++62 85e49be405d681e7
++63 f3ab276d02e4a806
++64 e3c7739aeb45d205
++65 8d40a990e6c95004
++66 c520ed271f4c4223
++67 d7c336a0b282ae02
++68 44dfb2ef882c7641
++69 1356f25ee7d0e140
++70 a96961c24d1473bf
++71 78cc4309bd2ea5de
++72 6fa41dad857383dd
++73 190db0d788cd9e3c
++74 5a6f3c0b9b8f1f7b
++75 e05a57b4d500a41a
++76 5e74868301d96419
++77 76fac159b7877a78
++78 ed22e6585a7dcab7
++79 e6b41c8b5a968e96
++80 358ddab3a326d455
++81 06dc0ed5a2888014
++82 74ad37a18e516a73
++83 4e14656f6f30ed92
++84 e125c908c5c60e91
++85 0d1c19b864853790
++86 b1512e39510f43cf
++87 afe2c80bfc2e7a6e
++88 4ebb3b6c3dbd80ad
++89 b57be2c1be03254c
++90 b2975e39b5f275cb
++91 c9d73048d8fcddea
++92 e199a8524b6fb669
++93 ea80582c008ad748
++94 371645b2d6df9a47
++95 0c820d7cfabec3e6
++96 b29e1a89be31ffe5
++97 5fa8aa25d03650e4
++98 00f6008337f7e503
++99 1c704017e174afe2
++100 bc951478c2ab2e21
+diff --git a/goldens/bundle.log.bin b/goldens/bundle.log.bin
+index f5b8e08..d02e986 100644
+Binary files a/goldens/bundle.log.bin and b/goldens/bundle.log.bin differ
+diff --git a/goldens/bundle.t1 b/goldens/bundle.t1
+index 7e609a9..cf34a1c 100644
+--- a/goldens/bundle.t1
++++ b/goldens/bundle.t1
+@@ -3,75 +3,75 @@ t1 1
+ demo bundle
+ seed 42
+ logic_hz 20
+-catalog_hash 99a32393078e0cca
++catalog_hash c59e720ff6ac3fb4
+ ticks 70
+-1 28c41aa14f8a4936
+-2 fdb7b89c79ca3737
+-3 cf0bd4a3b01237c4
+-4 78a3101764268835
+-5 434cdafab054595a
+-6 4614c1a276ba520b
+-7 921bb8dbc9c9bfe8
+-8 821657756ec8b919
+-9 e44a6ee3e3155cfe
+-10 e60fb8596e2a9cbf
+-11 732e507abdabd8c9
+-12 29e91cb38da8f7da
+-13 edcd1e043b1d9543
+-14 89d9fac891e4e34c
+-15 370187b3effdd20d
+-16 3b2cf0f1f7d0afee
+-17 2013c61d821c87a7
+-18 650cbd1509ad1ae0
+-19 da2d0af962142371
+-20 90e66b24c05ec762
+-21 25a8466960c7048b
+-22 55e5ca590a73f194
+-23 9abefd08a429bc75
+-24 d53ebff2b437c516
+-25 efc2235d0132416f
+-26 074c54a65245eec8
+-27 79db9cd3a8d8bed9
+-28 ff61164e8144e9aa
+-29 6b945e28e78a8953
+-30 0bb8f2482926be1c
+-31 f270bb158b2c644f
+-32 5ca536e6a0ef0aaa
+-33 8144fc299dc2d199
+-34 974a701d43a15964
+-35 7003ff22dee306e3
+-36 7ed46ba94195043e
+-37 9db304f9f66970dd
+-38 bad82313c48efe38
+-39 ea6e84cf433b8957
+-40 86cd2870015a40d2
+-41 9d4abda0be7065c1
+-42 105ad5b9c531452c
+-43 30f4f7da234d060b
+-44 32bbbbf6b4511726
+-45 788d57a0ea16c1e5
+-46 083ccbeba6caaba0
+-47 ae2c6177c898363f
+-48 22182d41917c26da
+-49 97df20c966b83d89
+-50 c0963d02341f5054
+-51 4de8d22b786f464c
+-52 68986a03a69ab7ab
+-53 cb1aaa57590abd1a
+-54 4cc265cdf2df937c
+-55 0169e360c3e5ee3a
+-56 8035e4a6636b8274
+-57 16b7682df981ccc0
+-58 243e028e1e7eb51d
+-59 7345bdbc330f601c
+-60 56badc0c1855048b
+-61 a38b9094f985724a
+-62 3bff9c942dc56869
+-63 bea43ec54c1b4ab0
+-64 a90ca8b86ad9844f
+-65 7900ade52b5bea3e
+-66 73bdf37a71d46b6d
+-67 a67f635ff08ffec4
+-68 9ea2acf18b352d93
+-69 a6f46b1b15eea9b2
+-70 9932c55629db3cb1
++1 df53463beb842bce
++2 b9690d90db9c291f
++3 ad61eb29d05f3e28
++4 68ce152c2162cbb9
++5 c97e7d1633298412
++6 c16821d8bdb99bf3
++7 5389b5029ded2eec
++8 683fc32343ad189d
++9 3d882ed860f7f716
++10 3d85e9398ec81f87
++11 0fb6952295e2830d
++12 7d8b3ae6444921ce
++13 f029aa8f5a26379b
++14 afe39f9960dad914
++15 080e5b0f0e3cbf31
++16 4076fca9a56434a2
++17 60b3cc4130dc53bf
++18 b081dda747a2a3c8
++19 8a9341d8fcfb4a15
++20 5df0fef93269dad6
++21 4fe7440387d761e3
++22 41d0be069e4aa8fc
++23 fdf4d8bb0f2c4019
++24 1eeab79cec4f4eca
++25 91fba9e0f9f93627
++26 c1ac816b2f83aa70
++27 7e0ff1eb0d76207d
++28 e172267f62685a7e
++29 8a53c88fee922f8b
++30 f071510acd2e0d04
++31 116b02bb46308783
++32 3cd9257f19b27f1e
++33 078c534bff243711
++34 df47e9478d3a0dcc
++35 edc986727bfa35d7
++36 0f1ef9e4282c8db2
++37 12d891e9eca74035
++38 b0ccdcb776888120
++39 c0d8c176c2ecc06b
++40 dc7bbdf7555dbb66
++41 bd1831ab4f732639
++42 3c08f3b548414b34
++43 3eacda72813a137f
++44 e5cec11b8e59c4ba
++45 1500450f34ac0a7d
++46 1963acbbbdf0a568
++47 3019778710e19413
++48 fbfd9ecb475beaee
++49 12294c5668f8b0a1
++50 27a1515d26c140dc
++51 80ba9fff79dd5940
++52 84a93cbdf91d354f
++53 9ea7d5a3ac72d732
++54 fa2d13d2bb4164cc
++55 87029cb3e4d18656
++56 ebabb1fa9f4fb598
++57 e1b3eddcddf2ced0
++58 c2b04b4a1eb4032d
++59 cc4b179612da26a8
++60 de8c1c7adf9d0317
++61 35ec83eb0e89a0fa
++62 bc190b7d66a590b9
++63 60a6f21ea3638c7c
++64 6195d2941f62cd3b
++65 5e8fcf74bc36804e
++66 2353e1ac45d42a1d
++67 84cc8c0bfd9ebf90
++68 a9adc697e06803bf
++69 4820957ac4168722
++70 8a9497c3217f8461
+diff --git a/goldens/bundle/02850ms.png b/goldens/bundle/02850ms.png
+index 2cff769..eec95a8 100644
+Binary files a/goldens/bundle/02850ms.png and b/goldens/bundle/02850ms.png differ
+diff --git a/goldens/demolish.log.bin b/goldens/demolish.log.bin
+index 36df60b..40cf921 100644
+Binary files a/goldens/demolish.log.bin and b/goldens/demolish.log.bin differ
+diff --git a/goldens/demolish.t1 b/goldens/demolish.t1
+index d9dcebc..4b25dc1 100644
+--- a/goldens/demolish.t1
++++ b/goldens/demolish.t1
+@@ -3,85 +3,85 @@ t1 1
+ demo demolish
+ seed 42
+ logic_hz 20
+-catalog_hash 99a32393078e0cca
++catalog_hash c59e720ff6ac3fb4
+ ticks 80
+-1 bd17300684022864
+-2 6682f43d6643dc43
+-3 07362a54557bf0e2
+-4 2c6a244c52811b01
+-5 34b0ece3393ba8d0
+-6 b13a171d3d43668f
+-7 96313cc8bd2cc3ae
+-8 bcd453170d5834fd
+-9 55bd4eec15bc50bc
+-10 7d7baadd9a4a223b
+-11 e24d566d2b8a855a
+-12 0e50fe9e6dbb461b
+-13 aebd1d1ca2c5aca0
+-14 52e036fb2e26a201
+-15 a4157304dfa6be56
+-16 4925ab57b8bbe127
+-17 669d078dbdfc9bbc
+-18 4cffd887cb7fd36d
+-19 89ab16d525415d72
+-20 634e044f1ee2c74a
+-21 2cb7156327681980
+-22 52d9249080a33e12
+-23 1cdbb9055006c822
+-24 e4d5bbafd4f7e75b
+-25 36a3b921d5d2adbc
+-26 87a1631536541470
+-27 08483c1c727a4678
+-28 a3659a39367988b2
+-29 cb017f18a87af501
+-30 1fa833acf0972300
+-31 414d12fbd39f20bf
+-32 6615842506fa547e
+-33 79038c2e959c283d
+-34 0f642acc5cd6da8c
+-35 8c3ac824b4f37e9b
+-36 be871ef532b82c6a
+-37 9c9440fdc3dcbf19
+-38 775f2c1e177b96d8
+-39 939ff7e337700117
+-40 19e503a80210e256
+-41 8514b9b39e889e15
+-42 ff5b2aacfd77aae4
+-43 7eb0df032f6d7df3
+-44 4e8c477ce6239a02
+-45 f099b2caf1264c11
+-46 221372c49f4ee9d0
+-47 cd4fd18cd7b1138f
+-48 c156244a7ae2b18e
+-49 231ba306b155404d
+-50 72ce62d51422b81c
+-51 97a1d2e17833b7ab
+-52 4510879838f8e53a
+-53 8a0d25f6e41f92a9
+-54 71783a40eded3528
+-55 23102d2401503427
+-56 f0d6860825091de6
+-57 f14167bddd8d7e65
+-58 feac2f210eb0b534
+-59 71a6e80e9cfc2603
+-60 abaf0145969eaf92
+-61 8dbd9d855be8bbe1
+-62 0d3d91de3a86f5e0
+-63 f87aef98404af71f
+-64 33d02b3e5002a3de
+-65 c1b021edf138979d
+-66 4a990b7be79db36c
+-67 04389645b7c8aa7b
+-68 894433d95a16864a
+-69 912df23124084a79
+-70 706d2afb6afa64b8
+-71 44abfe0ab20c6377
+-72 b51049467094e5b6
+-73 5bc8847de2b64c75
+-74 123d3ab70e34a744
+-75 87c1b1bc500879d3
+-76 2845721cc3c6bae2
+-77 4fcfa25a32c524f1
+-78 4a5d236f70ddde30
+-79 3c66753fc6f2156f
+-80 72b210abe73e2eee
++1 0482726c385c27fc
++2 9c7cafbe131771cb
++3 f4e28502b21e513e
++4 d5cc394d23bb3b6d
++5 4f69946440a7c0e8
++6 5333597df16a9d57
++7 8dc50e6c5752824a
++8 619e48c5f9d29e09
++9 cadee5912f3d0534
++10 a0e90f0cfb566583
++11 f483988e8a783606
++12 114cf26900146eb7
++13 de4deddac61868f8
++14 bf4a3edf694d4b09
++15 105cfdd86e7fdbe2
++16 b3d03cb445279da3
++17 2949f7c332769a94
++18 96d67836cd2f02f5
++19 b6602bc9e410949e
++20 095d3b233559a086
++21 fefe240c19eb46d0
++22 cd103d9071a44892
++23 d27ad4845d21992e
++24 d2546d99c0b00777
++25 2abbf05995c30dc4
++26 c88a3b58600a3798
++27 389d2f603518d894
++28 8fb56f35a7004906
++29 270466cda1901801
++30 a72a975e312b66a0
++31 ee4ce803ae0e96f3
++32 e64c9b2536652552
++33 0a3f1f023fac65dd
++34 4489a44a51dcea8c
++35 a170f4c2af339e8f
++36 ab84306441f9b69e
++37 eff68ad4b39d7219
++38 87ebba16bd8aac98
++39 f7fa3d5be1e1c8eb
++40 6866e9031940af6a
++41 7814b3f9521ba715
++42 1befd6d234cb2324
++43 5f19d9b2642d0727
++44 73824c51cced00f6
++45 e255a5e8adb96df1
++46 3f9a36b15f0071d0
++47 68fad07c9be68163
++48 404ec38aece05f42
++49 c4c9799c103ea4cd
++50 492ef47bb515ce3c
++51 d94cc7cf8401d7ff
++52 d1445baaad0c770e
++53 d9922508c1f56449
++54 0bddceaa9c9961c8
++55 c92bfff46037039b
++56 7607250feca9f09a
++57 a79a66d288f97745
++58 7c7d82f31c6e1694
++59 d3ac180657237d97
++60 cd6acd5874038626
++61 7fc2bff26df11aa1
++62 6ac44d2efc9294c0
++63 6a8f7773910ea513
++64 520d863a18665272
++65 00dec1dbb722f17d
++66 8206be0925f4762c
++67 625bd61a3db4beaf
++68 0b0f21209b166f3e
++69 cf6b431733adfeb9
++70 02d1d8970ce49038
++71 43d7837d9f9b9c0b
++72 300e065a3e566c0a
++73 524c6d09df21f635
++74 7d45ccd82cccc2c4
++75 c52a0a46042a2cc7
++76 201c521e4b057c96
++77 e54511befa199a91
++78 f2e599a133645070
++79 9b35f06ce6186a83
++80 52b30240e9f350e2
+diff --git a/goldens/demolish/01050ms.png b/goldens/demolish/01050ms.png
+index 9d1be5d..20ea8ab 100644
+Binary files a/goldens/demolish/01050ms.png and b/goldens/demolish/01050ms.png differ
+diff --git a/goldens/demolish/01250ms.png b/goldens/demolish/01250ms.png
+index f383d9e..b645e85 100644
+Binary files a/goldens/demolish/01250ms.png and b/goldens/demolish/01250ms.png differ
+diff --git a/goldens/demolish/01300ms.png b/goldens/demolish/01300ms.png
+index 7a1fbab..0b61027 100644
+Binary files a/goldens/demolish/01300ms.png and b/goldens/demolish/01300ms.png differ
+diff --git a/goldens/draw.log.bin b/goldens/draw.log.bin
+index aa2980f..d964d23 100644
+Binary files a/goldens/draw.log.bin and b/goldens/draw.log.bin differ
+diff --git a/goldens/draw.t1 b/goldens/draw.t1
+index 6bd3252..f2cc44b 100644
+--- a/goldens/draw.t1
++++ b/goldens/draw.t1
+@@ -3,65 +3,65 @@ t1 1
+ demo draw
+ seed 42
+ logic_hz 20
+-catalog_hash 99a32393078e0cca
++catalog_hash c59e720ff6ac3fb4
+ ticks 60
+-1 8cdc7f7070bddcec
+-2 758cb525ba076517
+-3 8d9b780e1b41afd6
+-4 a742bc57b745dc09
+-5 1336e7f6651f07d0
+-6 e10b2e3a6d91d8ab
+-7 e8fb83b21bf9e5da
+-8 fff42d17595cf14d
+-9 0d70b483fe68fb64
+-10 0a362f0c8f191c2f
+-11 685618bbf5172f23
+-12 c430e394ea25c6e2
+-13 420f5e5223a84ab9
+-14 6b1a2c1369a074a8
+-15 2b5b1a9e8b15a917
+-16 d53d70aafa3daaa6
+-17 841466863ae5006d
+-18 afe0db1a6b4a476c
+-19 65139c1f08a5265b
+-20 954385982e63cdba
+-21 c2edf491310bbe71
+-22 76886c1f04cee240
+-23 1c92f6c01236040f
+-24 4e17042c232d62de
+-25 8cb700292933a625
+-26 72672542fc416024
+-27 11b9dd3fa6300d53
+-28 a7289b90ed422c12
+-29 332f85dd26e07529
+-30 d9dfab3af2b63f58
+-31 0c9b5933cf6c69cb
+-32 9cfa8de3060ac2cc
+-33 3b78b6edae3a3399
+-34 41c12ce2b9e60192
+-35 8a61f1bfcc61e36f
+-36 22edf6bfe7355f50
+-37 72c16a0807b892dd
+-38 6fbfa440681785a6
+-39 48420a5eea5abbc3
+-40 c4f8a6c74b525184
+-41 20a582651ad4c0d1
+-42 9960cdf22c273cca
+-43 0a90175a2b08cda7
+-44 a46cfe369309ff88
+-45 8c85e6e095335275
+-46 9f6dcb461c0c79fe
+-47 171ff2627d025b1b
+-48 c2107def461175dc
+-49 11e6fac093836e69
+-50 32154cd630e72022
+-51 9c7d6490b953a47f
+-52 29938d2c897da1a0
+-53 f204626cc8ddc22d
+-54 27c61fa3a9fbd976
+-55 7e23fac6608eedd3
+-56 b8a3d762844499d4
+-57 af1b9e6e476125a1
+-58 5830b717fd0b201a
+-59 4e1fbeaee42c7577
+-60 177d06a89809e298
++1 1d8ae6eea70fd93c
++2 c10efc2953c3970f
++3 941e037973914592
++4 84402ac1c129577d
++5 32e79363dc19f920
++6 cf2563f110078a63
++7 7170d4b518d9cfe6
++8 45487cc072f87fd1
++9 05fd13310548a5d4
++10 fd97b6a0e413e5c7
++11 14acc808d270e82f
++12 5bdc3af03aa4b636
++13 be93d1c5815d2549
++14 3281fae9dee51ee0
++15 e733be2c47506cb3
++16 00affd85cccbb20a
++17 589ba78732626cfd
++18 05bcc2833c3ee564
++19 1d164b41153340c7
++20 d879a10334667ace
++21 fac4e417c9e8aec1
++22 53efaf026af95158
++23 61763db696c6856b
++24 be1d763ea92fed42
++25 239a1a994a677315
++26 2f556c3fe816969c
++27 368493b411808cff
++28 48442a940f7b5e86
++29 acc4db8e0529b519
++30 8619bd43a4fa7130
++31 badae04d7fd54967
++32 b8f5950afd941c20
++33 5f5b8bfe6f00a1a9
++34 8a7bd5514e0267ea
++35 025d00aa2742d1fb
++36 5280ee0a30a53ff4
++37 9769f0e520b595ad
++38 d8b6d39382fd381e
++39 c41d5b6f25539f3f
++40 061c5f6401278ef8
++41 c36314a4f257f241
++42 5bdeb67a7395cfc2
++43 84bef3a4db45d273
++44 371596928b604b4c
++45 de034e887bc648e5
++46 9bb988db7a5a3416
++47 ffd5dfb2df1e5a57
++48 56770de071560410
++49 c408eae36f905119
++50 0af45c4509a5e79a
++51 2f6a3edd87cfb76b
++52 5417b939e25680e4
++53 64daee00efd07e5d
++54 162fa6a0d719808e
++55 4ef9740679eb46ef
++56 54ae75561abd4b68
++57 6352a05418d15d31
++58 c91b75c352bf5132
++59 5dcaa568c8133063
++60 086f28a1b4efc0bc
+diff --git a/goldens/ecmp.log.bin b/goldens/ecmp.log.bin
+index 45ef7d3..79b4655 100644
+Binary files a/goldens/ecmp.log.bin and b/goldens/ecmp.log.bin differ
+diff --git a/goldens/ecmp.t1 b/goldens/ecmp.t1
+index c9c5c35..d42600f 100644
+--- a/goldens/ecmp.t1
++++ b/goldens/ecmp.t1
+@@ -3,85 +3,85 @@ t1 1
+ demo ecmp
+ seed 42
+ logic_hz 20
+-catalog_hash 99a32393078e0cca
++catalog_hash c59e720ff6ac3fb4
+ ticks 80
+-1 a4a616f36a68ff88
+-2 29042e7e6ce6b7b5
+-3 9bbbd66a39f7a07a
+-4 16888f64336d04d7
+-5 35234812cbbb2e74
+-6 c49a6a05d030d451
+-7 a36857366738da26
+-8 5aa6c9ccb6df8533
+-9 6512668318e27bb0
+-10 6670125e98eabf1d
+-11 c74f3ad9a00ca6b4
+-12 b75ec86bd786b8bd
+-13 8cfdd646eac542ae
+-14 36c718a21af13aa7
+-15 41dc207afb023cb0
+-16 c8aa98ad3b27d489
+-17 65eb6952a201e83a
+-18 78363197c17b5163
+-19 318f089c6d68a3dc
+-20 1ad7b66df2ba44d3
+-21 f8e275cfc784b281
+-22 50730392364c249f
+-23 83411058ddef260d
+-24 3ea4260ed375a21e
+-25 5bc4e3acb69ad844
+-26 26e2ce7403fdee2e
+-27 556e2d46ebf33b6e
+-28 5793607fa5be09f2
+-29 d685c5d5c161ed33
+-30 64eb58317ff342bc
+-31 7be8e5cdf5d54b9d
+-32 1ca09df758a542f9
+-33 ad91533c30f7a32a
+-34 4c295512900f2253
+-35 b5460612609d18cc
+-36 c3730ecbc9d7bdd5
+-37 180d0372911bb1e6
+-38 5f2aeb0e31ceb73f
+-39 d75fe92db88f11a8
+-40 176e47a71c23bfe1
+-41 21a7b7acc0ae3cb2
+-42 cc50c1b76e2900bb
+-43 2d3d0a76a50135b4
+-44 23e0e912c5cc89bd
+-45 68979da02357ea6e
+-46 ed37798e9e5d1767
+-47 a21d82993bdb2af0
+-48 017a32021a7cde49
+-49 9f7669c83224d1ba
+-50 f226cc8dc0fd2663
+-51 964c69f9aa4b52dc
+-52 0d19ad64e506b465
+-53 f9a433de1a364176
+-54 064cccf8cc13adcf
+-55 4fa32d98cd425b78
+-56 1b76bc2e69595c71
+-57 488855aa707a5302
+-58 055586064001c14b
+-59 a0f1f660a1ed9504
+-60 10f3d689da7dc70d
+-61 1d57ec7adfa4d4be
+-62 4cb10a8c6c56c237
+-63 6e6d92250a769380
+-64 23b1f3f7370208d9
+-65 89e35971ad97e08a
+-66 69cb881ad46dcf33
+-67 ee927cad1a925f2c
+-68 de906c27749f73b5
+-69 57194065fc626546
+-70 c1bbf28d84d6d89f
+-71 34424af023f90288
+-72 6e72b329f89aab41
+-73 eacb00b53315d992
+-74 13464e31ef275b9b
+-75 2c1138e41a059d94
+-76 f86b14d7c1f5be9d
+-77 5268ca78c18a1d4e
+-78 d701fe24ff925347
+-79 5aa757a5bb152050
+-80 2d892c3e64246b29
++1 59017abe95a0c868
++2 c1f4a46e3154567d
++3 d56bbf556d2746be
++4 9efbf62a11ca43e3
++5 61923bcf94a9a5d4
++6 c5fad4579a2786b9
++7 a54da507d8c9e9da
++8 316bccbf50cafe8f
++9 7ee7992dfa9841b0
++10 7c68f0f411dc9085
++11 12f283e7af1a7a68
++12 bec3247c6a62e219
++13 ffe32ca4fb1b06ae
++14 b5d7dff69033152f
++15 b9713c920055c334
++16 827b60a23774e435
++17 26056fc6e54ece7a
++18 7366da424d673a8b
++19 efef355eec3b6710
++20 0851e245645b4dcf
++21 f9af6e35144b3fb1
++22 375e70e71a7e0b97
++23 50f9ab47fb3b4549
++24 2b473a9fe8778bca
++25 1736b74c11804b5c
++26 429a3fc53ca0507e
++27 4907fa076ded20e2
++28 eb6ff576e900fbee
++29 8086bc2d5f197953
++30 cc7cbfe3198260fc
++31 a059b624246b17b1
++32 2af7952a6a586445
++33 2e836a2877f2838a
++34 ec8d54479621a39b
++35 45a8fac08dd0c120
++36 85888e83461d8911
++37 538f0e963e00efc6
++38 ed23e79aa4200e27
++39 33e3784e91c8f92c
++40 663528fb11db982d
++41 48195359f571ed32
++42 c123c71eb78ca923
++43 5dd50481aa0c76a8
++44 a0299ce8bb9f31d9
++45 2506eecdca67a6ee
++46 ed74aa18bf2ee16f
++47 2aba745b3c30c3b4
++48 29f92e403f8c7ab5
++49 5eb08fa56f032f7a
++50 a433e4eee59c2e0b
++51 927c81acb7d4fbd0
++52 019c3392d71ca401
++53 0ac8cd89e03ebf76
++54 f4194ae25cb35d97
++55 56f05c8754ca2d9c
++56 e270a83816785e1d
++57 d0c6dfa7cdc68562
++58 3508f8ec45b14053
++59 e67d813b98017b98
++60 75094d14510f0709
++61 17d2049023df569e
++62 5409702954b5275f
++63 08c9fde56b7449e4
++64 b5bf533ffa3942e5
++65 325ceaba3d60262a
++66 36166360380e9dbb
++67 6f6b655bf0460fc0
++68 2adc45c0c3f4d8b1
++69 571fb407c4e86ae6
++70 61937f9fd8d36047
++71 1dacbac265b9d54c
++72 09522efeed90434d
++73 1203b50d2f0aedd2
++74 8535843c5d3811c3
++75 1fef89b2fce7b348
++76 55dc56ff0bab7679
++77 9df39c34450ec20e
++78 d0e6c7fa2806570f
++79 7bada7340f5c5e54
++80 8a148a2be88ddad5
+diff --git a/goldens/ecmp/01250ms.png b/goldens/ecmp/01250ms.png
+index c026d4e..ca88dec 100644
+Binary files a/goldens/ecmp/01250ms.png and b/goldens/ecmp/01250ms.png differ
+diff --git a/goldens/ecmp/01350ms.png b/goldens/ecmp/01350ms.png
+index ec6ef77..393f4ad 100644
+Binary files a/goldens/ecmp/01350ms.png and b/goldens/ecmp/01350ms.png differ
+diff --git a/goldens/flow.log.bin b/goldens/flow.log.bin
+index aa2980f..d964d23 100644
+Binary files a/goldens/flow.log.bin and b/goldens/flow.log.bin differ
+diff --git a/goldens/flow.t1 b/goldens/flow.t1
+index d5c4436..408d918 100644
+--- a/goldens/flow.t1
++++ b/goldens/flow.t1
+@@ -3,65 +3,65 @@ t1 1
+ demo flow
+ seed 42
+ logic_hz 20
+-catalog_hash 99a32393078e0cca
++catalog_hash c59e720ff6ac3fb4
+ ticks 60
+-1 7d7d1963741e000e
+-2 b432ecd1a4d2e4f1
+-3 208f8270d56f05a4
+-4 a9a135ea48731fbf
+-5 7cde260864cccd62
+-6 e4b93ee5866c74d5
+-7 1a6752939caf5658
+-8 3aae077d87a23093
+-9 e30de58588c75eb6
+-10 3287a00ddd9f0719
+-11 07ada4ca924872bd
+-12 c9f1726136eac3ec
+-13 7c2e5f486497fa8f
+-14 f352bb59de67fcde
+-15 3b3b3cec00fe8a11
+-16 2449bd4864781e00
+-17 ea82b810247189b3
+-18 5e109e4359e490c2
+-19 824e339209889925
+-20 bc1b773e6355d0d4
+-21 d5ebf136977ccbd7
+-22 ad57a05807387786
+-23 2b49fec76b37fcd9
+-24 38518ff8bc43b608
+-25 4961ff5ad76fbf7b
+-26 0bb7af0797725daa
+-27 9026345cd24822ed
+-28 04e3c49d47baca9c
+-29 83d66253a543697f
+-30 add80bb7eae7dc8e
+-31 44890becdd62ef3d
+-32 988c0fb0ab329e66
+-33 311bb0c453449d47
+-34 70dbb996018cd998
+-35 e46c721e69b30b51
+-36 52f050e6022e771a
+-37 a4f2f19ef89db8cb
+-38 5248a3458854ddac
+-39 f0721fa174f6ea85
+-40 34b684057008854e
+-41 6ea08f90ba1deb49
+-42 da58fe51cd15c7ed
+-43 34aafe98e02d8dc5
+-44 ffb572b259ff294b
+-45 e32a7bb13bc90e31
+-46 f7ac7cacca067716
+-47 5aa4285fc605a815
+-48 540853f69443184e
+-49 70c8b2a1aa293cdf
+-50 64c0df2ffeb098e0
+-51 4997abda37f70289
+-52 90d579ae5328a322
+-53 8fbf5d04c91037a3
+-54 536b97435aef0b54
+-55 e1b85493fcd7da3d
+-56 4933b8cd03046d16
+-57 f91ff822ec297647
+-58 242e30aa6d115c48
+-59 10655094ad33ab71
+-60 cd0667d99393248a
++1 e8f166a6b5556a6e
++2 2f15cc6807374181
++3 541d2bd6c36e6ea0
++4 df30f4c89eefbf7b
++5 c6d1a5059f74a162
++6 1747e09a24dc42e5
++7 7510a22ad9f0fe14
++8 ea5dd54a0060842f
++9 3e896bed17bae4b6
++10 ef3840855824d1a9
++11 2d7cd53ef9060779
++12 2f0efda6398cf448
++13 c82ecd550dc38f6f
++14 0bccb3147a407b8e
++15 89ec2ddb3d0a60ad
++16 633611a375af587c
++17 c6ced1b375036e73
++18 9875dcaa91a40552
++19 32c66ca359236e41
++20 a76fba049714d910
++21 da8a224273add637
++22 6a053c465c79d596
++23 a42d08084185c395
++24 13bbf7f9ec721fc4
++25 07f3029750c3661b
++26 8e1cdaae10ac40fa
++27 5c155c4e659e28c9
++28 60e2396b1ab18d18
++29 5673953d99f9bdff
++30 aa965fa25a964c5e
++31 42a0b15da64989f9
++32 25a39083946842e2
++33 98f9f1de233329e7
++34 beee2f1b3e52ffe8
++35 7a1730cdbb3a286d
++36 edb130a270bd1df6
++37 880a999babe68c8b
++38 54d1c9fe08c726bc
++39 fc0fd88fa4b06d41
++40 7c8fafc672038fca
++41 15ffaaeac70c2e21
++42 22a707b945b78565
++43 c2688567e16d44f9
++44 fcf7247ba6e2572f
++45 a51897d2d19848a9
++46 41b7bcc0a788724e
++47 0d4ce120198db6e9
++48 9fa6a7c8ab0cdfb2
++49 f3e8df59cc055af7
++50 0aee1069fb388598
++51 36c01f712cfe7dbd
++52 74766879e0f67726
++53 cbdf133e315a53bb
++54 62f9cc1ef8a9c48c
++55 f4d9d4b854bb5611
++56 64f8c7a214a9a13a
++57 2115eeccfcd4997f
++58 6ac9d62642178500
++59 b244092c283d0965
++60 ca331832eeb8d8ee
+diff --git a/goldens/flow/02100ms.png b/goldens/flow/02100ms.png
+index f02505e..ae17d9a 100644
+Binary files a/goldens/flow/02100ms.png and b/goldens/flow/02100ms.png differ
+diff --git a/goldens/flow/02150ms.png b/goldens/flow/02150ms.png
+index f383d9e..b645e85 100644
+Binary files a/goldens/flow/02150ms.png and b/goldens/flow/02150ms.png differ
+diff --git a/goldens/flow/02250ms.png b/goldens/flow/02250ms.png
+index 7a1fbab..0b61027 100644
+Binary files a/goldens/flow/02250ms.png and b/goldens/flow/02250ms.png differ
+diff --git a/goldens/lose.log.bin b/goldens/lose.log.bin
+index c94af19..eab3a51 100644
+Binary files a/goldens/lose.log.bin and b/goldens/lose.log.bin differ
+diff --git a/goldens/lose.t1 b/goldens/lose.t1
+index 2004e90..dc99d96 100644
+--- a/goldens/lose.t1
++++ b/goldens/lose.t1
+@@ -3,69 +3,69 @@ t1 1
+ demo lose
+ seed 42
+ logic_hz 20
+-catalog_hash 99a32393078e0cca
++catalog_hash c59e720ff6ac3fb4
+ ticks 64
+-1 4591ac06c38337a6
+-2 fd237a53f9698523
+-3 19ed3e666fb0c2bc
+-4 575065a301f1e861
+-5 268d2018fc1bbfa2
+-6 2ac221609dae21cf
+-7 dd5a3fe3dadc02d8
+-8 6f460d1dda83ecdd
+-9 63fbe80f6e30847e
+-10 814dbda7ac2c793b
+-11 32ccd83da9d1d7b9
+-12 d8283109509adcf2
+-13 e110ac384aecf84b
+-14 d6960110668b9c14
+-15 4325224140bdb735
+-16 ef4299e0005744ae
+-17 b0411d9a240d2187
+-18 79b1b75304aa54f0
+-19 75d7a514a0d871f1
+-20 94be3a8fcf18c00a
+-21 11d93b5d11cf8e43
+-22 01a549d868290c2c
+-23 c56fb3d0ad22866d
+-24 d77f9a1e04bdd746
+-25 7484fc2c8443f5ff
+-26 04a7cbef56c8b588
+-27 bbb0b73686b69e49
+-28 bd0d7a08954b7902
+-29 b69bd972a3cf78db
+-30 4fa55f2b71f212e4
+-31 d46385ad96a53d05
+-32 86b4de8de636697e
+-33 3e4a03f25daeddd7
+-34 9b9a9d1ce7b23000
+-35 936ce073424c12c1
+-36 d1fdc26cb8528a9a
+-37 5c662fbdd1ec1453
+-38 d491e4a767b3e8bc
+-39 79ea03c2638b5bbd
+-40 a50ddc1e2ca86516
+-41 61476c4e2fd5c45b
+-42 a25a5e380b72cd70
+-43 f505fe704a7cc389
+-44 e8780dca261b9a1e
+-45 6d92f5aac1210d37
+-46 ae426f474bb3f9cc
+-47 807ae8e0da7af525
+-48 d79a92a47d42a66a
+-49 dffe530384f99be3
+-50 823af6813f68d558
+-51 0b1f0ebeaa010e31
+-52 8703022df8e13c86
+-53 b209ea1f94823e5f
+-54 870c51a0a2dedc94
+-55 770908a3ed06ec8d
+-56 0e40249dac167872
+-57 5e7ff192047829ab
+-58 eaa4ab4463e12cc0
+-59 44c66401c8e81dd9
+-60 8678d89ff8883297
+-61 cb0220c15bd0e883
+-62 cb0220c15bd0e883
+-63 cb0220c15bd0e883
+-64 cb0220c15bd0e883
++1 325b48dd0603611e
++2 446f6ec5c68c684b
++3 6360ce9f94356208
++4 89de58c6b4622d4d
++5 c6988493610355fa
++6 f70eb63294701b37
++7 27ee26789d644344
++8 c81e4f8b88948989
++9 50ed50b44f415716
++10 6816afb682dce6a3
++11 0a1a42c218318c85
++12 523798a98fcd9e7e
++13 7aad8f7c0ffd8343
++14 7cdd9dce90b7dfbc
++15 1948c03c59fabcc1
++16 112534220d5850ba
++17 738d512a13e6b57f
++18 442822a897eaaf98
++19 6f029fc704d10c1d
++20 bd1308e48551dd36
++21 396881d649c9039b
++22 4109f7ffcc711f14
++23 19fe8c7be21a1f19
++24 ca94acf6b71f4192
++25 01edbd7ffdd6df77
++26 0a9e928c8b056dd0
++27 f77b144d213480b5
++28 22c84514c3c5efae
++29 1d0d24ac90cc38b3
++30 526d0d37f09effec
++31 036f82f0cd20b0b1
++32 aaa63fd39338be6a
++33 872b18c80d93d8af
++34 3539059323fa6808
++35 00922370923a0b8d
++36 17983c06de940026
++37 ca62726f18fb6b4b
++38 8f0f2a247b2e2484
++39 58184a78861508c9
++40 fb265d4c00130402
++41 0180b08f9f261703
++42 a63570284e65c1d0
++43 10a817617cbd3345
++44 78d867a9ea9b2332
++45 1537dfe4dea8017f
++46 f3f9e300c366980c
++47 4e35f653d1d64a71
++48 025eab087f8fc24e
++49 b46e2c75479b1c6b
++50 88413d77d83e6e78
++51 62ecaf62ad6453ad
++52 bf5436ff20347d7a
++53 bd25bfafe013f287
++54 4e76a86bc7f54d54
++55 35c5ae0d0cbc7bb9
++56 90fdb4f58c83f9b6
++57 e383772d09e2d8f3
++58 ae71f782fb78e400
++59 165a103dae5808b5
++60 bf70a409ace2356b
++61 1a049caa310384a7
++62 1a049caa310384a7
++63 1a049caa310384a7
++64 1a049caa310384a7
+diff --git a/goldens/lose/03000ms.png b/goldens/lose/03000ms.png
+index 2b8c879..e5a0bdb 100644
+Binary files a/goldens/lose/03000ms.png and b/goldens/lose/03000ms.png differ
+diff --git a/goldens/qos.log.bin b/goldens/qos.log.bin
+new file mode 100644
+index 0000000..92f5654
+Binary files /dev/null and b/goldens/qos.log.bin differ
+diff --git a/goldens/qos.t1 b/goldens/qos.t1
+new file mode 100644
+index 0000000..b74c84a
+--- /dev/null
++++ b/goldens/qos.t1
+@@ -0,0 +1,1507 @@
++# t1 manifest — per-tick FNV-1a-64 state hashes (full sim state)
++t1 1
++demo qos
++seed 3003
++logic_hz 20
++catalog_hash c59e720ff6ac3fb4
++ticks 1500
++1 52e21908cf145fb9
++2 89e3008c7046b8b9
++3 824ef23ed9068c45
++4 ab73f8a647df961c
++5 5c92a3b0f7524e7c
++6 1f54dd7f1f1ed855
++7 3cddf7287d9d6391
++8 a6ef7c5477f46aea
++9 3639872fc9d56ffa
++10 e4c97e8cd7f74e34
++11 50645eb48944f3d4
++12 0004053e95852ea3
++13 19e605404b34f99c
++14 80ebf9bed21c582a
++15 36d919d25c86222b
++16 d69f7ae2f5bf5731
++17 745814f7381c2b35
++18 c6d54d2ee7fd0f9c
++19 b19bf86daebd8eaa
++20 040adf1fc198ef69
++21 e9221a39804925ce
++22 15b9f6aaa1141258
++23 611ed8d38ad8c129
++24 87193580bb97dc2b
++25 eb7b88c28f026dcf
++26 30cecb9310c91ec3
++27 8acbdf6c50897a04
++28 824bcaa5895d353c
++29 3077e9fd681f2f5d
++30 3ebe4ca0ed4eb2f4
++31 d9b1d273c7ff5ebc
++32 d7bc106943dcac33
++33 4f2d27304c2f7b03
++34 72c98c2ae0ba3b71
++35 78d32789a458eab6
++36 9be8ef866ab4a0e5
++37 73fb8f9397bda4ec
++38 9ce48ba4b7cba953
++39 e47fe89439a82110
++40 f3201c438ce14cf4
++41 ef0e4d6ebdd96158
++42 82d96a63c2454cbf
++43 eb36773b9de0acf1
++44 d5331f1f71ecb7c6
++45 d7c25afb9d401557
++46 01c04d9cd8604061
++47 97e6adb3cc47d1bb
++48 1908cca98fb6fc8a
++49 a3125c51f9962c56
++50 c46fc4344077ef02
++51 0441a925f714ce6e
++52 be7f4342115ab423
++53 0b284378891e29b5
++54 fdd636a9826f6633
++55 d1867499d7a8d25b
++56 7313b9ef94cde92f
++57 b5a525780f101ca4
++58 7134e0bfc00b982a
++59 9d4fb8452a75beaa
++60 5f0b6d8734fd746b
++61 9afc9f0b5e9f52f0
++62 d116726540598f4b
++63 09d0954ad70ce99e
++64 11dfaf3b748d4302
++65 9e983f872e9fc2bb
++66 1672f6589ded3fcf
++67 c59dd39aaf76316f
++68 ecb150941278a249
++69 b98f58ca8b35baa9
++70 8c91244c77b48c85
++71 e93ebe4a70224110
++72 1bb38419aa9245d1
++73 393090318a16e48c
++74 0564048fe4c1a67e
++75 335768244c4dd649
++76 bb5700d85ce9b700
++77 9ee4ebb8bdb35f4a
++78 351d07121afaa97b
++79 5f166eb3d2fed419
++80 351282cf84fc65c0
++81 4b5b23d58874b3a5
++82 40f5a439b04d7513
++83 17c23bd740929218
++84 77a7f51753727d11
++85 1f8e334dbfdce3bb
++86 ef7e6a95310a4e50
++87 1b82e93b7c9959af
++88 78249a8daa230bdf
++89 afd960dad1ebe2f6
++90 09a3737c4306c814
++91 3bf222c6d8258e92
++92 8e2ec60d53d9a647
++93 7d7fd59c2b928c71
++94 0ccf8ae4c48cfa49
++95 7bf27b6015f904e6
++96 a46ffa4742b7e789
++97 493061727feb8fba
++98 37e5f46dccfaff81
++99 625715b6d4d4825f
++100 033e081d2a4a87a5
++101 c23c53505fbe1179
++102 4f92aa32b3ecb577
++103 be5b285ef8f91113
++104 14e5d7bbb4cab688
++105 4615233518b6514e
++106 d3e0733242e3ddba
++107 defa9d3837baf965
++108 483720a799e6c556
++109 5afb24aeb93b58ae
++110 7aad7e02ace79df3
++111 2d2e3370bef1ff22
++112 33bb10d191541481
++113 c08399d5e4640f2e
++114 6f1a181c5cf66091
++115 de033d632e3ffc03
++116 6daeac0195a857b3
++117 e93265e2a5030866
++118 b4ea498230c95c5b
++119 4c871d98a02a0b88
++120 3a48476566cf2ee1
++121 0b2daea32b07d14d
++122 1ac3d01555d1d805
++123 54786811ffc495e1
++124 30a19d639bff3bfa
++125 0c5d8b1d26c3a805
++126 eba9925e21d14826
++127 95b882681c1494f1
++128 579a9b6a43f9f719
++129 badee8f615756aa8
++130 3cb71f7e0113595f
++131 bacd5c4193b9e5f2
++132 ff0e6c4c8a01396a
++133 dd6e6f654835d483
++134 1aa10aa1b7432650
++135 d59014451c9aba52
++136 b2a9ebd7ff24cb24
++137 3492955c0419a6ad
++138 3c62dc7324291f8a
++139 e72fe34f8f4d0514
++140 bcf0e314b71f615a
++141 ab661b58c0a72e69
++142 c0c6c1b6d43a49dc
++143 79e48eadecaa0a2b
++144 b2a191a0127d7df2
++145 cede6df899fa6ad6
++146 e976b3ff8b5f4e24
++147 f1370ef3178ec8b3
++148 191c59e076038d64
++149 987dd985afc91ac7
++150 3474178f959ef627
++151 adc49ce1dcabb5d0
++152 8aea09da1fba3f71
++153 088753bf9cb2108e
++154 8c8cf82ccc538841
++155 f56c64dda7d2eb7e
++156 2a0a97e80097ff8e
++157 11c8cd3e90197731
++158 eab992eb9156eb70
++159 fc8e43a8e9ab1b8a
++160 4bd18b61e2725788
++161 a5b6162114600c98
++162 44474e780e313186
++163 d55f7ad0ad5ce401
++164 3df52d21a0f3d035
++165 eee02e706f15b03e
++166 4925ce5a07d0ba12
++167 23c96d0c001c7039
++168 2128c3e802a31a8f
++169 a77d1b9e3e3c4852
++170 fdec85a297b0c6a4
++171 352a7786ce927f75
++172 2b9a67a5128dbb32
++173 333d5f6a67a5cfe6
++174 a7477f6bd9e991e7
++175 1da8d1e5ba6afe3a
++176 3d8434fa39dc16f1
++177 b6932dc805a59be2
++178 5494ffcb589c6485
++179 07ccbce6ebbda0ca
++180 381d6eeb4ce96053
++181 61cef25eddabdc47
++182 fbd31adea0c0c3d3
++183 7a7d458326d4533e
++184 85c9dc521d126272
++185 46e85f21999f8c63
++186 124d6ed434a9cccf
++187 dfccb99c9283210e
++188 3e8a40ca5af02542
++189 98c5de17dc22aac2
++190 9e51dda1f5382e3b
++191 29a9bfc120fac78d
++192 d66ff499fa111163
++193 f3ff48ccb0af6d62
++194 6c938836f99cff2c
++195 27a838522738e36a
++196 b95980d10629d9f8
++197 04ebc14fd7848aa7
++198 c7cc928a22c5864e
++199 4af19fe9676b0cee
++200 a1d8544d5ff396ce
++201 c21ad292b9a5e5fd
++202 7c0e341567a7f421
++203 1662d649f2f21a06
++204 e58673cee5af5fd7
++205 fcaa80b43e617c13
++206 1168e90fb4423b35
++207 1e605c1daf163932
++208 2bc24519a426b189
++209 717a0043418cdab5
++210 3e44eef58656088b
++211 8780434b50781a98
++212 bcb53fb7d4a6d108
++213 346051b6f9880b71
++214 a706e3a4b7dc1dc2
++215 599f560ac23089ee
++216 db6913790edc320c
++217 d9dda0a2e2cb8874
++218 7a9588344327eaa9
++219 33dd82467fc6acb3
++220 9bb67636014fc3cc
++221 710eb3e2f801d2b0
++222 8daeea2cbc1d3962
++223 03739e9481471487
++224 ac672ab48a129cba
++225 402be26ecd3e423d
++226 cddf230d98fd35fe
++227 eb4a90f7c0c8b04f
++228 33bf1c8fb069af25
++229 db781845a8e1134f
++230 5db87cb6c4c724eb
++231 dfa5eccfe7158e1b
++232 ed5436645521f75f
++233 5aba52b3114125e3
++234 6516c5ed847c78a0
++235 ed59139cde215948
++236 cd3adf964dbacb3c
++237 9cea8ec9659fdde1
++238 014d919c34f184a2
++239 5213088de41d0bcb
++240 757e1a896c198565
++241 020bb79cb31b0e4c
++242 c24e564427c64242
++243 3aa54eeef2edbaba
++244 66ef85a1c15cb118
++245 cbea5f82220db1e3
++246 997ac83b9cba958a
++247 93f47259db941d41
++248 9ca2dfc3c56c414e
++249 e9a2a9ca3df1baeb
++250 8586f4839985b772
++251 05dbfa827637ed48
++252 ec662bf1f9d49da3
++253 e411eaaabe650cbf
++254 af2463862d939fb0
++255 cd892803c1654d6e
++256 483a190a5423a787
++257 40d00510e261fad5
++258 d648830d05827bff
++259 38ae386d4ab51aab
++260 3b17435e20115c4a
++261 d3607d6677889e09
++262 1236c3e7d0b5a00f
++263 5b812efcb96c9c7b
++264 84d9eff4c13fad20
++265 c7f30d9db09d886b
++266 e93f560003352149
++267 7d56d6f66b58a2df
++268 fbd60cb444bdee9a
++269 c8e22213e6f659cc
++270 e5aae4ad194a06c9
++271 07e3e08bece74095
++272 9e4108a30adc9574
++273 3f111d6df510af99
++274 2f910a4ea9110c7b
++275 69d1ef87d3c59064
++276 848051cf0a136da9
++277 696b9210e36f2f27
++278 32db2da3e4fc5bcc
++279 9cd6e8bf60cbe357
++280 891d922d18881cde
++281 6d3b1f50178d4098
++282 2e06b8270da3c5ef
++283 50b5d8cdf28a5c95
++284 c30f62b51e92411e
++285 007fb1d1cb0f3591
++286 77e0fad5edb2d923
++287 f9dfb24f6e6b57b3
++288 ccbad8f3a9a89db6
++289 5d85d44ec5546b18
++290 17b05c3de58979c2
++291 22765c1a433289e0
++292 cd048d7aa8f79dbc
++293 b098d4084d5239d7
++294 924986c422deec69
++295 4211f6a024c70b01
++296 c2b1452affebcfe7
++297 4173b716ff062feb
++298 eec09440c72103b2
++299 671c0271a3f46940
++300 fe137f2758418ec9
++301 1a99bc73dc2f93df
++302 75c71b909cf09c0a
++303 48abf24d9bc6866b
++304 a3850d6a4e8ff0f1
++305 01554931b45d0bee
++306 cdb7d124c1956840
++307 e97e1a33a961c7a2
++308 074bc7abe5430809
++309 5c3469106574ad73
++310 9d33591b89d87ca7
++311 3dce5f5c295adc05
++312 ce714f938c4f7610
++313 4ca210def31fbca1
++314 639a963891ad170d
++315 f2b56e511acdf156
++316 8bdc09362889b9a1
++317 f6d9e7c22c980063
++318 56fc112a50347b85
++319 a69c87b1a69f7c1a
++320 a1e8bfbb04fa4523
++321 09b4130968d45856
++322 936cd5104345cd3d
++323 7465715e72765a5f
++324 3d82c4040ce40e41
++325 3784dfcbd894de56
++326 8aa6b0abd205c62f
++327 76a3a9230b14e4a6
++328 71e421eb83157e94
++329 f7f85e34a725ddeb
++330 b3a86f9e784fd98f
++331 365238a3a3a6e104
++332 40316abcc2a040d7
++333 4d62e969df21a736
++334 162402e5d93e8ab1
++335 c01e45f7b4fc0bf1
++336 ca34c14a39c9b87d
++337 9746019ecf5ead1e
++338 218da3b9bce394dc
++339 52f8963a698ec704
++340 ed1fb3a0268fb162
++341 c5411f2ee927c083
++342 b961a03c6f1f1f96
++343 ccab6698127f8617
++344 bce25a357694eaa9
++345 6fff0a3294ba4071
++346 18126f5a769650c7
++347 93c186bfdd98acf8
++348 057fa48c9d223881
++349 a9110bb12128e453
++350 3c5085807825a519
++351 e29a916e637fe3c0
++352 e414095ac712fae7
++353 9bc5a8ec25eb4ea0
++354 9b5dd41585688a55
++355 89d6d9838c28b424
++356 4c629cb47d5c2ab5
++357 884c990f3b44156c
++358 1edd1aa6c8ccf45b
++359 996f6b702fa9c648
++360 ec3a1e2405e510e1
++361 cd39ff95aa770056
++362 441a6833e9102d3e
++363 f637cecfade62c26
++364 ba18b391ff50faf8
++365 4549844b68eafbce
++366 3693ec1af284dcd5
++367 169c4028ee2c18d3
++368 6c2b345b91b6e0ed
++369 c5c2f64bdec615f9
++370 0dc3a81f8366495f
++371 376a9061d13a75da
++372 505b27e4d6b4eecc
++373 6cd1f17335d94f89
++374 cc98f9eb96680a78
++375 32aee584931d950d
++376 68fbdab10286b73b
++377 5100086d94df5a08
++378 bf5d55e78b97c487
++379 1c214a497d8f0c1d
++380 55627cd5e1fbfd98
++381 0faec62fdfd95b59
++382 1f34ce783ef2f013
++383 200159d51a3ab727
++384 e5dbe971ed907aed
++385 d44f186d9c57d6f3
++386 f3a78ba988be4963
++387 389b6c014cabdfd5
++388 9bbfe442a8803832
++389 eae566a9b719276b
++390 5580bd158c23c898
++391 9ac52985442b96df
++392 10e7de08dcf2a61f
++393 34e664a879708fda
++394 81578dd9a1078da7
++395 b925d2b6c55a6c86
++396 8efbe8209461bd84
++397 7d216ef9d058e618
++398 a39d33e7f89f201f
++399 02d5bcca1bee3645
++400 78c20283524ddbdc
++401 981ebf4738314697
++402 3cc38447fd1d674c
++403 8ab408f47a52e1f2
++404 a7fd28b78365bbbe
++405 5d5dba32d0535099
++406 b5a23e85a5e2679f
++407 f1c8d2706caec6ff
++408 e47b288126db41c1
++409 ef68e9de6704a066
++410 8f51217d200ab86d
++411 d1acdc515bc35bdc
++412 6ffa4f9ef44a7a24
++413 b704d5f37a44c2c8
++414 bd71f6d5bf2a1960
++415 608689e527e8bdd8
++416 cf63ac0d8afa8e5b
++417 b28b0f332fd980a1
++418 32dea89ba7f7667b
++419 e1ce054be1025053
++420 b41659e9c2983240
++421 8940869013cf54f8
++422 33008d9133544023
++423 d7b965788903abed
++424 db838aae377f00fb
++425 c45d8f2b29c1cb22
++426 3117015e9a8d988a
++427 f1a06189f84d285c
++428 5e704b9b8293271b
++429 f32be48db3ed6309
++430 38462e1abb52f34f
++431 63334f522b50a114
++432 c72fdeacd6ce6083
++433 0b41e1f7a09f8efa
++434 ea9a7eb9d6fc6d91
++435 049a6a748898480e
++436 e857880142aa77dd
++437 94925bfd57e3e95e
++438 2ad7e187948f4e91
++439 7821d9e657765974
++440 99ca16f24b606f52
++441 7178da1992143529
++442 904872535a618579
++443 66fd6f56d4b02e12
++444 f43fcabe683e9317
++445 4a202927a10b2e1a
++446 eb8635fe197c0c64
++447 84649ee76dec4970
++448 934de5ee7624ee6f
++449 f37ae22ee2cc5739
++450 6589929a47f6ae87
++451 e65a42e39046cdd8
++452 4f953b9d0daf7ac7
++453 22d5db9f8e22e4a2
++454 95617107e4482c80
++455 486cca59f20df519
++456 e73cc5886e7b19a1
++457 43eb10ad24578d49
++458 6afa76f24ec02b54
++459 eaf77010db7ffe13
++460 3f0871285dab73df
++461 2ed24cc775f98811
++462 81b67c5adfc44b33
++463 85eb8fbe812e1832
++464 9494467b3163c8c5
++465 faf22b9aec8ae96f
++466 67bd2d9eeff9c1f4
++467 61094172aa88ff90
++468 c95aa13347979725
++469 17410873280389e9
++470 cb5a788edfa924f6
++471 7e2db5dc1a27c625
++472 8442c489c4d7655e
++473 42dace4d7075d8a0
++474 f6686af4e12dd937
++475 ce712a93d5564648
++476 0445fb57a28f7e73
++477 c76bdb5e4e0629e9
++478 25d523390da1af8a
++479 e8cb3061e9cfbd08
++480 921a0f18cd33304c
++481 5381c4d8354efb6b
++482 cc1710f12613a3ba
++483 7e9e5929e746cf7a
++484 068d4253db2e579f
++485 7aaa6bbded23ebd8
++486 329e88c828c4dacc
++487 91ce413248716d66
++488 4ac0fc9f825865ed
++489 ae226b0bd29a4cfb
++490 e92676eeb44eae0c
++491 94fcc5350d22145f
++492 0525d1d0f4aca7e0
++493 64ff9546b506f4f4
++494 0016dc499677dd24
++495 b74eaa8d967ac4ef
++496 530077117696da50
++497 de7b1fecf70a55f5
++498 5bcd307af8f9627a
++499 614c27d37e46828a
++500 26163bf44b951428
++501 da84ffbe0ec9ceaf
++502 c4ac2eda08148558
++503 25c557f5be039fa9
++504 1ecb5f1ff8583251
++505 5f8cc83d110d6dae
++506 9454a55012f31720
++507 5ea274d5afa37716
++508 1a290879914e1089
++509 3f0d76807a2100ec
++510 471d0c22302308cb
++511 54d863e90497ea99
++512 54f41b7b038508a9
++513 3a5c26230e9d569f
++514 68f0bbaefa37b1ba
++515 d057d4a8b3284ed7
++516 941930366069e3c0
++517 522efc3e90a34d66
++518 01d8d483ed8f1fc4
++519 d4e4f4fbd3ed8051
++520 9926bd1fb8d05742
++521 d3771cd62d2d1e45
++522 5c7fc9c9b79dddba
++523 2b8d628c3eb05666
++524 1f65309186a0e03d
++525 faf4815293cc1a12
++526 9082921816bf76b3
++527 e5d675092ce0470f
++528 1955986afdac84e6
++529 dad63327781bd7ac
++530 8c428d59e4a3c680
++531 3f6f71df4cd291d9
++532 054e126431970fe7
++533 08b6729de244f853
++534 f799bef81dce1111
++535 0a153a77abe1fa00
++536 767a092a21ee5341
++537 7f1674c6fe23976e
++538 f9b04a515f2127b6
++539 8eef3676de37f2b7
++540 999607c6097e931e
++541 372b29267f126d0c
++542 ee66a851f59a7c63
++543 f3ff7a2209771bcf
++544 57141b0951c2c6bc
++545 3d9a01a6db756514
++546 2eae04c1b5ae9834
++547 aabfc531459596f4
++548 f870802784659293
++549 ae534e6d1b400276
++550 3abd227ea7b0f2c9
++551 2c99322c1fa45b33
++552 9465da89788931cf
++553 176e9e9a109a98cb
++554 92ab099ae093e348
++555 80c106b09a580f8c
++556 caf472fe8da4395c
++557 28d98690b1d372a5
++558 e1249f6b690f5714
++559 fc4e329e4b334940
++560 8fe0e529e30994c3
++561 3781f985beb294b5
++562 ccb163ac8f9a394b
++563 93eac910bdaaefbc
++564 eadcec6e1bfee535
++565 10d274190032c4af
++566 a2dd95ad450730ee
++567 af680c56f00793fa
++568 a076095816cac1f8
++569 2ef4114236a8d1bd
++570 008846d101cc42d2
++571 6b5dae98f64c9a5b
++572 b34cbb11b8070b30
++573 57d47430012e4916
++574 d97489584726df5a
++575 62883d4e922cb857
++576 beed1c8a299aec5e
++577 3b4829458cedc6e9
++578 abf332fb1da9d22d
++579 7b9021877853d4aa
++580 3d0868a1d32c6b97
++581 9bab18e78613406f
++582 65c8ed77c399c2ba
++583 b9f1b40737d84a9c
++584 8178a3f9631e731a
++585 b1c9a11f17eea003
++586 675c6b0bf15662e5
++587 096d4eaf24e7178b
++588 89be3114d89eae3a
++589 cbd0a381c53122aa
++590 f2d04e6cdb54353f
++591 91541b4a744bc3ec
++592 12a187899ff9d38c
++593 1843eefc8854baeb
++594 36ebe624b75154e2
++595 83de992f7e5b117a
++596 ded3aa1fcaa2315b
++597 fc811024cd3e4104
++598 4ac02e5c282f8518
++599 28dbecba73d2293c
++600 88a7bba1c6161c78
++601 b51f11065a8115ab
++602 1201345f7cb2aff4
++603 b5b76a4240f9c0e6
++604 d7cb738254f498ac
++605 fb4ad81a87a8c947
++606 d5b49c453010febd
++607 ec773c3b0aa06fc0
++608 d16e8a20b91ef151
++609 d153a976d4f395a1
++610 9814fdf37bc77998
++611 9316ac05191280a3
++612 54819fb9ff82061c
++613 d431edb403e1e30c
++614 0c72e87f0398752e
++615 fed535cc27b7e187
++616 f25a9b5c1ff32d0c
++617 66ad94f4fdec7842
++618 042113423c6b02a2
++619 a6f1c407e4945f42
++620 09cd199e2b12e4ba
++621 f34ae1f40266761e
++622 434eba3bb188e2eb
++623 0b1761e67f348b8b
++624 10cabcaae7d246a0
++625 64246c828545899e
++626 9238bf5f03718654
++627 9444685b09f8a8be
++628 5d2b8b22da5324ee
++629 0aa0b9e03b774274
++630 b2c4d13bccfd17c9
++631 d5141a24e463dadb
++632 670c6be376828fae
++633 39379860dab1d36c
++634 49e8365ae0567917
++635 42f8475548adbabe
++636 2b61f5351c8b0acc
++637 fe86f5dd7cd3ab60
++638 878767b70b3ae79b
++639 dc90b03a960521e7
++640 6ea766b3518854a9
++641 b3d657daef9c944c
++642 bef3d61b56a40808
++643 d68318c71df06a46
++644 5250a76a97836f09
++645 4386354075912b0e
++646 990e6c599663116e
++647 6beb3b94f5bf32fb
++648 469ad2a85cb41c90
++649 c114ccaa6cb1fb04
++650 ffa5fac88ec0c50a
++651 04807f33618740fe
++652 b38de98f3806faf1
++653 6b58bfd78ffb4f0a
++654 0a0daa74f712defb
++655 4afee482a7a99883
++656 1a22cd59c150339c
++657 4bc2ba0ee20ffdb3
++658 05577aab82057e8a
++659 ffa90274e8d71d29
++660 0c9760b8b8f876a4
++661 3b6bbe6d38a897b3
++662 58a062b706095dba
++663 5326e84a317cbaf1
++664 8e84d15e921e7b93
++665 cf969a87a065b978
++666 b3d0426549d43930
++667 e0c80f326e9569b2
++668 039216e2a53a4e6c
++669 176b9891c109a251
++670 76d9d08bcdccd0eb
++671 cf5d4ff9c4f7231f
++672 e3a4df6c8a14e464
++673 5aa4618acd749181
++674 7c166b62d09f4c21
++675 2d700e821d5362cc
++676 4ed1372efa5ad4d1
++677 700acae9eef49430
++678 3095a9868f672b30
++679 47eb3bc8b80f7d7b
++680 f5ebf25156e06fe8
++681 9a7ea37f4a407ea7
++682 24148e6bc3be785e
++683 7c0355dc4734ef54
++684 a7cf74c61c38325b
++685 bdcaacf0cef30987
++686 7bd384372429f1d3
++687 13f73e718b988841
++688 c87bc8c6127285e3
++689 c824076ff5b97193
++690 6ca419a855136a38
++691 d18634a16a3500dd
++692 5f3ef8251ca2cffc
++693 2d054c391b3a056f
++694 8ebeae59c007339d
++695 81dba61cf50cd785
++696 abc5a75dbb804180
++697 50fc0b182d070ac8
++698 02ebf16c06a0a54e
++699 4e5aa62e3f5eb3c1
++700 0c0327bffcf16742
++701 0b27158629d17d85
++702 32f3b94649c80cf9
++703 aea881dc85a983d6
++704 6ce927cbf0a5e6cd
++705 e6c79e786ff24530
++706 a7002d52f6a12dd7
++707 19c0878bf21773c9
++708 2704f3598f211133
++709 b4e6f9e74a381586
++710 52bbe69ed85410e3
++711 72f95ddfdda70992
++712 bc3adce074ec47c9
++713 339394ab5f98619a
++714 967e45168f28ba7f
++715 c7b8ff497be280a0
++716 a8f9986096a574cb
++717 ec5d7deb64db184f
++718 b50c2aff78ac1d60
++719 a3f7205e4fb1e0dd
++720 be96704a272b74d4
++721 03168eaa33ba5210
++722 f9457234c2bb6e11
++723 88b141a4a455b93a
++724 fc580e0ad83efd87
++725 706042dcf70430af
++726 b215a6f566618ec0
++727 9e1dc703d5d73df6
++728 4f782f46745ef595
++729 a77d2c755c4e4dcc
++730 d718bbc2f2ff9b20
++731 217757b9b7e322ef
++732 b3c91a758dad1b51
++733 1b78132577a7f974
++734 5ec8f3e592a4d4df
++735 793d091513c96369
++736 924aeb133e89e7a3
++737 0262ae9cb4e8cbb6
++738 273da02fd535ae49
++739 8ad2e6b9709d84b3
++740 ee5978d5e89cc610
++741 3e803fd8840d9749
++742 70f948862a30a828
++743 1623150503075e36
++744 58e7bd1f2778667d
++745 6f23cd55e73e028e
++746 50d825dc6fb5ec34
++747 974b80a03a02a392
++748 f98f9d6ddfa2cea2
++749 d3ec4b1bcdb82494
++750 8e9b15340c58e746
++751 66c01ad74052c8cc
++752 aa0270dfaf3a2aca
++753 86776952bdebad97
++754 1bbd6f061392c406
++755 81b660b318aacf5a
++756 5512cb27ecc946a6
++757 7642466e43454557
++758 4113b1aa7059f1ed
++759 2c720989e9cb027a
++760 921c32168701c781
++761 91c844e07a6ce44a
++762 f560394bcb602478
++763 aff9ef7ab17baf14
++764 5ed11874e263f37c
++765 ebccfbc941a3977c
++766 a58f632c0102a4f9
++767 944ff3b2efacdbbc
++768 976deab2fdc232a1
++769 47817db3b13c2aa3
++770 d1bf6611d284450d
++771 9a820df9d88b3290
++772 14c1bc12f98cc9fe
++773 3e1052fa3de58d07
++774 574b180a9ebb39d2
++775 9ed4ed46a1641d9e
++776 e144598aea8ecad3
++777 053d06a0c21c4e18
++778 75b48cc367ace35f
++779 5035540a8c014545
++780 8255730f48079310
++781 0e64b729ce4f8f7a
++782 eb89928dc04ab2f8
++783 59926c0a79299f6c
++784 38536652af0d3695
++785 23d8e6de434dd495
++786 f7acbf78e3051858
++787 137cf02310b28d70
++788 3c34e7f3f8bf0168
++789 bfea293dba6fb0fe
++790 3af7b50186ba7249
++791 e786ff2b7cbf182b
++792 afc392c02836f9c2
++793 e38f6792f9e739c8
++794 880379b85a5eea0d
++795 a2962d283e7a639c
++796 c4353e4e54ad46d9
++797 d9a38abfeeb93229
++798 c14bceefc7dbb158
++799 ea7f792961623709
++800 125fd406f6b64c60
++801 397023ae8df72499
++802 1f0c5790c92c8f11
++803 b43a5fbcf08eeff5
++804 8de7d723235b9f03
++805 76db8cdd7520b417
++806 7599e8e095376621
++807 20283d52303e8f72
++808 63d045b22a117021
++809 9f7799231c85f589
++810 ba2f01385b940687
++811 71827cabf68fe378
++812 61a55d03345520a8
++813 688988601fac70cd
++814 b18af43d99140961
++815 5b288eade21ae4c6
++816 7e56aaadfb9057e7
++817 127663c8b08e8a4a
++818 1ae7ec1d4f7b175d
++819 a53903e2bf782059
++820 18ba9a298bcd8fae
++821 c21f15f309e7e157
++822 fcc09dae451ad83f
++823 efafddb8c802568f
++824 3cdaad9e6c6532d2
++825 2386ac8d889b611a
++826 bb374e3dba341359
++827 a4ee5b9ccce2a270
++828 bd9f1cf3b608d369
++829 0ad5f72b065fc2e3
++830 c2bf8bbf393a1d1c
++831 345667695023539a
++832 2d6ba631b5dde667
++833 42e9f9069612ac3d
++834 0c5eb638a797990b
++835 decee0610474b434
++836 1f70a77ca6b55ecd
++837 923205d4147fe8c0
++838 a1fdd8bdfb6fa0b6
++839 bcacca7c9659a8f8
++840 923f83b79e7de2e3
++841 7fb32b343e34be84
++842 9777a9f6bd4a1c6e
++843 0ed1fceaa080c16c
++844 8a4f947f1afb55af
++845 f0a6fb258027937e
++846 f799f5c4ead96a19
++847 f79d595fde32570f
++848 e37462d24c5b6c76
++849 615fae3e5fd288f6
++850 3fc8e3e13283cb39
++851 3052602c3661bce8
++852 7c9fd1e4b260fc74
++853 8a532fc4e528d4de
++854 71771161263795be
++855 2d66761e645aaaa4
++856 6915b1c39043f7b8
++857 84ce8301466fc310
++858 429917c6c8ba1559
++859 8f7fcdb983ae5a91
++860 d1d53379e7e072e8
++861 9830a70d40bc600c
++862 c5b43be7fc06f153
++863 07cf4f4bbc50d7ac
++864 051e703cb5caef9c
++865 e13a00519fb1b1c0
++866 9533b9204711334c
++867 6a88925bc54b80a7
++868 fcdf95a41683bf0b
++869 14a3ba919ab76d3d
++870 76e4c02135ff7a5f
++871 ab8b03b840da9997
++872 b92b71f448e86cb1
++873 af547718d8b92ded
++874 b13d1fc9b1220bc2
++875 4d1aa673316cce6e
++876 99b4fc54b39ed63e
++877 f6724aac6ce7bb10
++878 a82b26404e839e6e
++879 ea523078cee5f72c
++880 9275a319ab721eb1
++881 7e3813a0fb516091
++882 b2ba1aae03b7a49f
++883 970fd9eb351d7a4f
++884 a84ce8b99a3ce462
++885 804511c75a12c9cd
++886 11eb509f1bff3107
++887 b92d7494f72b099f
++888 6c08db82e2ea3ccb
++889 7dda338ced94a868
++890 41ee9a2136d4ef7e
++891 baa33a59bdfb5f49
++892 463628c1197e5417
++893 23433c5bee6592d9
++894 7b9976a2bd6eec55
++895 5f5c01e6e9a442fe
++896 06c811f96855020a
++897 a823d152021d121c
++898 2f78e27ae36872c0
++899 8c3accab3e144f69
++900 90d371c4bb51fcce
++901 413889530d7197a4
++902 dffc6d27497facb8
++903 fece9183c7b86af6
++904 11270a0f7b1e902b
++905 6133e82101dfcc26
++906 90994550fe81abb8
++907 5444b6a49ec73f6f
++908 e61af34ae3016c77
++909 99dc8770fe769f41
++910 dd9218ace66c4f48
++911 1d041d4733afc107
++912 18de56e91fac4968
++913 fff984a3fd751801
++914 fc6e1262441243ec
++915 c1adf3d0dd098208
++916 9b58af03fbc82c03
++917 e29ad65efa3ed847
++918 67c8c1458ffe7ae9
++919 f9053798ffb4709e
++920 4e4cb294564fcb7f
++921 37a9eb34e98d07c6
++922 db4acb87c6757fa1
++923 08d597481b8cc51d
++924 2c34b2e9870c9e78
++925 5933ed1a76151b26
++926 9e811280cbb11450
++927 4aea251f486b9e78
++928 6dd254de5712bc0c
++929 70140c381bedfb35
++930 14ec17ca8222cd61
++931 6d40f91f75e43171
++932 e6995b87e3507eb4
++933 d25d5597dbab1799
++934 cd96597dee7761b5
++935 487bc581ed8e43ab
++936 b09019611600b314
++937 26b7350cd323621c
++938 45f32dafcce711a1
++939 8b619c859d4e3c4c
++940 e71b88de6ed888c1
++941 bf39b262820d7e1a
++942 5f785bb1e2a4ccc5
++943 642ab935d16be0aa
++944 187aef2135d26127
++945 6a22bd2e4f38b78e
++946 15c021fc4fe13ecf
++947 9b442e1e35186c29
++948 987b89ab838b8951
++949 1aedc5e64e821ea5
++950 fa27bdb57037633f
++951 dc03059edcf6eb40
++952 bf906ce699f91fc6
++953 1b79772ed3e46eaa
++954 b65fa8b78dbc7ea6
++955 7e2c608018254154
++956 11966e8a8c6d8f2e
++957 6b45b9da33504d22
++958 48129f45c272056a
++959 e6b62064b775776b
++960 a037a11c26f48dca
++961 b41a350e72e11fea
++962 39bf81580130839a
++963 4553b947e3a15f2a
++964 d9bc9313781405e3
++965 09ab17bbe54fbf8e
++966 382555b0ffaf58db
++967 61bf7eb2087a2d8f
++968 9980201accdb99e1
++969 584521865b1106df
++970 2f14d86f0f21425c
++971 e901dad7bf5ad643
++972 1043558275067bb5
++973 e2765c8887a7d9ed
++974 1b49b1c4f995b3c5
++975 315d04d078503d36
++976 4e556ba459aef3d8
++977 a5bc3fcbf6d14843
++978 f19c747c63cc0186
++979 6b85db47f56637ff
++980 0ec49dafde3daac6
++981 d81852437700cf41
++982 2c9c0253d40f52df
++983 22d3ead77ce05c1a
++984 a48430e6113012ab
++985 1dff98dc3e480ddb
++986 d8ba5c0bcaa02adb
++987 7c5263b5039a2002
++988 d7dbab9dbfa18270
++989 5ea57e814d3abda6
++990 8a953ffa6f1efadf
++991 194767b370d20701
++992 8b4a04415dcc50b6
++993 d6fe7ad40b2d80ed
++994 d561f0febf444d90
++995 0ed51504e047e1eb
++996 7853940861cd2d2c
++997 761987d8e1077c1c
++998 6af4e6f7191a6e6e
++999 8ffa7c27b940137d
++1000 c5c24adf7ffc8b14
++1001 72a7868a18969c4d
++1002 37bf4541a85a0b06
++1003 66c530acebb34192
++1004 51c17700be9592fc
++1005 12f217a00c4fcc7b
++1006 58490816a3692bf4
++1007 fc3eb16bb3ae5be1
++1008 abacd21f2f2155e4
++1009 ab0a5a4642f4c9a6
++1010 aa5b3ea4de826019
++1011 164f0820eda8fbe6
++1012 6e090d227e3dc6c8
++1013 a63864fa06e9f503
++1014 b2a1a5288b3f47ea
++1015 e49c3a38f083e496
++1016 ea2b5a9b0dc1c9a0
++1017 9d9c96fbd5de7e30
++1018 ad0907910b7effb7
++1019 ff8c0d75195e9956
++1020 4e03d7cba9742f38
++1021 0eef901788f2bd90
++1022 9ed2eef39f459d54
++1023 c6ee4c2b6feb1b41
++1024 f2906ee68d606826
++1025 60c1feef8ff4afd4
++1026 9c0005a81b43efde
++1027 55678aa5a2e27d10
++1028 44c30485d494a621
++1029 ec6a733e88124c98
++1030 771c1cf94bd84776
++1031 fb14d44f16a7a0c8
++1032 92a0d377a025163e
++1033 0399d63d5a13d98e
++1034 ce516cbc5aef3fcc
++1035 3b1b677ec89a69fb
++1036 eaa0ecb1030f0f6c
++1037 152a328cb4b16885
++1038 4d851dd5f67be710
++1039 5a9117d3d8384a9e
++1040 602b972f2529d674
++1041 9c274c6c43ac5cc5
++1042 22cb5c2a14ee58cd
++1043 0d3dbc1d8d07785b
++1044 093d0ff5bdfa4388
++1045 99f5ee4b824c89b9
++1046 0c4aece657fa55a7
++1047 9685af5cd7493158
++1048 5881906606832499
++1049 fb977a0b9fbec757
++1050 454d708c44417d6f
++1051 60e3d4eb4227a1dc
++1052 aea2806b99aed995
++1053 db6859379c9c4f05
++1054 1a9ad14130cfb8bc
++1055 541a7f6d65f6ec25
++1056 b92054426b0f1616
++1057 6ab5701df565fcae
++1058 0904729d820cc2e8
++1059 4517febfa5d209bd
++1060 7223e6f430c341fa
++1061 21915cee09d8beda
++1062 867b5d11b2e75514
++1063 0ae8f42dc27adaa6
++1064 1345df3bf96b2cb7
++1065 f75c1c1fda82de95
++1066 846b938328f0c32c
++1067 e9481a3afffcd2eb
++1068 70e1750c5656efe4
++1069 933f4c6d27b9147f
++1070 8ee6d3c446a0deab
++1071 66fc866f2d1f25e1
++1072 ec510b6aa93d54f5
++1073 4c6e0e36d5034f94
++1074 64cad5d20c9209a8
++1075 6725734b70e93b0f
++1076 d62ad6babbb50c2c
++1077 0c4f7b7edbabd744
++1078 880c4e95c88733a5
++1079 c84ad4ccd03bd42e
++1080 d7eac9a52c69015d
++1081 5c118994bcd91b47
++1082 1914d07305b5228f
++1083 dc9d2fc576975cdd
++1084 979e2208b620c95c
++1085 69de679cdb6c3698
++1086 7f503577c881c551
++1087 3685e477003fb7fd
++1088 e2347f6b93678002
++1089 144f0d590ff31b28
++1090 069e322be6e966c5
++1091 d1fff1de97c06440
++1092 a4727cdef0c2a70f
++1093 9cda01785c0818fc
++1094 0e3f02e37ba14270
++1095 99346292cd821c86
++1096 db3ab7661618799c
++1097 8ca46bf7254b48fd
++1098 b30a559d28c8b17f
++1099 efedd420e3987437
++1100 b6443da6f5540c06
++1101 aac1035d0c5dffb3
++1102 aeac9a7cbedd05e3
++1103 2642a2ec4290654d
++1104 9791023b09b0a28d
++1105 2b651e898ee14d91
++1106 ef1cb52a2bf101d5
++1107 3c2ec1e0798c3d8c
++1108 c26635ae9f080b1c
++1109 872e897bb841f191
++1110 6b9c3b8d33cf0d43
++1111 4ea986ea2c8a6a9b
++1112 df29711fb177ca97
++1113 0a2a25ec74d1ffc6
++1114 bebbb0a34d2bc4c3
++1115 955d44e2c9c1e66e
++1116 33dbb75daf92a5df
++1117 f3d2890aa6f953fd
++1118 fc80a6ac79cd1b73
++1119 4c49ad296952e263
++1120 bfaf75d6cf0536cb
++1121 2581429af43a18fb
++1122 a9cd9eb38f7d6b1f
++1123 d28597d36be9541d
++1124 0954b2231ddbdf65
++1125 683ca467aa8fef8a
++1126 9c55f9d71a4e3520
++1127 30dc667c04befa0a
++1128 40fc78837d31e990
++1129 46055ff723b6fb25
++1130 939bc67abfee1201
++1131 03c589513cddb9f3
++1132 4606cdc334d74ec3
++1133 4f0b8d03210e2730
++1134 fa7a7e91789cce10
++1135 bb2fe67c03f433e9
++1136 f4d38d2074e00ef4
++1137 454322e587a1a0b3
++1138 bb935717cec3e5dd
++1139 044356b0a694c250
++1140 2ee940e2f925c462
++1141 6b1233990fa175f3
++1142 fc2dcda024eb683a
++1143 3adc7724faa4d64a
++1144 1f5aa4d4933b2ba6
++1145 dcb6f38a9a49e53d
++1146 6dc963b23e8fd9da
++1147 17ba54824538bbab
++1148 0490c554e8d881a7
++1149 1eb918796f992066
++1150 0e890b26208549ba
++1151 5a1e4951714b1578
++1152 10483f67d996059b
++1153 c70ead209d8ea5e1
++1154 d2e64feb826c0ef6
++1155 1dde3ba076aca9cf
++1156 402a73503ae3feb9
++1157 fb558a3ddd29dd88
++1158 d23ce56987006954
++1159 83e84884a1bdb186
++1160 3b77c0053468525f
++1161 f24dda0f44235700
++1162 6e6e057b37887465
++1163 e9bf4e3708631a58
++1164 50d120d651e807bf
++1165 d6195603e9cd3584
++1166 3b3a35526c55dae4
++1167 20b21d42f3ccc621
++1168 77a64ef784232bbc
++1169 5d464f3075c604a9
++1170 ece07389509f3508
++1171 d6e353c7e82fdfdb
++1172 9de6947bc823f01e
++1173 42d86113a0cf5ab0
++1174 ee5d6119cf216f51
++1175 794617ff8f0fac06
++1176 caa8973fb41a84a9
++1177 643950cdea639529
++1178 30e1878c37ad8ffd
++1179 ca13d614d1af5511
++1180 be9a1f77d39e3d67
++1181 364f825481068273
++1182 ea5bd4fd0cd51bb6
++1183 bf1149abd89e44f6
++1184 074cf73ebc473090
++1185 9f839aacd60ba142
++1186 7adfd9125f2ba94c
++1187 a2c0ef596006c3f4
++1188 60f55cd4dfa90ede
++1189 01fff625273cd026
++1190 b081ff53a94bda0d
++1191 26ed7444f23af9a9
++1192 0952700f5d3b4dcd
++1193 8c553797b6f8c4d8
++1194 da074fc6f9bcd0a0
++1195 5fe9622343d544e5
++1196 ca65260286c5bf43
++1197 d90ef7ecd6ee766d
++1198 dccb28e910537c8e
++1199 f2feac2dd52474e0
++1200 ffb7668f5dd15190
++1201 7bbb98455ec646f5
++1202 8b7ec0ce47872d6c
++1203 fe0143c168c37e74
++1204 2ddb253e4b219091
++1205 7a18507ee4a4c900
++1206 8fe405eaa739c6d2
++1207 024975b5d22dcc43
++1208 b8d615ae460b7e74
++1209 1d749954ab48f9f1
++1210 daf2903b4a9d02b9
++1211 02de2c0ef972500d
++1212 3af84dfe57e0ba02
++1213 008ffdaf1dfd4c05
++1214 746ecbf8bb9af82e
++1215 bea4d41da32e092b
++1216 9cde6213b4398d82
++1217 f18e96d6d764cdef
++1218 a606f8f06dae5f5a
++1219 203ab2f935430b4a
++1220 c573f1dc8316288d
++1221 6924b3f9cf8eb645
++1222 c54bb494cdce5c9e
++1223 18bdb3305911e93f
++1224 e98df57f66a36ad0
++1225 89282427f13ae9d0
++1226 3892ddf3f638a475
++1227 469438cfe1aa988c
++1228 d0bfa9efc96a5c14
++1229 ce1b5458d022a6fc
++1230 bf5852063ead5342
++1231 e16b810a16e30105
++1232 a5871b567d36ebc1
++1233 97c282e6b2b8cbc2
++1234 6a780f8566da62e4
++1235 9907225ada130cdb
++1236 f32626f99a9bfedb
++1237 8098c564b934ebbc
++1238 6cefbc4e63527e90
++1239 88e49ae90e60b073
++1240 f4fa3b863a493b4c
++1241 04d314d9fe0561c3
++1242 7c2c32c00c2e9d95
++1243 74d83d427439e885
++1244 829cb5c489e1d3a1
++1245 0f2ed098ca1a2f0b
++1246 d1b78989236eee87
++1247 cf1f50039ffe241d
++1248 07117581ddd1b92f
++1249 5b037fe5aa39e13a
++1250 1efa1f1e46f05998
++1251 1b1b3cd4f42cb1ee
++1252 bd957a4e5b488a61
++1253 87413e5dce680ed3
++1254 a14d77dc6d981685
++1255 dbceb27a8b824fb0
++1256 f30e4d49d8248d2d
++1257 f1468531a8ecd8c8
++1258 ea8c80bfe6eda56d
++1259 8036bb38b72f0ecf
++1260 c2031b46559fa5d6
++1261 60b3f54a579ed833
++1262 1286d0f270176d46
++1263 f2f0148df7d94c27
++1264 5bec37e1bb5ea434
++1265 b1ecbd8fc6c15007
++1266 bc075fdffec13f4d
++1267 91dcedc00d6910ec
++1268 9c1de250fd484e46
++1269 b2d6823b4876b431
++1270 287fdd56c7b3428a
++1271 f3bf2d0c96f138d8
++1272 8508662a9c68a42c
++1273 764d47c60d21385b
++1274 30799956d7efa7e4
++1275 fab8023cf926cd34
++1276 1905ab82fc6d27d3
++1277 8644fd7b942a6248
++1278 9f0ae21b14895cc0
++1279 dd2d7f6449b0d937
++1280 4d01735e86b4b493
++1281 8bc044d0ffa1e647
++1282 fbac893aa705f2ae
++1283 c4d1476d1f1b8570
++1284 784fce56c771c7df
++1285 471e5d20c0f272f0
++1286 427ed677b9181667
++1287 0735dacf57bf3203
++1288 8af9720cd766c34d
++1289 275bf23e1a62a6ec
++1290 f33efa1abf0f8821
++1291 871ef9bfd5df4962
++1292 8fbc919be139b26e
++1293 ad9110471bdb4131
++1294 f187a1a4dbc1a7c0
++1295 9a7284896c5c5483
++1296 8bf8bc30581363f9
++1297 9b28033025c4ab62
++1298 46f9cb5dcdc2bbc8
++1299 7fa48df30366fabd
++1300 44871728d12e7d17
++1301 8d9f374910bb8b5d
++1302 35c06f8afee5bb33
++1303 c01207badbc67eef
++1304 86d1362e52e2ba2e
++1305 8b460c4bbc8a090b
++1306 d5b09f1e687f8d08
++1307 256cfff0215e7cf8
++1308 2804fd0c79f857b7
++1309 09b6e963a9ce578a
++1310 edacde94426516f0
++1311 3163e535e78c8fba
++1312 9a88487d211c166f
++1313 187f2a8f795f3613
++1314 6257b5e8196337b7
++1315 8b5d9dd7ad5d5695
++1316 d4735c133076ee1d
++1317 45c4cc7ba3a0802f
++1318 cd0ccbbac2709594
++1319 a8d51b4698a23a84
++1320 f996dd55a79b2111
++1321 b5a0606c0fb0abd2
++1322 4294f97ade43319e
++1323 ae9c6a5b4ac4b298
++1324 fa80e3b15b699142
++1325 3642fcdd959075de
++1326 ff2dfd5013387a1b
++1327 af2da65576a0c08d
++1328 ceb578b63c6da6a9
++1329 14605459878c6556
++1330 d53fcefdef9d4b7c
++1331 00249ffee55b7331
++1332 8938c834f163163e
++1333 6db8f9a0477c0fb3
++1334 7a46631cdab8391c
++1335 9afd523cfcb1b457
++1336 9229c016fba308d8
++1337 3a8bf15ac8bc8034
++1338 f1e2ccfae24db569
++1339 dd247ca6ab67629d
++1340 b2ff99b2eb6ef050
++1341 817c8dafb1e59769
++1342 f3d5efffe56038c3
++1343 74879c832884337e
++1344 a7c76d1f2a01d038
++1345 36c60e9b33bc544c
++1346 0a8b0aa8fbee6638
++1347 cae4ff96904fadc6
++1348 242e2e4cfbcc9afe
++1349 b14ade3cc7d4c3ae
++1350 46a03936179bb3fb
++1351 17c6ca5d834fde90
++1352 5927a43f9588de04
++1353 92a3f4bec1f5643a
++1354 5b0803cbc9b38bfa
++1355 dea27622961ee92a
++1356 b08749026cc39602
++1357 75d3ea6cc902f2f5
++1358 8dcc39c29d39c209
++1359 4fa4c8549e0a3a1c
++1360 0027ae043fc54134
++1361 3db6feebedfc59d6
++1362 0923c969ad9f5efa
++1363 d3f2d0b0bbefa830
++1364 baf5fafb348641bf
++1365 65b04f03037cf5f6
++1366 a7569a4dfde183d0
++1367 5992fff514f65926
++1368 45e7a8c1b4a74390
++1369 0a42e8275e0c63e4
++1370 6e63bd368ef2aaf6
++1371 cdee2075a0e8171a
++1372 0001e0048a23e5b8
++1373 d7bb4d3013fd9fbf
++1374 dc41c0cab77bf7d1
++1375 fc1b2b47b8afb48c
++1376 6b5b92ec67b45929
++1377 134ad72d2c779335
++1378 1ab993b171e2e773
++1379 3888d9b2802caa05
++1380 960ef23b5d391879
++1381 cc57df4f0462465a
++1382 e250a67887c49d70
++1383 77f50fef11a7fec5
++1384 a2ef2d3618123c51
++1385 dd85176abfc2c1ce
++1386 2453d63b349275a1
++1387 49eedf3346fac7ca
++1388 25e1bbc98122c635
++1389 43111a597a670b3e
++1390 2ea5b0ee6eb13abb
++1391 cc0def55d213c72f
++1392 a8a5534237032915
++1393 f32ffe095bc7beb8
++1394 ee481f1becfcdb95
++1395 0dd4a7af5c53e0b6
++1396 95803bc5df71850b
++1397 7ae8364d5168a2ad
++1398 1cdc0c13dded863b
++1399 e86f1a38ab42d389
++1400 cfe01d8e3cca0261
++1401 834413395081c800
++1402 8781be1bc2389da4
++1403 fc623e916e4df838
++1404 38d9b5539e2dad17
++1405 7747e39471afc6c3
++1406 e2070baeef2bdf11
++1407 1cae106d1159fb58
++1408 c3b5e6d1fdeaf27f
++1409 a1213763c15e0c04
++1410 94503a9beb06781d
++1411 45b2dc9d908bc990
++1412 c46b8fed4351b56e
++1413 2d57effab31cf905
++1414 37ec713360b855d9
++1415 0b1ca2f131b7d343
++1416 61c8b1f57f07c76d
++1417 dca6513d00ad6fff
++1418 e208baaec9064418
++1419 914ff91f55c028a6
++1420 97ff5413e448f575
++1421 a217d5fb6ab9ab6c
++1422 55b3fb32cd5dc088
++1423 bba18ea4e5e8f108
++1424 da848c9222ef3545
++1425 3a70c1fbc1953089
++1426 f7fe8c5443723613
++1427 4b574fe8a82e7572
++1428 3d6a2f9c866e738b
++1429 40b230ebeafbd8eb
++1430 c605486f5bed82b2
++1431 51824f2d23e85f47
++1432 b2508c6f3327c987
++1433 8e626c23efeb96f3
++1434 b21ea3fd64e8f21e
++1435 f4b1cb157d6b71d0
++1436 deec5bf731604630
++1437 24106000219f2d43
++1438 a52d24511e6207a1
++1439 a0ef00269ff4d2be
++1440 de73ff418110d77f
++1441 4879432530145680
++1442 70159693cb559157
++1443 92c635264a16f3f4
++1444 53e108267c5ba764
++1445 9fc65dc58fac86bd
++1446 1c6fac7bcc4654e3
++1447 4cf4f7efb893ad28
++1448 e4fe81d6e9c1f314
++1449 127e2a5d8d755688
++1450 b1dd4a0adf3171c7
++1451 3735ff7e0332da3b
++1452 d7b69bcc4aa581d9
++1453 32622ceb454b9452
++1454 cfe037fff20c3138
++1455 2300a93a8595e76f
++1456 62610d0e31d3c249
++1457 be8482e64db23754
++1458 e9d986638521760f
++1459 32f74c4964e33c5f
++1460 443b437332162639
++1461 6c6e7ab30717ea00
++1462 f493c65045e6a09e
++1463 5956cc3418f2d1d4
++1464 d7957ed496255148
++1465 ea425f4c9d9807fa
++1466 3752e18f41999fe8
++1467 c4d1fae0e218e7f1
++1468 1e536022752fb692
++1469 6ccd8e772222d294
++1470 6ccf2bb86f671524
++1471 d96eb058f4cef6a5
++1472 32334d640b99a09e
++1473 a25d39635afe49d5
++1474 221d8cc49be055e7
++1475 563d9b2493b7c971
++1476 4712a73a9ede2fee
++1477 6e9b1e3ec5ea495b
++1478 b63c810d84f9b516
++1479 23e46fdfd8b0bacb
++1480 6b55bc7096de282d
++1481 f9d468b58d7e782f
++1482 d015a788a6b988f3
++1483 44ceb94f3466bdf4
++1484 bddad22ff48d49a1
++1485 c25569460598fa80
++1486 de200d410f964018
++1487 112feeb5c923c396
++1488 5843197d47ea8d64
++1489 cbd9eb98e1175ec9
++1490 cc229f6e403a32b5
++1491 18537787a2ad2a24
++1492 7c7c5fdc7764dc15
++1493 3aa6a7d99c166058
++1494 e67376b7aa36dce9
++1495 69e4af54c1594158
++1496 93251ed5704bc6bd
++1497 afd164cc8dd56e34
++1498 5f84a112242c0669
++1499 3b07f3388fa9cc47
++1500 3fe4d92ca2134250
+diff --git a/goldens/qos/01000ms.png b/goldens/qos/01000ms.png
+new file mode 100644
+index 0000000..b8ab35c
+Binary files /dev/null and b/goldens/qos/01000ms.png differ
+diff --git a/goldens/qos/65000ms.png b/goldens/qos/65000ms.png
+new file mode 100644
+index 0000000..14a50d0
+Binary files /dev/null and b/goldens/qos/65000ms.png differ
+diff --git a/goldens/win.log.bin b/goldens/win.log.bin
+index aa2980f..d964d23 100644
+Binary files a/goldens/win.log.bin and b/goldens/win.log.bin differ
+diff --git a/goldens/win.t1 b/goldens/win.t1
+index 02c4a1a..f311b01 100644
+--- a/goldens/win.t1
++++ b/goldens/win.t1
+@@ -3,65 +3,65 @@ t1 1
+ demo win
+ seed 42
+ logic_hz 20
+-catalog_hash 99a32393078e0cca
++catalog_hash c59e720ff6ac3fb4
+ ticks 60
+-1 c6ddd231ced302b1
+-2 6ad234034a1de24e
+-3 a360746a961ff51f
+-4 ae857e22e71039c4
+-5 133d784ba573a385
+-6 74b88356edb88572
+-7 d019318e37a28293
+-8 84fc2882ecaf0458
+-9 47541a7e5c863779
+-10 ce416b1509e02e56
+-11 0b3314288847eb0c
+-12 749199b3cb143a1d
+-13 c9622c2bca31eb4e
+-14 3e4f741a9ee6ea1f
+-15 3e35f93286b20660
+-16 b5258cff79be17b1
+-17 38af2d53c0874202
+-18 0fe428ffbdced873
+-19 8d6aafd78a746234
+-20 cb4e05abd1998045
+-21 bdc1856e8b3ab796
+-22 918bd72daa0de147
+-23 16eb9f6ba1b2ee08
+-24 4cafef5485c8c4d9
+-25 3754b42ff04b9e8a
+-26 e6399b95f7eee59b
+-27 780234ef0371ce7c
+-28 3756cebe05c0978d
+-29 1e8a9edff59503be
+-30 60a43ed4854debcf
+-31 5d0b2fd9f7436c46
+-32 91905a854a7c2e5d
+-33 ab84d0481e772e58
+-34 f6729a12365a4887
+-35 466feb8dae94b3fa
+-36 5283d6687b24f0f1
+-37 f9317c525bf87e1c
+-38 19037119ee0770db
+-39 ca8b1efffd7d98ce
+-40 5a9d84a6e781d705
+-41 f882a8a481a192fa
+-42 b92d337fe72711be
+-43 070057ee7d34c392
+-44 b71ac9fffb398cec
+-45 9a6a9aae6ba52032
+-46 205de5d781dbb438
+-47 3a9005e7e01755c1
+-48 3a9005e7e01755c1
+-49 3a9005e7e01755c1
+-50 3a9005e7e01755c1
+-51 3a9005e7e01755c1
+-52 3a9005e7e01755c1
+-53 3a9005e7e01755c1
+-54 3a9005e7e01755c1
+-55 3a9005e7e01755c1
+-56 3a9005e7e01755c1
+-57 3a9005e7e01755c1
+-58 3a9005e7e01755c1
+-59 3a9005e7e01755c1
+-60 3a9005e7e01755c1
++1 794d390969de1149
++2 0e02e5205c408f06
++3 7af51ae54037c4b3
++4 8d3fb713bed18048
++5 6efe7a1d2b49aabd
++6 15d57e6173823a2a
++7 3fa53d05c5cc8387
++8 075d805079a8e55c
++9 b6d346fe6228e071
++10 b1c6e6c0f24a10ce
++11 4dd814f38dd82a40
++12 97b445ab666ff881
++13 66a297149529fe26
++14 9452a0bf7aef77b7
++15 eca40f6aee72f194
++16 54e482dcc229a335
++17 76f22584fb29379a
++18 bfe107943d4b1ecb
++19 ca21249e2c406a08
++20 ac0d5ac0d688d009
++21 5204349772feda0e
++22 0caf2cd2b617cd9f
++23 ba673f3cc25656dc
++24 9c6f53b23e0f74dd
++25 2aee88bbba8187e2
++26 79c5b10da8e9bcd3
++27 5777bb92262a31d0
++28 a866b4b3db75e6d1
++29 fdbb6592e8e7f976
++30 8e072c5a08812f07
++31 eecad1451e156f7a
++32 e37294985bc2a261
++33 be6de58eab11f210
++34 80a595d963b7151f
++35 a1320d95955419ae
++36 ed5f5c7368dda9b5
++37 630324fb4e381574
++38 55ff0a0dcdb39753
++39 46a28039308b1442
++40 7ec86f270c1e6a09
++41 96d3dab9812717f2
++42 a72efe538459dcd6
++43 de530726c51c6956
++44 158a1eba3f3d9430
++45 f48cf922a24327fa
++46 986cb8d89da0d658
++47 9b05746363018961
++48 9b05746363018961
++49 9b05746363018961
++50 9b05746363018961
++51 9b05746363018961
++52 9b05746363018961
++53 9b05746363018961
++54 9b05746363018961
++55 9b05746363018961
++56 9b05746363018961
++57 9b05746363018961
++58 9b05746363018961
++59 9b05746363018961
++60 9b05746363018961
+diff --git a/harness/catalogs.odin b/harness/catalogs.odin
+index 371ae14..1cf148c 100644
+--- a/harness/catalogs.odin
++++ b/harness/catalogs.odin
+@@ -21,9 +21,15 @@ load_catalogs :: proc(cat: ^pp.Catalogs) -> string {
+ 	if e2 != nil { return fmt.tprintf("cannot read data/pipe_tiers.json: %v", e2) }
+ 	bal, e3 := os.read_entire_file_from_path("data/balance.json", context.temp_allocator)
+ 	if e3 != nil { return fmt.tprintf("cannot read data/balance.json: %v", e3) }
++	pkt, e4 := os.read_entire_file_from_path("data/packet_types.json", context.temp_allocator)
++	if e4 != nil { return fmt.tprintf("cannot read data/packet_types.json: %v", e4) }
++	dem, e5 := os.read_entire_file_from_path("data/demand.json", context.temp_allocator)
++	if e5 != nil { return fmt.tprintf("cannot read data/demand.json: %v", e5) }
+ 	src.node_types = nt
+ 	src.pipe_tiers = pt
+ 	src.balance = bal
++	src.packet_types = pkt // 3.1
++	src.demand = dem       // 3.1
+ 	cerr := pp.catalogs_load(cat, &src)
+ 	if cerr.file != "" {
+ 		return pp.catalog_error_string(cerr)
+@@ -51,3 +57,14 @@ seed_fixture :: proc(state: ^pp.Run_State, cat: ^pp.Catalogs) -> (u32, u32, u32)
+ 	h := pp.topology_spawn_node(&state.topology, host_idx, FIXTURE_HOST_POS, cat)
+ 	return r, g, h
+ }
++
++// seed_qos_fixture — 3.1: extend the fixture with two MORE residentials (node
++// ids 3, 4) so the demand director's res->res email spec has a real sink set
++// (the base fixture's single residential would self-loop-exclude every email
++// dst). Same deterministic positions every replay (run setup, like the
++// fixture). The demo draws them to the router; all spans fit 'standard' (13).
++seed_qos_fixture :: proc(state: ^pp.Run_State, cat: ^pp.Catalogs) {
++	res_idx, _ := pp.node_type_index(cat, "residential")
++	pp.topology_spawn_node(&state.topology, res_idx, {14, 22}, cat)
++	pp.topology_spawn_node(&state.topology, res_idx, {26, 22}, cat)
++}
+diff --git a/harness/demo.odin b/harness/demo.odin
+index ad11929..5888ee8 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -67,6 +67,8 @@ Demo :: struct {
+ 	expect_hash_stable: bool,
+ 	use_fixture:        bool, // true = seed the 3-node fixture (back-compat); `fixture off` opts out
+ 	nodes:              [dynamic]Node_Spawn, // spawn_node directives (run setup — like the fixture)
++	era:                u8,   // 3.1: the demand era (0 = legacy — no director spawns)
++	qos_fixture:        bool, // 3.1: `fixture qos` — extra residentials so the res->res email spec has a sink set
+ 	draws:              [dynamic]Draw_Intent,
+ 	spawns:             [dynamic]Spawn_Intent,
+ 	demolishes:         [dynamic]Demolish_Intent,
+@@ -120,21 +122,25 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 			}
+ 			append(&d.nodes, Node_Spawn{type_name = strings.clone(fields[1]), pos = {i32(x), i32(y)}})
+ 		case "fixture":
+-			// fixture off — opt out of the hardcoded 3-node fixture for demos
++			// fixture on|off — opt out of the hardcoded 3-node fixture for demos
+ 			// that define their whole topology via spawn_node (arbitrary
+ 			// topologies: diamonds, grids). Default on (back-compat: every
+-			// pre-existing demo keeps the fixture). Run setup — re-created
++			// pre-existing demo keeps the fixture). fixture qos — the 3.1 qos
++			// fixture (extra residentials so the demand director's res->res
++			// email spec has multiple sinks). Run setup — re-created
+ 			// identically on every replay, like the fixture itself.
+ 			if len(fields) < 2 {
+-				return {}, fmt.tprintf("bad fixture (want: fixture on|off): %s", line)
++				return {}, fmt.tprintf("bad fixture (want: fixture on|off|qos): %s", line)
+ 			}
+ 			switch fields[1] {
+ 			case "on":
+ 				d.use_fixture = true
+ 			case "off":
+ 				d.use_fixture = false
++			case "qos":
++				d.qos_fixture = true
+ 			case:
+-				return {}, fmt.tprintf("bad fixture value %q (want on|off): %s", fields[1], line)
++				return {}, fmt.tprintf("bad fixture value %q (want on|off|qos): %s", fields[1], line)
+ 			}
+ 		case "seed":
+ 			if len(fields) < 2 {
+@@ -145,6 +151,16 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 				return {}, fmt.tprintf("bad seed: %q", fields[1])
+ 			}
+ 			d.seed = u64(v)
++		case "era":
++			// era <n> — the demand era (3.1). 0 = legacy (director inactive).
++			if len(fields) < 2 {
++				return {}, "era needs a value"
++			}
++			v, ok := strconv.parse_uint(fields[1], 10)
++			if !ok || v > 255 {
++				return {}, fmt.tprintf("bad era: %q", fields[1])
++			}
++			d.era = u8(v)
+ 		case "run":
+ 			if len(fields) < 2 {
+ 				return {}, "run needs a duration (e.g. run 5000ms)"
+diff --git a/harness/drift.odin b/harness/drift.odin
+index d4f4f2a..0631304 100644
+--- a/harness/drift.odin
++++ b/harness/drift.odin
+@@ -54,11 +54,22 @@ drift_check :: proc(cat: ^pp.Catalogs) -> i32 {
+ 				continue
+ 			}
+ 			fails := make([dynamic]string, context.temp_allocator)
+-			_, accepted := replay_hashes(tmp, cat, ticks, &demo_cfg, &fails)
++			replayed, accepted := replay_hashes(tmp, cat, ticks, &demo_cfg, &fails)
+ 			delete(fails)
+-			if accepted {
+-				// the gate ACCEPTED a drifted log — this is the failure we're
+-				// here to catch (the gate must REJECT every one of these).
++			ok := !accepted
++			if m.diverge {
++				// era-flip class (r1 warning #6): replay_hashes APPLIES the header
++				// era (run setup riding the log, not a rejection class), so the
++				// pin is that the re-sim DIVERGES from the manifest — a tampered
++				// era changes the demand plan, and the normal rejection assertion
++				// would never catch it. A gate rejection is stronger than
++				// required and also OK.
++				ok = !accepted || !seq_equal(replayed[:], man.hashes[:])
++			}
++			delete(replayed)
++			if !ok {
++				// the gate ACCEPTED a drifted log (or an era-flip log re-simmed
++				// the manifest) — this is the failure we're here to catch.
+ 				fmt.eprintfln("drift-check: %s: FAIL — gate ACCEPTED drifted log (%s)", name, m.label)
+ 				bad += 1
+ 			} else {
+@@ -81,8 +92,19 @@ drift_check :: proc(cat: ^pp.Catalogs) -> i32 {
+ }
+ 
+ Mutation :: struct {
+-	label: string,
+-	bytes: []u8,
++	label:  string,
++	bytes:  []u8,
++	diverge: bool, // era-flip class: the gate ACCEPTS (the era rides the log);
++	               // the pin is that the re-sim DIVERGES from the manifest
++}
++
++// seq_equal — elementwise equality for the era-flip divergence assertion.
++seq_equal :: proc(a, b: []u64) -> bool {
++	if len(a) != len(b) { return false }
++	for i in 0..<len(a) {
++		if a[i] != b[i] { return false }
++	}
++	return true
+ }
+ 
+ // mutated — clone src into a new []u8, apply the mutation, return it wrapped.
+@@ -95,11 +117,12 @@ mutated :: proc(src: []u8, label: string, mutate: proc(b: []u8)) -> Mutation {
+ 	return {label = label, bytes = c[:]}
+ }
+ 
+-// make_drift_mutations — the six drift classes the replay gate must reject:
++// make_drift_mutations — the seven drift classes the replay gate must bite on:
+ //   catalog_hash / logic_hz header drift (the ODN-11 binding), magic + version
+-//   + unknown-tag corruption (log_read rejects), and truncation.
++//   + unknown-tag corruption (log_read rejects), truncation, and the era-byte
++//   flip (divergence class — r1 warning #6).
+ make_drift_mutations :: proc(src: []u8) -> [dynamic]Mutation {
+-	out := make([dynamic]Mutation, 0, 6, context.temp_allocator)
++	out := make([dynamic]Mutation, 0, 7, context.temp_allocator)
+ 	// catalog_hash occupies bytes 17..24 (after magic4 + ver4 + seed8 + era1).
+ 	if len(src) > 24 {
+ 		append(&out, mutated(src, "catalog_hash", proc(b: []u8) { b[17] ~= 0xFF }))
+@@ -118,6 +141,15 @@ make_drift_mutations :: proc(src: []u8) -> [dynamic]Mutation {
+ 	if len(src) > 41 {
+ 		append(&out, mutated(src, "bad_tag", proc(b: []u8) { b[41] = 0xFF }))
+ 	}
++	// the era byte (byte 16, after magic4 + ver4 + seed8) — a tampered era
++	// changes the demand plan (the director). replay_hashes APPLIES the header
++	// era, so this is a DIVERGENCE class: the re-sim must not reproduce the
++	// manifest (drift_check asserts it — 0<->3 flips every demo's demand plan).
++	if len(src) > 16 {
++		m := mutated(src, "bad_era", proc(b: []u8) { b[16] ~= 3 })
++		m.diverge = true
++		append(&out, m)
++	}
+ 	// truncation — drop the last byte.
+ 	trunc := make([dynamic]u8, len(src)-1, context.temp_allocator)
+ 	copy(trunc[:], src[:len(src)-1])
+diff --git a/harness/goldens.odin b/harness/goldens.odin
+index e9a2b29..91cd1f8 100644
+--- a/harness/goldens.odin
++++ b/harness/goldens.odin
+@@ -97,6 +97,8 @@ write_golden :: proc(demo: string, ms: i64, img: rl.Image) {
+ check_golden :: proc(demo: string, ms: i64, img: rl.Image, report: ^Report, fails: ^[dynamic]string) {
+ 	path := golden_path(demo, ms)
+ 	if !os.exists(path) {
++		// aprintf (context.allocator): the fail strings outlive the tick loop's
++		// per-tick free_all — tprintf here would print garbage on FAIL (r1 note)
+ 		append(fails, fmt.aprintf("T2 %dms: no golden (run `harness save %s` to bless)", ms, demo))
+ 		append(&report.diff_dirs, save_diff_bundle(demo, ms, img, {}))
+ 		rl.UnloadImage(img)
+@@ -150,6 +152,8 @@ compare_images :: proc(a, b: rl.Image) -> (mismatched: int, total: int, bbox: [4
+ // lands in report.diff_dirs, which outlives the tick loop (see the
+ // check_golden allocator note).
+ save_diff_bundle :: proc(demo: string, ms: i64, actual: rl.Image, expected: rl.Image) -> string {
++	// the returned dir outlives the tick loop's free_all (it lands in
++	// Report.diff_dirs) — aprintf, not tprintf (r1 note).
+ 	dir := fmt.aprintf("goldens/_reports/%s/latest", demo)
+ 	mkdir_p(dir)
+ 	base := fmt.aprintf("%05dms", ms)
+diff --git a/harness/run.odin b/harness/run.odin
+index a8078d0..01f812c 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -100,9 +100,11 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 	state: pp.Run_State
+ 	defer pp.run_destroy(&state)
+ 	pp.run_init(&state, demo.seed, cat.hash, cat.balance.logic_hz)
++	state.era = demo.era // 3.1: the demand era (0 = legacy — director inactive)
+ 	cfg := Demo_Replay{
+ 		name = demo.name,
+ 		use_fixture = demo.use_fixture,
++		qos_fixture = demo.qos_fixture,
+ 		session = {demo.win_goal, demo.lose_cap_ms},
+ 	}
+ 	defer {
+@@ -239,20 +241,24 @@ apply_session :: proc(state: ^pp.Run_State, cfg: Session_Cfg, hz: i32) {
+ Demo_Replay :: struct {
+ 	name:        string,
+ 	use_fixture: bool,
++	qos_fixture: bool, // 3.1: `fixture qos` — extra residentials so the res->res email spec has a sink set
+ 	nodes:       [dynamic]Node_Spawn,
+ 	spawns:      [dynamic]Spawn_Intent,
+ 	session:     Session_Cfg,
+ }
+ 
+ // demo_apply_setup — apply ALL run-setup pieces in one place: the fixture
+-// (opt-out via `fixture off`), the spawn_node topology, the spawn demand, and
+-// the win/lose session. Called identically by run_demo (live) + replay_hashes
+-// (replay) — the single-source-of-truth for run setup. Returns "" on success,
+-// a one-line error otherwise.
++// (opt-out via `fixture off`, extra residentials via `fixture qos`), the
++// spawn_node topology, the spawn demand, and the win/lose session. Called
++// identically by run_demo (live) + replay_hashes (replay) — the single-source-
++// of-truth for run setup. Returns "" on success, a one-line error otherwise.
+ demo_apply_setup :: proc(state: ^pp.Run_State, cfg: ^Demo_Replay, cat: ^pp.Catalogs) -> string {
+ 	if cfg.use_fixture {
+ 		seed_fixture(state, cat)
+ 	}
++	if cfg.qos_fixture {
++		seed_qos_fixture(state, cat) // 3.1: run setup — re-created identically on every replay
++	}
+ 	if e := lower_nodes(state, cfg.name, cfg.nodes[:], cat); e != "" {
+ 		return e
+ 	}
+@@ -290,6 +296,7 @@ load_demo_replay :: proc(demo_name: string) -> Demo_Replay {
+ 		return cfg
+ 	}
+ 	cfg.use_fixture = demo.use_fixture
++	cfg.qos_fixture = demo.qos_fixture // 3.1
+ 	for n in demo.nodes {
+ 		append(&cfg.nodes, n)
+ 	}
+@@ -298,9 +305,7 @@ load_demo_replay :: proc(demo_name: string) -> Demo_Replay {
+ 	}
+ 	cfg.session.goal = demo.win_goal
+ 	cfg.session.cap_ms = demo.lose_cap_ms
+-	delete(demo.nodes)
+-	delete(demo.draws)
+-	delete(demo.spawns)
++	delete(demo.demolishes) // r1 note: the sibling loaders leaked this too
+ 	delete(demo.captures)
+ 	return cfg
+ }
+@@ -310,7 +315,9 @@ load_demo_replay :: proc(demo_name: string) -> Demo_Replay {
+ // defined rejection, never silent divergence), then re-sim tick 1..ticks with
+ // the SAME run setup re-created identically (the fixture + spawn_node topology
+ // + flow demand + win/lose session — NONE in the action log, like the
+-// fixture).
++// fixture). The demand ERA rides the log header too (it drives the director)
++// and is applied from the HEADER here — the log is authoritative, NOT the demo
++// file: a tampered era must re-sim a different demand plan (drift bad_era).
+ replay_hashes :: proc(lpath: string, cat: ^pp.Catalogs, ticks: u64, cfg: ^Demo_Replay,
+                       fails: ^[dynamic]string) -> ([dynamic]u64, bool) {
+ 	out := make([dynamic]u64)
+@@ -339,6 +346,7 @@ replay_hashes :: proc(lpath: string, cat: ^pp.Catalogs, ticks: u64, cfg: ^Demo_R
+ 	state: pp.Run_State
+ 	defer pp.run_destroy(&state)
+ 	pp.run_init(&state, header.seed, cat.hash, cat.balance.logic_hz)
++	state.era = header.era // 3.1: the era rides the log header (it drives the director) — the LOG is authoritative, not the demo file
+ 	if e := demo_apply_setup(&state, cfg, cat); e != "" {
+ 		// a run-setup that fails in the replay (e.g. an unknown spawn_node type)
+ 		// is a defined rejection — live and replay must agree on the setup.
+@@ -370,7 +378,7 @@ replay_hashes :: proc(lpath: string, cat: ^pp.Catalogs, ticks: u64, cfg: ^Demo_R
+ 
+ // verify_replay — the in-run gate: the blessed log reproduces the live hashes.
+ // The demo's run setup is re-created in the replay (fixture + spawn_node
+-// topology + spawn demand + win/lose cfg).
++// topology + spawn demand + win/lose cfg + the demand era from the log header).
+ verify_replay :: proc(demo_name: string, cat: ^pp.Catalogs, cfg: ^Demo_Replay,
+                       live_hashes: []u64) -> bool {
+ 	fails := make([dynamic]string, context.temp_allocator)

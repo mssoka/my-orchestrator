@@ -1,0 +1,82 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "broken-invariant",
+    "title": "Padded gap eras are indistinguishable from real rows: era_row/era_advance_validate accept an empty Era_Row as a valid advance target",
+    "location": "core/catalog.odin:hunk (+store at index era-1) & core/era.odin:era_advance_validate",
+    "evidence": "// store at index era-1 (pad with empty eras so index == era-1)\n\t\t\tfor len(cat.eras) < int(era) { append(&cat.eras, Era_Row{}) }\n\t\t\tcat.eras[era-1] = er\n---\n\tera_advance_validate :: proc(state: ^Run_State, c: Cmd_Era_Advance, cat: ^Catalogs) -> Edit_Error {\n\tif c.to_era == 0 || int(c.to_era) > len(cat.eras) {\n\t\treturn .Invalid_Era_Advance\n\t}",
+    "detail": "An eras.json with era 1 and era 3 (no era 2) loads clean: the padded empty row passes era_row and the FSM validates/fires an advance into an era with an empty roster and no demand binding — the exact drift fail-fast exists to reject.",
+    "recommended_fix": "Reject non-contiguous era tables at load (require every era 1..max present), or check the row is populated (id != \"\") in era_row/era_advance_validate."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "comment-vs-code",
+    "title": "Load comment claims unique era ids but no uniqueness check exists",
+    "location": "core/catalog.odin:hunk (eras parse block)",
+    "evidence": "// (strict int, 1..64, unique — the same domain as the demand rows),\n\t// `id`/`display_name` (non-empty, unique ids), `packet_types` (the ACTIVE",
+    "detail": "The duplicate guard only covers the era number (`seen[era-1]`); two rows with the same `id` load clean despite the documented uniqueness invariant. Either enforce or stop claiming it.",
+    "recommended_fix": "Add an id-uniqueness pass over parsed rows (linear, map-free per ODN-10) or delete \"unique ids\" from the contract comment."
+  },
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "contradiction",
+    "title": "log_write puts a defaulted parameter before a non-defaulted one — suspicious Odin signature that contradicts the claimed green build",
+    "location": "core/serialize.odin:log_write",
+    "evidence": "log_write :: proc(state: ^Run_State, scratch := context.temp_allocator, header_era: u8) -> []u8 {",
+    "detail": "A defaulted parameter (`scratch`) precedes a mandatory one (`header_era`); Odin requires default parameters to trail, so this either fails to compile (contradicting the diff's own 'ci-local 10/10, app build' claims) or silently reorders call semantics.",
+    "recommended_fix": "Make the signature `log_write :: proc(state: ^Run_State, header_era: u8, scratch := context.temp_allocator)` and update the five call sites accordingly."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "incomplete-validation",
+    "title": "Demo lowering validates an advance only against the START era, not prior advances — duplicate/non-forward chains bless a replay_error log",
+    "location": "harness/run.odin:lower_intents",
+    "evidence": "\t\tif d.to_era <= demo.era {\n\t\t\treturn fmt.tprintf(\"demo %s: advance to era %d is not forward of the demo start era %d\", demo.name, d.to_era, demo.era)\n\t\t}\n\t\tappend(&state.action_log, pp.Command{\n\t\t\tapply_tick = apply_tick_at(d.at_ms, pauses, cat.balance.logic_hz),\n\t\t\tkind = pp.Cmd_Era_Advance{to_era = d.to_era},\n\t\t})",
+    "detail": "The comment vows 'never let a bad demo bless a poisoned log', yet two `advance 3` lines (or 3 then 4 then 3) pass lowering; at apply the second fails validation and latches replay_error in the blessed log — precisely the failure mode the check claims to prevent.",
+    "recommended_fix": "Track a running expected era across sorted advances at lower time and reject any to_era not strictly forward of the previous target."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "era_step takes cat but never uses it; comments claim it 'loads the new era's unlocks'",
+    "location": "core/era.odin:era_step",
+    "evidence": "era_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {\n\tif state.era_advance_to == 0 {\n\t\treturn\n\t}\n\tif era_advance_blocked(state) {\n\t\treturn // E14 — an active crisis defers the advance until it clears\n\t}\n\tnew_era := state.era_advance_to\n\tstate.era = new_era\n\tstate.era_advance_to = 0\n\tevent_emit_era(state, tick, new_era)\n}",
+    "detail": "The body touches only state; `cat` is dead. The step.odin seam comment says era_step 'loads the new era's unlocks' — nothing is loaded; the unlocks are pure catalog queries. The parameter and the comment both overclaim.",
+    "recommended_fix": "Drop the cat parameter (update the step.odin call) or use it (e.g., assert era_row(cat, new_era)); fix the 'loads the unlocks' wording either way."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "brittle-test",
+    "title": "Demand-switch test hardcodes streaming's class index instead of resolving it",
+    "location": "core/era_test.odin:test_era_advance_fires_and_switches_demand",
+    "evidence": "\tfound_streaming := false\n\tfor e in plan.entries {\n\t\tif e.class == 1 { found_streaming = true }\n\t}\n\ttesting.expect(t, found_streaming, \"era 3's demand plan must include the streaming entry\")",
+    "detail": "`e.class == 1` assumes streaming is packet_types index 1; a reorder of packet_types.json flips the assertion to a false pass/fail. The same file resolves indices via class_index everywhere else.",
+    "recommended_fix": "Resolve `si, _ := class_index(cat, \"streaming\")` and compare `e.class == si`."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-mismatch",
+    "title": "Era domain is documented as both 1..6 and 1..64 within the same change",
+    "location": "core/era.odin:event_emit_era & core/catalog.odin eras parse",
+    "evidence": "// (the Event.class field carries it, tag-conditional — see serialize.odin's\n// w_event_payload; 1..6 fits a u8, class is u16 by the shared-payload idiom).\n---\n\t\t\tif era < 1 || era > 64 {\n\t\t\t\treturn {\"eras.json\", \"eras\", \"era must be in 1..64\"}\n\t\t\t}",
+    "detail": "The serializer comment justifies the u8 payload with a 1..6 era domain; the loader accepts 1..64. Both fit a u8, so this is only documentation drift today, but the 1..6 claim will be wrong the moment eras 4-6+ land.",
+    "recommended_fix": "State the real bound (u8 payload covers the catalog's 1..64 domain) instead of the content-specific 1..6."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "error-message",
+    "title": "A missing demand_era key reports 'has no demand.json row' instead of 'missing field'",
+    "location": "core/catalog.odin eras parse & core/catalog_test.odin",
+    "evidence": "\t\t\tde, okd := jint_strict(eo, \"demand_era\", 0)\n\t\t\tif !okd {\n\t\t\t\treturn {\"eras.json\", er.id, \"demand_era must be an integer (no decimals)\"}\n\t\t\t}\n\t\t\tif de < 1 || de > i32(len(cat.demand.eras)) {\n\t\t\t\treturn {\"eras.json\", er.id, fmt.tprintf(\"demand_era %d has no demand.json row (demand eras: 1..%d)\", de, len(cat.demand.eras))}\n\t\t\t}\n---\n\t\t{\"demand_era missing\", replace1(ERAS_VALID, `\"demand_era\": 1, `, ``, 1), \"has no demand.json row\"},",
+    "detail": "A row that omits demand_era defaults to 0 and errors 'demand_era 0 has no demand.json row' — a misleading message for a missing field, now blessed by the test. Fail-fast ergonomics suffer for no reason.",
+    "recommended_fix": "Distinguish absent-key from out-of-range (separate jint presence check) and emit 'demand_era is required' for the former."
+  }
+]

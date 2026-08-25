@@ -1,0 +1,122 @@
+[
+  {
+    "source": "architecture",
+    "severity": "blocker",
+    "category": "boundary",
+    "title": "Fail-loud font guard is dead code: a missing TTF still silently runs the raylib default",
+    "location": "app/render/view.odin:1431",
+    "evidence": "view.odin:1353-1356: `font_load_data :: proc(path: string, size: i32, cps: []rune) -> (glyphs: [^]rl.GlyphInfo, count: c.int) {` / `data, err := os.read_entire_file_from_path(path, context.allocator)` — verbatim: `data, err := os.read_entire_file_from_path(path, context.temp_allocator)` / `if err != nil {` / `return nil, 0`. view.odin:1431-1435: `font_from_glyphs :: proc(glyphs: [^]rl.GlyphInfo, count: c.int, size: i32) -> rl.Font {` / `f: rl.Font` / `if glyphs == nil || count == 0 {` / `return rl.GetFontDefault()`. app/main.odin:317-318: `if !rl.IsFontValid(app.view.font) || !rl.IsFontValid(app.view.font_header) || !rl.IsFontValid(app.view.font_mono) {` / `fmt.eprintln(\"app: HUD font family failed to load (assets/fonts) - refusing to run with the raylib default\")`. tools/raylib-sw/src/src/rtext.c:593-601 IsFontValid: `return ((font.baseSize > 0) &&      // Validate font size` / `(font.glyphCount > 0) &&    // Validate font contains some glyph` / `(font.recs != NULL) &&      // Validate font recs defining glyphs on texture atlas` / `(font.glyphs != NULL));     // Validate glyph data is loaded`. rtext.c:166 `defaultFont.glyphCount = 224; // Number of glyphs included in our default font`; rcore.c:710 `LoadFontDefault();` inside InitWindow; app InitWindow at main.odin:240 runs before load_fonts at 311, harness InitWindow at main.odin:347 before render_setup at 351.",
+    "detail": "Missing asset → nil glyphs → font_from_glyphs returns GetFontDefault(), which passes IsFontValid (224 glyphs, loaded at InitWindow before load_fonts). The exit(2) guard can never fire — the silent-fallback lie stays possible.",
+    "recommended_fix": "Return a zeroed (invalid) Font or a (Font, bool) from load_font_file on failure instead of GetFontDefault, so IsFontValid fails and the existing guards bite."
+  },
+  {
+    "source": "architecture",
+    "severity": "blocker",
+    "category": "coupling",
+    "title": "palette.json ink_soft edit violates the job's \"palette unchanged\" rule and guarantees non-text golden drift",
+    "location": "data/palette.json:10",
+    "evidence": "data/palette.json:10: `  \"ink_soft\":      [66, 72, 80, 255],` (diff: `-  \"ink_soft\":      [92, 98, 106, 255],` → `+  \"ink_soft\":      [66, 72, 80, 255],`). Non-text consumers read in the worktree: app/main.odin:642 `rl.DrawRectangleLinesEx(chip, 1, p.ink_soft)`; app/main.odin:1847/1861 `rl.DrawRectangleLinesEx(r, 1, p.ink_soft)` (tray chip borders — drawn every frame); app/render/health.odin:67 `rl.DrawRectangle(bar_x, bar_y, bar_w, bar_h, p.ink_soft)`; app/render/settings_panel.odin:131 `rl.DrawRectangleLines(i32(r.x), i32(r.y), i32(r.width), i32(r.height), p.ink_soft)`; app/render/popover.odin:119 `rl.DrawRectangleLinesEx(r, 1, v.palette.ink_soft)`. Job briefing rule 6 (hard): \"do NOT touch gameplay goldens beyond text pixels (palette/layout unchanged)\".",
+    "detail": "ink_soft is a shared token: besides text it colors tray-chip borders, the health bar track, settings/popover borders — non-text pixels present in essentially every golden. The re-bless diff bboxes cannot be text-band-only.",
+    "recommended_fix": "Scope the 7.2:1 contrast to a new text token (e.g. ink_text_soft) in palette.json, revert ink_soft, or explicitly document the non-text drift as a second bless cause."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "tooling",
+    "title": "noc_e2e TakeScreenshot moved BEFORE EndDrawing, contradicting its own pinned lesson and a false comment",
+    "location": "app/main.odin:677-699",
+    "evidence": "app/main.odin:668-675 (comment): `// then exit. AFTER EndDrawing: a mid-frame TakeScreenshot can miss the` / `// unflushed rlgl batch on the GPU build (the harness captures after` / `// EndDrawing for the same reason).` ... `// END is explicit below (the font-overhaul end block — EndDrawing in` / `// normal mode, EndTextureMode in gallery mode), so this block runs` / `// after the flush in both.` app/main.odin:677-688: `when #config(PP_DEBUG, false) {` / `if app.noc_e2e {` ... `case NOC_E2E_CAPTURE_ON:` / `rl.TakeScreenshot(\"bin/noc-e2e-on.png\")`. app/main.odin:691-699: `when #config(PP_DEBUG, false) {` / `rl.EndDrawing()` / `if gallery_frame(&app) {` / `break` / `}` / `} else {` / `rl.EndDrawing()` / `}`. grep for BeginTextureMode/EndTextureMode in app/: only this comment line 674 — no such call exists.",
+    "detail": "The capture block now executes before rl.EndDrawing() — the exact mid-frame unflushed-batch risk the comment names. The \"runs after the flush in both\" claim is false, and EndTextureMode doesn't exist.",
+    "recommended_fix": "Move the noc_e2e capture block after the EndDrawing end-block (both branches), and fix the stale EndTextureMode wording in the comment."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "duplication",
+    "title": "run_demo_to_ms added as a second copy of the replay driver; overlay_check keeps its own inline loop",
+    "location": "harness/overlay.odin:164",
+    "evidence": "harness/overlay.odin:73-78 (duplicated consecutive comment, read verbatim): `// run to the capture ms (wall ticks; paused wall ticks step nothing — the` / `// same driver the run path uses). The overlay renders the LAST stepped` / `// tick's state + its stats record + the event tail (the app's behavior).` / `hz := cat.balance.logic_hz` / `// run to the capture ms (wall ticks; paused wall ticks step nothing — the` / `// same driver the run path uses). ...` — followed by overlay_check's own inline wall-tick loop (for w in u64(1)..=wall_max ... pp.step). harness/overlay.odin:164: `run_demo_to_ms :: proc(state: ^pp.Run_State, d: ^Demo, cfg: ^Demo_Replay, cat: ^pp.Catalogs, cap_ms: i64) -> (sim_tick: u64, stats: pp.Stats_Record, stats_valid: bool) {`. harness/font_check.odin:160-161: `// 3. replay the demo to the capture ms (shared driver — the SAME sim` / `// path the overlay-check verb uses; the font swap never touches it).`",
+    "detail": "Three copies of the wall-tick replay loop now exist (run.odin, overlay_check inline, run_demo_to_ms); overlay_check was not refactored to call the \"shared\" driver, and the added comment is pasted twice.",
+    "recommended_fix": "Have overlay_check call run_demo_to_ms (optional out-param for the hash stream), delete its inline loop and the duplicated comment block."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "glyph_probe indexes the compacted glyph array by request index — misaligned verdicts and an OOB read for missing glyphs",
+    "location": "harness/font_check.odin:62",
+    "evidence": "harness/font_check.odin:62-65: `for i in 0..<n {` / `cp := cps[i]` / `g := f.glyphs[i]` / `present := g.advanceX > 0 || (g.image.width > 0 && g.image.height > 0)`. tools/raylib-sw/src/src/rtext.c:663-667 (LoadFontData): `if (index > 0) glyphCounter++;` ... `glyphs = (GlyphInfo *)RL_CALLOC(glyphCounter, sizeof(GlyphInfo));` — the array holds ONLY found glyphs (compaction); rtext.c:780 `*glyphCount = glyphCount;`. view.odin's own merge comment documents the same: \"raylib COMPACTS the glyph array (missing codepoints are skipped; the atlas lookup maps by glyph.value, never by index\".",
+    "detail": "For a candidate missing any probed codepoint, glyphs[i] no longer corresponds to cps[i]: verdicts after the gap read the wrong glyph, and i=95 reads past the 95-entry array — the exact negative-control case.",
+    "recommended_fix": "Look up by glyph value like font_probe_warning does (glyphs[i].value == cp), bound the loop by f.glyphCount, and reuse render.font_codepoints instead of duplicating build_probe_set."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "convention",
+    "title": "Package-level mutable global `gallery: Gallery` violates the no-globals rule (ODN-13) and the sibling debug-tooling pattern",
+    "location": "app/gallery.odin:63",
+    "evidence": "app/gallery.odin:63: `gallery: Gallery`. project-context.md (Critical Implementation Rules): \"**No globals / singletons.** Everything hangs off `App` → `Run_State`, passed by pointer (ODN-13).\" Sibling debug tooling keeps state on App: app/main.odin:181 `noc_e2e_frame: int,` (a field of the App struct), armed via `app.noc_e2e = os.get_env_alloc(\"PP_NOC_E2E\", ...)`. grep over app/*.odin: `gallery: Gallery` is the only package-level mutable variable in the app package.",
+    "detail": "First mutable package global in the app; the existing noc_e2e debug harness stores equivalent state as App fields. Diverges from ODN-13 and the established sibling pattern even inside PP_DEBUG code.",
+    "recommended_fix": "Add the gallery state to App (PP_DEBUG-commented fields like noc_e2e) and pass &app.gallery, keeping the compile gate as-is."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "docs",
+    "title": "_pr_body_font_overhaul.md ships the sprite-silhouette job's PR body, not this font job's",
+    "location": "_pr_body_font_overhaul.md:1",
+    "evidence": "_pr_body_font_overhaul.md:1 (new file in this diff): `# MM-minimal silhouette spec + validated re-render pipeline (work-start release)`; body covers `SPRITE_ORDER`, `tools/gen_sprites.py`, `docs/silhouette-spec.md`, `assets/blender/README.md`; line 102: `- **No goldens touched** — no sprite byte changed; `goldens/` untouched.` The diff itself changes 111 goldens/*.png files.",
+    "detail": "The font-overhaul PR body file is a copy of another job's body: it documents Blender sprite tooling and claims \"No goldens touched\", directly contradicting this PR's 152-file font swap + golden storm.",
+    "recommended_fix": "Replace the file with the real font-overhaul PR body: Plex pick, T2 re-bless cause doc, T1/replay hash-equal proof, ⚠ test results."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "tooling",
+    "title": "New PP_SW_AUDIO build flag has no producer: no script, CI job, or doc ever sets it",
+    "location": "app/audio/audio.odin:156",
+    "evidence": "app/audio/audio.odin:156-158: `// PP_SW_AUDIO=1 (the font-gallery SW builds): the raylib-sw shadow ships no` / `// raudio — the device stays off (the same silent-fallback path; the rl calls` / `// compile out so the link resolves).` repo-wide grep for PP_SW_AUDIO matches only app/audio/audio.odin (10 hits); tools/harness.sh builds only the harness (`odin build harness -out:bin/harness -debug`); project-context.md documents only PP_DEBUG (\"Debug tools behind `-define:PP_DEBUG=true`\").",
+    "detail": "The SW gallery app build (PP_DEBUG + PP_SW_AUDIO + rlsw shadow link + PP_FONT_GALLERY) exists nowhere as a recipe — the A/B capture pipeline isn't reproducible from the repo.",
+    "recommended_fix": "Commit a tools/gallery.sh that builds the app against the raylib-sw shadow with both defines, and note PP_SW_AUDIO in project-context.md's debug-gate rule."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "single-source",
+    "title": "palette.odin code fallbacks still carry the old ink_soft after palette.json moved — silent divergence on a failed palette load",
+    "location": "app/render/palette.odin:200",
+    "evidence": "app/render/palette.odin:200: `p.ink_soft = jcol(obj, \"ink_soft\", {92, 98, 106, 255})`; app/render/palette.odin:295: `p.ink_soft = {92, 98, 106, 255},`; data/palette.json:10: `  \"ink_soft\":      [66, 72, 80, 255],`. project-context.md (ODN-5): \"Numbers single-source: balance numbers live in data/*.json, never restated in code\".",
+    "detail": "The restated defaults drifted from the JSON after this diff: a missing/failing palette.json silently reverts ink_soft to the pre-contrast value — app renders and T2 goldens diverge without a failure.",
+    "recommended_fix": "Update both fallback literals to {66, 72, 80, 255} to match the JSON (or drop restated defaults and fail loud on palette load)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "tooling",
+    "title": "Specimen canvas still draws the pre-08-23 size ladder after the app moved to 24/32/16/15",
+    "location": "harness/font_check.odin:100",
+    "evidence": "harness/font_check.odin (draw_specimen): `draw_row(warn_font, \"Packet Plumber - v2\", y, 22, p.ink) // the 22px title header`; `draw_row(warn_font, \"SURGE SURVIVED - YOU WIN\", y, 30, rl.Color{44, 134, 66, 255}) // the 30px win toast`; header comment: \"the specimen canvas (the game's actual text at the game's sizes\". app/main.odin:1259: `draw_text_h(app, \"Packet Plumber - v2\", 12, 10, rnd.hud(&app.view, 24), p.ink) // 2026-08-23: the bigger-text ruling`; app/main.odin:1272: `draw_text_h(app, \"SURGE SURVIVED - YOU WIN\", 12, 66, rnd.hud(&app.view, 32), ...)`; app/render/crisis.odin:124: `draw_header_c(v, title, x, ty, i32(f32(hud(v, 16)) * ts), state_critical_text(p^))`.",
+    "detail": "The specimen claims to render \"the game's sizes\" but pins the old ladder (22 title / 30 toast / 15 crisis / 14 body) — future candidate gradings would judge stale sizes.",
+    "recommended_fix": "Sync draw_specimen to the shipped ladder: 24 title, 32 toasts, 16 crisis title, 15 body lines."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "debt",
+    "title": "font_merge_fallback leaks the fallback glyph array block (fg) it copies from",
+    "location": "app/render/view.odin:1419",
+    "evidence": "app/render/view.odin:1403-1404: `fg := rl.LoadFontData(raw_data(fdata), c.int(len(fdata)), size,` / `raw_data(missing[:missing_n]), c.int(missing_n), .DEFAULT, &ng)`; view.odin:1417-1421: `for j in 0..<ng {` / `merged[count + j] = fg[j]` / `}` / `rl.MemFree(glyphs) // the block is free; the glyph image data lives on in merged` — no MemFree(fg) anywhere in the proc. Its own comment claims: \"UnloadFont owns every byte: the glyph structs AND their image data\".",
+    "detail": "Only the main block is freed; the fallback GlyphInfo array block (raylib RL_CALLOC) is orphaned each merge — three times per app/harness init plus per test probe. Small, one-time, but contradicts the ownership comment.",
+    "recommended_fix": "Add `rl.MemFree(fg)` after the copy loop (before returning merged)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "tooling",
+    "title": "font-check probes the deleted Open Sans baseline — the comparison line can never load",
+    "location": "harness/font_check.odin:158",
+    "evidence": "harness/font_check.odin:158: `glyph_probe(\"assets/fonts/open_sans_regular.ttf\", rnd.FONT_BASE_SIZE)`. The same diff deletes the file: `diff --git a/assets/fonts/open_sans_regular.ttf b/assets/fonts/open_sans_regular.ttf` / `deleted file mode 100644` / `index bba741a9..00000000`. assets/fonts/ in the worktree contains only the four Plex/Noto ttfs.",
+    "detail": "The \"this candidate + the baseline\" probe hard-codes an asset removed in this same PR — every font-check run prints \"cannot load\" for the baseline instead of comparing anything.",
+    "recommended_fix": "Point the baseline probe at a committed font (e.g. ibm_plex_sans_regular.ttf) or delete the baseline call."
+  }
+]

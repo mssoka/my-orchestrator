@@ -1,0 +1,82 @@
+[
+  {
+    "source": "architecture",
+    "severity": "blocker",
+    "category": "lint",
+    "title": "Claimed lint hardening did not land: lint_demo_network.py is byte-unchanged since r2 and the 35-line cross-arm guard bleed still reproduces (r2 #11 fix didn't bite)",
+    "location": "scripts/lint_demo_network.py:162-163",
+    "evidence": "window = \"\\n\".join(lines[max(0, idx - 35) : idx])\n        guarded = \"model.demo_mode\" in window or \"updated_model.demo_mode\" in window  // git log -- scripts/lint_demo_network.py shows only r2 commit 1c2a6a9 (zero r3 changes; test.yml diff is solely the '^import api/' grep). Reproduced on a /tmp copy: injecting an unguarded 'payment_api.create_checkout_session(\"v-x\", \"tok\", ...)' in a fresh arm directly below UserToggledNotificationDropdown's demo_mode guard -> 'demo no-network lint clean', exit=0. No depth-aware arm boundary, no bite tests, no DEMO_INTERCEPTED<->demo_update.handle cross-check anywhere in the tree (grep finds only the keep-in-sync comment at line 43).",
+    "detail": "The r3 bar ('the hardened lint bites: depth-aware arm boundaries, bite tests, manifest check') is claimed but absent — the script was never touched. A real api call in a fresh arm within 35 lines of any demo_mode case passes vacuously. Fix that didn't bite = new blocker.",
+    "recommended_fix": "Truncate the guard window at the enclosing arm/fn boundary; add the three bite tests (unguarded arm, cross-arm guard, manifest drift) and a mechanical DEMO_INTERCEPTED vs demo_update.handle arm check."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "dup",
+    "title": "store_of and download_timeout still duplicated between demo_update.gleam and client.gleam (r2 #21 still present)",
+    "location": "client/src/demo/demo_update.gleam:633,792 vs client/src/client.gleam:5894,6864",
+    "evidence": "client/src/client.gleam:5894:fn demo_store_of(model: Model) -> DemoStore {\nclient/src/client.gleam:6864:fn download_timeout(analysis_id: String, delay_ms: Int) -> Effect(Msg) {\nclient/src/demo/demo_update.gleam:633:fn store_of(model: Model) -> DemoStore {\nclient/src/demo/demo_update.gleam:792:fn download_timeout(id: String) -> Effect(Msg) {",
+    "detail": "Two copies of the seed-fallback store accessor and the download timeout (documented as 'mirrors client.gleam's') persist; the toast helper in the same file has already drifted from add_toast (separate note).",
+    "recommended_fix": "Hoist the shared helpers into one demo module (or client helpers) and call from both sites."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Zero-caller demo exports still shipped: result_to_seed_error and demo_store.notifications (r2 #19 residual)",
+    "location": "client/src/demo/demo_fixtures.gleam:140; client/src/demo/demo_store.gleam:1494",
+    "evidence": "pub fn result_to_seed_error(result: Result(a, String)) -> Result(a, SeedError) {\npub fn notifications(store: DemoStore) -> List(Notification) {\n// grep -rn 'result_to_seed_error' client/src client/test -> definition only; grep -rn 'demo_store.notifications' client/src client/test -> only demo_api.gleam:366 notifications_unread (the sibling). check_session / capture_with_props / all_fixture_jsons / decode_checked ARE gone (fixed).",
+    "detail": "The rework deleted four of the six r2 orphans but left two public functions with no call sites; public fns escape the compiler's unused warnings.",
+    "recommended_fix": "Delete result_to_seed_error and notifications (or wire them)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "coupling",
+    "title": "demo_not_in_demo_toast still diverges from add_toast's id convention — a demo toast and a handler toast can share one id (r2 #25 still present)",
+    "location": "client/src/demo/demo_update.gleam:617-624 vs client/src/client.gleam:7090",
+    "evidence": "demo_update.gleam:617:  let toast_id = model.next_toast_id + 1\n                          ...\n                          next_toast_id: toast_id,\n// vs client.gleam add_toast:   let id = model.next_toast_id (then next_toast_id: id + 1) — after a demo toast (id=N+1, counter left at N+1) the next add_toast also uses id N+1; add_toast's 5-toast cap is also bypassed.",
+    "detail": "Duplicate toast ids mean the first timeout dismisses both toasts; the helper duplicates rather than reuses the shared toast path.",
+    "recommended_fix": "Route demo toasts through the shared add_toast (or dispatch AppShowToast) instead of hand-rolling id/cap logic."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "demo-create",
+    "title": "id_suffix truncation still guarantees id collisions for same-prefix names, and its doc comment still sits on add_days_iso (r2 #27 + #18 residual)",
+    "location": "client/src/demo/demo_store.gleam:1647-1656 (fn), 1575-1580 (misplaced doc)",
+    "evidence": "fn id_suffix(value: String) -> String {\n  ...\n    n -> string.drop_end(cleaned, n - 8)\n// and the doc '/// Stable short id suffix from a property name (lowercase alphanumeric,' (line 1575) directly precedes 'fn add_days_iso' (line 1580), not id_suffix. Two creations of 'My Apartment' both yield v-demo-my-apart / RTDEMOmy-apart; the store is keyed by id.",
+    "detail": "Same-prefix property names collide on vacancy id and short_code, contradicting the anti-collision comment; the stale doc placement r2 flagged persists.",
+    "recommended_fix": "Append a per-store counter to the suffix; move the doc block onto id_suffix."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "demo-latent",
+    "title": "fetch_leaderboard_page still ignores its page parameter and returns the full list (r2 #28, latent)",
+    "location": "client/src/demo/demo_api.gleam:217-220",
+    "evidence": "pub fn fetch_leaderboard_page(\n  store: DemoStore,\n  vacancy_id: String,\n  _page: Int,\n// resolves demo_store.leaderboard(store, vacancy_id) — the whole list; the response handler appends, so a rendered load-more would duplicate every row (unreachable today: page 1 returns everything).",
+    "detail": "Latent duplication bug if demo pagination is ever simulated; mirror signature promises paging it doesn't do.",
+    "recommended_fix": "Slice the entries by page, or have the demo handler replace instead of append."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "demo-latent",
+    "title": "Store-side change_status/mark_opened still has no status guard — audit rows append unconditionally (r2 #29, latent)",
+    "location": "client/src/demo/demo_store.gleam:1291",
+    "evidence": "fn change_status(\n  ...\n// overwrites status and appends AuditEntry on every call; the idempotency claim for mark_opened rests entirely on the dispatch-layer open_dispatched set in client.gleam.",
+    "detail": "Any future second dispatch path double-appends audit rows and re-fires the transition; the store's documented idempotency isn't self-enforcing.",
+    "recommended_fix": "Guard change_status on slug != current status (no-op, no audit row)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "demo-fidelity",
+    "title": "Reminders and bulk-invite still return hardcoded counts with the store untouched, contradicting the seeded awaiting list (r2 #24 still present)",
+    "location": "client/src/demo/demo_store.gleam:1379-1400",
+    "evidence": "pub fn remind_applicant(\n  ...\n  #(store, #(1, 0))\npub fn send_reminder(\n  ...\n  #(store, #(2, 1))\n      sent: 2,\n      invalid: 1,\n// the awaiting list never reflects a sent reminder; success toasts report counts unrelated to the seeded rows (send_reminder claims a failure the 3-row awaiting list can't produce deterministically).",
+    "detail": "Derived-not-serialized is the module's stated design, but these three mutations violate it — fixed canned responses drift from the source-of-truth store.",
+    "recommended_fix": "Derive counts from the awaiting rows and mark reminded rows in the store so the surface re-derives."
+  }
+]

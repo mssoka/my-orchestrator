@@ -1,0 +1,283 @@
+{
+  "round": "r3",
+  "job": "righttenantry-refcheck-rc4-3",
+  "pr": 606,
+  "reviewed_sha": "111e2214765cafef7bfbd56e6bb315df1281b9f7",
+  "failed_layers": [],
+  "verdict": "NEEDS CHANGES",
+  "counts": {
+    "blocker": 1,
+    "warning": 4,
+    "note": 14,
+    "rejected": 8
+  },
+  "lens_input": {
+    "total_findings": 77,
+    "waves": {
+      "c1": 26,
+      "c2": 20,
+      "c3": 25,
+      "c4": 6
+    }
+  },
+  "fix_audit": {
+    "prior_total": 24,
+    "fixed": 13,
+    "still_present_or_partial": [
+      "BLOCKER (partial fix): wrong-person leg read-time-only — SQL UPDATE still unguarded (TOCTOU)",
+      "W6 (partial): queued-row take-over menu entry added, confirm never renders for Queued rows — dead control",
+      "N4 (partial): per-slot re-arm + declined no-re-arm in code, unpinned",
+      "N5 (partial): behind-a-button + closing Cancel fixed; discard halves remain",
+      "N8/N13-client (still present): client ?slot= wire format untested",
+      "N14 (partial): Escape handler wired but unreachable in the natural click-...-Escape flow (no focus move)",
+      "N8/N9-spec (partial): spec line 73 still names substitute_reference_call.sql; line 232 still claims ONE additive column; epic-RC4-context.md documents the pre-W4 effective-contact rule",
+      "N11-resend-leg: W4 fix in code, no pin for the resend leg specifically",
+      "N1 (pronouns): deliberate gender-neutral deviation — flagged for the human's call, NOT a defect"
+    ],
+    "notes": "W1 typed-timestamptz gate + same_day_stale_bounce_stands_down_test verified FIXED (the r1/r2 format-mix is structurally gone; the r2-rejected payload-sentinel and exhaust-cycles-gate claims were re-filed and re-rejected). W2-W5, W7, W12 verified FIXED with pins."
+  },
+  "findings": [
+    {
+      "source": ["edge", "security", "acceptance", "blind", "architecture", "codebase"],
+      "severity": "blocker",
+      "category": "take-over",
+      "title": "STILL PRESENT (r2 BLOCKER, wrong/partial fix): the wrong-person leg's taken-over stand-down is read-time only — update_reference_call_status has no taken_over_at guard, so a take-over landing between the token read and the UPDATE still yanks a landlord-handled row into awaiting_correction and dead-ends it",
+      "location": "server/src/reference_checks/form_handler.gleam:1235-1254 (apply_wrong_person); server/src/reference_checks/sql/update_reference_call_status.sql:23-24",
+      "evidence": "form_handler.gleam: 'case row.taken_over_at != \"\" { True -> wisp.redirect(to: \"/reference/\" <> token) ... sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated)' — update_reference_call_status.sql: 'WHERE id = $1 AND status = $5::reference_call_status' (no taken_over_at clause). Contrast mark_awaiting_correction.sql:23 'AND taken_over_at IS NULL' (the webhook leg, fixed) and take_over_reference_call.sql (writes ONLY taken_over_at + next_attempt_at, status stays 'contact_initiated').",
+      "detail": "The r2 blocker's fix landed on the webhook leg (mark_awaiting_correction + exhaust_reference_call + find all gained taken_over_at IS NULL) but the wrong-person first-failure leg was only Gleam-guarded on the read row. Take-over never changes status, so a take-over committing between lookup_context and the UPDATE still matches, re-entering the landlord-handled row into the correction loop. The landlord's follow-up correction re-queues it queued + taken_over_at still set (correct_reference_call does not clear it); the sweep excludes taken-over rows forever, form_token was cleared and never re-minted, complete_reference_call requires contact_initiated — permanent dead-end, the exact r2 blocker's consequence.",
+      "recommended_fix": "Add a taken_over_at IS NULL backstop to the wrong-person awaiting UPDATE (dedicated guarded SQL mirroring mark_awaiting_correction, or extend update_reference_call_status with an optional flag), and pin a take-over-racing-wrong-person POST integration test.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind", "acceptance", "architecture", "codebase"],
+      "severity": "warning",
+      "category": "take-over",
+      "title": "STILL PRESENT (r2 W6, partial fix): queued-row take-over is a dead control — overflow_actions offers RefcheckTakeOver on Queued rows but row_detail's Queued arm never renders view_take_over_confirm; choosing it sets an invisible confirm that can't be confirmed or dismissed",
+      "location": "client/src/components/reference_panel.gleam:485-507 (overflow_actions Queued arm) vs 597-613 (row_detail Queued arm)",
+      "evidence": "overflow_actions: 'Queued -> list.append([RefcheckStart, RefcheckSkip], case call.hooks.can_take_over { True -> [RefcheckTakeOver] False -> [] })' — row_detail Queued arm: 'case pending_confirm(call.reference_call_id, RefcheckConfirmStart, confirm) { True -> view_start_confirm(...) False -> element.none() }' — only the START confirm; view_take_over_confirm is called ONLY from the Unreachable arm (line 631) and ContactInitiated arm (line 667); client.gleam:3373-3378 sets RefcheckConfirmTakeOver for the menu choice.",
+      "detail": "The r2 W6 fix added the queued menu entry (the hook is True for Queued — application_detail_handler.gleam:1108) but no confirm surface for the Queued state. A landlord who clicks 'Take over manually' on a queued row closes the menu, expands the row, and sees nothing; the pending confirm can be neither confirmed nor dismissed. The action is impossible from the state §7.7/AC2 includes in the take-over set.",
+      "recommended_fix": "Render view_take_over_confirm in the Queued arm of row_detail (pending RefcheckConfirmTakeOver), mirroring the ContactInitiated arm.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["acceptance", "edge"],
+      "severity": "warning",
+      "category": "exhaustion",
+      "title": "Stale-bounce gate is bypassable via the contact-fallback leg: matched_send_at='' is hardcoded genuine, so a redelivered PRE-correction bounce whose envelope equals a correction-retained channel exhausts the corrected row and fabricates referee_contact_invalid",
+      "location": "server/src/reference_checks/webhooks.gleam:297-298; server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:33-55",
+      "evidence": "webhooks.gleam: 'case row.matched_send_at == \"\" || row.send_is_post_correction { True -> exhaust_row(...) False -> Nil }' — find_reference_call_by_send_ref.sql: 'OR ($2 <> '' AND CASE WHEN rc.correction_cycles >= 1 THEN NULLIF(rc.corrected_email, '') ELSE COALESCE(NULLIF(rc.corrected_email, ''), rc.contact_email) END = $2)' with matched_send_at COALESCE((SELECT ...), '')",
+      "detail": "When the match comes via the contact fallback (crash-mid-tick send never appended to attempts), matched_send_at is '' and the gate treats it as genuine. If the correction retained the failed channel (e.g. only the phone was corrected), a stale redelivered bounce of the PRE-correction send matches the corrected-only fallback and exhausts — stamping referee_contact_invalid on a contact never re-tried, the exact fabrication W1's comment claims the gate prevents.",
+      "recommended_fix": "Do not treat the fallback leg as genuine when correction_cycles >= 1 and the matched channel was unchanged by the correction; or carry a corrected_at comparison into the fallback (e.g. reject envelopes that predate corrected_at when the address is unchanged).",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["edge"],
+      "severity": "warning",
+      "category": "exhaustion",
+      "title": "A bounce of the APPLICANT's co-nudge email exhausts a corrected row and fabricates referee_contact_invalid — the attempts-log containment matches the co-nudge entry (delivered, detail=<email_id>) and the typed gate classifies it as a genuine post-correction failure",
+      "location": "server/src/reference_checks/sweep.gleam:351-394 (step_co_nudge sends to row.applicant_email); server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:38-50 (attempts @> containment)",
+      "evidence": "sweep.gleam: 'send.send_co_nudge(deps, to_email: row.applicant_email, ...)' and 'outcomes_to_json([outcome], now_iso)' appended via sweep_advance — the co-nudge entry is {at, channel:email, outcome:delivered, detail:<email_id>}; find_reference_call_by_send_ref: 'rc.attempts @> NULLIF($1, '')::jsonb' where $1 = '[{\"outcome\":\"delivered\",\"detail\":\"<email_id>\"}]'",
+      "detail": "The co-nudge is addressed to the APPLICANT, not the referee, yet its delivered entry rides the same reference_call attempts jsonb and matches the send-ref containment. A bounce of the applicant's address on a corrected row (cycles >= 1) reads send_is_post_correction = true (the co-nudge fires post-correction) and exhausts the row to unreachable + stamps referee_contact_invalid — a fabricated fraud signal on a referee whose contact never failed.",
+      "recommended_fix": "Exclude applicant-addressed sends (co-nudge template tag) from the delivery-failure find, or tag the co-nudge entry (e.g. recipient=applicant) and have the gate stand it down.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["edge", "security"],
+      "severity": "warning",
+      "category": "take-over",
+      "title": "sweep_terminal / sweep_mark_failed lack the taken_over_at write guard — a take-over racing the T+144h terminalization (or a mark-failed) lands on a landlord-handled row and kills the §8.6 late-completion form link",
+      "location": "server/src/reference_checks/sql/sweep_terminal.sql:30-32; server/src/reference_checks/sql/sweep_mark_failed.sql:21-22",
+      "evidence": "sweep_terminal.sql: 'WHERE id = $1 AND status = 'contact_initiated' AND attempt_count = 4' — no taken_over_at filter; sweep_mark_failed.sql: 'WHERE id = $1 AND status IN ('queued', 'contact_initiated')' — no taken_over_at filter; contrast sweep_claim_t0.sql:34 'AND taken_over_at IS NULL' and sweep_advance.sql:25 'AND taken_over_at IS NULL' (the r1 N12 guards this PR extended).",
+      "detail": "The due-SELECT (sweep_due_reference_calls.sql:59) excludes taken-over rows, but that is a tick-start snapshot. A take-over committing between the SELECT and the terminal UPDATE still commits: the row terminalizes to unreachable/partial with taken_over_at set — the §7.7 'form link stays live' / §8.6 late-completion promise dies, and partial+taken_over is unrecoverable.",
+      "recommended_fix": "Add AND taken_over_at IS NULL to sweep_terminal.sql and sweep_mark_failed.sql (the same belt-and-braces every sibling sweep writer carries).",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["codebase", "tests", "blind", "edge", "acceptance"],
+      "severity": "note",
+      "category": "coverage",
+      "title": "STILL PRESENT (r2 N8/N13): the client's ?slot= wire format for per-row start has no test — the server 400 branch is pinned, the client URL building is not",
+      "location": "client/src/api/reference_checks_api.gleam:56-70; client/test/ (no hits)",
+      "evidence": "start_check: 'let url = case slot { Some(s) -> url <> \"?slot=\" <> s None -> url }' — grep of client/test/ for '?slot=' and 'reference_checks_api' returns zero hits; only server/test/integration/reference_checks_actions_integration_test.gleam:1140 start_with_invalid_slot_returns_400_test",
+      "detail": "The r2 N8 gap persists: the slot-scoped start URL (slot encoding + query building) is untested client-side, so a slot-encoding rename breaks per-row start silently while server tests stay green.",
+      "recommended_fix": "Add a client unit test asserting start_check builds ?slot=<encoded> for Some(slot) and no query for None.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind", "codebase", "edge", "architecture"],
+      "severity": "note",
+      "category": "client-state",
+      "title": "STILL PRESENT (r2 N5): single-slot refcheck_edit — a second row's action choice or any action success still discards another row's in-progress typed trio",
+      "location": "client/src/client.gleam:3385-3398 (overwrite), 3552-3561 (unconditional success clear)",
+      "evidence": "UserChoseRefcheckAction: 'RefcheckSubstitute -> #(Model(..menu_closed, refcheck_edit: Some(prefill_refcheck_edit(model, call_id, RefcheckEditSubstitute))), effect.none())' — overwrites any open edit; ApiReturnedRefcheckAction Ok arm: 'let cleared = Model(..model, refcheck_edit: None, refcheck_confirm: None, ...)' — clears unconditionally even when the success is for a different call_id",
+      "detail": "The behind-a-button + closing-Cancel halves of r2 N5 are fixed, but typed values on row A are still silently dropped when the landlord skips/takes over row B or opens B's edit — no per-call clear, no prompt. Referee PII typed into the §8.3 trio is lost.",
+      "recommended_fix": "Scope the success-clear and the edit-open to the acting call_id (only clear refcheck_edit when edit.call_id == call_id), or block a second edit while one is open.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests", "codebase", "edge"],
+      "severity": "note",
+      "category": "coverage",
+      "title": "Per-slot re-arm (r2 N4 fix) and declined no-re-arm are in code but unpinned — no test asserts only the requested slot re-arms or that the suppressed start path skips the re-arm",
+      "location": "server/src/reference_checks/sql/rearm_queued_reference_calls.sql:16-18; server/src/reference_checks/trigger.gleam:530-558; server/test/integration/reference_checks_actions_integration_test.gleam:812 (per_slot_start_creates_only_the_requested_slot_test — covers creation, not re-arm)",
+      "evidence": "rearm SQL: 'AND ($2 = '' OR ref_slot = $2)' — per-slot filter present; trigger.gleam: 'Ok(Suppressed) -> json_ok(json.object([#(\"started\", json.bool(True))]))' — no re-arm on declined; the only re-arm test (start_reams_existing_queued_rows_test:1304) asserts BOTH queued rows re-arm with no slot param",
+      "detail": "The r2 N4 fix is implemented (slot filter + declined skip) but the two guard branches have no pinning test. A regression to whole-application re-arm or declined re-arm would pass CI.",
+      "recommended_fix": "Pin: start with ?slot=landlord_ref re-arms only that slot (the other row's next_attempt_at stays stale); start on a declined application leaves next_attempt_at untouched.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["acceptance", "edge", "tests"],
+      "severity": "note",
+      "category": "a11y",
+      "title": "STILL PRESENT (r2 N14, partial): Escape-to-close is wired to the menu div, which never receives focus after clicking ⋯ — the natural click-then-Escape flow does nothing",
+      "location": "client/src/components/reference_panel.gleam:732-737",
+      "evidence": "event.on(\"keydown\", menu_escape_decoder(msg.UserToggledRefcheckMenu(call.reference_call_id))) attached to the menu div (a sibling of the ⋯ button); no autofocus moves focus into the menu on open (contrast the confirm_modal pattern which uses attribute.autofocus(True))",
+      "detail": "Keydown bubbles from the focused ⋯ button through its ancestors, never through the sibling menu div, so the handler fires only once focus is on a menuitem. The r2 N14 fix landed but is unreachable in the primary flow.",
+      "recommended_fix": "Move the keydown handler onto the ⋯ button (or autofocus the first menuitem on open) so Escape closes the menu immediately after opening it.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind", "codebase", "edge", "acceptance"],
+      "severity": "note",
+      "category": "spec-drift",
+      "title": "STILL PRESENT (r2 N8/N9, partial): the PR's spec artifacts still drift — item 4 still names substitute_reference_call.sql (deleted; substitute reuses insert_reference_call_if_absent), item 5's 'One additive column' contradicts the two-column migration, and epic-RC4-context.md documents the pre-W4 effective-contact rule",
+      "location": "_bmad-output/implementation-artifacts/spec-rc4-3-row-actions.md:73,232; _bmad-output/implementation-artifacts/epic-RC4-context.md:21,29",
+      "evidence": "spec:73 'substitute_reference_call.sql (reads the old row's' — the file no longer exists in the diff (do_substitute calls insert_reference_call_if_absent); spec:232 'One additive column, nothing destructive' — the migration ships corrected_name + corrected_at; epic-context:29 'Effective contact = corrected_* when present, else the immutable contact_* snapshot.' — the pre-W4 fallback rule the implementation replaced with corrected-only",
+      "detail": "The r3 rework fixed most of r2 N8/N9 (both columns listed at spec:79-80, corrected_name in item 6), but three shipped artifacts still contradict the code: a phantom SQL file name, the one-column claim, and the documented pre-W4 effective-contact rule (which re-contacts a proven-dead channel).",
+      "recommended_fix": "Update spec line 73 to insert_reference_call_if_absent.sql, line 232 to 'two additive columns', and epic-RC4-context.md to the corrected-only (W4) rule.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage",
+      "title": "The resend-leg effective() corrected-only rule (r2 W4 fix) has no pin — sweep helpers are tested (sweep_test.gleam), the form_handler resend send is not",
+      "location": "server/src/reference_checks/form_handler.gleam:710-716; server/test/reference_checks/sweep_test.gleam:48-90",
+      "evidence": "form_handler.gleam:710-716: 'to_email: effective(row.correction_cycles >= 1, row.corrected_email, row.contact_email)' — the W4 fix is in code; sweep_test.gleam covers effective_email/effective_phone at the sweep level only",
+      "detail": "The r2 W4 resend leg was fixed in code but the referee-initiated resend path (expired-link resend) has no test asserting a cleared channel stays absent post-correction. A regression to the snapshot fallback in the resend leg would pass CI.",
+      "recommended_fix": "Add a handler-level test: correct with a cleared phone, then resend — the send targets corrected_email only, never the dead snapshot channel.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage",
+      "title": "Take-over/correct/substitute client wiring pins are missing — only Start/Skip choices are handler-tested at the client level; the confirm-dispatch and save-resend effects are un-pinned",
+      "location": "client/test/components/reference_panel_test.gleam:1167-1560; client/test/client_test.gleam (ApiReturnedRefcheckAction section)",
+      "evidence": "reference_panel_test covers render (overflow entries, confirm inline, edit trio) but no client_test drives UserConfirmedRefcheckAction(TakeOver) → API call or UserSavedRefcheckEdit(Correct) → API call; the server-side HTTP happy paths (take_over_and_substitute_http_happy_paths_test:1168) exist",
+      "detail": "The render tests prove the surfaces exist; the dispatch chain (menu → confirm → API → refetch) for take-over/correct/substitute has no client-level test, so a broken effect (e.g. wrong endpoint, dropped refetch) would pass the client suite.",
+      "recommended_fix": "Add client update-handler tests for UserConfirmedRefcheckAction(TakeOver) and UserSavedRefcheckEdit(Correct/Substitute) asserting the API effect fires with the right URL/payload.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "note",
+      "category": "robustness",
+      "title": "exhaust_wrong_person swallows a DB error on the guarded exhaustion UPDATE into a silent redirect — no log, no Sentry capture (contrast the first-failure leg which logs)",
+      "location": "server/src/reference_checks/form_handler.gleam:1355-1359 (exhaust_wrong_person `_` arm); first-failure leg 1270-1278",
+      "evidence": "exhaust_wrong_person: 'case sql.exhaust_reference_call(...) { Ok(pog.Returned(_, [_, ..])) -> {...} _ -> wisp.redirect(to: \"/reference/\" <> token) }' — the `_` arm folds Error(err) and 0-row together; apply_wrong_person's first-failure leg: 'Error(err) -> { wisp.log_error(\"reference wrong-person: status update failed: \" <> string.inspect(err)) ... }'",
+      "detail": "A DB failure on the exhaustion UPDATE silently redirects the referee to the token page with no observability — the row stays live and the fraud-signal stamp + audit + notification never fire. The sibling leg logs; this one does not. 0-row stand-down is correct; Error should be captured.",
+      "recommended_fix": "Split the `_` arm: 0-row → redirect (legit stand-down), Error → wisp.log_error + sentry capture before redirecting.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "note",
+      "category": "robustness",
+      "title": "send_is_post_correction casts untrusted jsonb text to timestamptz unguarded — a malformed 'at' in a matching attempts entry raises and drops the whole delivery-failure event instead of standing down; the LIMIT-1 pick still orders lexically",
+      "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:38-50 (send_is_post_correction subquery)",
+      "evidence": "COALESCE((SELECT (e->>'at')::timestamptz >= rc.corrected_at FROM jsonb_array_elements(rc.attempts) AS e WHERE e->>'detail' = $4 AND e->>'outcome' = 'delivered' ORDER BY e->>'at' DESC LIMIT 1), false) AS send_is_post_correction",
+      "detail": "Any delivered attempts entry with an unparseable 'at' (empty string, bad format) turns the whole find into an exception, failing the webhook event (Sentry 'ReferenceWebhookFindFailed') rather than standing down — the r1 string compare this replaces could never raise. The ORDER BY e->>'at' is lexical while the gate is typed (mixed-format logs would pick the wrong entry).",
+      "recommended_fix": "Guard the cast (e.g. CASE WHEN e->>'at' ~ ... THEN (e->>'at')::timestamptz END) and order by the typed value.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind", "tests"],
+      "severity": "note",
+      "category": "test-quality",
+      "title": "stale_pre_correction_failure_stands_down_test uses a fixed absolute timestamp ('2026-08-01T08:00:00Z') — the result depends on the machine clock being past that instant",
+      "location": "server/test/integration/reference_checks_actions_integration_test.gleam:944-1003 (fixture at ~955)",
+      "evidence": "attempts = '[{\"at\":\"2026-08-01T08:00:00Z\",\"channel\":\"email\",\"outcome\":\"delivered\",\"detail\":\"old_send_1\"}]'::jsonb with corrected_at = now() — if the run clock is before 2026-08-01T08:00Z, the typed gate classifies the send as post-correction and the row exhausts instead of standing down, hard-failing the test",
+      "detail": "The sibling same-day test uses now()-relative to_char (the robust pattern); this one is an absolute timestamp that goes stale/brittle under clock skew or CI replay of the commit. It passes today but is a time-bomb.",
+      "recommended_fix": "Convert the fixture to now()-relative (to_char(now() - interval 'X', ...)) like same_day_stale_bounce_stands_down_test.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind", "edge"],
+      "severity": "note",
+      "category": "client-state",
+      "title": "AppCompletedRefcheckExport toasts unconditionally — a clipboard result settling after navigation lands 'Attempt log copied' on an unrelated page (no route/call-presence guard)",
+      "location": "client/src/client.gleam:3519-3530",
+      "evidence": "AppCompletedRefcheckExport(_call_id, result) -> case result { Ok(_) -> add_toast(Model(..model, clipboard_copied: None), copy.refcheck_toast_exported, ToastSuccess) ... } — the call_id is bound but discarded; no route check (the r2 W3 fix guards only ApiReturnedRefcheckAction via refcheck_response_is_current)",
+      "detail": "The export click copies via a promise; if the landlord navigates before it settles, the success/failure toast fires on the new page — the same stale-toast class r2 W3 fixed for row actions, unguarded for the export leg.",
+      "recommended_fix": "Apply the same route guard (refcheck_response_is_current or a route-match check) before toasting in AppCompletedRefcheckExport.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "note",
+      "category": "dead-code",
+      "title": "Substitution's returned reference_call_id is decoded but never consumed — the Ok arm discards the String; the decoded value is dead plumbing",
+      "location": "client/src/api/reference_checks_api.gleam:action_result_decoder; client/src/client.gleam:3550-3560 (Ok(_) arm)",
+      "evidence": "action_result_decoder: 'use id <- decode.optional_field(\"reference_call_id\", None, decode.optional(decode.string)) decode.success(option.unwrap(id, \"\"))' — the client then matches 'Ok(_) ->' and never reads the String; the module comment says the refetch carries the real state",
+      "detail": "The decoder contract promises the substitution's new row id; the handler discards it. Harmless today (the detail refetch is authoritative) but the decode + comment are misleading plumbing.",
+      "recommended_fix": "Drop the decoder field (and the response key) or bind and use the id (e.g. for a targeted refetch); don't ship a promised value that's ignored.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "note",
+      "category": "test-quality",
+      "title": "no_em_dash_test checks the same character twice — '\\u{2014}' and '—' are both U+2014, so the second disjunct can never be the sole trigger",
+      "location": "client/test/copy_test.gleam:354-363",
+      "evidence": "case string.contains(s, \"\\u{2014}\") || string.contains(s, \"—\") { True -> panic as \"em-dash in toast/page copy\" ... } — the escape resolves at compile time; both operands are the identical string",
+      "detail": "The check reads as covering two forms but covers one. Harmless redundancy (the em-dash ban is enforced), but the second disjunct is dead weight.",
+      "recommended_fix": "Keep a single contains check with a comment naming U+2014.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["codebase"],
+      "severity": "note",
+      "category": "copy",
+      "title": "Correction surface renders the §8.3 sentence twice and the new heading/body deviate from the spec verbatim copy ('the applicant' / 'update the details here' vs §8.3's name + wording)",
+      "location": "client/src/components/reference_panel.gleam:932-985 (view_correction_surface); client/src/copy.gleam:843-847",
+      "evidence": "view_correction_surface renders copy.refcheck_state_awaiting_correction(name, app.first_name) — which already contains the full §7.4/§8.3 sentence 'We couldn't reach {name} at these details. Check with {first_name}, update them here, and we'll send the invitation again.' — AND when the form opens: refcheck_correction_heading ('We couldn't reach {name} at these details.') + refcheck_correction_body ('Check with the applicant, update the details here, and we'll send the invitation again.')",
+      "detail": "With the form open the landlord sees the §8.3 sentence, then a heading repeating its first half, then a paraphrased repeat ('the applicant' instead of the applicant's name; §8.3 wireframe says 'Check with Aisling, update them here, and we'll try again.'). Duplicate copy that also breaks the verbatim guard.",
+      "recommended_fix": "Drop the duplicated heading/body (the state line is already §8.3 verbatim) or align the body to the §8.3 wireframe wording with the applicant's name.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind", "architecture"],
+      "severity": "note",
+      "category": "substitution",
+      "title": "trio_matches_row compares the submitted NAME against the snapshot (contact_name) while email/phone compare against the effective (corrected ?? snapshot) — an inconsistent basis for the idempotent no-op detection",
+      "location": "server/src/reference_checks/actions_handler.gleam:703-721 (trio_matches_row / effective_value)",
+      "evidence": "trio_matches_row: 'trio.name == row.contact_name && trio.email == effective_value(row.corrected_email, row.contact_email) && trio.phone == effective_value(row.corrected_phone, row.contact_phone)' — vs trio_matches (line 690-698) which uses corrected_name ?? contact_name for the name",
+      "detail": "For a substituted successor that was later corrected, a re-submit with the corrected name compares against the pre-correction snapshot name — a mismatched basis between the two no-op detectors (SameReferee check vs idempotent re-submit check). Narrow (successor must have been corrected), but the two functions disagree about what 'same referee' means.",
+      "recommended_fix": "Use the same effective-name basis in trio_matches_row (COALESCE(NULLIF(corrected_name,''), contact_name)) as trio_matches does.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["acceptance"],
+      "severity": "note",
+      "category": "defensive",
+      "title": "One-cycle rule has no SQL backstop: mark_awaiting_correction's WHERE matches a corrected row (queued, cycles=1, not taken over) — the AD-7 cycle cap rests solely on the two Gleam call-site gates",
+      "location": "server/src/reference_checks/sql/mark_awaiting_correction.sql:17-20",
+      "evidence": "mark_awaiting_correction.sql: 'WHERE id = $1 AND status IN ('queued', 'contact_initiated') AND taken_over_at IS NULL' — no correction_cycles arm; both call sites gate in Gleam (webhooks.gleam:286, form_handler.gleam:1242)",
+      "detail": "The r2 blocker's parallel hole (failure path re-entering the loop) was fixed structurally in SQL (taken_over_at IS NULL); the AD-7 cycle cap has no SQL-level equivalent. A future/regressed call site calling mark_awaiting_correction on a corrected row would allow correction_cycles=2 — defense-in-depth note only (both current call sites gate).",
+      "recommended_fix": "Add AND correction_cycles = 0 to mark_awaiting_correction's WHERE (the exhaustion path already gates on cycles >= 1 at its call sites).",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests", "blind", "architecture"],
+      "severity": "note",
+      "category": "coverage-gate",
+      "title": "Advisory test gate: PASS (4 lenses) — all P0 guards pinned; remaining gaps are P3",
+      "location": "N/A",
+      "evidence": "tests.c1/c2/c3/c4 all emit 'Advisory test gate: PASS': the r2 blocker's taken-over stand-down, W1 same-day typed gate, W2 session-state clear, W5 identical-trio 400, W7 history-row 409, W8 route-guard drop, authz negatives, per-slot start, exhaustion on both routes, notification pins all have tests at 111e221",
+      "detail": "P0 100%, P1 ~100% (r2 W8 CONCERNS resolved — the coverage-gate advisory is now PASS across all four chunks). The notes above (client ?slot=, per-slot re-arm, resend-leg pin, client wiring pins) are the P3 residue.",
+      "recommended_fix": "Fold the four P3 gaps (client ?slot= test, per-slot re-arm pin, resend-leg effective pin, client dispatch wiring tests) into the next story's test pass.",
+      "verification": "confirmed"
+    }
+  ]
+}

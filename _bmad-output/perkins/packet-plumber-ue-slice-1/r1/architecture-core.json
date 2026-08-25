@@ -1,0 +1,42 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "determinism-spine",
+    "title": "StateHash routes through a fixed 4096-byte buffer and silently returns the FNV offset basis when the state outgrows it",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:246-251",
+    "evidence": "inline uint64_t StateHash(const FSimState &State)\n{\n\tstd::vector<uint8_t> Buffer(4096);\n\tconst size_t N = SerializeState(State, Buffer.data(), Buffer.size());\n\treturn Fnv1a64(Buffer.data(), N);\n}",
+    "detail": "Serialized size is 98 + 14/node + 19/pipe + 48/packet + 18/demand-entry + 19/log-entry; past 4096 SerializeState returns 0 and Fnv1a64(ptr,0) returns FNV64_OFFSET — all oversized states collapse to one constant hash, silently false-greening replay-equality (ODN-11).",
+    "recommended_fix": "Hash the byte vector SerializeState already builds internally (vector-returning overload or size-query first) instead of a fixed stack buffer; optionally assert N>0."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "EqualCostHops staleness guard checks only table shape, so querying after ApplyEdit with a grown topology indexes out of bounds",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Routing.h:260-270",
+    "evidence": "\tif (R.N == 0 || R.HopOffset.size() != static_cast<uint64_t>(R.N) * R.N)\n\t{\n\t\treturn false; // table not built / stale shape — no route\n\t}\n\tuint32_t Fs = 0, Ds = 0;\n\tif (!NodeSlot(T, FromNode, Fs) || !NodeSlot(T, DstNode, Ds))\n\t{\n\t\treturn false;\n\t}\n\tconst uint64_t Idx = static_cast<uint64_t>(Fs) * R.N + Ds;\n\tOutOffset = R.HopOffset[Idx];",
+    "detail": "The doc promises ok=false when the table is stale, but NodeSlot resolves against the current topology; in the documented ApplyEdit window (PP_Sim.h:38-39 'derived views rebuild at the next Step') a new node's slot >= R.N makes Idx overrun HopOffset — UB, not false.",
+    "recommended_fix": "Extend the guard to `R.N != T.NodeAlive.size()` (return false) so a table-vs-topology mismatch is rejected instead of read out of bounds."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "fail-silent",
+    "title": "StepScenario silently drops replay commands beyond 16 per tick",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Scenario.h:79-86",
+    "evidence": "\t\tFCommand Cmds[16];\n\t\tint32_t N = 0;\n\t\tfor (const FLoggedCommand &E : State.ActionLog)\n\t\t{\n\t\t\tif (E.ApplyTick == Tick && N < 16)\n\t\t\t{\n\t\t\t\tCmds[N++] = E.Cmd;\n\t\t\t}\n\t\t}",
+    "detail": "This shared replay-path runner feeds PPProbe and tests; a scenario with >16 same-tick entries silently drops the excess — a deterministic-but-wrong replay with no ReplayError latch, against the never-silent ODN-2 discipline.",
+    "recommended_fix": "Gather into a std::vector (or count first and assert), so an over-capacity tick fails loudly instead of truncating."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "consistency",
+    "title": "spine-check --json hardcodes topology/flow summary literals while the PPProbe writer computes them",
+    "location": "tests/spine_check.cpp:466-468",
+    "evidence": "\t\t\t\"\\\"topology_summary\\\":{\\\"nodes\\\":3,\\\"pipes\\\":2,\\\"gen\\\":%u},\"\n\t\t\t\"\\\"forwarding_summary\\\":{\\\"reachable_pairs\\\":%u,\\\"total_hops\\\":%u},\"\n\t\t\t\"\\\"flow_summary\\\":{\\\"spawned\\\":11,\\\"delivered\\\":%d,\\\"live\\\":%d,\\\"score\\\":%d}}\\n\",",
+    "detail": "SCHEMA.md declares all three golden writers derive from one schema, but PPProbeCommandlet.cpp prints PP::NodeCount/PipeCount/Demand.size() while the standalone pins 3/2/11 — scenario changes drift these keys until literals are hand-edited.",
+    "recommended_fix": "Print PP::NodeCount(State.Topology), PP::PipeCount(State.Topology), and State.Flow.Demand.size() in the standalone printf, matching the commandlet."
+  }
+]

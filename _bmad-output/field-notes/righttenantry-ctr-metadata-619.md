@@ -1,0 +1,5 @@
+# righttenantry-ctr-metadata-619
+
+- 2026-08-14: SEO metadata lives in `layout.page(title:, description:)` at the top of each SSR content view — the `| RightTenantry` suffix is auto-appended by `layout.gleam` (`html.title([], title <> " | RightTenantry")`), so views carry the string minus the suffix; description flows to both meta + og:description from one field. Pin the RENDERED html, not source strings.
+- 2026-08-14: Lustre (houdini, erlang target) escapes apostrophes to `&#39;` in BOTH text nodes and attributes, and renders attributes sorted by name (content precedes name/property) — metadata test pins must use `escape_for_html` + exact tag terminators (`</title>`, `content="…" name="description"`) or they silently no-op.
+- 2026-08-14: `rent_post.title` is a single field feeding `<title>`, H1, JSON-LD headline and og:title — changing the SEO title changes the visible H1 by design (field doc: "Full SEO title and H1"); rpz's `WebApplication` JSON-LD description mirrored the old meta description and needed the same-string sync (mirror rule generalizes beyond OG).

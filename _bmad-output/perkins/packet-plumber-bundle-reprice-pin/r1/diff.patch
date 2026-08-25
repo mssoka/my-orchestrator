@@ -1,0 +1,109 @@
+diff --git a/core/routing_cost_test.odin b/core/routing_cost_test.odin
+index ef422a7..f19ef3c 100644
+--- a/core/routing_cost_test.odin
++++ b/core/routing_cost_test.odin
+@@ -14,6 +14,9 @@ package core
+ //   (d) ODN-5 wiring: the cost ladder is READ FROM THE CATALOG — mutating
+ //       cat.pipe_tiers[].cost changes the routing outcome (a data change
+ //       moves behavior).
++//   (e) W1 (Perkins r1 on #37): the mixed-tier BUNDLE re-pricing branch — a
++//       fatter later member re-pricing a bundle edge to its MIN member cost —
++//       with the representative Hop.pipe staying the lowest-slot member.
+ //
+ // Geometry: a COMPACT diamond (res at (8,15), mids at (16,11)/(16,19), host at
+ // (24,15); every span 9 <= narrow max 10) so the narrow legs draw legally —
+@@ -202,3 +205,94 @@ test_cost_ladder_read_from_data :: proc(t: ^testing.T) {
+ 		"mutated ladder: the narrow path (cost 1) must win now — got %d want m2=%d",
+ 		s2.routing.hops[int(off2)].node, m22)
+ }
++
++@(test)
++test_cost_mixed_tier_bundle_min_member_pricing :: proc(t: ^testing.T) {
++	// W1 (Perkins r1 on #37, review 4932327768): the mixed-tier BUNDLE
++	// re-pricing branch — `else if c < min_cost[ns]` in routing_rebuild's
++	// pass 1 (routing.odin), a FATTER LATER member re-pricing the bundle edge
++	// — never executed in any test or demo (bundle.dem's parallel pipes are
++	// standard+standard, so min == representative cost everywhere). Perkins
++	// fuzz-verified the branch over 400 random graphs (0 mismatches); this
++	// pin makes it a durable regression gate.
++	//
++	// Geometry: res->m1 is a parallel narrow(20)+wide(5) bundle with the
++	// NARROW DRAWN FIRST (lower slot) — the later wide member must re-price
++	// the edge from 20 down to the min member cost 5. The m2 path is
++	// all-standard (10+10). Pins:
++	//   (a) the edge prices at the MIN member (5): res->host via m1 is 5+5=10
++	//       — UNIQUELY cheaper than 10+10=20 via m2. With first-seen (non-
++	//       re-priced) bundle cost the edge would price at narrow's 20 and
++	//       the route would FLIP to m2 (20+5=25 > 20) — the bite vector;
++	//   (b) the ECMP/next-hop reflects it: count == 1, hop node == m1 (both
++	//       directions);
++	//   (c) the representative Hop.pipe stays the LOWEST-SLOT member (the
++	//       first-drawn narrow pipe) — re-pricing the COST must never re-pick
++	//       the representative;
++	//   (d) the 2.1 pooled view of the mixed-tier bundle: 2 members, static
++	//       cap = member sum (5+40), render tier = highest member (wide).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	narrow, _ := pipe_tier_index(cat, "narrow")
++	std, _ := pipe_tier_index(cat, "standard")
++	wide, _ := pipe_tier_index(cat, "wide")
++	s, res, m1, m2, host := cost_diamond_setup(cat)
++	defer run_destroy(&s)
++	// the W1 branch: parallel narrow+wide between res and m1, NARROW FIRST
++	// (lower slot) so the later wide member must re-price the edge downward.
++	draw(&s, 1, res, m1, narrow)
++	draw(&s, 1, res, m1, wide)
++	draw(&s, 1, m1, host, wide)
++	draw(&s, 1, res, m2, std)
++	draw(&s, 1, m2, host, std)
++	step_n(&s, 1, cat)
++
++	// (a)+(b) forward: the re-priced bundle makes m1 the UNIQUE next hop.
++	off, count, ok := routing_equal_cost_hops(&s.routing, &s.topology, res, host)
++	testing.expectf(t, ok, "(res,host) must resolve")
++	testing.expectf(t, count == 1,
++		"the re-priced fat bundle must win UNIQUELY (count 1), got %d", count)
++	testing.expectf(t, s.routing.hops[int(off)].node == m1,
++		"next hop must be m1 (bundle priced at its min member: 5+5=10), got %d — the bundle edge was NOT re-priced",
++		s.routing.hops[int(off)].node)
++	// (b) reverse: host's unique next hop toward res is m1 too.
++	nh, _, oknh := routing_next_hop(&s.routing, &s.topology, host, res)
++	testing.expectf(t, oknh && nh == m1,
++		"host's next hop toward res must be m1 (re-priced bundle, 5+5=10), got ok=%v nh=%d", oknh, nh)
++
++	// (c) the representative pipe toward m1 stays the LOWEST-SLOT member —
++	// the first-drawn narrow pipe — even though the wide member re-priced the
++	// edge. Derive the lowest live slot of the res-m1 bundle, then pin the
++	// hop's pipe to it.
++	lo, hi := res, m1
++	if hi < lo { lo, hi = hi, lo } // canonical (min, max) pair key
++	bundle_slot, bfound := bundles_slot_for_pair(&s.bundles, lo, hi)
++	testing.expectf(t, bfound, "the parallel res-m1 pipes must pool into ONE bundle")
++	rep_slot := -1
++	for pi in 0..<len(s.topology.pipe_alive) {
++		if !s.topology.pipe_alive[pi] {
++			continue
++		}
++		if s.bundles.pipe_bundle[pi] == bundle_slot {
++			rep_slot = pi // first live slot in slot order = lowest-slot member
++			break
++		}
++	}
++	testing.expectf(t, rep_slot != -1, "the res-m1 bundle must have a live member")
++	testing.expectf(t, s.topology.pipe_tier[rep_slot] == narrow,
++		"the lowest-slot member is the FIRST-DRAWN narrow pipe, got tier %d want %d",
++		s.topology.pipe_tier[rep_slot], narrow)
++	testing.expectf(t, s.routing.hops[int(off)].pipe == s.topology.pipe_id[rep_slot],
++		"representative Hop.pipe must stay the LOWEST-SLOT member (pipe %d, tier narrow), got %d",
++		s.topology.pipe_id[rep_slot], s.routing.hops[int(off)].pipe)
++
++	// (d) the pooled view (2.1): both members pooled, static cap = member sum
++	// (narrow 5 + wide 40), render tier = highest member (wide).
++	testing.expectf(t, s.bundles.bundle_count[bundle_slot] == 2,
++		"mixed-tier bundle holds 2 members, got %d", s.bundles.bundle_count[bundle_slot])
++	testing.expectf(t, s.bundles.bundle_cap[bundle_slot] == u32(cat.pipe_tiers[narrow].capacity_units) + u32(cat.pipe_tiers[wide].capacity_units),
++		"bundle cap = member capacity sum (5+40), got %d", s.bundles.bundle_cap[bundle_slot])
++	testing.expectf(t, s.bundles.bundle_tier[bundle_slot] == wide,
++		"bundle render tier = highest member (wide), got %d", s.bundles.bundle_tier[bundle_slot])
++}

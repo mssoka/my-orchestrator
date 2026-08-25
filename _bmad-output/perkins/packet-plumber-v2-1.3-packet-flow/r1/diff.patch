@@ -1,0 +1,1815 @@
+diff --git a/app/main.odin b/app/main.odin
+index 23e9d5b..aa507ae 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -88,7 +88,7 @@ main :: proc() {
+ 		rl.BeginDrawing()
+ 		defer rl.EndDrawing()
+ 		rl.ClearBackground(app.palette.canvas)
+-		rnd.draw_world(&app.view, &app.state.topology, app.drag)
++		rnd.draw_world(&app.view, &app.state.topology, &app.state.flow, app.drag)
+ 		draw_hud(&app)
+ 	}
+ }
+@@ -184,9 +184,9 @@ node_pos :: proc(app: ^App, id: u32) -> [2]i32 {
+ draw_hud :: proc(app: ^App) {
+ 	p := app.palette
+ 	// title + instructions
+-	title := "Packet Plumber — v2 story 1.2"
++	title := "Packet Plumber — v2 story 1.3 (per-hop flow)"
+ 	draw_text(app, title, 12, 10, 22, p.ink)
+-	draw_text(app, "drag a node onto another node to draw a pipe (standard tier)", 12, 36, 16, p.ink_soft)
++	draw_text(app, "draw source->router->sink; the packet flows per-hop to the sink", 12, 36, 16, p.ink_soft)
+ 	// the cost readout on the drag ghost
+ 	if app.drag.active && app.drag_to != 0 {
+ 		cur := rnd.to_screen(&app.view, app.drag.wx, app.drag.wy)
+@@ -252,5 +252,9 @@ seed_fixture :: proc(state: ^pp.Run_State, cat: ^pp.Catalogs) -> (u32, u32, u32)
+ 	r := pp.topology_spawn_node(&state.topology, res_idx, {8, 15}, cat)
+ 	g := pp.topology_spawn_node(&state.topology, rt_idx, {20, 15}, cat)
+ 	h := pp.topology_spawn_node(&state.topology, host_idx, {32, 15}, cat)
++	// 1.3 trivial demand: one packet, residential -> content_host, spawned at
++	// tick 1. It waits at the source until the player draws source->router->sink,
++	// then flows per-hop to the sink (the playable loop this story adds).
++	pp.flow_seed_demand(&state.flow, 1, r, h)
+ 	return r, g, h
+ }
+diff --git a/app/render/palette.odin b/app/render/palette.odin
+index 7fe0e40..7171ff5 100644
+--- a/app/render/palette.odin
++++ b/app/render/palette.odin
+@@ -24,7 +24,9 @@ Palette :: struct {
+ 	pipe_steel:   rl.Color,
+ 	pipe_fiber:   rl.Color,
+ 	pipe_unalloc: rl.Color,
+-	ghost_ok:     rl.Color,
++	packet_dot:  rl.Color,
++	packet_dark: rl.Color,
++	ghost_ok:    rl.Color,
+ 	ghost_bad:    rl.Color,
+ }
+ 
+@@ -67,6 +69,8 @@ palette_load :: proc(source: []byte = DEFAULT_PALETTE_JSON) -> Palette {
+ 	p.pipe_steel = jcol(obj, "pipe_steel", {120, 128, 140, 255})
+ 	p.pipe_fiber = jcol(obj, "pipe_fiber", {46, 84, 148, 255})
+ 	p.pipe_unalloc = jcol(obj, "pipe_unalloc", {58, 74, 92, 255})
++	p.packet_dot = jcol(obj, "packet_dot", {64, 140, 220, 255})
++	p.packet_dark = jcol(obj, "packet_dark", {28, 70, 120, 255})
+ 	p.ghost_ok = jcol(obj, "ghost_ok", {120, 128, 140, 200})
+ 	p.ghost_bad = jcol(obj, "ghost_bad", {232, 69, 69, 200})
+ 	return p
+@@ -90,6 +94,8 @@ fallback_palette :: proc() -> Palette {
+ 	p.pipe_steel = {120, 128, 140, 255}
+ 	p.pipe_fiber = {46, 84, 148, 255}
+ 	p.pipe_unalloc = {58, 74, 92, 255}
++	p.packet_dot = {64, 140, 220, 255}
++	p.packet_dark = {28, 70, 120, 255}
+ 	p.ghost_ok = {120, 128, 140, 200}
+ 	p.ghost_bad = {232, 69, 69, 200}
+ 	return p
+diff --git a/app/render/view.odin b/app/render/view.odin
+index 1837d66..02f728c 100644
+--- a/app/render/view.odin
++++ b/app/render/view.odin
+@@ -68,12 +68,14 @@ node_screen :: proc(v: ^View, pos: [2]i32) -> rl.Vector2 {
+ 	return to_screen(v, f32(pos[0]) * v.tile_px, f32(pos[1]) * v.tile_px)
+ }
+ 
+-// --- the world pass ----------------------------------------------------------
+-
+-draw_world :: proc(v: ^View, topo: ^pp.Topology, drag: Drag_State) {
++// draw_world :: the world pass: map -> pipes -> nodes -> packets -> drag
++// ghost. Packets draw ON TOP of pipes + nodes so mid-traversal dots are visible.
++// The view reads ONLY the topology + flow (ODN-1: never perturbs sim state).
++draw_world :: proc(v: ^View, topo: ^pp.Topology, flow: ^pp.Flow_State, drag: Drag_State) {
+ 	map_draw(v)
+ 	draw_pipes(v, topo)
+ 	draw_nodes(v, topo)
++	draw_packets(v, topo, flow)
+ 	if drag.active {
+ 		draw_ghost(v, topo, drag)
+ 	}
+@@ -202,6 +204,61 @@ draw_router :: proc(v: ^View, id: u32, c: rl.Vector2) {
+ 	}
+ }
+ 
++// draw_packets — the packet dots (1.3 render pass 5). Each in-flight packet
++// is drawn at a lerped position: on-edge packets sit `progress` of the way
++// along their current pipe (departure node -> heading); at-node packets sit on
++// the node. Pure read of the flow snapshot + topology (ODN-1). The along-edge
++// fraction IS the lerp the story spec calls for ("lerped positions between
++// snapshots" — between the pipe's two endpoint nodes).
++draw_packets :: proc(v: ^View, topo: ^pp.Topology, flow: ^pp.Flow_State) {
++	bandwidth := u32(v.catalogs.balance.packet_bandwidth)
++	for i in 0..<len(flow.packets) {
++		p := &flow.packets[i]
++		if p.delivered {
++			continue
++		}
++		pos: rl.Vector2
++		if p.on_edge {
++			ps, ok := pp.pipe_slot(topo, p.edge)
++			if !ok {
++				continue
++			}
++			a_id := topo.pipe_a[ps]
++			b_id := topo.pipe_b[ps]
++			// departure = the endpoint that ISN'T `heading`; arrive = heading
++			depart_id, arrive_id: u32
++			if a_id == p.heading {
++				depart_id, arrive_id = b_id, a_id
++			} else if b_id == p.heading {
++				depart_id, arrive_id = a_id, b_id
++			} else {
++				continue // defensive: heading isn't an endpoint (shouldn't happen)
++			}
++			ds, dok := pp.node_slot(topo, depart_id)
++			as_, aok := pp.node_slot(topo, arrive_id)
++			if !dok || !aok {
++				continue
++			}
++			depart := node_screen(v, topo.node_pos[ds])
++			arrive := node_screen(v, topo.node_pos[as_])
++			frac := f32(pp.packet_progress_frac(p, bandwidth)) / 256.0
++			pos = {
++				depart.x + (arrive.x - depart.x) * frac,
++				depart.y + (arrive.y - depart.y) * frac,
++			}
++		} else {
++			ns, ok := pp.node_slot(topo, p.at_node)
++			if !ok {
++				continue
++			}
++			pos = node_screen(v, topo.node_pos[ns])
++		}
++		r := v.tile_px * v.scale * 0.24
++		rl.DrawCircleV(pos, r, v.palette.packet_dark)    // outline (readable on any pipe)
++		rl.DrawCircleV(pos, r * 0.78, v.palette.packet_dot) // body
++	}
++}
++
+ // draw_ghost — the drag preview: a line from the source node to the cursor,
+ // green when the in-progress draw would validate, red when it would reject.
+ draw_ghost :: proc(v: ^View, topo: ^pp.Topology, drag: Drag_State) {
+diff --git a/core/catalog.odin b/core/catalog.odin
+index 326360f..0778845 100644
+--- a/core/catalog.odin
++++ b/core/catalog.odin
+@@ -44,12 +44,13 @@ Pipe_Tier :: struct {
+ }
+ 
+ Balance :: struct {
+-	logic_hz:    i32,
+-	max_ticks:   i32,
+-	snap_radius: i32, // inclusive node-snap radius in world px (E4)
+-	map_w_tiles: i32,
+-	map_h_tiles: i32,
+-	tile_px:     i32,
++	logic_hz:        i32,
++	max_ticks:       i32,
++	snap_radius:     i32, // inclusive node-snap radius in world px (E4)
++	map_w_tiles:     i32,
++	map_h_tiles:     i32,
++	tile_px:         i32,
++	packet_bandwidth: i32, // 1.3: bandwidth units a packet needs to cross one edge (transit = ceil(this / pipe.capacity))
+ }
+ 
+ Catalogs :: struct {
+@@ -161,6 +162,10 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 		if b.snap_radius <= 0 {
+ 			return {"balance.json", "snap_radius", "must be > 0"}
+ 		}
++		b.packet_bandwidth = jint(obj, "packet_bandwidth", 30)
++		if b.packet_bandwidth <= 0 {
++			return {"balance.json", "packet_bandwidth", "must be > 0 (the per-edge packet service demand)"}
++		}
+ 		if mp, okm := obj["map"].(json.Object); okm {
+ 			b.map_w_tiles = jint(mp, "w_tiles", 0)
+ 			b.map_h_tiles = jint(mp, "h_tiles", 0)
+diff --git a/core/determinism_test.odin b/core/determinism_test.odin
+index cb05566..4d22081 100644
+--- a/core/determinism_test.odin
++++ b/core/determinism_test.odin
+@@ -37,7 +37,7 @@ test_catalog :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalog
+ 	append(&cat.pipe_tiers, Pipe_Tier{id = "narrow", display = "Narrow Copper", capacity_units = 5, clean_span = 8, max_span = 10, cost_per_tile = 5, era_introduced = 1})
+ 	append(&cat.pipe_tiers, Pipe_Tier{id = "standard", display = "Standard Line", capacity_units = 15, clean_span = 10, max_span = 14, cost_per_tile = 12, era_introduced = 1})
+ 	append(&cat.pipe_tiers, Pipe_Tier{id = "wide", display = "Wide Fiber", capacity_units = 40, clean_span = 14, max_span = 18, cost_per_tile = 30, era_introduced = 3})
+-	cat.balance = Balance{logic_hz = TEST_LOGIC_HZ, max_ticks = 100000, snap_radius = 36, map_w_tiles = 40, map_h_tiles = 30, tile_px = 26}
++	cat.balance = Balance{logic_hz = TEST_LOGIC_HZ, max_ticks = 100000, snap_radius = 36, map_w_tiles = 40, map_h_tiles = 30, tile_px = 26, packet_bandwidth = 30}
+ 	return cat
+ }
+ 
+@@ -119,11 +119,14 @@ test_replay_byte_identical :: proc(t: ^testing.T) {
+ 	live_hashes := record_run(&live, 300, cat)
+ 	defer delete(live_hashes)
+ 
+-	// sanity: the keystone must be command-built + the rng heartbeat must
+-	// actually advance state (a vacuous keystone would pass while broken)
++	// sanity: the keystone must be command-built + the per-tick state must
++	// actually advance (a vacuous keystone would pass while broken). The hash
++	// varies tick-to-clock via the serialized tick field + any topology/flow
++	// state change (1.3: the rng is seeded but not advanced — ECMP/demand draws
++	// return in slice 2/3).
+ 	testing.expectf(t, pipe_count(&live.topology) == 2, "keystone must draw 2 pipes, got %d", pipe_count(&live.topology))
+ 	testing.expectf(t, len(live_hashes) == 300, "expected 300 hashes, got %d", len(live_hashes))
+-	testing.expect(t, live_hashes[0] != live_hashes[1], "per-tick hashes must vary (rng heartbeat)")
++	testing.expect(t, live_hashes[0] != live_hashes[1], "per-tick hashes must vary (tick field + state)")
+ 	testing.expect(t, !live.replay_error, "live run must not latch replay_error")
+ 
+ 	// replay: fresh run, same seed, the SAME action-log artifact (ODN-11)
+diff --git a/core/flow.odin b/core/flow.odin
+new file mode 100644
+index 0000000..be9ab96
+--- /dev/null
++++ b/core/flow.odin
+@@ -0,0 +1,195 @@
++package core
++
++// flow.odin — S2 Packet-Flow Simulation, trivial 1.3 form (architecture §6.2):
++// a packet spawns from a trivial hardcoded demand, advances by bandwidth-units
++// per tick along the drawn graph, and delivers at the sink. The forwarding is
++// PER-HOP (routing.odin): the packet carries NO cached route — at each node it
++// reaches it consults the fresh forwarding table for the next hop. This is the
++// locked routing model in its single-path form (no ECMP/bundles yet, no BFS
++// route cache, no LB — those are slice 2).
++//
++// 1.3 scope (per the story card): ONE packet, ONE path (source -> router ->
++// sink), spawned from a trivial hardcoded demand. No QoS lanes (slice 3), no
++// SLA (slice 3), no demand director / weighted picks (slice 3), no ECMP (slice
++// 2), no bundles (slice 2). The packet's in-flight state rides the T1 hash ->
++// replay-equality over the flow (E10). The flow-sim mechanics (progress vs
++// bandwidth-units, a cosmetic position along the current edge) are mined from
++// the prototype's flow.odin DESIGN; the prototype's BFS routing is NOT ported.
++//
++// Integer-only (ODN-10); arrays only (no map iteration — ODN-10); no file/clock
++// reads (ODN-1).
++
++// Packet — in-flight packet state. NO route[] field (per-hop forwarding). The
++// packet's location is either ON an edge (on_edge = true; `edge` is the pipe
++// being traversed, `heading` its far endpoint) or AT a node (on_edge = false;
++// `at_node` is where it sits, ready to forward). Node/pipe ids are 0-based, so
++// an explicit `on_edge` flag carries the on-edge/at-node distinction (0 is a
++// valid id, not a sentinel). progress_units accumulates the pipe's bandwidth
++// service; when it reaches the packet's bandwidth demand the packet arrives at
++// `heading` and (if not dst) forwards again from there next tick.
++Packet :: struct {
++	id:             u64,
++	src, dst:       u32, // node ids
++	on_edge:        bool, // true = traversing `edge` toward `heading`; false = resident at `at_node`
++	at_node:        u32, // the node the packet sits at (valid when !on_edge)
++	edge:           u32, // pipe id being traversed (valid when on_edge)
++	heading:        u32, // far-endpoint node id of `edge` (valid when on_edge)
++	progress_units: u32, // bandwidth units served on the current edge
++	spawn_tick:     u64,
++	delivered:      bool,
++}
++
++// Spawn_Req — a trivial hardcoded demand entry (1.3: run setup, like the
++// fixture; NOT part of the action log). The flow spawns a packet at `tick`
++// from `src` to `dst`. The pressure-plan director (weighted src/dst picks)
++// lands in slice 3; 1.3 carries one trivial entry.
++Spawn_Req :: struct {
++	tick: u64,
++	src:  u32,
++	dst:  u32,
++}
++
++Flow_State :: struct {
++	packets:        [dynamic]Packet,
++	demand:         [dynamic]Spawn_Req,
++	next_packet_id: u64,
++}
++
++flow_init :: proc(f: ^Flow_State, allocator := context.allocator) {
++	f^ = {}
++	f.packets = make([dynamic]Packet, 0, 16, allocator)
++	f.demand = make([dynamic]Spawn_Req, 0, 4, allocator)
++}
++
++flow_destroy :: proc(f: ^Flow_State) {
++	delete(f.packets)
++	delete(f.demand)
++}
++
++// flow_seed_demand — append a trivial demand entry (run setup; the harness
++// lowers a demo's spawn intents, the app hardcodes one). Re-created identically
++// on every replay (NOT in the action log — like the fixture + seed).
++flow_seed_demand :: proc(f: ^Flow_State, tick: u64, src, dst: u32) {
++	append(&f.demand, Spawn_Req{tick = tick, src = src, dst = dst})
++}
++
++// flow_step — the deterministic tick: spawn from demand, then advance every
++// in-flight packet one step of progress. PER-HOP forwarding: a packet AT a node
++// consults the routing table for its next hop (no cached route — E29). A packet
++// ON an edge consumes the pipe's capacity; when its bandwidth demand is met it
++// arrives at the far endpoint. Delivery at dst fires a Packet_Arrived event.
++//
++// One hop of progress per tick: a packet at a node forwards onto its next edge
++// (starts traversing) but does NOT also consume bandwidth that tick; a packet
++// on an edge consumes bandwidth and, on completion, arrives (forwards again
++// next tick). This keeps the motion readable (one edge-segment of progress per
++// tick) and the determinism coarse (the per-tick state delta is one step).
++flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
++	f := &state.flow
++	bandwidth := u32(cat.balance.packet_bandwidth)
++
++	// 1. SPAWN from this tick's demand. (1.3: trivial — one packet per req.)
++	for req in f.demand {
++		if req.tick != tick {
++			continue
++		}
++		f.next_packet_id += 1
++		append(&f.packets, Packet{
++			id = f.next_packet_id,
++			src = req.src,
++			dst = req.dst,
++			on_edge = false,
++			at_node = req.src, // resident at the source, ready to forward
++			spawn_tick = tick,
++		})
++	}
++
++	// 2. ADVANCE in-flight packets one step (per-hop). Iterate by index (we
++	// mutate fields; no array structural change in this loop — the cull is a
++	// separate compaction pass below).
++	for i in 0..<len(f.packets) {
++		p := &f.packets[i]
++		if p.delivered {
++			continue
++		}
++		if p.on_edge {
++			// ON AN EDGE — consume bandwidth toward `heading`.
++			ps, ok := pipe_slot(&state.topology, p.edge)
++			if !ok {
++				// The current pipe vanished mid-traversal (a demolish under the
++				// packet — slice 2.3's severance scenario). Under per-hop
++				// forwarding the packet re-forwards from the node it just left;
++				// 1.3 has no demolish so this is defensive. Drop back to the
++				// departure side of the lost edge + re-forward next tick.
++				p.on_edge = false
++				p.at_node = p.src
++				p.progress_units = 0
++				continue
++			}
++			cap := u32(cat.pipe_tiers[state.topology.pipe_tier[ps]].capacity_units)
++			advance_step := cap
++			if advance_step == 0 {
++				advance_step = 1 // defensive: a zero-capacity tier still creeps
++			}
++			p.progress_units += advance_step
++			if p.progress_units >= bandwidth {
++				// arrived at the far endpoint
++				p.at_node = p.heading
++				p.on_edge = false
++				p.progress_units = 0
++				if p.at_node == p.dst {
++					p.delivered = true
++					event_emit(state, tick, EVENT_TAG_PACKET_ARRIVED)
++				}
++			}
++		} else {
++			// AT A NODE — forward via the table (THE per-hop decision).
++			if p.at_node == p.dst {
++				// spawned at its own dst (degenerate); count as delivered
++				p.delivered = true
++				event_emit(state, tick, EVENT_TAG_PACKET_ARRIVED)
++				continue
++			}
++			next, pipe, ok := routing_next_hop(&state.routing, &state.topology, p.at_node, p.dst)
++			if !ok {
++				continue // no route yet (incomplete graph) — wait here; re-tries
++				         // next tick once a topology change rebuilds the table
++			}
++			p.on_edge = true
++			p.edge = pipe
++			p.heading = next
++			p.progress_units = 0
++		}
++	}
++
++	// 3. CULL delivered packets (insertion order preserved — determinism). The
++	// delivery itself is captured in the hash via the Packet_Arrived event
++	// (serialized in the tick's event stream); the in-flight set is what the
++	// hash carries forward.
++	survivors := make([dynamic]Packet, 0, len(f.packets), context.temp_allocator)
++	for p in f.packets {
++		if !p.delivered {
++			append(&survivors, p)
++		}
++	}
++	clear(&f.packets)
++	for p in survivors {
++		append(&f.packets, p)
++	}
++	delete(survivors)
++}
++
++// packet_progress_frac — the cosmetic along-edge fraction in Q8 (0..256) for
++// the render: 0 at the departure node, 256 at `heading`. Pure function of the
++// packet's edge state + the catalog bandwidth (the view reads this; ODN-1).
++// At-node packets return 0 (the render places them at `at_node`).
++packet_progress_frac :: proc(p: ^Packet, bandwidth: u32) -> u32 {
++	if !p.on_edge || bandwidth == 0 {
++		return 0
++	}
++	frac := (u64(p.progress_units) * 256 + u64(bandwidth)/2) / u64(bandwidth) // rounded
++	if frac > 256 {
++		frac = 256
++	}
++	return u32(frac)
++}
+diff --git a/core/flow_test.odin b/core/flow_test.odin
+new file mode 100644
+index 0000000..01480ab
+--- /dev/null
++++ b/core/flow_test.odin
+@@ -0,0 +1,221 @@
++package core
++
++// flow_test.odin — the Story 1.3 contracts as durable tests (arch §11.7): the
++// per-hop forwarding model (no cached route), the forwarding-table rebuild on
++// topology change (4-rule spine rule 1 — the story's named Golden), the E29
++// no-stale-route property, replay-equality over the flow (E10), and the trivial
++// unroutable-waits handling. Pinned at the lowest layer so they survive review
++// rounds, refactors, and Perkins.
++//
++// Scope note (surfaced in the PR): the FULL E29 — a demolish that severs the
++// path mid-traversal + a re-forward at the next junction — needs the demolish
++// command, which is Story 2.3. 1.3 delivers the MODEL that makes E29 automatic
++// (no cached route -> a topology change propagates via a table rebuild at the
++// next sync); these tests pin that model. The Packet struct has NO route field
++// by construction — the per-hop decision is structural, not a convention.
++
++import "core:testing"
++
++// flow_setup — a fresh run with the 1.2 fixture seeded (res/rt/host). The
++// caller draws pipes + seeds demand for the scenario.
++flow_setup :: proc(cat: ^Catalogs) -> (Run_State, u32, u32, u32) {
++	s: Run_State
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&s, cat)
++	return s, res, rt, host
++}
++
++// step_n — step `n` more ticks starting from the run's current tick (continues
++// a run; does NOT restart at tick 1 — a second call picks up where the first
++// left off, so a demand entry at tick 1 is not re-spawned). Applies logged
++// commands per the replay convention (apply all log entries for tick N before
++// stepping N). Mirrors record_run without the per-tick hashing.
++step_n :: proc(s: ^Run_State, n: u64, cat: ^Catalogs) {
++	start := s.tick + 1
++	for tick in start ..< start + n {
++		batch := make([dynamic]Command, 0, 4, context.temp_allocator)
++		for cmd in s.action_log {
++			if cmd.apply_tick == tick {
++				append(&batch, cmd)
++			}
++		}
++		step(s, tick, batch[:], cat)
++		free_all(context.temp_allocator)
++	}
++}
++
++// draw — log a Draw_Pipe command at apply_tick (applied by step_n at that tick).
++draw :: proc(s: ^Run_State, apply_tick: u64, a, b: u32, tier_idx: u16) {
++	append(&s.action_log, Command{apply_tick = apply_tick, kind = Cmd_Draw_Pipe{a = a, b = b, tier = tier_idx}})
++}
++
++count_arrived :: proc(s: ^Run_State) -> int {
++	n := 0
++	for e in s.events {
++		if e.tag == EVENT_TAG_PACKET_ARRIVED {
++			n += 1
++		}
++	}
++	return n
++}
++
++@(test)
++test_per_hop_forwarding_source_to_sink :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, host := flow_setup(cat)
++	defer run_destroy(&s)
++	std, _ := pipe_tier_index(cat, "standard")
++	// draw both pipes at tick 1 (res->rt, rt->host); spawn res->host at tick 1
++	draw(&s, 1, res, rt, std)
++	draw(&s, 1, rt, host, std)
++	flow_seed_demand(&s.flow, 1, res, host)
++	step_n(&s, 10, cat)
++
++	// delivered: exactly one Packet_Arrived event, no in-flight packets left
++	testing.expectf(t, count_arrived(&s) == 1, "one packet -> one Packet_Arrived, got %d", count_arrived(&s))
++	testing.expectf(t, len(s.flow.packets) == 0, "delivered packet is culled; got %d in-flight", len(s.flow.packets))
++
++	// the packet travelled THROUGH the router (the only path: terminals connect
++	// via routers, E26). The per-hop decision at the router points to the sink.
++	next, _, ok := routing_next_hop(&s.routing, &s.topology, rt, host)
++	testing.expect(t, ok, "router must have a route to the sink")
++	testing.expectf(t, next == host, "router's next hop toward the sink is the sink, got %d", next)
++	// and the source's next hop toward the sink is the router (the first hop)
++	snext, _, sok := routing_next_hop(&s.routing, &s.topology, res, host)
++	testing.expect(t, sok, "source must have a route to the sink")
++	testing.expectf(t, snext == rt, "source's first hop toward the sink is the router, got %d", snext)
++}
++
++@(test)
++test_forwarding_table_rebuild_on_topology_change :: proc(t: ^testing.T) {
++	// THE story Golden: the forwarding table is rebuilt only on a
++	// topology-changing Command, synchronously inside the tick (rule 1). A pipe
++	// added between ticks MUST appear in the table after the next step.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, host := flow_setup(cat)
++	defer run_destroy(&s)
++	std, _ := pipe_tier_index(cat, "standard")
++	draw(&s, 1, res, rt, std) // only res->rt at first
++	step_n(&s, 1, cat)
++	// with only res->rt drawn, the router has NO route to the sink
++	testing.expect(t, !routing_has_path(&s.routing, &s.topology, rt, host),
++		"before rt->host is drawn, the router cannot reach the sink")
++	// add rt->host (a topology-changing Command) + step -> table rebuilds
++	draw(&s, 2, rt, host, std)
++	step_n(&s, 2, cat)
++	testing.expect(t, routing_has_path(&s.routing, &s.topology, rt, host),
++		"after rt->host is drawn + stepped, the router CAN reach the sink (rule-1 rebuild)")
++}
++
++@(test)
++test_no_cached_route_reforwards_after_rebuild :: proc(t: ^testing.T) {
++	// E29 (1.3 form): under per-hop forwarding there are NO stale spawn-time
++	// routes. A packet spawned when only res->rt exists is unroutable to the
++	// sink (the router can't reach it) -> it waits. The moment rt->host is
++	// drawn the table rebuilds and the packet forwards via the FRESH table +
++	// delivers. A spawn-time-cached route would have stayed "unroutable"
++	// forever; the per-hop model re-evaluates at every step.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, host := flow_setup(cat)
++	defer run_destroy(&s)
++	std, _ := pipe_tier_index(cat, "standard")
++	draw(&s, 1, res, rt, std) // only res->rt at spawn time
++	flow_seed_demand(&s.flow, 1, res, host)
++	step_n(&s, 10, cat)
++	// no delivery yet (host unreachable from res: res->rt exists, but rt->host
++	// does not, so the BFS from res never reaches host)
++	testing.expectf(t, count_arrived(&s) == 0, "no delivery before the sink link exists, got %d", count_arrived(&s))
++	waiting := false
++	for p in s.flow.packets {
++		if p.at_node == res {
++			waiting = true
++		}
++	}
++	testing.expect(t, waiting, "the unroutable packet waits at its source (no stale route + no phantom)")
++	// now draw rt->host + step -> the table rebuilds; the waiting packet
++	// forwards via the FRESH table (res->rt->host) and delivers
++	draw(&s, 11, rt, host, std)
++	step_n(&s, 20, cat)
++	testing.expectf(t, count_arrived(&s) == 1, "the packet forwards + delivers after the rebuild, got %d", count_arrived(&s))
++}
++
++@(test)
++test_flow_replay_byte_identical :: proc(t: ^testing.T) {
++	// E10 over the flow: the packet's path rides the T1 hash. Re-step (seed,
++	// action_log, demand) twice -> byte-identical hash sequence. The demand is
++	// run-setup (re-created identically); the in-flight packets are the state.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	live: Run_State
++	defer run_destroy(&live)
++	run_init(&live, 7, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&live, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	draw(&live, 1, res, rt, std)
++	draw(&live, 1, rt, host, std)
++	flow_seed_demand(&live.flow, 1, res, host)
++	live_hashes := record_run(&live, 20, cat)
++	defer delete(live_hashes)
++
++	// sanity: the flow actually moved state (hashes vary during traversal)
++	testing.expectf(t, len(live_hashes) == 20, "20 ticks recorded, got %d", len(live_hashes))
++	vary := false
++	for i in 1..<len(live_hashes) {
++		if live_hashes[i] != live_hashes[i-1] {
++			vary = true
++		}
++	}
++	testing.expect(t, vary, "the flow must drive per-tick hash variation (packet motion)")
++	testing.expect(t, !live.replay_error, "live run must not latch replay_error")
++
++	// replay: fresh run, same seed, SAME action log + SAME demand shape
++	replayed: Run_State
++	defer run_destroy(&replayed)
++	run_init(&replayed, 7, cat.hash, TEST_LOGIC_HZ)
++	test_seed_fixture(&replayed, cat)
++	delete(replayed.action_log)
++	replayed.action_log = clone_log(live.action_log)
++	flow_seed_demand(&replayed.flow, 1, res, host) // identical demand (run setup)
++	replay_hashes := record_run(&replayed, 20, cat)
++	defer delete(replay_hashes)
++	testing.expect(t, !replayed.replay_error, "replay must not latch replay_error")
++	testing.expectf(t, len(live_hashes) == len(replay_hashes), "tick count mismatch")
++	diverged := false
++	for i in 0..<len(live_hashes) {
++		if live_hashes[i] != replay_hashes[i] {
++			diverged = true
++		}
++	}
++	testing.expectf(t, !diverged, "REPLAY DIVERGENCE: the packet's path differs")
++}
++
++@(test)
++test_unroutable_packet_waits_then_flows :: proc(t: ^testing.T) {
++	// 1.3 trivial E28 handling: a packet spawned with no path waits at its
++	// source (the slice-3 SLA-undelivered accrual is [LATER]). Once a path is
++	// drawn, it flows + delivers. No phantom packets park at sources.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, host := flow_setup(cat)
++	defer run_destroy(&s)
++	std, _ := pipe_tier_index(cat, "standard")
++	flow_seed_demand(&s.flow, 1, res, host)
++	step_n(&s, 5, cat) // no pipes at all
++	testing.expectf(t, count_arrived(&s) == 0, "no delivery with no graph, got %d", count_arrived(&s))
++	testing.expectf(t, len(s.flow.packets) == 1, "the packet exists (waiting), got %d", len(s.flow.packets))
++	testing.expect(t, s.flow.packets[0].at_node == res, "the packet waits at its source")
++	// connect the graph -> it flows + delivers
++	draw(&s, 6, res, rt, std)
++	draw(&s, 6, rt, host, std)
++	step_n(&s, 20, cat)
++	testing.expectf(t, count_arrived(&s) == 1, "delivered once the graph connects, got %d", count_arrived(&s))
++}
+diff --git a/core/routing.odin b/core/routing.odin
+new file mode 100644
+index 0000000..a7deda4
+--- /dev/null
++++ b/core/routing.odin
+@@ -0,0 +1,174 @@
++package core
++
++// routing.odin — the per-hop forwarding table (architecture §6.2, the locked
++// routing model — canon #18 / routing ruling, lavish 2026-08-10). Each node
++// holds a forwarding entry (node, dst) -> next hop (node + pipe), computed by
++// a deterministic BFS (insertion-order tie-breaks — NO rng in routing for the
++// single-path 1.3 form; ECMP's splitmix64 hash lands in slice 2). The table is
++// REBUILT ONLY WHEN THE TOPOLOGY CHANGES, SYNCHRONOUSLY INSIDE THE TICK (4-rule
++// spine rule 1, ODN-10) — never per-packet, never async. A packet carries NO
++// cached route; at each node it reaches it consults the fresh table — so a
++// topology change propagates at the next junction (E29: automatic migration).
++//
++// The prototype's compute_route BFS + cached packet.route[] is explicitly NOT
++// the model — do not port it. The BFS HERE builds the FORWARDING TABLE (next
++// hop per dst), not a per-packet route; the per-packet pick is a table lookup.
++//
++// Determinism: array-only (no map iteration — ODN-10); insertion-order
++// tie-breaks (stable across targets); integer-only. The table is DERIVED from
++// the Topology (a pure function of it) — so it is NOT serialized into the T1
++// hash (the Topology IS serialized; hashing derived state would bind replay to
++// the table-build algorithm, which is an implementation detail).
++
++Routing_Table :: struct {
++	// flat [from_slot * n + dst_slot] arrays. 0 = no route (node ids are
++	// monotonic from 0, so 0 is never a live next-hop — wait: node id 0 IS
++	// live (the first spawned node). We disambiguate with a separate `ok`
++	// check via the pipe field: pipe ids start at 0 too. So instead, `n`
++	// itself bounds validity and an entry is "no route" when BOTH next==0 AND
++	// pipe==0 — but id 0 is a real node/pipe. We resolve this by storing
++	// entries slot-indexed and treating an unvisited (dst) as next==0/pipe==0
++	// ONLY when the BFS never reached it; since the first node/pipe IS id 0,
++	// we use a +1 offset on stored ids (0 = none, real id v stored as v+1).
++	next: [dynamic]u32, // next-hop NODE id + 1 (0 = no route); indexed [from*n + dst]
++	pipe: [dynamic]u32, // pipe id + 1 toward next hop (0 = no route)
++	n:    u32,          // node slot count the table was built for (== len(node_alive))
++}
++
++routing_make :: proc(r: ^Routing_Table, allocator := context.allocator) {
++	r^ = {}
++	r.next = make([dynamic]u32, 0, 16, allocator)
++	r.pipe = make([dynamic]u32, 0, 16, allocator)
++}
++
++routing_destroy :: proc(r: ^Routing_Table) {
++	delete(r.next)
++	delete(r.pipe)
++}
++
++// routing_rebuild — recompute every node's forwarding entries from the current
++// Topology via BFS (insertion-order tie-breaks). Called by step ONLY when the
++// topology changed (Topology.gen moved — 4-rule spine rule 1). Pure w.r.t. the
++// Topology: identical Topology -> identical table on every target (ODN-10).
++//
++// BFS first-hop propagation: when a node is visited, it inherits the first hop
++// of its BFS predecessor (the neighbor of the source that leads to it). The
++// source's direct neighbors ARE their own first hop. This yields, for every
++// (src, dst), the first edge on a shortest path — exactly what a packet needs
++// to forward one hop toward dst. Ties (equal hop count via different
++// predecessors) resolve to insertion order: the first pipe to reach a node
++// wins (visited-guard), so the table is stable across runs.
++routing_rebuild :: proc(r: ^Routing_Table, t: ^Topology, allocator := context.allocator) {
++	context.allocator = allocator
++	n := u32(len(t.node_alive))
++	need := int(n) * int(n)
++	if n == 0 {
++		clear(&r.next)
++		clear(&r.pipe)
++		r.n = 0
++		return
++	}
++	if len(r.next) != need {
++		resize(&r.next, need)
++		resize(&r.pipe, need)
++	}
++	r.n = n
++	// default: no route (0 — the +1 id scheme makes 0 unambiguously "none")
++	for i in 0..<need {
++		r.next[i] = 0
++		r.pipe[i] = 0
++	}
++
++	// BFS scratch (temp — rebuilds are rare: only on a topology-changing
++	// Command, so the per-rebuild temp churn is negligible).
++	visited := make([]bool, int(n), context.temp_allocator)
++	first_node := make([]u32, int(n), context.temp_allocator) // first-hop node id
++	first_pipe := make([]u32, int(n), context.temp_allocator) // first-hop pipe id
++	queue := make([]u32, int(n), context.temp_allocator)
++
++	for s in 0..<int(n) {
++		if !t.node_alive[s] {
++			continue
++		}
++		for i in 0..<int(n) {
++			visited[i] = false
++		}
++		visited[s] = true
++		head, tail := 0, 1
++		queue[0] = u32(s)
++		first_node[s] = 0 // self: no first hop
++		first_pipe[s] = 0
++		for head < tail {
++			cur := queue[head]
++			head += 1
++			cur_id := t.node_id[cur]
++			// neighbors of cur: scan pipes in insertion order (stable; O(P)
++			// per node — fine at 1.3 scale; an adjacency index is [LATER]).
++			for pi in 0..<len(t.pipe_alive) {
++				if !t.pipe_alive[pi] {
++					continue
++				}
++				neighbor_id, is_end := pipe_other(t, u32(pi), cur_id)
++				if !is_end {
++					continue
++				}
++				ns, ok := node_slot(t, neighbor_id)
++				if !ok || visited[ns] {
++					continue
++				}
++				visited[ns] = true
++				// propagate the first hop: the source's direct neighbor is its
++				// own first hop; deeper nodes inherit their predecessor's.
++				if cur == u32(s) {
++					first_node[ns] = neighbor_id
++					first_pipe[ns] = t.pipe_id[pi]
++				} else {
++					first_node[ns] = first_node[cur]
++					first_pipe[ns] = first_pipe[cur]
++				}
++				queue[tail] = u32(ns)
++				tail += 1
++			}
++		}
++		// store this source's row (slot-indexed; +1 so id 0 is a real value)
++		row := u32(s) * n
++		for d in 0..<int(n) {
++			if d == s || !visited[d] {
++				continue
++			}
++			idx := int(row) + d
++			r.next[idx] = first_node[d] + 1
++			r.pipe[idx] = first_pipe[d] + 1
++		}
++	}
++}
++
++// routing_next_hop — the per-hop decision: at `from_node`, which node + pipe
++// leads toward `dst_node`. ok=false if no route (the packet waits — 1.3's
++// trivial handling of E28; the SLA-undelivered accrual lands with SLA in slice
++// 3). This is THE per-hop lookup — no cached route is consulted, so a topology
++// change (table rebuild) is reflected the moment the packet reaches its next
++// junction (E29: automatic migration under per-hop forwarding).
++routing_next_hop :: proc(r: ^Routing_Table, t: ^Topology, from_node, dst_node: u32) -> (next: u32, pipe: u32, ok: bool) {
++	if r.n == 0 || u64(len(r.next)) != u64(r.n) * u64(r.n) {
++		return 0, 0, false // table not built / stale shape — no route
++	}
++	fs, oks := node_slot(t, from_node)
++	ds, okd := node_slot(t, dst_node)
++	if !oks || !okd {
++		return 0, 0, false
++	}
++	idx := int(fs) * int(r.n) + int(ds)
++	stored := r.next[idx]
++	if stored == 0 {
++		return 0, 0, false // unreachable from `from_node`
++	}
++	return stored - 1, r.pipe[idx] - 1, true // undo the +1 none-sentinel
++}
++
++// routing_has_path — true iff `from_node` can currently reach `dst_node` per
++// the (fresh) table. Used by spawn-time unroutable checks (E28 shape).
++routing_has_path :: proc(r: ^Routing_Table, t: ^Topology, from_node, dst_node: u32) -> bool {
++	_, _, ok := routing_next_hop(r, t, from_node, dst_node)
++	return ok
++}
+diff --git a/core/serialize.odin b/core/serialize.odin
+index 9e90566..6b201dd 100644
+--- a/core/serialize.odin
++++ b/core/serialize.odin
+@@ -76,7 +76,34 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event,
+ 	w_u8(&w, state.era)
+ 	w_u64(&w, state.catalog_hash)
+ 	w_i32(&w, state.logic_hz)
+-	w_u32(&w, state.tick_nonce) // per-tick rng heartbeat (1.3: real sim state)
++	// the flow (1.3): the in-flight packets are the real per-tick sim state —
++	// their positions ride the T1 hash so replay reproduces the packet's path
++	// byte-identically (E10). The demand plan is serialized too (run-setup
++	// binding, like the fixture). The ROUTING TABLE is NOT serialized — it is a
++	// pure function of the Topology (which IS serialized above); hashing it
++	// would bind replay to the table-build algorithm, an implementation detail.
++	f := &state.flow
++	w_u32(&w, u32(len(f.packets)))
++	for i in 0 ..< len(f.packets) {
++		p := &f.packets[i]
++		w_u64(&w, p.id)
++		w_u32(&w, p.src)
++		w_u32(&w, p.dst)
++		w_bool(&w, p.on_edge)
++		w_u32(&w, p.at_node)
++		w_u32(&w, p.edge)
++		w_u32(&w, p.heading)
++		w_u32(&w, p.progress_units)
++		w_u64(&w, p.spawn_tick)
++		w_bool(&w, p.delivered)
++	}
++	w_u32(&w, u32(len(f.demand)))
++	for i in 0 ..< len(f.demand) {
++		w_u64(&w, f.demand[i].tick)
++		w_u32(&w, f.demand[i].src)
++		w_u32(&w, f.demand[i].dst)
++	}
++	w_u64(&w, f.next_packet_id)
+ 
+ 	// the Topology — the network commands mutate. Serialized slot-by-slot
+ 	// (alive flags included so tombstones/id-monotonicity ride in the hash,
+diff --git a/core/step.odin b/core/step.odin
+index b4f7ba7..a47544b 100644
+--- a/core/step.odin
++++ b/core/step.odin
+@@ -2,22 +2,26 @@ package core
+ 
+ // step.odin — the ONLY entry point that advances the simulation (ODN-1).
+ //
+-// Story 1.2: step (a) applies the tick's replay commands to the real Topology
+-// (validate-then-apply, the same path the live edit fast-path uses) and (b)
+-// draws the owned RNG once per tick — the thinnest sim activity that keeps the
+-// determinism plumbing (rng → serialize → hash → replay) real and testable.
+-// There is no flow / crisis / health yet (later slices); nothing here reads a
+-// clock, a file, or a device (ODN-1), and all math is integer (ODN-10).
++// Story 1.3: step (a) applies the tick's replay commands to the real Topology
++// (validate-then-apply, the same path the live edit fast-path uses), (b)
++// REBUILDS the per-hop forwarding table iff the topology changed this tick
++// (4-rule spine rule 1 — synchronous, never per-packet/async), and (c) runs the
++// flow (spawn from demand + advance packets per-hop). The per-tick state delta
++// is now real sim state (packet motion) — the 1.1 rng-heartbeat placeholder
++// (tick_nonce) is gone. There is no crisis / health / QoS yet (later slices);
++// nothing here reads a clock, a file, or a device (ODN-1), and all math is
++// integer (ODN-10).
+ //
+ // The command-application convention (pinned, arch §11.1): live edits apply
+ // immediately via the edit fast-path (the app's Command_Bus) and are logged
+ // with apply_tick = the next tick; replay applies every log entry with
+ // apply_tick == N BEFORE stepping N — so live and replay see identical state
+-// at every step boundary (E10). For 1.2 the harness plays the action log
+-// through step directly (the canonical path); the app's fast-path passes {} to
+-// step (the command is already applied + logged).
++// at every step boundary (E10). The routing rebuild converges at the same
++// boundary: Topology.gen moves on ANY mutation (the live fast-path's draw AND
++// the replayed draw both bump it), so step rebuilds exactly once per topology
++// change in BOTH paths.
+ //
+-// step needs the Catalogs to validate draws (span tier cap, node kinds). The
++// step needs the Catalogs to validate draws + read pipe bandwidth. The
+ // harness/app pass the already-loaded Catalogs pointer; core stays pure (no
+ // file I/O — ODN-1).
+ step :: proc(state: ^Run_State, tick: u64, commands: []Command, cat: ^Catalogs) {
+@@ -35,10 +39,18 @@ step :: proc(state: ^Run_State, tick: u64, commands: []Command, cat: ^Catalogs)
+ 		}
+ 	}
+ 
+-	// heartbeat: one owned-RNG draw folded into a per-tick state field. This is
+-	// the thinnest sim activity that ties the RNG into the step path (different
+-	// seed → different nonce sequence → different hashes; replay reproduces it
+-	// exactly). Story 1.3+ replaces tick_nonce with real rng-derived sim state
+-	// (demand spawn, ECMP, …).
+-	state.tick_nonce = rng_next(&state.rng)
++	// 4-rule spine RULE 1: rebuild the per-hop forwarding table ONLY when the
++	// topology changed, synchronously inside this tick. Topology.gen moves on
++	// every mutation (spawn + draw; future: demolish), so this fires exactly
++	// once per change — never per-packet, never per-tick. (The table is DERIVED
++	// from the topology; rebuilding it here keeps it fresh for the flow below +
++	// converges live/replay at the step boundary.)
++	if state.topology.gen != state.routing_gen {
++		routing_rebuild(&state.routing, &state.topology)
++		state.routing_gen = state.topology.gen
++	}
++
++	// the flow: spawn from demand + advance packets per-hop along the fresh
++	// table. Packet motion is the real per-tick state (in the T1 hash -> E10).
++	flow_step(state, tick, cat)
+ }
+diff --git a/core/topology.odin b/core/topology.odin
+index d4d808f..d3a6eda 100644
+--- a/core/topology.odin
++++ b/core/topology.odin
+@@ -32,6 +32,7 @@ Topology :: struct {
+ 	pipe_tier:    [dynamic]u16, // index into Catalogs.pipe_tiers
+ 	pipe_span:    [dynamic]i32, // cached integer Euclidean (rounded)
+ 	next_pipe_id: u32,
++	gen:          u32, // increments on EVERY mutation (spawn/draw; future demolish) — the routing-table rebuild trigger (rule 1)
+ }
+ 
+ topology_make :: proc(t: ^Topology, allocator := context.allocator) {
+@@ -134,6 +135,7 @@ topology_spawn_node :: proc(t: ^Topology, type_idx: u16, pos: [2]i32, cat: ^Cata
+ 	append(&t.node_role, nt.terminal_role)
+ 	append(&t.node_type, type_idx)
+ 	append(&t.node_pos, pos)
++	t.gen += 1 // a new node can open new paths -> rebuild the forwarding table
+ 	return id
+ }
+ 
+@@ -161,7 +163,8 @@ validate_draw :: proc(t: ^Topology, c: Cmd_Draw_Pipe, cat: ^Catalogs) -> Edit_Er
+ // apply_draw — assumes validate_draw returned .None. Appends a pipe, caching its
+ // integer span. The new pipe is live this tick (edit fast-path) and recorded in
+ // the action log with apply_tick = next (ODN-2); replay re-applies it at that
+-// tick before stepping.
++// tick before stepping. A new pipe can open / change paths -> bump gen so the
++// forwarding table rebuilds at the next step (rule 1).
+ apply_draw :: proc(t: ^Topology, c: Cmd_Draw_Pipe, cat: ^Catalogs) -> u32 {
+ 	sa := node_slot_raw(t, c.a)
+ 	sb := node_slot_raw(t, c.b)
+@@ -174,6 +177,7 @@ apply_draw :: proc(t: ^Topology, c: Cmd_Draw_Pipe, cat: ^Catalogs) -> u32 {
+ 	append(&t.pipe_b, c.b)
+ 	append(&t.pipe_tier, c.tier)
+ 	append(&t.pipe_span, span)
++	t.gen += 1
+ 	return id
+ }
+ 
+@@ -202,3 +206,29 @@ topology_apply_edit :: proc(t: ^Topology, cmd: Command, cat: ^Catalogs) -> (Edit
+ draw_cost :: proc(span: i32, tier_idx: u16, cat: ^Catalogs) -> i32 {
+ 	return span * cat.pipe_tiers[tier_idx].cost_per_tile
+ }
++
++// pipe_slot — pipe id -> slot, only for LIVE pipes (linear; core is map-free —
++// ODN-10). Used by the flow (the packet's current edge) + the render.
++pipe_slot :: proc(t: ^Topology, id: u32) -> (u32, bool) {
++	for i in 0 ..< len(t.pipe_alive) {
++		if t.pipe_alive[i] && t.pipe_id[i] == id {
++			return u32(i), true
++		}
++	}
++	return 0, false
++}
++
++// pipe_other — given a pipe slot + one endpoint node id, return the OTHER
++// endpoint (the neighbor). ok=false if `node_id` is not an endpoint of the pipe.
++// The adjacency primitive the forwarding-table BFS + the packet traversal use.
++pipe_other :: proc(t: ^Topology, pipe_slot: u32, node_id: u32) -> (other: u32, ok: bool) {
++	a := t.pipe_a[pipe_slot]
++	b := t.pipe_b[pipe_slot]
++	if a == node_id {
++		return b, true
++	}
++	if b == node_id {
++		return a, true
++	}
++	return 0, false
++}
+diff --git a/core/types.odin b/core/types.odin
+index 8c22d64..2cf72c1 100644
+--- a/core/types.odin
++++ b/core/types.odin
+@@ -52,12 +52,23 @@ Command :: struct {
+ 	kind:       Command_Kind,
+ }
+ 
+-// Event — the per-tick event buffer entry (ODN-14). The spine emits none (step
+-// is a heartbeat); later stories add Packet_Arrived, Crisis_Triggered, … The
+-// tag byte is the serialized discriminator.
++// Event — the per-tick event buffer entry (ODN-14). The spine emits none; the
++// flow emits Packet_Arrived (1.3); later stories add Packet_Dropped,
++// Crisis_Triggered, … The tag byte is the serialized discriminator.
+ Event :: struct {
+ 	tick: u64,
+-	tag:  u8, // 0 = (none); spine reserves 1.. for future variants
++	tag:  u8, // 0 = (none); see the EVENT_TAG_* constants below
++}
++
++// Event tags (stable across the wire; new variants append). The serialized
++// event stream carries these (serialize.odin) so event divergence is caught in
++// the T1 hash without a single pixel.
++EVENT_TAG_PACKET_ARRIVED :: u8(1) // 1.3: a packet reached its dst sink
++
++// event_emit — append an event to this tick's buffer (ODN-14). The harness /
++// app drain + hash `state.events[before:]` once per step.
++event_emit :: proc(state: ^Run_State, tick: u64, tag: u8) {
++	append(&state.events, Event{tick = tick, tag = tag})
+ }
+ 
+ // Run_State — the authoritative sim state (ODN-1/13). One value per run,
+@@ -71,9 +82,11 @@ Run_State :: struct {
+ 	catalog_hash: u64,                 // ODN-11 — binds the run to its catalogs
+ 	logic_hz:     i32,                 // ODN-11 — binds the run to its tick rate
+ 	topology:     Topology,            // S1 — the network the commands mutate (1.2)
++	routing:      Routing_Table,       // per-hop forwarding table (1.3) — DERIVED from topology, rebuilt on change
++	routing_gen:  u32,                 // the Topology.gen this routing table was built for (rule 1)
++	flow:         Flow_State,          // S2 — the packet flow (1.3): in-flight packets + trivial demand
+ 	action_log:   [dynamic]Command,    // the replay artifact (ODN-11)
+ 	events:       [dynamic]Event,      // per-tick buffer (ODN-14)
+-	tick_nonce:   u32,                 // per-tick rng-derived heartbeat (1.3 replaces with real sim state)
+ 	replay_error: bool,                // latched if a replayed command fails (critical)
+ }
+ 
+@@ -91,6 +104,8 @@ run_init :: proc(state: ^Run_State, seed: u64, catalog_hash: u64, logic_hz: i32,
+ 	state.action_log = make([dynamic]Command, allocator)
+ 	state.events = make([dynamic]Event, allocator)
+ 	topology_make(&state.topology, allocator)
++	routing_make(&state.routing, allocator)
++	flow_init(&state.flow, allocator)
+ 	rng_seed(&state.rng, seed)
+ }
+ 
+@@ -100,4 +115,6 @@ run_destroy :: proc(state: ^Run_State) {
+ 	delete(state.action_log)
+ 	delete(state.events)
+ 	topology_destroy(&state.topology)
++	routing_destroy(&state.routing)
++	flow_destroy(&state.flow)
+ }
+diff --git a/data/balance.json b/data/balance.json
+index 1599153..6beb07f 100644
+--- a/data/balance.json
++++ b/data/balance.json
+@@ -1,8 +1,9 @@
+ {
+-  "_comment": "Balance catalog (GDD § Numerical Design, ODN-5). Single source for every tunable number. All state-affecting values are int (ODN-10). logic_hz=20 is the fixed-timestep tick rate (ODN-2). snap_radius = inclusive node-snap radius in world px (E4). map.* = the design-grid world the camera fits into the 1280x720 window.",
++  "_comment": "Balance catalog (GDD § Numerical Design, ODN-5). Single source for every tunable number. All state-affecting values are int (ODN-10). logic_hz=20 is the fixed-timestep tick rate (ODN-2). snap_radius = inclusive node-snap radius in world px (E4). packet_bandwidth = the bandwidth units a packet must accumulate to cross one edge (1.3 flow; transit ticks = ceil(packet_bandwidth / pipe.capacity_units), so a standard pipe (cap 15) takes 2 ticks). map.* = the design-grid world the camera fits into the 1280x720 window.",
+   "logic_hz": 20,
+   "max_ticks": 100000,
+   "snap_radius": 36,
++  "packet_bandwidth": 30,
+   "map": {
+     "w_tiles": 40,
+     "h_tiles": 30,
+diff --git a/data/palette.json b/data/palette.json
+index d2dd96c..ca5a51b 100644
+--- a/data/palette.json
++++ b/data/palette.json
+@@ -20,6 +20,8 @@
+   "pipe_fiber":    [46, 84, 148, 255],
+   "pipe_core":     [122, 168, 230, 255],
+   "pipe_unalloc":  [58, 74, 92, 255],
++  "packet_dot":    [64, 140, 220, 255],
++  "packet_dark":  [28, 70, 120, 255],
+   "ghost_ok":      [120, 128, 140, 200],
+   "ghost_bad":     [232, 69, 69, 200]
+ }
+diff --git a/demos/flow.dem b/demos/flow.dem
+new file mode 100644
+index 0000000..acc956b
+--- /dev/null
++++ b/demos/flow.dem
+@@ -0,0 +1,19 @@
++# flow.dem — Story 1.3: one packet flows source -> router -> sink, forwarded
++# per-hop. The 1.2 fixture is residential(0) <- router(1) -> content_host(2),
++# 12 tiles apart on row y=15. Draw source->router then router->sink at the
++# 'standard' tier (span 12 <= max 14); spawn one packet residential(0) ->
++# content_host(2) at 2050ms (tick 41 — after both pipes apply at ticks 11/31).
++#
++# The packet then traverses per-hop (bandwidth 30 vs standard cap 15 -> 2
++# ticks/edge): forward onto edge0 (t41), mid edge0 (t42), arrive router (t43),
++# forward onto edge1 (t44), mid edge1 (t45), deliver at sink (t46). Captures
++# pin a mid-edge frame on each pipe + the per-hop stop at the router junction.
++seed 42
++run 3000ms
++at 500ms draw 0 1 standard
++at 1500ms draw 1 2 standard
++at 2050ms spawn 0 2
++capture at 2100ms
++capture at 2150ms
++capture at 2250ms
++expect hash stable
+diff --git a/goldens/boot.log.bin b/goldens/boot.log.bin
+index 4de62b5..268d925 100644
+Binary files a/goldens/boot.log.bin and b/goldens/boot.log.bin differ
+diff --git a/goldens/boot.t1 b/goldens/boot.t1
+index 051ec7c..dd1c4e7 100644
+--- a/goldens/boot.t1
++++ b/goldens/boot.t1
+@@ -3,105 +3,105 @@ t1 1
+ demo boot
+ seed 42
+ logic_hz 20
+-catalog_hash 84bee62d4822d70b
++catalog_hash 99a32393078e0cca
+ ticks 100
+-1 64f303e1f5b357c9
+-2 31f0daba58b12741
+-3 d968df386c4d0300
+-4 0569f6d3e6b23182
+-5 93d0a713ab3cb7a6
+-6 948008e8ef4643cc
+-7 1fa76f325879e267
+-8 c11ccdb36c8faead
+-9 fa57d81afe470c39
+-10 a387cd4ed7bd3e77
+-11 a65c053126b832e7
+-12 8ac8f7d54e67fd56
+-13 ad0b50b8f3470f91
+-14 97650d1218767e52
+-15 40d98baacf3d88fb
+-16 28d3d30a6a287f1a
+-17 ade95efd39f7a4a9
+-18 36eb7bfe730be94d
+-19 1d257223c7559781
+-20 e72a36dd040d3d80
+-21 e7b3951fa3e4867a
+-22 8ff0b31c8220574a
+-23 c5eb5d845b0683d8
+-24 e1f091ac7076a64e
+-25 f7ab6c7fe2290a25
+-26 7674a98245fb5e11
+-27 485fff93af1138de
+-28 f2b787815d800894
+-29 6a181f488ed08ff0
+-30 ba4a5ee99d17c9f2
+-31 91c6f5d442bb8624
+-32 53b3a33856b19980
+-33 2b610fae2c3f5356
+-34 81457f4111bac7f4
+-35 09da06c71b505014
+-36 29012cade0c6351e
+-37 602579d081495e16
+-38 7b8b513e6440ed95
+-39 eca5e2ed89c5a0d2
+-40 2481b9bbe39e7831
+-41 5e2cc6a68e5472ef
+-42 cfd2c1019271ea8b
+-43 8560da15755012b9
+-44 dfbfe43e7838a699
+-45 6ee10b381fac3fe5
+-46 20c533c43c6432b2
+-47 b303548825b87174
+-48 63c31c387a36afd2
+-49 8512940c80b2ee39
+-50 55359eaffbcd543e
+-51 eac3ea81936044b3
+-52 aee09f4214430873
+-53 054635828c20fd04
+-54 1e05ab2366413d57
+-55 e33fb91071f58ad2
+-56 9c1e80191298b67c
+-57 b74c816f4fb7c6bd
+-58 76076ef6b115f057
+-59 87db648ddb81ce90
+-60 8c12d5e330217343
+-61 7b5374c7a77d9445
+-62 2ba7dc9773af13d8
+-63 fc7688458559eef9
+-64 104343965655e89d
+-65 5e09566435554345
+-66 f343633c6a90860c
+-67 338bb8a481659739
+-68 acbfc9a880ffa060
+-69 add240606f6aac0e
+-70 aefb8495947287f9
+-71 e158b978a7e1d8c2
+-72 717fcb17b8da2d19
+-73 74970c1049a2c354
+-74 1a9c36d568ab4147
+-75 58e0eacd6aae1791
+-76 2364dcfa4c2b281d
+-77 2f3b61e806928b4d
+-78 bd7efe059c4e2cea
+-79 c35e76bdbd9e60a9
+-80 13503f4f5ec66687
+-81 a1f8d9f5eac60690
+-82 7c6fd88ae6a11039
+-83 aa3d735e6468e2d0
+-84 568c53acb0eb9fe4
+-85 262bad055a95ce18
+-86 697a924632179a7b
+-87 b89eed52f9ce4a45
+-88 7e83a5ace68cccc4
+-89 5d9feceef93c2d3f
+-90 5f79ca5012098c9c
+-91 8bef6c5115cdc413
+-92 06c97fe570b4ed6a
+-93 b833d12baef52b93
+-94 00e21e1d7756c32c
+-95 690e2d8c1e5743c5
+-96 a594177b3b8d044b
+-97 466a692948c785d1
+-98 9267a1e0a85cdc1d
+-99 abbdc6324e8b77e3
+-100 b178e4110a9cfe51
++1 a266cf5e46a12ca4
++2 7892a19a6fdab1e3
++3 3e0bc7ba011ff88e
++4 5142d54b77bafcbd
++5 0eed2dec965b5080
++6 366a2f78b04ac49f
++7 22395fc0c8c356ca
++8 b3dbd681f329bbf9
++9 5a3421208202cf3c
++10 261aa2a39bf60c9b
++11 27f7eba24d2de426
++12 4f4f2e9f457bac95
++13 993c99bd83162f58
++14 6920a35fc3ddcbb7
++15 fba72e0829974fe2
++16 e900ef96684c3331
++17 6c95fbb699cace54
++18 1051a147b07cb913
++19 b5ba9aa5523bc43e
++20 2ec0b7bea5751a6d
++21 d1f119687a749630
++22 91ca55f96319910f
++23 f5a5a33824de8afa
++24 7968034748065a29
++25 efc498f1d977346c
++26 8d1b350a0c485f8b
++27 468ece85f08bb596
++28 704a2f7383316f05
++29 c4785ec23504f048
++30 088eb61d6f9ba1e7
++31 87bff1aeb36b8cd2
++32 2cc9c75958d936a1
++33 871d0798f7498244
++34 a03aca22c9e6a303
++35 1642bd4d12778bae
++36 f6bb5d34a00d235d
++37 84fe4252e3751220
++38 e597a8579664233f
++39 51cc46b83a7dc66a
++40 13fbc0bffa74be19
++41 a5702322546ff35c
++42 2ae910a8f890ae3b
++43 268478fe2e3f8e46
++44 0127224bec35dcb5
++45 b25bde8242493178
++46 84d30a5bbc04c557
++47 32ba59eb87190e02
++48 9dc1f8c389a71b51
++49 0540e44e9045ff74
++50 653c2f909be5fcb3
++51 d3cd8c35fb2555de
++52 f1cee51a4ad2118d
++53 49cdbec6375c77d0
++54 8428074dcc7f132f
++55 ede693fba91d299a
++56 5cfe1eba5044dec9
++57 b95668645a4dbd0c
++58 f379b03f250f532b
++59 3a93f8110bf2cb36
++60 0896c4c6a2aaab25
++61 cf6c2121612f07e8
++62 2ea4483fabd37d87
++63 dd3fd0fcf64e56f2
++64 2cb777c1a5412b41
++65 01663a69740b4f64
++66 eb15111ff55ceca3
++67 b82e068cc846aa4e
++68 c1d4f511aeee607d
++69 c5332127b148df40
++70 49f354dffd0b1c5f
++71 341c82fa8545d48a
++72 4f3c1dd4277cabb9
++73 94c224626d7b0cfc
++74 5e259aaaf3a9ba5b
++75 a8b7e86beff728e6
++76 ba215c591ceebe55
++77 b85831c9c461ef18
++78 bf197f494b198577
++79 06889493e9de8aa2
++80 7a401ad4222da6f1
++81 96ed1117f3f2ea14
++82 3e656806617712d3
++83 32336347930282fe
++84 0ba38572bdcf482d
++85 36187df17a8f22f0
++86 4fa22ba8815516cf
++87 2fecbc8cda2ab9ba
++88 575bddd57d60f1e9
++89 a7671af00595102c
++90 694815acd3a4404b
++91 99287084dba15f56
++92 bbcf5ed1a8fd54c5
++93 8abf1749b3be8208
++94 15fb820359eafda7
++95 64d813d10a8adf92
++96 719d1453ed40a661
++97 57f1c17358d2a204
++98 3808a756cb1633c3
++99 898b04155c1ad46e
++100 5f52db2f8324181d
+diff --git a/goldens/draw.log.bin b/goldens/draw.log.bin
+index b3d1a56..aa2980f 100644
+Binary files a/goldens/draw.log.bin and b/goldens/draw.log.bin differ
+diff --git a/goldens/draw.t1 b/goldens/draw.t1
+index ef46410..5350767 100644
+--- a/goldens/draw.t1
++++ b/goldens/draw.t1
+@@ -3,65 +3,65 @@ t1 1
+ demo draw
+ seed 42
+ logic_hz 20
+-catalog_hash 84bee62d4822d70b
++catalog_hash 99a32393078e0cca
+ ticks 60
+-1 6236a81988230145
+-2 3884a893d32d653d
+-3 b5a238a100511da0
+-4 5e3e33d3972acbd2
+-5 6ffb2720217d440e
+-6 0345e261af7cdc44
+-7 58961b89ae8c3e2b
+-8 d63d8be91b0a6d81
+-9 115c495e7e4512d5
+-10 d8e7af06b681b25b
+-11 337d85396330b850
+-12 267875553574d433
+-13 d3dc5861fec6050e
+-14 72934b0c602d2147
+-15 231b71d045b418cc
+-16 c95c731f85d4856f
+-17 361fd1eb2c2fb886
+-18 b0d54db4a5ce1862
+-19 e2fca1eda743247e
+-20 b3ffaeb3bea65831
+-21 e56f2ec1ee47698f
+-22 9a0cab001616105f
+-23 86f489c729cfd6a9
+-24 76d143350bcd334b
+-25 4c89ec77c11e1b1a
+-26 9014197d96d9788e
+-27 6de7738828cd449b
+-28 502adf7fa593c1bd
+-29 a2be6874dbaf1f21
+-30 5fb98b6c92002627
+-31 9831509cfd260ba9
+-32 fc598bee058462cd
+-33 c5996459134fa8f7
+-34 2ed2f0519e470fd9
+-35 7fc14763ec674df9
+-36 a334ef6494b6fe5f
+-37 4c272a619f99d7b7
+-38 c7819fb47b597930
+-39 7217808a8852670b
+-40 d3071513e03be064
+-41 4b47ad58abd3318e
+-42 d85f6255ecee8fd2
+-43 308a5df46268194c
+-44 a4b51b01fbf5372c
+-45 60eb608e559665e0
+-46 f2cff50bd56222eb
+-47 0346891af00ec159
+-48 e84716dde264c60b
+-49 8ad56e06cd295ccc
+-50 d0320d76a00fa37f
+-51 272721be3b394eba
+-52 be302824a97c667a
+-53 516fc38ec9e71c89
+-54 2e3bb7be58764396
+-55 ce1f7bb178ed310b
+-56 280cff5231c65e61
+-57 bb8090edaa71e4b8
+-58 0ad165bb34b10696
+-59 74d50b783f72d63d
+-60 ad9afb6b70f55cea
++1 e5aa7a58df8d569c
++2 a77daf092949e68f
++3 cdbed178d4a47576
++4 cc24e02eaec62a71
++5 42fa3e0734721f20
++6 09960dfacb276f03
++7 5e683eb504352d5a
++8 f6c4c5d0772d9495
++9 21f6b81b39b4b394
++10 46b6b67b413b92a7
++11 19d45b55c04c3643
++12 04bd06f8da5dd20a
++13 6a0b3ce9a6be7129
++14 bea2f791592b3720
++15 8fff660f714c0657
++16 6c9bedf2981811ee
++17 4da19f2d9efedefd
++18 881c2a9b22b9a684
++19 a060dfe623c4f4bb
++20 3111cda741c285c2
++21 dc2df8931ec025e1
++22 8411c96868508f58
++23 66ec137e05bcdf0f
++24 77cde8717d069106
++25 0fb5dbb5c234eeb5
++26 e953f9aac1ca361c
++27 11aa3511550490f3
++28 bb4918bf94454fba
++29 da03f79f80fe7259
++30 f059127a56c1b550
++31 d2ee976990d6930b
++32 80c7098c1423af34
++33 26d272bd71a27dc9
++34 a3185cd1c11120aa
++35 62a3d036e6e6b48f
++36 8955451d0dfc8f58
++37 21aece59e5ac696d
++38 88a5e677d6beb57e
++39 4fb172bfbff92443
++40 ec6c90aadf84f6ac
++41 d0b8ed60eae75541
++42 7a70f60d86b53fe2
++43 01d6270cb96ea587
++44 47fdf999856eee50
++45 f64e7885a365d8c5
++46 97befc5ff16f4b96
++47 ece5c2299ae361db
++48 c10a532963c4c984
++49 aad5ff4c10abef59
++50 1b99949fee2586ba
++51 a2e42aa5f65b631f
++52 c01ad78b7130bb28
++53 8d3bf7f8a81d1b7d
++54 201fb70ca8d63dce
++55 2a9289a188799bd3
++56 1aa99c54234d8cfc
++57 de320b72dcb72b51
++58 2ed1d14c48358672
++59 012989c041a86ad7
++60 2eed1df0970bcd20
+diff --git a/goldens/flow.log.bin b/goldens/flow.log.bin
+new file mode 100644
+index 0000000..aa2980f
+Binary files /dev/null and b/goldens/flow.log.bin differ
+diff --git a/goldens/flow.t1 b/goldens/flow.t1
+new file mode 100644
+index 0000000..2631e93
+--- /dev/null
++++ b/goldens/flow.t1
+@@ -0,0 +1,67 @@
++# t1 manifest — per-tick FNV-1a-64 state hashes (full sim state)
++t1 1
++demo flow
++seed 42
++logic_hz 20
++catalog_hash 99a32393078e0cca
++ticks 60
++1 e926f3e69489b5fe
++2 5aa40b1315e112b9
++3 8371837ada729384
++4 9002147271b7c5b7
++5 175ad8014acff7f2
++6 e33871a95edde19d
++7 e731e3417ff07dd8
++8 b18184ff6e1f4a4b
++9 417d4e6a2ed4e826
++10 bd2740b86355a701
++11 74e28958e8e6b59d
++12 16b659185eb68ae4
++13 1f65df669840657f
++14 29e5046e700af0a6
++15 16fcff8cf3ca3751
++16 ce9271de1d911018
++17 823a460347bede83
++18 76f5103842c1b6ca
++19 eb5a96b4b0217a45
++20 fb11bc632a48b58c
++21 54c766d13e1bb107
++22 59f991e1ce962c8e
++23 76962e27dbfd97d9
++24 dbaf08f040109ea0
++25 eefa713b8e8a5d4b
++26 3aad1a4745cb00b2
++27 5ac373c803978c4d
++28 fbf42df20fc7d2d4
++29 30fe7df60a5af66f
++30 8960836d567e91d6
++31 c3171a7a0f75687d
++32 00d581f6722919fe
++33 5d1f85ff9f4ea577
++34 d3ddf798d3ef2740
++35 9730cfab5b511631
++36 4c1e3bc3d4aa4e72
++37 19e8c9754bd9d6db
++38 73c14fb1e6f9a514
++39 96a51ffe9e7b7305
++40 e7926cdc2d4ac906
++41 be1dddd99650aeb9
++42 93985d406f47bf75
++43 bd2ae65f32a29525
++44 e41e80bac9ddc593
++45 8189c7e469fb3d01
++46 4d0a3b6e5e8b18a7
++47 c2c750bc8dd9cdde
++48 0d7e9e59e352f5fd
++49 77c92d309504ac40
++50 b84fdd9d0f4dbb17
++51 a53755d04ff590d2
++52 32cbd046fea93fb1
++53 0df302b4c658bd44
++54 c11518aea4c4b88b
++55 ee5cfcf4e37b0986
++56 50066a2738be9425
++57 194367e40c04a4c8
++58 4ff0857f4963f6bf
++59 c1d9d00fb7a233fa
++60 5f087c56ee0a2479
+diff --git a/goldens/flow/02100ms.png b/goldens/flow/02100ms.png
+new file mode 100644
+index 0000000..f02505e
+Binary files /dev/null and b/goldens/flow/02100ms.png differ
+diff --git a/goldens/flow/02150ms.png b/goldens/flow/02150ms.png
+new file mode 100644
+index 0000000..f383d9e
+Binary files /dev/null and b/goldens/flow/02150ms.png differ
+diff --git a/goldens/flow/02250ms.png b/goldens/flow/02250ms.png
+new file mode 100644
+index 0000000..7a1fbab
+Binary files /dev/null and b/goldens/flow/02250ms.png differ
+diff --git a/harness/demo.odin b/harness/demo.odin
+index d94929b..0cdbdfe 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -23,12 +23,22 @@ Draw_Intent :: struct {
+ 	tier:  string, // pipe_tiers id (narrow/standard/wide); default "standard"
+ }
+ 
++// Spawn_Intent — a trivial 1.3 flow demand entry: spawn one packet `src -> dst`
++// at `at_ms`. Lowered into Flow_State.demand (run setup — NOT the action log,
++// like the fixture). The pressure-plan director (weighted picks) lands in slice 3.
++Spawn_Intent :: struct {
++	at_ms: i64,
++	src:   u32, // fixture node id
++	dst:   u32, // fixture node id
++}
++
+ Demo :: struct {
+ 	name:               string,
+ 	seed:               u64,
+ 	run_ms:             i64,
+ 	expect_hash_stable: bool,
+ 	draws:              [dynamic]Draw_Intent,
++	spawns:             [dynamic]Spawn_Intent,
+ 	captures:           [dynamic]i64, // T2 capture times (ms)
+ }
+ 
+@@ -38,6 +48,7 @@ Demo :: struct {
+ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 	d := Demo{name = name}
+ 	d.draws = make([dynamic]Draw_Intent, 0, 8, context.allocator)
++	d.spawns = make([dynamic]Spawn_Intent, 0, 8, context.allocator)
+ 	d.captures = make([dynamic]i64, 0, 8, context.allocator)
+ 	for raw in strings.split(text, "\n", context.temp_allocator) {
+ 		line := strings.trim_space(raw)
+@@ -74,20 +85,38 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 				return {}, fmt.tprintf("unknown expect: %s", line)
+ 			}
+ 		case "at":
+-			// at <n>ms draw <from> <to> <tier>
+-			if len(fields) < 6 || fields[2] != "draw" {
+-				return {}, fmt.tprintf("bad at-line (want: at <n>ms draw <from> <to> <tier>): %s", line)
++			// at <n>ms draw <from> <to> <tier>  |  at <n>ms spawn <from> <to>
++			if len(fields) < 3 {
++				return {}, fmt.tprintf("bad at-line (want: at <n>ms draw|spawn ...): %s", line)
+ 			}
+ 			ms, ok := parse_ms(fields[1])
+ 			if !ok {
+ 				return {}, fmt.tprintf("bad at-time: %q", fields[1])
+ 			}
+-			fa, oka := strconv.parse_uint(fields[3], 10)
+-			fb, okb := strconv.parse_uint(fields[4], 10)
+-			if !oka || !okb {
+-				return {}, fmt.tprintf("bad draw endpoints: %s", line)
++			switch fields[2] {
++			case "draw":
++				if len(fields) < 6 {
++					return {}, fmt.tprintf("bad draw at-line (want: at <n>ms draw <from> <to> <tier>): %s", line)
++				}
++				fa, oka := strconv.parse_uint(fields[3], 10)
++				fb, okb := strconv.parse_uint(fields[4], 10)
++				if !oka || !okb {
++					return {}, fmt.tprintf("bad draw endpoints: %s", line)
++				}
++				append(&d.draws, Draw_Intent{at_ms = ms, a = u32(fa), b = u32(fb), tier = fields[5]})
++			case "spawn":
++				if len(fields) < 5 {
++					return {}, fmt.tprintf("bad spawn at-line (want: at <n>ms spawn <from> <to>): %s", line)
++				}
++				fa, oka := strconv.parse_uint(fields[3], 10)
++				fb, okb := strconv.parse_uint(fields[4], 10)
++				if !oka || !okb {
++					return {}, fmt.tprintf("bad spawn endpoints: %s", line)
++				}
++				append(&d.spawns, Spawn_Intent{at_ms = ms, src = u32(fa), dst = u32(fb)})
++			case:
++				return {}, fmt.tprintf("unknown at-verb %q (want draw|spawn): %s", fields[2], line)
+ 			}
+-			append(&d.draws, Draw_Intent{at_ms = ms, a = u32(fa), b = u32(fb), tier = fields[5]})
+ 		case "capture":
+ 			// capture at <n>ms
+ 			if len(fields) < 3 || fields[1] != "at" {
+@@ -131,3 +160,10 @@ demo_run_ticks :: proc(d: ^Demo, logic_hz: i32) -> u64 {
+ intent_apply_tick :: proc(d: ^Draw_Intent, logic_hz: i32) -> u64 {
+ 	return u64(max(0, i64(d.at_ms) * i64(logic_hz) / 1000)) + 1
+ }
++
++// spawn_tick — the tick a spawn intent fires at. floor(at_ms*hz/1000) (NO +1:
++// spawns are run-setup, not logged commands, so the edit-fast-path convergence
++// convention doesn't apply — the demand is seeded identically on every replay).
++spawn_tick :: proc(s: ^Spawn_Intent, logic_hz: i32) -> u64 {
++	return u64(max(0, i64(s.at_ms) * i64(logic_hz) / 1000))
++}
+diff --git a/harness/drift.odin b/harness/drift.odin
+index 67f8bfe..3f99a9a 100644
+--- a/harness/drift.odin
++++ b/harness/drift.odin
+@@ -41,6 +41,8 @@ drift_check :: proc(cat: ^pp.Catalogs) -> i32 {
+ 			continue
+ 		}
+ 		ticks := u64(man.ticks)
++		demo_spawns := load_demo_spawns(name)
++		defer delete(demo_spawns)
+ 
+ 		mutations := make_drift_mutations(data)
+ 		for m in mutations {
+@@ -52,7 +54,7 @@ drift_check :: proc(cat: ^pp.Catalogs) -> i32 {
+ 				continue
+ 			}
+ 			fails := make([dynamic]string, context.temp_allocator)
+-			_, accepted := replay_hashes(tmp, cat, ticks, &fails)
++			_, accepted := replay_hashes(tmp, cat, ticks, demo_spawns[:], &fails)
+ 			delete(fails)
+ 			if accepted {
+ 				// the gate ACCEPTED a drifted log — this is the failure we're
+diff --git a/harness/goldens.odin b/harness/goldens.odin
+index f490734..ba5115b 100644
+--- a/harness/goldens.odin
++++ b/harness/goldens.odin
+@@ -44,9 +44,9 @@ render_setup :: proc(rc: ^Render_Ctx, cat: ^pp.Catalogs) {
+ // Render the world pass headless and read back normalized RGBA pixels. The
+ // drag state defaults to {} (no active drag) — the golden frame is a settled
+ // drawn-pipe state, not a mid-drag preview (so no HUD text is captured).
+-capture_frame :: proc(rc: ^Render_Ctx, topo: ^pp.Topology) -> rl.Image {
++capture_frame :: proc(rc: ^Render_Ctx, topo: ^pp.Topology, flow: ^pp.Flow_State) -> rl.Image {
+ 	rl.BeginDrawing()
+-	rnd.draw_world(&rc.view, topo, {})
++	rnd.draw_world(&rc.view, topo, flow, {})
+ 	rl.EndDrawing()
+ 	img := rl.LoadImageFromScreen()
+ 	rl.ImageFlipVertical(&img) // framebuffer readback is bottom-up
+diff --git a/harness/run.odin b/harness/run.odin
+index c21807a..362cb21 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -53,6 +53,7 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 	}
+ 	defer {
+ 		delete(demo.draws)
++		delete(demo.spawns)
+ 		delete(demo.captures)
+ 	}
+ 
+@@ -70,6 +71,9 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 	defer delete(fails)
+ 
+ 	hz := cat.balance.logic_hz
++	// lower the demo's spawn intents into the flow demand (run setup — NOT the
++	// action log; re-created identically on every replay, like the fixture).
++	lower_spawns(&state, demo.spawns[:], hz)
+ 	ticks := demo_run_ticks(&demo, hz)
+ 	hashes := make([dynamic]u64, 0, ticks)
+ 	defer delete(hashes)
+@@ -90,7 +94,7 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 			for cap_ms in demo.captures {
+ 				cap_tick := u64(max(0, i64(cap_ms) * i64(hz) / 1000))
+ 				if cap_tick == tick {
+-					img := capture_frame(rc, &state.topology)
++					img := capture_frame(rc, &state.topology, &state.flow)
+ 					if save {
+ 						write_golden(name, cap_ms, img)
+ 					} else {
+@@ -121,7 +125,7 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 		if !os.exists(log_path(name)) {
+ 			append(&fails, fmt.tprintf("no blessed log at %s (bless with `harness save %s`)",
+ 				log_path(name), name))
+-		} else if !verify_replay(name, cat, hashes[:]) {
++		} else if !verify_replay(name, cat, demo.spawns[:], hashes[:]) {
+ 			append(&fails, "replay of the blessed log diverges from the manifest")
+ 		}
+ 	}
+@@ -138,11 +142,45 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 	return false
+ }
+ 
++// lower_spawns — seed a run's flow demand from a demo's spawn intents (run
++// setup — NOT the action log; re-created identically on every replay, like the
++// fixture). Shared by run_demo (live) + replay_hashes (replay) so the flow is
++// replay-determinate: the demand is identical in both paths.
++lower_spawns :: proc(state: ^pp.Run_State, spawns: []Spawn_Intent, hz: i32) {
++	for s in spawns {
++		tick := u64(max(0, i64(s.at_ms) * i64(hz) / 1000))
++		pp.flow_seed_demand(&state.flow, tick, s.src, s.dst)
++	}
++}
++
++// load_demo_spawns — parse a demo file + return its spawn intents (caller-owned;
++// free with delete). Used by the standalone replay path (run_replay) + the drift
++// check to re-create the flow demand without holding the whole Demo struct.
++// Returns an empty slice on a missing/unparseable demo (the replay still runs;
++// the demand is just empty for demos that have none).
++load_demo_spawns :: proc(demo_name: string) -> [dynamic]Spawn_Intent {
++	spawns := make([dynamic]Spawn_Intent, 0, 4, context.allocator)
++	path := fmt.tprintf("demos/%s.dem", demo_name)
++	text_bytes, err := os.read_entire_file_from_path(path, context.temp_allocator)
++	if err != nil {
++		return spawns
++	}
++	demo, perr := parse_demo(demo_name, string(text_bytes))
++	for s in demo.spawns {
++		append(&spawns, s)
++	}
++	delete(demo.draws)
++	delete(demo.spawns)
++	delete(demo.captures)
++	return spawns
++}
++
+ // replay_hashes — re-run from an action log alone. The ODN-11 replay gate: the
+ // header's catalog_hash + logic_hz must match the current catalogs (else a
+ // defined rejection, never silent divergence), then re-sim tick 1..ticks with
+-// the SAME fixture seeded.
+-replay_hashes :: proc(lpath: string, cat: ^pp.Catalogs, ticks: u64,
++// the SAME fixture + flow demand seeded (both run setup, re-created identically
++// — the demand is NOT in the action log, like the fixture).
++replay_hashes :: proc(lpath: string, cat: ^pp.Catalogs, ticks: u64, demo_spawns: []Spawn_Intent,
+                       fails: ^[dynamic]string) -> ([dynamic]u64, bool) {
+ 	out := make([dynamic]u64)
+ 	data, err := os.read_entire_file_from_path(lpath, context.temp_allocator)
+@@ -171,6 +209,7 @@ replay_hashes :: proc(lpath: string, cat: ^pp.Catalogs, ticks: u64,
+ 	defer pp.run_destroy(&state)
+ 	pp.run_init(&state, header.seed, cat.hash, cat.balance.logic_hz)
+ 	seed_fixture(&state, cat) // identical fixture (run setup, re-created on every replay)
++	lower_spawns(&state, demo_spawns, cat.balance.logic_hz) // identical demand (run setup)
+ 	for cmd in cmds {
+ 		append(&state.action_log, cmd)
+ 	}
+@@ -195,10 +234,12 @@ replay_hashes :: proc(lpath: string, cat: ^pp.Catalogs, ticks: u64,
+ }
+ 
+ // verify_replay — the in-run gate: the blessed log reproduces the live hashes.
+-verify_replay :: proc(demo_name: string, cat: ^pp.Catalogs, live_hashes: []u64) -> bool {
++// The demo's spawns are re-created as flow demand in the replay (run setup).
++verify_replay :: proc(demo_name: string, cat: ^pp.Catalogs, demo_spawns: []Spawn_Intent,
++                     live_hashes: []u64) -> bool {
+ 	fails := make([dynamic]string, context.temp_allocator)
+ 	defer delete(fails)
+-	replayed, ok := replay_hashes(log_path(demo_name), cat, u64(len(live_hashes)), &fails)
++	replayed, ok := replay_hashes(log_path(demo_name), cat, u64(len(live_hashes)), demo_spawns, &fails)
+ 	defer delete(replayed)
+ 	if !ok {
+ 		for f in fails {
+@@ -221,7 +262,8 @@ verify_replay :: proc(demo_name: string, cat: ^pp.Catalogs, live_hashes: []u64)
+ }
+ 
+ // run_replay — standalone: `harness replay <demo> <log.bin>`. Manifest-driven,
+-// full length; the bit-for-bit ODN-11 check.
++// full length; the bit-for-bit ODN-11 check. Re-parses the demo so the flow
++// demand is re-created identically (run setup).
+ run_replay :: proc(demo_name, lpath: string, cat: ^pp.Catalogs) -> i32 {
+ 	man, okm := read_manifest(manifest_path(demo_name))
+ 	if !okm {
+@@ -233,9 +275,10 @@ run_replay :: proc(demo_name, lpath: string, cat: ^pp.Catalogs) -> i32 {
+ 			man.ticks, len(man.hashes))
+ 		return 1
+ 	}
++	demo_spawns := load_demo_spawns(demo_name)
+ 	fails := make([dynamic]string, context.temp_allocator)
+ 	defer delete(fails)
+-	replayed, ok := replay_hashes(lpath, cat, u64(man.ticks), &fails)
++	replayed, ok := replay_hashes(lpath, cat, u64(man.ticks), demo_spawns[:], &fails)
+ 	defer delete(replayed)
+ 	if !ok {
+ 		for f in fails {

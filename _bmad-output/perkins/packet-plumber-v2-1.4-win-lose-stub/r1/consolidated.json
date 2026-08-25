@@ -1,0 +1,121 @@
+{
+  "job": "packet-plumber-v2-1.4-win-lose-stub",
+  "round": 1,
+  "pr": 24,
+  "reviewed_sha": "0b125e2b01472343bbc9119323787fff5fe22ff4",
+  "diff_source": "gh pr diff 24 (solarity-services/Packet-Plumber), 21 files +965/-263, 1540 lines",
+  "reviewers_completed": 7,
+  "reviewers_total": 7,
+  "failed_layers": [],
+  "notes_on_collection": "kimi quota DOWN this cycle -> lenses ran on zai-coding-cn/glm-5.2 (sanctioned fallback). Initial 7-concurrent dispatch tripped a glm-5.2 rate-limit 429 on the tests lens + a security lens that churned on slow `find /`; both recovered via a re-prompted 2-concurrent wave. All 7 produced valid JSON. No chunking (diff 1540 < 3000).",
+  "verification": {
+    "total_findings": 8,
+    "confirmed": 8,
+    "rejected": 0,
+    "unverifiable_speculative": 0
+  },
+  "counts": { "blockers": 0, "warnings": 2, "notes": 6 },
+  "verdict": "READY TO MERGE",
+  "verdict_reason": "0 blockers. The load-bearing spine is sound and verified: terminal-event barrier (E17) freezes correctly (step returns before state mutates -> exactly one terminal event, tested); determinism holds over the full loop incl the terminal frame (win/lose/goal/tick_cap/terminal/outcome ride the T1 hash + serialize; WIN loop byte-identical-replay unit-tested, LOSE loop golden-covered + drift-rejected); package core is engine-free (no imports in win_lose/step/flow/types/serialize); win/lose gating is independent + win-beats-lose (tested, incl the cap-only-lose regression). odin test core = 27/27; odin build app (CI mode) OK; harness drift 29/29 rejected; harness run 5/5 green (boot/flow/win/draw/lose). Findings are test-coverage completeness + harness-edge notes, not correctness defects.",
+  "findings": [
+    {
+      "title": "Missing 'retry-restores-clean-state test' (spec-named Golden contract) + app Mode FSM untested",
+      "sources": ["acceptance", "tests"],
+      "severity": "warning",
+      "category": "missing-acceptance-test / coverage-restart",
+      "location": "app/main.odin:136-178 (start_run/restart_run/fresh_seed); spec: stories-v2.md Story 1.4 'Golden: ...retry-restores-clean-state test'",
+      "evidence": "Story 1.4 names the test ('retry-restores-clean-state test'). CODE restart_run -> start_run -> run_destroy + run_init (zeroes) + fresh_seed (crypto.rand_bytes) + mode/tick/accum/drag reset. No restart_run/fresh_seed test exists; no app/*_test.odin at all. (Reviewer agreement: 2 independent lenses.)",
+      "detail": "Spec-named test artifact absent. Behavior is VERIFIED CORRECT (clean fresh-context reset, fresh crypto seed, no leakage) and core-level fresh-context is tested, but the app restart orchestration + Mode FSM transitions (Run->Game_Over, Game_Over->Run) have zero automated coverage.",
+      "recommended_fix": "Lift start_run/restart_run reset into a raylib-free core/app helper; add a headless test: run to terminal, restart, assert score=0/events cleared/terminal=false/outcome=None and a fresh seed differs. Pins the named contract.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Advisory test gate: CONCERNS",
+      "sources": ["tests"],
+      "severity": "warning",
+      "category": "coverage-gate",
+      "location": "N/A (meta)",
+      "evidence": "27 core tests pass; 0 @(test) in app/ or harness/.",
+      "detail": "P0 core sim contracts 100% (WIN/LOSE/barrier/tie/disable/cap-only). Overall ~85%. CONCERNS: named 'clean restart' contract untested (app-layer) and LOSE-loop replay is golden-only (no core unit test). Harness integration (5/5 demos, 29/29 drift) mitigates but is not unit coverage.",
+      "recommended_fix": "Add the restart test, a LOSE-loop byte-identical-replay test, and a self-delivery score test -> gate to PASS.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "win_lose_eval's own terminal guard is redundant given step's barrier (defense-in-depth)",
+      "sources": ["blind"],
+      "severity": "note",
+      "category": "redundant-guard",
+      "location": "core/win_lose.odin:36-38",
+      "evidence": "step.odin:36 `if state.terminal { return }` runs BEFORE flow_step + win_lose_eval; flow_step never sets terminal. win_lose_eval:36 repeats the check. Docstring concedes 'Idempotent via the caller's terminal guard'.",
+      "detail": "With the current call structure the inner check is unreachable. It is intentional defense-in-depth (documented), not a defect.",
+      "recommended_fix": "Optional: reword the comment to state it is intentional defense-in-depth for future direct callers, or drop it.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Demo win-goal >= 2^32 silently truncates via u32(v) (no range guard)",
+      "sources": ["edge"],
+      "severity": "note",
+      "category": "integer-overflow",
+      "location": "harness/demo.odin:142",
+      "evidence": "`v, ok := strconv.parse_uint(fields[2], 10)` ... `d.win_goal = u32(v)` (uint->u32, no range check).",
+      "detail": "An out-of-range goal in a .dem fixture truncates (e.g. 4294967296 -> 0 -> WIN disabled). Harness demo-fixture parse path only; not core, not untrusted input. Impact nil in practice (goals are small packet counts).",
+      "recommended_fix": "Range-check before the cast (v > uint(u32(max)) -> the existing 'bad win goal' parse error).",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Sub-tick lose cap_ms floors to tick_cap 0, silently disabling lose (harness-only)",
+      "sources": ["edge"],
+      "severity": "note",
+      "category": "boundary-value",
+      "location": "harness/run.odin:176",
+      "evidence": "`state.tick_cap = u64(max(0, cfg.cap_ms * i64(hz) / 1000))`; win_lose treats tick_cap==0 as 'no cap'.",
+      "detail": "A cap_ms < 1000/hz (e.g. 25ms @ 20Hz) integer-divides to 0 -> lose disabled. HARNESS/DEMO path only (parsing 'lose cap <n>ms' from .dem); the playable app uses LOSE_TICK_CAP ticks directly (app/main.odin:31,143), unaffected. Low impact.",
+      "recommended_fix": "Floor to 1 tick when cap_ms > 0 (max(1, ...)) so any set cap still loses, or reject sub-tick caps in parse_demo.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "App Mode FSM transitions (Run<->Game_Over) untested",
+      "sources": ["tests"],
+      "severity": "note",
+      "category": "coverage-fsm",
+      "location": "app/main.odin:97-111,172-178",
+      "evidence": "`if app.state.terminal { app.mode = .Game_Over }` and `if rl.IsKeyPressed(.R)||.ENTER { restart_run(app) }`.",
+      "detail": "Driving core flags (terminal/outcome) are unit-tested; the app FSM transitions are not. Related to the restart-coverage warning. Acceptable for a stub, honest gap.",
+      "recommended_fix": "Unit-test the mode-decision logic decoupled from raylib input/render to pin the transitions.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "LOSE-loop byte-identical replay is golden-only; no core unit test mirroring the WIN test",
+      "sources": ["tests"],
+      "severity": "note",
+      "category": "coverage-replay-lose",
+      "location": "core/win_lose_test.odin:199 (test_win_loop_replay_byte_identical)",
+      "evidence": "win_lose_test pins replay for the WIN loop only (contract (f)). The LOSE loop's terminal frame + frozen post-terminal ticks are covered by the harness golden lose.t1 (drift-check rejects lose mutations), not by a core test.",
+      "detail": "Determinism over the LOSE loop IS verified (golden + drift), but there is no core unit test mirroring test_win_loop_replay_byte_identical for LOSE. Completeness gap, not a determinism break.",
+      "recommended_fix": "Add test_lose_loop_replay_byte_identical: incomplete graph + tick_cap, assert live==replay hash sequence incl the frozen tail.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Degenerate 'spawned at own dst' score increment (flow.odin:151) untested",
+      "sources": ["tests"],
+      "severity": "note",
+      "category": "coverage-self-delivery",
+      "location": "core/flow.odin:148-151",
+      "evidence": "`if p.at_node == p.dst { p.delivered = true; state.score += 1 }` (the second score increment, a 1.4 behavior).",
+      "detail": "No test seeds a self-dst spawn; only the normal delivery score (flow.odin:142) is exercised by test_win_on_goal_reached. A 1.4 behavior change with no test.",
+      "recommended_fix": "Add a test spawning a packet whose src==dst and assert score increments + Run_Won when goal is met.",
+      "verification": "confirmed"
+    }
+  ],
+  "carry_forward_out_of_scope": [
+    "`odin build app -vet` fails on an unused `import \"core:strings\"` in app/main.odin — but the import is PRE-EXISTING in base v2 (0 usages there too), NOT introduced by this PR, and CI uses `odin build app` (no -vet). Carry-forward / out of scope (do not block)."
+  ],
+  "load_bearing_properties_verified": [
+    "Terminal-event barrier (E17): step.odin:36 returns before state.tick mutation -> exactly one terminal event; tested (test_terminal_barrier_one_event_per_run).",
+    "Determinism over full loop incl terminal frame: score/goal/tick_cap/terminal/outcome ride T1 hash (serialize.odin:84-88); WIN loop byte-identical-replay unit-tested; LOSE loop golden+drift-covered.",
+    "package core engine-free (ODN-1): win_lose/step/flow/types/serialize have NO imports.",
+    "Win/lose independent gating + win-beats-lose: win_lose.odin:43-58; tested incl test_cap_only_lose_with_no_goal (the regression the minion self-fixed).",
+    "Restart clean: run_destroy + run_init(zeroes) + fresh crypto seed + reset (app/main.odin start_run/restart_run/fresh_seed).",
+    "odin test core = 27/27; odin build app (CI) OK; harness drift 29/29; harness run 5/5 (boot/flow/win/draw/lose)."
+  ]
+}

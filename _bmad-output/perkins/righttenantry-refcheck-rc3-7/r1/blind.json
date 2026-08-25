@@ -1,0 +1,72 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "missing-definition",
+    "title": "trigger.gleam calls opt_to_str but the diff defines it only in form_handler.gleam",
+    "location": "server/src/reference_checks/trigger.gleam:cross_application_reuse",
+    "evidence": "+    sql.count_cross_application_contact_reuse(\n+      db,\n+      app_uuid,\n+      this_ref.name,\n+      opt_to_str(this_ref.email),\n+      opt_to_str(this_ref.phone),\n+    )\n--- form_handler.gleam (the only definition in the diff): ---\n+/// None -> '' (the SQL TEXT-param convention).\n+fn opt_to_str(o: Option(String)) -> String {\n+  case o {\n+    Some(s) -> s\n+    None -> \"\"\n+  }\n+}",
+    "detail": "cross_application_reuse in trigger.gleam calls opt_to_str, but the diff adds only opt_nonempty and parse_count to trigger.gleam; opt_to_str is defined solely in form_handler.gleam (module-private). Unless it pre-exists in trigger.gleam, this won't compile.",
+    "recommended_fix": "Add opt_to_str to trigger.gleam, or move opt_to_str/opt_nonempty/parse_count/cross_application_reuse into a shared module imported by both files."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "duplicated-helpers",
+    "title": "cross_application_reuse + opt_nonempty + parse_count duplicated verbatim across form_handler.gleam and trigger.gleam",
+    "location": "server/src/reference_checks/form_handler.gleam & trigger.gleam",
+    "evidence": "form_handler.gleam:\n+fn cross_application_reuse(\n+  db: pog.Connection,\n+  app_uuid: uuid.Uuid,\n+  this_ref: fraud.RefContact,\n+) -> Bool {\ntrigger.gleam:\n+fn cross_application_reuse(\n+  db: pog.Connection,\n+  app_uuid: Uuid,\n+  this_ref: fraud.RefContact,\n+) -> Bool {",
+    "detail": "cross_application_reuse, opt_nonempty, and parse_count are defined with identical bodies in both form_handler.gleam and trigger.gleam. The two copies will drift; a bug fix in one won't propagate to the other.",
+    "recommended_fix": "Extract these helpers (plus opt_to_str) into fraud.gleam or a shared helper module, and import from both call sites."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "nullable-decode-crash",
+    "title": "submitted_ip_text/submitted_user_agent selected without COALESCE but decoded as non-optional String",
+    "location": "server/src/reference_checks/sql/get_form_context_by_form_token.sql",
+    "evidence": "+       a.submitted_ip_text,\n+       a.submitted_user_agent,\n...versus the decoder (non-optional):\n+    use submitted_ip_text <- decode.field(26, decode.string)\n+    use submitted_user_agent <- decode.field(27, decode.string)\n...and the row type:\n+    submitted_ip_text: String,\n+    submitted_user_agent: String,\n...while sibling columns ARE coalesced:\n+       COALESCE(rc.fraud_signals::text, '') AS fraud_signals,\n+       COALESCE((EXTRACT(EPOCH FROM (now() - rc.form_opened_at))::int)::text, '') AS completion_seconds,",
+    "detail": "The SQL selects a.submitted_ip_text and a.submitted_user_agent raw; the decoder uses decode.string (non-optional). If either column is NULL, the form-context fetch fails and the referee cannot submit. The sibling columns are COALESCE'd, these two are not.",
+    "recommended_fix": "COALESCE both columns to '' (matching fraud_signals/completion_seconds), or switch the decoder to decode.optional and the row fields to Option(String)."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "comment-code-mismatch",
+    "title": "effective_contact comment claims snapshot fallback for corrected='' but code returns None",
+    "location": "server/src/reference_checks/form_handler.gleam:effective_contact",
+    "evidence": "+/// Effective contact = corrected value when present, else the\n+/// snapshot (AD-7). A corrected '' is treated as absent (falls back to the\n+/// snapshot).\n+fn effective_contact(\n+  corrected: Option(String),\n+  snapshot: Option(String),\n+) -> Option(String) {\n+  case corrected {\n+    Some(c) -> opt_nonempty(c)\n+    None -> snapshot\n+  }\n+}",
+    "detail": "The doc says corrected='' falls back to the snapshot, but Some(c) -> opt_nonempty(c) returns None for '' — the snapshot branch (None -> snapshot) only runs when corrected is itself None. The stated fallback never fires for an empty correction.",
+    "recommended_fix": "Implement the documented fallback (Some('') -> snapshot), or correct the comment to state corrected='' yields None, not the snapshot."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "undeclared-key",
+    "title": "device_fingerprint_match_strength emitted but absent from the AD-10 table that says 'exactly these keys'",
+    "location": "server/src/reference_checks/fraud.gleam:form_session_block",
+    "evidence": "spec (in-diff):\n+The object stored at `result.fraud_signals` + the denormalised `reference_call.fraud_signals` column is exactly these keys (voice absent, referee_contact_invalid absent until it fires).\ncode:\n+    #(\"device_fingerprint_match_strength\", json.string(\"weak\")),",
+    "detail": "The spec says the fraud_signals object holds 'exactly these keys' and the AD-10 table lists four form_session keys. The code emits a fifth, device_fingerprint_match_strength, declared nowhere in the table. (referee_ip/referee_user_agent are sanctioned by D5; this one is not.)",
+    "recommended_fix": "Add device_fingerprint_match_strength to the AD-10 table/spec, or drop it and surface the 'weak' caveat via device_fingerprint_match alone."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "spec-code-divergence",
+    "title": "spec promises fraud.with_referee_contact_invalid (Gleam fn + unit test); code delivers a SQL stamp, Gleam fn absent",
+    "location": "server/src/reference_checks/fraud.gleam",
+    "evidence": "spec OWNS item 4:\n+   - `with_referee_contact_invalid(json) -> json.Json` — stamps the flag (the RC4.3 hook).\nAC5:\n+> **Given** `fraud.with_referee_contact_invalid`\nimplementation instead:\n+pub fn stamp_referee_contact_invalid(",
+    "detail": "Spec OWNS item 4 and AC5 reference fraud.with_referee_contact_invalid plus a stamping unit test. The implementation delivers stamp_referee_contact_invalid.sql instead; fraud.gleam has no such function and the only unit test asserts absence, not stamping.",
+    "recommended_fix": "Add fraud.with_referee_contact_invalid + its unit test as specified, or revise the spec/AC to name the SQL stamp as the delivered mechanism."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-type-mismatch",
+    "title": "stamp_creation_fraud_signals doc says 'non-optional String' but the generated type is Json (directive says TEXT)",
+    "location": "server/src/reference_checks/sql.gleam:stamp_creation_fraud_signals",
+    "evidence": "+/// Squirrel types fraud_signals as non-optional String (the JSON text); pass\n+/// the JSON serialised to a string.\n...\n+pub fn stamp_creation_fraud_signals(\n+  db: pog.Connection,\n+  arg_1: Uuid,\n+  arg_2: Json,\n) -> Result(pog.Returned(StampCreationFraudSignalsRow), pog.QueryError) {\nSQL directive:\n+--- stamp_creation_fraud_signals(reference_call_id: UUID, fraud_signals: TEXT)",
+    "detail": "The hand-written doc above stamp_creation_fraud_signals says the param is a 'non-optional String', but the generated signature is arg_2: Json and the SQL directive says TEXT. The three disagree about the parameter type.",
+    "recommended_fix": "Correct the doc to read Json, and align the SQL directive to JSON/JSONB so a Squirrel regen keeps the Json type and stays consistent."
+  }
+]

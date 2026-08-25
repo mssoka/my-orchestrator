@@ -1,0 +1,335 @@
+{
+ "job": "packet-plumber-v2-3.3-contention",
+ "round": 1,
+ "pr": 32,
+ "reviewed_sha": "ffc9b7b91c1719e98c696b898d62fbc55436a314",
+ "diff_file": "/Users/moses/code/_bmad-output/perkins/packet-plumber-v2-3.3-contention/r1/diff.patch",
+ "chunking": "diff 7648 lines > ~3000 => five file-group chunks, one full 7-lens wave each, sequentially: chunk1 = core+data (1202 lines, 12 files), chunk2 = spec+app+harness+demos (1050 lines, 6 files), chunk3 = light-demo goldens (1348 lines, 32 files), chunk4 = qos golden (3020 lines, 4 files), chunk5 = contention/emphasis/win goldens (1029 lines, 13 files). Findings merged before verification.",
+ "worktree": "/Users/moses/.herdr/worktrees/packet-plumber/perkins-v2-3.3-contention-r1",
+ "reviewers_completed": 35,
+ "reviewers_total": 35,
+ "failed_layers": [],
+ "total_findings": 60,
+ "unique_after_dedupe": 58,
+ "verified_confirmed": 46,
+ "rejected": 12,
+ "unverifiable_speculative": 0,
+ "counts": {
+  "blocker": 0,
+  "warning": 5,
+  "note": 18
+ },
+ "verdict": "READY TO MERGE",
+ "verdict_reason": "0 blockers. All load-bearing invariants verified independently at ffc9b7b: (1) ODN-11 re-bless PROVEN at the byte level with a sandbox splice-proof \u2014 all 9 light demos' OLD logs replayed with the NEW code + the OLD catalog_hash forced reproduce every old .t1 hash bit-for-bit (boot/bundle/demolish/draw/ecmp/flow/lose/place/win: zero sim drift; the per-tick line shifts are exactly the embedded catalog_hash field, which rides every state hash), while qos/qos_emphasis genuinely DIVERGE at tick 4 (the documented contention reason (c) is real \u2014 serialization engages after the pipes draw); the ecmp 'contention' claim is over-broad (its shift is pure catalog binding \u2014 4 packets can never fill a 6-bound lane queue), but the bytes are honest. (2) T2 re-bless verified: harness 12/12 demos green at the sha (boot..demolish incl. qos_contention T1+T2+replay gate); the qos_contention 1000ms/10000ms captures being byte-identical is a faithful render of a periodic steady state (probe: 13 in-flight at both ticks, identical geometry \u2014 packet ids differ, positions don't), NOT staleness. (3) E7 no-starvation: pinned (lone packet full capacity in every lane; continuous-Express rider gets its budget every window). (4) E9 ladder: all 21 combos + the double-shed distinct-index pin green; shed target = lowest-priority non-empty lane's NEWEST, arrival self-drops when it IS the target. (5) E22 strict-priority: Case A (BE resident pays) + Case C (all-Express pool never sheds for a Standard arrival) pinned. (6) E10: LOG_VERSION 3, tag-conditional Packet_Dropped payload (writes ONLY for tag 4), zero new serialized state (queues/lanes/budgets derived), drift-check 83/83 mutations rejected, replay gates green. (7) odin test core 85/85 (84 + the Perkins splice probe), app+harness build green, lint 5/5. The 5 warnings are bounded: a one-window work-conservation idle when a lane is skip-only (not starvation), a visual snap artifact in the lane-speed lerp for Standard/Best, a stale spec Always-section wording on E22 admission, and two test-pin gaps (no core replay-with-drops pin as the spec claims; E9 shed-target identity asserted by class/count not packet id) \u2014 the last mitigated by the harness replay gate.",
+ "findings": [
+  {
+   "sources": [
+    "blind"
+   ],
+   "severity": "warning",
+   "category": "e7-work-conserving",
+   "title": "WRR window idles a skip-only lane's budget: a lane whose packets all forwarded this tick is 'ready' but unservable, so its WFQ share never flows to waiting lanes (gap-fill claim contradicted)",
+   "location": "core/flow.odin:619-652 (serve window + serve_bundle_lane skip) / core/qos.odin:745 (qos_serialize)",
+   "evidence": "core/flow.odin:637-650: `ready := bundle_lane_ready(state, cat, bi)` / `budget := qos_serialize(caps, ready, remaining)` / `window_served += serve_bundle_lane(state, cat, tick, bi, u8(lane), budget[lane], forwarded[:])` / `if window_served == 0 { break }`. bundle_lane_ready counts a this-tick joiner as ready; serve_bundle_lane skips it via `forwarded`; qos_serialize allocates its budget anyway. PERKINS PROBE (sandbox): one BE packet on-edge servable + one Express packet joining this tick -> BE progress 10/15 after the service tick, 5 units idle while a packet waits (spec claims 'the pipe is never idle while a packet waits').",
+   "detail": "A lane whose whole queue joined this tick is ready-but-unservable: qos_serialize budgets it, serve returns 0, and window_served==0 breaks the loop with capacity idle. Bounded (one window), not starvation; E7 pins + light-demo transits unchanged.",
+   "recommended_fix": "Exclude this-tick forwarded ids from bundle_lane_ready, or donate a skip-only lane's unserved budget to the next servable lane in the window.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "blind"
+   ],
+   "severity": "warning",
+   "category": "render-speed",
+   "title": "Lane-speed per-mille scaling makes Standard/Best packets visually snap to the arrival node \u2014 the along-edge lerp never reaches frac 1.0 for lanes with ppm < 1000, so the 'ride end-to-end at lane speed' canon read is degraded",
+   "location": "app/render/view.odin:368-377",
+   "evidence": "app/render/view.odin:370-376: `ppm := v.palette.lane_speeds[lane]` / `if ppm > 0 { frac = min(1.0, frac * f32(ppm) / 1000.0) } else { frac = 0 }` / `pos = {depart.x + dx * frac, depart.y + dy * frac}`. palette.json lane_speeds = [1000, 850, 700]: a Standard packet at sim frac 1.0 draws at 0.85 of the edge, Best at 0.70 \u2014 the drawn position caps short of the arrival node, then the next tick's at-node draw snaps it there.",
+   "detail": "Express (ppm 1000) rides the full edge; Standard (850) and Best (700) visually stop 15%/30% short and teleport to the node on arrival. Speed ordering is correct (canon 8ece056), the artifact is the endpoint snap \u2014 a visual-fidelity issue, not a sim defect.",
+   "recommended_fix": "Scale by an arrival-anchored mapping (e.g. offset the lerp so frac reaches 1.0 at the arrival tick regardless of ppm), or document the snap as the intended lane-speed readout.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "blind"
+   ],
+   "severity": "warning",
+   "category": "spec-contradiction",
+   "title": "Spec E22 Always section and I/O matrix disagree on admission when the arrival's lane is empty \u2014 the Always bullet omits the strict-priority rule the code + Case C pin implement",
+   "location": "spec-3-3-contention.md:26 (Always bullet) vs :44 (I/O matrix E22 row)",
+   "evidence": "Always bullet: 'the arriving packet drops when it is the shed target (its lane is the lowest non-empty)'. I/O matrix: 'the arrival is admitted ONLY when that target is STRICTLY lower priority than its own lane, else the arrival drops (the inversion guard \u2014 an Express resident never pays for a Standard arrival)'. Code (flow.odin:410-436): `if shed_idx >= 0 && shed_lane > arrive_lane { ... } else { ... return false }` + Case C pin (qos_test.odin:617-640).",
+   "detail": "For an all-Express pool + Standard arrival with an EMPTY Standard lane, the Always wording implies admission (arrival isn't the shed target); the code + matrix + Case C pin drop the arrival. The Always bullet is stale/incomplete on the load-bearing strict rule.",
+   "recommended_fix": "Reword the Always E22 bullet to state the strict-priority rule exactly as the I/O matrix does (admit only when the target is strictly lower priority).",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "tests"
+   ],
+   "severity": "warning",
+   "category": "coverage-e10",
+   "title": "Replay-with-drops [E10] has no core pin \u2014 the spec code map claims one that does not exist",
+   "location": "core/qos_test.odin:323-355 (test_qos_replay_byte_identical) | spec-3-3-contention.md:71",
+   "evidence": "spec:71: 'core/qos_test.odin -- E7/E9/E22 pins + replay-with-drops pin'. test_qos_replay_byte_identical seeds ONLY the fixture + 2 draws + emphasis + lane (zero demand, zero spawns, zero drops) \u2014 no drop ever fires in the 30-tick record. The harness replay gate DOES cover drops end-to-end (qos_contention replays bit-for-bit, 12/12 green), so E10-with-drops is verified at the integration level; the claimed core pin does not exist.",
+   "detail": "Spec claims a core replay-with-drops pin; the replay test exercises commands only. The harness replay gate covers the property, so this is a spec-accuracy + unit-coverage gap, not an unverified E10.",
+   "recommended_fix": "Either drive an E9/E22 drop scenario through record_run live-vs-replay in qos_test.odin, or correct the spec code map to attribute drop-replay coverage to the harness gate.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "tests"
+   ],
+   "severity": "warning",
+   "category": "coverage-e9",
+   "title": "E9 shed-target identity unpinned \u2014 all 21 combos assert dropped CLASS/count, never which packet (the NEWEST tail)",
+   "location": "core/qos_test.odin:502-582 (test_qos_drop_ladder_e9), :657-710 (double-shed)",
+   "evidence": "test_qos_drop_ladder_e9 asserts `count_drops(&s, class_of[shed_lane], .Queue_Overflow) == 1` and queue totals \u2014 never the parked packet ids returned by queue_packet. A regression that shed the OLDEST (instead of the NEWEST tail) would pass every combo (all parked packets in a lane share the class). The double-shed test asserts two DISTINCT sheds via count==2, not identity.",
+   "detail": "The E9 contract's 'NEWEST' selection is the load-bearing half of the ladder; it is only exercised implicitly. A wrong-end shed would ship green.",
+   "recommended_fix": "Capture queue_packet return ids in the combos and assert the specific newest parked id is gone (and the arrival's id when it self-sheds).",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "edge",
+    "security",
+    "codebase"
+   ],
+   "severity": "note",
+   "category": "catalog-validation",
+   "title": "New E9/E22 balance keys parse via legacy truncating jint \u2014 a decimal silently truncates past the documented fail-fast '> 0' check",
+   "location": "core/catalog.odin:487,491 (jint at 676-683)",
+   "evidence": "core/catalog.odin:487: `b.lane_queue_packets = jint(obj, \"lane_queue_packets\", 0)`; :491: `b.pool_max_packets = jint(obj, \"pool_max_packets\", 0)`; jint (676-683) casts `case json.Float: return i32(x)` \u2014 a decimal 6.9 silently becomes 6 and passes the `<= 0` rejection. The 3.1 packet_types loader uses jint_strict for the same reason (catalog.odin:331-336).",
+   "detail": "New keys follow the old balance.json jint convention, not the 3.1 jint_strict bar; a fractional value in balance.json silently truncates instead of failing loud. Repo-owned data, low impact.",
+   "recommended_fix": "Parse both new keys with jint_strict (reject json.Float), matching the packet_types loader; add a decimal fail-fast test row.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "acceptance",
+    "codebase",
+    "tests"
+   ],
+   "severity": "note",
+   "category": "demo-authoring",
+   "title": "qos_contention.dem header claims pipe 0 is oversubscribed ~2.4x; the catalog math yields ~4x peak (60 units/tick demand vs 15 offer)",
+   "location": "demos/qos_contention.dem:2-3",
+   "evidence": "Comment: 'Pipe 0 (res 0 -> router 1) is oversubscribed ~2.4x'. Math: spawns every 25ms (2/tick @20Hz) alternating email 0->2 and streaming 2->0, both crossing pipe 0; each packet needs packet_bandwidth 30 units; standard cap 15 -> peak 2*30=60 units/tick demanded vs 15 offered = 4.0x (avg over the burst ~1.7x). The demo still saturates and drops BE first as intended \u2014 the header number is just wrong.",
+   "detail": "Documentation inaccuracy in the launchable's header comment; the demo's behavior (saturation, BE-first drops) is correct.",
+   "recommended_fix": "Correct the comment to ~4x peak (or state the average), or retune the spawn cadence to the claimed 2.4x.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "acceptance"
+   ],
+   "severity": "note",
+   "category": "memory",
+   "title": "load_demo_replay leaks the demo nodes/draws/spawns dynamic arrays",
+   "location": "harness/run.odin:383-396",
+   "evidence": "load_demo_replay appends demo.nodes/demo.spawns into cfg but deletes only `delete(demo.demolishes); delete(demo.emphasis); delete(demo.lanes); delete(demo.captures)` before `return cfg` \u2014 demo.nodes, demo.draws, demo.spawns, demo.places backing arrays leak on every standalone replay/drift path.",
+   "detail": "One-shot harness process (leak is reclaimed at exit), but the drift-check loop and any long-lived replay session accumulate the demo arrays.",
+   "recommended_fix": "delete(demo.nodes); delete(demo.draws); delete(demo.spawns); delete(demo.places) before returning cfg (mirror demo_replay_destroy).",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "edge"
+   ],
+   "severity": "note",
+   "category": "parse-error-leak",
+   "title": "parse_demo error returns discard the 3.3 spawn-class clones (and the partially-built Demo's other clones)",
+   "location": "harness/demo.odin:259-272 (spawn class clone) + every `return {}, fmt.tprintf` in parse_demo",
+   "evidence": "parse_demo makes 8 dynamic arrays up front and clones strings (spawn class at :272 `cls = strings.clone(fields[5])`, spawn_node/place type names); every error path `return {}, fmt.tprintf(...)` returns without freeing any of them. Error-path-only (a malformed demo aborts the run).",
+   "detail": "Error-path leak in the demo parser; a malformed demo leaks the partial parse. One-shot harness context.",
+   "recommended_fix": "Free the dynamic arrays + cloned strings before each error return (or parse into a temp arena).",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "acceptance",
+    "architecture",
+    "edge",
+    "codebase"
+   ],
+   "severity": "note",
+   "category": "demo-capture",
+   "title": "qos_contention 10000ms.png is byte-identical to 01000ms.png \u2014 the third T2 capture pins no additional state (periodic steady state, faithful render)",
+   "location": "goldens/qos_contention/01000ms.png == goldens/qos_contention/10000ms.png (md5 ebce0e7d...)",
+   "evidence": "md5 goldens/qos_contention/01000ms.png = ebce0e7d... == 10000ms.png. Perkins probe: 13 in-flight packets at both tick 20 (1000ms) and tick 200 (10000ms) with identical geometry (same lanes/edges/progress classes \u2014 only packet ids differ), so the render is correctly identical: the demo is a periodic steady state, not a stale capture (03000ms.png differs, and every T1 hash differs per tick).",
+   "detail": "Faithful render of a periodic steady state; the 10000ms capture is redundant as a golden (adds no new pixels). The drop evidence lives in the T1 stream, not this frame.",
+   "recommended_fix": "Move the third capture to a transition instant (e.g. 700ms mid-burst or 1500ms post-burst drain) so the golden set shows more than one phase.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "codebase"
+   ],
+   "severity": "note",
+   "category": "demo-capture",
+   "title": "qos T2 captures at 1000ms and 65000ms are 99.97% identical \u2014 the x10 streaming surge is visible only in the T1 drop stream, not in T2 pixels",
+   "location": "goldens/qos/01000ms.png vs goldens/qos/65000ms.png (318/921600 px differ, bbox (634,354)-(728,461))",
+   "evidence": "Per-lens measurement: 318/921600 differing pixels (0.03%); identical packet blobs at identical positions in both frames; drops are spliced out of the render (no drop marker) and the queue is at its bound at both capture instants. The surge's evidence lives in the 1500 re-blessed T1 hashes.",
+   "detail": "The launchable's 'watch best-effort drop first' story is not legible in the qos T2 captures (no drop marker is rendered); the T1 hash stream carries it. Faithful, but a visibility gap for the demo's purpose.",
+   "recommended_fix": "Render a transient drop marker (e.g. a fading X at the shed position) so T2 captures show the ladder, or accept T1-only evidence and say so in the demo header.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "architecture",
+    "codebase",
+    "acceptance"
+   ],
+   "severity": "note",
+   "category": "docs-wording",
+   "title": "Spec's 'catalog_hash header re-bless is the only T1 shift' is literal-false: catalog_hash rides INSIDE every per-tick state hash, so ALL per-tick lines shift (the shift is exactly the binding, zero sim drift \u2014 proven)",
+   "location": "spec-3-3-contention.md:29 (Determinism spine bullet) vs core/serialize.odin:88",
+   "evidence": "spec:29: 'existing light demos' T1 stays byte-identical (catalog_hash header re-bless is the only T1 shift)'. core/serialize.odin:88: `w_u64(&w, state.catalog_hash)` inside state_writer \u2014 the hash field is part of the per-tick state hash, so a header change shifts EVERY line. Perkins splice-proof: old log + new code + old hash reproduces all 9 light demos' old .t1 bit-for-bit.",
+   "detail": "The claim's INTENT (zero sim behavior change) is verified true; the wording 'only the header line shifts' is mechanically wrong and misleads future re-bless reviewers.",
+   "recommended_fix": "Reword to 'the only T1 shift is the catalog_hash binding, which rides every per-tick hash line; zero sim behavior changes'.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "codebase"
+   ],
+   "severity": "note",
+   "category": "docs-accuracy",
+   "title": "'Contention shifts in ecmp' over-claims: ecmp's traffic can never engage E9/E22 (4 packets total vs lane bound 6, pool 512), and its T1 shift is pure catalog binding (splice-proven)",
+   "location": "demos/ecmp.dem:31-34 | spec-3-3-contention.md re-bless reason (c)",
+   "evidence": "ecmp.dem spawns exactly 4 packets (0->3 x4) over a 4000ms run on a diamond; lane_queue_packets=6, pool_max_packets=512 -> the ladder can never fire. Perkins splice: ecmp's old log + new code + old hash reproduces the old ecmp.t1 bit-for-bit, so its re-bless is the catalog binding only. The minion's reason (c) lists ecmp as a contention shift.",
+   "detail": "The re-bless bytes are honest (proven); the documented REASON for ecmp is inaccurate. A future reviewer reading reason (c) would expect contention in ecmp that cannot occur.",
+   "recommended_fix": "Drop ecmp from reason (c) (catalog-binding only), or add E9-engaging traffic to ecmp if contention there is desired.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "architecture"
+   ],
+   "severity": "note",
+   "category": "doc-drift",
+   "title": "Architecture doc \u00a76.3 qos_serialize interface sketch was never updated to the shipped per-window-budget contract",
+   "location": "odin-architecture-v1.md:997 | core/qos.odin:193 (shipped qos_serialize)",
+   "evidence": "odin-architecture-v1.md:997: `qos_serialize :: proc(ready: [3][]Packet_Slot) -> (order: []Packet_Slot)`; shipped (core/qos.odin): `qos_serialize :: proc(caps: [3]u32, ready: [3]bool, capacity: u32) -> (budget: [3]u32)` with the flow looping cyclic windows. The arch doc's \u00a76.3 sketch predates the 3.3 budget contract.",
+   "detail": "Planning artifact drift: the architecture's interface sketch no longer matches the shipped contract. Cosmetic for code, but the arch doc is the canon reference for future slices.",
+   "recommended_fix": "Update odin-architecture-v1.md \u00a76.3 to the shipped signature + note the cyclic-window service loop.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "architecture"
+   ],
+   "severity": "note",
+   "category": "render-readability",
+   "title": "Queued-packet pile overlaps to one dot per lane \u2014 the serialization visual shows lane membership but no queue depth",
+   "location": "app/render/view.odin:373-385 (draw_packets pos computation)",
+   "evidence": "Queued packets (on_edge, progress 0) all compute `frac = 0` -> `pos = depart` + the SAME per-lane lateral band offset -> every queued packet of a lane draws at the identical position; a 6-deep BE queue renders as one dot. The qos_contention goldens confirm: 1000ms == 10000ms with 13 in-flight packets.",
+   "detail": "The story's serialization visual ('packets visibly queue') is degraded: depth is invisible, only lane membership + lane-ordered exit read. Drops also leave no marker, compounding the T2 visibility gap.",
+   "recommended_fix": "Offset queued packets within their band (e.g. a small along-edge pile step per queue position) so depth reads; optionally a drop marker.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "security"
+   ],
+   "severity": "note",
+   "category": "input-validation",
+   "title": "palette.json lane_speeds loader validates element type but not range \u2014 a negative/zero value silently freezes that lane's packets (ppm<=0 -> frac=0)",
+   "location": "app/render/palette.odin:94-106 (parse block) + app/render/view.odin:369-376 (consumer)",
+   "evidence": "palette.odin:94-106: type-checks `arr[i].(json.Integer)` only, no range check; consumer view.odin:371-374: `if ppm > 0 { ... } else { frac = 0 }` \u2014 a negative lane_speed passes load and freezes every packet of that lane at the departure node. Repo-owned data; the whole-array fallback guards missing/partial arrays.",
+   "detail": "Data-file validation gap: an out-of-range lane_speeds value silently degrades the render instead of failing fast. Low impact (repo-owned palette).",
+   "recommended_fix": "Reject out-of-range values (e.g. not in 1..1000) at palette load, or clamp in the consumer.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-serialization",
+   "title": "Tag-conditional serialization has no byte-level pin \u2014 pre-3.3 event bytes verified only indirectly",
+   "location": "core/serialize.odin:250-257 | core/*_test.odin",
+   "evidence": "The sparse pin (qos_test.odin:207-300) checks the QoS state sections, and replay pins check hash streams \u2014 no test asserts the exact event bytes (tick 8B + tag 1B with NO payload for tags 1-3, tick 8B + tag 1B + class u16 + reason u8 = 12B for tag 4). The splice-proof + golden stability verify it behaviorally.",
+   "detail": "The append-only event contract is the E10 mechanism; a byte-level pin would catch a payload-shape regression directly. Currently only indirect coverage.",
+   "recommended_fix": "Pin canonical event bytes: a tag-1 event writes exactly 9 bytes, a tag-4 event exactly 12 bytes, in a core test.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-boundary",
+   "title": "E9 queue-full boundary at exactly lane_queue_packets-1 (5/6) untested \u2014 only empty (0/6) and exact-bound (6/6) pinned",
+   "location": "core/qos_test.odin:512-537 (test_qos_drop_ladder_e9)",
+   "evidence": "The combos park `bound` (6) packets per lane or leave lanes empty; no case parks bound-1 (5/6) in the arrival's lane to assert the arrival JOINS with count_drops==0 at the last pre-full step. The !in_combo branch covers empty-lane joins only.",
+   "detail": "The join-side boundary of the ladder (lane at bound-1 accepts, no drop) is not isolated; a subtle off-by-one in the `>=` bound check would need this case.",
+   "recommended_fix": "Add one bound-1 case: park 5 in the arrival's lane, assert the arrival joins and count_drops == 0.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-e22",
+   "title": "E22 pool guard never exercised on the director spawn path (flow_step 1b) \u2014 E22 pins drive legacy demand only",
+   "location": "core/qos_test.odin:584-656 | core/flow.odin:493 (1b director) / flow_try_spawn",
+   "evidence": "test_qos_pool_exhaustion_e22 drives `flow_seed_demand` (legacy 1a) + queue_packet parks; demand_test.odin:197-200 explicitly raises pool_max_packets=100000 so the director (1b) path never meets the backstop. flow_try_spawn is shared, so the guard logic IS covered; only the era-3 director entry is unpinned.",
+   "detail": "The guard code is common to both spawn paths (covered); the 1b integration (director + pool cap) is not pinned. Optional coverage gap.",
+   "recommended_fix": "One era-3 director run with a small pool_max_packets asserting Pool_Exhaustion drops appear and replay stays byte-identical.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-render",
+   "title": "Spatial-lane render guard paths (zero-share stroke skip, ppm<=0 freeze) are untested and unreachable with current data",
+   "location": "app/render/view.odin:234,371-375 | app/render/palette.odin:94-111",
+   "evidence": "The zero-share stroke skip (`if bands.widths[lane] <= 0 { continue }`) and the ppm<=0 freeze branch require a zero-weight lane or a non-positive lane_speeds entry; no catalog/palette ships such data and no test drives them (the repo has no app-layer test harness).",
+   "detail": "Guard paths exist but are dead with shipped data and unpinned; a future balance/palette edit could hit them silently.",
+   "recommended_fix": "Either ship a catalog case exercising them, extract the pure band math for a unit pin, or document them as defensive.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-harness",
+   "title": "Unknown spawn-class fail-loud path (lower_spawns) has zero test coverage \u2014 the 3.3 error contract is unpinned",
+   "location": "harness/run.odin:282-287",
+   "evidence": "lower_spawns returns `fmt.tprintf(\"unknown spawn class %q\", s.class)` for an unresolvable class; no test or demo exercises it (all demos use email/streaming; harness has no unit-test structure). A typo'd class in a future demo would surface only at run time.",
+   "detail": "The fail-LOUD contract for the 3.3 optional spawn class is untested; the harness has no unit-test skeleton to host it.",
+   "recommended_fix": "Add a harness-level negative test (or a core-side validation pin) for an unknown spawn class.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "codebase",
+    "tests"
+   ],
+   "severity": "note",
+   "category": "docs-code-map",
+   "title": "Spec code map misattributes pin locations: flow_test.odin has NO E7/E9/E22 pins and demand_test misattributes them too",
+   "location": "spec-3-3-contention.md:56 ('core/flow_test.odin + core/qos_test.odin -- E7/E9/E22 pins') | core/demand_test.odin:200",
+   "evidence": "core/flow_test.odin has zero E7/E9/E22 references (6 tests: forwarding/table/replay/placement only); demand_test.odin:200 comment says 'the E22 ladder has its own pins in flow_test/qos_test' \u2014 flow_test has none. All E7/E9/E22 pins live in qos_test.odin.",
+   "detail": "Docs drift: the spec code map and a demand_test comment both point at flow_test.odin as a pin home that does not exist. Misleads future coverage audits.",
+   "recommended_fix": "Correct the spec code map and the demand_test comment to attribute the pins to qos_test.odin only.",
+   "verification": "confirmed"
+  },
+  {
+   "sources": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-gate",
+   "title": "Advisory test gate: PASS (P0 100% \u2014 the two P2 gaps above are the only shortfalls)",
+   "location": "N/A",
+   "evidence": "P0 contracts all pinned: E7 (budgets + lone-packet + no-starvation), E9 (21 combos + double-shed), E22 (A/B/C), sparse serialization, replay byte-identity (commands + harness-level drops), catalog fail-fast rows for the new keys. Shortfalls: E9 shed-IDENTITY and core replay-with-drops pin (both P2; drops covered by the harness replay gate). Overall >= 80%.",
+   "detail": "The gate would be CONCERNS only if the two P2 gaps were elevated; with the harness replay gate covering drop-E10 end-to-end, PASS is the honest call.",
+   "recommended_fix": "Optional: add the shed-identity + bound-1 pins to make the unit layer airtight.",
+   "verification": "confirmed"
+  }
+ ]
+}

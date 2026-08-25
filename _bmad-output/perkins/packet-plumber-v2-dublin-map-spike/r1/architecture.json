@@ -1,0 +1,92 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "consistency",
+    "title": "Preview grid renders at 18% blend but the game's render code was retuned to 9%",
+    "location": "tools/render_dublin_preview.py:33 | app/render/view.odin:528-532",
+    "evidence": "tools/render_dublin_preview.py:33: \"GRID_ALPHA = 46       # 18% of 255 — map.odin grid blend\"; :102: \"# --- grid (18% blend over land AND water — map.odin) ---\". app/render/view.odin:528-532: \"// v2-look-polish evening pass (LEFOU): the grid was the second-loudest // element on the frame (\\\"reads as graph paper\\\") — the MM whitespace cut // halves the 7.1 blend again (18% → 9%)\" and \"grid_soft := rl.Color{ u8((u16(g.r)*9 + u16(c.r)*91) / 100),\". (Also: the game pre-blends grid toward canvas as an opaque color; the preview uses a translucent overlay.)",
+    "detail": "The briefing requires the preview to match the game's look so the user gate is honest. The grid is drawn 2× stronger than the game's actual 9% blend, citing a stale map.odin value.",
+    "recommended_fix": "Match view.odin: blend 9% grid + 91% canvas as an opaque pre-blended color, and update the comments to cite view.odin map_draw, not map.odin."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "coupling",
+    "title": "UTM→tile projection math duplicated between osm_extract.py and render_dublin_preview.py",
+    "location": "tools/osm_extract.py:363-368 | tools/render_dublin_preview.py:180-191",
+    "evidence": "osm_extract.py:363-368: \"ox0 = cxm - (BOARD_W_TILES / scale) / 2.0 ... utm_top = cym + (BOARD_H_TILES / scale) / 2.0\". render_dublin_preview.py:180-188: \"# Tile coords for crop anchors (same math as osm_extract.bake). import pyproj tr = pyproj.Transformer.from_crs(\\\"WGS84\\\", \\\"EPSG:32629\\\", always_xy=True) ... ox0 = cxm - (b[\\\"w_tiles\\\"] / scale) / 2.0 utm_top = cym + (b[\\\"h_tiles\\\"] / scale) / 2.0\".",
+    "detail": "Two hand-synced copies of the fit math (the memlog's negative-scale mirror bug lived exactly here). The preview also takes on pyproj — a bake-only dependency — solely to re-derive constants the baker already computed.",
+    "recommended_fix": "Bake the fit window (origin easting/northing + scale, or the crop anchors as tile coords) into asset.board; the preview then needs no pyproj and one implementation remains."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "single-source",
+    "title": "Board constants 40/30/26 restated in both tools despite living in balance.json and the asset itself",
+    "location": "tools/osm_extract.py:72-75 | tools/render_dublin_preview.py:30",
+    "evidence": "osm_extract.py:72-75: \"# Board size (data/balance.json map.*): the camera fits this into 1280x720. BOARD_W_TILES = 40 BOARD_H_TILES = 30 TILE_PX = 26\". render_dublin_preview.py:30: \"TILE_PX = 26          # data/balance.json map.tile_px\" — while lines 183-184 already load \"b = asset[\\\"board\\\"]\" whose board block contains \"tile_px\": 26 (verified in data/maps/dublin.json).",
+    "detail": "Violates the numbers-single-source doctrine (ODN-5): the values now live in three places. Retuning balance.json map.* silently produces a wrong-sized bake and mis-scaled previews.",
+    "recommended_fix": "osm_extract: read map.* from data/balance.json at bake time; preview: use board.tile_px from the asset it already loads."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "determinism",
+    "title": "fetched_utc derives from file mtimes, breaking the byte-identical re-bake contract",
+    "location": "tools/osm_extract.py:506,541-552",
+    "evidence": "osm_extract.py:506: \"\\\"fetched_utc\\\": _fetch_time(cache_dir),\"; 541-552: \"def _fetch_time(cache_dir: str) -> str: ... times.append(os.stat(p).st_mtime) ... return datetime.fromtimestamp(max(times), tz=timezone.utc).isoformat(timespec=\\\"seconds\\\")\". Docstring line 23: \"Determinism contract: same cached raw response -> byte-identical dublin.json.\"",
+    "detail": "mtime is environment state, not cache content: a copied/restored/re-cloned cache yields identical raw_sha256 but a different fetched_utc, so re-bakes are not byte-identical and --verify fails.",
+    "recommended_fix": "Derive fetched_utc from the raw response content (e.g. Overpass timestamps_osm_base) or drop the field; byte-identity must depend on cache content only."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "schema",
+    "title": "terrain.coast holds only beach polygons while real coastlines are folded into water; coast_rings is dead",
+    "location": "tools/osm_extract.py:375,432,467",
+    "evidence": "osm_extract.py:375: \"water_rings, coast_rings, park_rings, beach_rings = [], [], [], []\"; :432: \"if nat == \\\"coastline\\\" or ww == \\\"riverbank\\\" or nat == \\\"water\\\" ...: water_rings.append(ring)\"; :467: \"coast = merge_and_emit(beach_rings, MIN_AREA[\\\"coast\\\"])\". Asset verified: terrain.coast = 13 polygons (the beaches); coast_rings is never appended to.",
+    "detail": "For a future game-input contract (and vs map.odin's Map_Kind.Coast meaning the land-water sand band), the key 'coast' misleadingly names beach-only data; coastline geometry hides inside 'water'.",
+    "recommended_fix": "Rename the layer to 'beach', or route natural=coastline features into it explicitly; delete the unused coast_rings variable."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "schema",
+    "title": "Asset stores float coordinates while project doctrine keeps catalog sim values integer-only",
+    "location": "tools/osm_extract.py:171 | data/maps/dublin.json",
+    "evidence": "osm_extract.py:171: \"QUANT = 0.02\" (all coordinates quantized to 0.02 tile and stored as JSON floats — verified: spawn_candidates sample [0.0, 3.82], all values type float). project-context.md: \"Keep all catalog data integer-only for sim values; absent fields use explicit load-time defaults (no sentinel values).\"",
+    "detail": "Streets are ruled to constrain pipes (gameplay geometry). A future catalog consumer must re-bake to fixed-point — the exact JSON-int-to-float trap ODN-11 deletes at the root. Integer centi-tiles would be lossless now.",
+    "recommended_fix": "Store quantized integers (e.g. centi-tiles, ×50) or document the fixed-point conversion contract in the asset's board block before game wiring."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Process/workflow rulings baked into a game data asset",
+    "location": "tools/osm_extract.py:173-184 | data/maps/dublin.json",
+    "evidence": "osm_extract.py:173-184: \"# User rulings (lavish gate 2026-08-23) — baked into the asset so the # follow-up minion reads them where they matter. ... RULINGS = { \\\"gate_verdict\\\": \\\"APPROVE\\\", ... \\\"gate_page\\\": \\\"lavish dublin-gallery (the look gate)\\\", ...\" — emitted verbatim into data/maps/dublin.json's top-level \"rulings\" block (verified in the asset).",
+    "detail": "data/ is the game-catalog space (embedded via #load() in release builds). Gate verdicts and gallery provenance are process state, already recorded in _bmad-output field notes; a future loader must ignore them.",
+    "recommended_fix": "Keep gate verdicts and density rulings in _bmad-output field notes; keep dublin.json purely geometric plus attribution/license/extract provenance."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "`if args.bake or True:` makes the documented --bake flag a no-op",
+    "location": "tools/osm_extract.py:586",
+    "evidence": "osm_extract.py:586: \"    if args.bake or True:\" — followed unconditionally by fetch_raw/bake/verify, while the docstring advertises \"tools/osm_extract.py --bake      # bake data/maps/dublin.json from the cached raw (or fetch)\".",
+    "detail": "The always-true guard is a lint-visible smell and the documented flag semantics (bake-from-cache without verify, fetch-only vs bake) are not actually implemented distinctly.",
+    "recommended_fix": "Drop the dead condition — run the default path unconditionally — or actually honor --bake (e.g. skip verify, or skip the fetch-if-missing behavior)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "robustness",
+    "title": "hex_to_rgba silently falls back to opaque black on missing palette tokens",
+    "location": "tools/render_dublin_preview.py:52-55",
+    "evidence": "render_dublin_preview.py:52-55: \"def hex_to_rgba(palette, key): v = palette.get(key) if v is None or len(v) < 4: return (0, 0, 0, 255) return tuple(int(x) for x in v)\".",
+    "detail": "This tool exists to make the user gate honest; a renamed/removed token (this project actively churns palette tokens) would silently render black terrain and skew the look verdict instead of failing.",
+    "recommended_fix": "Fail fast (raise) on a missing or malformed token, matching the game's fail-fast catalog validation."
+  }
+]

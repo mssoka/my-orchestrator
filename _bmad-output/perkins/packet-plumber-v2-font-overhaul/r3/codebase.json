@@ -1,0 +1,82 @@
+[
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "fix-audit-half-fold",
+    "title": "N11 fold is fictitious: gallery.retries is a dead field, GALLERY_MAX_RETRIES does not exist, and the stage machine still retries unbounded",
+    "location": "app/gallery.odin:57 + app/gallery.odin:236-239 (gallery_frame)",
+    "evidence": "app/gallery.odin:57:\n\tretries:  int, // N11: the condition-poll frame budget (GALLERY_MAX_RETRIES)\n\ngallery_frame polls never touch it (same for .Select_Release/.Noc/.Deselect/.Settings):\n\tcase .Draw_Release:\n\t\tif !pipe_live(app) {\n\t\t\tgallery.wait = 5 // the commit lands via the executor — poll\n\t\t\treturn false\n\t\t}\n\nrepo-wide grep 'retries' (excluding audio): only app/gallery.odin:57 — the field is never read or written; grep 'GALLERY_MAX_RETRIES': only the comment on line 57.",
+    "detail": "b4154c3 claims N1-N15 folded, but the N11 mechanism is absent: no constant, no counter, no abort. The unbounded condition-poll hang r1 flagged remains byte-for-byte.",
+    "recommended_fix": "Implement the budget: define GALLERY_MAX_RETRIES, increment gallery.retries on every condition-poll re-arm, and abort with the stage name when it exceeds."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "teardown-regression",
+    "title": "Delta-introduced: the audio seam refactor deleted rl.CloseAudioDevice with no seam wrapper — normal builds never close the audio device",
+    "location": "app/audio/audio.odin:316-331 (audio_destroy) + 47-80 (the 17-wrapper seam)",
+    "evidence": "diff.patch:169 removes it from audio_destroy:\n \t\tif a.bed_on {\n-\t\t\trl.StopMusicStream(a.bed)\n-\t\t\trl.UnloadMusicStream(a.bed)\n+\t\t\taudio_stop_music(a.bed)\n+\t\t\taudio_unload_music(a.bed)\n \t\t}\n \t}\n-\trl.CloseAudioDevice()\n }\n\nCurrent worktree audio_destroy still claims the close in its doc comment but has no close call:\n// audio_destroy — unload the sounds + close the device (app teardown).\naudio_destroy :: proc(a: ^Audio) {\n\tif a.device_on {\n...\t\tif a.bed_on {\n\t\t\taudio_stop_music(a.bed)\n\t\t\taudio_unload_music(a.bed)\n\t\t}\n\t}\n}\n\nThe when #config(PP_SW_AUDIO) seam defines 17 wrappers (audio_init_device … audio_set_music_volume) — none closes the device; grep CloseAudioDevice app/ → zero hits.",
+    "detail": "The refactor wrapped 17 call sites but deleted the 18th teardown call instead of wrapping it. Non-SW builds now leak the miniaudio device/context at exit — a behavior change the seam was forbidden to make.",
+    "recommended_fix": "Add audio_close_device to the seam (no-op under PP_SW_AUDIO; rl.CloseAudioDevice otherwise) and call it at audio_destroy's end, restoring the pre-refactor teardown idiom."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "build-wiring",
+    "title": "N10 unfixed and now worse: the seam's comment points at gallery-build documentation that does not exist — the PP_SW_AUDIO app build remains irreproducible",
+    "location": "app/audio/audio.odin:46; tools/build_raylib_sw.sh (final lines)",
+    "evidence": "app/audio/audio.odin:44-46:\n// are no-ops and the device stays off (the runtime paths already guard on\n// device_on); without it they are the plain raylib calls. The define's\n// producer is the gallery build documented in app/gallery.odin.\n\napp/gallery.odin contains no PP_SW_AUDIO mention and no build command (only: \"// NOTE: the gallery runs under the raylib-sw SOFTWARE renderer (the shadow\"); grep PP_SW_AUDIO tools/ docs/ .github/ → zero hits. tools/build_raylib_sw.sh ends:\necho \"== done. Build the harness with:\"\necho \"   ODIN_ROOT=$SHADOW odin build harness -out:bin/harness\"",
+    "detail": "Nothing in-repo sets or documents PP_SW_AUDIO; gallery.odin documents neither the define nor the app SW build command, so the fix commit added a dangling reference while claiming N10 folded.",
+    "recommended_fix": "Add the SW app build line (ODIN_ROOT=… odin build app -define:PP_DEBUG=true -define:PP_SW_AUDIO=true) to build_raylib_sw.sh or gallery.odin's header, and point the seam comment at it."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "stale-comments",
+    "title": "N2 half-folded: font_check still cites the deleted load_hud_font and the removed rune→byte truncation; lint.sh's gate-6 rationale and two noc_overlay comments are also stale",
+    "location": "harness/font_check.odin:96-97,140-141; tools/lint.sh:44-45; app/render/noc_overlay.odin:403,421-423",
+    "evidence": "harness/font_check.odin:96-97:\n\t// draw_row copies the string's raw UTF-8 BYTES (the game's draw_text_c\n\t// truncates every rune to a byte — ASCII-only canon; the specimen's ⚠\nharness/font_check.odin:140-141:\n\t// 1. load the candidate at the app's atlas size (the same recipe as\n\t// load_hud_font — a failed load is FATAL, never a silent fallback-font\ntools/lint.sh:44-45:\necho \"-- gate 6: render string literals ASCII-only (the byte-truncating draw_text_c)\"\n# draw_text_c truncates every rune to a byte, so any non-ASCII character in a\napp/render/noc_overlay.odin:403:\n// `size` is the font size (>= 14 body, 10 labels — the hierarchy ladder).\napp/render/noc_overlay.odin:422-425 (comment says HUD font; code uses font_mono):\n// units digit stays at `x_right` — counters never width-jitter as they tick;\n// the HUD font's digits are tabular, so every digit lands on a fixed pixel).\nnoc_col :: proc(v: ^View, txt: string, size: i32, col: rl.Color, x_right: i32, y: i32) {\n\tw := i32(rl.MeasureTextEx(v.font_mono, strings_clone_cstr_noc(txt, v), f32(size), 1).x)",
+    "detail": "crisis.odin/goldens.odin comments were fixed, but the exact font_check pair r1 cited remains (draw_text_c is UTF-8-safe since this PR; load_hud_font is deleted), lint names a nonexistent mechanism, noc comments lag the ladder/mono changes.",
+    "recommended_fix": "Update the five sites: draw_text_c copies raw UTF-8 now; the loader is load_fonts; lint gate 6 is the ASCII-content canon (drop the truncation mechanism); noc_row 15 body/12-13 labels; noc_col says font_mono."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "consistency",
+    "title": "N1 residual: the specimen's SLA row stays 14px while the shipped SLA gauge line is 17px",
+    "location": "harness/font_check.odin:119 vs app/main.odin:1817",
+    "evidence": "harness/font_check.odin:119:\n\tdraw_row(warn_font, \"delivered 12 / 20   avg 0.9 s   loss 0%\", y, 14, p.ink_soft) // the 14px SLA line\napp/main.odin:1817 (draw_sla_gauges):\n\t\tdraw_text(app, gauge, 12, sla_row_y(&app.view, line), rnd.hud(&app.view, 17), col)",
+    "detail": "The ladder re-derivation fixed title/toast/crisis/hint rows but left the SLA specimen row three steps behind the shipped 17px gauge — future font evaluations would grade a stale size.",
+    "recommended_fix": "Bump the specimen SLA row to 17 (and align the tabular block with the 15px NOC rows), or derive the specimen literals from the app's constants."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "convention",
+    "title": "N9 unfixed: gallery remains a package-level mutable global and the debug-global carve-out is still undocumented",
+    "location": "app/gallery.odin:64; project-context.md:41",
+    "evidence": "app/gallery.odin:64 (file-scope, PP_DEBUG-gated):\ngallery: Gallery\nproject-context.md:41:\n- **No globals / singletons.** Everything hangs off `App` → `Run_State`, passed by pointer (ODN-13). Per-run reset = create a fresh run context in a fresh arena; never \"clean up and reuse.\"",
+    "detail": "Neither of r1's suggested resolutions happened (no App field, no project-context.md carve-out note) although b4154c3 claims N1-N15 folded.",
+    "recommended_fix": "Document the PP_DEBUG-only debug-global carve-out in project-context.md, or hang Gallery on App behind a PP_DEBUG-gated field."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "invariant-watch",
+    "title": "N13 unfixed: the 24px SemiBold title still carries the 22px-era clearance comment and no min-clamp clearance check exists",
+    "location": "app/main.odin:1263-1270",
+    "evidence": "app/main.odin:1263-1270:\n\t// title — v2-ux-font-resize: SHORTENED so it clears the centered health\n\t// card's left edge at every width >= the min clamp (the old 58-char title\n\t// ran half-hidden UNDER the card at 1280x720 — a pre-existing overlap).\n\t// 2026-08-22 (v2-font-overhaul): the title draws in the SemiBold header\n\t// weight — the headline fix's anchor surface.\n\tdraw_text_h(app, \"Packet Plumber - v2\", 12, 10, rnd.hud(&app.view, 24), p.ink) // 2026-08-23: the bigger-text ruling\n(repo-wide grep for a title-clearance test/spot-check: none)",
+    "detail": "r1 asked for a min-clamp (1280x720) spot-check or an extended title-clearance check with the wider SemiBold title; nothing was added and the stale comment stands.",
+    "recommended_fix": "Add a MeasureTextEx-based title-vs-health-card clearance assertion (or a 1280x720 capture spot-check) and refresh the comment to the 24px reality."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "N15 unfixed: PP_DEBUG tooling remains compile-gate-only — gate 9 builds the debug binaries but never runs font-check/gallery behaviorally",
+    "location": "tools/ci-local.sh:63",
+    "evidence": "tools/ci-local.sh:63:\n  \"PP_DEBUG overlay builds (compile gate)|odin build app -define:PP_DEBUG=true -out:app-debug.bin && odin build harness -define:PP_DEBUG=true -out:bin/harness-debug\"",
+    "detail": "b4154c3 claims N15 folded; the gate list is unchanged. The data-stage font pins do run (gate 2, odin test app/render), but the font-check/gallery verbs still have no smoke run.",
+    "recommended_fix": "Add a smoke leg to ci-local.sh running the debug harness font-check on one demo (headless data-stage probes already cover the atlas assertions)."
+  }
+]

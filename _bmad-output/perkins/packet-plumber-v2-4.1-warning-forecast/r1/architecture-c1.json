@@ -1,0 +1,42 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "dead-config",
+    "title": "balance.json `warnings` lead-time fields (node_strained/critical, pipe_pressure) are parsed + validated + folded into catalog_hash but never consumed anywhere \u2014 the claimed 'UI reads the leads' telegraph does not exist",
+    "location": "core/catalog.odin:197-199, 532-534, 541-542; app/render/view.odin:338-342; core/warnings.odin:42-44",
+    "evidence": "core/catalog.odin:197-199:\n\tnode_strained_lead_ticks:   u64, // \ud83d\udfe1 lead time to failure (GDD: 30 s)\n\tnode_critical_lead_ticks:   u64, // \ud83d\udd34 lead time (GDD: 10 s)\n\tpipe_pressure_lead_ticks:   u64, // pressure lead time (GDD: 20 s)\ncore/catalog.odin:532-534:\n\t\t\tb.warnings.node_strained_lead_ticks = u64(jint(wobj, \"node_strained_lead_ticks\", 0))\n\t\t\tb.warnings.node_critical_lead_ticks = u64(jint(wobj, \"node_critical_lead_ticks\", 0))\n\t\t\tb.warnings.pipe_pressure_lead_ticks = u64(jint(wobj, \"pipe_pressure_lead_ticks\", 0))\ncore/catalog.odin:541-542:\n\t\tif b.warnings.node_strained_lead_ticks == 0 || b.warnings.node_critical_lead_ticks == 0 ||\n\t\t\tb.warnings.pipe_pressure_lead_ticks == 0 {\napp/render/view.odin:338-342:\n\tstep: u32 = 16 // slow amber pulse ~1.25 Hz @ 20 Hz logic\n\tglyph := \"!\"\n\tif lvl == .Red {\n\t\tcol = p.state_critical\n\t\tstep = 8 // fast critical pulse ~2.5 Hz\ncore/warnings.odin:42-44:\n// (ODN-1). The lead times (strained 30 s / critical 10 s / pressure 20 s \u2014\n// GDD Numerical Design) live in balance.json `warnings`; the UI reads them\n// from there (they are not re-stated here).\n(grep across core/app/harness finds NO reader of these three fields beyond the parse + `== 0` validation above; the only real lead in the system is demand.json's set-piece forecast_lead_ticks.)",
+    "detail": "The GDD M5 node/pipe lead times are data with no mechanism: the telegraph fires the tick strain crosses a threshold, no countdown/lead surface exists, while the in-code claims ('The UI reads the leads from here for the telegraph') are false and the fields force the all-goldens catalog_hash re-bless.",
+    "recommended_fix": "Consume the leads (e.g. drive the ring pulse step or a node/pipe 'to-critical' countdown from them), or drop the three fields from Warning_Balance + balance.json and re-bless once."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "cosmetic-spec-drift",
+    "title": "Ring pulse is 16x slower than documented: envelope cycle = 16 \u00d7 step ticks \u2192 12.8 s amber / 6.4 s red (0.078/0.156 Hz), not the '~1.25 Hz / ~2.5 Hz' the comments and art-direction \u00a76.1 specify",
+    "location": "app/render/view.odin:204, 210-213, 338-342",
+    "evidence": "app/render/view.odin:204:\nPULSE16 :: [16]f32{0.04, 0.18, 0.38, 0.55, 0.71, 0.84, 0.93, 0.99, 1.0, 0.96, 0.86, 0.71, 0.53, 0.35, 0.18, 0.05}\napp/render/view.odin:210-213:\npulse_factor :: proc(tick: u64, node_id: u32, step: u32) -> f32 {\n\ttable := PULSE16 // local copy \u2014 a constant can't be indexed by a runtime index\n\tidx := (tick + u64(node_id) * 5) / u64(step) & 15\n\treturn table[idx]\n}\napp/render/view.odin:338,342:\n\tstep: u32 = 16 // slow amber pulse ~1.25 Hz @ 20 Hz logic\n\tstep = 8 // fast critical pulse ~2.5 Hz\n(detail: idx advances 1 per `step` ticks; a full 16-step envelope = 16\u00d7step ticks = 256 amber / 128 red ticks @ 20 Hz = 12.8 s / 6.4 s per swell \u2014 the comment values are the table-step rate 20/16 and 20/8, not the pulse-cycle Hz.)",
+    "detail": "Art-direction \u00a76.1/epic-4-context pins 'ring pulse rate ~1.2 Hz strained, fast ~2.5 Hz critical'; the rendered swell is 16\u00d7 slower and the code comments mis-state the rate. Escalation language (2\u00d7) survives; cosmetic, deterministic, never feeds state.",
+    "recommended_fix": "Either use step \u2248 1 (amber) and make red visibly faster (e.g. 2-step table stride via a second table), or correct the comments to state the true cycle rate."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "validation-gap",
+    "title": "Warnings fail-fast rows are bypassable: amber=0 passes '0 <= amber < red <= 100' yet strain_level is inclusive so zero-strain nodes read Amber (E24 neutrality broken under legal data); a negative lead wraps through u64(jint(...)) and passes the '> 0' rejection",
+    "location": "core/catalog.odin:528-543; core/warnings.odin:71-75",
+    "evidence": "core/catalog.odin:528-543:\n\t\tif b.warnings.node_amber_pct < 0 || b.warnings.node_red_pct <= b.warnings.node_amber_pct ||\n\t\t\tb.warnings.node_red_pct > 100 || b.warnings.pipe_amber_pct < 0 ||\n\t\t\tb.warnings.pipe_red_pct <= b.warnings.pipe_amber_pct || b.warnings.pipe_red_pct > 100 {\n\t\t\treturn {\"balance.json\", \"warnings\", \"strain ladder must satisfy 0 <= amber < red <= 100 (node + pipe)\"}\n\t\t}\n\t\tif b.warnings.node_strained_lead_ticks == 0 || b.warnings.node_critical_lead_ticks == 0 ||\n\t\t\tb.warnings.pipe_pressure_lead_ticks == 0 {\n\t\t\treturn {\"balance.json\", \"warnings\", \"lead times must be > 0 (the FORGE #3 reaction-window surface)\"}\n\t\t}\ncore/warnings.odin:71-75:\nstrain_level :: proc(pct: i64, amber, red: i32) -> Strain_Level {\n\tif pct >= i64(red) do return .Red\n\tif pct >= i64(amber) do return .Amber\n\treturn .None\n}\n(amber=0 \u2192 strain_level(0,0,90) = .Amber on every live node; u64(jint(lead,-1)) wraps to 2^64-5 and skips the ==0 guard.)",
+    "detail": "ODN-5 fail-fast is the only defense for data-driven thresholds; the shipped 70/90/600/200/400 values are fine, but a legal-but-degenerate ladder (amber 0) or negative lead passes load and breaks the no-warning-on-healthy contract.",
+    "recommended_fix": "Require amber >= 1 in the ladder check and parse leads via jint_strict into i64 with a `lead < 0` rejection before the u64 cast (mirror the demand.json forecast_lead_ticks row)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "hardcoded-label",
+    "title": "Forecast panel hardcodes 'SURGE' for every set-piece row instead of reading an archetype name from the catalog \u2014 any future non-surge set-piece is mislabeled",
+    "location": "app/render/forecast.odin:22, 52",
+    "evidence": "app/render/forecast.odin:22:\n// set-piece inside its forecast window: \"<CLASS> SURGE \u00d7N \u2014 12s\" (or \"NOW\"\napp/render/forecast.odin:52:\n\t\tmult := fmt.aprintf(\"SURGE x%d\", f.multiplier, allocator = context.temp_allocator)\n(Forecast_Entry carries sp_index/class/multiplier/start_tick/countdown/active \u2014 no archetype name field; the era-3 set-piece is the only one today, so the label is currently accurate.)",
+    "detail": "The weather report is a data-driven read (ODN-5) but invents its archetype label in code; 4.2's crisis archetypes will add set-pieces and the panel would name them all 'SURGE'.",
+    "recommended_fix": "Carry the set-piece's id/display name into Forecast_Entry (serialized) or resolve it from the demand catalog via sp_index, and drop the hardcoded string."
+  }
+]

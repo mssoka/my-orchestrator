@@ -1,0 +1,102 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "date-logic",
+    "title": "add_days_iso performs only a single month rollover, producing invalid dates like 2026-09-48 for larger validity_days",
+    "location": "client/src/demo/demo_store.gleam (add_days_iso, called from create_vacancy)",
+    "evidence": "let total = days_in_month(y, m)\n  let new_d = d + days\n  let new_m = case new_d > total {\n    True -> m + 1\n    False -> m\n  }\n  let new_d2 = case new_d > total {\n    True -> new_d - total\n    False -> new_d\n  }\n--- called with ---\n  let now = \"2026-08-19T00:00:00Z\"\n  // closes_at = created_at + validity_days — a new vacancy must not render\n  // as closing/closed immediately (validity_days is the listing window).\n  let closes_at = add_days_iso(now, payload.validity_days)",
+    "detail": "Only the current month's length is subtracted once. Aug 19 + 45 days yields \"2026-09-33\", +60 yields \"2026-09-48\" — malformed timestamps stored in Vacancy.closes_at.",
+    "recommended_fix": "Loop while new_d exceeds days_in_month(new_y, new_m), or compute via ordinal day arithmetic, so any validity_days yields a valid date."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "inconsistency",
+    "title": "Created demo vacancies always get days_remaining 0; the carefully computed closes_at is never consumed, contradicting create_vacancy's own comment",
+    "location": "client/src/demo/demo_store.gleam (create_vacancy / demo_days_remaining / vacancy_with_stats)",
+    "evidence": "// closes_at = created_at + validity_days — a new vacancy must not render\n  // as closing/closed immediately (validity_days is the listing window).\n  let closes_at = add_days_iso(now, payload.validity_days)\n--- vs ---\nfn demo_days_remaining(vacancy_id: String) -> Int {\n  case vacancy_id {\n    \"v-maples\" -> 14\n    \"v-harbour\" -> 21\n    _ -> 0\n  }\n}\n--- and ---\n    days_remaining: demo_days_remaining(vac.id),",
+    "detail": "Every created vacancy (\"v-demo-*\") falls into `_ -> 0`, rendering as closing immediately — exactly what the comment says must not happen. closes_at is dead data.",
+    "recommended_fix": "Derive days_remaining from the vacancy's own closes_at/created_at (i.e. validity_days) instead of the id-keyed hardcoded table."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "consistency",
+    "title": "Hardcoded remindable_count 2 / followup_count 1 for every vacancy contradict the awaiting list they describe",
+    "location": "client/src/demo/demo_store.gleam (vacancy_detail / awaiting_count_for / awaiting)",
+    "evidence": "    awaiting_count: awaiting_count_for(vac.id),\n    remindable_count: 2,\n    followup_count: 1,\n--- vs ---\nfn awaiting_count_for(vacancy_id: String) -> Int {\n  case vacancy_id {\n    \"v-maples\" -> 3\n    _ -> 0\n  }\n}\n--- and in awaiting(\"v-maples\"), the only un-reminded applicant: ---\n      AwaitingApplicant(\n        email: \"emma.doyle@example.ie\",\n        name: Some(\"Emma Doyle\"),\n        invited_at: \"2026-08-15T10:00:00Z\",\n        reminded: False,",
+    "detail": "v-maples has 1 remindable awaiting applicant, detail reports 2; all other vacancies (and archived/new ones) report 2 remindable with 0 awaiting. Parallel non-derived numbers drift, contra module header.",
+    "recommended_fix": "Compute remindable_count/followup_count (and awaiting_count) from the same per-vacancy awaiting data instead of constants and id-keyed tables."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "state-machine",
+    "title": "mark_opened documented as idempotent, but change_status has no status guard: any call overwrites status and appends another audit row",
+    "location": "client/src/demo/demo_store.gleam (mark_opened / change_status)",
+    "evidence": "/// POST /open - idempotently moves a Submitted application to UnderReview\n/// and returns the post-transition status slug.\npub fn mark_opened(\n--- vs change_status, which matches on id only: ---\n              case app.application.id == application_id {\n                False -> app\n                True ->\n                  DemoApplication(\n                    ..app,\n                    application: Application(..app.application, status: target),\n                    audit_trail: list.append(app.audit_trail, [",
+    "detail": "No precondition on current status: repeated opens reset Approved/Shortlisted back to under_review and grow audit_trail with duplicate status_auto_changed entries each time.",
+    "recommended_fix": "Guard change_status: no-op (no status write, no audit append) when the application's status already equals target; restrict mark_opened to Submitted."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "collision",
+    "title": "Deterministic id_suffix guarantees id and short_code collisions for repeated or 8-char-prefix-sharing property names, despite its anti-collision comment",
+    "location": "client/src/demo/demo_store.gleam (create_vacancy / id_suffix)",
+    "evidence": "/// Stable short id suffix from a property name (lowercase alphanumeric,\n/// up to 8 chars) so re-created demo vacancies don't collide.\n--- vs ---\n  let suffix = id_suffix(payload.property_name)\n  let id = \"v-demo-\" <> suffix\n...\n      short_code: \"RTDEMO\" <> suffix,\n--- deterministic body: ---\nfn id_suffix(value: String) -> String {\n  let cleaned =\n    value\n    |> string.lowercase\n    |> string.replace(each: \" \", with: \"-\")",
+    "detail": "Same property name (or shared 8-char truncated prefix) yields identical vacancy id and short_code; find_vacancy then only ever mutates the first match, and keyed UI lists get duplicate keys.",
+    "recommended_fix": "Append a per-store disambiguator (e.g. vacancy count or a counter) to the suffix so created ids are unique within a session."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "inconsistency",
+    "title": "Approval refetches the leaderboard post-mutation; rejection and backward transitions perform the same mutation without the refetch",
+    "location": "client/src/demo/demo_update.gleam (UserConfirmedApproval / UserConfirmedRejection / UserConfirmedBackwardTransition)",
+    "evidence": "    UserConfirmedApproval(vid, aid) -> {\n      let #(updated, eff) = demo_status(model, vid, aid, \"approved\")\n      // Refetch the leaderboard from the POST-mutation store so the approved\n      // applicant's row reflects the new status (the pre-mutation store\n      // would leave them under-review).\n--- vs ---\n    UserConfirmedRejection(vid, aid) -> {\n      let #(updated, eff) = demo_status(model, vid, aid, \"rejected\")\n      #(\n        Model(..updated, show_reject_confirm: False, pending_rejection: None),\n        eff,\n      )\n    }",
+    "detail": "The stated staleness rationale applies identically to rejection and backward transitions: their leaderboard rows stay stale (or approval double-fetches if the response arm already refetches).",
+    "recommended_fix": "Apply the same post-mutation leaderboard refetch (from the updated store) in UserConfirmedRejection and UserConfirmedBackwardTransition."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "gleam/option import in demo_api.gleam is unused",
+    "location": "client/src/demo/demo_api.gleam (imports)",
+    "evidence": "import gleam/option.{type Option, None, Some}\n--- module's only fallible plumbing is Result-based: ---\nfn respond_result(\n  result: Result(a, Nil),",
+    "detail": "No Option, None, or Some appears anywhere in the 461-line module; dead import producing a compiler warning.",
+    "recommended_fix": "Delete the gleam/option import line."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "docs",
+    "title": "id_suffix's doc comment is pasted onto add_days_iso, leaving both misdocumented",
+    "location": "client/src/demo/demo_store.gleam (doc block above add_days_iso)",
+    "evidence": "/// Stable short id suffix from a property name (lowercase alphanumeric,\n/// up to 8 chars) so re-created demo vacancies don't collide.\n/// Add `days` to an ISO date-time string (naive Gregorian day arithmetic on\n/// the YYYY-MM-DD prefix; demo data is always \"now\"-relative so no timezone\n/// handling is needed).\nfn add_days_iso(iso: String, days: Int) -> String {",
+    "detail": "The first sentence describes id_suffix, not add_days_iso; id_suffix itself ends up with no documentation.",
+    "recommended_fix": "Move the \"Stable short id suffix...\" sentence onto id_suffix's own doc comment."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "contract",
+    "title": "fetch_leaderboard_page ignores the page parameter and always returns the full leaderboard",
+    "location": "client/src/demo/demo_api.gleam (fetch_leaderboard_page)",
+    "evidence": "pub fn fetch_leaderboard_page(\n  store: DemoStore,\n  vacancy_id: String,\n  _page: Int,\n  on_response: fn(Result(LeaderboardResponse, ApiError)) -> msg,\n) -> Effect(msg) {\n  case demo_store.leaderboard(store, vacancy_id) {",
+    "detail": "The mirrored endpoint is paginated; this returns every entry for any page, so append-style load-more handling duplicates rows and replace-style makes load-more a no-op.",
+    "recommended_fix": "Slice the leaderboard entries by _page and page size before delivering, mirroring the real endpoint's pagination."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "ux-gap",
+    "title": "Reset demo silently no-ops when seeding fails — no feedback of any kind",
+    "location": "client/src/demo/demo_update.gleam (reset_demo)",
+    "evidence": "pub fn reset_demo(model: Model) -> #(Model, Effect(Msg)) {\n  case demo_store.seed() {\n    Ok(store) -> {\n...\n    Error(_) -> #(model, effect.none())\n  }\n}",
+    "detail": "The user clicks \"Reset demo\" and nothing happens — no toast, no state change — inconsistent with the feedback pattern this module applies elsewhere.",
+    "recommended_fix": "On the Error arm, dispatch a brand-voice toast (e.g. copy.demo reset failure) so the dead click is never silent."
+  }
+]

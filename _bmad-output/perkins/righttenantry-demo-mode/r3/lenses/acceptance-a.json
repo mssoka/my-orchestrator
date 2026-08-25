@@ -1,0 +1,82 @@
+[
+  {
+    "source": "acceptance",
+    "severity": "blocker",
+    "category": "demo-boot",
+    "title": "In-demo navigation to /demo never fetches dashboard data: deep-link boot + breadcrumb home strands on a permanent skeleton (regression from the r2 no-reseed fix)",
+    "location": "client/src/client.gleam:487-488 (dispatch), 5160-5161 (fetch gate), 5811-5814 (enter_demo NotAsked); client/src/components/breadcrumb.gleam:51-53; client/src/pages/dashboard.gleam:75",
+    "evidence": "client.gleam BrowserChangedUrl: `routes.Demo, False -> enter_demo(model, route)` / `routes.Demo, True -> handle_browser_change(model, uri, route)`; handle_browser_change fetch gate: `let eff = case route, updated_model.vacancies {\n    routes.Dashboard, NotAsked ->` (no routes.Demo arm); enter_demo: `vacancies: case route {\n            routes.Demo | routes.Dashboard -> Loading\n            _ -> NotAsked\n          }`; breadcrumb.gleam: `True -> \"/demo\"\n    False -> \"/dashboard\"`; dashboard.gleam: `NotAsked, _ | Loading, _ -> view_loading_skeleton()`",
+    "detail": "Boot on a demo deep link (e.g. /vacancies/v-maples) leaves vacancies NotAsked by design; clicking the breadcrumb 'Dashboard' home (href /demo in demo) hits `routes.Demo, True -> handle_browser_change`, whose fetch gate matches only routes.Dashboard — no fetch fires and dashboard.view_dashboard renders the skeleton forever. Violates AC1 'every landlord surface clickable in demo state' on a headline entry path.",
+    "recommended_fix": "Extend the handle_browser_change dashboard fetch gate (and the Loading setter) to match `routes.Demo | routes.Dashboard` when demo_mode is True."
+  },
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "demo-mode-leak",
+    "title": "still present since round 2: Entering demo clobbers a live landlord session; exit downgrades auth to NotAsked",
+    "location": "client/src/model.gleam:747-768 (clear_demo_state); client/src/client.gleam:5801-5803 (enter_demo), 490-496 (exit)",
+    "evidence": "model.gleam clear_demo_state: `demo_mode: False,\n    demo_store: None,\n    auth: NotAsked,` ; client.gleam enter_demo: `auth: Success(landlord),\n          csrf_token: \"demo-csrf-token\",` ; exit arm: `handle_browser_change(model |> model.clear_demo_state, uri, route)` with no auth_api.check_session anywhere on the exit path",
+    "detail": "The r2 recommended fix ('On exit, re-check session instead of downgrading to NotAsked; on entry, stash real auth aside') did not land: entry still overwrites a real Success(auth) with the mock landlord, and clear_demo_state still drops auth to NotAsked with no session re-check, so a previously-authed landlord appears logged out until a full reload.",
+    "recommended_fix": "Fire auth_api.check_session(ApiReturnedSession) on demo exit to a public route (the cookie is still valid server-side), or stash and restore the prior auth around demo entry."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "demo-storage",
+    "title": "still present since round 2: Demo comparison ids and sweep-nudge dismissals still write to real web storage",
+    "location": "client/src/client.gleam:3527, 3541, 4935-4938",
+    "evidence": "`save_comparison_ids(new_ids)` (both UserToggledComparison arms, no demo_mode branch); `UserDismissedSweepNudge(application_id) -> {\n      let updated_dismissed =\n        set.insert(model.dismissed_sweep_nudges, application_id)\n      save_dismissed_sweep_nudges(set.to_list(updated_dismissed))`; grep of demo_update.gleam shows no UserToggledComparison/UserDismissedSweepNudge arm, so these fall through to update_inner in demo mode",
+    "detail": "Demo-scoped ids still persist to session/localStorage and hydrate back on demo re-entry — a refresh-wipe exception to the spec's 'no persistence of any kind' (no real endpoint writes).",
+    "recommended_fix": "Skip save_comparison_ids / save_dismissed_sweep_nudges when model.demo_mode is True, or use a demo-scoped storage key."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "docs",
+    "title": "still present since round 2: Stale visibilitychange doc paragraph still sits on handle_browser_change",
+    "location": "client/src/client.gleam:5043-5048",
+    "evidence": "/// Register a `visibilitychange` listener that silently refreshes /me each\n/// time a background tab comes back to the foreground. Cheap defence against\n/// the multi-tab footgun: if tab A accepts the policy, tab B (which would\n/// otherwise sit on the old modal forever) picks up the new\n/// server_policy_version the moment the landlord switches back to it.\nfn handle_browser_change(",
+    "detail": "The doc block describing listen_visibility_refresh is still attached to handle_browser_change; the actual listener function (line 5905) remains undocumented. The r1 #27 doc swap never happened.",
+    "recommended_fix": "Move the paragraph back to listen_visibility_refresh."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "still present since round 2: Dead routes.Demo arm in view_protected_page",
+    "location": "client/src/client.gleam:6542 vs 6572",
+    "evidence": "view_page: `// Demo — ungated by definition: render the demo shell + dashboard\n    // directly, no auth check. The demo's own data fetches fill the body.\n    routes.Demo -> view_demo_page(model)` ; view_protected_page content case: `routes.Demo -> dashboard.view_dashboard(model)`",
+    "detail": "view_page matches routes.Demo before the protected fall-through and is_protected_route(Demo) is False, so view_protected_page's routes.Demo arm is unreachable leftover from an earlier routing shape.",
+    "recommended_fix": "Delete the routes.Demo arm from view_protected_page."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "demo-mode-leak",
+    "title": "still present since round 2: Demo boot skips the visibility-refresh listener and localStorage hydrations for the page lifetime",
+    "location": "client/src/client.gleam:238-241",
+    "evidence": "True -> {\n      let #(demo_model, demo_eff) = enter_demo(base_model, route)\n      #(demo_model, effect.batch([modem.init(BrowserChangedUrl), demo_eff]))\n    }  — no listen_visibility_refresh(), no hydrate_dismissed_sweep_nudges_effect(), no hydrate_refcheck_explainer_dismissed_effect() in the demo branch (all three remain in the False branch)",
+    "detail": "After demo exit + SPA login without a reload, the multi-tab policy-sync listener and the sweep-nudge/refcheck hydration effects never install for the tab's lifetime.",
+    "recommended_fix": "Install the listeners/hydrations on demo exit (or on first real auth after a demo boot)."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "demo-latent",
+    "title": "still present since round 2: Latent: enter_demo keeps server_policy_version, so the policy re-acceptance modal could surface in demo and fire a real accept_policy POST",
+    "location": "client/src/client.gleam:5800-5832 (enter_demo); client/src/demo/demo_fixtures.gleam:26",
+    "evidence": "enter_demo builds `Model(\n          ..model,\n          route:,\n          auth: Success(landlord),\n          csrf_token: \"demo-csrf-token\",\n          demo_mode: True,` ... with no server_policy_version reset; fixture: `\"accepted_policy_version\":\"2026-05-23\"`; grep finds no UserAcceptedPolicy arm in demo_update.gleam",
+    "detail": "An in-SPA /demo entry from a real-authed session keeps the real server_policy_version; if it postdates the mock landlord's accepted version the policy modal opens in demo and UserAcceptedPolicy reaches the real accept_policy POST with the demo CSRF token. Latent today (no authed-UI link to /demo).",
+    "recommended_fix": "Set server_policy_version to \"\" in enter_demo (or intercept UserAcceptedPolicy in demo_update)."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "demo-boot",
+    "title": "Edit deep-link boot fetches the payload (r2-B4 fixed) but never sets vacancy_edit_loading — the empty form renders instead of a skeleton until the response lands",
+    "location": "client/src/client.gleam:5827-5830 (enter_demo); client/src/pages/vacancy_edit.gleam:22-24",
+    "evidence": "enter_demo: `// A deep-linked demo edit page needs its id set so the\n          // get_for_edit response is accepted and the form can load.\n          vacancy_edit_id: edit_id,` (vacancy_edit_loading untouched); vacancy_edit.gleam: `case model.vacancy_edit_loading {\n        True -> view_loading_skeleton()\n        False ->`",
+    "detail": "The VacancyEdit arm of demo_entry_effects now fires demo_api.get_for_edit (the r2-B4 blocker is fixed), but the second half of the recommended fix — vacancy_edit_loading: True in enter_demo — did not land, so a refresh on /vacancies/v-maples/edit flashes the empty form for a tick rather than the skeleton.",
+    "recommended_fix": "Set vacancy_edit_loading: True in enter_demo when the route is VacancyEdit."
+  }
+]

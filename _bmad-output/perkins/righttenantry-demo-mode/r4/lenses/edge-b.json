@@ -1,0 +1,112 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "error-channel",
+    "title": "still present since round 3: Vacancy/status mutations return Ok unconditionally - nonexistent ids report success; the Result error channel is dead",
+    "location": "client/src/demo/demo_store.gleam:1245",
+    "evidence": "  #(DemoStore(..store, vacancies: updated), Ok(vacancy_id))\n(archive_vacancy:1245, restore_vacancy:1259, close_vacancy:1273 — all identical) and change_status:1345:\n  #(DemoStore(..store, vacancies: updated), Ok(slug))\nThe list.map no-ops when no vacancy/application id matches, yet Ok is returned; update_vacancy/publish_vacancy (which use find_vacancy |> result.map) are the only mutations that can return Error.",
+    "detail": "Callers cannot distinguish a miss from a mutation; the deliver_err path in demo_api.respond_result is unreachable for these four mutations.",
+    "recommended_fix": "Check the match after the map and return Error(Nil) on miss, or drop the Result and simplify the call chain."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "demo-data",
+    "title": "still present since round 3: mark_opened doc claims an idempotent Submitted->UnderReview transition but applies it to any status",
+    "location": "client/src/demo/demo_store.gleam:1276",
+    "evidence": "/// POST /open - idempotently moves a Submitted application to UnderReview\n/// and returns the post-transition status slug.\npub fn mark_opened(\n  store: DemoStore,\n  vacancy_id: String,\n  application_id: String,\n) -> #(DemoStore, Result(String, Nil)) {\n  change_status(\n    store,\n    vacancy_id,\n    application_id,\n    \"under_review\",\n    \"status_auto_changed\",\n  )\n}\n— change_status (1308-1346) has no current-status guard; it sets status: target on any match.",
+    "detail": "An 'open' on an already-shortlisted/rejected application would regress it to UnderReview; idempotency rests entirely on the dispatch-layer open_dispatched set.",
+    "recommended_fix": "Transition only when the current status is Submitted; otherwise leave the store unchanged."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "id-uniqueness",
+    "title": "still present since round 3: create_vacancy derives the id from an 8-char-truncated name slug with no uniqueness check",
+    "location": "client/src/demo/demo_store.gleam:1124",
+    "evidence": "  let suffix = id_suffix(payload.property_name)\n  let id = \"v-demo-\" <> suffix\nand id_suffix (1674-1685):\n  case string.length(cleaned) {\n    n if n <= 8 -> cleaned\n    n -> string.drop_end(cleaned, n - 8)\n  }\nThe doc comment above id_suffix claims \"so re-created demo vacancies don't collide\" — truncation does not prevent collision; two created vacancies sharing an 8-char cleaned prefix get the same id and the second overwrites the first in store lookups.",
+    "detail": "Two demo-created vacancies named e.g. 'Riverside Apartments A' and 'Riverside Apartments B' both get id v-demo-riverside; the first silently vanishes from lookups.",
+    "recommended_fix": "Append a disambiguator (sequence or count of existing v-demo- ids) or extend the suffix until unique."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "demo-data",
+    "title": "still present since round 3: send_reminder / remind_applicant / send_bulk_invite mutate nothing and return canned counts that contradict the seeded awaiting list",
+    "location": "client/src/demo/demo_store.gleam:1394",
+    "evidence": "pub fn remind_applicant(\n  store: DemoStore,\n  _vacancy_id: String,\n) -> #(DemoStore, #(Int, Int)) {\n  #(store, #(1, 0))\n}\n\npub fn send_reminder(\n  store: DemoStore,\n  _vacancy_id: String,\n) -> #(DemoStore, #(Int, Int)) {\n  #(store, #(2, 1))\n}\nand send_bulk_invite (1413-1421) returns BulkInviteResult(sent: 2, invalid: 1, invalid_emails: [\"bad@example.ie\"], trimmed: 0). demo_api.gleam:116/128/140 still discard the store (let _ = next). static_awaiting seeds v-maples with 1 remindable row, so the canned #(2, 1) contradicts the visible awaiting list; v-harbour's empty list also reports #(2, 1).",
+    "detail": "The demo teaches an outcome that never happened: canned reminder/invite counts ignore both the typed input and the seeded awaiting state.",
+    "recommended_fix": "Parse the submitted emails, compute the result from actual input, and flip reminded/followed_up in static_awaiting-backed state (or drop the fake mutation and honest-count from the seeded rows)."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "state-reset",
+    "title": "Demo 'mark all read' leaves the badge and dropdown rows stale — the demo arm drops the real arm's optimistic model update and the Ok response handler is a no-op",
+    "location": "client/src/demo/demo_update.gleam:560",
+    "evidence": "    UserClickedMarkAllRead -> {\n      let store = store_of(model)\n      let #(next, eff) =\n        demo_api.mark_all_notifications_read(store, \"\", ApiReturnedMarkAllRead)\n      #(Model(..model, demo_store: Some(next)), eff)\n    }\nThe real arm (client.gleam:4395-4409) eagerly sets notifications (all is_read True) and unread_count: 0 before dispatching; the response handler (client.gleam:4468-4470) is:\n    ApiReturnedMarkAllRead(result) ->\n      case result {\n        Ok(_) -> #(model, effect.none())\nso in demo model.notifications/model.unread_count are never updated and no refetch is batched. The new pin (demo_flow_test.gleam:587-596) passes vacuously on the model side: demo_model() starts at model.initial()'s unread_count: 0 (model.gleam:689) and the returned effect never executes in a unit test, so after.unread_count == 0 proves nothing.",
+    "detail": "After the bell shows 2 unread (seeded notifications), clicking 'Mark all read' in demo leaves the badge at 2 and rows unread until the dropdown is reopened and refetches — diverges from the real dashboard the lavish verdict requires the demo to match.",
+    "recommended_fix": "Mirror the real arm's optimistic update (set notifications all-read + unread_count: 0) in the demo UserClickedMarkAllRead arm, and extend the pin to a model that starts with unread_count 2."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "toast-ids",
+    "title": "still present since round 3: demo_not_in_demo_toast diverges from add_toast's id convention - ids can collide and one timeout dismisses both",
+    "location": "client/src/demo/demo_update.gleam:638",
+    "evidence": "  let toast_id = model.next_toast_id + 1\n  ...\n      next_toast_id: toast_id,\n(demo_update.gleam:638,646) vs add_toast (client.gleam:7115,7128):\n  let id = model.next_toast_id\n  ...\n  #(Model(..model, toasts: capped_toasts, next_toast_id: id + 1), dismiss_eff)\nThe demo helper allocates id N+1 and leaves next_toast_id at N+1, so the next add_toast re-allocates N+1 while the demo toast (5s timeout, AppDismissToast(N+1)) is still live.",
+    "detail": "Two live toasts share one id; the demo toast's timeout dismisses the unrelated toast with the same id.",
+    "recommended_fix": "Reuse add_toast's allocation (id = next_toast_id, then increment) or route demo toasts through add_toast."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "latent",
+    "title": "still present since round 3: fetch_leaderboard_page ignores its page parameter",
+    "location": "client/src/demo/demo_api.gleam:217",
+    "evidence": "pub fn fetch_leaderboard_page(\n  store: DemoStore,\n  vacancy_id: String,\n  _page: Int,\n  on_response: fn(Result(LeaderboardResponse, ApiError)) -> msg,\n) -> Effect(msg) {\n  case demo_store.leaderboard(store, vacancy_id) {\n    Ok(response) -> deliver(on_response, response)\n    Error(_) -> deliver_err(on_response)\n  }\n}\nLatent today: the demo leaderboard returns all entries with total == list.length(entries), so leaderboard_view.gleam:676 (case loaded_count < total) never renders the load-more button in demo; ApiReturnedLeaderboardPage (client.gleam:2090-2101) would append, duplicating rows, if it ever fired.",
+    "detail": "The page parameter is discarded; if a vacancy ever exceeds one page of fixture data the demo would duplicate the whole list on load-more.",
+    "recommended_fix": "Slice by page or drop the parameter."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "still present since round 3: zero-caller export demo_store.notifications shipped",
+    "location": "client/src/demo/demo_store.gleam:1521",
+    "evidence": "pub fn notifications(store: DemoStore) -> List(Notification) {\n  store.notifications\n}\n(grep over client/src and client/test finds zero callers; demo_api.gleam:366 uses notifications_unread instead)",
+    "detail": "Exported surface with no caller; the notification surfaces consume notifications_unread.",
+    "recommended_fix": "Delete it or wire it."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "validation",
+    "title": "still present since round 3: status_from_slug silently coerces any unknown status slug to Submitted",
+    "location": "client/src/demo/demo_store.gleam:182",
+    "evidence": "fn status_from_slug(slug: String) -> ApplicationStatus {\n  case slug {\n    \"submitted\" -> Submitted\n    \"under_review\" -> UnderReview\n    \"shortlisted\" -> Shortlisted\n    \"viewed\" -> Viewed\n    \"approved\" -> Approved\n    \"rejected\" -> Rejected\n    _ -> Submitted\n  }\n}",
+    "detail": "A typo in a demo action wire (set_status/change_status caller) silently lands as Submitted instead of failing loudly, and change_status returns Ok(slug) regardless.",
+    "recommended_fix": "Return a Result or panic on unknown slugs in the demo store."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "duplication",
+    "title": "still present since round 3 (partial): download_timeout duplicated with divergent signature between demo_update and client.gleam (store_of half consolidated)",
+    "location": "client/src/demo/demo_update.gleam:838",
+    "evidence": "demo_update.gleam:838-845:\nfn download_timeout(id: String) -> Effect(Msg) {\n  effect.from(fn(dispatch) {\n    global.set_timeout(90_000, fn() {\n      dispatch(msg.AppTimedOutDownloadReport(id))\n    })\n    Nil\n  })\n}\nvs client.gleam:6890:\nfn download_timeout(analysis_id: String, delay_ms: Int) -> Effect(Msg) {\n(store_of is consolidated — client.gleam:5919-5921 demo_store_of now delegates to demo_update.store_of — but the two download_timeout variants still diverge in signature and timeout source.)",
+    "detail": "Two near-identical timeout helpers with different signatures; a change to one (e.g. the timeout duration) silently misses the other.",
+    "recommended_fix": "Lift download_timeout to a shared demo helper module (or call client.gleam's with 90_000)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "add_days_iso/roll_forward produce a malformed closes_at for negative validity_days, reachable via the unvalidated draft path",
+    "location": "client/src/demo/demo_store.gleam:1628",
+    "evidence": "demo_store.gleam:1628-1640:\n  let #(y2, m2, d2) = roll_forward(y, m, d + days)\n  pad2(y2) <> \"-\" <> pad2(m2) <> \"-\" <> pad2(d2) <> string.drop_start(iso, 10)\n...\nfn roll_forward(y: Int, m: Int, day: Int) -> #(Int, Int, Int) {\n  let total = days_in_month(y, m)\n  case day > total {\n    False -> #(y, m, day)\n(only the day > total overflow rolls; day <= 0 is returned verbatim) and pad2 (1666-1670):\n  case n < 10 {\n    True -> \"0\" <> int.to_string(n)\nso validity -25 yields \"2026-080-6T00:00:00Z\". Reachable: handle_vacancy_draft (client.gleam:6046-6050) calls submit_vacancy(model, \"draft\") with no validate_validity_days gate, and parse_int_or (client.gleam:7249-7253) passes any parseable integer through (\"-25\" -> -25).",
+    "detail": "Typing a negative number into the validity field and saving as draft in the demo creates a vacancy with a malformed closes_at string; days_between then parses garbage into an absurd days_remaining.",
+    "recommended_fix": "Clamp days to >= 0 in add_days_iso (or treat day <= 0 by rolling backward), or validate validity_days on the draft path too."
+  }
+]

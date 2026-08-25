@@ -1,0 +1,32 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "integer-coercion-at-parse",
+    "title": "jint_strict narrows json.Integer (i64) to i32 unchecked — values >= 2^32 silently truncate into valid small values, bypassing the ODN-5 fail-fast bar",
+    "location": "core/catalog.odin:564-569 (jint_strict), used at core/catalog.odin:382,405-408",
+    "evidence": "jint_strict :: proc(o: json.Object, key: string, def: i32) -> (i32, bool) {\n\tif v, ok := o[key]; ok {\n\t\t#partial switch x in v {\n\t\tcase json.Integer: return i32(x), true\n\t\tcase json.Float:   return 0, false\n\t\t}\n\t}\n\treturn def, true\n}\n...usage...\n\t\t\t\t\tst, okst := jint_strict(seo, \"start_tick\", 0)\n\t\t\t\t\tdt, okdt := jint_strict(seo, \"duration_ticks\", 0)\n...\n\t\t\t\t\tif mult < 1 || st < 0 || dt < 1 || fl < 0 {",
+    "detail": "json.Integer is i64; i32(x) truncates (verified: i32(4294967396)==100, i32(4294967296)==0, i32(4294967297)==1). start_tick 4294967396 loads as 100, volume 4294967296 as 0, era 4294967297 as 1 — the surge fires ~2^32 ticks early instead of 'out-of-range values abort startup' (ODN-5). Negative-wrap fix (r1 #3) landed; positive coercion gap is new.",
+    "recommended_fix": "In jint_strict, reject before narrowing: if x < i64(min(i32)) || x > i64(max(i32)) return 0, false. Add test rows for start_tick/volume/era = 2^32 and 2^32+100."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "input-validation",
+    "title": "volume/multiplier/demand_weight have no upper bounds — i32 overflow in effective_volume is reachable from catalog data that passes the loader",
+    "location": "core/demand.odin:73-78; core/catalog.odin:391,415,236-237",
+    "evidence": "effective_volume :: proc(plan: ^Pressure_Plan, class: u16, base: i32) -> i32 {\n\tv := base\n\tfor idx in plan.active_sp {\n\t\tsp := &plan.era_sp[idx]\n\t\tif sp.class == class {\n\t\t\tv *= sp.multiplier\n...loader checks (lower bounds only)...\n\t\t\t\t\tif de2.volume < 0 || de2.demand_weight < 1 || lane < 0 || lane > 2 {\n\t\t\t\t\tif mult < 1 || st < 0 || dt < 1 || fl < 0 {",
+    "detail": "Verified: 2^30 * 4 wraps to 0 (spec silently never spawns), 2e9 * 2 wraps negative (vol <= 0 skip). A typo like volume 2000000000 with multiplier 1 spawns 2e9 packets/tick (OOM) instead of fail-fast. Same class: demand_weight > 2^31 in 2+ sinks makes weighted_pick's total exceed 2^32, biasing the Lemire draw.",
+    "recommended_fix": "Add upper bounds at load (e.g. volume <= 1e6, multiplier <= 100, demand_weight <= 1e6) or compute effective_volume in i64 and reject products above max(i32) — fail-fast per ODN-5."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "allocator",
+    "title": "The new packet_types/demand json.parse value trees are never freed (no json.destroy_value anywhere) — odin test memory tracking flags leaks at the two new parse sites",
+    "location": "core/catalog.odin:278,344",
+    "evidence": "\t// packet_types (3.1)\n\t{\n\t\tv, e := json.parse(src.packet_types, parse_integers = true)\n...\n\t// demand (3.1)\n\t{\n\t\tv, e := json.parse(src.demand, parse_integers = true)\n...odin test core output:\n[WARN ] --- < 802.84KiB/ 1.03MiB> < 804.71KiB> ( 365/ 5393) :: core.test_catalogs_load_failfast\n        +++ leak       896B @ 0x6D08A5E00 [catalog.odin:251:catalogs_load()]\n        +++ leak       896B @ 0x6D08F6BC0 [parser.odin:299:parse_object_body()]\n        +++ leak       896B @ 0x6D083F600 [catalog.odin:278:catalogs_load()]",
+    "detail": "Each catalogs_load call leaks the parsed JSON value tree (maps at parser.odin:299). Base loaders (211/251/434) share the pattern; 3.1 adds two more sites and the 40-row fail-fast suite accumulates ~800KiB per test run. Bounded in the app/harness (one load per process), so no production consequence.",
+    "recommended_fix": "json.destroy_value(v) on every exit path of each catalog block (or parse into context.temp_allocator so the harness's per-demo free_all reclaims it)."
+  }
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "state-prop-blindspot",
+    "title": "Cross-check fires only when review is None — a last-attempt prop failure leaving the PRIOR attempt's dirty review in the slot still fail-closes despite a clean stamp",
+    "location": "tenant_scorer/callbacks/boundary_compliance_remediation.py:324-337 (same shape at final_compliance_remediation.py:273-284); tenant_scorer/agent.py:603-613",
+    "evidence": "boundary_compliance_remediation.py:324: `if review is None:` / :333 `verdict = read_review_verdict(state, \"boundary\")` / :336-337 `and verdict.get(\"passed\") is True` / `and verdict.get(\"violation_count\") == 0` — the stamp is consulted ONLY inside the review-is-None branch. agent.py:603 `review = ComplianceReviewResult.coerce(ctx.session.state.get(STATE_VERIFICATION_COMPLIANCE_REVIEW))` / :613 `if review is None or attempt == _BOUNDARY_GATE_MAX_ATTEMPTS - 1: break` — the slot is never popped/cleared between attempts.",
+    "detail": "Dirty attempt 0 writes the slot; attempt 1 (last) rules clean — stamp lands (in-place callback write) but output_key write is lost (the prop-failure class the stamp exists for). Slot still holds dirty review; gate breaks on max-1; finalize reads non-None dirty review, never consults the clean stamp, fail-closes. The #172 symptom survives the remediated multi-attempt case; only the None residue is covered.",
+    "recommended_fix": "In finalize_*_gate, when the review is parseable-but-dirty, cross-check the stamp too: if the stamp records a CLEAN final attempt (passed is True, violation_count == 0) and the dirty review predates it (attempt mismatch), treat as prop failure. Or clear the review slot before each re-judge so a lost write yields None and hits the existing cross-check."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "state-hygiene",
+    "title": "STATE_COMPLIANCE_REVIEW_VERDICT is absent from seed_pipeline_state's _COMPLIANCE_REVIEW_KEYS entry-clearing — a reused in-memory session can carry a prior invocation's clean stamp into a new run",
+    "location": "tenant_scorer/callbacks/state_init.py:55-57, 236-238; tenant_scorer/constants.py:83",
+    "evidence": "state_init.py:55 `_COMPLIANCE_REVIEW_KEYS: tuple[str, ...] = (` (:56-57 lists STATE_VERIFICATION_COMPLIANCE_REVIEW, STATE_FINAL_COMPLIANCE_REVIEW, repair keys, STATE_COMPLIANCE_JUDGE_META — NOT STATE_COMPLIANCE_REVIEW_VERDICT) / :236-238 `for key in _COMPLIANCE_REVIEW_KEYS: state[key] = \"\"` — 'a stale review from a previous invocation must never be read as this run's verdict'. constants.py:83 `STATE_COMPLIANCE_REVIEW_VERDICT = \"temp:compliance_review_verdict\"`.",
+    "detail": "The stamp is never popped (agent.py finally pops only STATE_COMPLIANCE_JUDGE_META) and is missing from the entry-clearing list. InMemorySessionService reuses the session dict across invocations, so a prior invocation's clean stamp survives; a new invocation whose judge produces nothing AND whose telemetry callback does not re-stamp (passed=False) then skips the fail-close via the stale clean stamp. Production VertexAiSessionService is safe (ADK trims temp: keys from persisted deltas — base_session_service.py:151-165), so 'invocation-local' holds only there.",
+    "recommended_fix": "Add STATE_COMPLIANCE_REVIEW_VERDICT to _COMPLIANCE_REVIEW_KEYS in state_init.py (and optionally pop it in the gate finally blocks alongside STATE_COMPLIANCE_JUDGE_META) so the codebase's own clear-at-entry hygiene covers the new stamp key."
+  }
+]

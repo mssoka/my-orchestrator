@@ -1,0 +1,112 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "contradiction",
+    "title": "Reduced-motion highlight documented as 'steady' but code draws nothing",
+    "location": "app/render/spawn_fx.odin: spawn_fx_draw_highlight",
+    "evidence": "+// Reduced-motion pins the steady band.\n+spawn_fx_draw_highlight :: proc(v: ^View, topo: ^pp.Topology, tick: u64) {\n+\tif v.reduced_motion {\n+\t\treturn\n+\t}",
+    "detail": "PR body, file header, and the function's own doc promise a steady reduced-motion highlight; the early return draws nothing, so reduced-motion users lose the placement feedback entirely.",
+    "recommended_fix": "When reduced_motion, draw the band at a fixed alpha (skip the k fade) instead of returning."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "rlsw-determinism",
+    "title": "Chip hairline alpha now faded via a line primitive — the rlsw trap the diff itself documents",
+    "location": "app/render/view.odin: draw_type_chip",
+    "evidence": " \t// the paper chip + ink hairline (full-alpha — the rlsw line-alpha trap)\n \tout := v.palette.ink_soft\n-\tout.a = 255\n+\tout.a = u8(255 * fade)\n-\trl.DrawRectangleLinesEx({x0, y0, cw, ch}, max(1.0, s * 0.02), out)\n+\trl.DrawRectangleLinesEx({x0, y0, cw, ch}, max(1.0, s * 0.02 * reveal_scale), out)\n+// (the rlsw line-alpha trap: a translucent DrawLineEx would capture solid —",
+    "detail": "The diff itself states rlsw ignores line alpha, so DrawRectangleLinesEx captures solid ink while the GPU app fades it — reveal frames diverge between harness and live app.",
+    "recommended_fix": "Keep the hairline at full alpha during reveal, or replace it with thin filled quads whose alpha fades (fills blend in rlsw)."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "invalid-free",
+    "title": "run_destroy on temp-allocator shadow clone repeats the bad-free pattern this PR removes",
+    "location": "app/render/spawn_fx.odin: spawn_fx_predict",
+    "evidence": "+\tshadow := shadow_clone(state, context.temp_allocator)\n+\tdefer pp.run_destroy(&shadow)\n+\t// TEMP allocator — the `defer delete`s were invalid frees (the temp arena\n+\t// owns the memory; 134 `+++ bad free` lines per `odin test core` run, the",
+    "detail": "The PR removes temp-arena deletes as invalid frees, then run_destroy frees dozens of temp-cloned shadow arrays per predict (and catalogs_destroy on temp-loaded catalogs) — same bad-free pattern.",
+    "recommended_fix": "Clone shadows with context.allocator before run_destroy, or add a destroy path that skips temp-backed arrays; verify app/render bad-free output."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "missing-import",
+    "title": "ordered_remove called without a core:containers import in the new file",
+    "location": "app/render/spawn_fx.odin: spawn_fx_feed",
+    "evidence": "+import pp \"../../core\"\n+import rl \"vendor:raylib\"\n+import \"core:mem\"\n+\t\tordered_remove(&fx.reveals, 0)",
+    "detail": "ordered_remove comes from core:containers; the new file imports only core, raylib, and core:mem. Unless the pinned compiler exposes it as a builtin, this cannot compile.",
+    "recommended_fix": "Add import \"core:containers\" to spawn_fx.odin."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "comment-mismatch",
+    "title": "Demo capture comments misstate the reveal envelope math",
+    "location": "demos/spawn_feel.dem",
+    "evidence": "+#   4100 ms (t82)  — reveal mid-envelope (scale ~0.75, fade ~0.8)\n+#   4250 ms (t85)  — reveal tail (the node ~settled, highlight fading)\n+\t\tk := f32(tick - r.spawn_tick) / f32(SPAWN_REVEAL_TICKS)\n+\t\te := smoothstep01(k)\n+\t\treturn 0.4 + 0.6 * e, 0.3 + 0.7 * e, true",
+    "detail": "At t82 (age 2/8) smoothstep01(0.25)=0.156 gives scale 0.49/fade 0.41, not ~0.75/~0.8; and the t85 highlight is already expired (ends T+4), not 'fading'.",
+    "recommended_fix": "Recompute the capture comments from the envelope (true mid ≈ t84) or move the 4100ms capture to t84."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "spawn_fx_init / spawn_fx_destroy are never called anywhere in the diff",
+    "location": "app/render/spawn_fx.odin",
+    "evidence": "+spawn_fx_init :: proc(fx: ^Spawn_FX, allocator := context.allocator) {\n+\tfx^ = {}\n+\tfx.reveals = make([dynamic]Spawn_Reveal, 0, 4, allocator)\n+}\n+\n+spawn_fx_destroy :: proc(fx: ^Spawn_FX) {\n+\tdelete(fx.reveals)\n+\tfx^ = {}\n+}",
+    "detail": "App, harness, and tests only ever call spawn_fx_reset on zero-value Spawn_FX; init and destroy have no call sites, so the intended allocator/capacity path is dead.",
+    "recommended_fix": "Wire spawn_fx_init/spawn_fx_destroy into the View lifecycle, or delete both procs."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Unreachable dedup-reset branch in spawn_fx_predict",
+    "location": "app/render/spawn_fx.odin: spawn_fx_predict",
+    "evidence": "+\tlead := window - tick\n+\tif lead > SPAWN_LEAD_TICKS {\n+\t\t// outside the telegraph window — a stale telegraph (a spawn whose\n+\t\t// reveal finished) just stays until its timeline expires; nothing to\n+\t\t// do. The dedup resets so the next window re-predicts.\n+\t\tif fx.predicted_window == window {\n+\t\t\tfx.predicted_window = 0\n+\t\t}\n+\t\treturn\n+\t}",
+    "detail": "predicted_window is only ever assigned when lead ≤ 10, and lead decreases monotonically toward a fixed window, so predicted_window == window is unreachable inside the lead > 10 branch.",
+    "recommended_fix": "Delete the reset; the dedup's window comparison already forces re-prediction once the window advances."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "comment-mismatch",
+    "title": "Negative-leg comment misstates separation distance (1 tile, not 2)",
+    "location": "app/render/spawn_fx_test.odin: test_spawn_fx_predict_pending_commands",
+    "evidence": "+\tpp.topology_spawn_node(&s.topology, rt, {12, 10}, cat)    // id 1\n+\tbad := []pp.Command{{kind = pp.Cmd_Place_Router{type_idx = rt_idx, pos = {13, 10}}, apply_tick = 77}}\n+\t// negative\"): an OUT-OF-SEPARATION pending place (2 tiles from the",
+    "detail": "The bad place (13,10) is 1 tile from the fixture router at (12,10), not 2. The rejection still holds (1 < 4) but the stated distance is wrong.",
+    "recommended_fix": "Correct the comment to '1 tile', or move the bad place to a true 2-tile offset."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "`_ = before` edit residue in the feed test",
+    "location": "app/render/spawn_fx_test.odin: test_spawn_fx_feed_and_reveal_math",
+    "evidence": "+\tbefore := len(s.events) - 1 // the last event is the t80 NODE_SPAWNED\n+\t_ = before\n+\tslice := s.events[before:]",
+    "detail": "`before` is used in the slice expression two lines below; the explicit discard is edit residue that wrongly signals an unused variable.",
+    "recommended_fix": "Delete the `_ = before` line."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "integer-underflow",
+    "title": "Telegraph timeline subtracts u64 T - SPAWN_LEAD_TICKS without a guard",
+    "location": "app/render/spawn_fx.odin: spawn_fx_draw_telegraph",
+    "evidence": "+\tT := fx.telegraph.spawn_tick\n+\tif tick < T - SPAWN_LEAD_TICKS || tick > T + SPAWN_BURST_TICKS {\n+\t\treturn // the timeline expires by construction — no explicit clear\n+\t}\n+\tage := i64(tick) - i64(T - SPAWN_LEAD_TICKS)",
+    "detail": "spawn_tick is data-driven via terminal_spawn_interval_ticks; a window landing before tick 10 makes T - 10 wrap u64, so the guard always returns and no ring renders.",
+    "recommended_fix": "Compare in i64 (i64(tick) < i64(T) - SPAWN_LEAD_TICKS) so early windows draw instead of wrapping."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "fixture-fidelity",
+    "title": "Test fixture omits the claimed demo recipe's second draw (0→1)",
+    "location": "app/render/spawn_fx_test.odin: sfx_fixture",
+    "evidence": "+// sfx_fixture — the growth.dem recipe's seed topology: the residential ←\n+\tpp.topology_apply_edit(&s.topology, pp.Command{kind = pp.Cmd_Draw_Pipe{a = 1, b = placed, tier = 1}}, cat)\n+at 2500ms draw 0 1 standard",
+    "detail": "The demo recipe also draws 0→1 at t50 and times edits at t40/t50; the fixture applies only 1→3 at init, so test spawn positions differ from the goldens'.",
+    "recommended_fix": "Add the 0→1 draw to the fixture or soften the 'growth.dem recipe' claim; document the timing divergence."
+  }
+]

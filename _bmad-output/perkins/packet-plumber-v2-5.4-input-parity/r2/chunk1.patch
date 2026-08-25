@@ -1,0 +1,3055 @@
+diff --git a/app/input/controller.odin b/app/input/controller.odin
+new file mode 100644
+index 0000000..6c77683
+--- /dev/null
++++ b/app/input/controller.odin
+@@ -0,0 +1,72 @@
++package input
++
++// controller.odin — the gamepad mapping (story 5.4): node-select, aim/confirm,
++// and tier/class cycling, mapped onto the SAME intents as the mouse (parity by
++// construction, FORGE #6). There is no cursor on a pad — the dpad moves a
++// NODE cursor (Node_Select) through the alive nodes in id order, and A
++// confirms: with no draw active it begins a draw at the cursor node (the
++// mouse's left-press twin); with a draw active it aims at the cursor node and
++// commits (the mouse's drag-release twin — the SAME validated command). B
++// cancels (ESC twin), the bumpers cycle the draw tier (no selection) or the
++// lane-key class (pipe selected), Start pauses.
++//
++// The live raylib adapter (poll.odin) maps rl.GamepadButton → Pad_Button; the
++// harness parity test scripts Pad_Button_Press directly. Deterministic: no
++// axis thresholding, no wall clock — node-order stepping only.
++
++
++// controller_map — convert a frame's gamepad Device_Events into Intents.
++controller_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
++	for ev in events {
++		p, ok := ev.(Pad_Button_Press)
++		if !ok {
++			continue
++		}
++		if inp.mode == .Game_Over {
++			// Game_Over: the only pad input is A (Confirm -> the executor's
++			// retry path) — Start/B/bumpers must not resume or mutate a
++			// terminal run.
++			if p.button == .A {
++				append(out, Intent(Confirm{}))
++			}
++			continue
++		}
++		switch p.button {
++		case .Dpad_Up:
++			append(out, Intent(Node_Select{step = -1}))
++		case .Dpad_Down:
++			append(out, Intent(Node_Select{step = +1}))
++		case .A:
++			// confirm — the executor branches on mode + drag state (retry at
++			// Game_Over, begin or aim-commit a draw)
++			append(out, Intent(Confirm{}))
++		case .B:
++			if inp.placing >= 0 {
++				// placement owns the surface: B cancels the armed placement (the
++				// mouse ESC twin) — NOT Cancel_Drag (a same-frame ghost would
++				// hide while the arm survives, and the next release would place)
++				append(out, Intent(Cancel{}))
++			} else if inp.drag.active {
++				// abandon the in-progress draw (the pad's escape hatch — see
++				// Cancel_Drag)
++				append(out, Intent(Cancel_Drag{}))
++			} else {
++				append(out, Intent(Cancel{}))
++			}
++		case .L_Bumper:
++			if inp.sel_pipe >= 0 {
++				append(out, Intent(Cycle_Class{dir = -1}))
++			} else {
++				append(out, Intent(Cycle_Tier{dir = -1}))
++			}
++		case .R_Bumper:
++			if inp.sel_pipe >= 0 {
++				append(out, Intent(Cycle_Class{dir = +1}))
++			} else {
++				append(out, Intent(Cycle_Tier{dir = +1}))
++			}
++		case .Start:
++			append(out, Intent(Toggle_Pause{}))
++		}
++	}
++}
+diff --git a/app/input/exec.odin b/app/input/exec.odin
+new file mode 100644
+index 0000000..5049b0e
+--- /dev/null
++++ b/app/input/exec.odin
+@@ -0,0 +1,618 @@
++package input
++
++// exec.odin — the ONE shared executor: semantic Intent → validated Command +
++// input-surface state. Every device's mapping funnels through here — parity by
++// construction (FORGE #6 / ODN-12): there is no per-device command production
++// to drift. Commands are produced exactly as the pre-intent handle_input did
++// (validate → apply-this-frame → log-at-next-tick, the ODN-2 edit fast-path),
++// so the mouse behavior is preserved byte-for-byte while touch + controller
++// ride the same intents.
++//
++// The world-hit helpers (snap_node, pipe_hit, tile math) move here from
++// app/main.odin with EXPLICIT args (topo/cat/view) — pure reads, usable by the
++// app's render-side code and the harness parity test alike. The lane + QoS
++// auto-follow helpers move here from app/qos_panel.odin (set_lane_class +
++// qos_apply_auto + qos_mode_manual) — they are command producers on the
++// validated path.
++
++import rl "vendor:raylib"
++import pp "../../core"
++import rnd "../render"
++
++// execute_all — run a frame's intents through the shared executor, in order.
++execute_all :: proc(inp: ^Input, intents: []Intent) {
++	for intent in intents {
++		apply_intent(inp, intent)
++	}
++}
++
++// apply_intent — the semantic executor (see types.odin for each intent's
++// contract). App-only side effects route through the Input's effect hooks
++// (nil-safe — the harness parity test leaves them nil for the command paths).
++apply_intent :: proc(inp: ^Input, intent: Intent) {
++	switch v in intent {
++	case Retry:
++		if inp.on_retry != nil { inp.on_retry(inp.user, inp) }
++	case Toggle_Pause:
++		// 5.3: the pause toggle — the executor flips the mode; the app copies
++		// it back. The sim freezes deterministically (no commands involved).
++		inp.mode = .Paused if inp.mode == .Run else .Run
++	case Toggle_Assist:
++		if inp.on_assist != nil { inp.on_assist(inp.user, inp) }
++	case Toggle_Overlay:
++		if inp.on_overlay != nil { inp.on_overlay(inp.user, inp) }
++	case Cancel:
++		// ESC / right-click-while-placing / pad B: cancel an armed placement
++		// (placement mode owns the surface) or deselect (ESC with nothing
++		// placing). The swallow latch is always set — the cancel gesture's
++		// release must not re-select. The mouse ESC keeps the old behavior:
++		// it never cancels an in-progress draw (the pad's B maps to
++		// Cancel_Drag for that).
++		if inp.placing >= 0 {
++			inp.placing = -1
++			inp.drag = {}
++			inp.drag.placing = -1
++		} else {
++			inp.sel_pipe = -1
++			inp.sel_node = -1
++		}
++		inp.press_swallowed = true
++	case Cancel_Drag:
++		// pad B with a draw in progress: abandon it (no command — the draw was
++		// never committed). The release-side swallow prevents a stray select.
++		inp.drag.active = false
++		inp.drag_to = 0
++		inp.press_swallowed = true
++	case Press_Anchor:
++		// the press's branch-top latch reset — must run AFTER a same-frame
++		// ESC/right Cancel so the press's reset wins (the old press block ran
++		// after the cancel block — Perkins B2)
++		inp.press_swallowed = false
++	case Select_Tier:
++		// a tray link-chip press: select the draw tier + exit placement mode
++		// (the current tray body, transcribed exactly)
++		inp.tier = v.tier
++		inp.placing = -1
++		inp.drag = {}
++		inp.drag.placing = -1
++	case Arm_Placement:
++		// a tray router-chip press: arm placement mode (click again to cancel)
++		inp.placing = (inp.placing == v.type_idx) ? -1 : v.type_idx
++		inp.drag = {}
++		inp.drag.placing = inp.placing
++		inp.drag_to = 0
++	case Begin_Draw:
++		// a press on a node: start the draw drag (mouse/touch press, pad
++		// confirm). The drag state machine is shared by all three devices.
++		begin_draw(inp, v.node, v.wx, v.wy)
++	case Cursor_Move:
++		// the pointer moved: mid-drag it re-snaps + re-validates the
++		// in-progress draw (live preview, READ-ONLY); while placing it tracks
++		// the placement ghost + validates the spot.
++		if inp.drag.active && inp.placing < 0 {
++			drag_retarget(inp, v.wx, v.wy)
++			if inp.on_drag_update != nil { inp.on_drag_update(inp.user, inp) } // Job B preview
++		} else if inp.placing >= 0 {
++			inp.drag.active = true
++			inp.drag.placing = inp.placing
++			inp.drag.wx = v.wx
++			inp.drag.wy = v.wy
++			tile := tile_from_world(inp.cat, v.wx, v.wy)
++			inp.drag.valid = pp.validate_place(inp.topo,
++				pp.Cmd_Place_Router{type_idx = u16(inp.placing), pos = tile}, inp.cat)
++			if inp.on_drag_update != nil { inp.on_drag_update(inp.user, inp) } // Job B preview (stale guard)
++		}
++	case Drag_Release:
++		// the drag release: commit the validated draw, then — if the release
++		// didn't move past the click threshold — click-select (the 5.5
++		// release-based surface, reachable even when no drag happened).
++		commit_draw(inp)
++		mouse := v.pos
++		moved := rl.Vector2Distance(mouse, inp.press) > 6
++		if !moved && !release_ui_hit(inp, mouse) {
++			click_select(inp, mouse)
++		}
++	case Place_Release:
++		// the placement release: commit if the release didn't move past the
++		// click threshold and wasn't swallowed (a tray/popover press).
++		if !inp.press_swallowed {
++			moved := rl.Vector2Distance(v.pos, inp.press) > 6
++			if !moved {
++				tile := tile_from_world(inp.cat, inp.drag.wx, inp.drag.wy)
++				cmd := pp.Cmd_Place_Router{type_idx = u16(inp.placing), pos = tile}
++				if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++					append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
++				}
++			}
++		}
++	case Select:
++		// a plain release: click-select (the 5.5 surface). The swallow latch is
++		// re-checked at EXECUTION time (a same-frame ESC-cancel sets it before
++		// this runs — the old code's synchronous ESC block did the same, so a
++		// release in the same frame as ESC must not re-select the cleared
++		// selection).
++		moved := rl.Vector2Distance(v.pos, inp.press) > 6
++		if !inp.press_swallowed && !moved && !release_ui_hit(inp, v.pos) {
++			click_select(inp, v.pos)
++		}
++	case Demolish:
++		// X/DEL: demolish the selected entity (the core's E1 / E27 paths —
++		// existing commands, no new command kinds). The placing/drag gates are
++		// re-checked at EXECUTION time: the old code ran the mouse branches
++		// FIRST (a same-frame press starts the drag before the X gate, so the
++		// demolish was suppressed; a same-frame drag-release cleared the drag,
++		// so the demolish ran) — the mapping emits on the pre-execution state,
++		// so the executor must match the post-branch state.
++		if inp.placing < 0 && !inp.drag.active {
++			if inp.sel_node >= 0 {
++				demolish_node(inp, u32(inp.sel_node))
++			} else if inp.sel_pipe >= 0 {
++				demolish_pipe(inp, u32(inp.sel_pipe))
++			}
++		}
++	case Set_Class:
++		// the class keys act on a live selection (the old code gated the whole
++		// 1/2 block on sel_pipe >= 0 — re-checked here so a same-frame
++		// right-click selection is the one the keys act on)
++		if inp.sel_pipe >= 0 {
++			inp.sel_class = v.class
++		}
++	case Set_Lane:
++		// the E/S/B lane keys (gated on the selection + the class index)
++		if inp.sel_pipe >= 0 && u32(inp.sel_class) < u32(len(inp.cat.packet_types)) {
++			set_lane_class(inp, inp.sel_class, v.lane)
++		}
++	case Arm_Preview:
++		// U acts on a live selection (same re-check rationale as Set_Class)
++		if inp.sel_pipe >= 0 && inp.on_arm_preview != nil {
++			inp.on_arm_preview(inp.user, inp)
++		}
++	case Cycle_Tier:
++		// pad bumpers (no selection): cycle the draw tier (deterministic wrap)
++		n := len(inp.cat.pipe_tiers)
++		if n > 0 {
++			inp.tier = u16((i32(inp.tier) + i32(v.dir) + i32(n)) % i32(n))
++		}
++	case Cycle_Class:
++		// pad bumpers (pipe selected): cycle the lane-key class
++		if inp.sel_pipe >= 0 {
++			n := len(inp.cat.packet_types)
++			if n > 0 {
++				inp.sel_class = u16((i32(inp.sel_class) + i32(v.dir) + i32(n)) % i32(n))
++			}
++		}
++	case Node_Select:
++		pad_step(inp, v.step)
++	case Confirm:
++		// pad A: retry at Game_Over; begin a draw at the cursor node; or
++		// aim-commit the in-progress draw at the cursor node (the mouse's
++		// drag-release twin — the SAME validated command).
++		if inp.mode == .Game_Over {
++			if inp.on_retry != nil { inp.on_retry(inp.user, inp) }
++		} else if inp.placing < 0 && inp.pad_has && pad_alive(inp) {
++			// pad_alive guards a cursor parked on a node that was demolished
++			// mid-gesture (Perkins note): a dead from_node would resolve via
++			// node_slot's slot-0 fallback and validate-reject forever.
++			if inp.drag.active {
++				nx, ny := node_world(inp.topo, inp.cat, inp.pad_node)
++				drag_retarget(inp, nx, ny)
++				// the aim step is a drag move — the live preview (R3 glow source)
++				// must recompute like any drag move (Perkins note)
++				if inp.on_drag_update != nil { inp.on_drag_update(inp.user, inp) }
++				commit_draw(inp)
++			} else {
++				nx, ny := node_world(inp.topo, inp.cat, inp.pad_node)
++				begin_draw(inp, inp.pad_node, nx, ny)
++			}
++		}
++	case Pan:
++		// two-finger pan — the intent seam exists; the camera-fit view has no
++		// pan state (landscape framing is a camera-fit decision, §18 OQ-1) —
++		// a deliberate no-op today, flagged in the PR; NOT camera work.
++		_ = v
++	case Right_Click:
++		// the right-press select/panel path (mouse UI — the app handler owns
++		// the pipe select + panel state; the drag interrupt happens there too,
++		// mirroring the current right-branch body)
++		if inp.on_right_click != nil { inp.on_right_click(inp.user, inp, v.pos) }
++	}
++}
++
++// --- the shared drag state machine -------------------------------------------
++
++// begin_draw — start a draw drag from a node (the mouse/touch press twin +
++// the pad confirm twin). All three devices enter the SAME drag state machine.
++begin_draw :: proc(inp: ^Input, node: u32, wx, wy: f32) {
++	inp.drag = {
++		active = true,
++		from_node = node,
++		wx = wx,
++		wy = wy,
++		valid = .None,
++		cost = 0,
++		placing = -1,
++	}
++	inp.drag_to = 0
++	if inp.on_drag_update != nil { inp.on_drag_update(inp.user, inp) } // app: preview_live = false
++}
++
++// drag_retarget — re-snap + re-validate the in-progress draw at a world
++// position (the live preview; READ-ONLY). Shared by the drag moves + the pad
++// aim step. Mirrors the current handle_input drag-update body exactly.
++drag_retarget :: proc(inp: ^Input, wx, wy: f32) {
++	inp.drag.wx = wx
++	inp.drag.wy = wy
++	if id, ok := snap_node(inp.topo, inp.cat, wx, wy); ok && id != inp.drag.from_node {
++		inp.drag_to = id
++		span := pp.span_between(node_pos(inp.topo, id), node_pos(inp.topo, inp.drag.from_node))
++		inp.drag.cost = pp.draw_cost(span, inp.tier, inp.cat)
++		inp.drag.valid = pp.validate_draw(inp.topo,
++			pp.Cmd_Draw_Pipe{a = inp.drag.from_node, b = id, tier = inp.tier}, inp.cat)
++	} else {
++		inp.drag_to = 0
++		inp.drag.valid = .None
++		inp.drag.cost = 0
++	}
++}
++
++// commit_draw — the shared draw-commit (the mouse drag release OR the pad
++// aim-confirm): apply the validated command THIS frame + log it at the next
++// tick (the edit fast-path, ODN-2), then the post-commit app effects (glow +
++// graduation nudge). Assumes drag_to/drag.valid are current (drag_retarget
++// ran on the final position). Clears the drag state.
++commit_draw :: proc(inp: ^Input) {
++	if inp.drag_to != 0 && inp.drag.valid == .None {
++		cmd := pp.Cmd_Draw_Pipe{a = inp.drag.from_node, b = inp.drag_to, tier = inp.tier}
++		if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++			append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
++			if inp.on_draw_commit != nil { inp.on_draw_commit(inp.user, inp) }
++		}
++	}
++	inp.drag.active = false
++	inp.drag_to = 0
++}
++
++// --- world hit-testing (moved from app/main.odin, explicit args) -------------
++
++// snap_node — nearest live node to a world-px point within the snap radius
++// (INCLUSIVE, E4). Integer-Euclidean² metric (the pinned distance). Ties break
++// to the lower id. Pure read (topo + cat).
++snap_node :: proc(topo: ^pp.Topology, cat: ^pp.Catalogs, wx, wy: f32) -> (u32, bool) {
++	t := topo
++	tile := f32(cat.balance.tile_px)
++	radius := f32(cat.balance.snap_radius)
++	r2 := f64(radius) * f64(radius)
++	best: u32 = 0
++	best_d2 := r2
++	found := false
++	for i in 0 ..< len(t.node_alive) {
++		if !t.node_alive[i] {
++			continue
++		}
++		nx := f32(t.node_pos[i][0]) * tile
++		ny := f32(t.node_pos[i][1]) * tile
++		dx := f64(nx - wx)
++		dy := f64(ny - wy)
++		d2 := dx*dx + dy*dy
++		if d2 <= best_d2 {
++			if d2 == best_d2 && found && t.node_id[i] > best {
++				continue
++			}
++			best = t.node_id[i]
++			best_d2 = d2
++			found = true
++		}
++	}
++	return best, found
++}
++
++// pipe_hit — nearest live pipe to a world-px point within PIPE_HIT_RADIUS
++// (world px). Point-to-segment distance², integer-style math on floats (the
++// view's basic-IEEE discipline); ties break to the lower pipe id.
++pipe_hit :: proc(topo: ^pp.Topology, cat: ^pp.Catalogs, wx, wy: f32) -> (u32, bool) {
++	t := topo
++	tile := f32(cat.balance.tile_px)
++	radius := f32(10) // world px — comfortably inside the fat-pipe read
++	r2 := radius * radius
++	best: u32 = 0
++	best_d2 := r2
++	found := false
++	for i in 0 ..< len(t.pipe_alive) {
++		if !t.pipe_alive[i] {
++			continue
++		}
++		a_slot, _ := pp.node_slot(t, t.pipe_a[i])
++		b_slot, _ := pp.node_slot(t, t.pipe_b[i])
++		ax := f32(t.node_pos[a_slot][0]) * tile
++		ay := f32(t.node_pos[a_slot][1]) * tile
++		bx := f32(t.node_pos[b_slot][0]) * tile
++		by := f32(t.node_pos[b_slot][1]) * tile
++		d2 := point_segment_d2(wx, wy, ax, ay, bx, by)
++		if d2 <= best_d2 {
++			if d2 == best_d2 && found && t.pipe_id[i] > best {
++				continue
++			}
++			best = t.pipe_id[i]
++			best_d2 = d2
++			found = true
++		}
++	}
++	return best, found
++}
++
++// point_segment_d2 — squared distance from a point to a segment (basic float
++// math; the projection clamps to the segment's endpoints).
++point_segment_d2 :: proc(px, py, ax, ay, bx, by: f32) -> f32 {
++	dx := bx - ax
++	dy := by - ay
++	len2 := dx*dx + dy*dy
++	if len2 <= 0 {
++		return (px-ax)*(px-ax) + (py-ay)*(py-ay)
++	}
++	t := ((px-ax)*dx + (py-ay)*dy) / len2
++	t = clamp(t, 0, 1)
++	ex := ax + t*dx - px
++	ey := ay + t*dy - py
++	return ex*ex + ey*ey
++}
++
++// node_pos — a node id's tile position (pure read; slot resolution).
++node_pos :: proc(topo: ^pp.Topology, id: u32) -> [2]i32 {
++	slot, _ := pp.node_slot(topo, id)
++	return topo.node_pos[slot]
++}
++
++// node_world — a node id's world-px position (tile × tile_px).
++node_world :: proc(topo: ^pp.Topology, cat: ^pp.Catalogs, id: u32) -> (f32, f32) {
++	p := node_pos(topo, id)
++	tile := f32(cat.balance.tile_px)
++	return f32(p[0]) * tile, f32(p[1]) * tile
++}
++
++// tile_from_world — the tile under a world-px point (world px → tile coords).
++// Equivalent to the old mouse_tile (from_screen then /tile_px — the camera
++// offsets cancel, so a world position converts directly).
++tile_from_world :: proc(cat: ^pp.Catalogs, wx, wy: f32) -> [2]i32 {
++	tile := f32(cat.balance.tile_px)
++	return {i32(wx / tile), i32(wy / tile)}
++}
++
++// --- selection + demolish (the 5.5 surface, moved from app/main.odin) --------
++
++// click_select — release-based selection (the prototype's B2 interaction): a
++// click on a JUNCTION selects it, a click on a PIPE selects it, a click on a
++// TERMINAL or empty ground clears the selection. Terminals never select — no
++// demolish affordance on a terminal, mirroring core's .Terminal_Demolish (E2).
++// Runs on EVERY left release that did not commit a draw/placement and did not
++// move past the click threshold.
++click_select :: proc(inp: ^Input, mouse: rl.Vector2) {
++	wx, wy := rnd.from_screen(inp.view, mouse.x, mouse.y)
++	if id, ok := snap_node(inp.topo, inp.cat, wx, wy); ok {
++		slot, _ := pp.node_slot(inp.topo, id)
++		if inp.topo.node_kind[slot] == .Junction {
++			inp.sel_node = i64(id)
++			inp.sel_pipe = -1
++			return
++		}
++		// a terminal click selects nothing — and never falls through to an
++		// incident pipe (the strictest reading of the no-terminal-affordance
++		// rule: the click said "no demolish here")
++		inp.sel_node = -1
++		inp.sel_pipe = -1
++		return
++	}
++	if pid, ok := pipe_hit(inp.topo, inp.cat, wx, wy); ok {
++		inp.sel_pipe = i64(pid)
++		inp.sel_node = -1
++		if inp.on_pipe_selected != nil { inp.on_pipe_selected(inp.user, inp) }
++		return
++	}
++	inp.sel_node = -1
++	inp.sel_pipe = -1 // empty ground closes the popover
++}
++
++// release_ui_hit — a left RELEASE landing inside the demolish popover, the
++// QoS panel (the app's on_ui_release effect — the 6px-boundary gap closer) or
++// a tray chip (shared hit-test) must not click-select.
++release_ui_hit :: proc(inp: ^Input, mouse: rl.Vector2) -> bool {
++	if inp.on_ui_release != nil && inp.on_ui_release(inp.user, inp, mouse) {
++		return true
++	}
++	n := rnd.tray_chip_count(inp.view)
++	for i in 0 ..< n {
++		if rl.CheckCollisionPointRec(mouse, rnd.tray_chip_rect(inp.view, i)) {
++			return true
++		}
++	}
++	return false
++}
++
++// demolish_pipe — the pipe demolish fast-path (the EXISTING core command — no
++// new command kinds, no LOG_VERSION bump): validate→apply THIS frame, logged
++// at the next tick. A rejection surfaces via the reject toast and keeps the
++// selection; success clears it.
++demolish_pipe :: proc(inp: ^Input, pipe: u32) {
++	cmd := pp.Cmd_Demolish_Pipe{pipe = pipe}
++	if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++		append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
++		inp.sel_pipe = -1
++		inp.sel_node = -1
++	} else {
++		inp.last_reject = err
++		inp.reject_tick = inp.tick
++	}
++}
++
++// demolish_node — the junction demolish fast-path (the core's E27 atomic
++// batch: incident pipes in edge-id order, then the vertex — the core owns
++// it). Clears BOTH selections (the batch may have killed the selected pipe).
++demolish_node :: proc(inp: ^Input, node: u32) {
++	cmd := pp.Cmd_Demolish_Node{node = node}
++	if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++		append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
++		inp.sel_pipe = -1
++		inp.sel_node = -1
++	} else {
++		inp.last_reject = err
++		inp.reject_tick = inp.tick
++	}
++}
++
++// --- the lane keys + QoS auto-follow (moved from app/qos_panel.odin) ---------
++
++// qos_mode_manual — the DERIVED mode: manual iff the pipe's current weights
++// differ from the auto-ladder result for its assignments (or the editor is
++// open). Untouched pipes are auto (weights == default preset == auto of the
++// empty assignment set).
++qos_mode_manual :: proc(inp: ^Input, ps: u32) -> bool {
++	if inp.qos_editing {
++		return true
++	}
++	if int(ps) >= len(inp.topo.pipe_weights) {
++		return false
++	}
++	w := inp.topo.pipe_weights[ps]
++	auto := pp.qos_auto_weights(inp.topo, inp.cat, u32(inp.sel_pipe))
++	return w != auto
++}
++
++// qos_apply_auto — the auto-follow write-through: recompute the ladder split
++// for the pipe's CURRENT assignments and write it through the serialized
++// command (Cmd_Set_Weights, weights). No-op when the weights didn't change
++// (a same-state assignment must not spam the action log). A rejection is
++// surfaced, never silent (the toast).
++qos_apply_auto :: proc(inp: ^Input, pipe: u32) {
++	ps, ok := pp.pipe_slot(inp.topo, pipe)
++	if !ok {
++		return
++	}
++	w := pp.qos_auto_weights(inp.topo, inp.cat, pipe)
++	if inp.topo.pipe_weights[ps] == w {
++		return // nothing to write — the split already matches the ladder
++	}
++	cmd := pp.Cmd_Set_Weights{pipe = pipe, weights = w}
++	if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++		append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
++	} else {
++		inp.last_reject = err
++		inp.reject_tick = inp.tick
++	}
++}
++
++// set_lane_class — assign `class` to `lane` on the selected pipe (the 1/2 +
++// E/S/B keys and the panel's row clicks both land here). Fast-path apply +
++// log, then the auto-follow UNLESS the manual editor is open (manual mode
++// owns the weights — assignments still apply, the split does not auto-follow;
++// [Revert] re-runs the ladder over all assignments).
++set_lane_class :: proc(inp: ^Input, class: u16, lane: u8) {
++	if inp.sel_pipe < 0 {
++		return
++	}
++	if u32(class) >= u32(len(inp.cat.packet_types)) {
++		return
++	}
++	pipe := u32(inp.sel_pipe)
++	ps, ok := pp.pipe_slot(inp.topo, pipe)
++	if !ok {
++		return
++	}
++	// Gate the auto-follow on the pipe's PRE-EDIT derived mode: an AUTO pipe
++	// follows its assignments — a MANUAL pipe keeps them until an explicit
++	// [Auto]/[Revert]. A silent clobber of player work would be a UX bug.
++	was_auto := !qos_mode_manual(inp, ps)
++	cmd := pp.Cmd_Set_Lane{pipe = pipe, class = class, lane = lane}
++	if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++		append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
++		if was_auto {
++			qos_apply_auto(inp, pipe)
++		}
++	} else {
++		inp.last_reject = err
++		inp.reject_tick = inp.tick
++	}
++}
++
++// --- the pad node cursor ------------------------------------------------------
++
++// right_click_select — the right-press select/panel path (5.8: right-click a
++// pipe SELECTS it and opens/refreshes the QoS panel; the 3.2 emphasis dial
++// RETIRES — documented decision, user ruling 2026-08-14). The early return
++// must not strand an in-progress drag's ghost: the drag state is cleared
++// first (the release check would otherwise be missed this frame). ONE copy
++// lives here — the app's effect hook AND the harness parity hook both
++// delegate to it (Perkins note: no hand-duplication to drift).
++right_click_select :: proc(inp: ^Input, pos: rl.Vector2) {
++	wx, wy := rnd.from_screen(inp.view, pos.x, pos.y)
++	was_dragging := inp.drag.active
++	inp.drag.active = false
++	inp.drag_to = 0
++	if was_dragging {
++		inp.press_swallowed = true // an interrupted drag's release must not re-select
++	}
++	if pid, ok := pipe_hit(inp.topo, inp.cat, wx, wy); ok {
++		inp.sel_pipe = i64(pid)
++		inp.sel_node = -1
++		inp.sel_class = 0
++		inp.qos_editing = false // a fresh selection starts with the editor closed
++	}
++}
++
++// pad_alive — is the pad cursor's node still alive (a cursor parked on a
++// demolished node must not aim/begin from a dead id)?
++pad_alive :: proc(inp: ^Input) -> bool {
++	if !inp.pad_has {
++		return false
++	}
++	slot, ok := pp.node_slot(inp.topo, inp.pad_node)
++	return ok && slot < u32(len(inp.topo.node_alive)) && inp.topo.node_alive[slot]
++}
++
++// pad_step — move the node cursor by `step` through the ALIVE nodes in id
++// order (array slot order — insertion order, deterministic — no map iteration,
++// ODN-10). With no cursor yet, +1 lands on the first alive node, -1 on the
++// last. A full-circle scan always finds an alive slot when one exists.
++pad_step :: proc(inp: ^Input, step: i32) {
++	t := inp.topo
++	n := len(t.node_alive)
++	if n <= 0 {
++		inp.pad_has = false
++		return
++	}
++	cur := -1
++	if inp.pad_has {
++		for i in 0 ..< n {
++			if t.node_alive[i] && t.node_id[i] == inp.pad_node {
++				cur = i
++				break
++			}
++		}
++	}
++	// first placement: step +1 starts at slot 0, step -1 at slot n-1 (the
++	// naive (-1 + step) % n would land on n-2 for the first Dpad_Up —
++	// edge-hunter finding 3).
++	idx: int
++	if cur == -1 {
++		idx = 0 if step >= 0 else n - 1
++	} else {
++		idx = cur + int(step)
++		if idx < 0 {
++			idx += n
++		}
++		idx %= n
++	}
++	// scan from idx in the step direction for the next ALIVE slot (a full
++	// circle always finds one when any exists).
++	for off in 0 ..< n {
++		j := idx + int(step)*off
++		if j < 0 {
++			j += n
++		}
++		j %= n
++		if t.node_alive[j] {
++			inp.pad_has = true
++			inp.pad_node = t.node_id[j]
++			return
++		}
++	}
++	inp.pad_has = false
++}
+diff --git a/app/input/input.odin b/app/input/input.odin
+new file mode 100644
+index 0000000..7eb21ee
+--- /dev/null
++++ b/app/input/input.odin
+@@ -0,0 +1,125 @@
++package input
++
++// input.odin — the input/intent layer (ODN-12, story 5.4): the Input context +
++// the per-frame dispatch. Raw device events (poll.odin adapters, or scripted
++// synthetic frames in the harness) map per-device onto semantic Intents, and
++// the ONE shared executor (exec.odin) turns those into validated Commands
++// through the same topology_apply_edit + action-log fast-path the pre-intent
++// handle_input used — parity by construction (FORGE #6).
++//
++// The Input struct is the device-agnostic input surface: the executor's state
++// (drag, press anchor, swallow latch, selection, tier, placement, the reject
++// toast, the QoS editor flag) + the refs it needs (topology, catalogs, view,
++// the action log) + nil-safe app-effect hooks for the app-only side effects
++// (assist, overlay, preview, glow, retry, popover/QoS UI). The app embeds ONE
++// persistent Input (`App.input`) and the app's UI reads/writes `app.input.*`
++// directly — there are NO sync copies (the executor's mutations are visible to
++// the render-side UI the same frame). `tick` + `mode` are mirrored into the
++// ctx around dispatch (they stay canonical on App). The harness builds its own
++// Input per parity scenario.
++
++import rl "vendor:raylib"
++import pp "../../core"
++import rnd "../render"
++
++// Input — the semantic input surface + executor context (see the package doc).
++// Refs are set by the app at init / by the harness per run; the per-frame
++// fields are synced by the app around dispatch (or driven directly by the
++// harness parity test).
++Input :: struct {
++	// refs (the app wires once; the harness wires per run)
++	topo: ^pp.Topology,
++	cat:  ^pp.Catalogs,
++	view: ^rnd.View,
++	log:  ^[dynamic]pp.Command, // the action log (commands land here — the replay artifact, ODN-11)
++
++	// per-frame state
++	tick: u64, // the current sim tick (apply_tick = tick + 1 — the edit fast-path, ODN-2)
++	mode: Mode, // Run / Paused / Game_Over (the app mirrors it)
++
++	// input-surface state (the executor's working set; the app syncs its own
++	// fields to/from these around dispatch)
++	drag:            rnd.Drag_State,
++	drag_to:         u32, // the node the cursor is currently snapped to (0 = none)
++	press:           rl.Vector2, // the moved-check anchor (press position)
++	press_swallowed: bool, // a press consumed by a popover/tray click must never re-select on release
++	sel_pipe:        i64, // the selected pipe (-1 = none)
++	sel_node:        i64, // the selected junction (-1 = none)
++	sel_class:       u16, // the class the lane keys act on
++	tier:            u16, // the selected draw tier
++	placing:         i32, // the node-type index while placing a router, else -1
++	last_reject:     pp.Edit_Error, // the most recent edit rejection (toast)
++	reject_tick:     u64, // the tick the rejection landed
++	qos_editing:     bool, // 5.8: the QoS panel's manual editor is open (gates the lane auto-follow)
++
++	// controller cursor (node-select)
++	pad_has:  bool, // the cursor has been placed
++	pad_node: u32, // the node under the cursor
++
++	// adapter state (poll.odin — the LIVE raylib adapters; the harness parity
++	// test drives scripted events and never touches these)
++	touch_count_prev:   i32,
++	touch_centroid_prev: rl.Vector2,
++
++	// frame scratch
++	events:  [dynamic]Device_Event, // the pollers' output for this frame
++	intents: [dynamic]Intent, // the mappings' output for this frame (cleared per device)
++
++	// effects — app-side side effects (nil = no-op; the harness parity test
++	// leaves them nil for the command paths). `user` is the App pointer.
++	user:            rawptr,
++	on_retry:        proc(user: rawptr, inp: ^Input),          // fresh run (E32)
++	on_assist:       proc(user: rawptr, inp: ^Input),          // T: assist tier cycle
++	on_overlay:      proc(user: rawptr, inp: ^Input),          // D: debug overlay (PP_DEBUG)
++	on_arm_preview:  proc(user: rawptr, inp: ^Input),          // U: R4 upgrade preview
++	on_ui_press:     proc(user: rawptr, inp: ^Input, pos: rl.Vector2) -> bool, // popover/QoS left press (swallowed?)
++	on_ui_release:   proc(user: rawptr, inp: ^Input, pos: rl.Vector2) -> bool, // release lands in a UI rect?
++	on_right_click:  proc(user: rawptr, inp: ^Input, pos: rl.Vector2), // the right-press select/panel path
++	on_drag_update:  proc(user: rawptr, inp: ^Input),          // Job B preview recompute on drag/placement moves
++	on_draw_commit:  proc(user: rawptr, inp: ^Input),          // post-commit glow + graduation nudge
++	on_pipe_selected: proc(user: rawptr, inp: ^Input),         // a pipe was click-selected (panel state reset)
++}
++
++// init — zero the scratch buffers + refs (the app calls once; the harness per
++// run). The app wires the effects after.
++init :: proc(inp: ^Input) {
++	inp.events = make([dynamic]Device_Event, 0, 16)
++	inp.intents = make([dynamic]Intent, 0, 16)
++	inp.sel_pipe = -1
++	inp.sel_node = -1
++	inp.placing = -1
++	inp.drag.placing = -1
++}
++
++// destroy — free the scratch buffers (the app calls at exit; the harness per
++// run).
++destroy :: proc(inp: ^Input) {
++	delete(inp.events)
++	delete(inp.intents)
++}
++
++// begin_frame — clear the frame scratch (the pollers then append the frame's
++// raw events; dispatch maps + executes them).
++begin_frame :: proc(inp: ^Input) {
++	clear(&inp.events)
++	clear(&inp.intents)
++}
++
++// dispatch_frame — map ONE frame's device events into intents and execute
++// them. Events are processed per-device in a FIXED order (mouse → touch →
++// controller) so a mixed-device frame is deterministic. Each device's events
++// go through its OWN mapping (the gesture vocabulary differs per device), but
++// ALL intents run through the ONE shared executor — parity by construction:
++// the same intent yields the same command regardless of which device produced
++// it. The harness parity test drives this with scripted frames.
++dispatch_frame :: proc(inp: ^Input, events: []Device_Event) {
++	clear(&inp.intents)
++	mouse_map(inp, events, &inp.intents)
++	execute_all(inp, inp.intents[:])
++	clear(&inp.intents)
++	touch_map(inp, events, &inp.intents)
++	execute_all(inp, inp.intents[:])
++	clear(&inp.intents)
++	controller_map(inp, events, &inp.intents)
++	execute_all(inp, inp.intents[:])
++}
+diff --git a/app/input/mouse.odin b/app/input/mouse.odin
+new file mode 100644
+index 0000000..f2b811e
+--- /dev/null
++++ b/app/input/mouse.odin
+@@ -0,0 +1,325 @@
++package input
++
++// mouse.odin — the mouse + keyboard mapping (ODN-12, mouse first). This is a
++// FAITHFUL transcription of the pre-intent app/handle_input: same branch
++// order, same conditions, same side effects (the press anchor + the swallow
++// latch), only the command/state mutations move into the shared executor
++// (exec.odin). Mouse behavior is preserved EXACTLY — placement, drag, the
++// release-based click-select surface (5.5), demolish X/DEL, the lane keys
++// E/S/B — while touch + controller ride the same intents (parity by
++// construction, FORGE #6).
++//
++// Frame processing mirrors the current code's structure:
++//   phase 1 keys  — Game_Over retry gate, P/Space pause, D overlay, T assist,
++//                   ESC cancel/deselect (pre-mouse block)
++//   right press   — the right-branch (placement cancel or the QoS select path)
++//   left press    — the press block (anchor, UI swallows, tray chips, drag
++//                   start); the release/move else-if chain is skipped (the
++//                   current code's early returns)
++//   release/move  — the drag-active / placement / plain-release else-if chain
++//   phase 2 keys  — demolish X/DEL, preview U, class 1/2, lanes E/S/B
++//                   (post-mouse block)
++
++import rl "vendor:raylib"
++import pp "../../core"
++import rnd "../render"
++
++// mouse_map — convert a frame's mouse/keyboard Device_Events into Intents.
++// The mapping mutates only the input-surface anchor bookkeeping (press,
++// press_swallowed) — every command/state mutation happens in the executor.
++mouse_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
++	// Game_Over: the only input is retry (a fresh run in a fresh context —
++	// no state leakage, ODN-13). R or Enter, exactly like the current code.
++	if inp.mode == .Game_Over {
++		for ev in events {
++			if k, ok := ev.(Key_Press); ok {
++				if k.key == .R || k.key == .Enter {
++					append(out, Intent(Retry{}))
++				}
++			}
++		}
++		return
++	}
++
++	// --- collect the frame's mouse state ------------------------------------
++	// The phase-1 keys are COLLECTED first (so the mouse-press state is known
++	// when emitting them), then emitted with the old `||` coalescing (W2/
++	// Perkins: P+Space and R+Enter each produce ONE intent, exactly like the
++	// old `if P || SPACE` / `if R || ENTER`). ESC maps to Cancel — the executor
++	// branches on placing (cancel placement vs deselect), matching the old
++	// `if placing >= 0 && ESC … elif ESC` block. `esc_cancelled` advances the
++	// placing state the mouse branches check (the old cancel block ran BEFORE
++	// the branches — Perkins B2).
++	keys: [4]Key
++	keys_n := 0
++	esc_cancelled := false
++	right_press: rl.Vector2
++	has_right := false
++	left_press: rl.Vector2
++	has_left := false
++	release_pos: rl.Vector2
++	has_release := false
++	// W5 (Perkins): no per-frame heap churn — the poll emits at most ONE
++	// Mouse_Move per frame, so a fixed buffer suffices (the project-context
++	// zero-per-frame-heap-churn rule).
++	moves: [2]rl.Vector2
++	moves_n := 0
++
++	for ev in events {
++		#partial switch e in ev {
++		case Key_Press:
++			#partial switch e.key {
++			case .P, .Space:
++				if !has_key(keys[:], .P) && !has_key(keys[:], .Space) {
++					if keys_n < len(keys) { keys[keys_n] = .P; keys_n += 1 }
++				}
++			case .D:
++				if keys_n < len(keys) { keys[keys_n] = .D; keys_n += 1 }
++			case .T:
++				if keys_n < len(keys) { keys[keys_n] = .T; keys_n += 1 }
++			case .Esc:
++				if keys_n < len(keys) { keys[keys_n] = .Esc; keys_n += 1 }
++			case: // R/Enter map via the Game_Over early return; phase-2 keys below
++			}
++		case Mouse_Press:
++			if e.button == .Right {
++				right_press = e.pos
++				has_right = true
++			} else {
++				left_press = e.pos
++				has_left = true
++			}
++		case Mouse_Release:
++			if e.button == .Left {
++				release_pos = e.pos
++				has_release = true
++			}
++		case Mouse_Move:
++			if moves_n < len(moves) {
++				moves[moves_n] = e.pos
++				moves_n += 1
++			}
++		case:
++		}
++	}
++
++	// emit the phase-1 key intents (the old pre-mouse block, `||`-coalesced)
++	for i in 0 ..< keys_n {
++		#partial switch keys[i] {
++		case .P, .Space:
++			append(out, Intent(Toggle_Pause{}))
++		case .D:
++			append(out, Intent(Toggle_Overlay{}))
++		case .T:
++			append(out, Intent(Toggle_Assist{}))
++		case .Esc:
++			if inp.placing >= 0 {
++				esc_cancelled = true
++			}
++			append(out, Intent(Cancel{}))
++		case:
++		}
++	}
++
++	// the effective placing for the mouse branches: an ESC cancel this frame
++	// already cleared placement (the old cancel block ran before the branches)
++	placing_eff := inp.placing
++	if esc_cancelled {
++		placing_eff = -1
++	}
++	// hoisted press-branch outcomes (the phase-2 gate below mirrors the old
++	// early returns, so it needs them after the branch block)
++	ui := false
++	tray_hit := false
++
++	// --- the right branch -----------------------------------------------------
++	// The current `if IsMouseButtonPressed(.RIGHT)` block: the right+left
++	// chord anchors the left release BEFORE the branch's early returns; a
++	// right press while placing cancels (the executor's Cancel — the phase-1
++	// ESC cancel already handled ESC); otherwise the QoS-panel select path
++	// (the app handler owns the pipe select + panel state).
++	if has_right {
++		if has_left {
++			// a same-frame right+left chord: anchor the left release so its
++			// click-select (if any) uses THIS press, never a stale one
++			inp.press = right_press
++			inp.press_swallowed = false
++		}
++		if placing_eff >= 0 {
++			// REVIEW FIX (blind-hunter W3): the OLD code's cancel block set
++			// placing = -1 BEFORE the right branch, making the branch's
++			// `if placing >= 0 { return }` dead code — a right-click while
++			// placing cancelled placement AND then selected a pipe under the
++			// cursor (the QoS path). Transcribed bug-for-bug: emit the Cancel
++			// (the executor clears placement + sets the swallow latch), then the
++			// Right_Click (the executor's drag-interrupt + pipe select).
++			// An ESC cancel earlier in the same frame already cleared placement —
++			// the right press then only selects (no duplicate cancel).
++			if !esc_cancelled {
++				append(out, Intent(Cancel{}))
++			}
++			append(out, Intent(Right_Click{pos = right_press}))
++		} else {
++			append(out, Intent(Right_Click{pos = right_press}))
++		}
++		if has_left {
++			// the right+left chord re-anchored the latch above; a same-frame
++			// cancel (the placement Cancel just emitted) would re-latch it — emit
++			// the Press_Anchor so the press's reset wins (the old chord ran AFTER
++			// the cancel block — Perkins B2)
++			append(out, Intent(Press_Anchor{}))
++		}
++	} else if has_left {
++		// --- the left-press branch (the current press block) -----------------
++		inp.press = left_press // the moved-check anchor for click-select + placement
++		inp.press_swallowed = false // reset until a popover/tray click consumes the press
++
++		if placing_eff < 0 && inp.on_ui_press != nil {
++			// the demolish popover's buttons swallow the click FIRST (the
++			// prototype's popover-first order) — a button press must never
++			// start a drag; then the QoS panel (a panel click never
++			// deselects, never starts a drag). The app handler returns
++			// whether the press was swallowed. Gated on the EFFECTIVE placing
++			// (an ESC cancel this frame already cleared placement — the old
++			// cancel block ran before the press block).
++			ui = inp.on_ui_press(inp.user, inp, left_press)
++		}
++		if ui {
++			inp.press_swallowed = true
++		} else {
++			// the hardware tray next: link chips select the draw tier; router
++			// chips arm placement mode (click again to cancel). Chips swallow
++			// the click — never start a drag from the tray, never
++			// click-select on release. The tray loop is NOT gated on placing
++			// (a tray click re-arms mid-placement, like the current code).
++			n := rnd.tray_chip_count(inp.view)
++			for i in 0 ..< n {
++				if rl.CheckCollisionPointRec(left_press, rnd.tray_chip_rect(inp.view, i)) {
++					if i < len(inp.cat.pipe_tiers) {
++						append(out, Intent(Select_Tier{tier = u16(i)}))
++					} else {
++						rts: [8]u16
++						nr := rnd.tray_router_types(inp.view, rts[:])
++						k := i - len(inp.cat.pipe_tiers)
++						if k < nr {
++							append(out, Intent(Arm_Placement{type_idx = i32(rts[k])}))
++						}
++					}
++					tray_hit = true
++					break
++				}
++			}
++			if tray_hit {
++				inp.press_swallowed = true
++			} else if placing_eff >= 0 {
++				// placement clicks land on release (the press is already
++				// recorded — the anchor + swallow reset above). Decided on the
++				// EFFECTIVE placing: an ESC cancel this frame freed the placement
++				// surface, so the press falls through to the drag start below
++				// (the old cancel-then-press order — Perkins B2).
++			} else {
++				// start a drag only if the press lands on a node; selection
++				// runs on RELEASE (5.5 — click-select on every left release).
++				// The Press_Anchor (swallow reset) precedes it so a same-frame
++				// ESC/right cancel's latch does not kill the gesture's release
++				// (the old press block reset the latch AFTER the cancel block).
++				append(out, Intent(Press_Anchor{}))
++				wx, wy := rnd.from_screen(inp.view, left_press.x, left_press.y)
++				if id, ok := snap_node(inp.topo, inp.cat, wx, wy); ok {
++					append(out, Intent(Begin_Draw{node = id, wx = wx, wy = wy}))
++				}
++			}
++		}
++	} else if has_release || moves_n > 0 {
++		// --- the release/drag else-if chain ----------------------------------
++		if inp.drag.active && placing_eff < 0 {
++			// the drag branch: every move re-snaps + re-validates the
++			// in-progress draw (live preview, READ-ONLY); the release frame
++			// re-snaps to the release point, then commits-or-selects.
++			for i in 0 ..< moves_n {
++				wx, wy := rnd.from_screen(inp.view, moves[i].x, moves[i].y)
++				append(out, Intent(Cursor_Move{wx = wx, wy = wy}))
++			}
++			if has_release {
++				wx, wy := rnd.from_screen(inp.view, release_pos.x, release_pos.y)
++				append(out, Intent(Cursor_Move{wx = wx, wy = wy}))
++				append(out, Intent(Drag_Release{pos = release_pos}))
++			}
++		} else if placing_eff >= 0 {
++			// the placement branch: the ghost tracks the cursor + the spot is
++			// validated per move; the release commits if it didn't move past
++			// the click threshold and wasn't swallowed (an ESC cancel this
++			// frame already cleared placement — the old cancel block ran first).
++			for i in 0 ..< moves_n {
++				wx, wy := rnd.from_screen(inp.view, moves[i].x, moves[i].y)
++				append(out, Intent(Cursor_Move{wx = wx, wy = wy}))
++			}
++			if has_release {
++				wx, wy := rnd.from_screen(inp.view, release_pos.x, release_pos.y)
++				append(out, Intent(Cursor_Move{wx = wx, wy = wy}))
++				append(out, Intent(Place_Release{pos = release_pos}))
++			}
++		} else if has_release && !inp.press_swallowed {
++			// a plain release (no drag, no placement) click-selects — the
++			// 5.5 release-based surface
++			append(out, Intent(Select{pos = release_pos}))
++		}
++	}
++
++	// --- phase 2 keys (the post-mouse block) ---------------------------------
++	// B1 (Perkins): the old handle_input RETURNED inside the right-press branch
++	// and on popover/QoS/tray-swallowed left-presses (and placement presses),
++	// so X/DEL/U/1/2/E/S/B were IGNORED on those frames. Mirror the early
++	// returns: suppress phase-2 on right-press frames + UI/tray-swallowed-left-
++	// press frames + placement-press frames. (The executor's Demolish
++	// placing/drag re-check still guards the frames that DO reach phase-2.)
++	phase2_blocked := has_right || (has_left && (ui || tray_hit || placing_eff >= 0))
++	if !phase2_blocked {
++	for ev in events {
++		k, ok := ev.(Key_Press)
++		if !ok {
++			continue
++		}
++		#partial switch k.key {
++		case .X, .Delete:
++			// the demolish keys — X or DEL destroys the selected entity. The
++			// placing/drag gates live in the EXECUTOR (Demolish): the old code
++			// evaluated them AFTER the mouse branches, so same-frame press+X
++			// (drag starts -> no demolish) and drag-release+X (drag cleared ->
++			// demolish) matched the post-branch state — the mapping cannot see
++			// that state before execution.
++			append(out, Intent(Demolish{}))
++		case .U:
++			// the R4 upgrade preview arm/disarm (a view-only look) — the
++			// sel_pipe gate lives in the executor (a same-frame selection must
++			// be the one the key acts on, like the old sequential code)
++			append(out, Intent(Arm_Preview{}))
++		case .One, .Two:
++			// the per-type class keys — with a pipe selected, 1/2 pick the
++			// class the lane keys act on (same executor-gated rationale)
++			for i in 0 ..< len(inp.cat.packet_types) {
++				if k.key == Key(int(Key.One) + i) {
++					append(out, Intent(Set_Class{class = u16(i)}))
++				}
++			}
++		case .E:
++			append(out, Intent(Set_Lane{lane = pp.LANE_EXPRESS}))
++		case .S:
++			append(out, Intent(Set_Lane{lane = pp.LANE_STANDARD}))
++		case .B:
++			append(out, Intent(Set_Lane{lane = pp.LANE_BEST_EFFORT}))
++		case: // phase-1 keys already handled
++		}
++	}
++	} // !phase2_blocked
++}
++
++// has_key — is `k` in the collected phase-1 key list (the `||` coalescing).
++has_key :: proc(keys: []Key, k: Key) -> bool {
++	for kk in keys {
++		if kk == k {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/app/input/poll.odin b/app/input/poll.odin
+new file mode 100644
+index 0000000..6d8f97b
+--- /dev/null
++++ b/app/input/poll.odin
+@@ -0,0 +1,144 @@
++package input
++
++// poll.odin — the LIVE raylib adapters: read raylib's raw device state for one
++// frame and append Device_Events to inp.events. This is the ONLY raylib-state
++// reading in the intent layer — the mappings + executor work purely on the
++// event data, so scripted synthetic frames (the harness parity test) exercise
++// the exact same path with no physical device. The harness never calls these.
++//
++// Key translation: raylib's IsKeyPressed → Key_Press (semantic Key). Mouse:
++// IsMouseButtonPressed/Released → Mouse_Press/Release (current pos), and a
++// Mouse_Move every frame (the current pos — the drag branch re-snaps per
++// frame, exactly like the pre-intent handle_input's per-frame GetMouseX/Y).
++// Touch: touch-count edges + the primary touch point synthesize
++// Touch_Press/Move/Release; >= 2 touches synthesize Two_Finger_Pan from the
++// touch-point centroid movement. Pad: GetGamepadButtonPressed → Pad_Button.
++
++import "core:c"
++import rl "vendor:raylib"
++
++// pad_map — raylib GamepadButton → semantic Pad_Button (nil = not mapped).
++pad_map :: proc(b: rl.GamepadButton) -> (Pad_Button, bool) {
++	#partial switch b {
++	case .LEFT_FACE_UP: return .Dpad_Up, true
++	case .LEFT_FACE_DOWN: return .Dpad_Down, true
++	case .RIGHT_FACE_DOWN: return .A, true // Xbox A / PS Cross
++	case .RIGHT_FACE_RIGHT: return .B, true // Xbox B / PS Circle
++	case .LEFT_TRIGGER_1: return .L_Bumper, true
++	case .RIGHT_TRIGGER_1: return .R_Bumper, true
++	case .MIDDLE_RIGHT: return .Start, true
++	case:
++		return .A, false
++	}
++}
++
++// poll_mouse — append the frame's keyboard + mouse events (the pre-intent
++// handle_input's reads, one-to-one).
++poll_mouse :: proc(inp: ^Input) {
++	// keys: every IsKeyPressed check the old handle_input made, in its order
++	if rl.IsKeyPressed(.R) { append(&inp.events, Device_Event(Key_Press{key = .R})) }
++	if rl.IsKeyPressed(.ENTER) { append(&inp.events, Device_Event(Key_Press{key = .Enter})) }
++	if rl.IsKeyPressed(.P) { append(&inp.events, Device_Event(Key_Press{key = .P})) }
++	if rl.IsKeyPressed(.SPACE) { append(&inp.events, Device_Event(Key_Press{key = .Space})) }
++	// 5.7: the debug-overlay toggle — D is PP_DEBUG-only, exactly like the old
++	// handle_input (release builds carry nothing that flips the bit).
++	when #config(PP_DEBUG, false) {
++		if rl.IsKeyPressed(.D) { append(&inp.events, Device_Event(Key_Press{key = .D})) }
++	}
++	if rl.IsKeyPressed(.T) { append(&inp.events, Device_Event(Key_Press{key = .T})) }
++	if rl.IsKeyPressed(.ESCAPE) { append(&inp.events, Device_Event(Key_Press{key = .Esc})) }
++	if rl.IsKeyPressed(.X) { append(&inp.events, Device_Event(Key_Press{key = .X})) }
++	if rl.IsKeyPressed(.DELETE) { append(&inp.events, Device_Event(Key_Press{key = .Delete})) }
++	if rl.IsKeyPressed(.U) { append(&inp.events, Device_Event(Key_Press{key = .U})) }
++	if rl.IsKeyPressed(.ONE) { append(&inp.events, Device_Event(Key_Press{key = .One})) }
++	if rl.IsKeyPressed(.TWO) { append(&inp.events, Device_Event(Key_Press{key = .Two})) }
++	if rl.IsKeyPressed(.E) { append(&inp.events, Device_Event(Key_Press{key = .E})) }
++	if rl.IsKeyPressed(.S) { append(&inp.events, Device_Event(Key_Press{key = .S})) }
++	if rl.IsKeyPressed(.B) { append(&inp.events, Device_Event(Key_Press{key = .B})) }
++
++	pos := rl.Vector2{f32(rl.GetMouseX()), f32(rl.GetMouseY())}
++	append(&inp.events, Device_Event(Mouse_Move{pos = pos})) // the per-frame pos read
++	if rl.IsMouseButtonPressed(.RIGHT) {
++		append(&inp.events, Device_Event(Mouse_Press{pos = pos, button = .Right}))
++	}
++	if rl.IsMouseButtonPressed(.LEFT) {
++		append(&inp.events, Device_Event(Mouse_Press{pos = pos, button = .Left}))
++	}
++	if rl.IsMouseButtonReleased(.LEFT) {
++		append(&inp.events, Device_Event(Mouse_Release{pos = pos, button = .Left}))
++	}
++}
++
++// poll_touch — append the frame's touch events from raylib's touch state.
++// Single touch: count 0→1 = Touch_Press (the primary point), moves while 1 =
++// Touch_Move, 1→0 = Touch_Release. Two or more touches: the centroid movement
++// between frames = Two_Finger_Pan (and the single-touch press/release edges
++// are suppressed — the gesture is a pan, not a drag).
++poll_touch :: proc(inp: ^Input) {
++	count := int(rl.GetTouchPointCount())
++	centroid := rl.Vector2{0, 0}
++	if count > 0 {
++		// the centroid of the first min(count, 2) touch points
++		n := min(count, 2)
++		for i in 0 ..< n {
++			p := rl.GetTouchPosition(c.int(i))
++			centroid.x += p.x
++			centroid.y += p.y
++		}
++		centroid.x /= f32(n)
++		centroid.y /= f32(n)
++	}
++	prev := inp.touch_count_prev
++	if count == 0 {
++		if prev >= 1 {
++			// 1→0 (or 2+→0): the touch ended — a release only for the
++			// single-touch case (a pan ending produces no release)
++			if prev == 1 {
++				append(&inp.events, Device_Event(Touch_Release{pos = inp.touch_centroid_prev}))
++			}
++		}
++	} else if count == 1 {
++		pos := rl.GetTouchPosition(0)
++		if prev == 0 {
++			append(&inp.events, Device_Event(Touch_Press{pos = pos}))
++		} else if prev == 1 {
++			append(&inp.events, Device_Event(Touch_Move{pos = pos}))
++		} else {
++			// 2+ → 1: the pan ended, a fresh press begins
++			append(&inp.events, Device_Event(Touch_Press{pos = pos}))
++		}
++	} else {
++		// two or more touches: the pan gesture. A 1 -> 2 transition ENDS the
++		// single-touch drag (a release at the last single-touch position — the
++		// drag commits-or-selects exactly like a finger lift; without it the
++		// drag would hang until the whole gesture lifts, committing a stale
++		// draw at the lift point — edge-hunter finding 5a).
++		if prev == 1 {
++			append(&inp.events, Device_Event(Touch_Release{pos = inp.touch_centroid_prev}))
++		} else if prev >= 2 {
++			append(&inp.events, Device_Event(Two_Finger_Pan{
++				dx = centroid.x - inp.touch_centroid_prev.x,
++				dy = centroid.y - inp.touch_centroid_prev.y,
++			}))
++		}
++	}
++	inp.touch_count_prev = i32(count)
++	inp.touch_centroid_prev = centroid
++}
++
++// poll_controller — append the frame's gamepad events (button edges only —
++// deterministic, no axis thresholding; the story's mappings are button-based).
++poll_controller :: proc(inp: ^Input) {
++	if !rl.IsGamepadAvailable(0) {
++		return
++	}
++	for {
++		b := rl.GetGamepadButtonPressed()
++		if b == .UNKNOWN {
++			break
++		}
++		if pb, ok := pad_map(b); ok {
++			append(&inp.events, Device_Event(Pad_Button_Press{button = pb}))
++		}
++	}
++}
+diff --git a/app/input/touch.odin b/app/input/touch.odin
+new file mode 100644
+index 0000000..11fcfdd
+--- /dev/null
++++ b/app/input/touch.odin
+@@ -0,0 +1,80 @@
++package input
++
++// touch.odin — the touch mapping (story 5.4): drag-draw, tap-select, and
++// two-finger pan, mapped onto the SAME intents as the mouse (parity by
++// construction, FORGE #6). A single touch press on a node begins a draw
++// (Begin_Draw — the mouse's left-press twin); a touch move extends it
++// (Cursor_Move); a release commits-or-selects (Drag_Release / Select — the
++// mouse's release twin, so a tap = the 5.5 release-based click-select).
++// Two fingers = the Pan intent (camera-pan — a deliberate no-op in the
++// executor today, see Pan; flagged in the PR per §18 OQ-1: landscape framing
++// is a camera-fit decision, NOT camera work here).
++//
++// The live raylib adapter (poll.odin) synthesizes these from
++// GetTouchPosition/GetTouchPointCount (single-touch drag + the two-finger
++// centroid); the harness parity test scripts them directly.
++
++import rnd "../render"
++
++// touch_map — convert a frame's touch Device_Events into Intents. Touch has
++// no keyboard, no right button, and (per the story's mapping list) no tray —
++// the world interactions only: drag-draw, tap-select, two-finger pan. A touch
++// press anchors the moved-check exactly like a mouse press.
++touch_map :: proc(inp: ^Input, events: []Device_Event, out: ^[dynamic]Intent) {
++	// Game_Over: frozen — no touch surface (retry is the pad A / R-Enter path)
++	if inp.mode == .Game_Over {
++		return
++	}
++	for ev in events {
++		#partial switch v in ev {
++		case Touch_Press:
++			// the press anchor (the moved-check for tap vs drag) + the
++			// swallow reset — the mouse press twin. A press on a node begins
++			// a draw drag; a press on empty ground just anchors (the release
++			// decides: a tap selects, a drag draws).
++			inp.press = v.pos
++			inp.press_swallowed = false
++			if inp.placing >= 0 {
++				// placement mode owns the surface (touch has no placement mapping
++				// in this story) — a touch press while placing just anchors, like
++				// the mouse press (the release's moved-check uses this anchor)
++			} else {
++				// W3 (Perkins): the app-UI swallow must gate touch presses too — a
++				// touch tap on the demolish popover / QoS panel must not start a
++				// drag or click-select through them (the mouse press mirrors this).
++				ui := false
++				if inp.on_ui_press != nil {
++					ui = inp.on_ui_press(inp.user, inp, v.pos)
++				}
++				if ui {
++					inp.press_swallowed = true
++				} else {
++					wx, wy := rnd.from_screen(inp.view, v.pos.x, v.pos.y)
++					if id, ok := snap_node(inp.topo, inp.cat, wx, wy); ok {
++						append(out, Intent(Begin_Draw{node = id, wx = wx, wy = wy}))
++					}
++				}
++			}
++		case Touch_Move:
++			wx, wy := rnd.from_screen(inp.view, v.pos.x, v.pos.y)
++			append(out, Intent(Cursor_Move{wx = wx, wy = wy}))
++		case Touch_Release:
++			wx, wy := rnd.from_screen(inp.view, v.pos.x, v.pos.y)
++			if inp.drag.active && inp.placing < 0 {
++				// a drag release: final re-snap + commit-or-select (the mouse
++				// Drag_Release twin — a tap = a release without a move, so it
++				// click-selects; a drag = a move past 6px, so it commits)
++				append(out, Intent(Cursor_Move{wx = wx, wy = wy}))
++				append(out, Intent(Drag_Release{pos = v.pos}))
++			} else if !inp.press_swallowed && inp.placing < 0 {
++				// a plain tap release: click-select (5.5 — reachable even when no
++				// drag happened). Gated on placing: placement owns the surface
++				// (the mouse's placement release commits, never selects).
++				append(out, Intent(Select{pos = v.pos}))
++			}
++		case Two_Finger_Pan:
++			append(out, Intent(Pan{dx = v.dx, dy = v.dy}))
++		case:
++		}
++	}
++}
+diff --git a/app/input/types.odin b/app/input/types.odin
+new file mode 100644
+index 0000000..e4a5f85
+--- /dev/null
++++ b/app/input/types.odin
+@@ -0,0 +1,290 @@
++package input
++
++// types.odin — the intent-layer vocabulary (ODN-12): raw device events → typed
++// Intent → validated Command. Story 5.4 (touch + controller parity).
++//
++// The three-stage seam the architecture's ODN-12 row specifies:
++//   raw raylib device events (poll.odin adapters)  → Device_Event (this file)
++//   per-device mappings (mouse/touch/controller)   → Intent (this file)
++//   the ONE shared executor (exec.odin)            → validated Command
++//
++// Parity is BY CONSTRUCTION (FORGE #6): every device maps onto the same
++// semantic intents and every intent runs through the same executor — there is
++// no per-device command production to drift. The Device_Event/Intent types are
++// device-agnostic data (raylib types only as plain data: rl.Vector2 for
++// positions/rects); the mappings never call raylib state, so scripted
++// synthetic frames drive the harness parity test deterministically (T1 across
++// inputs) with no physical device.
++
++import rl "vendor:raylib"
++
++// Mode — the app-layer FSM mirror the input layer gates on (ODN-13 §9.5:
++// Boot → Menu → Run ↔ Paused → Game_Over). The app maps its Mode to this per
++// frame; the executor flips Run ↔ Paused (the pause intent) and the app
++// copies the result back.
++Mode :: enum {
++	Run,
++	Paused,
++	Game_Over,
++}
++
++// Key — the semantic keyboard keys the intent layer understands. Device-
++// agnostic by design: the raylib adapter (poll.odin) maps rl.KeyboardKey →
++// Key, so the mappings never touch raylib's enum and the harness scripts keys
++// directly. The roster is exactly the current handle_input keys (R/Enter
++// retry, P/Space pause, D overlay, T assist, ESC cancel/deselect, X/DEL
++// demolish, U preview, 1/2 class, E/S/B lanes).
++Key :: enum {
++	Esc,
++	R,
++	Enter,
++	P,
++	Space,
++	D,
++	T,
++	X,
++	Delete,
++	U,
++	One,
++	Two,
++	E,
++	S,
++	B,
++}
++
++Mouse_Button :: enum {
++	Left,
++	Right,
++}
++
++// Pad_Button — the semantic controller buttons the story's controller mapping
++// defines (node-select, aim/confirm, tier/class cycling): dpad moves the node
++// cursor, A confirms (begin/commit a draw, retry at Game_Over), B cancels,
++// bumpers cycle the tier (no selection) or the class (pipe selected), Start
++// pauses. The raylib adapter (poll.odin) maps rl.GamepadButton → Pad_Button.
++Pad_Button :: enum {
++	Dpad_Up,
++	Dpad_Down,
++	A, // confirm (Xbox A / PS Cross)
++	B, // cancel (Xbox B / PS Circle)
++	L_Bumper,
++	R_Bumper,
++	Start,
++}
++
++// --- Device_Event — ONE frame's raw device input, as plain data --------------
++
++Key_Press :: struct {
++	key: Key,
++}
++
++Mouse_Press :: struct {
++	pos:    rl.Vector2,
++	button: Mouse_Button,
++}
++
++Mouse_Release :: struct {
++	pos:    rl.Vector2,
++	button: Mouse_Button,
++}
++
++Mouse_Move :: struct {
++	pos: rl.Vector2,
++}
++
++Touch_Press :: struct {
++	pos: rl.Vector2,
++}
++
++Touch_Move :: struct {
++	pos: rl.Vector2,
++}
++
++Touch_Release :: struct {
++	pos: rl.Vector2,
++}
++
++Two_Finger_Pan :: struct {
++	dx, dy: f32,
++}
++
++Pad_Button_Press :: struct {
++	button: Pad_Button,
++}
++
++Device_Event :: union {
++	Key_Press,
++	Mouse_Press,
++	Mouse_Release,
++	Mouse_Move,
++	Touch_Press,
++	Touch_Move,
++	Touch_Release,
++	Two_Finger_Pan,
++	Pad_Button_Press,
++}
++
++// --- Intent — the semantic, device-agnostic action ----------------------------
++
++// Retry — R/Enter at Game_Over (mouse) / A at Game_Over (pad): fresh run,
++// fresh seed (E32). App effect.
++Retry :: struct {}
++
++// Toggle_Pause — P/Space / pad Start: Run ↔ Paused (5.3). The executor flips
++// the mode; the sim freezes deterministically (no commands involved).
++Toggle_Pause :: struct {}
++
++// Toggle_Assist — T: the Job B assist tier cycle (full → glow-only → off).
++// App effect.
++Toggle_Assist :: struct {}
++
++// Toggle_Overlay — D (PP_DEBUG builds only): the 5.7 debug overlay. App effect.
++Toggle_Overlay :: struct {}
++
++// Cancel — ESC / right-click-while-placing / pad B: cancels an armed placement
++// (placing → -1) or deselects (ESC with no placement); the swallow latch is
++// always set (the cancel gesture's release must not re-select).
++Cancel :: struct {}
++
++// Cancel_Drag — pad B with a draw in progress: abandon the in-progress draw
++// (the pad has no ESC/right-click equivalent, so B must be able to escape a
++// stuck drag — the mouse recovers via a new press; the pad cannot). The mouse
++// ESC keeps the old behavior (it never cancels a drag — see Cancel).
++Cancel_Drag :: struct {}
++
++// Press_Anchor — a left press re-anchored the latch: the old handle_input's
++// press block RESET press_swallowed at its top, and on a same-frame ESC/right
++// cancel (whose block ran BEFORE the press) that reset must WIN over the
++// cancel's latch. This intent runs AFTER the frame's Cancel(s) in the executor
++// queue, reproducing the old sequential order (Perkins B2).
++Press_Anchor :: struct {}
++
++// Select_Tier — a tray link-chip press (mouse) or a bumper cycle (pad): set
++// the draw tier. Tray clicks also exit placement mode + clear the drag state.
++Select_Tier :: struct {
++	tier: u16,
++}
++
++// Arm_Placement — a tray router-chip press: toggle placement mode for a node
++// type (click again to cancel, like the current tray).
++Arm_Placement :: struct {
++	type_idx: i32,
++}
++
++// Begin_Draw — a press on a node (mouse/touch) or A on the pad cursor: start
++// the draw drag from the node at the given world position.
++Begin_Draw :: struct {
++	node: u32,
++	wx, wy: f32,
++}
++
++// Cursor_Move — the pointer moved (mouse move / touch move / placement ghost
++// tracking). The executor routes by state: mid-drag it re-snaps + re-validates
++// the in-progress draw (live preview, READ-ONLY); while placing it tracks the
++// placement ghost + validates the spot.
++Cursor_Move :: struct {
++	wx, wy: f32,
++}
++
++// Drag_Release — a left release while a draw drag is active: commit the
++// validated draw (the edit fast-path command) or, if the release didn't move
++// past the click threshold, click-select instead (the 5.5 release-based
++// surface — node → pipe → clear on EVERY left release).
++Drag_Release :: struct {
++	pos: rl.Vector2,
++}
++
++// Place_Release — a left release while placement mode is armed: commit the
++// validated router placement (press_swallowed + the moved check gate it).
++Place_Release :: struct {
++	pos: rl.Vector2,
++}
++
++// Select — a plain left release (no drag, no placement): click-select at the
++// release point (5.5 — reachable even when no drag happened).
++Select :: struct {
++	pos: rl.Vector2,
++}
++
++// Demolish — X/DEL with a selection: demolish the selected pipe or junction
++// (the core's E1 / E27 paths, existing commands — no new command kinds).
++Demolish :: struct {}
++
++// Set_Class — the 1/2 keys with a pipe selected: pick the class the lane keys
++// act on.
++Set_Class :: struct {
++	class: u16,
++}
++
++// Set_Lane — the E/S/B keys (or a panel row) with a pipe selected: assign the
++// class to a lane, then the auto-follow writes the ladder split through
++// Cmd_Set_Weights unless the manual editor owns the weights.
++Set_Lane :: struct {
++	lane: u8,
++}
++
++// Arm_Preview — U with a pipe selected: arm/disarm the R4 upgrade preview
++// (app effect — the pure look, never a command).
++Arm_Preview :: struct {}
++
++// Cycle_Tier — pad bumpers (no pipe selected): cycle the draw tier by dir.
++Cycle_Tier :: struct {
++	dir: i8,
++}
++
++// Cycle_Class — pad bumpers (pipe selected): cycle the lane-key class by dir.
++Cycle_Class :: struct {
++	dir: i8,
++}
++
++// Node_Select — pad dpad: step the node cursor by dir through the alive nodes
++// (in id order — deterministic, no map iteration).
++Node_Select :: struct {
++	step: i32,
++}
++
++// Confirm — pad A: with no draw active, begin a draw at the pad cursor; with a
++// draw active, aim-commit it at the pad cursor (the same validated command the
++// mouse's drag release produces); at Game_Over, retry.
++Confirm :: struct {}
++
++// Pan — two-finger pan (touch): the camera-pan intent. The view is camera-fit
++// only (landscape framing is a camera-fit decision, §18 OQ-1) — the executor
++// is a deliberate no-op today, flagged in the PR; NOT camera work.
++Pan :: struct {
++	dx, dy: f32,
++}
++
++// Right_Click — a right press with no placement armed: the QoS-panel select /
++// drag-interrupt path (mouse UI — the app handler owns the pipe select + panel
++// state; the executor interrupts an in-flight drag first).
++Right_Click :: struct {
++	pos: rl.Vector2,
++}
++
++Intent :: union {
++	Retry,
++	Cancel_Drag,
++	Press_Anchor,
++	Toggle_Pause,
++	Toggle_Assist,
++	Toggle_Overlay,
++	Cancel,
++	Select_Tier,
++	Arm_Placement,
++	Begin_Draw,
++	Cursor_Move,
++	Drag_Release,
++	Place_Release,
++	Select,
++	Demolish,
++	Set_Class,
++	Set_Lane,
++	Arm_Preview,
++	Cycle_Tier,
++	Cycle_Class,
++	Node_Select,
++	Confirm,
++	Pan,
++	Right_Click,
++}
+diff --git a/app/main.odin b/app/main.odin
+index 1b025a0..752634c 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -18,6 +18,7 @@ import "core:os"
+ import "core:strings"
+ import pp "../core"
+ import rnd "./render"
++import inp "./input" // 5.4: the intent layer (ODN-12) — raw device events → Intent → validated Command
+ import rl "vendor:raylib"
+ 
+ WIN_W :: 1280
+@@ -59,18 +60,21 @@ App :: struct {
+ 	state:         pp.Run_State,
+ 	view:          rnd.View,
+ 	palette:       rnd.Palette,
+-	drag:          rnd.Drag_State,
+-	tick:          u64,
+-	accum:         f64,    // the fixed-timestep accumulator (ODN-2)
+-	tier:          u16,    // the selected draw tier (3.5: tray link chips; default standard)
+-	placing:       i32,    // 3.5: node-type index while placing a router from the tray, else -1
+-	res_id:        u32,
+-	rt_id:         u32,
+-	host_id:       u32,
+-	drag_to:       u32,    // the node the cursor is currently snapped to (0 = none)
+-	press:         rl.Vector2, // 3.5: the placement press position (movement guard)
+-	mode:          Mode,   // 1.4: the app-layer FSM (ODN-13)
+-	run_live:      bool,   // 1.4: has App.state been run_init'd (the restart destroy guard)
++	// 5.4: the intent layer's context (ODN-12) — the device-agnostic input
++	// surface the executor works on: drag, press anchor, swallow latch,
++	// selection (sel_pipe/sel_node/sel_class), the draw tier, placement mode,
++	// the reject toast, the QoS editor flag + the refs/effects it needs. The
++	// app's input handling reads/writes app.input.* directly (no sync copies);
++	// tick + mode stay canonical on App and are mirrored into the ctx around
++	// dispatch.
++	input:          inp.Input,
++	tick:           u64,
++	accum:          f64,    // the fixed-timestep accumulator (ODN-2)
++	res_id:         u32,
++	rt_id:          u32,
++	host_id:        u32,
++	mode:           Mode,   // 1.4: the app-layer FSM (ODN-13)
++	run_live:       bool,   // 1.4: has App.state been run_init'd (the restart destroy guard)
+ 	win_goal:      u32,    // 1.4: the session goal (mirrored into state.goal each run)
+ 	lose_tick_cap: u64,    // 1.4: the session cap (mirrored into state.tick_cap each run)
+ 	health_on:     bool,   // 4.3: the session meter flag (mirrored into state.health_enabled)
+@@ -78,22 +82,17 @@ App :: struct {
+ 	// 3.2: the QoS interaction state — the selected pipe (the readout + the
+ 	// lane-key target; -1 = none) + the class index the lane keys act on, +
+ 	// the transient rejection toast (a rejected QoS edit must never be
+-	// silent — e.g. E6's never-drop guard).
+-	sel_pipe:    i64,
+-	sel_class:   u16,
+-	// 5.8: the QoS panel's manual editor is expanded (app-side UI state — the
+-	// panel's mode is DERIVED from weights vs the auto ladder, never stored;
+-	// reset on deselect/restart).
+-	qos_editing: bool,
++	// silent — e.g. E6's never-drop guard). 5.4: these live in app.input now
++	// (the intent layer's context) — the executor + the UI both read them
++	// from there.
+ 	// 5.5: the selected junction (the demolish popover's target; -1 = none) —
+ 	// mutually exclusive with sel_pipe (click_select keeps one of the two).
+ 	// press_swallowed: a left press consumed by a popover button or the tray
+ 	// must never re-select on its release (or place a router from a tray
+ 	// click's release — the placement commit gates on it too).
+-	sel_node:        i64,
+-	press_swallowed: bool,
+-	last_reject: pp.Edit_Error, // 3.2: the most recent QoS edit rejection (drawn while fresh)
+-	reject_tick: u64,           // the tick the rejection landed (toast age)
++	// 5.8: the QoS panel's manual editor flag (app-side UI state — the panel's
++	// mode is DERIVED from weights vs the auto ladder, never stored; reset on
++	// deselect/restart).
+ 	// Job B (readability package, canon 2026-08-13): the R2a assist tiers +
+ 	// the R3 post-draw glow + the graduation nudge. TWO preview buffers:
+ 	// `preview` is the live drag what-if; `glow` is the COMMITTED DAG (copied
+@@ -186,13 +185,13 @@ main :: proc() {
+ 	app: App
+ 	app.cat = cat
+ 	std, _ := pp.pipe_tier_index(&cat, "standard")
+-	app.tier = std
++	app.input.tier = std
+ 	app.win_goal = WIN_GOAL
+ 	app.lose_tick_cap = LOSE_TICK_CAP
+ 	app.health_on = APP_HEALTH_ON
+ 	app.surge_win_pct = APP_SURGE_WIN_PCT
+-	app.sel_pipe = -1 // 3.2: no selection at startup (0 is a LIVE pipe id, not a sentinel)
+-	app.sel_class = 0
++	app.input.sel_pipe = -1 // 3.2: no selection at startup (0 is a LIVE pipe id, not a sentinel)
++	app.input.sel_class = 0
+ 	// 5.7: the stats stream sink. The builder + header are ALWAYS initialized
+ 	// (a constant header, cheap), but the per-step append is gated by the loop:
+ 	// --stats-out -> stats_emit appends to this builder; overlay-only -> nil sb
+@@ -240,6 +239,29 @@ main :: proc() {
+ 	app.view.font = rnd.load_hud_font()
+ 	rnd.view_compute(&app.view, WIN_W, WIN_H, &cat.balance)
+ 
++	// 5.4: the intent-layer context (ODN-12) — the refs + effect hooks are
++	// wired ONCE here; the per-frame fields (selection, tier, placement, drag,
++	// the reject toast, the QoS editor flag) are read/written directly by
++	// handle_input + the UI via app.input.* — no sync copies. tick + mode stay
++	// canonical on App and are mirrored into the ctx around dispatch.
++	app.input.topo = &app.state.topology
++	app.input.cat = &app.cat
++	app.input.view = &app.view
++	app.input.log = &app.state.action_log
++	app.input.user = &app
++	inp.init(&app.input)
++	app.input.on_retry = effect_retry
++	app.input.on_assist = effect_assist
++	app.input.on_overlay = effect_overlay
++	app.input.on_arm_preview = effect_arm_preview
++	app.input.on_ui_press = effect_ui_press
++	app.input.on_ui_release = effect_ui_release
++	app.input.on_right_click = effect_right_click
++	app.input.on_drag_update = effect_drag_update
++	app.input.on_draw_commit = effect_draw_commit
++	app.input.on_pipe_selected = effect_pipe_selected
++	defer inp.destroy(&app.input)
++
+ 	tick_seconds := 1.0 / f64(cat.balance.logic_hz)
+ 
+ 	for !rl.WindowShouldClose() {
+@@ -339,7 +361,7 @@ main :: proc() {
+ 		rl.BeginDrawing()
+ 		defer rl.EndDrawing()
+ 		rl.ClearBackground(app.palette.canvas)
+-		rnd.draw_world(&app.view, &app.state.topology, &app.state.bundles, &app.state.flow, &app.state.crisis, app.tick, app.drag, app.sel_pipe)
++		rnd.draw_world(&app.view, &app.state.topology, &app.state.bundles, &app.state.flow, &app.state.crisis, app.tick, app.input.drag, app.input.sel_pipe)
+ 		// v2-visibility (gap 2): the drop-site markers — drawn with the world
+ 		// (world-anchored at the shed bundle's midpoint) but APP-LAYER ONLY:
+ 		// the harness T2 capture path never calls this line (capture_frame
+@@ -359,11 +381,11 @@ main :: proc() {
+ 		// (a QoS emphasis edit also bumps gen — the glow drops early,
+ 		// conservatively, never stale).
+ 		if (app.mode == .Run || app.mode == .Paused) && app.assist_mode != .Off {
+-			if app.preview_live && app.preview.ok && app.drag.active {
++			if app.preview_live && app.preview.ok && app.input.drag.active {
+ 				rnd.draw_route_glow(&app.view, &app.state.topology, &app.state.bundles, &app.preview,
+-					app.assist_mode == .Full, rnd.to_screen(&app.view, app.drag.wx, app.drag.wy))
++					app.assist_mode == .Full, rnd.to_screen(&app.view, app.input.drag.wx, app.input.drag.wy))
+ 			} else if app.tick <= app.glow_until && app.state.topology.gen == app.glow_gen &&
+-				!app.drag.active && app.glow.ok {
++				!app.input.drag.active && app.glow.ok {
+ 				rnd.draw_route_glow(&app.view, &app.state.topology, &app.state.bundles, &app.glow, false, {})
+ 			}
+ 		}
+@@ -371,8 +393,8 @@ main :: proc() {
+ 		// harness capture path never sees it). Hidden while placing AND
+ 		// mid-drag (the placement ghost / held gesture own the surface).
+ 		// 5.3: live while paused too (demolish-and-plan under the veil).
+-		if (app.mode == .Run || app.mode == .Paused) && app.placing < 0 && !app.drag.active {
+-			rnd.draw_demolish_popover(&app.view, &app.state.topology, &app.cat, app.sel_node, app.sel_pipe)
++		if (app.mode == .Run || app.mode == .Paused) && app.input.placing < 0 && !app.input.drag.active {
++			rnd.draw_demolish_popover(&app.view, &app.state.topology, &app.cat, app.input.sel_node, app.input.sel_pipe)
+ 		}
+ 		// 5.3 (user ruling 2026-08-14): the paused state renders with NO overlay —
+ 		// no full-screen dim, no centered PAUSED text (the prototype's paused
+@@ -417,7 +439,7 @@ main :: proc() {
+ 		// (read-only — never drains, never filters forward; the 4.2 tripwire).
+ 		when #config(PP_DEBUG, false) {
+ 			if app.overlay_on && app.stats_valid {
+-				rnd.draw_debug_overlay(&app.view, &app.state.topology, &app.cat, &app.stats, app.state.events[:], app.sel_pipe)
++				rnd.draw_debug_overlay(&app.view, &app.state.topology, &app.cat, &app.stats, app.state.events[:], app.input.sel_pipe)
+ 			}
+ 		}
+ 	}
+@@ -446,17 +468,20 @@ start_run :: proc(app: ^App, seed: u64) {
+ 	app.state.growth_enabled = true // 5.1: the map grows (run setup — terminals appear outward from the player-placed router mesh; era 3 unlocks content_host spawns + the wide-tier connect radius)
+ 	app.tick = 0
+ 	app.accum = 0
+-	app.drag = {}
+-	app.drag.placing = -1 // 3.5: not placing (a zero struct would read as type 0)
+-	app.drag_to = 0
+-	app.placing = -1 // 3.5
+-	app.sel_pipe = -1 // 3.2: fresh run, fresh selection (pipe ids recycle from 0)
+-	app.sel_node = -1 // 5.5: fresh run, fresh junction selection
+-	app.press_swallowed = false
+-	app.press = {} // 5.5: a stale pre-restart anchor must never anchor the fresh run's first release
+-	app.sel_class = 0
+-	app.last_reject = .None
+-	app.reject_tick = 0
++	app.input.drag = {}
++	app.input.drag.placing = -1 // 3.5: not placing (a zero struct would read as type 0)
++	app.input.drag_to = 0
++	app.input.placing = -1 // 3.5
++	app.input.sel_pipe = -1 // 3.2: fresh run, fresh selection (pipe ids recycle from 0)
++	app.input.sel_node = -1 // 5.5: fresh run, fresh junction selection
++	app.input.press_swallowed = false
++	app.input.press = {} // 5.5: a stale pre-restart anchor must never anchor the fresh run's first release
++	app.input.sel_class = 0
++	app.input.last_reject = .None
++	app.input.reject_tick = 0
++	app.input.pad_has = false // edge-hunter finding 1: the pad cursor must not
++	app.input.pad_node = 0 // leak across restarts (node ids recycle from 0 — a
++	// stale cursor id would anchor a draw at the wrong node — ODN-13)
+ 	// Job B: the readability state is run-scoped (node ids recycle across
+ 	// runs — a stale DAG must never survive; the assist TIER is a setting and
+ 	// persists across in-session restarts). The scratch buffers are reused
+@@ -513,405 +538,237 @@ fresh_seed :: proc() -> u64 {
+ // swallow, X/DEL keys) --------------------------------------------------------
+ 
+ handle_input :: proc(app: ^App) {
+-	// Game_Over: the only input is retry (a fresh run in a fresh context — no
+-	// state leakage, ODN-13). Run + Paused: the full input surface below.
+-	if app.mode == .Game_Over {
+-		if rl.IsKeyPressed(.R) || rl.IsKeyPressed(.ENTER) {
+-			restart_run(app)
+-		}
+-		return
+-	}
++	// 5.4: the intent layer (ODN-12). Raw device events (polled this frame)
++	// map per-device onto semantic Intents; the ONE shared executor turns
++	// those into validated Commands through the same topology_apply_edit +
++	// action-log fast-path — mouse behavior preserved exactly, touch +
++	// controller parity by construction (FORGE #6). The input-surface state
++	// (drag, press anchor, swallow latch, selection, tier, placement) lives in
++	// app.input; tick + mode are mirrored in/out here (the pause intent flips
++	// the ctx mode; the app copies it back).
++	ictx := &app.input
++	ictx.tick = app.tick
++	ictx.mode = mode_to_input(app.mode)
++	inp.begin_frame(ictx)
++	inp.poll_mouse(ictx)
++	inp.poll_touch(ictx)
++	inp.poll_controller(ictx)
++	inp.dispatch_frame(ictx, ictx.events[:])
++	app.mode = mode_from_input(ictx.mode)
++}
+ 
+-	// 5.3: the pause toggle — P OR SPACE (the GDD controls-table canon, user
+-	// ruling 2026-08-14; regular keys, no F-keys: the solo-dev laptop ruling).
+-	// Neither collides with anything (R restart / T assist / E-S-B lanes /
+-	// 1-2 class / U preview / X-DEL demolish / ESC cancel are all taken). Run
+-	// <-> Paused; the edit fast-path stays live in both (the surface below
+-	// never gates on the mode — pause-and-plan [ODN-2]). Restarts clear it
+-	// (start_run drops the mode to Run).
+-	if rl.IsKeyPressed(.P) || rl.IsKeyPressed(.SPACE) {
+-		app.mode = .Paused if app.mode == .Run else .Run
++// mode_to_input — the App FSM -> intent-layer Mode mirror (Boot collapses into
++// Run; the ctx gates on Run/Paused/Game_Over).
++mode_to_input :: proc(m: Mode) -> inp.Mode {
++	switch m {
++	case .Boot, .Run:
++		return .Run
++	case .Paused:
++		return .Paused
++	case .Game_Over:
++		return .Game_Over
+ 	}
++	return .Run
++}
+ 
+-	// 5.7: the debug-overlay toggle — D (regular key, free: R/T/E/S/B/1/2/U/
+-	// X/DEL/P/SPACE are taken). PP_DEBUG builds only (this toggle + the draw
+-	// call are compile-gated; release builds carry nothing that flips the bit).
+-	when #config(PP_DEBUG, false) {
+-		if rl.IsKeyPressed(.D) {
+-			app.overlay_on = !app.overlay_on
+-		}
+-	}
+-	// Job B: the assist tier toggle (T) — the R2a graduation control:
+-	// full -> glow-only -> off -> full. Any engagement with the toggle
+-	// dismisses the graduation nudge for this run (opt-in, never forced).
+-	if rl.IsKeyPressed(.T) {
+-		switch app.assist_mode {
+-		case .Full:
+-			app.assist_mode = .Glow_Only
+-		case .Glow_Only:
+-			app.assist_mode = .Off
+-		case .Off:
+-			app.assist_mode = .Full
+-		}
+-		app.nudge_done = true
+-		app.nudge_until = 0
++// mode_from_input — the intent-layer Mode -> App FSM mirror (the executor's
++// pause flip lands on the app's canonical mode).
++mode_from_input :: proc(m: inp.Mode) -> Mode {
++	switch m {
++	case .Run:
++		return .Run
++	case .Paused:
++		return .Paused
++	case .Game_Over:
++		return .Game_Over
+ 	}
++	return .Run
++}
++
++// --- the app's effect hooks (the intent layer's nil-safe callbacks) ----------
++
++// effect_retry — a fresh run in a fresh context (ODN-13) with a fresh seed
++// (E32). The ctx mode drops to Run (restart_run does the same on App).
++effect_retry :: proc(user: rawptr, ictx: ^inp.Input) {
++	app := cast(^App)user
++	restart_run(app)
++	ictx.mode = .Run
++}
+ 
+-	mx, my := rl.GetMouseX(), rl.GetMouseY()
+-	wx, wy := rnd.from_screen(&app.view, f32(mx), f32(my))
+-
+-	// placement cancel (3.5): ESC or right-click — the right-click that
+-	// cancels placement is consumed here and never reaches the 3.2 dial.
+-	if app.placing >= 0 && (rl.IsKeyPressed(.ESCAPE) || rl.IsMouseButtonPressed(.RIGHT)) {
+-		app.placing = -1
+-		app.drag.active = false
+-		app.drag.placing = -1
+-		app.press_swallowed = true // the cancel gesture's release must not re-select
+-	} else if rl.IsKeyPressed(.ESCAPE) {
+-		// 5.5: ESC deselects when nothing is placing (empty-click does the
+-		// same via click_select) — the popover's close gesture.
+-		app.sel_pipe = -1
+-		app.sel_node = -1
+-		app.press_swallowed = true // an in-flight click's release must not re-select after ESC
++// effect_assist — T: the Job B assist tier toggle (full -> glow-only -> off).
++// Any engagement with the toggle dismisses the graduation nudge for this run.
++effect_assist :: proc(user: rawptr, ictx: ^inp.Input) {
++	app := cast(^App)user
++	switch app.assist_mode {
++	case .Full:
++		app.assist_mode = .Glow_Only
++	case .Glow_Only:
++		app.assist_mode = .Off
++	case .Off:
++		app.assist_mode = .Full
+ 	}
++	app.nudge_done = true
++	app.nudge_until = 0
++}
+ 
+-	if rl.IsMouseButtonPressed(.RIGHT) {
+-		if rl.IsMouseButtonPressed(.LEFT) {
+-			// a same-frame right+left chord: anchor the left release so its
+-			// click-select (if any) uses THIS press, never a stale one
+-			app.press = {f32(mx), f32(my)}
+-			app.press_swallowed = false
+-		}
+-		if app.placing >= 0 {
+-			// the click already cancelled placement above — nothing else
+-			return
+-		}
+-		// 5.8: right-click a pipe SELECTS it and opens/refreshes the QoS panel
+-		// (the 3.2 emphasis dial RETIRES — its only job was cycling opaque
+-		// presets; the panel shows the consequence of every choice, and its
+-		// [Edit weights] + preset chips replace cycling. Documented decision,
+-		// user ruling 2026-08-14.) The early return must not strand an
+-		// in-progress drag's ghost: clear the drag state first (the release
+-		// check below would otherwise be missed this frame and the ghost would
+-		// stick until the next press-release).
+-		was_dragging := app.drag.active
+-		app.drag.active = false
+-		app.drag_to = 0
+-		if was_dragging {
+-			app.press_swallowed = true // an interrupted drag's release must not re-select
+-		}
+-		if pid, ok := pipe_hit(app, wx, wy); ok {
+-			app.sel_pipe = i64(pid)
+-			app.sel_node = -1
+-			app.sel_class = 0
+-			app.qos_editing = false // a fresh selection starts with the editor closed
+-		}
+-		return
++// effect_overlay — D: the 5.7 debug-overlay toggle (PP_DEBUG builds only; the
++// toggle + the draw are compile-gated — release builds carry nothing).
++effect_overlay :: proc(user: rawptr, ictx: ^inp.Input) {
++	app := cast(^App)user
++	app.overlay_on = !app.overlay_on
++}
++
++// effect_arm_preview — U: arm/disarm the R4 upgrade preview — a VIEW-ONLY
++// look (the core helper never writes; nothing enters the action log).
++effect_arm_preview :: proc(user: rawptr, ictx: ^inp.Input) {
++	app := cast(^App)user
++	if app.preview_active {
++		disarm_preview(app)
++	} else {
++		app.preview_active = true
+ 	}
++	app.preview_gen = 0 // force a recompute (the draw keyed on gen)
++}
+ 
+-	if rl.IsMouseButtonPressed(.LEFT) {
+-		app.press = {f32(mx), f32(my)} // the moved-check anchor for click-select + placement
+-		app.press_swallowed = false    // reset until a popover/tray click consumes the press
+-		// 5.5: the demolish popover's buttons swallow the click FIRST (the
+-		// prototype's popover-first order) — a button press must never start
+-		// a drag, and its release must never re-select (press_swallowed).
+-		if app.placing < 0 && popover_click(app, {f32(mx), f32(my)}) {
+-			app.press_swallowed = true
+-			return
+-		}
+-		// 5.8: the QoS panel swallows clicks on it (row cycles, edit buttons,
+-		// chips, nudges) — a panel click never deselects, never starts a drag.
+-		if app.placing < 0 && qos_panel_click(app, {f32(mx), f32(my)}) {
+-			app.press_swallowed = true
+-			return
+-		}
+-		// the hardware tray next: link chips select the draw tier; router
+-		// chips arm placement mode (click again to cancel). Chips swallow the
+-		// click — never start a drag from the tray, never click-select on
+-		// release (a router-chip press that arms placement must not place on
+-		// its own release — the placement commit gates on press_swallowed).
+-		n_chips := rnd.tray_chip_count(&app.view)
+-		for i in 0 ..< n_chips {
+-			r := rnd.tray_chip_rect(&app.view, i)
+-			if rl.CheckCollisionPointRec({f32(mx), f32(my)}, r) {
+-				if i < len(app.cat.pipe_tiers) {
+-					app.tier = u16(i)
+-					app.placing = -1
+-					app.drag = {}
+-					app.drag.placing = -1
+-				} else {
+-					rts: [8]u16
+-					nr := rnd.tray_router_types(&app.view, rts[:])
+-					k := i - len(app.cat.pipe_tiers)
+-					if k < nr {
+-						tidx := i32(rts[k])
+-						app.placing = (app.placing == tidx) ? -1 : tidx // click again to cancel
+-						app.drag = {}
+-						app.drag.placing = app.placing
+-						app.drag_to = 0
+-					}
+-				}
+-				app.press_swallowed = true
+-				return
+-			}
+-		}
+-		if app.placing >= 0 {
+-			return // placement clicks land on release (press already recorded)
+-		}
+-		// start a drag only if the press lands on a node; selection now runs
+-		// on RELEASE (5.5 — click-select on every left release, prototype
+-		// Perkins r2 B2: reachable even when no drag happened).
+-		if id, ok := snap_node(app, wx, wy); ok {
+-			app.drag.active = true
+-			app.drag.from_node = id
+-			app.drag.wx = wx
+-			app.drag.wy = wy
+-			app.drag.valid = .None
+-			app.drag.cost = 0
+-			app.drag_to = 0
+-			app.preview_live = false // Job B: no stale preview from a previous drag (recomputed on the move frames)
+-		}
+-	} else if app.drag.active && app.placing < 0 {
+-		app.drag.wx = wx
+-		app.drag.wy = wy
+-		// re-snap + re-validate the in-progress draw (live preview, READ-ONLY)
+-		if id, ok := snap_node(app, wx, wy); ok && id != app.drag.from_node {
+-			app.drag_to = id
+-			span := pp.span_between(node_pos(app, app.drag.from_node), node_pos(app, id))
+-			app.drag.cost = pp.draw_cost(span, app.tier, &app.cat)
+-			app.drag.valid = pp.validate_draw(&app.state.topology,
+-				pp.Cmd_Draw_Pipe{app.drag.from_node, id, app.tier}, &app.cat)
+-		} else {
+-			app.drag_to = 0
+-			app.drag.valid = .None
+-			app.drag.cost = 0
+-		}
+-		// Job B (R2a): the live what-if preview — while a valid candidate is
+-		// snapped and assist is not off, compute the path packets WILL take
+-		// (a pure what-if table on a scratch clone — view-only, ODN-12; the
+-		// harness cross-checks this against the sim's own routing).
+-		if app.drag_to != 0 && app.drag.valid == .None && app.assist_mode != .Off {
+-			app.preview_live = rnd.preview_compute(&app.preview_scratch, &app.state.topology,
+-				&app.state.flow, &app.cat,
+-				pp.Cmd_Draw_Pipe{app.drag.from_node, app.drag_to, app.tier}, &app.preview)
+-		} else {
+-			app.preview_live = false
+-		}
+-		if rl.IsMouseButtonReleased(.LEFT) {
+-			// commit if snapped to a legal target
+-			if app.drag_to != 0 && app.drag.valid == .None {
+-				cmd := pp.Cmd_Draw_Pipe{app.drag.from_node, app.drag_to, app.tier}
+-				if _, err := pp.topology_apply_edit(&app.state.topology,
+-					pp.Command{1, cmd}, &app.cat); err == .None {
+-					// edit fast-path (ODN-2): applied THIS frame, logged at next tick
+-					append(&app.state.action_log, pp.Command{
+-						apply_tick = app.tick + 1,
+-						kind = cmd,
+-					})
+-					// Job B: the R3 payoff + the graduation counter. The committed
+-					// DAG (what-if over the committed topology) IS the post-commit
+-					// winning path — copy it into the glow buffer (the live preview
+-					// stays free for the next drag) and light it for glow_ticks.
+-					// glow_gen is the POST-apply gen (== the clone's gen).
+-					app.draws_since_nudge += 1
+-					if app.preview_live && app.preview.ok {
+-						rnd.preview_copy(&app.glow, &app.preview)
+-						app.glow_until = app.tick + app.assist.glow_ticks
+-						app.glow_gen = app.state.topology.gen
+-					} else {
+-						app.glow_until = 0
+-					}
+-					// the graduation nudge: after N successful draws in Full
+-					// mode, ONE opt-in HUD line (never a modal, never forced;
+-					// any T press latches nudge_done).
+-					if app.assist_mode == .Full && !app.nudge_done &&
+-						app.draws_since_nudge >= u32(app.assist.graduation_n) {
+-						app.nudge_until = app.tick + app.assist.nudge_ticks
+-						app.nudge_done = true
+-					}
+-				}
+-			}
+-			app.drag.active = false
+-			app.drag_to = 0
+-			// 5.5: click-select on the release even when a drag happened (a
+-			// node press with no move is a CLICK — select it). A committed
+-			// draw or a real drag (>6px) leaves the selection untouched, and a
+-			// release landing inside a UI rect (popover/tray — the 6px-boundary
+-			// gap) is never a selection click.
+-			mouse := rl.Vector2{f32(mx), f32(my)}
+-			moved := rl.Vector2Distance(mouse, app.press) > 6
+-			if !moved && !release_ui_hit(app, mouse) {
+-				click_select(app, mouse)
+-			}
+-		}
+-	} else if app.placing >= 0 {
+-		// placement mode: the ghost preview tracks the tile under the cursor;
+-		// a click drops the router (validated), click again/ESC/right-click
+-		// cancels (above + the chip toggle). Never starts a link drag. A press
+-		// that DRAGS past 6px is a no-op (not a place intent).
+-		app.drag.active = true
+-		app.preview_live = false // Job B: no routing preview in placement mode (a stale draw preview must not linger)
+-		app.drag.placing = app.placing
+-		app.drag.wx = wx
+-		app.drag.wy = wy
+-		tile := mouse_tile(app)
+-		app.drag.valid = pp.validate_place(&app.state.topology,
+-			pp.Cmd_Place_Router{u16(app.placing), tile}, &app.cat)
+-		if rl.IsMouseButtonReleased(.LEFT) && !app.press_swallowed {
+-			moved := rl.Vector2Distance({f32(mx), f32(my)}, app.press) > 6
+-			if !moved {
+-				cmd := pp.Cmd_Place_Router{type_idx = u16(app.placing), pos = tile}
+-				if _, err := pp.topology_apply_edit(&app.state.topology,
+-					pp.Command{1, cmd}, &app.cat); err == .None {
+-					// edit fast-path (ODN-2): applied THIS frame, logged at next tick
+-					append(&app.state.action_log, pp.Command{
+-						apply_tick = app.tick + 1,
+-						kind = cmd,
+-					})
+-				}
+-			}
+-		}
+-	} else if rl.IsMouseButtonReleased(.LEFT) && !app.press_swallowed {
+-		// 5.5: a plain release (no drag, no placement) click-selects — the
+-		// prototype's B2 fix: selection is reachable even when no drag
+-		// happened. A release that moved past the click threshold, or lands
+-		// inside a UI rect (popover/tray), is a no-op.
+-		mouse := rl.Vector2{f32(mx), f32(my)}
+-		moved := rl.Vector2Distance(mouse, app.press) > 6
+-		if !moved && !release_ui_hit(app, mouse) {
+-			click_select(app, mouse)
+-		}
++// effect_ui_press — a left PRESS on app UI: the demolish popover's buttons
++// swallow the click FIRST (the prototype's popover-first order), then the QoS
++// panel — a button press must never start a drag, and its release must never
++// re-select (the mapping sets the swallow latch on the return value).
++effect_ui_press :: proc(user: rawptr, ictx: ^inp.Input, pos: rl.Vector2) -> bool {
++	app := cast(^App)user
++	if popover_click(app, pos) {
++		return true
+ 	}
++	return qos_panel_click(app, pos)
++}
+ 
+-	// 5.5: the demolish keys — X or DEL destroys the selected entity (the
+-	// popover button is the discoverable twin). Disabled while placing
+-	// (placement mode owns the surface) and mid-drag (the held gesture's
+-	// anchor must not be demolished under it — the drag would re-validate
+-	// forever against a dead from_node) — the demolish affordance must never
+-	// collide with the 1/2 lane keys, the right-click dial, or the tray.
+-	if app.placing < 0 && !app.drag.active && (rl.IsKeyPressed(.X) || rl.IsKeyPressed(.DELETE)) {
+-		if app.sel_node >= 0 {
+-			demolish_node(app, u32(app.sel_node))
+-		} else if app.sel_pipe >= 0 {
+-			demolish_pipe(app, u32(app.sel_pipe))
+-		}
++// effect_ui_release — a left RELEASE landing inside the demolish popover or
++// the QoS panel must not click-select (the release-side 6px-boundary gap
++// closer; the tray chips are hit-tested by the input layer itself).
++effect_ui_release :: proc(user: rawptr, ictx: ^inp.Input, pos: rl.Vector2) -> bool {
++	app := cast(^App)user
++	return popover_ui_hit(app, pos) || qos_ui_hit(app, pos)
++}
++
++// effect_right_click — the right-press select/panel path (5.8: right-click a
++// pipe SELECTS it and opens/refreshes the QoS panel; the 3.2 emphasis dial
++// RETIRES — documented decision, user ruling 2026-08-14). The early return
++// must not strand an in-progress drag's ghost: the drag state is cleared
++// first (the release check below would otherwise be missed this frame and the
++// ghost would stick until the next press-release).
++effect_right_click :: proc(user: rawptr, ictx: ^inp.Input, pos: rl.Vector2) {
++	// the body lives in the input package (right_click_select) — ONE copy,
++	// shared with the harness parity hook (Perkins note: no drift)
++	inp.right_click_select(ictx, pos)
++}
++
++// effect_drag_update — Job B (R2a): the live what-if preview — while a valid
++// candidate is snapped and assist is not off, compute the path packets WILL
++// take (a pure what-if table on a scratch clone — view-only, ODN-12; the
++// harness cross-checks this against the sim's own routing). Runs on every
++// drag/placement move + the pad aim step (and once at drag start — drag_to ==
++// 0 clears it, so no stale preview from a previous drag).
++effect_drag_update :: proc(user: rawptr, ictx: ^inp.Input) {
++	app := cast(^App)user
++	if ictx.drag_to != 0 && ictx.drag.valid == .None && app.assist_mode != .Off {
++		app.preview_live = rnd.preview_compute(&app.preview_scratch, &app.state.topology,
++			&app.state.flow, &app.cat,
++			pp.Cmd_Draw_Pipe{a = ictx.drag.from_node, b = ictx.drag_to, tier = ictx.tier}, &app.preview)
++	} else {
++		app.preview_live = false
+ 	}
++}
+ 
+-	// 3.2: the per-type promote/demote keys — with a pipe selected, 1/2 pick
+-	// the class, E/S/B assign its lane on that pipe (GDD M2's per-pipe override).
+-	if app.sel_pipe >= 0 {
+-		if rl.IsKeyPressed(.U) {
+-			// R4: arm/disarm the upgrade preview — a VIEW-ONLY look (the core
+-			// helper never writes; nothing enters the action log). The next
+-			// draw recomputes the prediction for the selected pipe. Disarming
+-			// frees the shifts (N4: no path leaks the app-owned buffer).
+-			if app.preview_active {
+-				disarm_preview(app)
+-			} else {
+-				app.preview_active = true
+-			}
+-			app.preview_gen = 0 // force a recompute (the draw keyed on gen)
+-		}
+-		for i in 0..<len(app.cat.packet_types) {
+-			key := rl.KeyboardKey(int(rl.KeyboardKey.ONE) + i)
+-			if rl.IsKeyPressed(key) {
+-				app.sel_class = u16(i)
+-			}
+-		}
+-		if rl.IsKeyPressed(.E) { set_lane_key(app, pp.LANE_EXPRESS) }
+-		if rl.IsKeyPressed(.S) { set_lane_key(app, pp.LANE_STANDARD) }
+-		if rl.IsKeyPressed(.B) { set_lane_key(app, pp.LANE_BEST_EFFORT) }
++// effect_draw_commit — the R3 payoff + the graduation counter after a
++// committed draw: the committed DAG (what-if over the committed topology) IS
++// the post-commit winning path — copy it into the glow buffer and light it
++// for glow_ticks. glow_gen is the POST-apply gen (== the clone's gen).
++effect_draw_commit :: proc(user: rawptr, ictx: ^inp.Input) {
++	app := cast(^App)user
++	app.draws_since_nudge += 1
++	if app.preview_live && app.preview.ok {
++		rnd.preview_copy(&app.glow, &app.preview)
++		app.glow_until = app.tick + app.assist.glow_ticks
++		app.glow_gen = app.state.topology.gen
++	} else {
++		app.glow_until = 0
++	}
++	// the graduation nudge: after N successful draws in Full mode, ONE opt-in
++	// HUD line (never a modal, never forced; any T press latches nudge_done).
++	if app.assist_mode == .Full && !app.nudge_done &&
++		app.draws_since_nudge >= u32(app.assist.graduation_n) {
++		app.nudge_until = app.tick + app.assist.nudge_ticks
++		app.nudge_done = true
+ 	}
+ }
+ 
+-// --- 5.5: click-select + the demolish surface ---------------------------------
++// effect_pipe_selected — a pipe was click-selected: the QoS panel starts with
++// the editor closed (a fresh selection).
++effect_pipe_selected :: proc(user: rawptr, ictx: ^inp.Input) {
++	app := cast(^App)user
++	app.input.qos_editing = false
++}
+ 
+-// release_ui_hit — a left RELEASE landing inside the demolish popover or a
+-// tray chip must not click-select (the world entity under a UI rect is not
+-// what the player aimed at). The press-side swallow (press_swallowed) covers
+-// presses that START inside UI; this closes the 6px-boundary gap (press just
+-// outside, release just inside).
+-release_ui_hit :: proc(app: ^App, mouse: rl.Vector2) -> bool {
+-	if app.sel_node >= 0 {
+-		if slot, ok := pp.node_slot(&app.state.topology, u32(app.sel_node)); ok &&
++// --- 5.5: click-select + the demolish surface (the intent layer owns the
++// selection + demolish COMMANDS in input/exec.odin; the app keeps only the
++// popover UI hit-testing + the anchor math) -------------------------------
++
++// popover_ui_hit — a left RELEASE landing inside the demolish popover must not
++// click-select (the 6px-boundary gap closer: press just outside, release just
++// inside). The QoS panel half is qos_ui_hit; the tray chips are hit-tested by
++// the input layer itself (input.release_ui_hit).
++popover_ui_hit :: proc(app: ^App, mouse: rl.Vector2) -> bool {
++	if app.input.sel_node >= 0 {
++		if slot, ok := pp.node_slot(&app.state.topology, u32(app.input.sel_node)); ok &&
+ 			app.state.topology.node_kind[slot] == .Junction {
+ 			pop := rnd.popover_rect(&app.view, rnd.node_screen(&app.view, app.state.topology.node_pos[slot]), rnd.POPOVER_H_NODE)
+ 			if rl.CheckCollisionPointRec(mouse, pop) { return true }
+ 		}
+-	} else if app.sel_pipe >= 0 {
+-		if ps, ok := pp.pipe_slot(&app.state.topology, u32(app.sel_pipe)); ok {
++	} else if app.input.sel_pipe >= 0 {
++		if ps, ok := pp.pipe_slot(&app.state.topology, u32(app.input.sel_pipe)); ok {
+ 			pop := rnd.popover_rect(&app.view, pipe_anchor(app, ps), rnd.POPOVER_H_PIPE)
+ 			if rl.CheckCollisionPointRec(mouse, pop) { return true }
+ 		}
+-		// 5.8: the QoS panel is UI — a release inside it never click-selects.
+-		if rl.CheckCollisionPointRec(mouse, qos_panel_rect(app)) { return true }
+-	}
+-	n_chips := rnd.tray_chip_count(&app.view)
+-	for i in 0 ..< n_chips {
+-		if rl.CheckCollisionPointRec(mouse, rnd.tray_chip_rect(&app.view, i)) { return true }
+ 	}
+ 	return false
+ }
+ 
+-// click_select — release-based selection (the prototype's B2 interaction): a
+-// click on a JUNCTION selects it (new), a click on a PIPE selects it (3.2's
+-// target — now release-based), a click on a TERMINAL or empty ground clears
+-// the selection. Terminals never select — no demolish affordance on a
+-// terminal, mirroring core's .Terminal_Demolish (E2). Runs on EVERY left
+-// release that did not commit a draw/placement and did not move past the
+-// click threshold.
+-click_select :: proc(app: ^App, mouse: rl.Vector2) {
+-	wx, wy := rnd.from_screen(&app.view, mouse.x, mouse.y)
+-	if id, ok := snap_node(app, wx, wy); ok {
+-		slot, _ := pp.node_slot(&app.state.topology, id)
+-		if app.state.topology.node_kind[slot] == .Junction {
+-			app.sel_node = i64(id)
+-			app.sel_pipe = -1
+-			return
+-		}
+-		// a terminal click selects nothing — and never falls through to an
+-		// incident pipe (the strictest reading of the no-terminal-affordance
+-		// rule: the click said "no demolish here").
+-		app.sel_node = -1
+-		app.sel_pipe = -1
+-		return
+-	}
+-	if pid, ok := pipe_hit(app, wx, wy); ok {
+-		app.sel_pipe = i64(pid)
+-		app.sel_node = -1
+-		app.qos_editing = false // a fresh selection starts with the editor closed
+-		return
++// qos_ui_hit — the 5.8 QoS panel is UI — a release inside it never
++// click-selects.
++qos_ui_hit :: proc(app: ^App, mouse: rl.Vector2) -> bool {
++	if app.input.sel_pipe < 0 {
++		return false
+ 	}
+-	app.sel_node = -1
+-	app.sel_pipe = -1 // empty ground closes the popover
++	return rl.CheckCollisionPointRec(mouse, qos_panel_rect(app))
+ }
+ 
+ // popover_click — the demolish popover's hit-test (called on left PRESS,
+ // before the tray + the drag start). Returns true when the press was
+-// swallowed: the demolish button (submit the command) or the panel itself (a
+-// click on the popover never deselects, never starts a drag). The app's
+-// swallow latch (press_swallowed) keeps the release from re-selecting.
++// swallowed: the demolish button (submit the command through the intent
++// layer's shared executor — input.demolish_*) or the panel itself (a click on
++// the popover never deselects, never starts a drag). The swallow latch
++// (press_swallowed) keeps the release from re-selecting.
+ popover_click :: proc(app: ^App, mouse: rl.Vector2) -> bool {
+-	if app.sel_node >= 0 {
+-		slot, ok := pp.node_slot(&app.state.topology, u32(app.sel_node))
++	if app.input.sel_node >= 0 {
++		slot, ok := pp.node_slot(&app.state.topology, u32(app.input.sel_node))
+ 		if !ok || app.state.topology.node_kind[slot] != .Junction {
+ 			return false
+ 		}
+ 		pop := rnd.popover_rect(&app.view, rnd.node_screen(&app.view, app.state.topology.node_pos[slot]), rnd.POPOVER_H_NODE)
+ 		if rl.CheckCollisionPointRec(mouse, rnd.demolish_button_rect(pop)) {
+-			demolish_node(app, u32(app.sel_node))
++			inp.demolish_node(&app.input, u32(app.input.sel_node))
+ 			return true
+ 		}
+ 		return rl.CheckCollisionPointRec(mouse, pop)
+ 	}
+-	if app.sel_pipe >= 0 {
+-		ps, ok := pp.pipe_slot(&app.state.topology, u32(app.sel_pipe))
++	if app.input.sel_pipe >= 0 {
++		ps, ok := pp.pipe_slot(&app.state.topology, u32(app.input.sel_pipe))
+ 		if !ok {
+ 			return false
+ 		}
+ 		pop := rnd.popover_rect(&app.view, pipe_anchor(app, ps), rnd.POPOVER_H_PIPE)
+ 		if rl.CheckCollisionPointRec(mouse, rnd.demolish_button_rect(pop)) {
+-			demolish_pipe(app, u32(app.sel_pipe))
++			inp.demolish_pipe(&app.input, u32(app.input.sel_pipe))
+ 			return true
+ 		}
+ 		return rl.CheckCollisionPointRec(mouse, pop)
+@@ -930,158 +787,14 @@ pipe_anchor :: proc(app: ^App, ps: u32) -> rl.Vector2 {
+ 	return {(a.x + b.x) / 2, (a.y + b.y) / 2}
+ }
+ 
+-// demolish_pipe — the pipe demolish fast-path (the EXISTING core command — no
+-// new command kinds, no LOG_VERSION bump): validate→apply THIS frame, logged
+-// at the next tick — byte-identical to draw/emphasis/lane/place. A rejection
+-// (e.g. .Missing_Pipe) surfaces via the reject toast and keeps the selection;
+-// success clears it.
+-demolish_pipe :: proc(app: ^App, pipe: u32) {
+-	cmd := pp.Cmd_Demolish_Pipe{pipe = pipe}
+-	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {
+-		append(&app.state.action_log, pp.Command{
+-			apply_tick = app.tick + 1,
+-			kind = cmd,
+-		})
+-		app.sel_pipe = -1
+-		app.sel_node = -1
+-	} else {
+-		app.last_reject = err
+-		app.reject_tick = app.tick
+-	}
+-}
+-
+-// demolish_node — the junction demolish fast-path (the core's E27 atomic
+-// batch: incident pipes in edge-id order, then the vertex — the core owns
+-// it). Clears BOTH selections (the batch may have killed the selected pipe).
+-demolish_node :: proc(app: ^App, node: u32) {
+-	cmd := pp.Cmd_Demolish_Node{node = node}
+-	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {
+-		append(&app.state.action_log, pp.Command{
+-			apply_tick = app.tick + 1,
+-			kind = cmd,
+-		})
+-		app.sel_pipe = -1
+-		app.sel_node = -1
+-	} else {
+-		app.last_reject = err
+-		app.reject_tick = app.tick
+-	}
+-}
+-
+-// mouse_tile — the tile under the cursor (world px → tile coords).
+-mouse_tile :: proc(app: ^App) -> [2]i32 {
+-	mx, my := rl.GetMouseX(), rl.GetMouseY()
+-	wx, wy := rnd.from_screen(&app.view, f32(mx), f32(my))
+-	tile := f32(app.cat.balance.tile_px)
+-	return {i32(wx / tile), i32(wy / tile)}
+-}
+-
+-// snap_node — nearest live node to a world-px point within the snap radius
+-// (INCLUSIVE, E4). Integer-Euclidean² metric (the pinned distance). Ties break
+-// to the lower id.
+-snap_node :: proc(app: ^App, wx, wy: f32) -> (u32, bool) {
+-	t := &app.state.topology
+-	tile := f32(app.cat.balance.tile_px)
+-	radius := f32(app.cat.balance.snap_radius)
+-	r2 := f64(radius) * f64(radius)
+-	best: u32 = 0
+-	best_d2 := r2
+-	found := false
+-	for i in 0..<len(t.node_alive) {
+-		if !t.node_alive[i] {
+-			continue
+-		}
+-		nx := f32(t.node_pos[i][0]) * tile
+-		ny := f32(t.node_pos[i][1]) * tile
+-		dx := f64(nx - wx)
+-		dy := f64(ny - wy)
+-		d2 := dx*dx + dy*dy
+-		if d2 <= best_d2 {
+-			if d2 == best_d2 && found && t.node_id[i] > best {
+-				continue
+-			}
+-			best = t.node_id[i]
+-			best_d2 = d2
+-			found = true
+-		}
+-	}
+-	return best, found
+-}
+-
+-// pipe_hit — nearest live pipe to a world-px point within PIPE_HIT_RADIUS
+-// (world px). Point-to-segment distance², integer-style math on floats (the
+-// view's basic-IEEE discipline); ties break to the lower pipe id. Returns the
+-// pipe id + ok.
+-pipe_hit :: proc(app: ^App, wx, wy: f32) -> (u32, bool) {
+-	t := &app.state.topology
+-	tile := f32(app.cat.balance.tile_px)
+-	radius := f32(10) // world px — comfortably inside the fat-pipe read
+-	r2 := radius * radius
+-	best: u32 = 0
+-	best_d2 := r2
+-	found := false
+-	for i in 0..<len(t.pipe_alive) {
+-		if !t.pipe_alive[i] {
+-			continue
+-		}
+-		a_slot, _ := pp.node_slot(t, t.pipe_a[i])
+-		b_slot, _ := pp.node_slot(t, t.pipe_b[i])
+-		ax := f32(t.node_pos[a_slot][0]) * tile
+-		ay := f32(t.node_pos[a_slot][1]) * tile
+-		bx := f32(t.node_pos[b_slot][0]) * tile
+-		by := f32(t.node_pos[b_slot][1]) * tile
+-		d2 := point_segment_d2(wx, wy, ax, ay, bx, by)
+-		if d2 <= best_d2 {
+-			if d2 == best_d2 && found && t.pipe_id[i] > best {
+-				continue
+-			}
+-			best = t.pipe_id[i]
+-			best_d2 = d2
+-			found = true
+-		}
+-	}
+-	return best, found
+-}
+-
+-// point_segment_d2 — squared distance from a point to a segment (basic float
+-// math; the projection clamps to the segment's endpoints).
+-point_segment_d2 :: proc(px, py, ax, ay, bx, by: f32) -> f32 {
+-	dx := bx - ax
+-	dy := by - ay
+-	len2 := dx*dx + dy*dy
+-	if len2 <= 0 {
+-		return (px-ax)*(px-ax) + (py-ay)*(py-ay)
+-	}
+-	t := ((px-ax)*dx + (py-ay)*dy) / len2
+-	t = clamp(t, 0, 1)
+-	ex := ax + t*dx - px
+-	ey := ay + t*dy - py
+-	return ex*ex + ey*ey
+-}
+-
+ // (the 3.2 emphasis dial retired into the 5.8 QoS panel — cycle_emphasis was
+ // removed; the panel's Edit/Revert/preset/nudge surface lives in qos_panel.odin)
+ 
+-// set_lane_key — the per-type promote/demote keys: with a pipe selected,
+-// 1/2 pick the class, E/S/B assign its lane on that pipe (GDD M2's "override a
+-// type's lane per-pipe"). 5.8: the assignment auto-follows — the ladder
+-// recomputes the split and writes it through Cmd_Set_Weights (unless the
+-// manual editor is open — manual owns the weights). Fast-path apply + log,
+-// like every edit.
+-set_lane_key :: proc(app: ^App, lane: u8) {
+-	if app.sel_pipe < 0 {
+-		return
+-	}
+-	if u32(app.sel_class) >= u32(len(app.cat.packet_types)) {
+-		return
+-	}
+-	set_lane_class(app, app.sel_class, lane)
+-}
++// (set_lane_key + the lane command producers moved into app/input/exec.odin
++// in story 5.4 — the 1/2 + E/S/B keys now route through the intent layer's
++// shared executor; the #55 terminology rename (Cmd_Set_Weights ->
++// Cmd_Set_Weights) is reflected there.)
+ 
+-node_pos :: proc(app: ^App, id: u32) -> [2]i32 {
+-	slot, _ := pp.node_slot(&app.state.topology, id)
+-	return app.state.topology.node_pos[slot]
+-}
+ 
+ // disarm_preview — drop the armed upgrade preview AND free its shifts. Every
+ // disarm path routes through here (Perkins N4): the U-toggle-off, a cleared /
+@@ -1104,11 +817,11 @@ update_preview :: proc(app: ^App) {
+ 	if !app.preview_active {
+ 		return // disarmed — the shifts are already freed (every disarm frees)
+ 	}
+-	if app.sel_pipe < 0 {
++	if app.input.sel_pipe < 0 {
+ 		disarm_preview(app)
+ 		return
+ 	}
+-	pipe := u32(app.sel_pipe)
++	pipe := u32(app.input.sel_pipe)
+ 	ps, ok := pp.pipe_slot(&app.state.topology, pipe)
+ 	if !ok {
+ 		disarm_preview(app) // the selected pipe is gone — drop the preview
+@@ -1176,7 +889,7 @@ draw_hud :: proc(app: ^App) {
+ 	// v2-ux-font-resize: hints SHORTENED + dropped to 14px so they fit left of
+ 	// the centered health card at the min clamp too (the old 88-char hint ran
+ 	// under the card at 1280x720). The full control list lives in the README.
+-	if app.placing >= 0 {
++	if app.input.placing >= 0 {
+ 		draw_text(app, "click to place; ESC / right-click cancels", 12, 36, 14, p.ink)
+ 	} else {
+ 		draw_text(app, "draw pipes; P / Space pauses; U previews upgrade", 12, 36, 14, p.ink_soft)
+@@ -1255,10 +968,10 @@ draw_hud :: proc(app: ^App) {
+ 	// glyph chip + util % / load / throughput). App-layer only — the harness
+ 	// capture path never calls draw_hud, so T2 goldens are untouched. Hidden
+ 	// while placing + mid-drag (the ghost owns the cursor surface).
+-	if (app.mode == .Run || app.mode == .Paused) && app.placing < 0 && !app.drag.active {
++	if (app.mode == .Run || app.mode == .Paused) && app.input.placing < 0 && !app.input.drag.active {
+ 		mx, my := rl.GetMouseX(), rl.GetMouseY()
+ 		wx, wy := rnd.from_screen(&app.view, f32(mx), f32(my))
+-		if id, ok := snap_node(app, wx, wy); ok {
++		if id, ok := inp.snap_node(&app.state.topology, &app.cat, wx, wy); ok {
+ 			if slot, s_ok := pp.node_slot(&app.state.topology, id); s_ok {
+ 				rnd.draw_node_health_card(&app.view, &app.state.flow, &app.state.topology,
+ 					&app.state.crisis, &app.cat, int(slot),
+@@ -1289,12 +1002,12 @@ draw_hud :: proc(app: ^App) {
+ 	// at the cursor too — mutually exclusive with the cost label by
+ 	// construction (valid vs invalid) — so it never collides with the
+ 	// congestion-legend row at (12, 76).
+-	if app.drag.active && app.drag_to != 0 {
+-		cur := rnd.to_screen(&app.view, app.drag.wx, app.drag.wy)
+-		if app.drag.valid != .None {
+-			draw_text(app, reject_label(app.drag.valid), i32(cur.x)+12, i32(cur.y)-14, 16, rl.Color{184, 52, 52, 255})
++	if app.input.drag.active && app.input.drag_to != 0 {
++		cur := rnd.to_screen(&app.view, app.input.drag.wx, app.input.drag.wy)
++		if app.input.drag.valid != .None {
++			draw_text(app, reject_label(app.input.drag.valid), i32(cur.x)+12, i32(cur.y)-14, 16, rl.Color{184, 52, 52, 255})
+ 		} else if app.assist_mode == .Off || (app.assist_mode == .Full && !(app.preview_live && app.preview.ok)) {
+-			label := fmt.tprintf("cost %d", app.drag.cost)
++			label := fmt.tprintf("cost %d", app.input.drag.cost)
+ 			draw_text(app, label, i32(cur.x)+12, i32(cur.y)-14, 16, p.ink)
+ 		}
+ 	}
+@@ -1529,7 +1242,7 @@ draw_tray :: proc(app: ^App) {
+ 	for tier, ti in app.cat.pipe_tiers {
+ 		r := rnd.tray_chip_rect(&app.view, i)
+ 		bg := rl.Color{238, 230, 210, 255}
+-		if i32(ti) == i32(app.tier) { bg = rl.Color{210, 226, 196, 255} }
++		if i32(ti) == i32(app.input.tier) { bg = rl.Color{210, 226, 196, 255} }
+ 		rl.DrawRectangleRec(r, bg)
+ 		rl.DrawRectangleLinesEx(r, 1, p.ink_soft)
+ 		// a little link glyph in the tier color
+@@ -1543,7 +1256,7 @@ draw_tray :: proc(app: ^App) {
+ 		tidx := rts[k]
+ 		nt := app.cat.node_types[tidx]
+ 		bg := rl.Color{238, 230, 210, 255}
+-		if i32(tidx) == app.placing { bg = rl.Color{210, 226, 196, 255} }
++		if i32(tidx) == app.input.placing { bg = rl.Color{210, 226, 196, 255} }
+ 		rl.DrawRectangleRec(r, bg)
+ 		rl.DrawRectangleLinesEx(r, 1, p.ink_soft)
+ 		rl.DrawCircle(i32(r.x + 15), i32(r.y + r.height/2), 6, p.router_body)
+diff --git a/app/qos_panel.odin b/app/qos_panel.odin
+index 18a5bf8..e1892e7 100644
+--- a/app/qos_panel.odin
++++ b/app/qos_panel.odin
+@@ -2,6 +2,7 @@ package main
+ 
+ import "core:fmt"
+ import pp "../core"
++import inp "./input" // 5.4: the shared executor's lane/QoS command producers
+ import rl "vendor:raylib"
+ 
+ // app/qos_panel.odin — Story 5.8: the per-pipe QoS panel (user ruling
+@@ -37,7 +38,8 @@ QOS_ROW0_Y :: QOS_PANEL_Y + 8
+ // editor is expanded, +1 for the v2-visibility queue-depth readout row).
+ qos_panel_h :: proc(app: ^App) -> i32 {
+ 	n := 1 + 3 + i32(len(app.cat.packet_types)) + 1 + 1 // title + split + classes + queue depth + actions
+-	if app.qos_editing {
++	if app.input.qos_editing {
++
+ 		n += 2 // preset chips + nudges
+ 	}
+ 	return 8 + n * QOS_ROW_H
+@@ -61,7 +63,7 @@ qos_class_row_rect :: proc(app: ^App, i: i32) -> rl.Rectangle {
+ // never hit-tested (the panel background swallow covers it).
+ qos_queue_depth_y :: proc(app: ^App) -> i32 {
+ 	y := qos_row_y(4 + i32(len(app.cat.packet_types)) + 1)
+-	if app.qos_editing {
++	if app.input.qos_editing {
+ 		y = qos_row_y(6 + i32(len(app.cat.packet_types)) + 1)
+ 	}
+ 	return y
+@@ -96,98 +98,17 @@ qos_nudge_rect :: proc(app: ^App, lane: i32, minus: bool) -> rl.Rectangle {
+ 	return {f32(x + 72), f32(y + 3), 20, 16}
+ }
+ 
+-// qos_mode_manual — the DERIVED mode: manual iff the pipe's current weights
+-// differ from the auto-ladder result for its assignments (or the editor is
+-// open). Untouched pipes are auto (weights == default preset == auto of the
+-// empty assignment set).
+-qos_mode_manual :: proc(app: ^App, ps: u32) -> bool {
+-	if app.qos_editing {
+-		return true
+-	}
+-	if int(ps) >= len(app.state.topology.pipe_weights) {
+-		return false
+-	}
+-	w := app.state.topology.pipe_weights[ps]
+-	auto := pp.qos_auto_weights(&app.state.topology, &app.cat, u32(app.sel_pipe))
+-	return w != auto
+-}
+-
+-// qos_apply_auto — the auto-follow write-through: recompute the ladder split
+-// for the pipe's CURRENT assignments and write it through the serialized
+-// command (Cmd_Set_Weights, weights). No-op when the weights didn't change
+-// (a same-state assignment must not spam the action log). A rejection is
+-// surfaced, never silent (the toast). NEVER-drop safety by construction: the
+-// auto set never zeros an in-play lane and every never-drop class rides an
+-// in-play lane — the bus guard is belt-and-braces here.
+-qos_apply_auto :: proc(app: ^App, pipe: u32) {
+-	ps, ok := pp.pipe_slot(&app.state.topology, pipe)
+-	if !ok {
+-		return
+-	}
+-	w := pp.qos_auto_weights(&app.state.topology, &app.cat, pipe)
+-	if app.state.topology.pipe_weights[ps] == w {
+-		return // nothing to write — the split already matches the ladder
+-	}
+-	cmd := pp.Cmd_Set_Weights{pipe = pipe, weights = w}
+-	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {
+-		append(&app.state.action_log, pp.Command{
+-			apply_tick = app.tick + 1,
+-			kind = cmd,
+-		})
+-	} else {
+-		app.last_reject = err
+-		app.reject_tick = app.tick
+-	}
+-}
+-
+-// set_lane_class — assign `class` to `lane` on the selected pipe (the 1/2 +
+-// E/S/B keys and the panel's row clicks both land here). Fast-path apply +
+-// log, then the auto-follow UNLESS the manual editor is open (manual mode
+-// owns the weights — assignments still apply, the split does not auto-follow;
+-// [Revert] re-runs the ladder over all assignments).
+-set_lane_class :: proc(app: ^App, class: u16, lane: u8) {
+-	if app.sel_pipe < 0 {
+-		return
+-	}
+-	if u32(class) >= u32(len(app.cat.packet_types)) {
+-		return
+-	}
+-	pipe := u32(app.sel_pipe)
+-	ps, ok := pp.pipe_slot(&app.state.topology, pipe)
+-	if !ok {
+-		return
+-	}
+-	// Gate the auto-follow on the pipe's PRE-EDIT derived mode: an AUTO pipe
+-	// (weights == the ladder's current result) follows its assignments — a
+-	// MANUAL pipe (the player hand-tuned weights) keeps them until an explicit
+-	// [Auto]/[Revert] (the ruling's "revertible to auto"). A silent clobber of
+-	// player work on the panel's primary affordance would be a UX bug.
+-	was_auto := !qos_mode_manual(app, ps)
+-	cmd := pp.Cmd_Set_Lane{pipe = pipe, class = class, lane = lane}
+-	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {
+-		append(&app.state.action_log, pp.Command{
+-			apply_tick = app.tick + 1,
+-			kind = cmd,
+-		})
+-		if was_auto {
+-			qos_apply_auto(app, pipe)
+-		}
+-	} else {
+-		app.last_reject = err
+-		app.reject_tick = app.tick
+-	}
+-}
+ 
+ // qos_cycle_class_lane — the panel row click: advance a class's lane on the
+ // selected pipe E -> S -> B -> E.
+ qos_cycle_class_lane :: proc(app: ^App, class: u16) {
+-	if app.sel_pipe < 0 {
++	if app.input.sel_pipe < 0 {
+ 		return
+ 	}
+ 	if u32(class) >= u32(len(app.cat.packet_types)) {
+ 		return
+ 	}
+-	cur := pp.qos_lane_of(&app.state.topology, &app.cat, u32(app.sel_pipe), class)
++	cur := pp.qos_lane_of(&app.state.topology, &app.cat, u32(app.input.sel_pipe), class)
+ 	never_drop := app.cat.packet_types[class].max_loss_pct == 0
+ 	for step in 1..=pp.LANE_COUNT {
+ 		next := u8((i32(cur) + i32(step)) % pp.LANE_COUNT)
+@@ -196,7 +117,7 @@ qos_cycle_class_lane :: proc(app: ^App, class: u16) {
+ 		// deadlocking on a rejection toast. Droppable classes may starve a
+ 		// zeroed lane (the trade-off mechanic) — the cycle offers it.
+ 		if never_drop {
+-			ps, ok := pp.pipe_slot(&app.state.topology, u32(app.sel_pipe))
++			ps, ok := pp.pipe_slot(&app.state.topology, u32(app.input.sel_pipe))
+ 			if !ok {
+ 				return
+ 			}
+@@ -204,12 +125,12 @@ qos_cycle_class_lane :: proc(app: ^App, class: u16) {
+ 				continue
+ 			}
+ 		}
+-		set_lane_class(app, class, next)
++		inp.set_lane_class(&app.input, class, next)
+ 		return
+ 	}
+ 	// all three lanes are zeroed on a never-drop pipe — nothing parkable
+-	app.last_reject = .Invalid_Weights
+-	app.reject_tick = app.tick
++	app.input.last_reject = .Invalid_Weights
++	app.input.reject_tick = app.tick
+ }
+ 
+ // qos_nudge — the manual editor: move one lane's weight by +/-5 (clamped to
+@@ -218,10 +139,10 @@ qos_cycle_class_lane :: proc(app: ^App, class: u16) {
+ // [4,2,1] don't sum to 100 either); the derived % readout follows. E6 + the
+ // all-zero guard live in the bus (a zeroed never-drop lane rejects).
+ qos_nudge :: proc(app: ^App, lane: u8, minus: bool) {
+-	if app.sel_pipe < 0 {
++	if app.input.sel_pipe < 0 {
+ 		return
+ 	}
+-	ps, ok := pp.pipe_slot(&app.state.topology, u32(app.sel_pipe))
++	ps, ok := pp.pipe_slot(&app.state.topology, u32(app.input.sel_pipe))
+ 	if !ok || lane >= pp.LANE_COUNT {
+ 		return
+ 	}
+@@ -236,15 +157,15 @@ qos_nudge :: proc(app: ^App, lane: u8, minus: bool) {
+ 		return // clamped — nothing to write
+ 	}
+ 	w[lane] = nv
+-	cmd := pp.Cmd_Set_Weights{pipe = u32(app.sel_pipe), weights = w}
++	cmd := pp.Cmd_Set_Weights{pipe = u32(app.input.sel_pipe), weights = w}
+ 	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {
+ 		append(&app.state.action_log, pp.Command{
+ 			apply_tick = app.tick + 1,
+ 			kind = cmd,
+ 		})
+ 	} else {
+-		app.last_reject = err
+-		app.reject_tick = app.tick
++		app.input.last_reject = err
++		app.input.reject_tick = app.tick
+ 	}
+ }
+ 
+@@ -252,33 +173,33 @@ qos_nudge :: proc(app: ^App, lane: u8, minus: bool) {
+ // weight set through the serialized command (the chip marks the pipe manual —
+ // the derived mode reads the non-auto weights).
+ qos_apply_preset :: proc(app: ^App, preset: u16) {
+-	if app.sel_pipe < 0 {
++	if app.input.sel_pipe < 0 {
+ 		return
+ 	}
+ 	if u32(preset) >= u32(len(app.cat.balance.lane_presets)) {
+ 		return
+ 	}
+ 	w := app.cat.balance.lane_presets[preset].weights
+-	cmd := pp.Cmd_Set_Weights{pipe = u32(app.sel_pipe), weights = w}
++	cmd := pp.Cmd_Set_Weights{pipe = u32(app.input.sel_pipe), weights = w}
+ 	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {
+ 		append(&app.state.action_log, pp.Command{
+ 			apply_tick = app.tick + 1,
+ 			kind = cmd,
+ 		})
+ 	} else {
+-		app.last_reject = err
+-		app.reject_tick = app.tick
++		app.input.last_reject = err
++		app.input.reject_tick = app.tick
+ 	}
+ }
+ 
+ // qos_revert_auto — the [Revert] / [Auto] button: drop the manual weights,
+ // re-run the ladder over ALL current assignments, close the editor.
+ qos_revert_auto :: proc(app: ^App) {
+-	if app.sel_pipe < 0 {
++	if app.input.sel_pipe < 0 {
+ 		return
+ 	}
+-	app.qos_editing = false
+-	qos_apply_auto(app, u32(app.sel_pipe))
++	app.input.qos_editing = false
++	inp.qos_apply_auto(&app.input, u32(app.input.sel_pipe))
+ }
+ 
+ // qos_panel_click — the panel's hit-test (called on left PRESS when a pipe is
+@@ -287,7 +208,7 @@ qos_revert_auto :: proc(app: ^App) {
+ // [Revert] toggle mode; the chips + nudges edit the weights. A click on the
+ // panel's background swallows too (it never deselects, never starts a drag).
+ qos_panel_click :: proc(app: ^App, mouse: rl.Vector2) -> bool {
+-	if app.sel_pipe < 0 {
++	if app.input.sel_pipe < 0 {
+ 		return false
+ 	}
+ 	if !rl.CheckCollisionPointRec(mouse, qos_panel_rect(app)) {
+@@ -301,16 +222,16 @@ qos_panel_click :: proc(app: ^App, mouse: rl.Vector2) -> bool {
+ 		}
+ 	}
+ 	// actions row
+-	ps, ok := pp.pipe_slot(&app.state.topology, u32(app.sel_pipe))
++	ps, ok := pp.pipe_slot(&app.state.topology, u32(app.input.sel_pipe))
+ 	if !ok {
+ 		return false // the selected pipe is gone — nothing to edit
+ 	}
+ 	ar0 := qos_action_rect(app, 0)
+ 	if rl.CheckCollisionPointRec(mouse, ar0) {
+-		if app.qos_editing || qos_mode_manual(app, ps) {
++		if app.input.qos_editing || inp.qos_mode_manual(&app.input, ps) {
+ 			qos_revert_auto(app)
+ 		} else {
+-			app.qos_editing = true
++			app.input.qos_editing = true
+ 		}
+ 		return true
+ 	}
+@@ -319,7 +240,7 @@ qos_panel_click :: proc(app: ^App, mouse: rl.Vector2) -> bool {
+ 		return true
+ 	}
+ 	// manual editor rows
+-	if app.qos_editing {
++	if app.input.qos_editing {
+ 		for i in 0..<len(app.cat.balance.lane_presets) {
+ 			if rl.CheckCollisionPointRec(mouse, qos_preset_chip_rect(app, i32(i))) {
+ 				qos_apply_preset(app, u16(i))
+@@ -345,29 +266,29 @@ qos_panel_click :: proc(app: ^App, mouse: rl.Vector2) -> bool {
+ // cream card — the full font story is a later story). ASCII-only literals
+ // (the byte-truncating draw_text — lint gate 6).
+ draw_qos_panel :: proc(app: ^App) {
+-	if app.sel_pipe < 0 {
+-		app.qos_editing = false
++	if app.input.sel_pipe < 0 {
++		app.input.qos_editing = false
+ 		return
+ 	}
+-	ps, ok := pp.pipe_slot(&app.state.topology, u32(app.sel_pipe))
++	ps, ok := pp.pipe_slot(&app.state.topology, u32(app.input.sel_pipe))
+ 	if !ok {
+-		app.qos_editing = false // the selected pipe is gone — close the editor
++		app.input.qos_editing = false // the selected pipe is gone — close the editor
+ 		return
+ 	}
+ 	p := app.palette
+ 	panel := qos_panel_rect(app)
+ 	rl.DrawRectangleRounded(panel, 0.12, 6, rl.Color{240, 232, 212, 235})
+ 
+-	manual := qos_mode_manual(app, ps)
++	manual := inp.qos_mode_manual(&app.input, ps)
+ 	cur := app.state.topology.pipe_weights[ps]
+ 	mode_label := "AUTO" if !manual else "MANUAL"
+-	title := fmt.tprintf("QoS - pipe %d - %s", app.sel_pipe, mode_label)
++	title := fmt.tprintf("QoS - pipe %d - %s", app.input.sel_pipe, mode_label)
+ 	draw_text(app, title, QOS_PANEL_X + 10, qos_row_y(0) + 2, 16, p.ink)
+ 
+ 	// the resulting split — the caps the flow will allocate (pure proc — a
+ 	// fast-path edit this frame has not been stepped yet, so flow.lane_caps
+ 	// would be stale; qos_pipe_caps is the same allocation the flow rebuilds).
+-	caps := pp.qos_pipe_caps(&app.state.topology, &app.cat, ps, u32(app.sel_pipe))
++	caps := pp.qos_pipe_caps(&app.state.topology, &app.cat, ps, u32(app.input.sel_pipe))
+ 	labels := [3]string{"Express", "Standard", "Best-eff"}
+ 	cols := [3]rl.Color{p.lane_express, p.lane_standard, p.lane_best_effort}
+ 	total := u64(caps[0]) + u64(caps[1]) + u64(caps[2])
+@@ -390,10 +311,10 @@ draw_qos_panel :: proc(app: ^App) {
+ 	// override); clicking the row cycles the lane (or 1/2 + E/S/B).
+ 	for i in 0..<len(app.cat.packet_types) {
+ 		row := qos_class_row_rect(app, i32(i))
+-		lane := pp.qos_lane_of(&app.state.topology, &app.cat, u32(app.sel_pipe), u16(i))
++		lane := pp.qos_lane_of(&app.state.topology, &app.cat, u32(app.input.sel_pipe), u16(i))
+ 		row_label := fmt.tprintf("%s -> %s", app.cat.packet_types[i].display, lane_label(lane))
+ 		col := p.ink_soft
+-		if i32(app.sel_class) == i32(i) {
++		if i32(app.input.sel_class) == i32(i) {
+ 			col = p.ink // the key-target class stands out
+ 			row_label = fmt.tprintf("%s -> %s  [1/2 + E/S/B]", app.cat.packet_types[i].display, lane_label(lane))
+ 		}
+@@ -410,7 +331,7 @@ draw_qos_panel :: proc(app: ^App) {
+ 	draw_text(app, "Revert", i32(a1.x) + 8, i32(a1.y) + 1, 14, p.ink)
+ 
+ 	// the manual editor rows
+-	if app.qos_editing {
++	if app.input.qos_editing {
+ 		// preset quick-set chips
+ 		for i in 0..<len(app.cat.balance.lane_presets) {
+ 			chip := qos_preset_chip_rect(app, i32(i))
+@@ -472,7 +393,7 @@ draw_qos_panel :: proc(app: ^App) {
+ 
+ 	// the transient rejection toast (a rejected QoS edit is never silent —
+ 	// e.g. E6's never-drop guard once that content exists)
+-	if app.last_reject != .None && app.tick - app.reject_tick < 30 {
+-		draw_text(app, reject_label(app.last_reject), QOS_PANEL_X + 10, i32(panel.y + panel.height) - 18, 14, rl.Color{184, 52, 52, 255})
++	if app.input.last_reject != .None && app.tick - app.input.reject_tick < 30 {
++		draw_text(app, reject_label(app.input.last_reject), QOS_PANEL_X + 10, i32(panel.y + panel.height) - 18, 14, rl.Color{184, 52, 52, 255})
+ 	}
+ }

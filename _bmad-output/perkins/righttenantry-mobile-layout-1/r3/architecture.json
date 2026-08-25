@@ -1,0 +1,42 @@
+[
+  {
+    "source": "architecture",
+    "severity": "blocker",
+    "category": "state-machine",
+    "title": "ApiReturnedLeaderboard guard drops legitimate responses on the two cold-load fetch paths that never set leaderboard_vacancy_id (session restore and demo entry)",
+    "location": "client/src/client.gleam:1046-1052 (fetch), 1083-1090 (model without tag), 5839-5910 (enter_demo), 5929-5934 (demo_entry_effects), guard at 2081-2112",
+    "evidence": "routes.VacancyDetail(id) | routes.VacancyHandoff(id) ->\n                  effect.batch([\n                    vacancy_api.get_detail(id, ApiReturnedVacancyDetail),\n                    application_api.fetch_leaderboard(id, fn(result) {\n                      ApiReturnedLeaderboard(id, result)\n                    }),\n                  ])  // ApiReturnedSession branch; its updated_model at 1083-1090 sets only `vacancy_detail: Loading, vacancy_detail_request_id: Some(id)` — no leaderboard_vacancy_id. Same in enter_demo: `vacancy_detail_request_id: request_ids.0,` with the comment \"Set the route's request ids so the first demo responses pass the stale-response guards\" but no leaderboard_vacancy_id. Guard: `case result, model.leaderboard_vacancy_id { Ok(response), Some(current) if current == vacancy_id -> ... _, _ -> #(model, effect.none())` and model.initial() has `leaderboard_vacancy_id: None`.",
+    "detail": "On a non-demo cold load/bookmark of /vacancies/A, ApiReturnedSession dispatches the leaderboard fetch with tag None, so the Ok response is dropped and the board sits at NotAsked until the poller's LeaderboardRefresh (~60s) fills it. On a demo deep-link boot, enter_demo/demo_entry_effects fetch with tag None and demo has no poller — the leaderboard never loads.",
+    "recommended_fix": "Set `leaderboard: Loading, leaderboard_vacancy_id: Some(id)` in the ApiReturnedSession VacancyDetail/VacancyHandoff updated_model and in enter_demo's request_ids block for VacancyDetail routes, alongside vacancy_detail_request_id. Add a cold-boot test per path."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "vacancy_detail pb-28 compare-bar padding still untested (still present since round 2)",
+    "location": "client/src/pages/vacancy_detail.gleam:104-111",
+    "evidence": "let content_class = case model.comparison_ids {\n    [] -> \"\"\n    _ -> \"pb-28\"\n  }\n  html.div([class(content_class)], [\n    view_confirm_action(model),  — and in client/test/client_test.gleam the only pb-28 assertions are `application_detail_page.view` tests at 5207-5221; no vacancy_detail view test asserts pb-28.",
+    "detail": "application_detail's pb-28 gained a revert-pin this round but vacancy_detail's identical conditional padding still has none; deleting `pb-28` there passes the suite. Same coverage gap flagged in rounds 1 and 2.",
+    "recommended_fix": "Add a vacancy_detail view test asserting pb-28 present when comparison_ids non-empty and absent when empty, mirroring application_detail_reserves_room_when_comparing_test."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Filter pill shrink-0 change still has no test (still present since round 2)",
+    "location": "client/src/components/leaderboard_view.gleam:404-408",
+    "evidence": "class(\n        \"shrink-0 whitespace-nowrap \"\n        <> case is_active {\n          True -> active_class\n          False -> inactive_class\n        }  — in client/test/client_test.gleam the only shrink-0 assertion is `status_stepper_stops_do_not_squash_test` (line 5191: `html |> string.contains(\"shrink-0\")`); leaderboard_view tests (4105-4188) never assert shrink-0 on filter pills.",
+    "detail": "The fix-3 filter-pill shrink-0 remains unpinned; a revert in view_filter_pill passes the suite. Flagged in rounds 1 and 2 and still unaddressed.",
+    "recommended_fix": "Add a leaderboard_view test rendering filter pills asserting the shrink-0 class on the pill buttons."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "state-machine",
+    "title": "ApiReturnedLeaderboard Error branch ignores the vacancy tag — a late error from vacancy A overwrites B's in-flight board with Failure copy",
+    "location": "client/src/client.gleam:2101-2111",
+    "evidence": "Error(err), _ -> #(\n          Model(\n            ..model,\n            leaderboard: Failure(error_page_copy(\n              err,\n              copy.CtxApplicationsLoadList,\n            )),\n          ),\n          effect.none(),\n        )",
+    "detail": "The Ok arm is guarded by `current == vacancy_id`, but the Error arm matches `_` on the tag. Sequence: A fetch in flight, navigate to B (board Loading, tag B), A's request fails → B's Loading flips to a spurious 'couldn't load' Failure until B's Ok lands. Same in ApiReturnedLeaderboardPage: `Error(_), _, _` clears B's leaderboard_loading_more on A's stale error.",
+    "recommended_fix": "Guard both Error arms on the tag match too: `Error(err), Some(current) if current == vacancy_id`, falling through to the no-op `_, _` arm otherwise."
+  }
+]

@@ -1,0 +1,76 @@
+[
+  {
+    "source": "blind",
+    "severity": "high",
+    "confidence": "high",
+    "file": "harness/run.odin",
+    "location": "load_demo_spawns",
+    "summary": "Unused `perr` binding is an Odin compile error (build-breaking); the intended parse-error check is also missing.",
+    "detail": "load_demo_spawns binds `demo, perr := parse_demo(...)` and never references `perr` afterwards. Odin rejects unused variables by default (it is one of its hallmark strictness checks), so this is a hard compile error — the harness will not build. The doc-comment above the proc also claims it 'Returns an empty slice on a missing/unparseable demo', but because `perr` is never inspected the parse-error path is not actually handled (it only happens to return empty because a failed parse_demo yields a zero Demo with no spawns). Either discard with `_` or check `perr`. Every caller (drift_check, run_replay) depends on this proc compiling.",
+    "evidence": [
+      "+load_demo_spawns :: proc(demo_name: string) -> [dynamic]Spawn_Intent {",
+      "+\tspawns := make([dynamic]Spawn_Intent, 0, 4, context.allocator)",
+      "+\tpath := fmt.tprintf(\"demos/%s.dem\", demo_name)",
+      "+\ttext_bytes, err := os.read_entire_file_from_path(path, context.temp_allocator)",
+      "+\tif err != nil {",
+      "+\t\treturn spawns",
+      "+\t}",
+      "+\tdemo, perr := parse_demo(demo_name, string(text_bytes))",
+      "+\tfor s in demo.spawns {",
+      "+\t\tappend(&spawns, s)",
+      "+\t}",
+      "+\tdelete(demo.draws)",
+      "+\tdelete(demo.spawns)",
+      "+\tdelete(demo.captures)",
+      "+\treturn spawns",
+      "+}"
+    ]
+  },
+  {
+    "source": "blind",
+    "severity": "medium",
+    "confidence": "high",
+    "file": "harness/demo.odin",
+    "location": "spawn_tick (def) vs harness/run.odin lower_spawns (use)",
+    "summary": "Dead code: `spawn_tick` is defined but never called; `lower_spawns` re-implements its exact formula inline, so the two can silently diverge and break the replay-identical-demand invariant.",
+    "detail": "demo.odin adds `spawn_tick` with the formula `u64(max(0, i64(s.at_ms) * i64(logic_hz) / 1000))` and a comment stating it exists to keep demand 'seeded identically on every replay'. But no caller invokes it anywhere in the diff — it is dead code. Meanwhile run.odin's `lower_spawns` (the proc that actually lowers spawns into the flow demand for BOTH the live run and the replay) duplicates the identical expression inline instead of calling `spawn_tick`. This is a latent divergence hazard on a critical invariant: if `spawn_tick` is later changed (e.g. the floor vs +1 convention), `lower_spawns` will not follow, and live vs replay demand ticks will differ -> replay divergence (E10) with no obvious cause. The live path (run_demo -> lower_spawns) and replay path (replay_hashes -> lower_spawns) at least share one implementation, but the existence of a second, unused copy of the formula is a trap.",
+    "evidence": [
+      "+// spawn_tick — the tick a spawn intent fires at. floor(at_ms*hz/1000) (NO +1:",
+      "+// spawns are run-setup, not logged commands, so the edit-fast-path convergence",
+      "+// convention doesn't apply — the demand is seeded identically on every replay).",
+      "+spawn_tick :: proc(s: ^Spawn_Intent, logic_hz: i32) -> u64 {",
+      "+\treturn u64(max(0, i64(s.at_ms) * i64(logic_hz) / 1000))",
+      "+}",
+      "+lower_spawns :: proc(state: ^pp.Run_State, spawns: []Spawn_Intent, hz: i32) {",
+      "+\tfor s in spawns {",
+      "+\t\ttick := u64(max(0, i64(s.at_ms) * i64(hz) / 1000))",
+      "+\t\tpp.flow_seed_demand(&state.flow, tick, s.src, s.dst)",
+      "+\t}",
+      "+}"
+    ]
+  },
+  {
+    "source": "blind",
+    "severity": "medium",
+    "confidence": "medium",
+    "file": "core/determinism_test.odin",
+    "location": "test_replay_byte_identical — assertion live_hashes[0] != live_hashes[1]",
+    "summary": "Retained hash-variation assertion is justified by a 'serialized tick field' that does not appear in this diff; the field it replaces (tick_nonce) was the documented sole source of per-tick variation and is removed here.",
+    "detail": "The diff removes the per-tick RNG heartbeat (`state.tick_nonce = rng_next(&state.rng)` in step.odin and its `w_u32(&w, state.tick_nonce)` serialization) — which the old comment explicitly described as THE mechanism making per-tick hashes vary ('different seed -> different nonce sequence -> different hashes'). It keeps the assertion `live_hashes[0] != live_hashes[1]` but rewrites its justification to 'per-tick hashes must vary (tick field + state)' and adds a comment claiming 'The hash varies tick-to-clock via the serialized tick field + any topology/flow state change'. No serialized tick field is added anywhere in this diff. This test also seeds NO flow demand, so 'flow state change' cannot contribute. The assertion now holds only if the (unseen) keystone mutates topology between ticks 1 and 2 — i.e. its basis silently shifted from 'guaranteed by the nonce' to 'incidentally true if the keystone draws at ticks 1-2'. Either a real serialized tick field must exist (then the comment should point at it) or this assertion is fragile/misleading.",
+    "evidence": [
+      "-\ttesting.expect(t, live_hashes[0] != live_hashes[1], \"per-tick hashes must vary (rng heartbeat)\")",
+      "+\ttesting.expect(t, live_hashes[0] != live_hashes[1], \"per-tick hashes must vary (tick field + state)\")",
+      "+\t// sanity: the keystone must be command-built + the per-tick state must",
+      "+\t// actually advance (a vacuous keystone would pass while broken). The hash",
+      "+\t// varies tick-to-clock via the serialized tick field + any topology/flow",
+      "+\t// state change (1.3: the rng is seeded but not advanced — ECMP/demand draws",
+      "+\t// return in slice 2/3).",
+      "-\t// heartbeat: one owned-RNG draw folded into a per-tick state field. This is",
+      "-\t// the thinnest sim activity that ties the RNG into the step path (different",
+      "-\t// seed → different nonce sequence → different hashes; replay reproduces it",
+      "-\t// exactly). Story 1.3+ replaces tick_nonce with real rng-derived sim state",
+      "-\t// (demand spawn, ECMP, …).",
+      "-\tstate.tick_nonce = rng_next(&state.rng)"
+    ]
+  }
+]

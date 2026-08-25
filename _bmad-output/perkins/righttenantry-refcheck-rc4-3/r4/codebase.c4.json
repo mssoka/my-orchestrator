@@ -1,0 +1,62 @@
+[
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "toctou",
+    "title": "STILL PRESENT (r3): the wrong-person leg's taken-over stand-down is read-time only — apply_wrong_person still executes the unguarded update_reference_call_status; the guarded mark_awaiting_correction_wrong_person SQL is never wired in",
+    "location": "server/src/reference_checks/form_handler.gleam:1235-1251; server/src/reference_checks/sql/update_reference_call_status.sql:23-24",
+    "evidence": "form_handler.gleam:1235 `case row.taken_over_at != \"\" {` ... :1250 `sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated)` — update_reference_call_status.sql:23-24 `WHERE id = $1` / `AND status = $5::reference_call_status` (no taken_over_at clause). The guarded query mark_awaiting_correction_wrong_person.sql (`AND taken_over_at IS NULL`) is called ONLY by sql.gleam's generated fn + the direct-call test (server/test/integration/reference_checks_actions_integration_test.gleam:1746,1758), never by the handler. The only race pin, wrong_person_awaiting_sql_has_taken_over_backstop_test (:1729), calls the guarded SQL DIRECTLY — it stays green while the handler's unguarded UPDATE keeps the hole open (vacuous pin).",
+    "detail": "A take-over landing between lookup_context's read (1235) and the executed UPDATE still matches (take-over keeps status contact_initiated, A7) and yanks a landlord-handled row into awaiting_correction. The r4 mandate's condition (1) is unmet.",
+    "recommended_fix": "In apply_wrong_person's False branch call sql.mark_awaiting_correction_wrong_person instead of update_reference_call_status, and add a POST-route race test (take-over, then POST /reference/:token/wrong-person -> redirect, status unchanged) that goes red when the backstop is removed."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "STILL PRESENT (r3): the guarded query mark_awaiting_correction_wrong_person + its generated code ship dead — the PR's own TOCTOU backstop is never executed by any handler",
+    "location": "server/src/reference_checks/sql/mark_awaiting_correction_wrong_person.sql:1-27; server/src/reference_checks/sql.gleam:1891",
+    "evidence": "grep for mark_awaiting_correction_wrong_person outside sql.gleam + the .sql file: only server/test/integration/reference_checks_actions_integration_test.gleam:1746/1758 (the direct-call pin). The wrong-person POST path (form_handler.gleam:1250) calls sql.update_reference_call_status, not this query. sql.gleam:1891 `pub fn mark_awaiting_correction_wrong_person(` with the SQL text `AND taken_over_at IS NULL` (sql.gleam:1915).",
+    "detail": "The guarded SQL exists and is generated, but no production code path calls it — dead backstop. The direct-call test cannot catch the unwired handler (it pins the SQL, not the wiring).",
+    "recommended_fix": "Wire it into apply_wrong_person (the only awaiting-transition in the wrong-person route) or delete it — never ship an unexecuted guard as the fix for a TOCTOU."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "client-state",
+    "title": "STILL PRESENT (r3): N17 — the substitution response's reference_call_id is still decoded and carried but never consumed",
+    "location": "client/src/api/reference_checks_api.gleam:37-40; client/src/client.gleam:3555",
+    "evidence": "reference_checks_api.gleam:38 `use id <- decode.optional_field(\"reference_call_id\", None, decode.optional(decode.string))` — client.gleam:3555 `Ok(_) -> {` (the Result(String) payload is never read; the refetch is a whole-detail refetch: :3567 `refetch_refcheck_effect(model)`).",
+    "detail": "r3 asked drop-or-use; neither happened — the decoded id rides ApiReturnedRefcheckAction's payload through every consumer as `_`. Dead plumbing persists, and the module doc-comment claims it is consumed.",
+    "recommended_fix": "Drop the field from action_result_decoder (the detail refetch carries the new row) or actually consume it (e.g. scroll/focus the substituted row)."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "a11y",
+    "title": "STILL PRESENT (r3): N14 — Escape-to-close stays on the menu div, which never receives focus after clicking the ⋯ button",
+    "location": "client/src/components/reference_panel.gleam:745-747",
+    "evidence": ":745 `// r2 (N14): Escape closes the menu (the confirm_modal pattern).` :747 `event.on(\"keydown\", menu_escape_decoder(msg.UserToggledRefcheckMenu(` — the listener is on the absolutely-positioned menu div (a SIBLING of the ⋯ button, :719 `html.div([class(\"relative flex-shrink-0 self-start\")], [`), which contains the button). No autofocus/tabindex moves focus into the menu on open.",
+    "detail": "After clicking ⋯, focus stays on the button; keydown events bubble through the button's ancestors (not the sibling menu div), so click-then-Escape does nothing. Handler fires only if the user first clicks a menu item.",
+    "recommended_fix": "Attach the keydown handler to the ⋯ button (or autofocus the menu div on open) so the natural click-then-Escape flow closes the menu."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "client-state",
+    "title": "STILL PRESENT (r3): N5 — the edit-open path still unconditionally overwrites another row's in-progress typed trio (only the success-clear half was scoped)",
+    "location": "client/src/client.gleam:3383-3399",
+    "evidence": ":3383 `RefcheckSubstitute -> #(` :3386 `refcheck_edit: Some(prefill_refcheck_edit(` :3397 `RefcheckCorrect -> #(` :3398 `refcheck_edit: Some(prefill_refcheck_edit(` — no guard on an existing Some(edit) with a different call_id (contrast the success path :3556 `Some(edit) if edit.call_id == call_id -> None; other -> other`).",
+    "detail": "Choosing Substitute/Correct on any row while another row's edit-trio is in progress silently discards the typed values; no explicit carry-with-reason comment either. Row menus stay clickable while an inline edit is open.",
+    "recommended_fix": "Scope the edit-open: if an edit exists for a different call_id, keep it (or block opening with a prompt). At minimum document the deliberate discard."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "spec-drift",
+    "title": "STILL PRESENT (r3): N8/N9-spec — two of the three drift spots remain: spec-rc4-3-row-actions.md still names the deleted substitute_reference_call.sql and still claims ONE additive column",
+    "location": "_bmad-output/implementation-artifacts/spec-rc4-3-row-actions.md:73,233",
+    "evidence": ":73 `cycle bump + re-arm in ONE update), `substitute_reference_call.sql` (reads the old row's` (no such file exists at df0ea22 — the substitute path uses sql.insert_reference_call_if_absent, actions_handler.gleam:371); :233 `effective name. One additive column, nothing destructive.` (the migration ships corrected_name AND corrected_at). The epic-RC4-context.md W4 effective-contact rule spot IS fixed (:26-28 documents the corrected-replaces-snapshot rule).",
+    "detail": "The implementation spec's query inventory and migration claim no longer match the shipped code — a future implementer reading the spec would look for a nonexistent query and expect a one-column migration.",
+    "recommended_fix": "Rename the query to insert_reference_call_if_absent (or describe the idempotent-CTE substitute) and say 'two additive columns (corrected_name, corrected_at)'."
+  }
+]

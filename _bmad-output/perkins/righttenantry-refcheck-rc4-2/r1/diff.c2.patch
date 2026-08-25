@@ -1,0 +1,284 @@
+diff --git a/server/src/application/application_detail_handler.gleam b/server/src/application/application_detail_handler.gleam
+index 04202c66..b2db6dbe 100644
+--- a/server/src/application/application_detail_handler.gleam
++++ b/server/src/application/application_detail_handler.gleam
+@@ -1182,6 +1182,14 @@ pub fn encode_reference_call(
+       "" -> None
+       s -> Some(s)
+     },
++    form_opened_at: case row.form_opened_at {
++      "" -> None
++      s -> Some(s)
++    },
++    submitted_at: case row.submitted_at {
++      "" -> None
++      s -> Some(s)
++    },
+     attempts:,
+     result: case row.result {
+       "" -> None
+diff --git a/server/src/application/sql.gleam b/server/src/application/sql.gleam
+index d6db69cd..cbb0a553 100644
+--- a/server/src/application/sql.gleam
++++ b/server/src/application/sql.gleam
+@@ -2099,6 +2099,8 @@ pub type ListReferenceCallsForDetailRow {
+     outcome: String,
+     attempt_count: Int,
+     next_attempt_at: String,
++    form_opened_at: String,
++    submitted_at: String,
+     attempts: String,
+     result: String,
+   )
+@@ -2139,8 +2141,10 @@ pub fn list_reference_calls_for_detail(
+     use outcome <- decode.field(4, decode.string)
+     use attempt_count <- decode.field(5, decode.int)
+     use next_attempt_at <- decode.field(6, decode.string)
+-    use attempts <- decode.field(7, decode.string)
+-    use result <- decode.field(8, decode.string)
++    use form_opened_at <- decode.field(7, decode.string)
++    use submitted_at <- decode.field(8, decode.string)
++    use attempts <- decode.field(9, decode.string)
++    use result <- decode.field(10, decode.string)
+     decode.success(ListReferenceCallsForDetailRow(
+       id:,
+       ref_slot:,
+@@ -2149,6 +2153,8 @@ pub fn list_reference_calls_for_detail(
+       outcome:,
+       attempt_count:,
+       next_attempt_at:,
++      form_opened_at:,
++      submitted_at:,
+       attempts:,
+       result:,
+     ))
+@@ -2182,6 +2188,14 @@ SELECT
+   COALESCE(outcome::text, '') AS outcome,
+   attempt_count,
+   COALESCE(next_attempt_at::text, '') AS next_attempt_at,
++  -- RC4.2 additive: the first form-open timestamp — the panel's \"Form
++  -- opened\" progress state (the attempts log records sends only, so the
++  -- §8.1 contract as merged cannot distinguish it from \"Invitation sent\").
++  COALESCE(form_opened_at::text, '') AS form_opened_at,
++  -- RC4.2 additive: the submission timestamp — the honest \"Reference
++  -- received\" line (neither the attempts log nor the stored result carries
++  -- the completion instant).
++  COALESCE(submitted_at::text, '') AS submitted_at,
+   attempts::text              AS attempts,
+   -- §4.2: raw referee IP/UA stripped at the read boundary. `#-` deletes a
+   -- path and is a no-op when the path is absent (minimal terminals carry no
+diff --git a/server/src/application/sql/list_reference_calls_for_detail.sql b/server/src/application/sql/list_reference_calls_for_detail.sql
+index 415bd5fa..8a508450 100644
+--- a/server/src/application/sql/list_reference_calls_for_detail.sql
++++ b/server/src/application/sql/list_reference_calls_for_detail.sql
+@@ -26,6 +26,14 @@ SELECT
+   COALESCE(outcome::text, '') AS outcome,
+   attempt_count,
+   COALESCE(next_attempt_at::text, '') AS next_attempt_at,
++  -- RC4.2 additive: the first form-open timestamp — the panel's "Form
++  -- opened" progress state (the attempts log records sends only, so the
++  -- §8.1 contract as merged cannot distinguish it from "Invitation sent").
++  COALESCE(form_opened_at::text, '') AS form_opened_at,
++  -- RC4.2 additive: the submission timestamp — the honest "Reference
++  -- received" line (neither the attempts log nor the stored result carries
++  -- the completion instant).
++  COALESCE(submitted_at::text, '') AS submitted_at,
+   attempts::text              AS attempts,
+   -- §4.2: raw referee IP/UA stripped at the read boundary. `#-` deletes a
+   -- path and is a no-op when the path is absent (minimal terminals carry no
+diff --git a/server/test/application/application_detail_handler_test.gleam b/server/test/application/application_detail_handler_test.gleam
+index ead4e652..59a964fd 100644
+--- a/server/test/application/application_detail_handler_test.gleam
++++ b/server/test/application/application_detail_handler_test.gleam
+@@ -254,6 +254,8 @@ fn sample_reference_call_row(
+     outcome:,
+     attempt_count: 2,
+     next_attempt_at: "2026-08-01T09:00:00Z",
++    form_opened_at: "2026-08-01T21:12:00Z",
++    submitted_at: "2026-08-02T09:00:00Z",
+     attempts: "[{\"at\":\"2026-08-01T08:00:00Z\",\"channel\":\"email\",\"outcome\":\"delivered\",\"detail\":\"\"}]",
+     result:,
+   )
+@@ -419,6 +421,15 @@ pub fn encode_reference_call_pre_terminal_nullables_test() {
+   wire |> string.contains("\"outcome\":null") |> should.be_true
+   wire |> string.contains("\"result\":null") |> should.be_true
+   wire |> string.contains("\"display_disclaimer\":null") |> should.be_true
++  // RC4.2 additive: the row fixture carries form_opened_at + submitted_at —
++  // they must ride through the encoder (the panel's "Form opened" state and
++  // the "Reference received" timestamp).
++  wire
++  |> string.contains("\"form_opened_at\":\"2026-08-01T21:12:00Z\"")
++  |> should.be_true
++  wire
++  |> string.contains("\"submitted_at\":\"2026-08-02T09:00:00Z\"")
++  |> should.be_true
+ }
+ 
+ /// Unparseable attempts degrade to [] (never a fabricated log entry).
+@@ -432,6 +443,8 @@ pub fn encode_reference_call_malformed_attempts_test() {
+       outcome: "",
+       attempt_count: 0,
+       next_attempt_at: "",
++      form_opened_at: "",
++      submitted_at: "",
+       attempts: "{not json",
+       result: "",
+     )
+diff --git a/shared/src/shared/reference_call.gleam b/shared/src/shared/reference_call.gleam
+index 2bff4555..8d71302c 100644
+--- a/shared/src/shared/reference_call.gleam
++++ b/shared/src/shared/reference_call.gleam
+@@ -453,6 +453,17 @@ pub fn hooks_decoder() -> decode.Decoder(ReferenceCallHooks) {
+ ///
+ /// - `outcome`/`next_attempt_at` are None for rows that have no value yet
+ ///   (the SQL read COALESCEs nulls to '', mapped to None here).
++/// - `form_opened_at` (RC4.2 additive, expand-only) is None until the referee
++///   opens the form link — the panel's "Form opened" progress state. The
++///   attempts log records sends only, so the RC4.1 §8.1 contract as merged
++///   cannot distinguish "Form opened" from "Invitation sent"; the AC matrix
++///   requires the state, so the payload grew one nullable key (back-compat:
++///   the decoder defaults absent keys to None).
++/// - `submitted_at` (RC4.2 additive, expand-only) is None until the referee
++///   submits the form (or a manual outcome is recorded) — the honest
++///   "Reference received" timestamp. Neither the attempts log nor the stored
++///   result carries the completion instant, so the terminal-row timestamps
++///   need this key.
+ /// - `result` is the stored §6.2 profile as JSON text, with §4.2 internal-only
+ ///   fields already stripped at the read boundary (the SQL detail read drops
+ ///   `fraud_signals.form_session.referee_ip` / `referee_user_agent` and never
+@@ -469,6 +480,14 @@ pub type ReferenceCallDetail {
+     outcome: Option(ReferenceCallOutcome),
+     attempt_count: Int,
+     next_attempt_at: Option(String),
++    /// RC4.2 additive: first form-open timestamp (nullable). None until the
++    /// referee opens the link (rc3-3's `stamp_form_opened`); the panel's
++    /// "Form opened" state keyed off this.
++    form_opened_at: Option(String),
++    /// RC4.2 additive: form-submitted timestamp (nullable). None until the
++    /// referee submits (or a manual outcome is recorded); the panel's
++    /// "Reference received" timestamp.
++    submitted_at: Option(String),
+     attempts: List(ReferenceCallAttempt),
+     result: Option(String),
+     display_disclaimer: Option(String),
+@@ -485,6 +504,8 @@ pub fn encode_detail(detail: ReferenceCallDetail) -> json.Json {
+     #("outcome", json.nullable(detail.outcome, encode_outcome_json)),
+     #("attempt_count", json.int(detail.attempt_count)),
+     #("next_attempt_at", json.nullable(detail.next_attempt_at, json.string)),
++    #("form_opened_at", json.nullable(detail.form_opened_at, json.string)),
++    #("submitted_at", json.nullable(detail.submitted_at, json.string)),
+     #("attempts", json.array(detail.attempts, encode_attempt)),
+     #("result", json.nullable(detail.result, json.string)),
+     #(
+@@ -511,6 +532,16 @@ pub fn detail_decoder() -> decode.Decoder(ReferenceCallDetail) {
+     None,
+     decode.optional(decode.string),
+   )
++  use form_opened_at <- decode.optional_field(
++    "form_opened_at",
++    None,
++    decode.optional(decode.string),
++  )
++  use submitted_at <- decode.optional_field(
++    "submitted_at",
++    None,
++    decode.optional(decode.string),
++  )
+   use attempts <- decode.optional_field(
+     "attempts",
+     [],
+@@ -535,6 +566,8 @@ pub fn detail_decoder() -> decode.Decoder(ReferenceCallDetail) {
+     outcome:,
+     attempt_count:,
+     next_attempt_at:,
++    form_opened_at:,
++    submitted_at:,
+     attempts:,
+     result:,
+     display_disclaimer:,
+diff --git a/shared/test/reference_call_test.gleam b/shared/test/reference_call_test.gleam
+index 28845429..62f93cc9 100644
+--- a/shared/test/reference_call_test.gleam
++++ b/shared/test/reference_call_test.gleam
+@@ -273,6 +273,8 @@ pub fn detail_entry_roundtrip_test() {
+       outcome: None,
+       attempt_count: 2,
+       next_attempt_at: Some("2026-08-01T09:00:00Z"),
++      form_opened_at: Some("2026-08-01T09:30:00Z"),
++      submitted_at: Some("2026-08-01T10:04:00Z"),
+       attempts: [sample_attempt()],
+       result: Some("{\"schema_version\":\"refcall-v1\"}"),
+       display_disclaimer: Some(
+@@ -299,6 +301,8 @@ pub fn detail_entry_wire_keys_are_snake_case_test() {
+       outcome: Some(OutcomeFormCompleted),
+       attempt_count: 0,
+       next_attempt_at: None,
++      form_opened_at: None,
++      submitted_at: None,
+       attempts: [],
+       result: None,
+       display_disclaimer: None,
+@@ -317,6 +321,8 @@ pub fn detail_entry_wire_keys_are_snake_case_test() {
+     "\"outcome\"",
+     "\"attempt_count\"",
+     "\"next_attempt_at\"",
++    "\"form_opened_at\"",
++    "\"submitted_at\"",
+     "\"attempts\"",
+     "\"result\"",
+     "\"display_disclaimer\"",
+@@ -340,6 +346,8 @@ pub fn detail_entry_terminal_roundtrip_test() {
+       outcome: Some(OutcomeFormCompleted),
+       attempt_count: 4,
+       next_attempt_at: None,
++      form_opened_at: None,
++      submitted_at: None,
+       attempts: [],
+       result: None,
+       display_disclaimer: None,
+@@ -383,3 +391,45 @@ pub fn hooks_roundtrip_test() {
+   |> should.be_ok
+   |> should.equal(sample_hooks())
+ }
++
++/// RC4.2 back-compat: an old server payload WITHOUT the additive
++/// `form_opened_at` key must still decode (the decoder defaults it to None).
++pub fn detail_decoder_tolerates_missing_form_opened_at_test() {
++  // An old server payload (no `form_opened_at` key - RC4.1 wire shape) must
++  // still decode; the decoder defaults the additive key to None.
++  let wire =
++    "{\"reference_call_id\":\"uuid-rc-3\",\"ref_slot\":\"landlord_ref\",\"owner_label\":\"primary\",\"status\":\"queued\",\"outcome\":null,\"attempt_count\":0,\"next_attempt_at\":null,\"attempts\":[],\"result\":null,\"display_disclaimer\":null,\"hooks\":{\"can_record_manual\":true,\"can_substitute_referee\":false,\"can_retry\":false}}"
++  // Map a decode failure to a sentinel so the assertion is total (no
++  // `should.fail` - gleeunit's fail takes no arguments in this version).
++  let opened = case json.parse(wire, reference_call.detail_decoder()) {
++    Ok(detail) -> detail.form_opened_at
++    Error(_) -> option.Some("decode-error")
++  }
++  opened |> should.equal(option.None)
++}
++
++/// RC4.2: the additive key round-trips when present.
++pub fn detail_form_opened_at_roundtrip_test() {
++  let detail =
++    ReferenceCallDetail(
++      reference_call_id: "uuid-rc-4",
++      ref_slot: LandlordRef,
++      owner_label: Primary,
++      status: ContactInitiated,
++      outcome: None,
++      attempt_count: 1,
++      next_attempt_at: Some("2026-08-02T10:00:00Z"),
++      form_opened_at: Some("2026-08-01T21:12:00Z"),
++      submitted_at: Some("2026-08-02T09:00:00Z"),
++      attempts: [],
++      result: None,
++      display_disclaimer: None,
++      hooks: sample_hooks(),
++    )
++  detail
++  |> reference_call.encode_detail
++  |> json.to_string
++  |> json.parse(reference_call.detail_decoder())
++  |> should.be_ok
++  |> should.equal(detail)
++}

@@ -1,0 +1,52 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "dead-guard",
+    "title": "r3 wrong-person TOCTOU backstop `mark_awaiting_correction_wrong_person` is never called — apply_wrong_person still transitions via unguarded `update_reference_call_status`",
+    "location": "server/src/reference_checks/form_handler.gleam:1250 (apply_wrong_person) / server/src/reference_checks/sql.gleam:1891",
+    "evidence": "--- mark_awaiting_correction_wrong_person(reference_call_id: UUID)\nUPDATE reference_call\nSET status          = 'awaiting_correction'::reference_call_status,\n    terminal_reason = 'contact_invalid',\n    next_attempt_at = NULL,\n    updated_at      = now()\nWHERE id = $1\n  AND status = 'contact_initiated'::reference_call_status\n  AND taken_over_at IS NULL\nRETURNING id::text;  AND  case\n                sql.update_reference_call_status(\n                  config.db,\n                  id_uuid,\n                  sql.AwaitingCorrection,\n                  \"\",\n                  \"contact_invalid\",\n                  sql.ContactInitiated,\n                )  AND  case row.taken_over_at != \"\" {\n        True -> wisp.redirect(to: \"/reference/\" <> token)",
+    "detail": "The new guarded SQL (taken_over_at IS NULL) has zero call sites; the handler still uses update_reference_call_status, whose only guard is status = contact_initiated — and take-over preserves that status. A take-over landing between the token read and the UPDATE still yanks the landlord-handled row into awaiting_correction: the exact race the r3 head commit claims to fix.",
+    "recommended_fix": "Call sql.mark_awaiting_correction_wrong_person(...) in apply_wrong_person's non-exhaust branch (handle 0 rows as stand-down), or add AND taken_over_at IS NULL AND correction_cycles = 0 to update_reference_call_status.sql."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "unreachable-branch",
+    "title": "Contact-fallback CASE in find_reference_call_by_send_ref: `WHEN rc.correction_cycles >= 1` arm is unreachable under the outer `rc.correction_cycles = 0` gate",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:90-97",
+    "evidence": "    OR (rc.correction_cycles = 0 AND $1 <> '' AND CASE\n         WHEN rc.correction_cycles >= 1 THEN NULLIF(rc.corrected_email, '')\n         ELSE COALESCE(NULLIF(rc.corrected_email, ''), rc.contact_email)\n       END = $1)\n    OR (rc.correction_cycles = 0 AND $2 <> '' AND CASE\n         WHEN rc.correction_cycles >= 1 THEN NULLIF(rc.corrected_phone, '')\n         ELSE COALESCE(NULLIF(rc.corrected_phone, ''), rc.contact_phone)\n       END = $2)",
+    "detail": "Inside `rc.correction_cycles = 0` the >= 1 branch can never fire; both twins always take ELSE. Harmless today (the outer gate enforces the pre-correction-only intent) but it is dead complexity that misstates the rule and invites a wrong future edit.",
+    "recommended_fix": "Drop the inner CASE entirely: under the outer = 0 gate the compare is simply COALESCE(NULLIF(rc.corrected_email, ''), rc.contact_email) = $1 (same for phone)."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "error-path-returns-success",
+    "title": "run_action_with_prechecks: a DB Error from verify_vacancy_active falls into the catch-all `_ -> action()` — the action proceeds on a failed precheck",
+    "location": "server/src/reference_checks/actions_handler.gleam:636-643",
+    "evidence": "      case app_sql.verify_vacancy_active(db, vacancy_uuid, landlord_uuid) {\n        Ok(pog.Returned(_, [vacancy_row])) if vacancy_row.is_archived ->\n          response_helpers.json_error(\n            error_code.VacancyUnavailable,\n            \"This vacancy is archived. Restore it to continue reviewing applications.\",\n            422,\n          )\n        _ -> action()\n      }",
+    "detail": "The `_` arm swallows Error(...) and 'no vacancy row' identically to 'vacancy not archived', so a DB failure during the archived-vacancy precheck still executes the mutation and returns 200. The outer verify_application_in_vacancy Error maps to 404 (misleading but safe); this one is not safe.",
+    "recommended_fix": "Match Error(err) explicitly and return db_failure/500; keep `_` for the not-archived success path only."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "guard-gap",
+    "title": "send_is_post_correction timestamp regex is prefix-only — a malformed entry with a valid prefix still raises on the timestamptz cast",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:58-61",
+    "evidence": "           CASE WHEN e->>'at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}'\n                THEN (e->>'at')::timestamptz >= rc.corrected_at\n                ELSE false END",
+    "detail": "The regex has no trailing anchor, so e.g. '2026-08-08T12:00:00garbage' passes the test and `(e->>'at')::timestamptz` throws, contradicting the r3 N9 comment that a malformed entry stands the event down instead of raising.",
+    "recommended_fix": "Anchor the regex with $ (or a timezone/end component), or guard the cast so any remainder fails closed to false."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-mismatch",
+    "title": "handle_take_over doc claims the write is 'ONLY taken_over_at' but the SQL also NULLs next_attempt_at and stamps updated_at",
+    "location": "server/src/reference_checks/actions_handler.gleam (handle_take_over doc) vs take_over_reference_call SQL",
+    "evidence": "/// — the landlord takes the check over manually. Guarded on the waiting\n/// states + `unreachable` (§7.7); writes ONLY `taken_over_at` (the sweep\n/// stops sending — its SELECT already filters `taken_over_at IS NULL`), and  AND  UPDATE reference_call\nSET taken_over_at = now(),\n    next_attempt_at = NULL,\n    updated_at = now()",
+    "detail": "The handler comment attributes sweep-exclusion solely to the SELECT filter while the SQL itself also NULLs next_attempt_at (the sql.gleam comment documents this as belt-and-braces). Two comments in the same feature disagree; the handler one is stale.",
+    "recommended_fix": "Amend the handler doc to 'writes only taken_over_at + next_attempt_at = NULL + updated_at' to match the SQL."
+  }
+]

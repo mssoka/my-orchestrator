@@ -1,0 +1,72 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "doc-consistency",
+    "title": "Canonical docs contradict the implementation on the ATTACH draw domain (district-scoped vs global ring)",
+    "location": "core/map.odin:33-36 (also demos/dublin_board.dem:5-7, core/map_test.odin:13)",
+    "evidence": "core/map.odin:33-36: \"board: the ATTACH family draws from the anchor's OWN district's pool (an // estate never crosses a district boundary), and the derived cluster view is // unchanged (radius adjacency) — the district scoping at the DRAW makes // cross-district estates unreachable by construction.\" — but core/growth.odin:532: \"caller draws one index. The ring is GLOBAL (not district-scoped): the\" and the implementation core/growth.odin:541-547 has no district filter: \"for k in 0..<len(board.candidates) { // c := board.candidates[k] // d := c - anchor // d2 := i64(d[0]) * i64(d[0]) + i64(d[1]) * i64(d[1]) // if d2 >= lo2 && d2 <= hi2 { // append(ring, u32(k))\". demos/dublin_board.dem:5-7 repeats the false claim: \"the ATTACH family draws from the anchor's # district pool — a cluster never crosses a district boundary).\" and core/map_test.odin:13: \"family stays WITHIN the anchor's district (the growth_groups\" while the test body never checks district containment.",
+    "detail": "Three committed documents (core loader header, the blessed demo's header, the test header) state a district-scoped ATTACH contract the code does not implement. Future stage-2 work following map.odin would change replay-relevant spawn behavior.",
+    "recommended_fix": "Rewrite the map.odin district paragraph, dublin_board.dem header, and map_test.odin comment (d) to describe the global street ring (the growth.odin text is the accurate one)."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "The '1-in-6 snap/dedupe/grid-filter' unit pin only exercises stride+snap — dedupe and grid-filter paths are never tested",
+    "location": "core/map_test.odin:105-116",
+    "evidence": "core/map_test.odin:109: \"src := `{\\\"board\\\":{\\\"w_tiles\\\":8,\\\"h_tiles\\\":6},\\\"spawn_candidates\\\":[[1.1,1.2],[1.3,1.4],[1.5,1.6],[7.9,5.1],[-0.4,2.0],[2.0,6.4]],...}`\" with MAP_SPAWN_STRIDE :: 6 (core/map.odin:63) — stride-6 over 6 candidates samples index 0 only, so the out-of-grid points at indices 3-5 are never sampled and one point cannot dedupe. The test itself says: \"// stride 6 over 6 candidates = 1 point (the first). It snaps to (1,1).\" and asserts only \"testing.expectf(t, len(b.candidates) == 1, ...\" and \"testing.expectf(t, b.candidates[0] == [2]i32{1, 1}, ...\" while its header claims \"(a) stride -> snap -> grid filter -> dedupe: the pool holds integer // TILES only, in first-occurrence order; out-of-grid points never enter.\"",
+    "detail": "The PR-claimed pin for briefing rule 3 (filter at bake-load: grid-filter + dedupe) passes without testing either path. A regression in the loader's filter/dedupe logic would go undetected.",
+    "recommended_fix": "Extend the fixture (e.g. 12+ candidates so stride-6 samples an out-of-grid point and two points snapping to the same tile) and assert the filtered/deduped pool shape."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "District pool data and helpers ship in core with no sim-path consumer",
+    "location": "core/map.odin:446-450, core/map.odin:390-404, core/growth.odin:496-509",
+    "evidence": "core/map.odin:446-450: \"// map_board_candidate_pool — the global pool range (the SEED family's draw // domain): ... // map_board_pool_lo :: proc(b: ^Map_Board) -> u32 { return 0 } // map_board_pool_hi :: proc(b: ^Map_Board) -> u32 { return u32(len(b.candidates)) }\" — grep across core/ app/ harness/ demos/ shows map_board_pool_lo/hi have zero call sites. The district_start prefix-sum (map.odin:390-404: \"b.district_start = make([dynamic]u32, len(b.districts) + 1, allocator) ... acc += counts[di]\") and board_district_at (core/growth.odin:501) are referenced only by core/map_test.odin:42 (\"append(&b.candidate_district, board_district_at(&b, b.candidates[i]))\"), never by growth's draw path.",
+    "detail": "Loaded, indexed, and helper-wrapped data retained for a hypothetical future policy is premature surface; combined with the contradictory district docs it actively misleads maintainers about the live behavior.",
+    "recommended_fix": "Either wire district_start/candidate_district into the draw or trim them (plus the lo/hi helpers) until the district-scoped policy actually lands."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "api-hygiene",
+    "title": "growth_board_ring_scan declares unused `t: ^Topology` and `alloc` parameters",
+    "location": "core/growth.odin:537-550",
+    "evidence": "core/growth.odin:537: \"growth_board_ring_scan :: proc(board: ^Map_Board, t: ^Topology, anchor: [2]i32, sep, radius: i32, ring: ^[dynamic]u32, alloc := context.temp_allocator) -> i32 {\" — the body references neither: \"lo2 := i64(sep) * i64(sep) // hi2 := i64(radius) * i64(radius) // clear(ring) // for k in 0..<len(board.candidates) { // c := board.candidates[k] // d := c - anchor // d2 := i64(d[0]) * i64(d[0]) + i64(d[1]) * i64(d[1]) // if d2 >= lo2 && d2 <= hi2 { // append(ring, u32(k))\"",
+    "detail": "Dead parameters imply a topology dependence the scan does not have, and the unused `alloc` bypasses the explicit-allocator intent (appends fall back to the ring's implicit allocator) — ODN-18 hygiene noise.",
+    "recommended_fix": "Drop `t` and `alloc` from the signature (append reuses the caller's scratch buffer), or thread `alloc` into append explicitly."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "leak-on-error",
+    "title": "map_board_load leaks partial board allocations on its fail-loud error paths",
+    "location": "core/map.odin:319-327",
+    "evidence": "core/map.odin:319: \"append(&b.districts, Map_District{name = strings_clone(name, allocator), kind = kind, pos = {f32(px), f32(py)}})\" — after which later failures return without freeing b's buffers, e.g. map.odin:322-323: \"if len(b.districts) == 0 { // return {}, \\\"map_board_load: no districts\\\"\" and the terrain/street failures at lines 410-422 return after candidates/districts are built. The only defers are `defer json.destroy_value(v, allocator)` and `defer delete(snapped)`; there is no `defer map_board_destroy(&b)` on error.",
+    "detail": "A corrupt-asset load discards the partially built Map_Board's dynamic arrays. Under the project's own ODN-18 tracking-allocator rule this is a leak on the fallback-to-procedural path.",
+    "recommended_fix": "On each error return after allocations begin, call map_board_destroy(&b) (or one deferred destroy guarded by the err result) before returning."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "duplication",
+    "title": "dublin.odin hand-rolls cstring copies where the package already uses strings.clone_to_cstring",
+    "location": "app/render/dublin.odin:385,392-415 (vs app/render/noc_overlay.odin:514-519)",
+    "evidence": "app/render/dublin.odin:385: \"w := rl.MeasureTextEx(v.font, cstring(raw_data(dublin_label_cstr(d.name))), f32(size), 1)\" then :387: \"draw_text_font_halo(v.font, d.name, i32(x), i32(y), size, ink, halo)\" — draw_text_font_halo (line 405) rebuilds the copy internally: \"cbuf := make([dynamic]u8, 0, len(txt) + 1, context.temp_allocator) // for b in transmute([]u8)(txt) { // append(&cbuf, b) // }\". The package's existing helper noc_overlay.odin:516-519: \"strings_clone_cstr_noc :: proc(s: string, v: ^View) -> cstring { // return strings.clone_to_cstring(s, context.temp_allocator) // }\".",
+    "detail": "Two conventions for the same temp-cstring need now coexist in one package, and each label pays a duplicate per-frame copy (measure + draw) versus the one-line stdlib call.",
+    "recommended_fix": "Replace dublin_label_cstr and the inline loops with strings.clone_to_cstring(s, context.temp_allocator) (matching noc_overlay), and pass the measured cstring through to the draw."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "global-state",
+    "title": "board_cache/board_cache_loaded introduce the first file-scope mutable state in the harness",
+    "location": "harness/catalogs.odin:85-106",
+    "evidence": "harness/catalogs.odin:85-86: \"board_cache: pp.Map_Board // board_cache_loaded: bool\" — a grep for file-scope value declarations across harness/*.odin finds no other package-level mutable state; every other harness dependency (catalogs, Render_Ctx, demo config) is threaded by parameter. board_load mutates it: \"board_cache = b // board_cache_loaded = true // return &board_cache, \\\"\\\"\".",
+    "detail": "The harness was uniformly stateless-per-verb; a mutable package cache breaks that precedent and would silently misbehave if a verb ever reloaded a different board in one process.",
+    "recommended_fix": "Load the board once in main() per verb invocation (the load_catalogs pattern) and pass ^pp.Map_Board down alongside cat, keeping the process stateless."
+  }
+]

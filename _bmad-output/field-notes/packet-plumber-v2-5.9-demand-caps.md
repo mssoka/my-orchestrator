@@ -1,0 +1,5 @@
+# packet-plumber-v2-5.9-demand-caps — field notes
+
+- The multi-edit atomic trap hit again (crisis_test batch): ONE ambiguous oldText rejected all 5 edits — the cap-1000 scenario overrides never landed, and I debugged phantom behavior for a round before noticing. Re-verify each edit's file AND uniqueness before batching; re-grep after.
+- A draw to a NONEXISTENT node id is silently rejected (replay_error latched, no test checks it) — my first W10 fixture drew (1,3) where the sink was id 2, and the W5 transit pin passed VACUOUSLY (delivered 0 → the latency assert skipped). New fixture tests now carry `!replay_error` guards; verify every draw's ids from the spawn returns.
+- The era-3 director volumes + growth pacing are load-bearing across MANY test files (crisis/health/node_health/stats all feed on them) — a demand re-tune re-pins far beyond demand_test; the crisis-engine tests can isolate the cap at `cap_fraction_permille = 1000` (full-rate arrival) with the cap's own pins in W9/W10. Also: the harness `save` does NOT delete stale capture PNGs (growth/05500ms.png lingered).

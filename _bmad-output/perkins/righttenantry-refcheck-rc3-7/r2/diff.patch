@@ -1,0 +1,2628 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-rc3-7-fraud-signals-module.md b/_bmad-output/implementation-artifacts/spec-rc3-7-fraud-signals-module.md
+new file mode 100644
+index 00000000..321ce3db
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-rc3-7-fraud-signals-module.md
+@@ -0,0 +1,155 @@
++---
++baseline_commit: 7cecf8ffd786ce9f0e4ac2802631d87c29faa7c5
++story_key: rc3-7-fraud-signals-module
++---
++
++# Story RC3.7: Fraud-Signals Module
++
++**Status:** review
++**Epic:** RC3 (the referee collection funnel). Closes RC3. Depends on rc3-1…rc3-6 (merged; #602 was the last).
++**Model:** `zai-coding-cn/glm-5.2` (kimi quota down this cycle; glm-5.2 proven capable across rc3-2…rc3-6).
++**Perkins:** ON (fraud/privacy code + the AD-10 honesty invariant — the load-bearing rule). Round runs on glm-5.2 fallback while kimi is down.
++**GitHub issue:** #548
++
++## Story
++
++> As a landlord,
++> I want honest fraud signals on each reference,
++> So that I have clues about provenance — never fabricated detections, never verdicts.
++
++rc3-1…rc3-6 shipped the collection funnel: the SMS client + Twilio Lookup infra (rc3-1), templates + send helpers (rc3-2), the referee form session (rc3-3), the exit routes incl. the stop-link objection route (rc3-4), the cadence sweep (rc3-5), and the verified delivery webhooks (rc3-6). rc3-7 **closes RC3** by building the honest fraud-signals table (AD-10) — the clues-about-provenance layer that RC4's landlord panel will DISPLAY. rc3-7 computes + persists; RC4 renders.
++
++**The load-bearing rule (AD-10 honesty):** signals are clues about provenance — **never fabricated detections, never verdicts**. They never auto-reject or alter a score (§9.4). The v2-reserved signals emit `unknown` / `null` / **absent** rather than placeholders. Innocent reuse (a letting agent legitimately appearing across several applications) is NOT fraud.
++
++## The AD-10 signal table (the spine — exactly this, nothing more)
++
++| Signal | v1 mechanism | Collectible? | Honest v1 value |
++|---|---|---|---|
++| `contact_reused_within_application` | Pure DB: same phone/email in two ref slots of one application | Yes | `true`/`false` |
++| `contact_duplicate_of_applicant` | Pure DB: referee contact == applicant's own (`application.email`/`phone`) | Yes | `true`/`false` |
++| `contact_reused_across_applications` | Pure DB: same contact under a **different** referee name across applications | Yes | `true`/`false` |
++| `line_type` | Twilio Lookup Line-Type (`lookup.lookup_line_type`) | Yes (keys optional) | `"mobile"`/`"landline"`/`"voip"`/`"unknown"` |
++| `voip_or_burner` | `lookup.voip(line_type)` — **honestly `voip` only**; "burner" is not detectable v1 | Yes | `true`/`false` |
++| `form_session.completion_seconds` | Server wall-clock `form_opened_at` → `submitted_at` (seconds) | Yes | int / `null` (no form yet) |
++| `form_session.ip_matches_applicant` | Referee form IP vs `application.submitted_ip_text` | Yes | `true`/`false`/`null` |
++| `form_session.device_fingerprint_match` | Referee UA vs `application.submitted_user_agent` — **NOT a JS fingerprint lib; labelled weak** | Yes, weak | `true`/`false`/`null` |
++| `form_session.focus_seconds_reported` | Client-reported focus seconds (rc3-4 `_focus_seconds`, JS-wired) | Yes | int |
++| `geo_vs_claimed_property` | — (no geo-IP db) | **No** | **`"unknown"`** (never a guess) |
++| `coached_answer_score` | — (no LLM pass v1) | **No** | **`null`** (never a guess) |
++| `voice_matches_other_reference` | — (Art 9 biometric gate; v3) | **Reserved** | **ABSENT** (key never emitted) |
++| `referee_contact_invalid` | Correction-cycle second failure (AD-7, §6.4); supersedes heist-535 `referee_number_wrong` | Yes — at exhaustion | `true` / **absent** until it fires |
++
++The object stored at `result.fraud_signals` + the denormalised `reference_call.fraud_signals` column is exactly these keys (voice absent, referee_contact_invalid absent until it fires).
++
++## Scope
++
++### OWNS
++1. **`server/src/reference_checks/fraud.gleam`** (NEW) — the pure fraud-signals builder. Two entry points:
++   - `creation_fraud_signals(inputs) -> json.Json` — DB signals + line-type + honest placeholders, `form_session: null`, no `referee_contact_invalid`.
++   - `submission_fraud_signals(inputs) -> json.Json` — DB signals (re-run) + line-type (carried) + full `form_session` + placeholders.
++   - `with_referee_contact_invalid` is delivered as the SQL `stamp_referee_contact_invalid.sql` (jsonb_set on the stored column, preserving the other keys) — a DB op, not a Gleam fn. rc3-7 ships the SQL + integration tests; the RC4.3 correction-exhaustion terminal calls it.
++   Pure functions (no DB/HTTP inside); inputs passed in. Every v2-reserved signal emits its honest placeholder EXACTLY.
++2. **Phase 1 — row creation (`trigger.gleam`):** compute the pure-DB signals + run the line-type lookup (`lookup.lookup_line_type(config.twilio, config.sentry, …)`), then write the `fraud_signals` COLUMN via a new `stamp_creation_fraud_signals.sql`. `result` stays null (no result until terminal). Pre-existing rows (created before this story) keep `null` honestly.
++3. **Phase 2 — submission (`form_handler.gleam`):** capture referee IP + UA (`request_helpers.client_ip/client_user_agent`), fetch the applicant comparator (`application.submitted_ip_text`/`submitted_user_agent`) + the row's existing `fraud_signals` (to carry `line_type`) via an amended `get_form_context_by_form_token.sql`, compute `form_session`, re-run the DB signals, and write the full `fraud_signals` (embedded in `result.fraud_signals` + the column) through the existing `complete_reference_call.sql`.
++4. **Phase 3 — `referee_contact_invalid`:** the SQL stamp (`stamp_referee_contact_invalid.sql`, jsonb_set) + integration tests proving it stamps honestly + preserves the other keys (and handles a null column). The LIVE second-failure → unreachable transition is RC4.3 (does not exist today); rc3-7 provides the mechanism + never fabricates the signal.
++5. **New SQL:** `stamp_creation_fraud_signals.sql` (write the column at creation); a reuse-context read (this application's effective referee contacts + the applicant's own, for `contact_duplicate_of_applicant` + `contact_reused_within_application`); a cross-application reuse read (`contact_reused_across_applications`). Amended `get_form_context_by_form_token.sql` (+ `submitted_ip_text`, `submitted_user_agent`, `fraud_signals`).
++6. **`lookup.gleam`:** add `line_type_to_string(LineType) -> String` (fraud.gleam emits the string signal).
++7. **`result.gleam`:** `structure_form_result` takes the pre-built `fraud_signals` json (the handler builds it via `fraud.submission_fraud_signals`); the stub `form_session_fraud_signals` helper is removed (its logic moves, enriched, into `fraud.gleam`). Separation of concerns: result.gleam structures answers; fraud.gleam owns signals.
++8. **W1 cleanup (carried from rc3-6 Perkins r1):** remove the dead `claim_webhook_event` defense layer in `webhooks.gleam::apply_delivery_failure` (the discarded `case` whose every arm yields `Nil` and falls through) + correct the comments to name the real idempotency mechanism (find/mark live-status scoping). **Do NOT make it early-return** — Perkins ruled that risks at-most-once lost transitions.
++9. **Tests:** per-signal unit tests (`server/test/reference_checks/fraud_test.gleam`) incl. innocent-reuse fixtures (a letting agent across applications ≠ fraud), the weak-UA label, the honesty placeholders, the §4.2 boundary (raw IP/UA never leave the builder), and `referee_contact_invalid` stamping. Integration coverage for the Phase 1 + Phase 2 writes.
++
++### Does NOT own (deferred / sibling stories)
++- **Landlord DISPLAY** of fraud signals → RC4.1/RC4.2. rc3-7 computes + persists only.
++- **The §4.2 API stripping** (raw IP/UA out of the landlord response) → RC4.1. rc3-7 STORES `referee_ip`/`referee_user_agent` inside `form_session` (internal-only, §4.2); RC4.1 strips them at the boundary. rc3-7 touches no landlord API, so nothing leaks in this story's scope — but the keys are clearly internal.
++- **The correction FLOW + correction-exhaustion terminal** (`awaiting_correction → unreachable`) → RC4.3 (needs a timeout SLA the arch doesn't specify). rc3-7 provides `with_referee_contact_invalid`; RC4.3 calls it on exhaustion.
++- **Geo-IP, device-fingerprint library, coached-answer LLM score** → v2/v3 (AD-10 deferred; rc3-7 emits the honest placeholders only).
++- **`line_type` re-lookup on a corrected contact** → RC4.3's re-trigger. rc3-7 carries the creation-time value (avoids a paid re-lookup on every submission).
++
++## Acceptance Criteria (BDD — from epic RC3.7 + arch AD-10/§4.2/§6.4/§9.4, FR-RC12)
++
++**AC1 — The AD-10 table, exactly + honestly**
++> **Given** the `fraud.gleam` module
++> **When** it builds signals
++> **Then** it produces exactly the table above: the three pure-DB reuse signals, `line_type`/`voip_or_burner`, and `form_session.{completion_seconds, ip_matches_applicant, device_fingerprint_match, focus_seconds_reported}`
++> **And** `geo_vs_claimed_property` is `"unknown"`, `coached_answer_score` is `null`, `voice_matches_other_reference` is **absent** (key never emitted), and `referee_contact_invalid` is **absent** until it fires — never fabricated (AD-10)
++
++**AC2 — Phase 1: creation writes DB + line-type; pre-existing rows keep nulls**
++> **Given** a new `reference_call` row is created (viewed trigger / manual start)
++> **When** creation completes
++> **Then** the `fraud_signals` column holds the pure-DB reuse signals + `line_type`/`voip_or_burner` (looked up once, before any send) + `form_session: null` + the honest placeholders, and `result` is still null
++> **And** rows created before this story (and any row whose phone has no Twilio keys) keep `null`/`unknown` honestly — never a fabricated value
++
++**AC3 — Phase 2: submission computes form_session; raw IP/UA internal-only**
++> **Given** a referee submits the form
++> **When** the submit handler runs
++> **Then** `form_session` is computed: `completion_seconds` (server `form_opened_at`→`submitted_at`), `ip_matches_applicant` (referee IP vs `application.submitted_ip_text`), `device_fingerprint_match` (referee UA vs `application.submitted_user_agent`, **labelled weak**), `focus_seconds_reported`; the DB signals are re-run; `line_type` is carried from the row's creation-time value
++> **And** the full `fraud_signals` lands in `result.fraud_signals` AND the denormalised column
++> **And** the raw referee IP/UA live only inside `form_session` (internal-only, §4.2) — only the derived booleans are the public signals
++
++**AC4 — Innocent reuse is not fraud**
++> **Given** the same letting-agent contact legitimately appears as a referee across several applications (or two slots of one application)
++> **When** the reuse signals compute
++> **Then** `contact_reused_*` is `true` (it IS reused — a clue), but the signal is a reuse clue, **never** styled as a verdict, and never auto-rejects or alters a score (AD-10, §9.4)
++
++**AC5 — `referee_contact_invalid` stamps honestly; `referee_number_wrong` superseded**
++> **Given** `fraud.with_referee_contact_invalid`
++> **When** it stamps a `fraud_signals` object
++> **Then** `referee_contact_invalid: true` is set; the slug is `referee_contact_invalid` (heist-535's `referee_number_wrong` is superseded, §6.4 — the new slug only)
++> **And** at creation + submission the signal is honestly **absent** (no correction has exhausted); the LIVE second-failure wiring is RC4.3 (the path does not exist in rc3-7's scope)
++
++**AC6 — No signal is a decision (§9.4)**
++> **Given** any fraud_signals object rc3-7 produces
++> **When** the landlord/AI consumes it
++> **Then** no signal auto-rejects an application and no signal alters an AI score; signals are display + confidence content only
++
++**AC7 — W1 cleanup: dead claim removed, idempotency intact**
++> **Given** `webhooks.gleam::apply_delivery_failure`
++> **When** the dead `claim_webhook_event` defense layer is removed
++> **Then** the comments name the real idempotency mechanism (find/mark `WHERE status IN ('queued','contact_initiated')` live-status scoping), the existing `resend_redelivery_is_idempotent_test` still passes (audit_count == 1, notification_count == 1), and the claim is NOT made early-return (Perkins: at-most-once risk)
++
++**AC8 — `make test-server` green; no em-dashes in user-facing copy**
++
++## Decisions & rationale (load-bearing — read at review)
++
++- **D1 — Creation-time `fraud_signals` persistence (write the COLUMN at creation).** §7.3 + FR-RC12 are explicit: line-type runs "at row creation, before the first message"; DB checks run "at creation and again at submission". So new rows get a creation-time `fraud_signals` (DB + line-type + placeholders; `form_session: null`). `result` stays null until terminal (§4.1); the column is the pre-submission home. "Rows created before this story keep nulls honestly" (epic AC) confirms new rows are the ones populated. *Rejected:* computing-at-creation-but-not-persisting (then why compute it; the line-type paid lookup would re-run).
++- **D2 — `referee_contact_invalid` mechanism + hook now; LIVE wiring is RC4.3.** AD-7 ties the signal to the SECOND failure (correction exhausted → `unreachable`); the `awaiting_correction → unreachable` transition does not exist yet (rc3-6 deferred it to RC4.3 — no timeout SLA in the arch). rc3-7 ships the SQL `stamp_referee_contact_invalid` (jsonb_set — operates on the stored column, not a Gleam fn), proves it with integration tests, and keeps the signal honestly absent at creation/submission. *Never fabricate a second-failure path that doesn't exist* (AD-10). The RC4.3 terminalization calls the stamp. **B1 (Perkins r1, fix applied):** the Phase-1 creation stamp is scoped to `created_ids` (the rows THIS trigger call inserted) — a wholesale re-stamp would wipe a submitted sibling's `form_session` on a supported re-trigger (`handle_start` re-fires on demand).
++- **D3 — `line_type` carried at submission (no paid re-lookup).** AD-10 scopes line-type to capture. Re-looking-up on every submission is a paid call for no v1 gain (contacts don't change until RC4.3's correction). rc3-7 carries the creation-time value from the row's existing `fraud_signals`; RC4.3's correction re-trigger re-looks-up.
++- **D4 — `completion_seconds` = server wall-clock; `focus_seconds_reported` is separate.** AD-10's row reads "Server timestamps (`form_opened_at`→`submitted_at`) + client-reported focus time" — two distinct inputs. `completion_seconds` is the server wall-clock (seconds); `focus_seconds_reported` (rc3-4) is the client-reported focus time. Both are `form_session` keys.
++- **D5 — Raw referee IP/UA stored INSIDE `form_session` (§4.2 literal), internal-only.** §4.2: "raw IPs/UAs (inside `fraud_signals.form_session`) never leave the server". So `form_session` carries `referee_ip` + `referee_user_agent` (server-side evidence) alongside the derived booleans; RC4.1 strips them at the API boundary. *Rejected alternative:* a separate internal column (diverges from §4.2; the architecture wants them inside form_session so the strip is one path).
++- **D6 — W1: remove the dead claim + fix comments (Perkins explicit).** rc3-6 Perkins r1 W1 (4-source agreement): the `claim_webhook_event` `case` is a discarded expression (Gleam has no early return) — every arm yields `Nil` and falls through to find+mark; the "Stand down" comment lies. Real idempotency = find/mark live-status scoping (`WHERE status IN ('queued','contact_initiated')`). Fix = remove the dead step + correct comments. *Not* early-return (Perkins: at-most-once lost-transition risk).
++
++## Clarify — RESOLVED (lavish, 2026-08-11; all = recommendation A)
++
++1. **D2 — `referee_contact_invalid`:** build stamping fn + hook + unit test now; **LIVE second-failure wiring is RC4.3** (the `awaiting_correction → unreachable` transition doesn't exist today — never fabricate it).
++2. **D5 — raw IP/UA:** store `referee_ip` + `referee_user_agent` **inside `form_session`** (§4.2 literal, internal-only); RC4.1 strips at the API boundary. Derived booleans are the public face.
++3. **D1 — creation-time persistence:** **write the `fraud_signals` COLUMN at creation** (DB reuse + line-type + placeholders; `form_session: null`); `result` stays null until terminal. Pre-existing rows keep null.
++4. **`device_fingerprint_match` naming:** **keep** the AD-10 name (arch-canonical). "Weak" is conveyed via a code comment + RC4 rendering — **no sibling data key** (preserves AD-10's "exactly these keys"; Perkins r1 N1).
++
++## Files / areas
++
++- **NEW:** `server/src/reference_checks/fraud.gleam` · `reference_checks/fraud_inputs.gleam` (shared DB + parsing helpers — DRY across trigger + form_handler; Perkins r1 W1)
++- **NEW SQL:** `server/src/reference_checks/sql/stamp_creation_fraud_signals.sql`, `get_application_reference_contacts.sql`, `count_cross_application_contact_reuse.sql` (names tentative — final at impl)
++- **AMEND SQL:** `server/src/reference_checks/sql/get_form_context_by_form_token.sql` (+ `submitted_ip_text`, `submitted_user_agent`, `fraud_signals`)
++- **EDIT:** `server/src/reference_checks/trigger.gleam` (Phase 1), `form_handler.gleam` (Phase 2), `result.gleam` (refactor: take pre-built fraud_signals; drop the stub helper), `webhooks.gleam` (W1), `lookup.gleam` (`line_type_to_string`), `sql.gleam` (Squirrel regen)
++- **TESTS:** `server/test/reference_checks/fraud_test.gleam` (unit) + integration coverage in `server/test/integration/`
++- **NO migration** (the `fraud_signals` JSONB column already exists from rc2-1; rc3-7 only writes it). **No new enum values.**
++
++## Verify
++
++- Every signal in the AD-10 table produced, with the honest placeholders exactly (`"unknown"` / `null` / absent).
++- Innocent-reuse fixtures pass (letting-agent-across-applications ≠ fraud); a weak UA compare is labelled weak.
++- `referee_contact_invalid` stamping proven (unit test); honest absent at creation/submission; `referee_number_wrong` superseded.
++- Raw IPs/UAs internal-only (the §4.2 boundary); signals land in `result.fraud_signals` + the column.
++- No signal alters a score or rejects (AD-10); `make test-server` green; no em-dashes in user-facing copy.
++- W1: dead claim removed, `resend_redelivery_is_idempotent_test` still green.
++- After user approval of this spec: implement, then commit + push + open PR targeting `develop`. **Never merge.**
++
++## Carry-forwards (read the merged work)
++
++- **RC1.1** — `application.submitted_ip_text` / `submitted_user_agent` (the fraud comparator captured at submission; on the `application` row).
++- **rc3-1** — `lookup.gleam` (Twilio Lookup; `lookup_line_type` no-ops to `Unknown` without keys — the honest null path).
++- **rc3-3** — `form_opened_at` (first GET) — the `completion_seconds` start.
++- **rc3-4** — `_focus_seconds` (client-reported, JS-wired in `reference_form.js`) + the form-session read (`get_form_context_by_form_token`).
++- **rc3-5** — the sweep (owns every send; `next_attempt_at` clock); the correction-cycle context.
++- **rc3-6** — `mark_awaiting_correction` (records `terminal_reason` for the `referee_contact_invalid` lens) + **W1** (the dead `claim_webhook_event` defense layer to drop).
++- **`result.gleam`** — already emits `fraud_signals.form_session.{focus_seconds_reported, completion_seconds: null}` (the stub rc3-7 enriches); `structure_form_result` returns `#(result, fraud_signals)`.
+diff --git a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+index f6a91653..30939a48 100644
+--- a/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
++++ b/_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml
+@@ -47,7 +47,7 @@
+ # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
+ 
+ generated: 2026-07-31
+-last_updated: "2026-08-12"
++last_updated: "2026-08-11"
+ project: RightTenantry
+ project_key: NOKEY
+ tracking_system: file-system
+@@ -77,7 +77,7 @@ development_status:
+   rc3-4-form-completion-exit-routes-submit-decline-objection-wrong-person: review
+   rc3-5-the-sweep-cadence-engine-cloud-run-job: review
+   rc3-6-verified-webhooks-resend-events-twilio-sms: in-progress
+-  rc3-7-fraud-signals-module: backlog
++  rc3-7-fraud-signals-module: review
+   epic-rc3-retrospective: optional
+ 
+   # Epic RC4: Landlord Reference Panel & Workflow
+diff --git a/server/src/reference_checks/form_handler.gleam b/server/src/reference_checks/form_handler.gleam
+index 233d1747..0f44ad2b 100644
+--- a/server/src/reference_checks/form_handler.gleam
++++ b/server/src/reference_checks/form_handler.gleam
+@@ -43,6 +43,8 @@ import pog
+ import reference_checks/form_copy
+ import reference_checks/form_pages
+ import reference_checks/form_question_pages.{QuestionView}
++import reference_checks/fraud
++import reference_checks/fraud_inputs
+ import reference_checks/messages
+ import reference_checks/questions.{type Question}
+ import reference_checks/result
+@@ -796,7 +798,7 @@ pub fn handle_submit(
+             True ->
+               form_pages.view_thank_you(copy_vars(row))
+               |> ssr_response.to_sensitive_response
+-            False -> save_submit(config, token, row, values)
++            False -> save_submit(config, req, token, row, values)
+           }
+         // State moved (already completed / declined / expired / ...): the
+         // GET re-renders the truthful state page.
+@@ -807,6 +809,7 @@ pub fn handle_submit(
+ 
+ fn save_submit(
+   config: ServerConfig,
++  req: Request,
+   token: String,
+   row: sql.GetFormContextByFormTokenRow,
+   values: List(#(String, String)),
+@@ -843,7 +846,12 @@ fn save_submit(
+               // deferred in v1, AD-13; get_form_context doesn't surface it).
+               owner_label: "primary",
+               attempts: row.attempts,
+-              focus_seconds: parse_focus_seconds(values),
++              fraud_signals: build_submission_fraud_signals(
++                config,
++                req,
++                row,
++                values,
++              ),
+             )
+           let #(result_json, fraud_json) =
+             result.structure_form_result(slot, draft, ctx)
+@@ -1265,6 +1273,79 @@ fn exit_get(config: ServerConfig, token: String, page: String) -> Response {
+   }
+ }
+ 
++// -- Phase 2 fraud-signals build (rc3-7, AD-10) -------------------------------
++
++/// Build the submission-time `fraud_signals` (AD-10): re-run the pure-DB
++/// reuse signals (contacts can change via the correction loop), carry the
++/// creation-time line-type (no paid re-lookup), and compute the full
++/// `form_session` block — completion_seconds, ip_matches_applicant,
++/// device_fingerprint_match (a UA compare, labelled weak),
++/// focus_seconds_reported. Raw referee IP/UA live INSIDE form_session and are
++/// internal-only (§4.2 — RC4.1 strips them at the landlord API boundary).
++/// Best-effort: a fraud-signal query failure degrades to honest defaults
++/// (empty other-refs, not-flagged cross-app), never blocks the submit.
++fn build_submission_fraud_signals(
++  config: ServerConfig,
++  req: Request,
++  row: sql.GetFormContextByFormTokenRow,
++  values: List(#(String, String)),
++) -> json.Json {
++  let this_ref =
++    fraud.RefContact(
++      name: row.contact_name,
++      email: fraud_inputs.effective_contact(
++        row.corrected_email,
++        row.contact_email,
++      ),
++      phone: fraud_inputs.effective_contact(
++        row.corrected_phone,
++        row.contact_phone,
++      ),
++    )
++  let applicant =
++    fraud.RefContact(
++      // name is unused for duplicate_of_applicant (email/phone only).
++      name: "",
++      email: Some(row.applicant_email),
++      phone: row.applicant_phone,
++    )
++  let app_uuid = uuid.from_string(row.application_id)
++  let other_refs = case app_uuid {
++    Ok(id) ->
++      case sql.get_application_reference_contacts(config.db, id) {
++        Ok(pog.Returned(_, refs)) ->
++          fraud_inputs.other_refs_from_rows(refs, row.id)
++        _ -> []
++      }
++    Error(_) -> []
++  }
++  let cross_app = case app_uuid {
++    Ok(id) -> fraud_inputs.cross_application_reuse(config.db, id, this_ref)
++    Error(_) -> False
++  }
++  let db =
++    fraud.FraudDbInputs(
++      this_ref:,
++      other_application_refs: other_refs,
++      applicant:,
++      cross_app_reuse: cross_app,
++    )
++  let fs =
++    fraud.FormSessionInputs(
++      referee_ip: request_helpers.client_ip(req),
++      referee_user_agent: request_helpers.client_user_agent(req),
++      applicant_ip: row.submitted_ip_text,
++      applicant_user_agent: row.submitted_user_agent,
++      completion_seconds: fraud_inputs.parse_int_opt(row.completion_seconds),
++      focus_seconds: parse_focus_seconds(values),
++    )
++  fraud.submission_fraud_signals(
++    db,
++    fraud.carry_line_type(row.fraud_signals),
++    fs,
++  )
++}
++
+ /// The client-reported focus seconds (the form's hidden _focus_seconds
+ /// field); an unparseable/missing value is 0. rc3-7 builds the full
+ /// form_session fraud block on top of this.
+diff --git a/server/src/reference_checks/fraud.gleam b/server/src/reference_checks/fraud.gleam
+new file mode 100644
+index 00000000..1ba78f21
+--- /dev/null
++++ b/server/src/reference_checks/fraud.gleam
+@@ -0,0 +1,263 @@
++//// The honest fraud-signals builder (AD-10).
++////
++//// Pure server-side code: turns gathered inputs into the `fraud_signals`
++//// JSON object that lands in `result.fraud_signals` (authoritative) and the
++//// denormalised `reference_call.fraud_signals` column. The load-bearing rule
++//// is AD-10 honesty — signals are clues about provenance, NEVER fabricated
++//// detections, NEVER verdicts. They never auto-reject and never alter a
++//// score (§9.4). The v2-reserved signals emit their honest placeholders
++//// exactly: `geo_vs_claimed_property` = `"unknown"`, `coached_answer_score`
++//// = null, `voice_matches_other_reference` is ABSENT (the key is never
++//// emitted), `referee_contact_invalid` is ABSENT until a correction cycle
++//// exhausts (rc3-7 never fabricates it; the stamp is a SQL `jsonb_set` the
++//// RC4.3 correction-exhaustion path calls).
++////
++//// Two build phases (§7.3):
++////   - `creation_fraud_signals` — at row creation (trigger): the pure-DB
++////     reuse signals + the Twilio line-type lookup + the honest placeholders.
++////     `form_session` is null (no form yet). `result` stays null at this
++////     phase; only the `fraud_signals` column is written.
++////   - `submission_fraud_signals` — at form submit (form_handler): re-runs
++////     the pure-DB signals (contacts can change via the correction loop),
++////     carries the creation-time line-type (no paid re-lookup), and computes
++////     the full `form_session` block (completion_seconds, ip_matches_applicant,
++////     device_fingerprint_match — a UA compare, labelled weak,
++////     focus_seconds_reported). Raw referee IP/UA live INSIDE `form_session`
++////     and are INTERNAL-ONLY (§4.2): RC4.1 strips them at the landlord API
++////     boundary. The derived booleans are the public face.
++////
++//// DB-reuse inputs are gathered by the caller (trigger / form_handler) —
++//// fraud.gleam is pure and owns no DB/HTTP. `cross_app_reuse` is precomputed
++//// by a SQL read (same effective contact under a DIFFERENT referee name in
++//// another application — the innocent letting-agent case, same name, does
++//// NOT flag).
++
++import gleam/dynamic/decode
++import gleam/json
++import gleam/list
++import gleam/option.{type Option, None, Some}
++import reference_checks/lookup
++
++/// A referee's effective contact (the snapshot OR corrected value — the
++/// caller resolves which via `corrected_*` fallback). Used for the pure-DB
++/// reuse + duplicate signals.
++pub type RefContact {
++  RefContact(name: String, email: Option(String), phone: Option(String))
++}
++
++/// The pure-DB inputs (AD-10). Gathered by the caller; fraud.gleam is pure.
++pub type FraudDbInputs {
++  FraudDbInputs(
++    // The referee being scored (this row's effective contact).
++    this_ref: RefContact,
++    // The application's OTHER reference rows' effective contacts (for
++    // `contact_reused_within_application` — per-ref involvement: does THIS
++    // ref's contact appear in another slot?).
++    other_application_refs: List(RefContact),
++    // The applicant's own contact (for `contact_duplicate_of_applicant`).
++    applicant: RefContact,
++    // Precomputed by the cross-application SQL read: true iff this ref's
++    // effective contact appears under a DIFFERENT name in another
++    // application's reference rows (for `contact_reused_across_applications`).
++    cross_app_reuse: Bool,
++  )
++}
++
++/// The `form_session` inputs (computed at submission only). Raw referee
++/// IP/UA are INTERNAL-ONLY (§4.2) — they ride inside `form_session` for the
++/// server-side evidence trail and RC4.1 strips them at the API boundary.
++pub type FormSessionInputs {
++  FormSessionInputs(
++    referee_ip: String,
++    referee_user_agent: String,
++    applicant_ip: String,
++    applicant_user_agent: String,
++    // Server wall-clock seconds from `form_opened_at` to now (computed in
++    // SQL — `EXTRACT(EPOCH FROM (now() - form_opened_at))`); None when the
++    // form was never opened.
++    completion_seconds: Option(Int),
++    // Client-reported focus seconds (rc3-4 `_focus_seconds`, JS-wired).
++    focus_seconds: Int,
++  )
++}
++
++// -- Phase 1: creation-time signals ------------------------------------------
++
++/// Build the creation-time `fraud_signals` (AD-10): pure-DB reuse signals +
++/// the line-type lookup + the honest placeholders. `form_session` is null
++/// (no form yet); `referee_contact_invalid` is ABSENT. The caller writes
++/// this to the `fraud_signals` column; `result` stays null until terminal.
++pub fn creation_fraud_signals(
++  db db: FraudDbInputs,
++  line_type line_type: lookup.LineType,
++) -> json.Json {
++  base_fraud_signals(db:, line_type:, form_session: json.null())
++}
++
++// -- Phase 2: submission-time signals ----------------------------------------
++
++/// Build the full submission-time `fraud_signals` (AD-10): re-runs the
++/// pure-DB signals (contacts can change via the correction loop), carries
++/// the creation-time line-type (no paid re-lookup), and computes the full
++/// `form_session` block. `referee_contact_invalid` is ABSENT. The caller
++/// embeds this in `result.fraud_signals` AND the denormalised column.
++pub fn submission_fraud_signals(
++  db db: FraudDbInputs,
++  line_type line_type: lookup.LineType,
++  fs fs: FormSessionInputs,
++) -> json.Json {
++  base_fraud_signals(db:, line_type:, form_session: form_session_block(fs))
++}
++
++// -- The shared AD-10 shape (both phases differ only in form_session) --------
++
++fn base_fraud_signals(
++  db db: FraudDbInputs,
++  line_type line_type: lookup.LineType,
++  form_session form_session: json.Json,
++) -> json.Json {
++  json.object([
++    #(
++      "contact_reused_within_application",
++      json.bool(reused_within_application(
++        db.this_ref,
++        db.other_application_refs,
++      )),
++    ),
++    #(
++      "contact_duplicate_of_applicant",
++      json.bool(duplicate_of_applicant(db.this_ref, db.applicant)),
++    ),
++    #("contact_reused_across_applications", json.bool(db.cross_app_reuse)),
++    #("line_type", json.string(lookup.line_type_to_string(line_type))),
++    #("voip_or_burner", json.bool(lookup.voip(line_type))),
++    #("form_session", form_session),
++    // Honest placeholders — NEVER fabricated (AD-10). geo has no geo-IP db;
++    // coached has no LLM pass in v1. Both emit their exact honest value.
++    #("geo_vs_claimed_property", json.string("unknown")),
++    #("coached_answer_score", json.null()),
++    // voice_matches_other_reference is v3-reserved (Art 9 biometric gate) —
++  // the key is ABSENT, never a placeholder. Do not emit it.
++  // referee_contact_invalid is ABSENT here — it is stamped only by the
++  // RC4.3 correction-exhaustion path (stamp_referee_contact_invalid.sql).
++  ])
++}
++
++/// The `form_session` block (computed at submission). Raw referee IP/UA are
++/// INTERNAL-ONLY (§4.2) — present server-side for the evidence trail, stripped
++/// at the landlord API boundary by RC4.1. `device_fingerprint_match` is a UA
++/// string compare, NOT a JS fingerprint library — it is labelled weak (AD-10);
++/// the boolean is uniform with `ip_matches_applicant`, the weakness is a
++/// documented property of the signal that RC4 renders with a caveat.
++fn form_session_block(fs: FormSessionInputs) -> json.Json {
++  json.object([
++    #("completion_seconds", int_or_null(fs.completion_seconds)),
++    #(
++      "ip_matches_applicant",
++      bool_or_null(ip_matches(fs.referee_ip, fs.applicant_ip)),
++    ),
++    #(
++      "device_fingerprint_match",
++      // AD-10: a UA string compare, NOT a JS fingerprint library — honestly
++      // weak. The bool is uniform with ip_matches_applicant; the weakness is a
++      // documented property of this signal (RC4 renders the caveat). No data
++      // key — keeps the form_session block to the AD-10 keys exactly.
++      bool_or_null(ua_matches(fs.referee_user_agent, fs.applicant_user_agent)),
++    ),
++    #("focus_seconds_reported", json.int(fs.focus_seconds)),
++    // Internal-only (§4.2) — RC4.1 strips at the API boundary.
++    #("referee_ip", json.string(fs.referee_ip)),
++    #("referee_user_agent", json.string(fs.referee_user_agent)),
++  ])
++}
++
++// -- Pure signal computations (exported for unit tests) ----------------------
++
++/// `contact_reused_within_application`: does THIS ref's effective email or
++/// phone appear in another of the application's reference slots? (AD-10.)
++/// Empty contacts never match (a missing phone is not "reused").
++pub fn reused_within_application(
++  this: RefContact,
++  others: List(RefContact),
++) -> Bool {
++  list.any(others, fn(other) { shares_contact(this, other) })
++}
++
++/// `contact_duplicate_of_applicant`: is the referee's effective contact the
++/// applicant's OWN email or phone? (AD-10.) Empty contacts never match.
++pub fn duplicate_of_applicant(ref: RefContact, applicant: RefContact) -> Bool {
++  shares_contact(ref, applicant)
++}
++
++/// `form_session.ip_matches_applicant`: referee form IP vs applicant-
++/// submission IP. Both must be present + exactly equal to confirm; either
++/// absent -> None (unknown — never fabricated). (AD-10.)
++pub fn ip_matches(referee_ip: String, applicant_ip: String) -> Option(Bool) {
++  exact_match(referee_ip, applicant_ip)
++}
++
++/// `form_session.device_fingerprint_match` — a User-Agent string compare
++/// (NOT a JS fingerprint lib), labelled WEAK (AD-10). Both must be present +
++/// exactly equal to confirm; either absent -> None. (AD-10.)
++pub fn ua_matches(referee_ua: String, applicant_ua: String) -> Option(Bool) {
++  exact_match(referee_ua, applicant_ua)
++}
++
++// -- Phase 2 helper: carry the creation-time line-type (no paid re-lookup) ---
++
++/// Carry the creation-time `line_type` from a stored `fraud_signals` JSON
++/// text (AD-10: at submission, line-type is NOT re-looked-up — the contact
++/// hasn't changed in v1 until RC4.3's correction re-triggers a fresh lookup).
++/// `Unknown` when the text is empty (a pre-rc3-7 row, or a creation-time
++/// stamp failure) or unparseable — never fabricated (AD-10 honesty).
++pub fn carry_line_type(fraud_signals_text: String) -> lookup.LineType {
++  case fraud_signals_text {
++    "" -> lookup.Unknown
++    text ->
++      case json.parse(text, decode.at(["line_type"], decode.string)) {
++        Ok(s) -> lookup.line_type_from_string(s)
++        Error(_) -> lookup.Unknown
++      }
++  }
++}
++
++// -- internals ---------------------------------------------------------------
++
++/// Two contacts share if their effective email matches OR their effective
++/// phone matches. Empty contacts never match (a missing field is not reuse).
++fn shares_contact(a: RefContact, b: RefContact) -> Bool {
++  same_optional(a.email, b.email) || same_optional(a.phone, b.phone)
++}
++
++/// Two optional non-empty strings are the same when both are present,
++/// non-empty, and exactly equal. Empty/absent never matches.
++fn same_optional(a: Option(String), b: Option(String)) -> Bool {
++  case a, b {
++    Some(x), Some(y) -> x != "" && y != "" && x == y
++    _, _ -> False
++  }
++}
++
++/// Two required-ish strings match exactly when both are non-empty + equal;
++/// either empty -> None (unknown); non-empty + unequal -> Some(False).
++fn exact_match(referee: String, applicant: String) -> Option(Bool) {
++  case referee, applicant {
++    "", _ -> None
++    _, "" -> None
++    r, a -> Some(r == a)
++  }
++}
++
++fn int_or_null(value: Option(Int)) -> json.Json {
++  case value {
++    Some(n) -> json.int(n)
++    None -> json.null()
++  }
++}
++
++fn bool_or_null(value: Option(Bool)) -> json.Json {
++  case value {
++    Some(b) -> json.bool(b)
++    None -> json.null()
++  }
++}
+diff --git a/server/src/reference_checks/fraud_inputs.gleam b/server/src/reference_checks/fraud_inputs.gleam
+new file mode 100644
+index 00000000..a6d386cc
+--- /dev/null
++++ b/server/src/reference_checks/fraud_inputs.gleam
+@@ -0,0 +1,125 @@
++//// Shared input-gathering helpers for the AD-10 fraud-signals builder
++//// (rc3-7). `fraud.gleam` is the pure builder; this module owns the small
++//// DB + parsing glue both call sites (trigger at creation, form_handler at
++//// submission) share, so the two do not drift (DRY — extracted after Perkins
++//// r1 W1). Best-effort throughout: a query failure degrades to honest
++//// defaults (empty other-refs, not-flagged cross-app) — never blocks the
++//// caller, never fabricates a signal (AD-10).
++
++import gleam/int
++import gleam/list
++import gleam/option.{type Option, None, Some}
++import pog
++import reference_checks/fraud
++import reference_checks/sql
++import youid/uuid
++
++/// '' -> None, else Some(value). The effective-contact columns read as '' for
++/// a referee with no contact of that kind (the COALESCE-to-'' convention).
++pub fn opt_nonempty(value: String) -> Option(String) {
++  case value {
++    "" -> None
++    other -> Some(other)
++  }
++}
++
++/// None -> '' (the SQL TEXT-param convention — pass Option(String) to a TEXT
++/// param as '').
++pub fn opt_to_str(o: Option(String)) -> String {
++  case o {
++    Some(s) -> s
++    None -> ""
++  }
++}
++
++/// Parse the cross-application reuse count ('' / unparseable -> 0).
++pub fn parse_count(text: String) -> Int {
++  case int.parse(text) {
++    Ok(n) -> n
++    Error(_) -> 0
++  }
++}
++
++/// Parse the SQL-derived completion_seconds text ('' -> None: the form was
++/// never opened, or the value is unparseable).
++pub fn parse_int_opt(text: String) -> Option(Int) {
++  case text {
++    "" -> None
++    other ->
++      case int.parse(other) {
++        Ok(n) -> Some(n)
++        Error(_) -> None
++      }
++  }
++}
++
++/// Effective contact = corrected value when present (non-empty), else the
++/// immutable snapshot (AD-7). A corrected '' is treated as absent (falls back
++/// to the snapshot), matching the SQL `NULLIF(corrected,'')` convention.
++pub fn effective_contact(
++  corrected: Option(String),
++  snapshot: Option(String),
++) -> Option(String) {
++  case corrected {
++    Some(c) ->
++      case opt_nonempty(c) {
++        Some(v) -> Some(v)
++        None -> snapshot
++      }
++    None -> snapshot
++  }
++}
++
++/// Build a `RefContact` from the SQL row's effective columns (name +
++/// effective_email/phone, already COALESCE'd to '' for absent).
++pub fn from_effective(
++  name name: String,
++  effective_email effective_email: String,
++  effective_phone effective_phone: String,
++) -> fraud.RefContact {
++  fraud.RefContact(
++    name:,
++    email: opt_nonempty(effective_email),
++    phone: opt_nonempty(effective_phone),
++  )
++}
++
++/// The application's OTHER reference rows' effective contacts (excludes
++/// `exclude_id`), for `contact_reused_within_application` (per-ref
++/// involvement: does THIS ref's contact appear in another slot?). Pure —
++/// caller reads the rows once (via `get_application_reference_contacts`) and
++/// passes them in; this just filters + maps. Best-effort at the read is the
++/// caller's concern (an empty list reads as no reuse).
++pub fn other_refs_from_rows(
++  rows: List(sql.GetApplicationReferenceContactsRow),
++  exclude_id exclude_id: String,
++) -> List(fraud.RefContact) {
++  rows
++  |> list.filter(fn(r) { r.id != exclude_id })
++  |> list.map(fn(r) {
++    from_effective(r.contact_name, r.effective_email, r.effective_phone)
++  })
++}
++
++/// `contact_reused_across_applications` (AD-10): true iff this referee's
++/// effective contact appears under a DIFFERENT name in another application's
++/// reference rows (the innocent same-name letting agent does NOT flag).
++/// Best-effort: a query failure reads as not-flagged.
++pub fn cross_application_reuse(
++  db: pog.Connection,
++  app_uuid: uuid.Uuid,
++  this_ref this_ref: fraud.RefContact,
++) -> Bool {
++  case
++    sql.count_cross_application_contact_reuse(
++      db,
++      app_uuid,
++      this_ref.name,
++      opt_to_str(this_ref.email),
++      opt_to_str(this_ref.phone),
++    )
++  {
++    Ok(pog.Returned(_, [row, ..])) -> parse_count(row.reuse_count) > 0
++    _ -> False
++  }
++}
+diff --git a/server/src/reference_checks/lookup.gleam b/server/src/reference_checks/lookup.gleam
+index 695d9f11..5c6a7a88 100644
+--- a/server/src/reference_checks/lookup.gleam
++++ b/server/src/reference_checks/lookup.gleam
+@@ -186,6 +186,32 @@ pub fn voip(line_type line_type: LineType) -> Bool {
+   line_type == VoIP
+ }
+ 
++/// The fraud-signal string for a line type (AD-10 `line_type`): `"mobile"`,
++/// `"landline"`, `"voip"`, `"unknown"`. `Unknown` covers both the genuine
++/// indeterminate case and the no-keys no-op path — the honest v1 value when
++/// Twilio is unconfigured or the lookup failed (AD-10: never fabricated).
++/// Pure for tests.
++pub fn line_type_to_string(line_type: LineType) -> String {
++  case line_type {
++    Mobile -> "mobile"
++    Landline -> "landline"
++    VoIP -> "voip"
++    Unknown -> "unknown"
++  }
++}
++
++/// Inverse of `line_type_to_string` — map a stored `line_type` signal string
++/// back to a `LineType`. `Unknown` covers `"unknown"` + any unmapped value
++/// (the honest fallback — never fabricated). Pure for tests.
++pub fn line_type_from_string(text: String) -> LineType {
++  case text {
++    "mobile" -> Mobile
++    "landline" -> Landline
++    "voip" -> VoIP
++    _ -> Unknown
++  }
++}
++
+ // -- internals ---------------------------------------------------------------
+ 
+ fn capture_failure(
+diff --git a/server/src/reference_checks/result.gleam b/server/src/reference_checks/result.gleam
+index 01a54354..4996fa52 100644
+--- a/server/src/reference_checks/result.gleam
++++ b/server/src/reference_checks/result.gleam
+@@ -32,7 +32,10 @@ import shared/reference_call.{
+ }
+ 
+ /// What the structurer needs from the row + the request. Kept as a record so
+-/// the call site reads clearly and the pure function stays testable.
++/// the call site reads clearly and the pure function stays testable. rc3-7
++/// carries the pre-built `fraud_signals` json here (built by `fraud.gleam`
++/// from the DB-reuse + line-type + form_session inputs) — the structurer
++/// embeds it opaquely; it owns no fraud logic (separation of concerns).
+ pub type StructureContext {
+   StructureContext(
+     reference_call_id: String,
+@@ -40,7 +43,7 @@ pub type StructureContext {
+     ref_slot: String,
+     owner_label: String,
+     attempts: String,
+-    focus_seconds: Int,
++    fraud_signals: json.Json,
+   )
+ }
+ 
+@@ -54,7 +57,11 @@ pub fn structure_form_result(
+ ) -> #(json.Json, json.Json) {
+   let verification = verification_block(slot, draft)
+   let completeness = required_completeness(slot, draft)
+-  let fraud_signals = form_session_fraud_signals(ctx)
++  // fraud_signals is built by fraud.gleam (AD-10) and carried on ctx; the
++  // structurer embeds it verbatim. Returns #(result, fraud_signals) so the
++  // handler writes `result` and the denormalised `fraud_signals` column from
++  // one build.
++  let fraud_signals = ctx.fraud_signals
+   let attempts = parse_attempts(ctx.attempts)
+   let result =
+     json.object([
+@@ -517,24 +524,6 @@ type AttemptRow {
+   AttemptRow(at: String, channel: String, outcome: String, detail: String)
+ }
+ 
+-// -- form_session fraud inputs (AD-10; rc3-7 enriches with line-type/DB) -----
+-
+-/// rc3-4 captures the client-reported focus seconds. completion_seconds and
+-/// the line-type / DB-reuse signals are rc3-7's concern (the row's
+-/// form_opened_at + submitted_at let rc3-7 compute completion_seconds later).
+-fn form_session_fraud_signals(ctx: StructureContext) -> json.Json {
+-  json.object([
+-    #(
+-      "form_session",
+-      json.object([
+-        #("focus_seconds_reported", json.int(ctx.focus_seconds)),
+-        // completion_seconds is filled by rc3-7 from the row's timestamps.
+-        #("completion_seconds", json.null()),
+-      ]),
+-    ),
+-  ])
+-}
+-
+ // -- The required-draft-keys registry per slot (completeness + nothing else) --
+ 
+ fn required_draft_keys(slot: RefSlot) -> List(String) {
+diff --git a/server/src/reference_checks/sql.gleam b/server/src/reference_checks/sql.gleam
+index d92b3972..34e2450a 100644
+--- a/server/src/reference_checks/sql.gleam
++++ b/server/src/reference_checks/sql.gleam
+@@ -59,54 +59,6 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
+-/// A row you get from running the `claim_webhook_event` query
+-/// defined in `./src/reference_checks/sql/claim_webhook_event.sql`.
+-///
+-/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
+-/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+-///
+-pub type ClaimWebhookEventRow {
+-  ClaimWebhookEventRow(event_id: String)
+-}
+-
+-/// Idempotency claim (NFR-RC5): INSERT returns a row on first sight, 0 rows on a
+-/// re-delivery (ON CONFLICT DO NOTHING). The handler claims BEFORE the guarded
+-/// transition so a crash mid-handler never double-applies; the guarded
+-/// mark_awaiting_correction is the second layer of exactly-once. Mirrors
+-/// claim_stripe_event / processed_stripe_event (20260509024546).
+-/// - claim_webhook_event(event_id: TEXT, source: TEXT)
+-///
+-/// > 🐿️ This function was generated automatically using v4.6.0 of
+-/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+-///
+-pub fn claim_webhook_event(
+-  db: pog.Connection,
+-  arg_1: String,
+-  arg_2: String,
+-) -> Result(pog.Returned(ClaimWebhookEventRow), pog.QueryError) {
+-  let decoder = {
+-    use event_id <- decode.field(0, decode.string)
+-    decode.success(ClaimWebhookEventRow(event_id:))
+-  }
+-
+-  "-- Idempotency claim (NFR-RC5): INSERT returns a row on first sight, 0 rows on a
+--- re-delivery (ON CONFLICT DO NOTHING). The handler claims BEFORE the guarded
+--- transition so a crash mid-handler never double-applies; the guarded
+--- mark_awaiting_correction is the second layer of exactly-once. Mirrors
+--- claim_stripe_event / processed_stripe_event (20260509024546).
+---- claim_webhook_event(event_id: TEXT, source: TEXT)
+-INSERT INTO processed_reference_webhook_event (event_id, source)
+-VALUES ($1, $2)
+-ON CONFLICT (source, event_id) DO NOTHING
+-RETURNING event_id;
+-"
+-  |> pog.query
+-  |> pog.parameter(pog.text(arg_1))
+-  |> pog.parameter(pog.text(arg_2))
+-  |> pog.returning(decoder)
+-  |> pog.execute(db)
+-}
+-
+ /// A row you get from running the `complete_reference_call` query
+ /// defined in `./src/reference_checks/sql/complete_reference_call.sql`.
+ ///
+@@ -192,6 +144,72 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `count_cross_application_contact_reuse` query
++/// defined in `./src/reference_checks/sql/count_cross_application_contact_reuse.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type CountCrossApplicationContactReuseRow {
++  CountCrossApplicationContactReuseRow(reuse_count: String)
++}
++
++/// contact_reused_across_applications (AD-10): does THIS referee's effective
++/// contact appear under a DIFFERENT name in ANOTHER application's reference
++/// rows? The innocent case — a letting agent legitimately listed under the
++/// SAME name across applications — does NOT flag (same name excluded, so a
++/// legitimate letting agent reads as innocent, not fraud). Returns a count;
++/// >0 -> the signal is true (a clue about provenance, never a verdict — §9.4).
++/// 
++/// Effective contact = corrected value when present, else the snapshot.
++/// NULLIF on the params: an empty email/phone param must never match (a
++/// missing contact is not "reused"). Either an email OR a phone match counts.
++/// - count_cross_application_contact_reuse(this_application_id: UUID, referee_name: TEXT, email: TEXT, phone: TEXT)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn count_cross_application_contact_reuse(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: String,
++  arg_3: String,
++  arg_4: String,
++) -> Result(pog.Returned(CountCrossApplicationContactReuseRow), pog.QueryError) {
++  let decoder = {
++    use reuse_count <- decode.field(0, decode.string)
++    decode.success(CountCrossApplicationContactReuseRow(reuse_count:))
++  }
++
++  "-- contact_reused_across_applications (AD-10): does THIS referee's effective
++-- contact appear under a DIFFERENT name in ANOTHER application's reference
++-- rows? The innocent case — a letting agent legitimately listed under the
++-- SAME name across applications — does NOT flag (same name excluded, so a
++-- legitimate letting agent reads as innocent, not fraud). Returns a count;
++-- >0 -> the signal is true (a clue about provenance, never a verdict — §9.4).
++--
++-- Effective contact = corrected value when present, else the snapshot.
++-- NULLIF on the params: an empty email/phone param must never match (a
++-- missing contact is not \"reused\"). Either an email OR a phone match counts.
++--- count_cross_application_contact_reuse(this_application_id: UUID, referee_name: TEXT, email: TEXT, phone: TEXT)
++SELECT count(*)::text AS reuse_count
++FROM reference_call rc
++WHERE rc.application_id <> $1
++  AND rc.contact_name <> $2
++  AND (
++       COALESCE(rc.corrected_email, rc.contact_email) = NULLIF($3, '')
++    OR COALESCE(rc.corrected_phone, rc.contact_phone) = NULLIF($4, '')
++  );
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(arg_2))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `find_reference_call_by_send_ref` query
+ /// defined in `./src/reference_checks/sql/find_reference_call_by_send_ref.sql`.
+ ///
+@@ -290,6 +308,86 @@ LIMIT 1;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `get_application_reference_contacts` query
++/// defined in `./src/reference_checks/sql/get_application_reference_contacts.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type GetApplicationReferenceContactsRow {
++  GetApplicationReferenceContactsRow(
++    id: String,
++    ref_slot: String,
++    contact_name: String,
++    effective_email: String,
++    effective_phone: String,
++  )
++}
++
++/// The effective contacts of an application's reference rows, for the
++/// form-session fraud RE-RUN at submission (contact_reused_within_application —
++/// contacts can change via the correction loop, so submission reads the
++/// committed rows, not the application's stored trios; §7.3). Effective
++/// contact = corrected value when present, else the immutable snapshot (AD-7).
++/// One row per reference_call; the caller excludes the submitting ref and
++/// computes reuse (per-ref involvement: does THIS ref's contact appear in
++/// another slot?).
++/// - get_application_reference_contacts(application_id: UUID)
++/// effective_email/phone: COALESCE all the way to '' so a ref with neither
++/// a corrected nor snapshot contact (both NULL) reads as '' (None on the
++/// Gleam side) rather than decoding-failing on a NULL the Squirrel String
++/// type does not expect (the repo's nullable-cast convention).
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn get_application_reference_contacts(
++  db: pog.Connection,
++  arg_1: Uuid,
++) -> Result(pog.Returned(GetApplicationReferenceContactsRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    use ref_slot <- decode.field(1, decode.string)
++    use contact_name <- decode.field(2, decode.string)
++    use effective_email <- decode.field(3, decode.string)
++    use effective_phone <- decode.field(4, decode.string)
++    decode.success(GetApplicationReferenceContactsRow(
++      id:,
++      ref_slot:,
++      contact_name:,
++      effective_email:,
++      effective_phone:,
++    ))
++  }
++
++  "-- The effective contacts of an application's reference rows, for the
++-- form-session fraud RE-RUN at submission (contact_reused_within_application —
++-- contacts can change via the correction loop, so submission reads the
++-- committed rows, not the application's stored trios; §7.3). Effective
++-- contact = corrected value when present, else the immutable snapshot (AD-7).
++-- One row per reference_call; the caller excludes the submitting ref and
++-- computes reuse (per-ref involvement: does THIS ref's contact appear in
++-- another slot?).
++--- get_application_reference_contacts(application_id: UUID)
++-- effective_email/phone: COALESCE all the way to '' so a ref with neither
++-- a corrected nor snapshot contact (both NULL) reads as '' (None on the
++-- Gleam side) rather than decoding-failing on a NULL the Squirrel String
++-- type does not expect (the repo's nullable-cast convention).
++SELECT rc.id::text,
++       rc.ref_slot,
++       rc.contact_name,
++       COALESCE(rc.corrected_email, rc.contact_email, '') AS effective_email,
++       COALESCE(rc.corrected_phone, rc.contact_phone, '') AS effective_phone
++FROM reference_call rc
++WHERE rc.application_id = $1
++ORDER BY rc.ref_slot;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `get_application_reference_data` query
+ /// defined in `./src/reference_checks/sql/get_application_reference_data.sql`.
+ ///
+@@ -309,6 +407,8 @@ pub type GetApplicationReferenceDataRow {
+     employer_ref_phone: Option(String),
+     employer_ref_email: Option(String),
+     reference_contact_choice: Option(String),
++    applicant_email: String,
++    applicant_phone: Option(String),
+   )
+ }
+ 
+@@ -321,6 +421,10 @@ pub type GetApplicationReferenceDataRow {
+ /// already verify ownership — the trigger path inherits the status PATCH's
+ /// verification, the manual-start path verifies in its handler.
+ /// 
++/// rc3-7 also reads the applicant's own email/phone (a.email NOT NULL,
++/// a.phone nullable) for the contact_duplicate_of_applicant fraud signal
++/// (AD-10) at row creation.
++/// 
+ /// Nullable TEXT columns stay Option(String) on the Gleam side; the boolean
+ /// is cast to text (squirrel codegen for booleans expects text-typed bools
+ /// per the repo convention).
+@@ -349,6 +453,8 @@ pub fn get_application_reference_data(
+       10,
+       decode.optional(decode.string),
+     )
++    use applicant_email <- decode.field(11, decode.string)
++    use applicant_phone <- decode.field(12, decode.optional(decode.string))
+     decode.success(GetApplicationReferenceDataRow(
+       never_rented_before:,
+       landlord_ref_name:,
+@@ -361,6 +467,8 @@ pub fn get_application_reference_data(
+       employer_ref_phone:,
+       employer_ref_email:,
+       reference_contact_choice:,
++      applicant_email:,
++      applicant_phone:,
+     ))
+   }
+ 
+@@ -373,6 +481,10 @@ pub fn get_application_reference_data(
+ -- already verify ownership — the trigger path inherits the status PATCH's
+ -- verification, the manual-start path verifies in its handler.
+ --
++-- rc3-7 also reads the applicant's own email/phone (a.email NOT NULL,
++-- a.phone nullable) for the contact_duplicate_of_applicant fraud signal
++-- (AD-10) at row creation.
++--
+ -- Nullable TEXT columns stay Option(String) on the Gleam side; the boolean
+ -- is cast to text (squirrel codegen for booleans expects text-typed bools
+ -- per the repo convention).
+@@ -387,7 +499,9 @@ SELECT
+   a.employer_ref_name,
+   a.employer_ref_phone,
+   a.employer_ref_email,
+-  a.reference_contact_choice
++  a.reference_contact_choice,
++  a.email                                    AS applicant_email,
++  a.phone                                    AS applicant_phone
+ FROM application a
+ JOIN vacancy v ON v.id = a.vacancy_id
+ WHERE a.id = $1
+@@ -434,6 +548,12 @@ pub type GetFormContextByFormTokenRow {
+     job_title: Option(String),
+     employment_duration: Option(String),
+     monthly_income_cents: Int,
++    applicant_email: String,
++    applicant_phone: Option(String),
++    submitted_ip_text: String,
++    submitted_user_agent: String,
++    fraud_signals: String,
++    completion_seconds: String,
+     landlord_display_name: String,
+     origin_domain: String,
+   )
+@@ -480,8 +600,14 @@ pub fn get_form_context_by_form_token(
+     use job_title <- decode.field(21, decode.optional(decode.string))
+     use employment_duration <- decode.field(22, decode.optional(decode.string))
+     use monthly_income_cents <- decode.field(23, decode.int)
+-    use landlord_display_name <- decode.field(24, decode.string)
+-    use origin_domain <- decode.field(25, decode.string)
++    use applicant_email <- decode.field(24, decode.string)
++    use applicant_phone <- decode.field(25, decode.optional(decode.string))
++    use submitted_ip_text <- decode.field(26, decode.string)
++    use submitted_user_agent <- decode.field(27, decode.string)
++    use fraud_signals <- decode.field(28, decode.string)
++    use completion_seconds <- decode.field(29, decode.string)
++    use landlord_display_name <- decode.field(30, decode.string)
++    use origin_domain <- decode.field(31, decode.string)
+     decode.success(GetFormContextByFormTokenRow(
+       id:,
+       application_id:,
+@@ -507,6 +633,12 @@ pub fn get_form_context_by_form_token(
+       job_title:,
+       employment_duration:,
+       monthly_income_cents:,
++      applicant_email:,
++      applicant_phone:,
++      submitted_ip_text:,
++      submitted_user_agent:,
++      fraud_signals:,
++      completion_seconds:,
+       landlord_display_name:,
+       origin_domain:,
+     ))
+@@ -548,6 +680,18 @@ SELECT rc.id::text,
+        a.job_title,
+        a.employment_duration,
+        a.monthly_income_cents,
++       -- rc3-7 (AD-10) fraud inputs at submission: the applicant's own contact
++       -- (contact_duplicate_of_applicant), the applicant-submission IP/UA
++       -- capture (the form_session comparators — RC1.1), the row's existing
++       -- fraud_signals (to carry the creation-time line_type without a paid
++       -- re-lookup), and completion_seconds (server wall-clock
++       -- form_opened_at -> now; '' when the form was never opened).
++       a.email                    AS applicant_email,
++       a.phone                    AS applicant_phone,
++       a.submitted_ip_text,
++       a.submitted_user_agent,
++       COALESCE(rc.fraud_signals::text, '') AS fraud_signals,
++       COALESCE((EXTRACT(EPOCH FROM (now() - rc.form_opened_at))::int)::text, '') AS completion_seconds,
+        l.name                     AS landlord_display_name,
+        v.origin_domain
+ FROM reference_call rc
+@@ -1637,6 +1781,69 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `stamp_creation_fraud_signals` query
++/// defined in `./src/reference_checks/sql/stamp_creation_fraud_signals.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type StampCreationFraudSignalsRow {
++  StampCreationFraudSignalsRow(id: String)
++}
++
++/// Phase 1 (rc3-7, AD-10): write the creation-time `fraud_signals` to the
++/// column right after row creation. The pure-DB reuse signals + the Twilio
++/// line-type lookup + the honest placeholders (`form_session: null`). `result`
++/// stays null until terminal — only the `fraud_signals` column is written at
++/// creation, so fraud review can query pre-submission (§7.3: line-type + DB
++/// checks run at creation). Best-effort: the row exists regardless of this
++/// stamp; a stamp failure leaves `null` `fraud_signals` honestly (AD-10).
++/// 
++/// The caller (trigger) computes the signals in Gleam (pure) from the
++/// in-memory referee trios + the applicant's own contact + the cross-app
++/// reuse read + the line-type lookup, then passes the json.Json value here
++/// (Squirrel types the ::jsonb param as Json and serialises it itself).
++/// - stamp_creation_fraud_signals(reference_call_id: UUID, fraud_signals: JSONB)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn stamp_creation_fraud_signals(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Json,
++) -> Result(pog.Returned(StampCreationFraudSignalsRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(StampCreationFraudSignalsRow(id:))
++  }
++
++  "-- Phase 1 (rc3-7, AD-10): write the creation-time `fraud_signals` to the
++-- column right after row creation. The pure-DB reuse signals + the Twilio
++-- line-type lookup + the honest placeholders (`form_session: null`). `result`
++-- stays null until terminal — only the `fraud_signals` column is written at
++-- creation, so fraud review can query pre-submission (§7.3: line-type + DB
++-- checks run at creation). Best-effort: the row exists regardless of this
++-- stamp; a stamp failure leaves `null` `fraud_signals` honestly (AD-10).
++--
++-- The caller (trigger) computes the signals in Gleam (pure) from the
++-- in-memory referee trios + the applicant's own contact + the cross-app
++-- reuse read + the line-type lookup, then passes the json.Json value here
++-- (Squirrel types the ::jsonb param as Json and serialises it itself).
++--- stamp_creation_fraud_signals(reference_call_id: UUID, fraud_signals: JSONB)
++UPDATE reference_call
++SET fraud_signals = $2::jsonb,
++    updated_at   = now()
++WHERE id = $1
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(json.to_string(arg_2)))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `stamp_form_opened` query
+ /// defined in `./src/reference_checks/sql/stamp_form_opened.sql`.
+ ///
+@@ -1687,6 +1894,75 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `stamp_referee_contact_invalid` query
++/// defined in `./src/reference_checks/sql/stamp_referee_contact_invalid.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type StampRefereeContactInvalidRow {
++  StampRefereeContactInvalidRow(id: String)
++}
++
++/// referee_contact_invalid (AD-7, §6.4): stamp the claim-integrity signal when
++/// a correction cycle exhausts — the row moves awaiting_correction -> unreachable
++/// on its SECOND failure. Supersedes heist-535's referee_number_wrong (the same
++/// signal, widened to email bounces as well as bad phone numbers).
++/// 
++/// rc3-7 provides the MECHANISM only; the LIVE second-failure terminal
++/// (awaiting_correction -> unreachable) is RC4.3 (needs a correction-timeout
++/// SLA the arch does not specify). rc3-7 never fabricates the signal — both
++/// builders keep it absent; this stamp is what RC4.3 calls on exhaustion.
++/// 
++/// jsonb_set adds the key to whatever `fraud_signals` already holds (the
++/// creation-time DB + line-type signals) without disturbing the other keys;
++/// COALESCE to '{}' so a null column (a pre-rc3-7 row) is handled honestly.
++/// The caller guards the transition; the UPDATE is by id.
++/// - stamp_referee_contact_invalid(reference_call_id: UUID)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn stamp_referee_contact_invalid(
++  db: pog.Connection,
++  arg_1: Uuid,
++) -> Result(pog.Returned(StampRefereeContactInvalidRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(StampRefereeContactInvalidRow(id:))
++  }
++
++  "-- referee_contact_invalid (AD-7, §6.4): stamp the claim-integrity signal when
++-- a correction cycle exhausts — the row moves awaiting_correction -> unreachable
++-- on its SECOND failure. Supersedes heist-535's referee_number_wrong (the same
++-- signal, widened to email bounces as well as bad phone numbers).
++--
++-- rc3-7 provides the MECHANISM only; the LIVE second-failure terminal
++-- (awaiting_correction -> unreachable) is RC4.3 (needs a correction-timeout
++-- SLA the arch does not specify). rc3-7 never fabricates the signal — both
++-- builders keep it absent; this stamp is what RC4.3 calls on exhaustion.
++--
++-- jsonb_set adds the key to whatever `fraud_signals` already holds (the
++-- creation-time DB + line-type signals) without disturbing the other keys;
++-- COALESCE to '{}' so a null column (a pre-rc3-7 row) is handled honestly.
++-- The caller guards the transition; the UPDATE is by id.
++--- stamp_referee_contact_invalid(reference_call_id: UUID)
++UPDATE reference_call
++SET fraud_signals = jsonb_set(
++      COALESCE(fraud_signals, '{}'::jsonb),
++      '{referee_contact_invalid}',
++      'true'::jsonb
++    ),
++    updated_at = now()
++WHERE id = $1
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `sweep_advance` query
+ /// defined in `./src/reference_checks/sql/sweep_advance.sql`.
+ ///
+diff --git a/server/src/reference_checks/sql/claim_webhook_event.sql b/server/src/reference_checks/sql/claim_webhook_event.sql
+deleted file mode 100644
+index cede0dac..00000000
+--- a/server/src/reference_checks/sql/claim_webhook_event.sql
++++ /dev/null
+@@ -1,10 +0,0 @@
+--- Idempotency claim (NFR-RC5): INSERT returns a row on first sight, 0 rows on a
+--- re-delivery (ON CONFLICT DO NOTHING). The handler claims BEFORE the guarded
+--- transition so a crash mid-handler never double-applies; the guarded
+--- mark_awaiting_correction is the second layer of exactly-once. Mirrors
+--- claim_stripe_event / processed_stripe_event (20260509024546).
+---- claim_webhook_event(event_id: TEXT, source: TEXT)
+-INSERT INTO processed_reference_webhook_event (event_id, source)
+-VALUES ($1, $2)
+-ON CONFLICT (source, event_id) DO NOTHING
+-RETURNING event_id;
+diff --git a/server/src/reference_checks/sql/count_cross_application_contact_reuse.sql b/server/src/reference_checks/sql/count_cross_application_contact_reuse.sql
+new file mode 100644
+index 00000000..8575cbee
+--- /dev/null
++++ b/server/src/reference_checks/sql/count_cross_application_contact_reuse.sql
+@@ -0,0 +1,19 @@
++-- contact_reused_across_applications (AD-10): does THIS referee's effective
++-- contact appear under a DIFFERENT name in ANOTHER application's reference
++-- rows? The innocent case — a letting agent legitimately listed under the
++-- SAME name across applications — does NOT flag (same name excluded, so a
++-- legitimate letting agent reads as innocent, not fraud). Returns a count;
++-- >0 -> the signal is true (a clue about provenance, never a verdict — §9.4).
++--
++-- Effective contact = corrected value when present, else the snapshot.
++-- NULLIF on the params: an empty email/phone param must never match (a
++-- missing contact is not "reused"). Either an email OR a phone match counts.
++--- count_cross_application_contact_reuse(this_application_id: UUID, referee_name: TEXT, email: TEXT, phone: TEXT)
++SELECT count(*)::text AS reuse_count
++FROM reference_call rc
++WHERE rc.application_id <> $1
++  AND rc.contact_name <> $2
++  AND (
++       COALESCE(rc.corrected_email, rc.contact_email) = NULLIF($3, '')
++    OR COALESCE(rc.corrected_phone, rc.contact_phone) = NULLIF($4, '')
++  );
+diff --git a/server/src/reference_checks/sql/get_application_reference_contacts.sql b/server/src/reference_checks/sql/get_application_reference_contacts.sql
+new file mode 100644
+index 00000000..8d8f4bb1
+--- /dev/null
++++ b/server/src/reference_checks/sql/get_application_reference_contacts.sql
+@@ -0,0 +1,21 @@
++-- The effective contacts of an application's reference rows, for the
++-- form-session fraud RE-RUN at submission (contact_reused_within_application —
++-- contacts can change via the correction loop, so submission reads the
++-- committed rows, not the application's stored trios; §7.3). Effective
++-- contact = corrected value when present, else the immutable snapshot (AD-7).
++-- One row per reference_call; the caller excludes the submitting ref and
++-- computes reuse (per-ref involvement: does THIS ref's contact appear in
++-- another slot?).
++--- get_application_reference_contacts(application_id: UUID)
++-- effective_email/phone: COALESCE all the way to '' so a ref with neither
++-- a corrected nor snapshot contact (both NULL) reads as '' (None on the
++-- Gleam side) rather than decoding-failing on a NULL the Squirrel String
++-- type does not expect (the repo's nullable-cast convention).
++SELECT rc.id::text,
++       rc.ref_slot,
++       rc.contact_name,
++       COALESCE(rc.corrected_email, rc.contact_email, '') AS effective_email,
++       COALESCE(rc.corrected_phone, rc.contact_phone, '') AS effective_phone
++FROM reference_call rc
++WHERE rc.application_id = $1
++ORDER BY rc.ref_slot;
+diff --git a/server/src/reference_checks/sql/get_application_reference_data.sql b/server/src/reference_checks/sql/get_application_reference_data.sql
+index d2e9cf0d..c916bbe5 100644
+--- a/server/src/reference_checks/sql/get_application_reference_data.sql
++++ b/server/src/reference_checks/sql/get_application_reference_data.sql
+@@ -7,6 +7,10 @@
+ -- already verify ownership — the trigger path inherits the status PATCH's
+ -- verification, the manual-start path verifies in its handler.
+ --
++-- rc3-7 also reads the applicant's own email/phone (a.email NOT NULL,
++-- a.phone nullable) for the contact_duplicate_of_applicant fraud signal
++-- (AD-10) at row creation.
++--
+ -- Nullable TEXT columns stay Option(String) on the Gleam side; the boolean
+ -- is cast to text (squirrel codegen for booleans expects text-typed bools
+ -- per the repo convention).
+@@ -21,7 +25,9 @@ SELECT
+   a.employer_ref_name,
+   a.employer_ref_phone,
+   a.employer_ref_email,
+-  a.reference_contact_choice
++  a.reference_contact_choice,
++  a.email                                    AS applicant_email,
++  a.phone                                    AS applicant_phone
+ FROM application a
+ JOIN vacancy v ON v.id = a.vacancy_id
+ WHERE a.id = $1
+diff --git a/server/src/reference_checks/sql/get_form_context_by_form_token.sql b/server/src/reference_checks/sql/get_form_context_by_form_token.sql
+index 645f5b45..8083ad61 100644
+--- a/server/src/reference_checks/sql/get_form_context_by_form_token.sql
++++ b/server/src/reference_checks/sql/get_form_context_by_form_token.sql
+@@ -34,6 +34,18 @@ SELECT rc.id::text,
+        a.job_title,
+        a.employment_duration,
+        a.monthly_income_cents,
++       -- rc3-7 (AD-10) fraud inputs at submission: the applicant's own contact
++       -- (contact_duplicate_of_applicant), the applicant-submission IP/UA
++       -- capture (the form_session comparators — RC1.1), the row's existing
++       -- fraud_signals (to carry the creation-time line_type without a paid
++       -- re-lookup), and completion_seconds (server wall-clock
++       -- form_opened_at -> now; '' when the form was never opened).
++       a.email                    AS applicant_email,
++       a.phone                    AS applicant_phone,
++       a.submitted_ip_text,
++       a.submitted_user_agent,
++       COALESCE(rc.fraud_signals::text, '') AS fraud_signals,
++       COALESCE((EXTRACT(EPOCH FROM (now() - rc.form_opened_at))::int)::text, '') AS completion_seconds,
+        l.name                     AS landlord_display_name,
+        v.origin_domain
+ FROM reference_call rc
+diff --git a/server/src/reference_checks/sql/stamp_creation_fraud_signals.sql b/server/src/reference_checks/sql/stamp_creation_fraud_signals.sql
+new file mode 100644
+index 00000000..77db9cf2
+--- /dev/null
++++ b/server/src/reference_checks/sql/stamp_creation_fraud_signals.sql
+@@ -0,0 +1,18 @@
++-- Phase 1 (rc3-7, AD-10): write the creation-time `fraud_signals` to the
++-- column right after row creation. The pure-DB reuse signals + the Twilio
++-- line-type lookup + the honest placeholders (`form_session: null`). `result`
++-- stays null until terminal — only the `fraud_signals` column is written at
++-- creation, so fraud review can query pre-submission (§7.3: line-type + DB
++-- checks run at creation). Best-effort: the row exists regardless of this
++-- stamp; a stamp failure leaves `null` `fraud_signals` honestly (AD-10).
++--
++-- The caller (trigger) computes the signals in Gleam (pure) from the
++-- in-memory referee trios + the applicant's own contact + the cross-app
++-- reuse read + the line-type lookup, then passes the json.Json value here
++-- (Squirrel types the ::jsonb param as Json and serialises it itself).
++--- stamp_creation_fraud_signals(reference_call_id: UUID, fraud_signals: JSONB)
++UPDATE reference_call
++SET fraud_signals = $2::jsonb,
++    updated_at   = now()
++WHERE id = $1
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sql/stamp_referee_contact_invalid.sql b/server/src/reference_checks/sql/stamp_referee_contact_invalid.sql
+new file mode 100644
+index 00000000..e9587ada
+--- /dev/null
++++ b/server/src/reference_checks/sql/stamp_referee_contact_invalid.sql
+@@ -0,0 +1,24 @@
++-- referee_contact_invalid (AD-7, §6.4): stamp the claim-integrity signal when
++-- a correction cycle exhausts — the row moves awaiting_correction -> unreachable
++-- on its SECOND failure. Supersedes heist-535's referee_number_wrong (the same
++-- signal, widened to email bounces as well as bad phone numbers).
++--
++-- rc3-7 provides the MECHANISM only; the LIVE second-failure terminal
++-- (awaiting_correction -> unreachable) is RC4.3 (needs a correction-timeout
++-- SLA the arch does not specify). rc3-7 never fabricates the signal — both
++-- builders keep it absent; this stamp is what RC4.3 calls on exhaustion.
++--
++-- jsonb_set adds the key to whatever `fraud_signals` already holds (the
++-- creation-time DB + line-type signals) without disturbing the other keys;
++-- COALESCE to '{}' so a null column (a pre-rc3-7 row) is handled honestly.
++-- The caller guards the transition; the UPDATE is by id.
++--- stamp_referee_contact_invalid(reference_call_id: UUID)
++UPDATE reference_call
++SET fraud_signals = jsonb_set(
++      COALESCE(fraud_signals, '{}'::jsonb),
++      '{referee_contact_invalid}',
++      'true'::jsonb
++    ),
++    updated_at = now()
++WHERE id = $1
++RETURNING id::text;
+diff --git a/server/src/reference_checks/sweep.gleam b/server/src/reference_checks/sweep.gleam
+index 26dd3828..e39e35f6 100644
+--- a/server/src/reference_checks/sweep.gleam
++++ b/server/src/reference_checks/sweep.gleam
+@@ -519,7 +519,9 @@ fn step_terminal(
+             ref_slot: row.ref_slot,
+             owner_label: "primary",
+             attempts: row.attempts,
+-            focus_seconds: 0,
++            // partial_result (the abandoned-draft terminal) emits no
++            // fraud_signals block — pass a placeholder (A2 / §4.6).
++            fraud_signals: json.null(),
+           ),
+         )
+       #(sql.Partial, "partial", result, TerminalPartial)
+diff --git a/server/src/reference_checks/trigger.gleam b/server/src/reference_checks/trigger.gleam
+index d4aec932..3e18b6c1 100644
+--- a/server/src/reference_checks/trigger.gleam
++++ b/server/src/reference_checks/trigger.gleam
+@@ -30,6 +30,9 @@ import shared/landlord.{type Landlord}
+ import wisp.{type Request, type Response}
+ import youid/uuid.{type Uuid}
+ 
++import reference_checks/fraud
++import reference_checks/fraud_inputs
++import reference_checks/lookup
+ import reference_checks/sql
+ 
+ /// The primary-applicant owner label. Co-applicant employer refs are
+@@ -176,7 +179,7 @@ fn create_eligible_slots(
+   let eligible = list.filter(candidates, trio_has_contact)
+ 
+   let run = fn(tx: pog.Connection) {
+-    list.try_fold(eligible, 0, fn(count, slot) {
++    list.try_fold(eligible, [], fn(created, slot) {
+       case
+         create_one_slot(
+           tx,
+@@ -188,22 +191,137 @@ fn create_eligible_slots(
+           email: slot.3,
+         )
+       {
+-        Ok(True) -> Ok(count + 1)
+-        Ok(False) -> Ok(count)
++        Ok(Some(id)) -> Ok([id, ..created])
++        Ok(None) -> Ok(created)
+         Error(e) -> Error(e)
+       }
+     })
+   }
+   case pog.transaction(config.db, run) {
+-    Ok(inserted) -> Ok(Created(count: inserted))
++    Ok(created_ids) -> {
++      // Phase 1 (rc3-7, AD-10): stamp the creation-time `fraud_signals` on
++      // the NEWLY-CREATED rows only (B1: a wholesale re-stamp would wipe a
++      // submitted sibling's `form_session` — `handle_start` re-fires this on
++      // demand, so re-triggers are a supported operation). Skipped entirely
++      // when `created_ids` is empty (a pure re-trigger no-op). Runs after the
++      // tx commits so the rows are visible + the line-type HTTP lookup never
++      // holds the insert tx. Best-effort: a stamp failure leaves `null`
++      // `fraud_signals` honestly (AD-10), never fails the trigger.
++      stamp_creation_fraud(config, app_uuid, data, created_ids)
++      Ok(Created(count: list.length(created_ids)))
++    }
+     Error(err) -> Error(DbError(err))
+   }
+ }
+ 
++// -- Phase 1 fraud-signals stamp (rc3-7, AD-10) ------------------------------
++
++/// Stamp the creation-time `fraud_signals` on the application's NEWLY-CREATED
++/// reference rows only: pure-DB reuse signals + the Twilio line-type lookup +
++/// honest placeholders (`form_session: null`). Runs AFTER the creation tx
++/// commits so the reuse reads see the rows and the line-type HTTP lookup
++/// never holds the insert tx. Best-effort throughout — a failure leaves that
++/// row's `fraud_signals` null honestly (AD-10) and logs, never failing the
++/// trigger.
++///
++/// `created_ids` scopes the stamp to the rows this trigger call inserted (B1:
++/// `handle_start` re-fires the trigger on demand, so re-triggers are a
++/// supported operation — a wholesale re-stamp would wipe a submitted
++/// sibling's `form_session`). Empty `created_ids` (a pure re-trigger no-op)
++/// stamps nothing. The reuse COMPUTATION still reads the application's full
++/// reference set; only the WRITE is scoped to the new rows.
++fn stamp_creation_fraud(
++  config: ServerConfig,
++  app_uuid: Uuid,
++  data: sql.GetApplicationReferenceDataRow,
++  created_ids: List(String),
++) -> Nil {
++  case created_ids {
++    [] -> Nil
++    _ ->
++      case sql.get_application_reference_contacts(config.db, app_uuid) {
++        Ok(pog.Returned(_, all_refs)) -> {
++          let applicant =
++            fraud.RefContact(
++              // name is unused for duplicate_of_applicant (email/phone only).
++              name: "",
++              email: Some(data.applicant_email),
++              phone: data.applicant_phone,
++            )
++          // Stamp ONLY the newly-created rows (never a submitted sibling).
++          let to_stamp =
++            list.filter(all_refs, fn(r) { list.contains(created_ids, r.id) })
++          list.each(to_stamp, fn(ref) {
++            stamp_one_creation_fraud(config, app_uuid, ref, all_refs, applicant)
++          })
++        }
++        _ ->
++          // Read failure — best-effort: leave fraud_signals null.
++          wisp.log_warning(
++            "stamp_creation_fraud: could not read reference contacts for "
++            <> uuid.to_string(app_uuid),
++          )
++      }
++  }
++}
++
++fn stamp_one_creation_fraud(
++  config: ServerConfig,
++  app_uuid: Uuid,
++  ref: sql.GetApplicationReferenceContactsRow,
++  all_refs: List(sql.GetApplicationReferenceContactsRow),
++  applicant: fraud.RefContact,
++) -> Nil {
++  let this_ref =
++    fraud_inputs.from_effective(
++      ref.contact_name,
++      ref.effective_email,
++      ref.effective_phone,
++    )
++  let other_refs = fraud_inputs.other_refs_from_rows(all_refs, ref.id)
++  let cross_app =
++    fraud_inputs.cross_application_reuse(config.db, app_uuid, this_ref)
++  // Line-type lookup (AD-10): only when the referee has a phone. No-ops to
++  // Unknown when Twilio is unconfigured or the lookup fails — never blocks.
++  let line_type = case this_ref.phone {
++    Some(phone) -> lookup.lookup_line_type(config.twilio, config.sentry, phone)
++    None -> lookup.Unknown
++  }
++  let signals =
++    fraud.creation_fraud_signals(
++      fraud.FraudDbInputs(
++        this_ref:,
++        other_application_refs: other_refs,
++        applicant:,
++        cross_app_reuse: cross_app,
++      ),
++      line_type,
++    )
++  case uuid.from_string(ref.id) {
++    Ok(id) ->
++      case sql.stamp_creation_fraud_signals(config.db, id, signals) {
++        Ok(_) -> Nil
++        Error(err) ->
++          wisp.log_warning(
++            "stamp_creation_fraud: stamp failed for "
++            <> ref.id
++            <> ": "
++            <> string.inspect(err),
++          )
++      }
++    Error(_) ->
++      wisp.log_warning("stamp_creation_fraud: non-uuid reference id " <> ref.id)
++  }
++}
++
+ /// Inserts one slot's row (idempotent) and writes the `reference_call_created`
+ /// audit only when a row was actually created (ON CONFLICT DO NOTHING returns
+ /// 0 rows on a conflict — a double trigger, or a landlord-pre-skipped slot).
+ /// Runs inside the caller's transaction so row + audit commit together.
++/// Returns `Some(id)` when a row was created, `None` on a conflict (no new
++/// row) — so the caller collects only the newly-created ids (rc3-7 stamps
++/// fraud_signals on those, never a re-stamp that would wipe a submitted
++/// sibling; B1).
+ fn create_one_slot(
+   tx: pog.Connection,
+   app_uuid app_uuid: Uuid,
+@@ -212,16 +330,16 @@ fn create_one_slot(
+   name name: Option(String),
+   phone phone: Option(String),
+   email email: Option(String),
+-) -> Result(Bool, String) {
++) -> Result(Option(String), String) {
+   case
+     sql.insert_reference_call_if_absent(
+       tx,
+       app_uuid,
+       slot,
+       primary_owner,
+-      opt_to_str(name),
+-      opt_to_str(email),
+-      opt_to_str(phone),
++      fraud_inputs.opt_to_str(name),
++      fraud_inputs.opt_to_str(email),
++      fraud_inputs.opt_to_str(phone),
+     )
+   {
+     Ok(pog.Returned(_, [row])) ->
+@@ -244,7 +362,7 @@ fn create_one_slot(
+               ]),
+             )
+           {
+-            Ok(_) -> Ok(True)
++            Ok(_) -> Ok(Some(row.id))
+             Error(err) ->
+               Error(
+                 "reference_call_created audit failed: " <> string.inspect(err),
+@@ -257,9 +375,9 @@ fn create_one_slot(
+       // 0 rows — a live row already occupies this slot (ON CONFLICT DO
+       // NOTHING), so no duplicate was created and no audit is written (the
+       // original creation already audited). The catch-all also covers any
+-      // unexpected multi-row return defensively. Returns False so the
+-      // caller's insert COUNT reflects actual inserts, not eligible slots.
+-      Ok(False)
++      // unexpected multi-row return defensively. Returns None so the caller
++      // collects only newly-created ids.
++      Ok(None)
+     Error(err) ->
+       Error("insert_reference_call_if_absent failed: " <> string.inspect(err))
+   }
+@@ -563,8 +681,8 @@ fn create_one_skipped_slot(
+       slot,
+       primary_owner,
+       name,
+-      opt_to_str(email),
+-      opt_to_str(phone),
++      fraud_inputs.opt_to_str(email),
++      fraud_inputs.opt_to_str(phone),
+     )
+   {
+     Ok(pog.Returned(_, [row])) ->
+@@ -914,13 +1032,6 @@ fn trio_for_slot(
+   }
+ }
+ 
+-fn opt_to_str(o: Option(String)) -> String {
+-  case o {
+-    Some(s) -> s
+-    None -> ""
+-  }
+-}
+-
+ /// A valid referee slot path segment. `shared.ref_slot_from_string` is a
+ /// total function that falls back to `LandlordRef` for unknown values, so it
+ /// can't validate a path param — this does.
+diff --git a/server/src/reference_checks/webhooks.gleam b/server/src/reference_checks/webhooks.gleam
+index a565413e..5d39ef13 100644
+--- a/server/src/reference_checks/webhooks.gleam
++++ b/server/src/reference_checks/webhooks.gleam
+@@ -219,9 +219,12 @@ fn process_twilio_event(
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// Shared pipeline: idempotency claim -> find row -> guarded transition ->
+-// audit + in-app notification. Best-effort after the signature gate (a
+-// processing error is Sentry-captured, never crashes the acked webhook).
++// Shared pipeline: find row -> guarded transition -> audit + in-app
++// notification. Idempotency is the find/mark live-status scoping (both
++// WHERE status IN ('queued','contact_initiated')): a re-delivered event finds
++// 0 rows once the row has moved to awaiting_correction, so it no-ops. Best-
++// effort after the signature gate (a processing error is Sentry-captured,
++// never crashes the acked webhook).
+ // ---------------------------------------------------------------------------
+ 
+ fn apply_delivery_failure(
+@@ -234,31 +237,12 @@ fn apply_delivery_failure(
+   contact_phone contact_phone: String,
+   terminal_reason terminal_reason: String,
+ ) -> Nil {
+-  // 1. Idempotency claim FIRST (a crash mid-handler never double-applies).
+-  case sql.claim_webhook_event(db, event_id, source) {
+-    Ok(pog.Returned(_, [_, ..])) -> Nil
+-    Ok(_) -> {
+-      // 0 rows = already processed (ON CONFLICT). Stand down.
+-      wisp.log_info(
+-        "reference webhook: duplicate event ignored ("
+-        <> source
+-        <> "/"
+-        <> event_id
+-        <> ")",
+-      )
+-      Nil
+-    }
+-    Error(err) -> {
+-      capture(
+-        sentry,
+-        "ReferenceWebhookClaimFailed",
+-        "claim_webhook_event failed: " <> query_error_to_string(err),
+-        [#("source", source), #("event_id", event_id)],
+-      )
+-      Nil
+-    }
+-  }
+-  // 2. Find the reference_call row this delivery-failure belongs to.
++  // 1. Find the reference_call row this delivery-failure belongs to. The
++  // idempotency layer is the find + mark live-status scoping (both WHERE
++  // status IN ('queued','contact_initiated')): a re-delivered event finds 0
++  // rows once the row has moved to awaiting_correction, so it no-ops (W1 from
++  // rc3-6: the discarded claim_webhook_event case gated nothing — removed; the
++  // live-status scoping is the real dedup, not an early-return claim).
+   let send_ref_json =
+     json.to_string(
+       json.array(
+@@ -289,12 +273,12 @@ fn apply_delivery_failure(
+             [#("id", row.id)],
+           )
+         Ok(reference_call_id) ->
+-          // 3. Guarded transition (sticky + idempotent in one UPDATE).
++          // 2. Guarded transition (sticky + idempotent in one UPDATE).
+           case
+             sql.mark_awaiting_correction(db, reference_call_id, terminal_reason)
+           {
+             Ok(pog.Returned(_, [_, ..])) -> {
+-              // 4. Real transition — write the AD-16 audit + the in-app
++              // 3. Real transition — write the AD-16 audit + the in-app
+               // notification. Both are best-effort (a failure here is
+               // captured but does not roll back the transition).
+               write_audit(
+@@ -340,7 +324,7 @@ fn apply_delivery_failure(
+         sentry,
+         "ReferenceWebhookFindFailed",
+         "find_reference_call_by_send_ref failed: " <> query_error_to_string(err),
+-        [#("source", source)],
++        [#("source", source), #("event_id", event_id)],
+       )
+   }
+   Nil
+diff --git a/server/test/integration/reference_checks_fraud_integration_test.gleam b/server/test/integration/reference_checks_fraud_integration_test.gleam
+new file mode 100644
+index 00000000..c85f555d
+--- /dev/null
++++ b/server/test/integration/reference_checks_fraud_integration_test.gleam
+@@ -0,0 +1,263 @@
++//// Integration tests for rc3-7 fraud-signals SQL contracts (AD-10): the
++//// cross-application reuse read (innocent letting-agent vs suspicious
++//// different-name), the creation-time `fraud_signals` stamp, and the
++//// `referee_contact_invalid` jsonb_set stamp (preserves the other keys, §6.4,
++//// and handles a null column honestly). The pure `fraud.gleam` builder is
++//// unit-tested; the form_handler Phase 2 wiring is exercised by the form
++//// integration suite. These pin the SQL contracts the builders + wiring
++//// depend on, durably (the lowest layer).
++////
++//// Assertions parse the stored `fraud_signals::text` (Postgres jsonb output
++//// carries a space after `:`) rather than substring-matching, so they are
++//// robust to the jsonb text formatting.
++
++import gleam/dict
++import gleam/dynamic/decode
++import gleam/int
++import gleam/json
++import gleam/option
++import gleam/result
++import gleeunit/should
++import integration/helpers.{setup}
++import integration/test_db
++import pog
++import reference_checks/fraud
++import reference_checks/lookup
++import reference_checks/sql as rc_sql
++import unitest
++import youid/uuid
++
++fn seed_app(db: pog.Connection, email: String) -> String {
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 0)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let assert Ok(application_id) =
++    test_db.seed_application(db, vacancy_id, email)
++  application_id
++}
++
++/// Insert a landlord_ref row with the given contact (non-idempotent insert —
++/// the test owns seeding order). Returns the row id.
++fn insert_call(
++  db: pog.Connection,
++  application_id: String,
++  name: String,
++  email: String,
++  phone: String,
++) -> String {
++  let assert Ok(app_uuid) = uuid.from_string(application_id)
++  let assert Ok(returned) =
++    rc_sql.insert_reference_call(
++      db,
++      app_uuid,
++      "landlord_ref",
++      "primary",
++      name,
++      email,
++      phone,
++    )
++  case returned.rows {
++    [row, ..] -> row.id
++    _ -> panic as "insert_reference_call returned no id"
++  }
++}
++
++/// Read a row's `fraud_signals` column back as text ('' when null).
++fn fraud_signals_text(db: pog.Connection, id: String) -> String {
++  let assert Ok(row_uuid) = uuid.from_string(id)
++  let assert Ok(returned) = rc_sql.get_reference_call_by_id(db, row_uuid)
++  case returned.rows {
++    [row, ..] -> row.fraud_signals
++    _ -> panic as "get_reference_call_by_id returned no row"
++  }
++}
++
++/// The reuse count for a referee contact (parsed from the ::text result).
++fn reuse_count(
++  db: pog.Connection,
++  this_app: String,
++  name: String,
++  email: String,
++  phone: String,
++) -> Int {
++  let assert Ok(app_uuid) = uuid.from_string(this_app)
++  let assert Ok(returned) =
++    rc_sql.count_cross_application_contact_reuse(
++      db,
++      app_uuid,
++      name,
++      email,
++      phone,
++    )
++  case returned.rows {
++    [row, ..] ->
++      case int.parse(row.reuse_count) {
++        Ok(n) -> n
++        Error(_) -> 0
++      }
++    _ -> 0
++  }
++}
++
++/// A realistic creation-time fraud_signals object for "Mary Ref".
++fn mary_signals(line_type line_type: lookup.LineType) -> json.Json {
++  fraud.creation_fraud_signals(
++    fraud.FraudDbInputs(
++      this_ref: fraud.RefContact(
++        name: "Mary Ref",
++        email: option.Some("mary@example.com"),
++        phone: option.Some("+353861111111"),
++      ),
++      other_application_refs: [],
++      applicant: fraud.RefContact(
++        name: "",
++        email: option.Some("a@example.com"),
++        phone: option.None,
++      ),
++      cross_app_reuse: False,
++    ),
++    line_type,
++  )
++}
++
++/// A top-level key is present in the stored fraud_signals jsonb.
++fn has_key(text: String, key: String) -> Bool {
++  case json.parse(text, decode.dict(decode.string, decode.dynamic)) {
++    Ok(map) -> dict.has_key(map, key)
++    Error(_) -> False
++  }
++}
++
++/// A top-level string field's value in the stored fraud_signals jsonb.
++fn string_field(text: String, key: String) -> String {
++  let assert Ok(value) = json.parse(text, decode.at([key], decode.string))
++  value
++}
++
++/// A top-level bool field's value in the stored fraud_signals jsonb.
++fn bool_field(text: String, key: String) -> Bool {
++  let assert Ok(value) = json.parse(text, decode.at([key], decode.bool))
++  value
++}
++
++// -- AC4: innocent reuse (same name) vs suspicious (different name) ----------
++
++pub fn cross_app_reuse_innocent_letting_agent_same_name_is_zero_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_a = seed_app(db, "a@example.com")
++  let app_b = seed_app(db, "b@example.com")
++  // A letting agent legitimately listed under the SAME name + phone across
++  // two applications — innocent, NOT fraud (AD-10).
++  let _ = insert_call(db, app_a, "Legit Lettings", "", "+353860000000")
++  let _ = insert_call(db, app_b, "Legit Lettings", "", "+353860000000")
++  reuse_count(db, app_a, "Legit Lettings", "", "+353860000000")
++  |> should.equal(0)
++}
++
++pub fn cross_app_reuse_different_name_flags_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_a = seed_app(db, "a@example.com")
++  let app_b = seed_app(db, "b@example.com")
++  // Same phone, DIFFERENT names across applications — the suspicious pattern.
++  let _ = insert_call(db, app_a, "Alice Ref", "", "+353860000000")
++  let _ = insert_call(db, app_b, "Bob Ref", "", "+353860000000")
++  reuse_count(db, app_a, "Alice Ref", "", "+353860000000")
++  |> should.equal(1)
++}
++
++pub fn cross_app_reuse_empty_contact_never_matches_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_a = seed_app(db, "a@example.com")
++  let app_b = seed_app(db, "b@example.com")
++  // A referee with no phone/email must never read as reused (NULLIF guard).
++  let _ = insert_call(db, app_a, "Alice Ref", "", "")
++  let _ = insert_call(db, app_b, "Bob Ref", "", "")
++  reuse_count(db, app_a, "Alice Ref", "", "")
++  |> should.equal(0)
++}
++
++pub fn cross_app_reuse_excludes_this_application_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app_a = seed_app(db, "a@example.com")
++  let assert Ok(app_uuid) = uuid.from_string(app_a)
++  // A reuse WITHIN app_a (two slots, different names) must not count as
++  // cross-application (the query excludes this application's own rows).
++  let _ = insert_call(db, app_a, "Alice Ref", "", "+353860000000")
++  let assert Ok(_) =
++    rc_sql.insert_reference_call(
++      db,
++      app_uuid,
++      "employer_ref",
++      "primary",
++      "Erin Ref",
++      "",
++      "+353860000000",
++    )
++  reuse_count(db, app_a, "Alice Ref", "", "+353860000000")
++  |> should.equal(0)
++}
++
++// -- AC2: creation-time fraud_signals stamp ----------------------------------
++
++pub fn creation_stamp_writes_fraud_signals_column_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app = seed_app(db, "a@example.com")
++  let id = insert_call(db, app, "Mary Ref", "mary@example.com", "+353861111111")
++  let assert Ok(row_uuid) = uuid.from_string(id)
++  // Build a real creation-time fraud_signals object + stamp it.
++  let assert Ok(_) =
++    rc_sql.stamp_creation_fraud_signals(
++      db,
++      row_uuid,
++      mary_signals(lookup.Unknown),
++    )
++  let text = fraud_signals_text(db, id)
++  // The AD-10 honest values land exactly (Unknown line-type here).
++  string_field(text, "line_type") |> should.equal("unknown")
++  string_field(text, "geo_vs_claimed_property") |> should.equal("unknown")
++  // voice + referee_contact_invalid are ABSENT (the keys never exist).
++  has_key(text, "voice_matches_other_reference") |> should.be_false
++  has_key(text, "referee_contact_invalid") |> should.be_false
++}
++
++// -- AC5: referee_contact_invalid jsonb_set stamp (§6.4) ---------------------
++
++pub fn referee_contact_invalid_stamp_adds_flag_preserving_keys_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app = seed_app(db, "a@example.com")
++  let id = insert_call(db, app, "Mary Ref", "mary@example.com", "+353861111111")
++  let assert Ok(row_uuid) = uuid.from_string(id)
++  // Stamp a creation-time object first (the realistic precondition).
++  let assert Ok(_) =
++    rc_sql.stamp_creation_fraud_signals(
++      db,
++      row_uuid,
++      mary_signals(lookup.Mobile),
++    )
++  // Now the correction-exhaustion stamp (the RC4.3 hook).
++  let assert Ok(_) = rc_sql.stamp_referee_contact_invalid(db, row_uuid)
++  let text = fraud_signals_text(db, id)
++  bool_field(text, "referee_contact_invalid") |> should.be_true
++  // jsonb_set preserved the creation-time keys (not a wholesale overwrite).
++  string_field(text, "line_type") |> should.equal("mobile")
++  has_key(text, "contact_reused_within_application") |> should.be_true
++}
++
++pub fn referee_contact_invalid_stamp_handles_null_column_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let app = seed_app(db, "a@example.com")
++  // A row whose fraud_signals is still null (a pre-rc3-7 row, or a creation
++  // stamp that failed). The COALESCE-to-'{}' must handle it honestly.
++  let id = insert_call(db, app, "Mary Ref", "mary@example.com", "+353861111111")
++  let assert Ok(row_uuid) = uuid.from_string(id)
++  fraud_signals_text(db, id) |> should.equal("")
++  let assert Ok(_) = rc_sql.stamp_referee_contact_invalid(db, row_uuid)
++  let text = fraud_signals_text(db, id)
++  bool_field(text, "referee_contact_invalid") |> should.be_true
++}
+diff --git a/server/test/integration/reference_checks_trigger_integration_test.gleam b/server/test/integration/reference_checks_trigger_integration_test.gleam
+index 7fd25e3f..fc5758a6 100644
+--- a/server/test/integration/reference_checks_trigger_integration_test.gleam
++++ b/server/test/integration/reference_checks_trigger_integration_test.gleam
+@@ -11,6 +11,7 @@ import gleam/http
+ import gleam/json
+ import gleam/list
+ import gleam/option.{type Option, None, Some}
++import gleam/string
+ import gleeunit/should
+ import integration/helpers.{setup, test_server_config}
+ import integration/test_db
+@@ -715,3 +716,152 @@ pub fn handle_re_enable_cross_tenant_is_not_found_test() {
+ 
+   resp.status |> should.equal(404)
+ }
++
++// --- rc3-7 fraud-signals: creation stamp (W3) + re-trigger idempotency (B1) ---
++
++/// The `fraud_signals` column text for a slot's row ('' when null).
++fn fraud_signals_for_slot(
++  db: pog.Connection,
++  application_id: String,
++  slot: String,
++) -> String {
++  let assert Ok(returned) =
++    pog.query(
++      "SELECT COALESCE(fraud_signals::text, '') FROM reference_call
++       WHERE application_id = $1 AND ref_slot = $2 AND owner_label = 'primary'",
++    )
++    |> pog.parameter(pog.text(application_id))
++    |> pog.parameter(pog.text(slot))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  case returned.rows {
++    [text, ..] -> text
++    _ -> ""
++  }
++}
++
++/// Stamp an arbitrary fraud_signals json on a slot's row (test-only —
++/// simulates a submitted row carrying a form_session block).
++fn stamp_fraud_signals_raw(
++  db: pog.Connection,
++  application_id: String,
++  slot: String,
++  json_text: String,
++) -> Nil {
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET fraud_signals = $3::jsonb, updated_at = now()
++       WHERE application_id = $1 AND ref_slot = $2 AND owner_label = 'primary'",
++    )
++    |> pog.parameter(pog.text(application_id))
++    |> pog.parameter(pog.text(slot))
++    |> pog.parameter(pog.text(json_text))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  Nil
++}
++
++/// AC2 / W3: the trigger stamps the creation-time fraud_signals on each
++/// newly-created row (the orchestrator glue, not just the SQL contract).
++pub fn trigger_stamps_creation_fraud_signals_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id) =
++    seed_full_app(db, "rc3-fraud-a@example.com", False, "attested")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++
++  let _ = trigger.run_create_checks(config, app, landlord, vacancy)
++
++  // Each created row carries the creation-time fraud_signals (the keys are
++  // present; values are honest — line_type unknown here since Twilio is
++  // Disabled in the test config).
++  let landlord_fs = fraud_signals_for_slot(db, app_id, "landlord_ref")
++  landlord_fs |> string.contains("line_type") |> should.be_true
++  landlord_fs
++  |> string.contains("contact_reused_within_application")
++  |> should.be_true
++  landlord_fs |> string.contains("geo_vs_claimed_property") |> should.be_true
++  // form_session is null at creation (no form yet).
++  landlord_fs |> string.contains("\"form_session\": null") |> should.be_true
++  // The honest-absent keys are absent.
++  landlord_fs
++  |> string.contains("voice_matches_other_reference")
++  |> should.be_false
++  landlord_fs |> string.contains("referee_contact_invalid") |> should.be_false
++}
++
++/// B1 regression: a re-trigger (idempotent, inserted==0) must NOT wipe a
++/// submitted sibling's fraud_signals. `handle_start` re-fires the trigger on
++/// demand, so re-triggers are a supported operation; the creation stamp is
++/// scoped to newly-created rows only.
++pub fn re_trigger_does_not_wipe_submitted_fraud_signals_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id) =
++    seed_full_app(db, "rc3-fraud-b@example.com", False, "attested")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++
++  let _ = trigger.run_create_checks(config, app, landlord, vacancy)
++  // Simulate a SUBMITTED landlord row: stamp a submitted-shape fraud_signals
++  // carrying a form_session block (completion_seconds etc.).
++  stamp_fraud_signals_raw(
++    db,
++    app_id,
++    "landlord_ref",
++    "{\"line_type\":\"mobile\",\"form_session\":{\"completion_seconds\":120,\"ip_matches_applicant\":true},\"geo_vs_claimed_property\":\"unknown\",\"coached_answer_score\":null}",
++  )
++
++  // Re-trigger (idempotent — no new rows).
++  let second = trigger.run_create_checks(config, app, landlord, vacancy)
++  second |> should.equal(Ok(trigger.Created(count: 0)))
++
++  // B1: the submitted fraud_signals SURVIVES — the completion_seconds key
++  // (present only in the submitted form_session block, never in the
++  // creation-time object whose form_session is null) is still there. A wipe
++  // would replace it with creation-time signals (form_session: null).
++  let after = fraud_signals_for_slot(db, app_id, "landlord_ref")
++  after |> string.contains("completion_seconds") |> should.be_true
++  after |> string.contains("\"form_session\": null") |> should.be_false
++}
++
++/// B1 (sibling): a re-trigger that creates a NEW row (a freed slot) must not
++/// wipe a submitted SIBLING. The stamp is scoped to created_ids, not the
++/// whole application.
++pub fn re_trigger_new_row_does_not_wipe_submitted_sibling_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let config = test_server_config(db)
++  let #(landlord_id, vacancy_id, app_id) =
++    seed_full_app(db, "rc3-fraud-c@example.com", False, "attested")
++  let #(landlord, vacancy, app) = uuids(landlord_id, vacancy_id, app_id)
++
++  let _ = trigger.run_create_checks(config, app, landlord, vacancy)
++  // Simulate a submitted landlord row.
++  stamp_fraud_signals_raw(
++    db,
++    app_id,
++    "landlord_ref",
++    "{\"line_type\":\"mobile\",\"form_session\":{\"completion_seconds\":240},\"geo_vs_claimed_property\":\"unknown\",\"coached_answer_score\":null}",
++  )
++  // Terminalize the employer slot so a re-trigger can create a NEW employer
++  // row (the live-slot unique index frees the slot once terminal). Then re-fire.
++  let assert Ok(_) =
++    pog.query(
++      "UPDATE reference_call SET status = 'failed', next_attempt_at = NULL
++       WHERE application_id = $1 AND ref_slot = 'employer_ref' AND owner_label = 'primary'",
++    )
++    |> pog.parameter(pog.text(app_id))
++    |> pog.returning(decode.at([0], decode.string))
++    |> pog.execute(db)
++  let second = trigger.run_create_checks(config, app, landlord, vacancy)
++  // A new employer row is created (the slot freed); the submitted landlord
++  // sibling must be untouched.
++  second |> should.equal(Ok(trigger.Created(count: 1)))
++  let landlord_after = fraud_signals_for_slot(db, app_id, "landlord_ref")
++  landlord_after |> string.contains("completion_seconds") |> should.be_true
++  landlord_after
++  |> string.contains("\"form_session\": null")
++  |> should.be_false
++}
+diff --git a/server/test/integration/reference_checks_webhooks_integration_test.gleam b/server/test/integration/reference_checks_webhooks_integration_test.gleam
+index 4f5ab3e3..c5833fd4 100644
+--- a/server/test/integration/reference_checks_webhooks_integration_test.gleam
++++ b/server/test/integration/reference_checks_webhooks_integration_test.gleam
+@@ -130,7 +130,9 @@ pub fn resend_redelivery_is_idempotent_test() {
+ 
+   // First delivery — transitions.
+   post_resend(cfg, body, svix_id, ts, sig) |> simulate.read_body |> ignore
+-  // Re-delivery with the SAME svix-id — idempotent (claim 0 rows).
++  // Re-delivery with the SAME svix-id — idempotent (find/mark live-status
++  // scoping: the row is now awaiting_correction, so the guarded
++  // mark_awaiting_correction returns 0 rows).
+   post_resend(cfg, body, svix_id, ts, sig) |> simulate.read_body |> ignore
+ 
+   audit_count(db, row_id, "reference_call_correction_requested")
+diff --git a/server/test/integration/reference_exit_routes_integration_test.gleam b/server/test/integration/reference_exit_routes_integration_test.gleam
+index fda6780b..4bd110b3 100644
+--- a/server/test/integration/reference_exit_routes_integration_test.gleam
++++ b/server/test/integration/reference_exit_routes_integration_test.gleam
+@@ -665,6 +665,29 @@ pub fn focus_seconds_reported_flows_into_the_result_test() {
+     |> simulate.form_body([#("_focus_seconds", "240"), ..timing_fields()])
+   let _ = router.handle_request(test_router_context(db), req)
+   focus_seconds_reported(db, token) |> should.equal("240")
++  // N5: the FULL form_session block is computed + embedded (not just
++  // focus_seconds) — the richer fields are present. Some read null here: the
++  // test POSTs directly (form_opened_at unset -> completion_seconds null) and
++  // the seeded application has no submitted_ip_text/UA (the compares null).
++  let fs = form_session_text(db, token)
++  fs |> string.contains("completion_seconds") |> should.be_true
++  fs |> string.contains("ip_matches_applicant") |> should.be_true
++  fs |> string.contains("device_fingerprint_match") |> should.be_true
++  fs |> string.contains("focus_seconds_reported") |> should.be_true
++  // Raw referee IP/UA live INSIDE form_session (§4.2 internal-only).
++  fs |> string.contains("referee_ip") |> should.be_true
++  fs |> string.contains("referee_user_agent") |> should.be_true
++}
++
++/// The result's form_session block as text (for key-presence assertions).
++fn form_session_text(db: pog.Connection, token: String) -> String {
++  test_db.query_text(
++    db,
++    "SELECT result->'fraud_signals'->'form_session'::text FROM reference_call WHERE form_token = '"
++      <> token
++      <> "'",
++  )
++  |> result.unwrap("missing")
+ }
+ 
+ // --- W5: audit terminal events are written -----------------------------------
+diff --git a/server/test/reference_checks/fraud_test.gleam b/server/test/reference_checks/fraud_test.gleam
+new file mode 100644
+index 00000000..5f7ed621
+--- /dev/null
++++ b/server/test/reference_checks/fraud_test.gleam
+@@ -0,0 +1,297 @@
++//// Unit tests for reference_checks/fraud — the AD-10 honest fraud-signals
++//// builder. Pure — no DB. Pins: every signal in the AD-10 table, the honest
++//// placeholders EXACTLY (geo "unknown", coached null, voice ABSENT,
++//// referee_contact_invalid ABSENT), the innocent-reuse read, the weak UA
++//// compare, and the §4.2 raw-IP/UA containment inside form_session.
++
++import gleam/json
++import gleam/option.{None, Some}
++import gleam/string
++import gleeunit/should
++import reference_checks/fraud
++import reference_checks/lookup
++
++// -- helpers ------------------------------------------------------------------
++
++fn as_text(j: json.Json) -> String {
++  json.to_string(j)
++}
++
++fn applicant() -> fraud.RefContact {
++  fraud.RefContact(
++    name: "Aisling",
++    email: Some("aisling@mail.ie"),
++    phone: Some("+353860000000"),
++  )
++}
++
++/// A landlord referee whose contact is NOT the applicant's and NOT reused.
++fn clean_landlord_ref() -> fraud.RefContact {
++  fraud.RefContact(
++    name: "Mary",
++    email: Some("mary@mail.ie"),
++    phone: Some("+353861111111"),
++  )
++}
++
++fn empty_db() -> fraud.FraudDbInputs {
++  fraud.FraudDbInputs(
++    this_ref: clean_landlord_ref(),
++    other_application_refs: [],
++    applicant: applicant(),
++    cross_app_reuse: False,
++  )
++}
++
++fn fs(ip ip: String, ua ua: String) -> fraud.FormSessionInputs {
++  fraud.FormSessionInputs(
++    referee_ip: ip,
++    referee_user_agent: ua,
++    applicant_ip: "203.0.113.10",
++    applicant_user_agent: "Mozilla/5.0 (applicant)",
++    completion_seconds: Some(312),
++    focus_seconds: 280,
++  )
++}
++
++// -- AC1: the AD-10 table, exactly + honestly ---------------------------------
++
++pub fn creation_emits_every_ad10_signal_test() {
++  let text = as_text(fraud.creation_fraud_signals(empty_db(), lookup.Mobile))
++  // The three pure-DB reuse signals.
++  text
++  |> string.contains("\"contact_reused_within_application\":false")
++  |> should.be_true
++  text
++  |> string.contains("\"contact_duplicate_of_applicant\":false")
++  |> should.be_true
++  text
++  |> string.contains("\"contact_reused_across_applications\":false")
++  |> should.be_true
++  // Line-type (carried from the lookup) + voip_or_burner.
++  text |> string.contains("\"line_type\":\"mobile\"") |> should.be_true
++  text |> string.contains("\"voip_or_burner\":false") |> should.be_true
++  // Honest placeholders — EXACTLY these values, never a guess.
++  text
++  |> string.contains("\"geo_vs_claimed_property\":\"unknown\"")
++  |> should.be_true
++  text |> string.contains("\"coached_answer_score\":null") |> should.be_true
++  // form_session is null at creation (no form yet).
++  text |> string.contains("\"form_session\":null") |> should.be_true
++}
++
++pub fn creation_line_type_unknown_is_honest_test() {
++  // No Twilio keys / lookup failed -> Unknown -> "unknown" + voip false.
++  // Never a fabricated value (AD-10 honesty).
++  let text = as_text(fraud.creation_fraud_signals(empty_db(), lookup.Unknown))
++  text |> string.contains("\"line_type\":\"unknown\"") |> should.be_true
++  text |> string.contains("\"voip_or_burner\":false") |> should.be_true
++}
++
++pub fn voice_matches_other_reference_is_absent_test() {
++  // v3 biometric — the key is NEVER emitted (AD-10 absence contract).
++  let text = as_text(fraud.creation_fraud_signals(empty_db(), lookup.Mobile))
++  text
++  |> string.contains("voice_matches_other_reference")
++  |> should.be_false
++}
++
++pub fn referee_contact_invalid_is_absent_until_exhaustion_test() {
++  // rc3-7 never fabricates this signal; it is stamped only by the RC4.3
++  // correction-exhaustion path. Both builders emit it ABSENT.
++  let creation =
++    as_text(fraud.creation_fraud_signals(empty_db(), lookup.Mobile))
++  let submission =
++    as_text(fraud.submission_fraud_signals(
++      empty_db(),
++      lookup.Mobile,
++      fs("", ""),
++    ))
++  creation |> string.contains("referee_contact_invalid") |> should.be_false
++  submission |> string.contains("referee_contact_invalid") |> should.be_false
++}
++
++// -- AC2 / AC3: form_session at submission; raw IP/UA internal-only ----------
++
++pub fn submission_computes_form_session_test() {
++  let text =
++    as_text(fraud.submission_fraud_signals(
++      empty_db(),
++      lookup.Mobile,
++      fs("203.0.113.10", "Mozilla/5.0 (applicant)"),
++    ))
++  // completion_seconds carried through.
++  text |> string.contains("\"completion_seconds\":312") |> should.be_true
++  // ip_matches_applicant: referee IP == applicant IP -> true.
++  text |> string.contains("\"ip_matches_applicant\":true") |> should.be_true
++  // device_fingerprint_match: referee UA == applicant UA -> true (weak).
++  text
++  |> string.contains("\"device_fingerprint_match\":true")
++  |> should.be_true
++  text |> string.contains("\"focus_seconds_reported\":280") |> should.be_true
++}
++
++pub fn submission_mismatch_is_false_not_null_test() {
++  // Both present + different -> Some(False), not None (a real non-match).
++  let text =
++    as_text(fraud.submission_fraud_signals(
++      empty_db(),
++      lookup.Mobile,
++      fs("198.51.100.9", "Mozilla/5.0 (different)"),
++    ))
++  text |> string.contains("\"ip_matches_applicant\":false") |> should.be_true
++  text
++  |> string.contains("\"device_fingerprint_match\":false")
++  |> should.be_true
++}
++
++pub fn submission_missing_applicant_ip_is_null_test() {
++  // Applicant capture absent -> None (unknown — never fabricated).
++  let inputs =
++    fraud.FormSessionInputs(
++      referee_ip: "203.0.113.10",
++      referee_user_agent: "Mozilla/5.0 (ref)",
++      applicant_ip: "",
++      applicant_user_agent: "Mozilla/5.0 (applicant)",
++      completion_seconds: Some(100),
++      focus_seconds: 90,
++    )
++  let text =
++    as_text(fraud.submission_fraud_signals(empty_db(), lookup.Mobile, inputs))
++  text |> string.contains("\"ip_matches_applicant\":null") |> should.be_true
++}
++
++pub fn raw_ip_ua_live_inside_form_session_test() {
++  // §4.2: raw IPs/UAs live INSIDE form_session (internal-only; RC4.1 strips).
++  let text =
++    as_text(fraud.submission_fraud_signals(
++      empty_db(),
++      lookup.Mobile,
++      fs("203.0.113.10", "Mozilla/5.0 (ref)"),
++    ))
++  text
++  |> string.contains("\"referee_ip\":\"203.0.113.10\"")
++  |> should.be_true
++  text
++  |> string.contains("\"referee_user_agent\":\"Mozilla/5.0 (ref)\"")
++  |> should.be_true
++}
++
++// -- AC4: innocent reuse is not fraud ----------------------------------------
++
++pub fn innocent_letting_agent_across_apps_is_not_flagged_test() {
++  // The cross-application SQL reads "same contact under a DIFFERENT name".
++  // A letting agent appearing under the SAME name across applications is
++  // innocent -> cross_app_reuse = false -> the signal is false (a clue that
++  // does NOT fire). fraud.gleam honours the precomputed boolean.
++  let innocent = fraud.FraudDbInputs(..empty_db(), cross_app_reuse: False)
++  let text = as_text(fraud.creation_fraud_signals(innocent, lookup.Landline))
++  text
++  |> string.contains("\"contact_reused_across_applications\":false")
++  |> should.be_true
++}
++
++pub fn suspicious_cross_app_reuse_under_different_name_flags_test() {
++  // Same contact under a DIFFERENT name across apps -> the SQL returns true
++  // -> the signal fires (a clue; never a verdict, never auto-reject).
++  let suspicious = fraud.FraudDbInputs(..empty_db(), cross_app_reuse: True)
++  let text = as_text(fraud.creation_fraud_signals(suspicious, lookup.Landline))
++  text
++  |> string.contains("\"contact_reused_across_applications\":true")
++  |> should.be_true
++}
++
++// -- pure-DB reuse + duplicate computations ----------------------------------
++
++pub fn reused_within_application_detects_shared_phone_test() {
++  // Two slots of one application share a phone -> reuse flagged (per-ref).
++  let this =
++    fraud.RefContact(name: "A", email: None, phone: Some("+353860000000"))
++  let other =
++    fraud.RefContact(
++      name: "B",
++      email: Some("b@mail.ie"),
++      phone: Some("+353860000000"),
++    )
++  fraud.reused_within_application(this, [other]) |> should.be_true
++}
++
++pub fn reused_within_application_clean_is_false_test() {
++  let this = clean_landlord_ref()
++  let other =
++    fraud.RefContact(
++      name: "Employer",
++      email: Some("hr@work.ie"),
++      phone: Some("+353862222222"),
++    )
++  fraud.reused_within_application(this, [other]) |> should.be_false
++}
++
++pub fn reused_within_application_empty_contacts_never_match_test() {
++  // A missing phone/email is not "reused" (honesty: absence is not a match).
++  let this = fraud.RefContact(name: "A", email: None, phone: None)
++  let other = fraud.RefContact(name: "B", email: None, phone: None)
++  fraud.reused_within_application(this, [other]) |> should.be_false
++}
++
++pub fn duplicate_of_applicant_flags_shared_email_test() {
++  // Referee email == applicant email -> duplicate (a claim-integrity clue).
++  let ref =
++    fraud.RefContact(
++      name: "Mary",
++      email: Some("aisling@mail.ie"),
++      phone: Some("+353869999999"),
++    )
++  fraud.duplicate_of_applicant(ref, applicant()) |> should.be_true
++}
++
++pub fn duplicate_of_applicant_clean_is_false_test() {
++  fraud.duplicate_of_applicant(clean_landlord_ref(), applicant())
++  |> should.be_false
++}
++
++// -- ip / ua match semantics --------------------------------------------------
++
++pub fn ip_matches_equal_is_true_test() {
++  fraud.ip_matches("203.0.113.10", "203.0.113.10") |> should.equal(Some(True))
++}
++
++pub fn ip_matches_different_is_false_test() {
++  fraud.ip_matches("203.0.113.10", "198.51.100.9") |> should.equal(Some(False))
++}
++
++pub fn ip_matches_missing_is_null_test() {
++  fraud.ip_matches("", "203.0.113.10") |> should.equal(None)
++  fraud.ip_matches("203.0.113.10", "") |> should.equal(None)
++}
++
++pub fn ua_matches_semantics_mirror_ip_test() {
++  // Weak (UA compare), but the match semantics mirror ip_matches.
++  fraud.ua_matches("Mozilla/5.0 (x)", "Mozilla/5.0 (x)")
++  |> should.equal(Some(True))
++  fraud.ua_matches("Mozilla/5.0 (x)", "curl/8.0") |> should.equal(Some(False))
++  fraud.ua_matches("", "Mozilla/5.0 (x)") |> should.equal(None)
++}
++
++// -- carry_line_type (D3: carry the creation-time line_type at submission) ----
++
++pub fn carry_line_type_empty_is_unknown_test() {
++  // A pre-rc3-7 row, or a creation stamp that failed -> Unknown (honest).
++  fraud.carry_line_type("") |> should.equal(lookup.Unknown)
++}
++
++pub fn carry_line_type_valid_maps_back_test() {
++  let signals =
++    "{\"line_type\":\"mobile\",\"form_session\":null,\"geo_vs_claimed_property\":\"unknown\"}"
++  fraud.carry_line_type(signals) |> should.equal(lookup.Mobile)
++}
++
++pub fn carry_line_type_missing_key_is_unknown_test() {
++  // No line_type key -> Unknown (honest — never fabricated).
++  fraud.carry_line_type("{\"form_session\":null}")
++  |> should.equal(lookup.Unknown)
++}
++
++pub fn carry_line_type_unparseable_is_unknown_test() {
++  fraud.carry_line_type("not json at all") |> should.equal(lookup.Unknown)
++}
+diff --git a/server/test/reference_checks/lookup_test.gleam b/server/test/reference_checks/lookup_test.gleam
+index c9239b94..48be4dbd 100644
+--- a/server/test/reference_checks/lookup_test.gleam
++++ b/server/test/reference_checks/lookup_test.gleam
+@@ -99,3 +99,28 @@ pub fn voip_false_for_mobile_test() {
+ pub fn voip_false_for_unknown_test() {
+   lookup.voip(line_type: lookup.Unknown) |> should.be_false
+ }
++
++// -- line_type_to_string / line_type_from_string (rc3-7 fraud signal) --------
++
++pub fn line_type_to_string_all_variants_test() {
++  lookup.line_type_to_string(lookup.Mobile) |> should.equal("mobile")
++  lookup.line_type_to_string(lookup.Landline) |> should.equal("landline")
++  lookup.line_type_to_string(lookup.VoIP) |> should.equal("voip")
++  lookup.line_type_to_string(lookup.Unknown) |> should.equal("unknown")
++}
++
++pub fn line_type_from_string_round_trips_test() {
++  // Every emitted signal string maps back to its LineType.
++  lookup.line_type_from_string("mobile") |> should.equal(lookup.Mobile)
++  lookup.line_type_from_string("landline") |> should.equal(lookup.Landline)
++  lookup.line_type_from_string("voip") |> should.equal(lookup.VoIP)
++  lookup.line_type_from_string("unknown") |> should.equal(lookup.Unknown)
++}
++
++pub fn line_type_from_string_unmapped_is_unknown_test() {
++  // The honesty-critical fallback: any unmapped string (the raw Twilio
++  // "fixedVoIP", garbage, "") -> Unknown — never fabricated.
++  lookup.line_type_from_string("fixedVoIP") |> should.equal(lookup.Unknown)
++  lookup.line_type_from_string("nonsense") |> should.equal(lookup.Unknown)
++  lookup.line_type_from_string("") |> should.equal(lookup.Unknown)
++}
+diff --git a/server/test/reference_checks/result_test.gleam b/server/test/reference_checks/result_test.gleam
+index 04ee72d8..5da4f427 100644
+--- a/server/test/reference_checks/result_test.gleam
++++ b/server/test/reference_checks/result_test.gleam
+@@ -36,7 +36,9 @@ fn ctx() -> result.StructureContext {
+     ref_slot: "landlord_ref",
+     owner_label: "primary",
+     attempts: "[]",
+-    focus_seconds: 250,
++    // rc3-7 carries the pre-built fraud_signals on ctx; the structurer embeds
++    // it opaquely. Tests assert on the verification block, not fraud.
++    fraud_signals: json.object([]),
+   )
+ }
+ 

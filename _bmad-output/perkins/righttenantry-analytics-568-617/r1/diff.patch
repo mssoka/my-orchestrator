@@ -1,0 +1,1167 @@
+diff --git a/client/src/client.gleam b/client/src/client.gleam
+index 2f05d951..95c2deed 100644
+--- a/client/src/client.gleam
++++ b/client/src/client.gleam
+@@ -2035,6 +2035,11 @@ fn update_inner(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+ 
+     // -- Google OAuth ---------------------------------------------------------
+     UserClickedGoogleSignIn -> {
++      // Issue #617: the Google flow is a full-page redirect to
++      // accounts.google.com and back, which destroys the SPA's in-memory
++      // first-touch params. They ride this initiate URL as a query string;
++      // the server persists them in a short-lived signed cookie and reads
++      // them back when the callback lands.
+       let oauth_uri =
+         gleam_uri.Uri(
+           scheme: None,
+@@ -2042,7 +2047,10 @@ fn update_inner(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+           host: None,
+           port: None,
+           path: "/auth/oauth/google",
+-          query: None,
++          query: case model.first_touch_params {
++            [] -> None
++            params -> Some(first_touch.to_query_string(params))
++          },
+           fragment: None,
+         )
+       #(model, modem.load(oauth_uri))
+diff --git a/client/src/helpers/first_touch.gleam b/client/src/helpers/first_touch.gleam
+index 99b6d5ea..311de624 100644
+--- a/client/src/helpers/first_touch.gleam
++++ b/client/src/helpers/first_touch.gleam
+@@ -44,3 +44,12 @@ pub fn from_uri(uri: gleam_uri.Uri) -> List(#(String, String)) {
+     }
+   })
+ }
++
++/// Serialize first-touch pairs as a URL query string for the OAuth
++/// initiate request (issue #617). The Google flow is a full-page redirect
++/// that destroys the SPA's in-memory params, so they ride the
++/// `/auth/oauth/google` URL and the server persists them in a short-lived
++/// signed cookie, read back after the callback.
++pub fn to_query_string(pairs: List(#(String, String))) -> String {
++  gleam_uri.query_to_string(pairs)
++}
+diff --git a/client/test/first_touch_test.gleam b/client/test/first_touch_test.gleam
+index 57d45cd4..220342d6 100644
+--- a/client/test/first_touch_test.gleam
++++ b/client/test/first_touch_test.gleam
+@@ -49,3 +49,19 @@ pub fn internal_content_marker_is_captured_verbatim_test() {
+   |> first_touch.from_uri
+   |> should.equal([#("utm_source", "content"), #("utm_medium", "footer")])
+ }
++
++pub fn to_query_string_serializes_pairs_for_the_oauth_url_test() {
++  // Issue #617: the pairs the SPA holds in memory ride the
++  // `/auth/oauth/google` initiate URL so the server can persist them across
++  // the Google redirect.
++  first_touch.to_query_string([
++    #("utm_source", "google"),
++    #("utm_medium", "cpc"),
++    #("utm_campaign", "spring 2026"),
++  ])
++  |> should.equal("utm_source=google&utm_medium=cpc&utm_campaign=spring%202026")
++}
++
++pub fn to_query_string_empty_pairs_yields_empty_string_test() {
++  first_touch.to_query_string([]) |> should.equal("")
++}
+diff --git a/server/src/auth/attribution.gleam b/server/src/auth/attribution.gleam
+index fdb50f98..77db4d48 100644
+--- a/server/src/auth/attribution.gleam
++++ b/server/src/auth/attribution.gleam
+@@ -72,7 +72,7 @@ pub fn first_touch_set_once(ft: FirstTouch) -> List(#(String, json.Json)) {
+     #("first_touch_msclkid", ft.msclkid),
+   ]
+   |> list.filter_map(fn(pair) {
+-    case clamp(pair.1) {
++    case clamp_value(pair.1) {
+       "" -> Error(Nil)
+       value -> Ok(#(pair.0, json.string(value)))
+     }
+@@ -83,7 +83,12 @@ fn is_internal_source(source: String) -> Bool {
+   string.lowercase(string.trim(source)) == internal_source
+ }
+ 
+-fn clamp(raw: String) -> String {
++/// Trim and clamp a raw first-touch value to `max_value_len`. Public so the
++/// OAuth first-touch cookie writer (`auth/first_touch_cookie`) applies the
++/// same cap at cookie-write time — the cookie travels in a browser header,
++/// so an attacker-controlled `utm_campaign` must be bounded there too, not
++/// just at `$set_once` build time.
++pub fn clamp_value(raw: String) -> String {
+   raw
+   |> string.trim
+   |> string.slice(0, max_value_len)
+diff --git a/server/src/auth/auth_handler.gleam b/server/src/auth/auth_handler.gleam
+index 341b66d2..79534d9e 100644
+--- a/server/src/auth/auth_handler.gleam
++++ b/server/src/auth/auth_handler.gleam
+@@ -7,6 +7,7 @@ import audit/tx_error
+ import auth/attribution
+ import auth/cookie_names
+ import auth/csrf
++import auth/first_touch_cookie
+ import auth/password_reset_handler
+ import auth/pkce
+ import auth/provider
+@@ -506,9 +507,18 @@ fn process_login(
+               |> set_landlord_external_id_cookie(req, l.id)
+             }
+             _ -> {
+-              // Supabase auth succeeded but no landlord row — auto-create
++              // Supabase auth succeeded but no landlord row — auto-create.
++              // Analytics decision (issue #568): this is a backfill, NOT a
++              // first signup — the Supabase auth user already existed (the
++              // password login just succeeded against it), so the landlord
++              // row is closing a gap, not registering a new account.
++              // `signup_completed` is deliberately not fired here; the
++              // account's true signup already emitted it (or predates
++              // tracking). The line below is the decision's log/metric.
+               wisp.log_info(
+-                "Login: auto-creating landlord for auth_user_id " <> user_id,
++                "Login: auto-creating landlord for auth_user_id "
++                <> user_id
++                <> " — backfill for a pre-existing Supabase auth user; signup_completed deliberately not fired (issue #568)",
+               )
+               case
+                 sql.create_landlord(
+@@ -975,14 +985,32 @@ pub fn handle_oauth_initiate(
+       let oauth_url =
+         supabase.generate_oauth_url(config, challenge, redirect_url, provider)
+ 
+-      wisp.redirect(oauth_url)
+-      |> wisp.set_cookie(
+-        req,
+-        cookie_names.pkce(),
+-        verifier,
+-        wisp.Signed,
+-        pkce_max_age,
+-      )
++      let response =
++        wisp.redirect(oauth_url)
++        |> wisp.set_cookie(
++          req,
++          cookie_names.pkce(),
++          verifier,
++          wisp.Signed,
++          pkce_max_age,
++        )
++      // Issue #617: the SPA appends the first-touch params it captured off
++      // the landing URL (in-memory, #466) to this initiate request; persist
++      // them in a short-lived signed cookie so they survive the full-page
++      // bounce to accounts.google.com and back. No params (organic landing)
++      // → no cookie — the callback then falls back to `provider=google`.
++      case first_touch_cookie.from_initiate_query(wisp.get_query(req)) {
++        [] -> response
++        pairs ->
++          response
++          |> wisp.set_cookie(
++            req,
++            cookie_names.first_touch(),
++            first_touch_cookie.cookie_value(pairs),
++            wisp.Signed,
++            first_touch_cookie.max_age,
++          )
++      }
+     }
+   }
+ }
+@@ -995,6 +1023,7 @@ pub fn handle_oauth_callback(
+   sentry: Sentry,
+   resend_api_key: String,
+   posthog: PostHog,
++  meta: Meta,
+ ) -> Response {
+   let query_params = wisp.get_query(req)
+ 
+@@ -1008,6 +1037,7 @@ pub fn handle_oauth_callback(
+       wisp.log_info("OAuth cancelled or errored: " <> error_code <> description)
+       wisp.redirect("/login")
+       |> wisp.set_cookie(req, cookie_names.pkce(), "", wisp.Signed, 0)
++      |> first_touch_cookie.clear_cookie(req)
+     }
+     Error(_) ->
+       process_oauth_callback(
+@@ -1018,6 +1048,7 @@ pub fn handle_oauth_callback(
+         sentry,
+         resend_api_key,
+         posthog,
++        meta,
+       )
+   }
+ }
+@@ -1030,6 +1061,7 @@ fn process_oauth_callback(
+   sentry: Sentry,
+   resend_api_key: String,
+   posthog: PostHog,
++  meta: Meta,
+ ) -> Response {
+   // Extract authorization code
+   case list.key_find(query_params, "code") {
+@@ -1037,6 +1069,7 @@ fn process_oauth_callback(
+       wisp.log_warning("OAuth callback missing code parameter")
+       wisp.redirect("/login")
+       |> wisp.set_cookie(req, cookie_names.pkce(), "", wisp.Signed, 0)
++      |> first_touch_cookie.clear_cookie(req)
+     }
+     Ok(code) -> {
+       // Retrieve PKCE verifier from cookie
+@@ -1045,6 +1078,7 @@ fn process_oauth_callback(
+           wisp.log_warning("OAuth callback: PKCE cookie missing or expired")
+           wisp.redirect("/login")
+           |> wisp.set_cookie(req, cookie_names.pkce(), "", wisp.Signed, 0)
++          |> first_touch_cookie.clear_cookie(req)
+         }
+         Ok(verifier) -> {
+           // Exchange code for tokens
+@@ -1053,6 +1087,7 @@ fn process_oauth_callback(
+               wisp.log_error("OAuth token exchange failed: " <> err)
+               wisp.redirect("/login")
+               |> wisp.set_cookie(req, cookie_names.pkce(), "", wisp.Signed, 0)
++              |> first_touch_cookie.clear_cookie(req)
+             }
+             Ok(token_resp) ->
+               complete_oauth_flow(
+@@ -1063,6 +1098,7 @@ fn process_oauth_callback(
+                 config.secret_key,
+                 resend_api_key,
+                 posthog,
++                meta,
+               )
+           }
+         }
+@@ -1084,7 +1120,16 @@ pub fn complete_oauth_flow(
+   secret_key: String,
+   resend_api_key: String,
+   posthog: PostHog,
++  meta: Meta,
+ ) -> Response {
++  // Recover first-touch attribution persisted before the Google bounce
++  // (issue #617): the SPA's in-memory UTM/click-id params are destroyed by
++  // the full-page redirect, so the initiate handler stored them in a
++  // short-lived signed cookie. An organic landing (or absent/expired
++  // cookie) reads as an all-empty `FirstTouch`, which the set_once
++  // fallback turns into `provider=google`.
++  let first_touch = first_touch_cookie.read_cookie(req)
++
+   // Create or update landlord via ON CONFLICT upsert
+   case uuid.from_string(token_resp.user_id) {
+     Error(_) -> {
+@@ -1093,6 +1138,7 @@ pub fn complete_oauth_flow(
+       // dangling GoTrue identity bound to a token we can't store.
+       capture_signup_orphan(sentry, "oauth_invalid_user_id", token_resp.user_id)
+       wisp.redirect("/login")
++      |> first_touch_cookie.clear_cookie(req)
+     }
+     Ok(auth_uuid) -> {
+       let name = case token_resp.user_name {
+@@ -1114,31 +1160,21 @@ pub fn complete_oauth_flow(
+           // cookie that a cold post-auth load can outlive). Fire the
+           // same identify + capture pair the signup path uses so every
+           // Google sign-in lands regardless of the bridge. First-touch
+-          // attribution (issue #466) can't survive the OAuth redirect —
+-          // the SPA's in-memory UTM params are lost in the full-page
+-          // navigation — so `$set_once` is empty until first-touch is
+-          // persisted across the redirect (PR notes). The capture event
+-          // is OAuth-scoped by construction: email/password logins
+-          // deliberately skip capture (identify counts as activity, see
+-          // process_login), so `login_succeeded` must not be read as a
+-          // cross-provider login funnel without a follow-up on the
+-          // email path (PR notes). `row.is_new` is the upsert's own
+-          // insert-vs-update flag ((xmax = 0) in RETURNING) — atomic,
+-          // no check-then-act race, no extra round-trip.
++          // attribution (#466) is recovered from the cookie set before
++          // the bounce (issue #617), or falls back to `provider=google`
++          // when nothing survived. The capture event is OAuth-scoped by
++          // construction: email/password logins deliberately skip capture
++          // (identify counts as activity, see process_login), so
++          // `login_succeeded` must not be read as a cross-provider login
++          // funnel without a follow-up on the email path (PR notes).
++          // `row.is_new` is the upsert's own insert-vs-update flag
++          // ((xmax = 0) in RETURNING) — atomic, no check-then-act race,
++          // no extra round-trip.
+           posthog_client.identify_with_set_once(
+             posthog,
+             row.id,
+             [#("email", json.string(row.email))],
+-            attribution.first_touch_set_once(attribution.FirstTouch(
+-              utm_source: "",
+-              utm_medium: "",
+-              utm_campaign: "",
+-              utm_content: "",
+-              utm_term: "",
+-              gclid: "",
+-              fbclid: "",
+-              msclkid: "",
+-            )),
++            first_touch_cookie.set_once_with_fallback(first_touch),
+           )
+           posthog_client.capture(
+             posthog,
+@@ -1149,6 +1185,38 @@ pub fn complete_oauth_flow(
+             },
+             [],
+           )
++          // Meta CAPI CompleteRegistration — consent-gated (Plan §5) and
++          // only on a true insert: a returning Google sign-in (upsert
++          // conflict) is a login, not a signup, and fires nothing
++          // (fire-once contract, issue #568). The browser-side Pixel
++          // dispatch can't run here — the flow ends in a full-page
++          // redirect with no SPA to echo the event_id — so CAPI alone
++          // carries the event; Meta's external_id hash keeps cross-event
++          // identity.
++          case row.is_new {
++            True -> {
++              // event_id has no consumer on this path (no SPA body to echo
++              // it to — the flow ends in a full-page redirect), so it is
++              // logged for correlation/debugging only.
++              case
++                dispatch_signup_meta(
++                  meta,
++                  req,
++                  row.id,
++                  string.lowercase(string.trim(row.email)),
++                )
++              {
++                Some(event_id) ->
++                  wisp.log_debug(
++                    "OAuth signup Meta CompleteRegistration fired, event_id "
++                    <> event_id,
++                  )
++                None -> Nil
++              }
++              Nil
++            }
++            False -> Nil
++          }
+           // Cache session to avoid Supabase round-trip on first request
+           session_cache.put(
+             token_resp.access_token,
+@@ -1176,6 +1244,7 @@ pub fn complete_oauth_flow(
+           |> set_landlord_identify_cookie(req, row.id)
+           |> set_landlord_external_id_cookie(req, row.id)
+           |> wisp.set_cookie(req, cookie_names.pkce(), "", wisp.Signed, 0)
++          |> first_touch_cookie.clear_cookie(req)
+         }
+         Error(err) -> {
+           let err_str = string.inspect(err)
+@@ -1186,6 +1255,7 @@ pub fn complete_oauth_flow(
+             token_resp.user_id,
+           )
+           wisp.redirect("/login")
++          |> first_touch_cookie.clear_cookie(req)
+         }
+         _ -> {
+           wisp.log_error("OAuth: unexpected landlord upsert result")
+@@ -1195,6 +1265,7 @@ pub fn complete_oauth_flow(
+             token_resp.user_id,
+           )
+           wisp.redirect("/login")
++          |> first_touch_cookie.clear_cookie(req)
+         }
+       }
+     }
+diff --git a/server/src/auth/cookie_names.gleam b/server/src/auth/cookie_names.gleam
+index a0528df8..703f108e 100644
+--- a/server/src/auth/cookie_names.gleam
++++ b/server/src/auth/cookie_names.gleam
+@@ -55,6 +55,17 @@ pub fn pkce() -> String {
+   with_host_prefix("rt_pkce")
+ }
+ 
++/// First-touch attribution carried across the Google OAuth full-page
++/// redirect (issue #617). The SPA's in-memory UTM/click-id params are
++/// destroyed by the bounce to accounts.google.com, so
++/// `handle_oauth_initiate` persists them in this short-lived signed cookie
++/// and `complete_oauth_flow` reads them back after the callback. Signed
++/// (server-only write/read) and short-lived (same max-age as the PKCE
++/// verifier) — same class as `pkce()`.
++pub fn first_touch() -> String {
++  with_host_prefix("rt_first_touch")
++}
++
+ /// Cookie name used by consent.js to persist the user's banner choice.
+ /// Read server-side by `consent/consent_check.marketing_granted` so server
+ /// flows (Meta CAPI, marketing-cookie writers) can honour the user's
+diff --git a/server/src/auth/first_touch_cookie.gleam b/server/src/auth/first_touch_cookie.gleam
+new file mode 100644
+index 00000000..465ee6fe
+--- /dev/null
++++ b/server/src/auth/first_touch_cookie.gleam
+@@ -0,0 +1,144 @@
++//// First-touch persistence across the Google OAuth redirect (issue #617).
++////
++//// The SPA captures UTM/click-id params off the landing URL and holds them
++//// in memory (#466). The Google OAuth flow is a full-page redirect to
++//// accounts.google.com and back that destroys that in-memory state, so:
++////
++////   1. the SPA appends the params to the `/auth/oauth/google` initiate URL,
++////   2. `auth_handler.handle_oauth_initiate` extracts them here and persists
++////      them in a short-lived signed cookie (`rt_first_touch`), and
++////   3. `auth_handler.complete_oauth_flow` reads the cookie back after the
++////      callback and records them as PostHog `$set_once` first-touch person
++////      properties — falling back to `provider=google` when nothing
++////      survived (an organic OAuth landing).
++////
++//// Consent-independent: same first-party URL-param basis as #466's capture.
++//// The cookie is signed (server-only write/read), short-lived (same max-age
++//// as the PKCE verifier), and cleared on every terminal OAuth response.
++
++import auth/attribution
++import auth/cookie_names
++import gleam/json
++import gleam/list
++import gleam/uri
++import wisp.{type Request, type Response}
++
++/// Max age for the first-touch cookie. Mirrors the PKCE verifier's window:
++/// both are single-flow values, and 5 minutes covers the slowest Google
++/// round-trip while expiring before any follow-up navigation could reuse
++/// stale attribution.
++pub const max_age: Int = 300
++
++/// Keys the first-touch cookie may carry — mirrors the client extractor
++/// (`client/src/helpers/first_touch.gleam`) and the signup body decoder
++/// (`auth_handler.signup_decoder`).
++const keys = [
++  "utm_source",
++  "utm_medium",
++  "utm_campaign",
++  "utm_content",
++  "utm_term",
++  "gclid",
++  "fbclid",
++  "msclkid",
++]
++
++/// Extract the first-touch params from the OAuth initiate request's query
++/// (the SPA appends the params it captured in memory). Only the keys the
++/// signup body understands are accepted; each value is trimmed and clamped
++/// to `attribution.max_value_len` (the same cap applied at `$set_once`
++/// write time) so an attacker-controlled `utm_campaign` can't bloat the
++/// signed cookie past the browser's ~4KB header budget. Blank values are
++/// dropped, mirroring the client extractor. Returns `[]` for an organic
++/// landing with no campaign params.
++pub fn from_initiate_query(
++  query: List(#(String, String)),
++) -> List(#(String, String)) {
++  list.filter_map(keys, fn(key) {
++    case list.find(query, fn(pair) { pair.0 == key }) {
++      Ok(#(_, raw)) ->
++        case attribution.clamp_value(raw) {
++          "" -> Error(Nil)
++          value -> Ok(#(key, value))
++        }
++      Error(_) -> Error(Nil)
++    }
++  })
++}
++
++/// Serialize first-touch pairs for the signed cookie payload. Stored as a
++/// percent-encoded query string — the same wire shape the landing URL
++/// used — so parsing back is exactly `uri.parse_query`.
++pub fn cookie_value(pairs: List(#(String, String))) -> String {
++  uri.query_to_string(pairs)
++}
++
++/// Read the first-touch cookie off the callback request and turn it into
++/// the `FirstTouch` the identify call needs. An absent / malformed /
++/// expired cookie reads as an all-empty `FirstTouch` (the caller's
++/// provider fallback then applies).
++pub fn read_cookie(req: Request) -> attribution.FirstTouch {
++  case wisp.get_cookie(req, cookie_names.first_touch(), wisp.Signed) {
++    Error(_) -> empty()
++    Ok(raw) ->
++      case uri.parse_query(raw) {
++        Error(_) -> empty()
++        Ok(pairs) -> from_pairs(pairs)
++      }
++  }
++}
++
++/// The `$set_once` first-touch properties for an OAuth sign-in, with the
++/// issue #617 fallback: when no first-touch param survived the redirect
++/// (organic landing, content-only marker, or absent/expired cookie), record
++/// what exists instead of nothing — `provider=google` — so every OAuth
++/// signup is at least attributable to its sign-in method rather than
++/// reading as fully unattributed. `$set_once` semantics make this a no-op
++/// for returning sign-ins (their original values are already locked).
++pub fn set_once_with_fallback(
++  first_touch: attribution.FirstTouch,
++) -> List(#(String, json.Json)) {
++  case attribution.first_touch_set_once(first_touch) {
++    [] -> [#("provider", json.string("google"))]
++    set_once -> set_once
++  }
++}
++
++/// Expire the first-touch cookie. Called on every terminal OAuth response
++/// (success and error alike) so a stale attribution can never leak into a
++/// later attempt inside the 5-minute window.
++pub fn clear_cookie(response: Response, req: Request) -> Response {
++  wisp.set_cookie(response, req, cookie_names.first_touch(), "", wisp.Signed, 0)
++}
++
++fn empty() -> attribution.FirstTouch {
++  attribution.FirstTouch(
++    utm_source: "",
++    utm_medium: "",
++    utm_campaign: "",
++    utm_content: "",
++    utm_term: "",
++    gclid: "",
++    fbclid: "",
++    msclkid: "",
++  )
++}
++
++fn from_pairs(pairs: List(#(String, String))) -> attribution.FirstTouch {
++  let value = fn(key) {
++    case list.key_find(pairs, key) {
++      Ok(v) -> v
++      Error(_) -> ""
++    }
++  }
++  attribution.FirstTouch(
++    utm_source: value("utm_source"),
++    utm_medium: value("utm_medium"),
++    utm_campaign: value("utm_campaign"),
++    utm_content: value("utm_content"),
++    utm_term: value("utm_term"),
++    gclid: value("gclid"),
++    fbclid: value("fbclid"),
++    msclkid: value("msclkid"),
++  )
++}
+diff --git a/server/src/auth/session_middleware.gleam b/server/src/auth/session_middleware.gleam
+index d852fa04..af4c9298 100644
+--- a/server/src/auth/session_middleware.gleam
++++ b/server/src/auth/session_middleware.gleam
+@@ -89,10 +89,18 @@ fn lookup_and_handle(
+           |> transform_response
+         }
+         _ -> {
+-          // Auth succeeded but no landlord row — auto-create
++          // Auth succeeded but no landlord row — auto-create.
++          // Analytics decision (issue #568): backfill, NOT a first signup —
++          // the Supabase auth user already existed (the session cookie
++          // proves it), so `signup_completed` is deliberately not fired
++          // here; the account's true signup already emitted it (or
++          // predates tracking). The line below is the decision's
++          // log/metric.
+           let fallback_email = option.unwrap(email_hint, "unknown")
+           wisp.log_info(
+-            "Session: auto-creating landlord for auth_user_id " <> auth_user_id,
++            "Session: auto-creating landlord for auth_user_id "
++            <> auth_user_id
++            <> " — backfill for a pre-existing Supabase auth user; signup_completed deliberately not fired (issue #568)",
+           )
+           case
+             sql.create_landlord(
+diff --git a/server/src/router.gleam b/server/src/router.gleam
+index a485188c..f17173fe 100644
+--- a/server/src/router.gleam
++++ b/server/src/router.gleam
+@@ -144,6 +144,7 @@ pub fn handle_request(ctx: Context, req: Request) -> Response {
+         ctx.config.sentry,
+         ctx.config.resend_api_key,
+         ctx.config.posthog,
++        ctx.config.meta,
+       )
+ 
+     // Auth routes (public — no session auth required)
+diff --git a/server/test/auth/auth_test.gleam b/server/test/auth/auth_test.gleam
+index 13e962a9..d2955a7b 100644
+--- a/server/test/auth/auth_test.gleam
++++ b/server/test/auth/auth_test.gleam
+@@ -1,11 +1,15 @@
+ //// Tests for auth_handler OAuth provider validation
+ 
+ import auth/auth_handler
++import auth/cookie_names
+ import auth/types.{SupabaseConfig}
+ import gleam/erlang/process
+ import gleam/http
++import gleam/list
++import gleam/string
+ import gleeunit/should
+ import pog
++import wisp
+ import wisp/simulate
+ 
+ pub fn oauth_initiate_rejects_unsupported_provider_test() {
+@@ -62,6 +66,78 @@ pub fn oauth_initiate_rejects_facebook_provider_test() {
+   response.status |> should.equal(404)
+ }
+ 
++// -- First-touch cookie on the initiate redirect (issue #617) -----------------
++
++fn find_set_cookie(resp: wisp.Response, name: String) -> Result(String, Nil) {
++  resp.headers
++  |> list.find_map(fn(pair) {
++    let #(key, value) = pair
++    case
++      string.lowercase(key) == "set-cookie"
++      && string.starts_with(value, name <> "=")
++    {
++      True -> Ok(value)
++      False -> Error(Nil)
++    }
++  })
++}
++
++pub fn oauth_initiate_sets_first_touch_cookie_test() {
++  // The SPA appends the landing-URL first-touch params to the initiate URL
++  // (issue #617); the handler persists them in the signed cookie that
++  // survives the bounce to accounts.google.com.
++  let req =
++    simulate.request(
++      http.Get,
++      "/auth/oauth/google?utm_source=google&utm_campaign=spring&ref=friend",
++    )
++  let config =
++    SupabaseConfig(
++      url: "http://localhost",
++      anon_key: "test-key",
++      secret_key: "test-secret",
++    )
++  let response =
++    auth_handler.handle_oauth_initiate(
++      req,
++      config,
++      "http://localhost/callback",
++      "google",
++    )
++  response.status |> should.equal(303)
++  let assert Ok(cookie) = find_set_cookie(response, cookie_names.first_touch())
++  // Signed cookie — the value is base64url payload, not the raw params.
++  string.starts_with(cookie, cookie_names.first_touch() <> "=")
++  |> should.be_true
++  string.contains(cookie, "Max-Age=300")
++  |> should.be_true
++}
++
++pub fn oauth_initiate_omits_first_touch_cookie_for_organic_landing_test() {
++  // No params (organic landing) → no cookie; the callback falls back to
++  // `provider=google` rather than carrying stale or empty attribution.
++  let req = simulate.request(http.Get, "/auth/oauth/google")
++  let config =
++    SupabaseConfig(
++      url: "http://localhost",
++      anon_key: "test-key",
++      secret_key: "test-secret",
++    )
++  let response =
++    auth_handler.handle_oauth_initiate(
++      req,
++      config,
++      "http://localhost/callback",
++      "google",
++    )
++  response.status |> should.equal(303)
++  find_set_cookie(response, cookie_names.first_touch())
++  |> should.be_error
++  // The PKCE verifier cookie is still set — the flow is unchanged.
++  find_set_cookie(response, cookie_names.pkce())
++  |> should.be_ok
++}
++
+ // -- handle_email_confirm recovery branch -------------------------------------
+ 
+ pub fn email_confirm_recovery_missing_token_redirects_to_login_test() {
+diff --git a/server/test/auth/first_touch_cookie_test.gleam b/server/test/auth/first_touch_cookie_test.gleam
+new file mode 100644
+index 00000000..aba5f2b7
+--- /dev/null
++++ b/server/test/auth/first_touch_cookie_test.gleam
+@@ -0,0 +1,190 @@
++//// Unit tests for the OAuth first-touch cookie round-trip (issue #617).
++////
++//// The cookie's pure functions (extract → serialize → parse) are pinned
++//// here without a browser or DB; the end-to-end read through
++//// `complete_oauth_flow` is pinned in the integration suite.
++
++import auth/attribution
++import auth/cookie_names
++import auth/first_touch_cookie
++import gleam/http
++import gleam/json
++import gleam/list
++import gleam/string
++import gleeunit/should
++import wisp
++import wisp/simulate
++
++// -- from_initiate_query ------------------------------------------------------
++
++pub fn from_initiate_query_extracts_known_keys_in_key_order_test() {
++  // Output is in `keys` order (matches the signup body decoder), not query
++  // order; unknown keys (ref) are dropped; the first occurrence of a
++  // duplicate key wins.
++  let query = [
++    #("gclid", "Cj0KCA"),
++    #("ref", "some_friend"),
++    #("utm_source", "google"),
++    #("utm_source", "dup"),
++    #("utm_campaign", "spring_2026"),
++  ]
++  first_touch_cookie.from_initiate_query(query)
++  |> should.equal([
++    #("utm_source", "google"),
++    #("utm_campaign", "spring_2026"),
++    #("gclid", "Cj0KCA"),
++  ])
++}
++
++pub fn from_initiate_query_returns_empty_for_organic_landing_test() {
++  first_touch_cookie.from_initiate_query([])
++  |> should.equal([])
++  first_touch_cookie.from_initiate_query([#("ref", "friend")])
++  |> should.equal([])
++}
++
++pub fn from_initiate_query_drops_blank_values_test() {
++  first_touch_cookie.from_initiate_query([
++    #("utm_source", "   "),
++    #("utm_campaign", "spring"),
++  ])
++  |> should.equal([#("utm_campaign", "spring")])
++}
++
++pub fn from_initiate_query_clamps_values_to_max_value_len_test() {
++  let long = string.repeat("a", 300)
++  let result = first_touch_cookie.from_initiate_query([#("utm_campaign", long)])
++  result
++  |> should.equal([#("utm_campaign", string.repeat("a", 200))])
++}
++
++// -- cookie_value + read_cookie round-trip ------------------------------------
++
++pub fn cookie_round_trip_preserves_params_test() {
++  let pairs = [
++    #("utm_source", "google"),
++    #("utm_medium", "cpc"),
++    #("utm_campaign", "spring 2026"),
++    #("gclid", "abc.123"),
++  ]
++  let req =
++    simulate.request(http.Get, "/auth/callback")
++    |> simulate.cookie(
++      cookie_names.first_touch(),
++      first_touch_cookie.cookie_value(pairs),
++      wisp.Signed,
++    )
++  first_touch_cookie.read_cookie(req)
++  |> should.equal(attribution.FirstTouch(
++    utm_source: "google",
++    utm_medium: "cpc",
++    utm_campaign: "spring 2026",
++    utm_content: "",
++    utm_term: "",
++    gclid: "abc.123",
++    fbclid: "",
++    msclkid: "",
++  ))
++}
++
++pub fn read_cookie_without_cookie_yields_empty_first_touch_test() {
++  let req = simulate.request(http.Get, "/auth/callback")
++  first_touch_cookie.read_cookie(req)
++  |> should.equal(empty_first_touch())
++}
++
++pub fn read_cookie_rejects_tampered_value_test() {
++  // A cookie whose signature doesn't verify must read as empty, never as
++  // attacker-supplied attribution.
++  let req =
++    simulate.request(http.Get, "/auth/callback")
++    |> simulate.header(
++      "cookie",
++      cookie_names.first_touch() <> "=utm_source=attacker",
++    )
++  first_touch_cookie.read_cookie(req)
++  |> should.equal(empty_first_touch())
++}
++
++// -- set_once_with_fallback ---------------------------------------------------
++
++pub fn set_once_with_fallback_records_provider_when_first_touch_empty_test() {
++  first_touch_cookie.set_once_with_fallback(empty_first_touch())
++  |> should.equal([#("provider", json.string("google"))])
++}
++
++pub fn set_once_with_fallback_keeps_real_first_touch_test() {
++  first_touch_cookie.set_once_with_fallback(attribution.FirstTouch(
++    utm_source: "google",
++    utm_medium: "cpc",
++    utm_campaign: "spring",
++    utm_content: "",
++    utm_term: "",
++    gclid: "abc",
++    fbclid: "",
++    msclkid: "",
++  ))
++  |> should.equal([
++    #("first_touch_utm_source", json.string("google")),
++    #("first_touch_utm_medium", json.string("cpc")),
++    #("first_touch_utm_campaign", json.string("spring")),
++    #("first_touch_gclid", json.string("abc")),
++  ])
++}
++
++pub fn set_once_with_fallback_falls_back_for_content_only_marker_test() {
++  // utm_source=content is masked server-side (it's a navigation, not an
++  // acquisition source) — so the fallback still applies.
++  first_touch_cookie.set_once_with_fallback(attribution.FirstTouch(
++    utm_source: "content",
++    utm_medium: "",
++    utm_campaign: "",
++    utm_content: "",
++    utm_term: "",
++    gclid: "",
++    fbclid: "",
++    msclkid: "",
++  ))
++  |> should.equal([#("provider", json.string("google"))])
++}
++
++// -- clear_cookie -------------------------------------------------------------
++
++pub fn clear_cookie_expires_the_cookie_test() {
++  let req = simulate.request(http.Get, "/auth/callback")
++  let resp =
++    wisp.redirect("/dashboard")
++    |> first_touch_cookie.clear_cookie(req)
++  let assert Ok(set_cookie) = find_set_cookie(resp, cookie_names.first_touch())
++  string.contains(set_cookie, "Max-Age=0")
++  |> should.be_true
++}
++
++// -- Helpers ------------------------------------------------------------------
++
++fn empty_first_touch() -> attribution.FirstTouch {
++  attribution.FirstTouch(
++    utm_source: "",
++    utm_medium: "",
++    utm_campaign: "",
++    utm_content: "",
++    utm_term: "",
++    gclid: "",
++    fbclid: "",
++    msclkid: "",
++  )
++}
++
++fn find_set_cookie(resp: wisp.Response, name: String) -> Result(String, Nil) {
++  resp.headers
++  |> list.find_map(fn(pair) {
++    let #(key, value) = pair
++    case
++      string.lowercase(key) == "set-cookie"
++      && string.starts_with(value, name <> "=")
++    {
++      True -> Ok(value)
++      False -> Error(Nil)
++    }
++  })
++}
+diff --git a/server/test/integration/auth_integration_test.gleam b/server/test/integration/auth_integration_test.gleam
+index 6125f779..611f09da 100644
+--- a/server/test/integration/auth_integration_test.gleam
++++ b/server/test/integration/auth_integration_test.gleam
+@@ -15,9 +15,11 @@ import gleam/list
+ import gleam/option
+ import gleam/result
+ import gleam/string
++import gleam/uri
+ import gleeunit/should
+ import integration/helpers.{setup}
+ import integration/test_db
++import meta/meta_client
+ import pog
+ import posthog/posthog_client
+ import sentry/sentry_client
+@@ -488,16 +490,37 @@ fn run_oauth_callback(
+   db: pog.Connection,
+   token: types.OAuthTokenResponse,
+   posthog: posthog_client.PostHog,
++) -> wisp.Response {
++  run_oauth_callback_with(
++    simulate.request(http.Get, "/auth/callback"),
++    db,
++    token,
++    posthog,
++    meta_client.Disabled,
++  )
++}
++
++/// `run_oauth_callback` with an explicit request + CAPI handle so tests can
++/// attach the first-touch / consent cookies the flow reads and assert the
++/// Meta fire. `req` must be a `simulate` request (signed cookies verify
++/// against its canned secret key base).
++fn run_oauth_callback_with(
++  req: wisp.Request,
++  db: pog.Connection,
++  token: types.OAuthTokenResponse,
++  posthog: posthog_client.PostHog,
++  meta: meta_client.Meta,
+ ) -> wisp.Response {
+   // resend_api_key is empty → the welcome email spawn is skipped.
+   auth_handler.complete_oauth_flow(
+-    simulate.request(http.Get, "/auth/callback"),
++    req,
+     db,
+     token,
+     sentry_client.Disabled,
+     "test-secret",
+     "",
+     posthog,
++    meta,
+   )
+ }
+ 
+@@ -520,9 +543,11 @@ pub fn oauth_first_signin_fires_identify_and_signup_completed_test() {
+         <> "'::uuid",
+     )
+ 
+-  // Identify first (email `$set`, empty `$set_once` — no first-touch data
+-  // survives the OAuth redirect), then the funnel capture. Order is
++  // Identify first (email `$set`), then the funnel capture. Order is
+   // deterministic: the Recording variant sends synchronously in call order.
++  // No first-touch cookie on this request (organic landing) → the issue
++  // #617 fallback records `provider=google` instead of an all-empty
++  // `$set_once`.
+   let events = posthog_client.drain_recording(subject, 1000)
+   case events {
+     [
+@@ -533,13 +558,63 @@ pub fn oauth_first_signin_fires_identify_and_signup_completed_test() {
+       let assert Ok(email_json) = list.key_find(set_properties, "email")
+       email_json
+       |> should.equal(json.string("oauth-" <> auth_uuid <> "@example.com"))
+-      set_once_properties |> should.equal([])
++      set_once_properties
++      |> should.equal([#("provider", json.string("google"))])
+       capture_id |> should.equal(row_id)
+     }
+     _ -> should.fail()
+   }
+ }
+ 
++pub fn oauth_signin_with_first_touch_cookie_records_attribution_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let subject = process.new_subject()
++  let posthog = posthog_client.Recording(subject)
++  let auth_uuid = uuid.v4_string()
++
++  // The initiate step (pinned in auth_test) set the signed cookie from the
++  // landing URL; here the callback reads it back and records it as
++  // `$set_once` first-touch properties (issue #617).
++  let req =
++    simulate.request(http.Get, "/auth/callback")
++    |> simulate.cookie(
++      cookie_names.first_touch(),
++      "utm_source=google&utm_medium=cpc&utm_campaign=spring_2026&gclid=abc123",
++      wisp.Signed,
++    )
++  let resp =
++    run_oauth_callback_with(
++      req,
++      db,
++      oauth_token_response(auth_uuid),
++      posthog,
++      meta_client.Disabled,
++    )
++  resp.status |> should.equal(303)
++
++  let events = posthog_client.drain_recording(subject, 1000)
++  case events {
++    [
++      posthog_client.Identify(_, _, set_once_properties),
++      posthog_client.Capture(_, "signup_completed", _),
++    ] ->
++      set_once_properties
++      |> should.equal([
++        #("first_touch_utm_source", json.string("google")),
++        #("first_touch_utm_medium", json.string("cpc")),
++        #("first_touch_utm_campaign", json.string("spring_2026")),
++        #("first_touch_gclid", json.string("abc123")),
++      ])
++    _ -> should.fail()
++  }
++
++  // The cookie is cleaned up after the callback (issue #617 acceptance).
++  find_set_cookie(resp, cookie_names.first_touch())
++  |> should.be_ok
++  |> fn(cookie) { string.contains(cookie, "Max-Age=0") |> should.be_true }
++}
++
+ pub fn oauth_returning_signin_fires_login_succeeded_test() {
+   use <- unitest.tag("integration")
+   let db = setup()
+@@ -574,3 +649,163 @@ pub fn oauth_returning_signin_fires_login_succeeded_test() {
+     _ -> should.fail()
+   }
+ }
++
++// ============================================================================
++// META CAPI ON OAUTH SIGNUP — CompleteRegistration fires on insert only,
++// consent-gated (Plan §5), never on a returning sign-in (issue #568)
++// ============================================================================
++
++/// Browser-shaped marketing consent cookie (mirrors
++/// `payment_verify_integration_test.consent_cookie_value`).
++fn consent_cookie_value(marketing: Bool) -> String {
++  let marketing_str = case marketing {
++    True -> "true"
++    False -> "false"
++  }
++  let json =
++    "{\"version\":\""
++    <> compliance.cookie_policy_version
++    <> "\",\"ts\":1748419200000,\"token\":\"00000000-0000-0000-0000-000000000000\",\"analytics\":false,\"marketing\":"
++    <> marketing_str
++    <> "}"
++  uri.percent_encode(json)
++}
++
++fn oauth_callback_request_with_consent() -> wisp.Request {
++  simulate.request(http.Get, "/auth/callback")
++  |> simulate.header("cookie", "rt_consent=" <> consent_cookie_value(True))
++}
++
++fn drain_meta(
++  subject: process.Subject(meta_client.Event),
++  timeout_ms: Int,
++) -> List(meta_client.Event) {
++  meta_client.drain_recording(subject, timeout_ms)
++}
++
++pub fn oauth_insert_fires_meta_complete_registration_when_consented_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let ph_subject = process.new_subject()
++  let meta_subject = process.new_subject()
++  let posthog = posthog_client.Recording(ph_subject)
++  let meta = meta_client.Recording(meta_subject)
++  let auth_uuid = uuid.v4_string()
++
++  // A new Google sign-in with marketing consent → CAPI CompleteRegistration.
++  let resp =
++    run_oauth_callback_with(
++      oauth_callback_request_with_consent(),
++      db,
++      oauth_token_response(auth_uuid),
++      posthog,
++      meta,
++    )
++  resp.status |> should.equal(303)
++
++  let meta_events = drain_meta(meta_subject, 1000)
++  case meta_events {
++    [meta_client.CompleteRegistration(event_id, _)] -> {
++      // A fresh per-event UUID, never the landlord row id (matches the
++      // password path's `dispatch_signup_meta` contract).
++      let _ = uuid.from_string(event_id) |> should.be_ok
++      Nil
++    }
++    _ -> should.fail()
++  }
++}
++
++pub fn oauth_insert_skips_meta_without_consent_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let ph_subject = process.new_subject()
++  let meta_subject = process.new_subject()
++  let posthog = posthog_client.Recording(ph_subject)
++  let meta = meta_client.Recording(meta_subject)
++  let auth_uuid = uuid.v4_string()
++
++  // No consent cookie → marketing_granted False → CAPI stays silent
++  // (Plan §5 gate), even though this is a true signup insert.
++  let resp =
++    run_oauth_callback_with(
++      simulate.request(http.Get, "/auth/callback"),
++      db,
++      oauth_token_response(auth_uuid),
++      posthog,
++      meta,
++    )
++  resp.status |> should.equal(303)
++
++  drain_meta(meta_subject, 1000) |> should.equal([])
++}
++
++pub fn oauth_returning_signin_fires_no_meta_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let ph_subject = process.new_subject()
++  let meta_subject = process.new_subject()
++  let posthog = posthog_client.Recording(ph_subject)
++  let meta = meta_client.Recording(meta_subject)
++  let auth_uuid = uuid.v4_string()
++  let token = oauth_token_response(auth_uuid)
++
++  // First sign-in, no consent — creates the row, no CAPI fire.
++  let first =
++    run_oauth_callback_with(
++      simulate.request(http.Get, "/auth/callback"),
++      db,
++      token,
++      posthog,
++      meta,
++    )
++  first.status |> should.equal(303)
++  drain_meta(meta_subject, 1000) |> should.equal([])
++  let first_ph = posthog_client.drain_recording(ph_subject, 1000)
++  case first_ph {
++    [
++      posthog_client.Identify(_, _, _),
++      posthog_client.Capture(_, "signup_completed", _),
++    ] -> Nil
++    _ -> should.fail()
++  }
++
++  // Returning sign-in WITH consent is a login, not a signup — the upsert
++  // conflicts (is_new = False) and CAPI must not fire (fire-once contract,
++  // issue #568). The PostHog capture becomes login_succeeded.
++  let second =
++    run_oauth_callback_with(
++      oauth_callback_request_with_consent(),
++      db,
++      token,
++      posthog,
++      meta,
++    )
++  second.status |> should.equal(303)
++  drain_meta(meta_subject, 1000) |> should.equal([])
++  let second_ph = posthog_client.drain_recording(ph_subject, 1000)
++  case second_ph {
++    [
++      posthog_client.Identify(_, _, _),
++      posthog_client.Capture(_, "login_succeeded", _),
++    ] -> Nil
++    _ -> should.fail()
++  }
++}
++
++// -- Helpers ------------------------------------------------------------------
++
++/// Find the Set-Cookie header whose value starts with `name=` (mirrors
++/// `cookie_attributes_test.find_set_cookie`).
++fn find_set_cookie(resp: wisp.Response, name: String) -> Result(String, Nil) {
++  resp.headers
++  |> list.find_map(fn(pair) {
++    let #(key, value) = pair
++    case
++      string.lowercase(key) == "set-cookie"
++      && string.starts_with(value, name <> "=")
++    {
++      True -> Ok(value)
++      False -> Error(Nil)
++    }
++  })
++}

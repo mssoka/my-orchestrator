@@ -1,0 +1,230 @@
+{
+  "job": "packet-plumber-v2-spawn-feel",
+  "round": 1,
+  "pr": 84,
+  "reviewed_sha": "1c1d408ba69205d39e62d162ddc181424f14483f",
+  "diff_file": "/Users/moses/code/_bmad-output/perkins/packet-plumber-v2-spawn-feel/r1/diff.patch",
+  "worktree": "/Users/moses/.herdr/worktrees/packet-plumber/perkins-packet-plumber-v2-spawn-feel-r1",
+  "spec": "/Users/moses/code/_bmad-output/briefings/packet-plumber-v2-spawn-feel.md",
+  "reviewers_completed": "7/7",
+  "failed_layers": [],
+  "dispatch_notes": "zai glm-5.3 rate-limited (429) under 7-way concurrency; wave recovered via serial re-dispatches (acceptance r1b, architecture r1c, codebase r1b, tests r1b, edge r1b). All 7 lenses delivered valid JSON.",
+  "total_raw_findings": 30,
+  "confirmed": 28,
+  "rejected": 2,
+  "rejected_detail": [
+    {
+      "source": "blind",
+      "title": "Vector2Length transcendental",
+      "reason": "sqrt is IEEE-754 deterministic, not a transcendental; in-code comment cites the draw_path_offset_band precedent already in the raster path"
+    },
+    {
+      "source": "blind",
+      "title": "Reveal envelope never reaches k=1",
+      "reason": "smoothstep easing by design; residual 2% at last live tick is imperceptible; expiry-to-identity is the standard envelope"
+    }
+  ],
+  "blockers": [
+    {
+      "title": "Pipe-highlight radius mixes units: tile-space dx/dy tested against 8*tile_px \u2014 every pipe on the map pulses",
+      "sources": [
+        "blind",
+        "edge",
+        "tests"
+      ],
+      "location": "app/render/spawn_fx.odin spawn_fx_draw_highlight",
+      "evidence": "rad := f32(SPAWN_HIGHLIGHT_RADIUS_TILES) * v.tile_px  // =8*26=208 (px-per-tile units)\n... dx := f32(mid[0]) - f32(r.pos[0])  // TILE units\nif dx * dx + dy * dy > rad * rad { continue }",
+      "detail": "Radius guard compares tile-unit squared distance against (8 x tile_px)^2 = 208 tiles \u2014 no pipe on a 40x30 map is ever excluded. Golden-verified: spawn_feel/04000ms pulses pipe 1-3 whose midpoint sits 9.8 tiles from the spawn (intended bound: 8). Network-wide flash instead of the documented neighborhood feedback; baked into the re-blessed goldens.",
+      "recommended_fix": "Drop the * v.tile_px (compare pure tile units) or multiply dx/dy by tile_px; re-bless spawn_feel captures.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Pending-commands predictor pin is vacuous \u2014 its draw is span-invalid and is rejected identically on both sides",
+      "sources": [
+        "tests"
+      ],
+      "location": "app/render/spawn_fx_test.odin test_spawn_fx_predict_pending_commands",
+      "evidence": "pending := []pp.Command{{kind = pp.Cmd_Draw_Pipe{a = 0, b = 3, tier = 1}, apply_tick = 77}}  // node0(10,10)->node3(34,15): span 25 > standard max_span 14 -> Span_Exceeds_Tier",
+      "detail": "The pinned draw never materializes (span 25 > 14), so live and shadow sides stay identical and the assert 'pending draw must move the prediction' is a tautology. The load-bearing pending mechanism is unpinned while the test claims to cover it. Same cause silently rejects sfx_fixture's own 1->3 pipe (span 23 > 14).",
+      "recommended_fix": "Use the real harness fixture positions (res(8,15), rt(20,15), host(32,15), placed router (34,15)) so the 1->3 draw is span-exact 14 = valid; assert the pipe exists after apply.",
+      "verification": "confirmed"
+    }
+  ],
+  "warnings": [
+    {
+      "title": "Reduced-motion disables the pipe highlight entirely, contradicting the documented 'steady band'",
+      "sources": [
+        "blind"
+      ],
+      "location": "app/render/spawn_fx.odin spawn_fx_draw_highlight",
+      "detail": "File header + PR body promise 'the highlight is steady' under E9.2 (pulse_read precedent: presence, not motion); the code early-returns. Ring and reveal keep their static readings \u2014 the highlight alone loses presence.",
+      "recommended_fix": "Draw the steady band at fixed alpha when reduced_motion instead of returning.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Type-chip hairline fade reintroduces the rlsw line-alpha trap during the reveal",
+      "sources": [
+        "blind"
+      ],
+      "location": "app/render/view.odin draw_type_chip",
+      "evidence": "out.a = u8(255 * fade); rl.DrawRectangleLinesEx(...)",
+      "detail": "The software renderer ignores line alpha, so golden captures render the hairline solid through the reveal while the GPU app fades it \u2014 app and goldens visually diverge for 8 ticks per spawn. The pre-change code deliberately kept this line full-alpha.",
+      "recommended_fix": "Keep the hairline full-alpha (as before) or draw it as filled rects.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "spawn_fx_init/spawn_fx_destroy are dead code; reveals latches the ambient allocator and is never torn down \u2014 3,318 tracker leak lines added to the render suite",
+      "sources": [
+        "blind",
+        "security",
+        "codebase",
+        "architecture"
+      ],
+      "location": "app/render/spawn_fx.odin spawn_fx_init/spawn_fx_destroy",
+      "detail": "No call sites anywhere; View.spawn_fx zero-inits and the buffer self-allocates on first append via the ambient allocator, never freed. Adds 3,318 tracker leak lines to odin test app/render (the same noise class the PR's growth_test fold cleaned from core).",
+      "recommended_fix": "Wire init/destroy into the View lifecycle (app init + harness ctx), or delete the procs and document the latch-on-append pattern.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "shadow_clone completeness guard cannot catch future non-serialized dynamic fields; a miss frees live sim memory",
+      "sources": [
+        "architecture"
+      ],
+      "location": "app/render/spawn_fx.odin shadow_clone",
+      "detail": "The round-trip pin covers only hash-visible (serialized) state. A future [dynamic] field missed by the clone leaves the clone aliasing the live array; run_destroy(&shadow) then deletes the LIVE sim's buffer. Today the clone is field-for-field complete (verified against every sub-struct).",
+      "recommended_fix": "Extend the pin to walk field metadata, or add a construction-time assert/comment contract naming every dynamic field.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Reveal-buffer >4 trim boundary has no test",
+      "sources": [
+        "tests"
+      ],
+      "location": "app/render/spawn_fx.odin spawn_fx_feed",
+      "detail": "The bounded-buffer trim (pause/catch-up bursts must not grow reveals unbounded) is unexercised; ordered_remove appears nowhere in the test file.",
+      "recommended_fix": "Feed 5+ NODE_SPAWNED events in one slice and assert len(reveals) == 4.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Reduced-motion telegraph ring and highlight draw paths untested",
+      "sources": [
+        "tests"
+      ],
+      "location": "app/render/spawn_fx.odin draw paths",
+      "detail": "Only the reveal's reduced-motion pin exists; the static-ring and (currently disabled) steady-highlight branches have no automation, so the W1 doc/code divergence is invisible to the suite.",
+      "recommended_fix": "Pin the reduced-motion ring draw (static radius/alpha) and highlight behavior once W1 is fixed.",
+      "verification": "confirmed"
+    }
+  ],
+  "notes": [
+    {
+      "title": "PR body mis-describes the node_health 20000ms re-bless as carrying 'the ring burst' \u2014 no telegraph can exist in that golden",
+      "sources": [
+        "acceptance"
+      ],
+      "detail": "At t400 the harness predict targets window 480 (lead 80 > 10) and the t400 telegraph was never predicted (prior capture t200 also predicts nothing) \u2014 the frame carries reveal + highlight only. The re-bless itself remains justified.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Placement feedback highlights neighborhood pipes vs the spec's 'connecting pipe' \u2014 documented, defensible interpretation",
+      "sources": [
+        "acceptance"
+      ],
+      "detail": "A fresh spawn has no pipes; the PR body documents the estate-neighborhood reading. Superseded in practice by B1 (the filter is ineffective anyway).",
+      "verification": "confirmed"
+    },
+    {
+      "title": "sfx_fixture is not 'the growth.dem recipe' it claims \u2014 different base positions and its fixture pipe is silently rejected",
+      "sources": [
+        "acceptance",
+        "tests"
+      ],
+      "detail": "Harness fixture: (8,15)/(20,15)/(32,15); test uses (10,10)/(12,10)/(14,10) and its 1->3 draw (span 23 > 14) is dropped silently, so the tests run on a pipe-less topology. The pins still hold (clone/predict exactness is fixture-independent) but the comment lies.",
+      "recommended_fix": "Adopt the harness fixture positions (also fixes B2).",
+      "verification": "confirmed"
+    },
+    {
+      "title": "sfx_load_cat declares an allocator parameter the body never uses",
+      "sources": [
+        "security",
+        "codebase"
+      ],
+      "detail": "read1 + catalogs_load use context.allocator regardless; all callers pass context.temp_allocator in vain. Cosmetic API dishonesty in a test helper.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Predictor detects spawns via next_node_id delta \u2014 a pending Cmd_Place_Router inside the lead window plus a rejecting growth plan would telegraph the router",
+      "sources": [
+        "codebase"
+      ],
+      "detail": "Theoretical today: both callers pass only already-applied commands (app {}, harness action_log past-only). The API surface allows the misuse.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Dedup-reset branch in spawn_fx_predict is unreachable",
+      "sources": [
+        "blind"
+      ],
+      "detail": "predicted_window can only equal `window` when lead <= 10 for that window; lead never grows within a window, so the reset never fires. Dead defensive code.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Pointless '_ = before' no-op in the feed test",
+      "sources": [
+        "blind"
+      ],
+      "detail": "`before` is used two lines below in the slice expression; the discard is leftover noise.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Telegraph timeline guard wraps when terminal_spawn_interval_ticks < 10",
+      "sources": [
+        "blind",
+        "edge"
+      ],
+      "detail": "T - SPAWN_LEAD_TICKS underflows u64 for tiny windows; unreachable at the shipped 80-tick cadence (catalog floor is >= 1), but a modded catalog could hit it.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Bad-free fix is unverifiable by test; the 2 remaining bad frees are pre-existing in health_test.odin",
+      "sources": [
+        "tests"
+      ],
+      "detail": "Verified by Perkins: exactly 2 bad frees in `odin test core`, both in health_test.odin lines 877/910 \u2014 a file this diff does not touch.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "App-side predict glue (Run-mode gate, per-frame dedup, topology-gen re-predict) is never exercised by automation",
+      "sources": [
+        "tests"
+      ],
+      "detail": "Goldens cover the harness force path; the app dedup/gen-retarget logic in main.odin has no automated coverage.",
+      "verification": "confirmed"
+    },
+    {
+      "title": "Render package now owns a field-by-field Run_State deep copy and executes pp.step in the view layer",
+      "sources": [
+        "architecture"
+      ],
+      "detail": "Layering tension vs ODN-1's spirit \u2014 documented and deliberate per the PR body's decision table (core-side prediction rejected as a sim-semantics change); recorded as accepted risk, not re-litigated per round orders.",
+      "verification": "confirmed"
+    }
+  ],
+  "advisory_gate": {
+    "title": "Advisory test gate: FAIL",
+    "source": "tests",
+    "detail": "P0 gaps: vacuous pending-commands pin, reduced-motion paths untested, highlight radius unpinned. Folded into the blocker/warning counts above \u2014 not double-counted.",
+    "verification": "confirmed"
+  },
+  "verdict": "NEEDS CHANGES",
+  "perkins_mechanical_checks": {
+    "odin_test_core": "236/236 PASS (verified)",
+    "odin_test_app_render": "22/22 PASS from repo root (verified; run from app/render the new tests trap on cwd \u2014 by design, tests document repo-root cwd)",
+    "harness": "47/47 demos green incl. replay gate (verified)",
+    "ci_local_mac": "10/10 gates green (verified)",
+    "bad_frees": "2, both pre-existing in untouched health_test.odin (verified)",
+    "spawn_sequence_pixels": "ring at 3600 (age 2) -> grows by 3900 -> pop at 4000 -> reveal converges monotonically 2399/2287/1938/0 px vs settled -> second beat 7600/8000 (mechanical capture-diff, verified)",
+    "scope": "confined to spawn_fx + wiring + estate folds; no serialization/LOG_VERSION/sim-semantics changes (verified)",
+    "clone_completeness": "field-for-field complete vs every Run_State sub-struct (verified manually)"
+  }
+}

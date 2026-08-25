@@ -1,0 +1,32 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "security",
+    "title": "STILL PRESENT (r1): W3 staleness gate is defeated for same-day corrections — mixed timestamp formats break the lexical compare, so a redelivered pre-correction bounce still exhausts + fabricates referee_contact_invalid",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:40-42 + webhooks.gleam:297-304",
+    "evidence": "find_reference_call_by_send_ref.sql:40-42:\n       ), '') AS matched_send_at,\n       -- r1 W3: the correction instant ('' for never-corrected rows).\n       COALESCE(rc.corrected_at::text, '') AS corrected_at,\nwebhooks.gleam:300-304:\n                    corrected ->\n                      // ISO timestamps — lexical compare is chronological.\n                      string.compare(at, corrected) != order.Lt",
+    "detail": "matched_send_at is RFC3339 ('2026-08-12T08:00:00Z', sweep to_rfc3339) but corrected_at is Postgres ::text ('2026-08-12 09:00:00.160468+00'). Same calendar day: 'T'(0x54)>' '(0x20) forces at>corrected always, so a stale same-day pre-correction bounce exhausts + stamps the fraud signal. Verified against the live test DB; the r1 tests only cover cross-day ('2026-08-01T08:00:00Z').",
+    "recommended_fix": "Compare in one format: return corrected_at as RFC3339 (to_char AT TIME ZONE 'UTC') or do the comparison in SQL against timestamptz; add a same-day stale-bounce test."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "edge",
+    "title": "Correction re-queues the row but leaves the previous form session live: the corrected referee's fresh link rehydrates the wrong person's draft_answers and form_opened_at suppresses the co-nudge forever",
+    "location": "server/src/reference_checks/sql/correct_reference_call.sql:25-36",
+    "evidence": "correct_reference_call.sql:25-36:\nSET status = 'queued'::reference_call_status,\n    corrected_name = NULLIF($3, ''),\n    corrected_email = NULLIF($4, ''),\n    corrected_phone = NULLIF($5, ''),\n    correction_cycles = correction_cycles + 1,\n    corrected_at = now(),\n    terminal_reason = NULL,\n    attempt_count = 0,\n    form_token = NULL,\n    form_token_expires_at = NULL,\n    next_attempt_at = now(),\n    updated_at = now()\n(form_opened_at / draft_answers not cleared)",
+    "detail": "Wrong-person path keeps form_opened_at + draft_answers (mark_awaiting_correction.sql touches neither). After correction the sweep mints a fresh token but form_handler.gleam:162 rehydrates the old draft (questions.prefill_for) for the corrected referee, who may submit the wrong person's answers; co_nudge_should_fire is dead (form_was_opened).",
+    "recommended_fix": "Also SET form_opened_at = NULL, draft_answers = NULL in correct_reference_call.sql (the T0 restart should own the whole form session) and pin with a wrong-person-then-correct test."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "codebase",
+    "title": "STILL PRESENT (r1): N10 — substitute_reference_call.sql still duplicates the live-slot ON CONFLICT predicate inline instead of reusing insert_reference_call_if_absent.sql; the predicate is now maintained in 4 places",
+    "location": "server/src/reference_checks/sql/substitute_reference_call.sql:37-41,51-54",
+    "evidence": "substitute_reference_call.sql:37-41:\n  ON CONFLICT (application_id, ref_slot, owner_label) WHERE status NOT IN (\n    'form_completed', 'unreachable', 'refused', 'objected',\n    'manual_recorded', 'failed', 'completed', 'partial'\n  )\nsubstitute_reference_call.sql:51-54:\n  AND rc.status NOT IN (\n    'form_completed', 'unreachable', 'refused', 'objected',\n    'manual_recorded', 'failed', 'completed', 'partial'\n  )",
+    "detail": "The live-slot status list now lives in the migration (20260731222000:140), insert_reference_call_if_absent.sql, and twice in substitute_reference_call.sql. A future status-set change (e.g. adding a terminal) must touch all four or the ON CONFLICT silently diverges from the index.",
+    "recommended_fix": "Extract the live-status predicate once (a shared SQL fragment constant or a comment-pinned canonical copy) and reference it in both queries; add a schema test asserting the three predicate texts stay identical."
+  }
+]

@@ -1,0 +1,1058 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-v2-estate-spawning.md b/_bmad-output/implementation-artifacts/spec-v2-estate-spawning.md
+new file mode 100644
+index 0000000..9cd5a6a
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-v2-estate-spawning.md
+@@ -0,0 +1,156 @@
++---
++title: 'v2 estate spawning — strict cluster placement for director-spawned terminals'
++type: 'feature'
++created: '2026-08-22'
++status: 'done' # draft | ready-for-dev | in-progress | in-review | done
++review_loop_iteration: 0 # incremented by step-04 before each review loopback
++baseline_commit: '4ccc8c75a7642c76079dd9a480e83a429baec4d7'
++context:
++  - '{project-root}/project-context.md'
++  - '{project-root}/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md'
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** User ruling 2026-08-21 (~23:5xZ play session): director-spawned terminals still look randomly scattered — "not so great looking topology". The 5.12 soft bias (750‰ attach coin, cap 8) leaves too many strays and estates that read as noise; the user wants most nodes NEXT TO each other, like an estate, and after ~5 nodes a NEW area elsewhere, leaving routing room between sections.
++
++**Approach:** STRICT ESTATE (shape a from the briefing — the simpler one that satisfies both acceptance maps deterministically): every growth spawn is exactly one of two classes — ATTACH (an eligible cluster exists → candidate within adjacency radius of a member) or SEED (no eligible cluster → fresh area at ≥ new-area seed distance from every terminal, still in the outward-from-mesh annulus). Both classes keep the full E31 envelope. Existing 5.12 machinery (derived cluster view, attach draws, rejection sampling) is reused; the delta is the seed-distance predicate, the cap default 8→5, attach probability 750→1000, and the re-pinned tests + deliberate golden re-bless.
++
++## Boundaries & Constraints
++
++**Always:**
++- E31 spawn validity is the hard contract: bounds + min separation from every node/pipe + connectable-within-span; bounded rejection sampling from the same rng stream; deterministic, seed-derived, no serialization/LOG_VERSION change; growth spawns TERMINALS only, outward from the player-placed mesh, waits without a junction (story 5.1 / 3.5).
++- All tunables named in balance.json (ODN-5), loader fail-fast on missing/invalid keys; integer-only (ODN-10); no map iteration in core.
++- Cluster cap default 5 (`max_members`), new-area seed distance + adjacency radius (`radius_tiles`) as named knobs; a one-line balance.json change moves the cap.
++- Draw ORDER/counts per attempt unchanged where possible; the acceptance-pin tests update to the new policy (never deleted).
++
++**Ask First:**
++- None expected. If the strict contract cannot satisfy E31+connectability on the current map geometry, HALT rather than bending E31.
++
++**Never:**
++- No spawn-timing/cadence changes (`terminal_spawn_interval_ticks` stays 80), no node-type visual identity work (out of scope by the briefing), no routing semantics, no serialization/LOG_VERSION, no `terminal_min_sep_tiles` change (E31 packing floor).
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| Fresh map, first spawn | No terminals yet | SEED: annulus draw, seed-distance filter vacuous, E31 | bounded rejection → skip window |
++| Eligible cluster exists | Any cluster size < cap | ATTACH: within radius of a member, E31 | rejected → re-draw (bounded) → skip window deterministically |
++| All clusters at cap | Every cluster ≥ cap | SEED: ≥ seed_dist from every live terminal, within span of a junction | rejected → re-draw (bounded) → skip window |
++| Dense map | Budget exhausted (8 attempts) | No spawn this window (deterministic, no stall) | N/A |
++| attach_prob < 1000 (user opt-in) | Coin misses | SEED family (the 08-17 minority-isolate mix, now seed-distance-respecting) | N/A |
++| No junction | Router not yet placed | Growth waits (unchanged) | N/A |
++| Malformed growth_groups block | Missing/invalid key in balance.json | Fail-fast load error naming the key | N/A |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `data/balance.json` -- `growth_groups` block: `bias_prob_permille` 750→1000 (attach probability; 1000 = strict), `max_members` 8→5 (the cap), NEW `new_area_seed_tiles` (default 10), `min_members` 3 / `radius_tiles` 5 / `member_weight_permille` 250 unchanged; comments carry the 08-21 ruling + supersession note.
++- `core/catalog.odin` -- `Growth_Groups_Balance` struct (line ~258) + loader parse/validate (~line 861): bias range 1..999 → 1..1000 (0 still invalid); parse + validate the new key (must exceed `radius_tiles`); update the doctrine comments (the "NOT 100%" load-time bar is superseded at the default, kept as a data option).
++- `core/growth.odin` -- `growth_plan_demand` (~line 460): attach family unchanged (coin → eligible cluster → anchor → dir → dist ∈ [min_sep, radius]); the coin-miss AND no-eligible-cluster branches become the SEED family: existing annulus draw (router + dir + dist ∈ [GROWTH_OUT_MIN, span]) + NEW predicate `growth_seed_sep_ok` (candidate ≥ `new_area_seed_tiles` from every live terminal, i64 dist², ODN-10). Comments updated to the 08-21 ruling.
++- `core/catalog_test.odin` -- `BAL_VALID` fixture (~line 48) + the 5.12 loader rows (~line 651): "bias 1000" flips error→valid; new rows for the new key (missing / ≤ radius / negative).
++- `core/growth_test.odin` -- re-pin `test_groups_estates_and_isolated` to the strict audit (every spawn attach-or-seed; estates form; no stray isolates — every singleton is a fresh seed); new pure-unit pin for `growth_seed_sep_ok`; `test_groups_view_and_scale`, `test_groups_replay_byte_identical`, `test_growth_outward_bias_annulus`, E31 + determinism pins adapt (mechanism assertions survive; seed-dependent outcomes re-verified).
++- `_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md` -- append the 2026-08-21 canon entry (estate ruling + the 08-17 "NOT 100%" supersession flag), mirroring the 2026-08-19 entry style.
++- `goldens/` + `demos/growth.dem` + `docs/captures/` -- the deliberate re-bless (catalog_hash folds every balance byte) + before/after captures for the PR body (same seed, same tick, old vs new defaults).
++- `harness/main.odin`, `tools/harness.sh`, `tools/ci-local.sh` -- run/save verbs + the 10-gate suite (read-only: no changes expected).
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `data/balance.json` -- retune `growth_groups` (bias 1000, cap 5) + add `new_area_seed_tiles: 10` + rewrite the block comment (08-21 ruling, supersession note) -- the named tunables are the user's fun-test surface.
++- [x] `core/catalog.odin` -- struct field + loader parse + validation (`> radius_tiles` + the 08-21 map-diameter bound) + comment updates -- fail-fast named-knob loading.
++- [x] `core/growth.odin` -- `growth_seed_sep_ok` predicate + SEED family wiring + ruling comments (+ `growth_attach_radius_ok` + the live-terminal anchor guard — the strict "no strays" closures the acceptance audit requires) -- the strict attach-or-seed contract inside E31.
++- [x] `core/catalog_test.odin` -- fixture + loader rows for the new range/key -- loader pins updated to the new policy.
++- [x] `core/growth_test.odin` -- strict-audit re-pin + new predicate unit pins + adapt surviving pins -- acceptance as durable tests (updated, never deleted).
++- [x] `_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md` -- append the 08-21 canon entry -- the canon tension is flagged in-repo, not just in the PR.
++- [x] `goldens/` -- deliberate `harness save` re-bless (fold-check + splice proof per the re-bless discipline) -- byte-identical replay on the new stream.
++- [x] `docs/captures/v2-estate-spawning/` + PR body -- before/after spawn maps (rendered captures + coordinate dump, same seed/tick) + the one-line cap change (8→5) demonstrated -- the briefing's acceptance evidence.
++
++**Acceptance Criteria:**
++- Given a growing map with a player-placed router at default tunables, when N spawn windows run, then every spawn is auditable as ATTACH (within `radius_tiles` of a then-live terminal) or SEED (≥ `new_area_seed_tiles` from every then-live terminal) — no third class, no strays.
++- Given an estate at the cap (5), when growth continues, then the estate stops extending and a SEED spawns ≥ seed distance away (and still within connect span).
++- Given `max_members: 8` in balance.json (one-line change), when the same run repeats, then estates grow to 8 — demonstrated in the PR body.
++- Given the new defaults, when `harness run` + `tools/ci-local.sh --mac` execute, then all 10 gates green (T1 + T2 + replay byte-identical + drift + input-parity + lint).
++- Given a malformed `growth_groups` block (missing `new_area_seed_tiles`, seed_dist ≤ radius, bias 0/1001), when the catalog loads, then it fails fast naming the key.
++
++## Spec Change Log
++
++## Design Notes
++
++**Canon flag (briefing rule 1 — flagged, not silently rewritten):** the 08-21 ruling's acceptance ("no lone-node scatter", cap ~5, new areas) supersedes the 08-17 "estates, but NOT 100% of the time" mix at the DEFAULT (attach 1000‰). The 08-17 doctrine is not deleted: `bias_prob_permille < 1000` restores the minority-isolate mix as a data option. The spatial-lane canon (2026-08-12, commits 2e3acab/8ece056) governs PIPE lane rendering — node placement does not touch it; no tension. Both flags land in the decision-log entry + PR body.
++
++**Why strict over emergent:** the emergent shape (b) is the current 5.12 mechanism — probabilistic strays can't satisfy "no lone nodes far from any cluster" deterministically. Strict (a) satisfies both acceptance maps by construction, matches "after ~5 nodes, go to a new area" literally, and reuses the existing attach machinery — the delta is two predicates + defaults. Draw counts per attempt are unchanged (the strict predicates are rejection predicates, like E31), so the rng interleaving shifts only through the acceptance outcome — re-bless is the deliberate, cause-documented 08-21 fold.
++
++**Implementation-time closures (beyond the spec's one-predicate delta — forced by the acceptance's "no third class, no strays", cause-documented in code + decision-log + PR body):** (1) `growth_attach_radius_ok` — the attach candidate must sit within the EUCLIDEAN radius of its anchor member; the 5.12 compass draw's diagonal directions placed candidates at up to dist×√2 (5.7–7.1 tiles) — outside radius, inside the seed floor: the exact third class (measured pre-fix: 7/19 = 37% of growth.dem spawns were strays under the strict lens). (2) The attach anchor is a LIVE TERMINAL only — the derived view leaves dead slots' id at 0, colliding with cluster 0's id (the fixture residential at slot 0), so a raw id match could anchor an attach on a ROUTER (a pre-existing 5.12 defect invisible to the old pins). Both are zero-draw rejection predicates; the anchor guard changes the eligible member set (no rng draws). KEEP both — the strict audit tests (`test_groups_estates_strict`, `test_groups_strict_audit_with_fixture`) pin them.
++
++**Seed distance default 10:** 2× the adjacency radius — visually distinct sections on the 40×30-tile map while staying within the era-3 connect span (18) for E31. The rejection budget keeps it honest on dense maps (deterministic skip, no stall).
++
++## Verification
++
++**Commands:**
++- `tools/ci-local.sh --fast` -- expected: lint + all unit tests green.
++- `tools/harness.sh run` -- expected: all goldens green (T1 + replay + T2) after the deliberate `harness save`.
++- `tools/ci-local.sh --mac` -- expected: 10/10 gates green.
++- `odin run bin/splice_check` (or the fold-check equivalent) -- expected: boot tick-1 shift is the catalog-hash fold alone.
++
++## Suggested Review Order
++
++**Strict attach-or-seed policy (the entry point)**
++
++- Every growth spawn is exactly ATTACH or SEED — the 08-21 doctrine, branch by branch
++  [growth.odin:518](../../core/growth.odin#L518)
++
++- The no-eligible-cluster branch seeds a fresh area; the coin-miss (bias < 1000) shares it
++  [growth.odin:694](../../core/growth.odin#L694)
++
++- The seed predicate applies to both seed branches (the fresh-area floor)
++  [growth.odin:732](../../core/growth.odin#L732)
++
++**The two stray-closing predicates**
++
++- SEED candidates must clear every live terminal by the new-area floor (i64 dist²)
++  [growth.odin:301](../../core/growth.odin#L301)
++
++- ATTACH candidates must sit within the Euclidean radius of a live-terminal anchor (diagonal escape closed)
++  [growth.odin:335](../../core/growth.odin#L335)
++
++**Loader validation (fail-fast, named keys)**
++
++- New key parsed; bias range widened 1..999 → 1..1000 (1000 = strict default)
++  [catalog.odin:895](../../core/catalog.odin#L895)
++
++- Seed floor must exceed the attach radius — a closer seed would read as a stray
++  [catalog.odin:910](../../core/catalog.odin#L910)
++
++- Seed floor must stay under the map diameter — an absurd floor would stall all growth
++  [catalog.odin:1016](../../core/catalog.odin#L1016)
++
++**Tunables (the user's fun-test surface)**
++
++- The four knobs + the supersession flag in the block comment
++  [balance.json:16](../../data/balance.json#L16)
++
++**Acceptance pins (updated, never deleted)**
++
++- The mechanism-exact strict classification used by every audit
++  [growth_test.odin:521](../../core/growth_test.odin#L521)
++
++- The parametrized audit: cap 5 AND cap 8, mid-run seed, coin-miss seed asserted
++  [growth_test.odin:608](../../core/growth_test.odin#L608)
++
++- The 08-17 minority-isolate mix at bias 750 — the data option stays audit-clean
++  [growth_test.odin:754](../../core/growth_test.odin#L754)
++
++- The two pure predicate pins (reachable geometry only)
++  [growth_test.odin:769](../../core/growth_test.odin#L769)
++
++- Loader rows: bias 750 valid, diameter-bound errors, missing-key fail-fast
++  [catalog_test.odin:564](../../core/catalog_test.odin#L564)
++
++**Canon record**
++
++- The 08-21 ruling entry: supersession flag + spatial-lane non-tension + consequences
++  [decision-log.md:1052](../../_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md#L1052)
+diff --git a/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md b/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md
+index b0a9b60..de82b1d 100644
+--- a/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md
++++ b/_bmad-output/planning-artifacts/gdds/gdd-packet-plumber-2026-08-05/decision-log.md
+@@ -1047,3 +1047,16 @@ the r1/r2 notes below), never by editing this exhibit.)*
+   first-assignment engagement, removal return, never-drop untouched floor, tier-change
+   survival); the `palcheck` lane-stripe oracle sets explicit Express weights (a default pipe
+   no longer shows Express). Full `tools/ci-local.sh --mac` suite green (10/10 gates).
++
++---
++
++## 2026-08-21 — Estate spawning canon: STRICT cluster placement for director-spawned terminals (supersedes the 08-17 "NOT 100%" mix at the default)
++
++- **Origin (user ruling 2026-08-21, ~23:5xZ play session, verbatim anchors):** *"not so great looking topology"* — the 5.12 soft bias (750‰ attach coin, cap 8) leaves "too many strays and estates that read as noise"; the user wants *"most nodes NEXT TO each other, like an estate, and after ~5 nodes a NEW area elsewhere, leaving routing room between sections."*
++- **Decision — the STRICT estate doctrine (shape (a) of the briefing):** every growth spawn is exactly one of two classes — **ATTACH** (an eligible cluster exists → the candidate sits within `radius_tiles` of a member — the estate extends) or **SEED** (no eligible cluster → a fresh area at ≥ `new_area_seed_tiles` from every live terminal, still in the outward-from-mesh annulus). The delta over 5.12: bias default 750→**1000** (strict; the coin-miss branch remains as a data option at < 1000), cap 8→**5** (the "after ~5 nodes" band), NEW `new_area_seed_tiles` = **10** (2× the adjacency radius — visually distinct sections on the 40×30 map, within the era-3 connect span 18 for E31), plus two zero-draw rejection predicates that close the stray classes the strict audit exposes:
++  1. **`growth_attach_radius_ok`** — the attach candidate must sit within the *Euclidean* radius of its anchor member. The 5.12 compass draw's diagonal directions placed candidates at up to dist×√2 (5.7–7.1 tiles) from the anchor — outside the adjacency radius, inside the seed floor: the exact third class the ruling deletes (measured pre-fix: 7 of 19 growth.dem spawns were strays (37%) under the strict lens).
++  2. **Anchor is a LIVE TERMINAL only** — the derived cluster view leaves dead slots' `id` at 0, which collides with cluster 0's id (the fixture residential at slot 0): a raw id match counted non-terminals (routers) as members and anchored "attaches" on a ROUTER — another stray source.
++- **Shape consequence (documented, not accidental):** with the attach dist range [min_sep, radius] = [4, 5], every diagonal compass draw lands at dist×√2 ≥ 5.66 > radius 5 and rejects pre-E31 — accepted attach geometry is CARDINAL-ONLY, so estates read as **compact crosses** (the ~50% per-attempt budget burn on diagonal draws is the known, deterministic cost).
++- **Canon flag (briefing rule 1 — flagged, not silently rewritten):** the 08-21 acceptance supersedes the 08-17 *"estates, but NOT 100% of the time"* mix **at the default** (attach 1000‰). The 08-17 doctrine is not deleted: `bias_prob_permille < 1000` restores the minority-isolate mix as a data option, now seed-distance-respecting. The spatial-lane canon (2026-08-12, commits 2e3acab/8ece056) governs PIPE lane rendering — node placement does not touch it; no tension.
++- **What this does NOT change:** E31 stays the hard contract (bounds + min separation + connectable-within-span; bounded rejection sampling from the same rng stream); per-attempt draw counts are unchanged EXCEPT the member pick, which counts live members only (the dead-slot collision guard — its rng_range can flip from drawn to SKIPPED in the collision case; every other count is unchanged; the two strict predicates are zero-draw rejection tests, like E31 — the rng interleaving shifts through the acceptance outcome + that one count); no spawn-timing change (`terminal_spawn_interval_ticks` stays 80), no `terminal_min_sep_tiles` change (4), no serialization/LOG_VERSION; growth spawns TERMINALS only, outward from the player-placed mesh.
++- **Applied:** balance.json `growth_groups` (bias 1000, cap 5, `new_area_seed_tiles` 10, comments carry the ruling + supersession note); core/catalog.odin (struct field + loader parse + validation — bias range 1..1000, the new key must exceed `radius_tiles` — fail-fast naming the key); core/growth.odin (`growth_seed_sep_ok` + `growth_attach_radius_ok` + the live-terminal anchor guard + the SEED family wiring); core/catalog_test.odin + core/growth_test.odin (the strict attach-or-seed audit re-pin — every spawn auditable as ATTACH or SEED, no third class, no strays, every singleton a fresh seed — + the two predicate unit pins); the 2026-08-21 golden re-bless (all 45 demos + input-parity; `harness fold-check` proves boot's tick-1 shift is the catalog-hash fold alone); `docs/captures/v2-estate-spawning/` before/after captures + coordinate dumps (same seed 42, same ticks, old vs new policy: 7/19 strays → 0 strays) + the one-line cap change (5→8) demonstrated.
+diff --git a/_pr_body_estate_spawning.md b/_pr_body_estate_spawning.md
+new file mode 100644
+index 0000000..dddddc6
+--- /dev/null
++++ b/_pr_body_estate_spawning.md
+@@ -0,0 +1,168 @@
++# v2 estate spawning — strict cluster placement for director-spawned terminals
++
++The 08-21 play-session ruling ("not so great looking topology") applied:
++director-spawned terminals now form **strict estates** — every growth spawn is
++exactly one of two classes, **ATTACH** (within `radius_tiles` of a member of an
++eligible cluster — the estate extends) or **SEED** (no eligible cluster → a
++fresh area ≥ `new_area_seed_tiles` from every live terminal, still in the
++outward-from-mesh annulus). No third class, no strays.
++
++The delta over 5.12 (all in `balance.json` `growth_groups` unless noted):
++
++| knob | before | after |
++|---|---|---|
++| `bias_prob_permille` (attach fraction) | 750 (0.75 — the 08-17 "NOT 100%" mix) | **1000 (strict — every spawn attach-or-seed)** |
++| `max_members` (estate cap) | 8 | **5** (the ruling: "after ~5 nodes a NEW area elsewhere") |
++| `new_area_seed_tiles` | — (new) | **10** (2× the adjacency radius — routing room between sections, within the era-3 connect span 18) |
++| `min_members` / `radius_tiles` / `member_weight_permille` | 3 / 5 / 250 | unchanged |
++
++Plus two zero-draw rejection predicates in `core/growth.odin` that close the
++stray classes the strict audit exposes (draw order/counts per attempt
++unchanged — the rng interleaving shifts only through acceptance):
++
++1. **`growth_attach_radius_ok`** — the attach candidate must sit within the
++   *Euclidean* radius of its anchor. The 5.12 compass draw's diagonal
++   directions placed candidates at up to dist×√2 (5.7–7.1 tiles) from the
++   anchor — outside the adjacency radius, inside the seed floor: the exact
++   third class the ruling deletes.
++2. **Anchor is a LIVE TERMINAL only** — the derived cluster view leaves dead
++   slots' `id` at 0, which collides with cluster 0's id (the fixture
++   residential at slot 0): a raw id match could anchor an "attach" on a
++   ROUTER — another stray source (pre-existing 5.12 defect, invisible to the
++   old pins).
++
++## Before / after (measured, same seed 42, same ticks — growth.dem)
++
++Coordinate dumps + rendered captures at `docs/captures/v2-estate-spawning/`
++(`before/`, `after/`, `spawn-audit-before.txt`, `spawn-audit-after.txt`).
++Honest attribution: the strays are killed by the **two predicates in code**
++(the Euclidean attach-radius closure + the live-terminal anchor guard) and the
++**seed floor**; the defaults (bias 1000, cap 5) set the regime. The
++before/after lens is old **policy** vs new **policy** — identical audit, same
++seed, same ticks.
++
++**The strict audit lens applied to both runs** (ATTACH = within 5 tiles of a
++then-live terminal; SEED = ≥ 10 tiles from every then-live terminal):
++
++| run | spawns | ATTACH | SEED | **STRAY** |
++|---|---|---|---|---|
++| before (5.12 policy) | 19 | 12 | 0 | **7 (37%)** — five diagonal-escape attaches at 5.66–7.07 tiles + the coin-miss/uniform draws at 6.4–8.9 tiles |
++| after (strict policy) | 13 | 12 | 1 | **0** |
++
++The after map at t1760 reads as three compact 5-member estates (the cap) —
++final derived clusters: {res fixture + 4}, {host fixture + 4}, and the seeded
++estate at {20,6}…{16,10} — every terminal sits within 5 tiles of a sibling,
++every singleton is a fresh seed. The static-start capture (t30) is
++byte-identical before/after (no render surface moved).
++
++**Quantified skip rate + capacity note:** the after run spawned on 13 of 21
++era-1 windows (8 skipped — the bounded rejection budget exhausted on the
++denser map, deterministic by design). The strict policy also reads as fewer,
++larger sections per map than the old mix: estates of 5 span ~12–20 tiles and
++seeds must clear 10 tiles from every terminal — the intended "distinct
++sections" reading. The knobs (`radius_tiles`, `new_area_seed_tiles`,
++`terminal_min_sep_tiles`) are the iteration surface if the fun-test wants
++denser or sparser sections.
++
++**The one-line cap change, demonstrated** (`max_members: 8` in balance.json,
++`spawn-audit-after-cap8.txt`): the same seed run grows estates to **8**
++members before seeding a new area — the cap is a data knob, one line.
++
++## Decisions & rationale
++
++- **Strict over emergent (shape (a) of the briefing):** probabilistic strays
++  can't satisfy "no lone nodes far from any cluster" deterministically; strict
++  attach-or-seed satisfies both acceptance maps by construction and reuses the
++  5.12 machinery — the delta is two predicates + defaults.
++- **Canon flag, not a rewrite:** the 08-21 acceptance supersedes the 08-17
++  "estates, but NOT 100% of the time" doctrine **at the default**. The 08-17
++  doctrine is not deleted: `bias_prob_permille < 1000` restores the
++  minority-isolate mix as a data option, now seed-distance-respecting. The
++  spatial-lane canon (08-12) governs pipe rendering — untouched, no tension.
++  Both flags are in the GDD decision-log entry (2026-08-21).
++- **Seed distance 10 = 2× the adjacency radius:** visually distinct sections
++  on the 40×30 map, inside the era-3 connect span (18) so E31 connectability
++  stays satisfiable; the bounded rejection budget keeps it honest on dense
++  maps (deterministic skip, no stall).
++- **Fail-fast loader (ODN-5):** `new_area_seed_tiles` is a named key —
++  missing / ≤ `radius_tiles` / bias 0 or 1001 all reject naming the key; bias
++  range widened 1..999 → 1..1000 (0 still invalid).
++
++## Save/action-log compatibility
++
++The `balance.json` knob changes fold into `catalog_hash` (every golden shifts
++— the established re-bless precedent): old action logs / saves from earlier
++builds **replay-fail under the new hash** — the app and harness refuse
++mismatched manifests, by design (ODN-11). Nothing from an earlier build is
++loadable into this one; this is the documented cost of a catalog retune.
++
++## Golden re-bless (deliberate, cause-documented)
++
++All 45 demos' T1 manifests + action logs + T2 captures and the input-parity
++manifests re-blessed (`harness save` + `harness input-parity save`). Every
++shift is caused by (a) the catalog_hash fold (the new knob values + comments)
++and (b) the genuine behavioral change (estate spawns — the point of the
++story). **`harness fold-check` PASS** (prev `dfe3e342b56679fb` /
++`4eaa272171fac065`): boot's tick-1 shift is the catalog fold alone — no
++serialization/layout drift. Replay gate: every blessed log re-sims its
++manifest bit-for-bit.
++
++## Tests
++
++The acceptance pins re-pinned (updated, never deleted) in `core/growth_test.odin`:
++- **`test_groups_estates_strict`** — the parametrized strict attach-or-seed
++  audit (the renamed re-pin) on seed 9, at BOTH caps: every spawn is audited
++  against its then-live terminal subset with the mechanism-exact class rule
++  (eligible cluster existed → ATTACH required; every cluster at the cap →
++  SEED required; fresh map → seed), a **mid-run seed** (spawn index > 0 — the
++  cap-to-new-area acceptance cannot pass on the forced first spawn alone),
++  estates form (≥ min_members), every final-view singleton is a fresh seed,
++  E31 + compactness hold. `max_members: 8` (acceptance criterion 3 — the
++  one-line change) is a repeatable leg of the same test, not a one-off
++  capture.
++- **`test_groups_strict_audit_with_fixture`** (new) — the same audit on the
++  fixture map (residential at slot 0): pins the dead-slot anchor collision fix.
++- **`test_groups_optin_mix_seeds_audit_clean`** (new) — bias 750 (the 08-17
++  "NOT 100%" data option): every spawn attach-or-seed, seed-distance-
++  respecting, and a coin-miss SEED (seed-class spawn while an eligible cluster
++  existed — mechanically impossible at bias 1000) is asserted: the branch
++  would regress silently without the pin. Loader positive row: bias 750 loads
++  clean.
++- **`test_growth_seed_sep_predicate`** + **`test_growth_attach_radius_predicate`**
++  (new pure-unit pins, no seed dependence).
++- Loader pins: bias 1000 valid (was a rejection), new key rows (missing / at
++  radius / below radius / negative) reject naming the key; the shared
++  `test_catalog` fixture mirrors the new data.
++- Surviving pins adapted: `test_growth_outward_bias_annulus` (the annulus
++  bound now holds for both families by construction — E31 keeps ATTACH
++  candidates ≥ the 4-tile floor and ≤ span), E31 + determinism + replay pins
++  re-verified on the new stream.
++
++Full suite: `tools/ci-local.sh --mac` **10/10 green**.
++
++## How the evidence was produced
++
++- **Before** captures + dumps: the baseline code at `4ccc8c75` (the spec's
++  baseline commit, old balance) in a scratch worktree; the growth.dem
++  scenario replayed there and the OLD blessed T2 frames extracted from git.
++- **After** captures + dumps: this branch's code + balance, same scenario.
++- Same seed 42, same ticks (t30/t300/t900/t1760), the same audit lens
++  (positions only — ATTACH within 5 of a then-live terminal, SEED ≥ 10 from
++  every then-live terminal).
++- The coordinate-dump tool was a scratch program, deleted by design after
++  producing the dumps — the dumps + captures in `docs/captures/` are the
++  durable artifact.
++
++## Out of scope (per the briefing)
++
++Spawn timing (`terminal_spawn_interval_ticks` stays 80), `terminal_min_sep_tiles`
++(stays 4 — the E31 packing floor), node-type visual identity, routing
++semantics, serialization / LOG_VERSION — all untouched. E31 is the hard
++contract throughout; growth spawns TERMINALS only, outward from the
++player-placed mesh.
++
++## Fun-test gate
++
++Merge ≠ done: the user plays `odin run app` after merge; the knobs
++(`max_members`, `new_area_seed_tiles`, `radius_tiles`) are the expected
++iteration surface for the follow-up tuning round (the cap change is one line).
+diff --git a/docs/captures/v2-estate-spawning/after/01500ms.png b/docs/captures/v2-estate-spawning/after/01500ms.png
+new file mode 100644
+index 0000000..7ebc67d
+Binary files /dev/null and b/docs/captures/v2-estate-spawning/after/01500ms.png differ
+diff --git a/docs/captures/v2-estate-spawning/after/15000ms.png b/docs/captures/v2-estate-spawning/after/15000ms.png
+new file mode 100644
+index 0000000..219663b
+Binary files /dev/null and b/docs/captures/v2-estate-spawning/after/15000ms.png differ
+diff --git a/docs/captures/v2-estate-spawning/after/45000ms.png b/docs/captures/v2-estate-spawning/after/45000ms.png
+new file mode 100644
+index 0000000..8d91efb
+Binary files /dev/null and b/docs/captures/v2-estate-spawning/after/45000ms.png differ
+diff --git a/docs/captures/v2-estate-spawning/after/88000ms.png b/docs/captures/v2-estate-spawning/after/88000ms.png
+new file mode 100644
+index 0000000..2de4322
+Binary files /dev/null and b/docs/captures/v2-estate-spawning/after/88000ms.png differ
+diff --git a/docs/captures/v2-estate-spawning/before/01500ms.png b/docs/captures/v2-estate-spawning/before/01500ms.png
+new file mode 100644
+index 0000000..7ebc67d
+Binary files /dev/null and b/docs/captures/v2-estate-spawning/before/01500ms.png differ
+diff --git a/docs/captures/v2-estate-spawning/before/15000ms.png b/docs/captures/v2-estate-spawning/before/15000ms.png
+new file mode 100644
+index 0000000..f415bf7
+Binary files /dev/null and b/docs/captures/v2-estate-spawning/before/15000ms.png differ
+diff --git a/docs/captures/v2-estate-spawning/before/45000ms.png b/docs/captures/v2-estate-spawning/before/45000ms.png
+new file mode 100644
+index 0000000..f25dc8a
+Binary files /dev/null and b/docs/captures/v2-estate-spawning/before/45000ms.png differ
+diff --git a/docs/captures/v2-estate-spawning/before/88000ms.png b/docs/captures/v2-estate-spawning/before/88000ms.png
+new file mode 100644
+index 0000000..fbd387d
+Binary files /dev/null and b/docs/captures/v2-estate-spawning/before/88000ms.png differ
+diff --git a/docs/captures/v2-estate-spawning/spawn-audit-after-cap8.txt b/docs/captures/v2-estate-spawning/spawn-audit-after-cap8.txt
+new file mode 100644
+index 0000000..f16dfd9
+--- /dev/null
++++ b/docs/captures/v2-estate-spawning/spawn-audit-after-cap8.txt
+@@ -0,0 +1,150 @@
++== after (max_members 8) == seed 42 era 1 growth on | bias 1000 cap 8 radius 5 seed_dist 10 sep 4
++--- after (max_members 8) tick 30 (1500ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 1
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 1
++  WINDOW tick 80 -> spawn slot 3 @ [13, 15]
++      vs TERM slot 0 @ [8, 15] : 5.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 7.00 tiles
++      vs TERM slot 2 @ [32, 15] : 19.00 tiles
++  WINDOW tick 160 -> spawn slot 4 @ [32, 10]
++      vs TERM slot 0 @ [8, 15] : 24.52 tiles
++      vs JUNC slot 1 @ [20, 15] : 13.00 tiles
++      vs TERM slot 2 @ [32, 15] : 5.00 tiles
++      vs TERM slot 3 @ [13, 15] : 19.65 tiles
++  WINDOW tick 240 -> spawn slot 5 @ [32, 20]
++      vs TERM slot 0 @ [8, 15] : 24.52 tiles
++      vs JUNC slot 1 @ [20, 15] : 13.00 tiles
++      vs TERM slot 2 @ [32, 15] : 5.00 tiles
++      vs TERM slot 3 @ [13, 15] : 19.65 tiles
++      vs TERM slot 4 @ [32, 10] : 10.00 tiles
++--- after (max_members 8) tick 300 (15000ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 2
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 3
++  slot 03 TERM id 3 role Residential @ [13, 15]  cluster_size 2
++  slot 04 TERM id 4 role Residential @ [32, 10]  cluster_size 3
++  slot 05 TERM id 5 role Residential @ [32, 20]  cluster_size 3
++  WINDOW tick 320 -> spawn slot 6 @ [13, 20]
++      vs TERM slot 0 @ [8, 15] : 7.07 tiles
++      vs JUNC slot 1 @ [20, 15] : 8.60 tiles
++      vs TERM slot 2 @ [32, 15] : 19.65 tiles
++      vs TERM slot 3 @ [13, 15] : 5.00 tiles
++      vs TERM slot 4 @ [32, 10] : 21.47 tiles
++      vs TERM slot 5 @ [32, 20] : 19.00 tiles
++  WINDOW tick 480 -> spawn slot 7 @ [8, 11]
++      vs TERM slot 0 @ [8, 15] : 4.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 12.65 tiles
++      vs TERM slot 2 @ [32, 15] : 24.33 tiles
++      vs TERM slot 3 @ [13, 15] : 6.40 tiles
++      vs TERM slot 4 @ [32, 10] : 24.02 tiles
++      vs TERM slot 5 @ [32, 20] : 25.63 tiles
++      vs TERM slot 6 @ [13, 20] : 10.30 tiles
++  WINDOW tick 640 -> spawn slot 8 @ [17, 20]
++      vs TERM slot 0 @ [8, 15] : 10.30 tiles
++      vs JUNC slot 1 @ [20, 15] : 5.83 tiles
++      vs TERM slot 2 @ [32, 15] : 15.81 tiles
++      vs TERM slot 3 @ [13, 15] : 6.40 tiles
++      vs TERM slot 4 @ [32, 10] : 18.03 tiles
++      vs TERM slot 5 @ [32, 20] : 15.00 tiles
++      vs TERM slot 6 @ [13, 20] : 4.00 tiles
++      vs TERM slot 7 @ [8, 11] : 12.73 tiles
++  WINDOW tick 720 -> spawn slot 9 @ [13, 10]
++      vs TERM slot 0 @ [8, 15] : 7.07 tiles
++      vs JUNC slot 1 @ [20, 15] : 8.60 tiles
++      vs TERM slot 2 @ [32, 15] : 19.65 tiles
++      vs TERM slot 3 @ [13, 15] : 5.00 tiles
++      vs TERM slot 4 @ [32, 10] : 19.00 tiles
++      vs TERM slot 5 @ [32, 20] : 21.47 tiles
++      vs TERM slot 6 @ [13, 20] : 10.00 tiles
++      vs TERM slot 7 @ [8, 11] : 5.10 tiles
++      vs TERM slot 8 @ [17, 20] : 10.77 tiles
++  WINDOW tick 800 -> spawn slot 10 @ [9, 20]
++      vs TERM slot 0 @ [8, 15] : 5.10 tiles
++      vs JUNC slot 1 @ [20, 15] : 12.08 tiles
++      vs TERM slot 2 @ [32, 15] : 23.54 tiles
++      vs TERM slot 3 @ [13, 15] : 6.40 tiles
++      vs TERM slot 4 @ [32, 10] : 25.08 tiles
++      vs TERM slot 5 @ [32, 20] : 23.00 tiles
++      vs TERM slot 6 @ [13, 20] : 4.00 tiles
++      vs TERM slot 7 @ [8, 11] : 9.06 tiles
++      vs TERM slot 8 @ [17, 20] : 8.00 tiles
++      vs TERM slot 9 @ [13, 10] : 10.77 tiles
++--- after (max_members 8) tick 900 (45000ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 7
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 3
++  slot 03 TERM id 3 role Residential @ [13, 15]  cluster_size 7
++  slot 04 TERM id 4 role Residential @ [32, 10]  cluster_size 3
++  slot 05 TERM id 5 role Residential @ [32, 20]  cluster_size 3
++  slot 06 TERM id 6 role Residential @ [13, 20]  cluster_size 7
++  slot 07 TERM id 7 role Residential @ [8, 11]  cluster_size 7
++  slot 08 TERM id 8 role Residential @ [17, 20]  cluster_size 7
++  slot 09 TERM id 9 role Residential @ [13, 10]  cluster_size 7
++  slot 10 TERM id 10 role Residential @ [9, 20]  cluster_size 7
++  WINDOW tick 1120 -> spawn slot 11 @ [13, 24]
++      vs TERM slot 0 @ [8, 15] : 10.30 tiles
++      vs JUNC slot 1 @ [20, 15] : 11.40 tiles
++      vs TERM slot 2 @ [32, 15] : 21.02 tiles
++      vs TERM slot 3 @ [13, 15] : 9.00 tiles
++      vs TERM slot 4 @ [32, 10] : 23.60 tiles
++      vs TERM slot 5 @ [32, 20] : 19.42 tiles
++      vs TERM slot 6 @ [13, 20] : 4.00 tiles
++      vs TERM slot 7 @ [8, 11] : 13.93 tiles
++      vs TERM slot 8 @ [17, 20] : 5.66 tiles
++      vs TERM slot 9 @ [13, 10] : 14.00 tiles
++      vs TERM slot 10 @ [9, 20] : 5.66 tiles
++  WINDOW tick 1360 -> spawn slot 12 @ [28, 20]
++      vs TERM slot 0 @ [8, 15] : 20.62 tiles
++      vs JUNC slot 1 @ [20, 15] : 9.43 tiles
++      vs TERM slot 2 @ [32, 15] : 6.40 tiles
++      vs TERM slot 3 @ [13, 15] : 15.81 tiles
++      vs TERM slot 4 @ [32, 10] : 10.77 tiles
++      vs TERM slot 5 @ [32, 20] : 4.00 tiles
++      vs TERM slot 6 @ [13, 20] : 15.00 tiles
++      vs TERM slot 7 @ [8, 11] : 21.93 tiles
++      vs TERM slot 8 @ [17, 20] : 11.00 tiles
++      vs TERM slot 9 @ [13, 10] : 18.03 tiles
++      vs TERM slot 10 @ [9, 20] : 19.00 tiles
++      vs TERM slot 11 @ [13, 24] : 15.52 tiles
++  WINDOW tick 1520 -> spawn slot 13 @ [23, 20]
++      vs TERM slot 0 @ [8, 15] : 15.81 tiles
++      vs JUNC slot 1 @ [20, 15] : 5.83 tiles
++      vs TERM slot 2 @ [32, 15] : 10.30 tiles
++      vs TERM slot 3 @ [13, 15] : 11.18 tiles
++      vs TERM slot 4 @ [32, 10] : 13.45 tiles
++      vs TERM slot 5 @ [32, 20] : 9.00 tiles
++      vs TERM slot 6 @ [13, 20] : 10.00 tiles
++      vs TERM slot 7 @ [8, 11] : 17.49 tiles
++      vs TERM slot 8 @ [17, 20] : 6.00 tiles
++      vs TERM slot 9 @ [13, 10] : 14.14 tiles
++      vs TERM slot 10 @ [9, 20] : 14.00 tiles
++      vs TERM slot 11 @ [13, 24] : 10.77 tiles
++      vs TERM slot 12 @ [28, 20] : 5.00 tiles
++--- after (max_members 8) tick 1760 (88000ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 8
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 5
++  slot 03 TERM id 3 role Residential @ [13, 15]  cluster_size 8
++  slot 04 TERM id 4 role Residential @ [32, 10]  cluster_size 5
++  slot 05 TERM id 5 role Residential @ [32, 20]  cluster_size 5
++  slot 06 TERM id 6 role Residential @ [13, 20]  cluster_size 8
++  slot 07 TERM id 7 role Residential @ [8, 11]  cluster_size 8
++  slot 08 TERM id 8 role Residential @ [17, 20]  cluster_size 8
++  slot 09 TERM id 9 role Residential @ [13, 10]  cluster_size 8
++  slot 10 TERM id 10 role Residential @ [9, 20]  cluster_size 8
++  slot 11 TERM id 11 role Residential @ [13, 24]  cluster_size 8
++  slot 12 TERM id 12 role Residential @ [28, 20]  cluster_size 5
++  slot 13 TERM id 13 role Residential @ [23, 20]  cluster_size 5
++--- spawn audit (slot order; ATTACH = within radius 5 of an earlier terminal, SEED = >= 10 from all) ---
++  spawn #01 slot 03 ATTCH @ [13, 15]  nearest-earlier 5.00 tiles
++  spawn #02 slot 04 ATTCH @ [32, 10]  nearest-earlier 5.00 tiles
++  spawn #03 slot 05 ATTCH @ [32, 20]  nearest-earlier 5.00 tiles
++  spawn #04 slot 06 ATTCH @ [13, 20]  nearest-earlier 5.00 tiles
++  spawn #05 slot 07 ATTCH @ [8, 11]  nearest-earlier 4.00 tiles
++  spawn #06 slot 08 ATTCH @ [17, 20]  nearest-earlier 4.00 tiles
++  spawn #07 slot 09 ATTCH @ [13, 10]  nearest-earlier 5.00 tiles
++  spawn #08 slot 10 ATTCH @ [9, 20]  nearest-earlier 4.00 tiles
++  spawn #09 slot 11 ATTCH @ [13, 24]  nearest-earlier 4.00 tiles
++  spawn #10 slot 12 ATTCH @ [28, 20]  nearest-earlier 4.00 tiles
++  spawn #11 slot 13 ATTCH @ [23, 20]  nearest-earlier 5.00 tiles
+diff --git a/docs/captures/v2-estate-spawning/spawn-audit-after.txt b/docs/captures/v2-estate-spawning/spawn-audit-after.txt
+new file mode 100644
+index 0000000..065729c
+--- /dev/null
++++ b/docs/captures/v2-estate-spawning/spawn-audit-after.txt
+@@ -0,0 +1,184 @@
++== after (strict defaults) == seed 42 era 1 growth on | bias 1000 cap 5 radius 5 seed_dist 10 sep 4
++--- after (strict defaults) tick 30 (1500ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 1
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 1
++  WINDOW tick 80 -> spawn slot 3 @ [13, 15]
++      vs TERM slot 0 @ [8, 15] : 5.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 7.00 tiles
++      vs TERM slot 2 @ [32, 15] : 19.00 tiles
++  WINDOW tick 160 -> spawn slot 4 @ [32, 10]
++      vs TERM slot 0 @ [8, 15] : 24.52 tiles
++      vs JUNC slot 1 @ [20, 15] : 13.00 tiles
++      vs TERM slot 2 @ [32, 15] : 5.00 tiles
++      vs TERM slot 3 @ [13, 15] : 19.65 tiles
++  WINDOW tick 240 -> spawn slot 5 @ [32, 20]
++      vs TERM slot 0 @ [8, 15] : 24.52 tiles
++      vs JUNC slot 1 @ [20, 15] : 13.00 tiles
++      vs TERM slot 2 @ [32, 15] : 5.00 tiles
++      vs TERM slot 3 @ [13, 15] : 19.65 tiles
++      vs TERM slot 4 @ [32, 10] : 10.00 tiles
++--- after (strict defaults) tick 300 (15000ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 2
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 3
++  slot 03 TERM id 3 role Residential @ [13, 15]  cluster_size 2
++  slot 04 TERM id 4 role Residential @ [32, 10]  cluster_size 3
++  slot 05 TERM id 5 role Residential @ [32, 20]  cluster_size 3
++  WINDOW tick 320 -> spawn slot 6 @ [13, 20]
++      vs TERM slot 0 @ [8, 15] : 7.07 tiles
++      vs JUNC slot 1 @ [20, 15] : 8.60 tiles
++      vs TERM slot 2 @ [32, 15] : 19.65 tiles
++      vs TERM slot 3 @ [13, 15] : 5.00 tiles
++      vs TERM slot 4 @ [32, 10] : 21.47 tiles
++      vs TERM slot 5 @ [32, 20] : 19.00 tiles
++  WINDOW tick 480 -> spawn slot 7 @ [8, 11]
++      vs TERM slot 0 @ [8, 15] : 4.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 12.65 tiles
++      vs TERM slot 2 @ [32, 15] : 24.33 tiles
++      vs TERM slot 3 @ [13, 15] : 6.40 tiles
++      vs TERM slot 4 @ [32, 10] : 24.02 tiles
++      vs TERM slot 5 @ [32, 20] : 25.63 tiles
++      vs TERM slot 6 @ [13, 20] : 10.30 tiles
++  WINDOW tick 640 -> spawn slot 8 @ [17, 20]
++      vs TERM slot 0 @ [8, 15] : 10.30 tiles
++      vs JUNC slot 1 @ [20, 15] : 5.83 tiles
++      vs TERM slot 2 @ [32, 15] : 15.81 tiles
++      vs TERM slot 3 @ [13, 15] : 6.40 tiles
++      vs TERM slot 4 @ [32, 10] : 18.03 tiles
++      vs TERM slot 5 @ [32, 20] : 15.00 tiles
++      vs TERM slot 6 @ [13, 20] : 4.00 tiles
++      vs TERM slot 7 @ [8, 11] : 12.73 tiles
++  WINDOW tick 880 -> spawn slot 9 @ [27, 20]
++      vs TERM slot 0 @ [8, 15] : 19.65 tiles
++      vs JUNC slot 1 @ [20, 15] : 8.60 tiles
++      vs TERM slot 2 @ [32, 15] : 7.07 tiles
++      vs TERM slot 3 @ [13, 15] : 14.87 tiles
++      vs TERM slot 4 @ [32, 10] : 11.18 tiles
++      vs TERM slot 5 @ [32, 20] : 5.00 tiles
++      vs TERM slot 6 @ [13, 20] : 14.00 tiles
++      vs TERM slot 7 @ [8, 11] : 21.02 tiles
++      vs TERM slot 8 @ [17, 20] : 10.00 tiles
++--- after (strict defaults) tick 900 (45000ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 5
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 4
++  slot 03 TERM id 3 role Residential @ [13, 15]  cluster_size 5
++  slot 04 TERM id 4 role Residential @ [32, 10]  cluster_size 4
++  slot 05 TERM id 5 role Residential @ [32, 20]  cluster_size 4
++  slot 06 TERM id 6 role Residential @ [13, 20]  cluster_size 5
++  slot 07 TERM id 7 role Residential @ [8, 11]  cluster_size 5
++  slot 08 TERM id 8 role Residential @ [17, 20]  cluster_size 5
++  slot 09 TERM id 9 role Residential @ [27, 20]  cluster_size 4
++  WINDOW tick 960 -> spawn slot 10 @ [27, 15]
++      vs TERM slot 0 @ [8, 15] : 19.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 7.00 tiles
++      vs TERM slot 2 @ [32, 15] : 5.00 tiles
++      vs TERM slot 3 @ [13, 15] : 14.00 tiles
++      vs TERM slot 4 @ [32, 10] : 7.07 tiles
++      vs TERM slot 5 @ [32, 20] : 7.07 tiles
++      vs TERM slot 6 @ [13, 20] : 14.87 tiles
++      vs TERM slot 7 @ [8, 11] : 19.42 tiles
++      vs TERM slot 8 @ [17, 20] : 11.18 tiles
++      vs TERM slot 9 @ [27, 20] : 5.00 tiles
++  WINDOW tick 1040 -> spawn slot 11 @ [20, 6]
++      vs TERM slot 0 @ [8, 15] : 15.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 9.00 tiles
++      vs TERM slot 2 @ [32, 15] : 15.00 tiles
++      vs TERM slot 3 @ [13, 15] : 11.40 tiles
++      vs TERM slot 4 @ [32, 10] : 12.65 tiles
++      vs TERM slot 5 @ [32, 20] : 18.44 tiles
++      vs TERM slot 6 @ [13, 20] : 15.65 tiles
++      vs TERM slot 7 @ [8, 11] : 13.00 tiles
++      vs TERM slot 8 @ [17, 20] : 14.32 tiles
++      vs TERM slot 9 @ [27, 20] : 15.65 tiles
++      vs TERM slot 10 @ [27, 15] : 11.40 tiles
++  WINDOW tick 1120 -> spawn slot 12 @ [25, 6]
++      vs TERM slot 0 @ [8, 15] : 19.24 tiles
++      vs JUNC slot 1 @ [20, 15] : 10.30 tiles
++      vs TERM slot 2 @ [32, 15] : 11.40 tiles
++      vs TERM slot 3 @ [13, 15] : 15.00 tiles
++      vs TERM slot 4 @ [32, 10] : 8.06 tiles
++      vs TERM slot 5 @ [32, 20] : 15.65 tiles
++      vs TERM slot 6 @ [13, 20] : 18.44 tiles
++      vs TERM slot 7 @ [8, 11] : 17.72 tiles
++      vs TERM slot 8 @ [17, 20] : 16.12 tiles
++      vs TERM slot 9 @ [27, 20] : 14.14 tiles
++      vs TERM slot 10 @ [27, 15] : 9.22 tiles
++      vs TERM slot 11 @ [20, 6] : 5.00 tiles
++  WINDOW tick 1200 -> spawn slot 13 @ [20, 10]
++      vs TERM slot 0 @ [8, 15] : 13.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 5.00 tiles
++      vs TERM slot 2 @ [32, 15] : 13.00 tiles
++      vs TERM slot 3 @ [13, 15] : 8.60 tiles
++      vs TERM slot 4 @ [32, 10] : 12.00 tiles
++      vs TERM slot 5 @ [32, 20] : 15.62 tiles
++      vs TERM slot 6 @ [13, 20] : 12.21 tiles
++      vs TERM slot 7 @ [8, 11] : 12.04 tiles
++      vs TERM slot 8 @ [17, 20] : 10.44 tiles
++      vs TERM slot 9 @ [27, 20] : 12.21 tiles
++      vs TERM slot 10 @ [27, 15] : 8.60 tiles
++      vs TERM slot 11 @ [20, 6] : 4.00 tiles
++      vs TERM slot 12 @ [25, 6] : 6.40 tiles
++  WINDOW tick 1280 -> spawn slot 14 @ [15, 6]
++      vs TERM slot 0 @ [8, 15] : 11.40 tiles
++      vs JUNC slot 1 @ [20, 15] : 10.30 tiles
++      vs TERM slot 2 @ [32, 15] : 19.24 tiles
++      vs TERM slot 3 @ [13, 15] : 9.22 tiles
++      vs TERM slot 4 @ [32, 10] : 17.46 tiles
++      vs TERM slot 5 @ [32, 20] : 22.02 tiles
++      vs TERM slot 6 @ [13, 20] : 14.14 tiles
++      vs TERM slot 7 @ [8, 11] : 8.60 tiles
++      vs TERM slot 8 @ [17, 20] : 14.14 tiles
++      vs TERM slot 9 @ [27, 20] : 18.44 tiles
++      vs TERM slot 10 @ [27, 15] : 15.00 tiles
++      vs TERM slot 11 @ [20, 6] : 5.00 tiles
++      vs TERM slot 12 @ [25, 6] : 10.00 tiles
++      vs TERM slot 13 @ [20, 10] : 6.40 tiles
++  WINDOW tick 1360 -> spawn slot 15 @ [16, 10]
++      vs TERM slot 0 @ [8, 15] : 9.43 tiles
++      vs JUNC slot 1 @ [20, 15] : 6.40 tiles
++      vs TERM slot 2 @ [32, 15] : 16.76 tiles
++      vs TERM slot 3 @ [13, 15] : 5.83 tiles
++      vs TERM slot 4 @ [32, 10] : 16.00 tiles
++      vs TERM slot 5 @ [32, 20] : 18.87 tiles
++      vs TERM slot 6 @ [13, 20] : 10.44 tiles
++      vs TERM slot 7 @ [8, 11] : 8.06 tiles
++      vs TERM slot 8 @ [17, 20] : 10.05 tiles
++      vs TERM slot 9 @ [27, 20] : 14.87 tiles
++      vs TERM slot 10 @ [27, 15] : 12.08 tiles
++      vs TERM slot 11 @ [20, 6] : 5.66 tiles
++      vs TERM slot 12 @ [25, 6] : 9.85 tiles
++      vs TERM slot 13 @ [20, 10] : 4.00 tiles
++      vs TERM slot 14 @ [15, 6] : 4.12 tiles
++--- after (strict defaults) tick 1760 (88000ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 5
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 5
++  slot 03 TERM id 3 role Residential @ [13, 15]  cluster_size 5
++  slot 04 TERM id 4 role Residential @ [32, 10]  cluster_size 5
++  slot 05 TERM id 5 role Residential @ [32, 20]  cluster_size 5
++  slot 06 TERM id 6 role Residential @ [13, 20]  cluster_size 5
++  slot 07 TERM id 7 role Residential @ [8, 11]  cluster_size 5
++  slot 08 TERM id 8 role Residential @ [17, 20]  cluster_size 5
++  slot 09 TERM id 9 role Residential @ [27, 20]  cluster_size 5
++  slot 10 TERM id 10 role Residential @ [27, 15]  cluster_size 5
++  slot 11 TERM id 11 role Residential @ [20, 6]  cluster_size 5
++  slot 12 TERM id 12 role Residential @ [25, 6]  cluster_size 5
++  slot 13 TERM id 13 role Residential @ [20, 10]  cluster_size 5
++  slot 14 TERM id 14 role Residential @ [15, 6]  cluster_size 5
++  slot 15 TERM id 15 role Residential @ [16, 10]  cluster_size 5
++--- spawn audit (slot order; ATTACH = within radius 5 of an earlier terminal, SEED = >= 10 from all) ---
++  spawn #01 slot 03 ATTCH @ [13, 15]  nearest-earlier 5.00 tiles
++  spawn #02 slot 04 ATTCH @ [32, 10]  nearest-earlier 5.00 tiles
++  spawn #03 slot 05 ATTCH @ [32, 20]  nearest-earlier 5.00 tiles
++  spawn #04 slot 06 ATTCH @ [13, 20]  nearest-earlier 5.00 tiles
++  spawn #05 slot 07 ATTCH @ [8, 11]  nearest-earlier 4.00 tiles
++  spawn #06 slot 08 ATTCH @ [17, 20]  nearest-earlier 4.00 tiles
++  spawn #07 slot 09 ATTCH @ [27, 20]  nearest-earlier 5.00 tiles
++  spawn #08 slot 10 ATTCH @ [27, 15]  nearest-earlier 5.00 tiles
++  spawn #09 slot 11 SEED  @ [20, 6]  nearest-earlier 11.40 tiles
++  spawn #10 slot 12 ATTCH @ [25, 6]  nearest-earlier 5.00 tiles
++  spawn #11 slot 13 ATTCH @ [20, 10]  nearest-earlier 4.00 tiles
++  spawn #12 slot 14 ATTCH @ [15, 6]  nearest-earlier 5.00 tiles
++  spawn #13 slot 15 ATTCH @ [16, 10]  nearest-earlier 4.00 tiles
+diff --git a/docs/captures/v2-estate-spawning/spawn-audit-before.txt b/docs/captures/v2-estate-spawning/spawn-audit-before.txt
+new file mode 100644
+index 0000000..9053d4e
+--- /dev/null
++++ b/docs/captures/v2-estate-spawning/spawn-audit-before.txt
+@@ -0,0 +1,317 @@
++== before (5.12 defaults) == seed 42 era 1 growth on | bias 750 cap 8 radius 5 seed_dist 10 (the 08-21 audit floor; pre-08-21 balance has no such knob) sep 4
++--- before (5.12 defaults) tick 30 (1500ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 1
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 1
++  WINDOW tick 80 -> spawn slot 3 @ [28, 19]
++      vs TERM slot 0 @ [8, 15] : 20.40 tiles
++      vs JUNC slot 1 @ [20, 15] : 8.94 tiles
++      vs TERM slot 2 @ [32, 15] : 5.66 tiles
++  WINDOW tick 160 -> spawn slot 4 @ [28, 11]
++      vs TERM slot 0 @ [8, 15] : 20.40 tiles
++      vs JUNC slot 1 @ [20, 15] : 8.94 tiles
++      vs TERM slot 2 @ [32, 15] : 5.66 tiles
++      vs TERM slot 3 @ [28, 19] : 8.00 tiles
++  WINDOW tick 240 -> spawn slot 5 @ [24, 23]
++      vs TERM slot 0 @ [8, 15] : 17.89 tiles
++      vs JUNC slot 1 @ [20, 15] : 8.94 tiles
++      vs TERM slot 2 @ [32, 15] : 11.31 tiles
++      vs TERM slot 3 @ [28, 19] : 5.66 tiles
++      vs TERM slot 4 @ [28, 11] : 12.65 tiles
++--- before (5.12 defaults) tick 300 (15000ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 1
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 1
++  slot 03 TERM id 3 role Residential @ [28, 19]  cluster_size 1
++  slot 04 TERM id 4 role Residential @ [28, 11]  cluster_size 1
++  slot 05 TERM id 5 role Residential @ [24, 23]  cluster_size 1
++  WINDOW tick 320 -> spawn slot 6 @ [28, 6]
++      vs TERM slot 0 @ [8, 15] : 21.93 tiles
++      vs JUNC slot 1 @ [20, 15] : 12.04 tiles
++      vs TERM slot 2 @ [32, 15] : 9.85 tiles
++      vs TERM slot 3 @ [28, 19] : 13.00 tiles
++      vs TERM slot 4 @ [28, 11] : 5.00 tiles
++      vs TERM slot 5 @ [24, 23] : 17.46 tiles
++  WINDOW tick 400 -> spawn slot 7 @ [24, 10]
++      vs TERM slot 0 @ [8, 15] : 16.76 tiles
++      vs JUNC slot 1 @ [20, 15] : 6.40 tiles
++      vs TERM slot 2 @ [32, 15] : 9.43 tiles
++      vs TERM slot 3 @ [28, 19] : 9.85 tiles
++      vs TERM slot 4 @ [28, 11] : 4.12 tiles
++      vs TERM slot 5 @ [24, 23] : 13.00 tiles
++      vs TERM slot 6 @ [28, 6] : 5.66 tiles
++  WINDOW tick 480 -> spawn slot 8 @ [28, 15]
++      vs TERM slot 0 @ [8, 15] : 20.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 8.00 tiles
++      vs TERM slot 2 @ [32, 15] : 4.00 tiles
++      vs TERM slot 3 @ [28, 19] : 4.00 tiles
++      vs TERM slot 4 @ [28, 11] : 4.00 tiles
++      vs TERM slot 5 @ [24, 23] : 8.94 tiles
++      vs TERM slot 6 @ [28, 6] : 9.00 tiles
++      vs TERM slot 7 @ [24, 10] : 6.40 tiles
++  WINDOW tick 560 -> spawn slot 9 @ [12, 23]
++      vs TERM slot 0 @ [8, 15] : 8.94 tiles
++      vs JUNC slot 1 @ [20, 15] : 11.31 tiles
++      vs TERM slot 2 @ [32, 15] : 21.54 tiles
++      vs TERM slot 3 @ [28, 19] : 16.49 tiles
++      vs TERM slot 4 @ [28, 11] : 20.00 tiles
++      vs TERM slot 5 @ [24, 23] : 12.00 tiles
++      vs TERM slot 6 @ [28, 6] : 23.35 tiles
++      vs TERM slot 7 @ [24, 10] : 17.69 tiles
++      vs TERM slot 8 @ [28, 15] : 17.89 tiles
++  WINDOW tick 640 -> spawn slot 10 @ [15, 10]
++      vs TERM slot 0 @ [8, 15] : 8.60 tiles
++      vs JUNC slot 1 @ [20, 15] : 7.07 tiles
++      vs TERM slot 2 @ [32, 15] : 17.72 tiles
++      vs TERM slot 3 @ [28, 19] : 15.81 tiles
++      vs TERM slot 4 @ [28, 11] : 13.04 tiles
++      vs TERM slot 5 @ [24, 23] : 15.81 tiles
++      vs TERM slot 6 @ [28, 6] : 13.60 tiles
++      vs TERM slot 7 @ [24, 10] : 9.00 tiles
++      vs TERM slot 8 @ [28, 15] : 13.93 tiles
++      vs TERM slot 9 @ [12, 23] : 13.34 tiles
++  WINDOW tick 720 -> spawn slot 11 @ [20, 5]
++      vs TERM slot 0 @ [8, 15] : 15.62 tiles
++      vs JUNC slot 1 @ [20, 15] : 10.00 tiles
++      vs TERM slot 2 @ [32, 15] : 15.62 tiles
++      vs TERM slot 3 @ [28, 19] : 16.12 tiles
++      vs TERM slot 4 @ [28, 11] : 10.00 tiles
++      vs TERM slot 5 @ [24, 23] : 18.44 tiles
++      vs TERM slot 6 @ [28, 6] : 8.06 tiles
++      vs TERM slot 7 @ [24, 10] : 6.40 tiles
++      vs TERM slot 8 @ [28, 15] : 12.81 tiles
++      vs TERM slot 9 @ [12, 23] : 19.70 tiles
++      vs TERM slot 10 @ [15, 10] : 7.07 tiles
++  WINDOW tick 800 -> spawn slot 12 @ [15, 6]
++      vs TERM slot 0 @ [8, 15] : 11.40 tiles
++      vs JUNC slot 1 @ [20, 15] : 10.30 tiles
++      vs TERM slot 2 @ [32, 15] : 19.24 tiles
++      vs TERM slot 3 @ [28, 19] : 18.38 tiles
++      vs TERM slot 4 @ [28, 11] : 13.93 tiles
++      vs TERM slot 5 @ [24, 23] : 19.24 tiles
++      vs TERM slot 6 @ [28, 6] : 13.00 tiles
++      vs TERM slot 7 @ [24, 10] : 9.85 tiles
++      vs TERM slot 8 @ [28, 15] : 15.81 tiles
++      vs TERM slot 9 @ [12, 23] : 17.26 tiles
++      vs TERM slot 10 @ [15, 10] : 4.00 tiles
++      vs TERM slot 11 @ [20, 5] : 5.10 tiles
++  WINDOW tick 880 -> spawn slot 13 @ [15, 15]
++      vs TERM slot 0 @ [8, 15] : 7.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 5.00 tiles
++      vs TERM slot 2 @ [32, 15] : 17.00 tiles
++      vs TERM slot 3 @ [28, 19] : 13.60 tiles
++      vs TERM slot 4 @ [28, 11] : 13.60 tiles
++      vs TERM slot 5 @ [24, 23] : 12.04 tiles
++      vs TERM slot 6 @ [28, 6] : 15.81 tiles
++      vs TERM slot 7 @ [24, 10] : 10.30 tiles
++      vs TERM slot 8 @ [28, 15] : 13.00 tiles
++      vs TERM slot 9 @ [12, 23] : 8.54 tiles
++      vs TERM slot 10 @ [15, 10] : 5.00 tiles
++      vs TERM slot 11 @ [20, 5] : 11.18 tiles
++      vs TERM slot 12 @ [15, 6] : 9.00 tiles
++--- before (5.12 defaults) tick 900 (45000ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 1
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 6
++  slot 03 TERM id 3 role Residential @ [28, 19]  cluster_size 6
++  slot 04 TERM id 4 role Residential @ [28, 11]  cluster_size 6
++  slot 05 TERM id 5 role Residential @ [24, 23]  cluster_size 1
++  slot 06 TERM id 6 role Residential @ [28, 6]  cluster_size 6
++  slot 07 TERM id 7 role Residential @ [24, 10]  cluster_size 6
++  slot 08 TERM id 8 role Residential @ [28, 15]  cluster_size 6
++  slot 09 TERM id 9 role Residential @ [12, 23]  cluster_size 1
++  slot 10 TERM id 10 role Residential @ [15, 10]  cluster_size 3
++  slot 11 TERM id 11 role Residential @ [20, 5]  cluster_size 1
++  slot 12 TERM id 12 role Residential @ [15, 6]  cluster_size 3
++  slot 13 TERM id 13 role Residential @ [15, 15]  cluster_size 3
++  WINDOW tick 960 -> spawn slot 14 @ [20, 10]
++      vs TERM slot 0 @ [8, 15] : 13.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 5.00 tiles
++      vs TERM slot 2 @ [32, 15] : 13.00 tiles
++      vs TERM slot 3 @ [28, 19] : 12.04 tiles
++      vs TERM slot 4 @ [28, 11] : 8.06 tiles
++      vs TERM slot 5 @ [24, 23] : 13.60 tiles
++      vs TERM slot 6 @ [28, 6] : 8.94 tiles
++      vs TERM slot 7 @ [24, 10] : 4.00 tiles
++      vs TERM slot 8 @ [28, 15] : 9.43 tiles
++      vs TERM slot 9 @ [12, 23] : 15.26 tiles
++      vs TERM slot 10 @ [15, 10] : 5.00 tiles
++      vs TERM slot 11 @ [20, 5] : 5.00 tiles
++      vs TERM slot 12 @ [15, 6] : 6.40 tiles
++      vs TERM slot 13 @ [15, 15] : 7.07 tiles
++  WINDOW tick 1040 -> spawn slot 15 @ [8, 10]
++      vs TERM slot 0 @ [8, 15] : 5.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 13.00 tiles
++      vs TERM slot 2 @ [32, 15] : 24.52 tiles
++      vs TERM slot 3 @ [28, 19] : 21.93 tiles
++      vs TERM slot 4 @ [28, 11] : 20.02 tiles
++      vs TERM slot 5 @ [24, 23] : 20.62 tiles
++      vs TERM slot 6 @ [28, 6] : 20.40 tiles
++      vs TERM slot 7 @ [24, 10] : 16.00 tiles
++      vs TERM slot 8 @ [28, 15] : 20.62 tiles
++      vs TERM slot 9 @ [12, 23] : 13.60 tiles
++      vs TERM slot 10 @ [15, 10] : 7.00 tiles
++      vs TERM slot 11 @ [20, 5] : 13.00 tiles
++      vs TERM slot 12 @ [15, 6] : 8.06 tiles
++      vs TERM slot 13 @ [15, 15] : 8.60 tiles
++      vs TERM slot 14 @ [20, 10] : 12.00 tiles
++  WINDOW tick 1120 -> spawn slot 16 @ [19, 28]
++      vs TERM slot 0 @ [8, 15] : 17.03 tiles
++      vs JUNC slot 1 @ [20, 15] : 13.04 tiles
++      vs TERM slot 2 @ [32, 15] : 18.38 tiles
++      vs TERM slot 3 @ [28, 19] : 12.73 tiles
++      vs TERM slot 4 @ [28, 11] : 19.24 tiles
++      vs TERM slot 5 @ [24, 23] : 7.07 tiles
++      vs TERM slot 6 @ [28, 6] : 23.77 tiles
++      vs TERM slot 7 @ [24, 10] : 18.68 tiles
++      vs TERM slot 8 @ [28, 15] : 15.81 tiles
++      vs TERM slot 9 @ [12, 23] : 8.60 tiles
++      vs TERM slot 10 @ [15, 10] : 18.44 tiles
++      vs TERM slot 11 @ [20, 5] : 23.02 tiles
++      vs TERM slot 12 @ [15, 6] : 22.36 tiles
++      vs TERM slot 13 @ [15, 15] : 13.60 tiles
++      vs TERM slot 14 @ [20, 10] : 18.03 tiles
++      vs TERM slot 15 @ [8, 10] : 21.10 tiles
++  WINDOW tick 1200 -> spawn slot 17 @ [20, 20]
++      vs TERM slot 0 @ [8, 15] : 13.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 5.00 tiles
++      vs TERM slot 2 @ [32, 15] : 13.00 tiles
++      vs TERM slot 3 @ [28, 19] : 8.06 tiles
++      vs TERM slot 4 @ [28, 11] : 12.04 tiles
++      vs TERM slot 5 @ [24, 23] : 5.00 tiles
++      vs TERM slot 6 @ [28, 6] : 16.12 tiles
++      vs TERM slot 7 @ [24, 10] : 10.77 tiles
++      vs TERM slot 8 @ [28, 15] : 9.43 tiles
++      vs TERM slot 9 @ [12, 23] : 8.54 tiles
++      vs TERM slot 10 @ [15, 10] : 11.18 tiles
++      vs TERM slot 11 @ [20, 5] : 15.00 tiles
++      vs TERM slot 12 @ [15, 6] : 14.87 tiles
++      vs TERM slot 13 @ [15, 15] : 7.07 tiles
++      vs TERM slot 14 @ [20, 10] : 10.00 tiles
++      vs TERM slot 15 @ [8, 10] : 15.62 tiles
++      vs TERM slot 16 @ [19, 28] : 8.06 tiles
++  WINDOW tick 1280 -> spawn slot 18 @ [16, 24]
++      vs TERM slot 0 @ [8, 15] : 12.04 tiles
++      vs JUNC slot 1 @ [20, 15] : 9.85 tiles
++      vs TERM slot 2 @ [32, 15] : 18.36 tiles
++      vs TERM slot 3 @ [28, 19] : 13.00 tiles
++      vs TERM slot 4 @ [28, 11] : 17.69 tiles
++      vs TERM slot 5 @ [24, 23] : 8.06 tiles
++      vs TERM slot 6 @ [28, 6] : 21.63 tiles
++      vs TERM slot 7 @ [24, 10] : 16.12 tiles
++      vs TERM slot 8 @ [28, 15] : 15.00 tiles
++      vs TERM slot 9 @ [12, 23] : 4.12 tiles
++      vs TERM slot 10 @ [15, 10] : 14.04 tiles
++      vs TERM slot 11 @ [20, 5] : 19.42 tiles
++      vs TERM slot 12 @ [15, 6] : 18.03 tiles
++      vs TERM slot 13 @ [15, 15] : 9.06 tiles
++      vs TERM slot 14 @ [20, 10] : 14.56 tiles
++      vs TERM slot 15 @ [8, 10] : 16.12 tiles
++      vs TERM slot 16 @ [19, 28] : 5.00 tiles
++      vs TERM slot 17 @ [20, 20] : 5.66 tiles
++  WINDOW tick 1360 -> spawn slot 19 @ [8, 19]
++      vs TERM slot 0 @ [8, 15] : 4.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 12.65 tiles
++      vs TERM slot 2 @ [32, 15] : 24.33 tiles
++      vs TERM slot 3 @ [28, 19] : 20.00 tiles
++      vs TERM slot 4 @ [28, 11] : 21.54 tiles
++      vs TERM slot 5 @ [24, 23] : 16.49 tiles
++      vs TERM slot 6 @ [28, 6] : 23.85 tiles
++      vs TERM slot 7 @ [24, 10] : 18.36 tiles
++      vs TERM slot 8 @ [28, 15] : 20.40 tiles
++      vs TERM slot 9 @ [12, 23] : 5.66 tiles
++      vs TERM slot 10 @ [15, 10] : 11.40 tiles
++      vs TERM slot 11 @ [20, 5] : 18.44 tiles
++      vs TERM slot 12 @ [15, 6] : 14.76 tiles
++      vs TERM slot 13 @ [15, 15] : 8.06 tiles
++      vs TERM slot 14 @ [20, 10] : 15.00 tiles
++      vs TERM slot 15 @ [8, 10] : 9.00 tiles
++      vs TERM slot 16 @ [19, 28] : 14.21 tiles
++      vs TERM slot 17 @ [20, 20] : 12.04 tiles
++      vs TERM slot 18 @ [16, 24] : 9.43 tiles
++  WINDOW tick 1520 -> spawn slot 20 @ [20, 24]
++      vs TERM slot 0 @ [8, 15] : 15.00 tiles
++      vs JUNC slot 1 @ [20, 15] : 9.00 tiles
++      vs TERM slot 2 @ [32, 15] : 15.00 tiles
++      vs TERM slot 3 @ [28, 19] : 9.43 tiles
++      vs TERM slot 4 @ [28, 11] : 15.26 tiles
++      vs TERM slot 5 @ [24, 23] : 4.12 tiles
++      vs TERM slot 6 @ [28, 6] : 19.70 tiles
++      vs TERM slot 7 @ [24, 10] : 14.56 tiles
++      vs TERM slot 8 @ [28, 15] : 12.04 tiles
++      vs TERM slot 9 @ [12, 23] : 8.06 tiles
++      vs TERM slot 10 @ [15, 10] : 14.87 tiles
++      vs TERM slot 11 @ [20, 5] : 19.00 tiles
++      vs TERM slot 12 @ [15, 6] : 18.68 tiles
++      vs TERM slot 13 @ [15, 15] : 10.30 tiles
++      vs TERM slot 14 @ [20, 10] : 14.00 tiles
++      vs TERM slot 15 @ [8, 10] : 18.44 tiles
++      vs TERM slot 16 @ [19, 28] : 4.12 tiles
++      vs TERM slot 17 @ [20, 20] : 4.00 tiles
++      vs TERM slot 18 @ [16, 24] : 4.00 tiles
++      vs TERM slot 19 @ [8, 19] : 13.00 tiles
++  WINDOW tick 1600 -> spawn slot 21 @ [12, 19]
++      vs TERM slot 0 @ [8, 15] : 5.66 tiles
++      vs JUNC slot 1 @ [20, 15] : 8.94 tiles
++      vs TERM slot 2 @ [32, 15] : 20.40 tiles
++      vs TERM slot 3 @ [28, 19] : 16.00 tiles
++      vs TERM slot 4 @ [28, 11] : 17.89 tiles
++      vs TERM slot 5 @ [24, 23] : 12.65 tiles
++      vs TERM slot 6 @ [28, 6] : 20.62 tiles
++      vs TERM slot 7 @ [24, 10] : 15.00 tiles
++      vs TERM slot 8 @ [28, 15] : 16.49 tiles
++      vs TERM slot 9 @ [12, 23] : 4.00 tiles
++      vs TERM slot 10 @ [15, 10] : 9.49 tiles
++      vs TERM slot 11 @ [20, 5] : 16.12 tiles
++      vs TERM slot 12 @ [15, 6] : 13.34 tiles
++      vs TERM slot 13 @ [15, 15] : 5.00 tiles
++      vs TERM slot 14 @ [20, 10] : 12.04 tiles
++      vs TERM slot 15 @ [8, 10] : 9.85 tiles
++      vs TERM slot 16 @ [19, 28] : 11.40 tiles
++      vs TERM slot 17 @ [20, 20] : 8.06 tiles
++      vs TERM slot 18 @ [16, 24] : 6.40 tiles
++      vs TERM slot 19 @ [8, 19] : 4.00 tiles
++      vs TERM slot 20 @ [20, 24] : 9.43 tiles
++--- before (5.12 defaults) tick 1760 (88000ms) ---
++  slot 00 TERM id 0 role Residential @ [8, 15]  cluster_size 21
++  slot 01 JUNC id 1 role None @ [20, 15]  cluster_size 0
++  slot 02 TERM id 2 role Content_Host @ [32, 15]  cluster_size 21
++  slot 03 TERM id 3 role Residential @ [28, 19]  cluster_size 21
++  slot 04 TERM id 4 role Residential @ [28, 11]  cluster_size 21
++  slot 05 TERM id 5 role Residential @ [24, 23]  cluster_size 21
++  slot 06 TERM id 6 role Residential @ [28, 6]  cluster_size 21
++  slot 07 TERM id 7 role Residential @ [24, 10]  cluster_size 21
++  slot 08 TERM id 8 role Residential @ [28, 15]  cluster_size 21
++  slot 09 TERM id 9 role Residential @ [12, 23]  cluster_size 21
++  slot 10 TERM id 10 role Residential @ [15, 10]  cluster_size 21
++  slot 11 TERM id 11 role Residential @ [20, 5]  cluster_size 21
++  slot 12 TERM id 12 role Residential @ [15, 6]  cluster_size 21
++  slot 13 TERM id 13 role Residential @ [15, 15]  cluster_size 21
++  slot 14 TERM id 14 role Residential @ [20, 10]  cluster_size 21
++  slot 15 TERM id 15 role Residential @ [8, 10]  cluster_size 21
++  slot 16 TERM id 16 role Residential @ [19, 28]  cluster_size 21
++  slot 17 TERM id 17 role Residential @ [20, 20]  cluster_size 21
++  slot 18 TERM id 18 role Residential @ [16, 24]  cluster_size 21
++  slot 19 TERM id 19 role Residential @ [8, 19]  cluster_size 21
++  slot 20 TERM id 20 role Residential @ [20, 24]  cluster_size 21
++  slot 21 TERM id 21 role Residential @ [12, 19]  cluster_size 21
++--- spawn audit (slot order; ATTACH = within radius 5 of an earlier terminal, SEED = >= 10 from all — the 08-21 strict lens applied to the 5.12 run) ---
++  spawn #01 slot 03 STRAY @ [28, 19]  nearest-earlier 5.66 tiles
++  spawn #02 slot 04 STRAY @ [28, 11]  nearest-earlier 5.66 tiles
++  spawn #03 slot 05 STRAY @ [24, 23]  nearest-earlier 5.66 tiles
++  spawn #04 slot 06 ATTCH @ [28, 6]  nearest-earlier 5.00 tiles
++  spawn #05 slot 07 ATTCH @ [24, 10]  nearest-earlier 4.12 tiles
++  spawn #06 slot 08 ATTCH @ [28, 15]  nearest-earlier 4.00 tiles
++  spawn #07 slot 09 STRAY @ [12, 23]  nearest-earlier 8.94 tiles
++  spawn #08 slot 10 STRAY @ [15, 10]  nearest-earlier 8.60 tiles
++  spawn #09 slot 11 STRAY @ [20, 5]  nearest-earlier 6.40 tiles
++  spawn #10 slot 12 ATTCH @ [15, 6]  nearest-earlier 4.00 tiles
++  spawn #11 slot 13 ATTCH @ [15, 15]  nearest-earlier 5.00 tiles
++  spawn #12 slot 14 ATTCH @ [20, 10]  nearest-earlier 4.00 tiles
++  spawn #13 slot 15 ATTCH @ [8, 10]  nearest-earlier 5.00 tiles
++  spawn #14 slot 16 STRAY @ [19, 28]  nearest-earlier 7.07 tiles
++  spawn #15 slot 17 ATTCH @ [20, 20]  nearest-earlier 5.00 tiles
++  spawn #16 slot 18 ATTCH @ [16, 24]  nearest-earlier 4.12 tiles
++  spawn #17 slot 19 ATTCH @ [8, 19]  nearest-earlier 4.00 tiles
++  spawn #18 slot 20 ATTCH @ [20, 24]  nearest-earlier 4.00 tiles
++  spawn #19 slot 21 ATTCH @ [12, 19]  nearest-earlier 4.00 tiles

@@ -1,0 +1,72 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "ordering",
+    "title": "Same-frame ESC + popover/QoS click: mapping-time UI side effects execute before the queued Cancel — old code deselected synchronously first",
+    "location": "app/input/mouse.odin (mouse_map phase-1 keys + press branch) / app/main.odin (effect_ui_press, popover_click)",
+    "evidence": "+\t\tcase .Esc:\n+\t\t\tif inp.placing >= 0 {\n+\t\t\t\tesc_cancelled = true\n+\t\t\t}\n+\t\t\tappend(out, Intent(Cancel{}))\n...and later in the same mapping, before execute_all runs:...\n+\t\tif placing_eff < 0 && inp.on_ui_press != nil {\n+\t\t\tui = inp.on_ui_press(inp.user, inp, left_press)\n+\t\t}\n...which reaches:...\n+effect_ui_press :: proc(user: rawptr, ictx: ^inp.Input, pos: rl.Vector2) -> bool {\n+\tapp := cast(^App)user\n+\tif popover_click(app, pos) {\n+\t\treturn true\n+\t}\n+\treturn qos_panel_click(app, pos)\n+}\n...and:...\n+\t\tif rl.CheckCollisionPointRec(mouse, rnd.demolish_button_rect(pop)) {\n+\t\t\tinp.demolish_node(&app.input, u32(app.input.sel_node))\n...whereas the OLD code ran the deselect BEFORE the press block:...\n-\t} else if rl.IsKeyPressed(.ESCAPE) {\n-\t\tapp.sel_pipe = -1\n-\t\tapp.sel_node = -1\n-\t\tapp.press_swallowed = true // an in-flight click's release must not re-select after ESC\n-\t}\n...\n-\t\tif app.placing < 0 && popover_click(app, {f32(mx), f32(my)}) {",
+    "detail": "Cancel is only queued for the executor, but on_ui_press→popover_click/qos_panel_click mutates topology synchronously during mapping. ESC + demolish-button click same frame: old code cleared the selection first (click no-op'd); new code demolishes, then deselects.",
+    "recommended_fix": "Route popover/QoS commands through intents (Demolish/Set_Lane) so executor ordering applies, or run the UI press hit-test after the frame's queued phase-1 cancels have executed."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "cancel-ordering",
+    "title": "ESC + release while placing: stale drag.active routes to Drag_Release, whose click-select never re-checks the swallow latch (Select does)",
+    "location": "app/input/mouse.odin (release else-if chain) / app/input/exec.odin (apply_intent Drag_Release case)",
+    "evidence": "+\t} else if has_release || moves_n > 0 {\n+\t\tif inp.drag.active && placing_eff < 0 {\n...\n+\t\t\tif has_release {\n+\t\t\t\twx, wy := rnd.from_screen(inp.view, release_pos.x, release_pos.y)\n+\t\t\t\tappend(out, Intent(Cursor_Move{wx = wx, wy = wy}))\n+\t\t\t\tappend(out, Intent(Drag_Release{pos = release_pos}))\n...\n+\tcase Drag_Release:\n+\t\tcommit_draw(inp)\n+\t\tmouse := v.pos\n+\t\tmoved := rl.Vector2Distance(mouse, inp.press) > 6\n+\t\tif !moved && !release_ui_hit(inp, mouse) {\n+\t\t\tclick_select(inp, mouse)\n+\t\t}\n...contradicting Cancel's own contract:...\n+\t\t// placing). The swallow latch is always set — the cancel gesture's\n+\t\t// release must not re-select.",
+    "detail": "The placement ghost sets drag.active (exec Cursor_Move), so on an ESC+release frame the mapping branches on pre-Cancel state and emits Drag_Release; its click-select path ignores press_swallowed. The cancel gesture's release now re-selects — the old synchronous cancel made that branch unreachable.",
+    "recommended_fix": "Re-check placing/drag/press_swallowed at execution time inside Drag_Release (as Select and Demolish already do), or have the mapping suppress release intents when esc_cancelled is set."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "ordering",
+    "title": "Chord Press_Anchor runs after Right_Click and clears the drag-interrupt latch the old code left set",
+    "location": "app/input/mouse.odin (has_right chord block) / app/input/exec.odin (right_click_select)",
+    "evidence": "+\t\tif has_left {\n+\t\t\t// the right+left chord re-anchored the latch above; a same-frame\n+\t\t\t// cancel (the placement Cancel just emitted) would re-latch it — emit\n+\t\t\t// the Press_Anchor so the press's reset wins (the old chord ran AFTER\n+\t\t\t// the cancel block — Perkins B2)\n+\t\t\tappend(out, Intent(Press_Anchor{}))\n+\t\t}\n...against:...\n+\twas_dragging := inp.drag.active\n+\tinp.drag.active = false\n+\tinp.drag_to = 0\n+\tif was_dragging {\n+\t\tinp.press_swallowed = true // an interrupted drag's release must not re-select\n+\t}\n...old order (anchor reset ran BEFORE the interrupt latch):...\n-\t\tif rl.IsMouseButtonPressed(.LEFT) {\n-\t\t\tapp.press = {f32(mx), f32(my)}\n-\t\t\tapp.press_swallowed = false\n-\t\t}\n...\n-\t\tif was_dragging {\n-\t\t\tapp.press_swallowed = true // an interrupted drag's release must not re-select\n-\t\t}",
+    "detail": "Old net latch after a chord interrupting a drag: true (interrupt ran last). New: Right_Click sets it, then unconditional Press_Anchor clears it. With pad-Confirm/touch drags (drag.active with no button held), the chord's left release now click-selects, violating the stated invariant.",
+    "recommended_fix": "Emit Press_Anchor only when a same-frame Cancel was actually emitted, or order the anchor reset before Right_Click so the drag-interrupt latch survives."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "coalescing",
+    "title": "Game_Over R+Enter same frame emits two Retry intents — the comment claims || coalescing; restart_run fires twice",
+    "location": "app/input/mouse.odin (mouse_map Game_Over early return)",
+    "evidence": "+\tif inp.mode == .Game_Over {\n+\t\tfor ev in events {\n+\t\t\tif k, ok := ev.(Key_Press); ok {\n+\t\t\t\tif k.key == .R || k.key == .Enter {\n+\t\t\t\t\tappend(out, Intent(Retry{}))\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t\treturn\n+\t}\n...contradicted by the mapping's own comment:...\n+\t// the phase-1 keys are COLLECTED first (so the mouse-press state is known\n+\t// when emitting them), then emitted with the old `||` coalescing (W2/\n+\t// Perkins: P+Space and R+Enter each produce ONE intent, exactly like the\n+\t// old `if P || SPACE` / `if R || ENTER`).\n...old code:...\n-\tif app.mode == .Game_Over {\n-\t\tif rl.IsKeyPressed(.R) || rl.IsKeyPressed(.ENTER) {\n-\t\t\trestart_run(app)\n-\t\t}\n-\t\treturn\n-\t}",
+    "detail": "poll_mouse can emit both R and Enter Key_Press events in one frame; each becomes a Retry, so effect_retry→restart_run runs twice (double destroy/re-init, two fresh seeds). Cross-device R + pad A doubles too. Old code restarted exactly once.",
+    "recommended_fix": "Coalesce Retry like P/Space: emit at most one Retry per frame from the Game_Over block (a local flag), or dedupe Retry in the executor."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Class keys hard-capped at 1/2: the retained generic loop can never match i>=2; old code polled ONE+i per packet type",
+    "location": "app/input/mouse.odin (case .One, .Two) / app/input/poll.odin (poll_mouse) / app/input/types.odin (Key)",
+    "evidence": "+\t\tcase .One, .Two:\n+\t\t\tfor i in 0 ..< len(inp.cat.packet_types) {\n+\t\t\t\tif k.key == Key(int(Key.One) + i) {\n+\t\t\t\t\tappend(out, Intent(Set_Class{class = u16(i)}))\n+\t\t\t\t}\n+\t\t\t}\n...and the poll only ever produces two class keys:...\n+\tif rl.IsKeyPressed(.ONE) { append(&inp.events, Device_Event(Key_Press{key = .One})) }\n+\tif rl.IsKeyPressed(.TWO) { append(&inp.events, Device_Event(Key_Press{key = .Two})) }\n...old code:...\n-\t\tfor i in 0..<len(app.cat.packet_types) {\n-\t\t\tkey := rl.KeyboardKey(int(rl.KeyboardKey.ONE) + i)\n-\t\t\tif rl.IsKeyPressed(key) {\n-\t\t\t\tapp.sel_class = u16(i)\n-\t\t\t}\n-\t\t}\n...despite types.odin's claim:...\n+\t// directly. The roster is exactly the current handle_input keys (R/Enter",
+    "detail": "The Key enum + poll stop at Two, so loop iterations for i>=2 are dead comparisons; if the catalog grows a third packet type its class key silently stops working (old code derived keys from len(packet_types)). The 'roster is exactly the current handle_input keys' claim only holds for exactly two classes.",
+    "recommended_fix": "Either bound the loop at 2 with an explicit comment, or extend the Key enum/poll roster to cover the catalog's class count."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "boundary",
+    "title": "mouse_map silently drops Mouse_Move events beyond its fixed buffer of 2 — harness-scripted frames can truncate a drag path without signal",
+    "location": "app/input/mouse.odin (mouse_map moves collection)",
+    "evidence": "+\t// W5 (Perkins): no per-frame heap churn — the poll emits at most ONE\n+\t// Mouse_Move per frame, so a fixed buffer suffices (the project-context\n+\t// zero-per-frame-heap-churn rule).\n+\tmoves: [2]rl.Vector2\n+\tmoves_n := 0\n...\n+\t\tcase Mouse_Move:\n+\t\t\tif moves_n < len(moves) {\n+\t\t\t\tmoves[moves_n] = e.pos\n+\t\t\t\tmoves_n += 1\n+\t\t\t}",
+    "detail": "The size-2 justification covers only the live poll (one move per frame), but the harness parity test scripts synthetic frames directly; a scripted frame with >2 moves silently loses re-snaps — a parity-test blind spot with no error, no assertion, no log.",
+    "recommended_fix": "Assert or log on moves buffer overflow (or size it to the harness's documented maximum) so dropped moves are loud rather than silent."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "stale-comment",
+    "title": "Self-referential rename note: '(Cmd_Set_Weights -> Cmd_Set_Weights)' documents a no-op rename",
+    "location": "app/main.odin (set_lane_key removal comment)",
+    "evidence": "+// (set_lane_key + the lane command producers moved into app/input/exec.odin\n+// in story 5.4 — the 1/2 + E/S/B keys now route through the intent layer's\n+// shared executor; the #55 terminology rename (Cmd_Set_Weights ->\n+// Cmd_Set_Weights) is reflected there.)",
+    "detail": "The rename's source and target are identical — the comment is stale or mis-copied (presumably the pre-#55 command name). It misleads future readers about what was actually renamed.",
+    "recommended_fix": "Correct the comment to name the actual pre-rename command, or drop the parenthetical entirely."
+  }
+]

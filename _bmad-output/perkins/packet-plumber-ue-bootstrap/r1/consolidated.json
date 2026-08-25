@@ -1,0 +1,393 @@
+{
+  "job": "packet-plumber-ue-bootstrap",
+  "round": 1,
+  "pr": 1,
+  "reviewed_sha": "836f44e38989f83c50b936e02a01d1c584efcbfe7",
+  "diff_file": "/Users/moses/code/_bmad-output/perkins/packet-plumber-ue-bootstrap/r1/diff.patch",
+  "worktree": "/Users/moses/.herdr/worktrees/packet-plumber-ue/perkins-bootstrap-r1",
+  "model": "zai-coding-cn/glm-5.3",
+  "resume_note": "Round resumed after host reboot at ~17:59Z killed the orchestrator mid-round; 5 lens outputs were durable on disk, tests+security regenerated against the identical canonical diff bytes. No findings regenerated from scratch except those two lenses.",
+  "reviewers_completed": ["acceptance", "architecture", "blind", "codebase", "edge", "security", "tests"],
+  "failed_layers": [],
+  "raw_findings": 55,
+  "surviving_findings": 32,
+  "verification": {
+    "confirmed": 55,
+    "rejected": 0,
+    "unverifiable_speculative": 0,
+    "note": "Every finding re-verified against the worktree. Mechanical checks run by the verifier: standalone spine-check built and executed green (exit 0); standalone --json output byte-identical to docs/goldens/probe-seed42-ticks100.json; clang-format --dry-run --Werror over Source/ → 8/16 files fail; scripts/format-check.sh exits 1 when run; AGENTS.md g++ rebuild one-liner reproduces linker failure on fresh clone (no tests/build); grep confirms no writer of docs/goldens/.engine-probe.json anywhere; grep confirms UE_ROOT appears only in local-ci.sh; blind/vision-read absent from repo, PATH, and main checkout; bin/ absent. Compile-level claims (ParseCommandLine arity, LogPPCore declaration, UBT V5 include-path resolution) verified structurally — engine not installed at this sha."
+  },
+  "blockers": [
+    {
+      "id": "B1",
+      "title": "Golden gate's engine leg is structurally dead: nothing ever writes docs/goldens/.engine-probe.json, so the engine-vs-standalone cross-runner compare never runs; --bless (the golden's documented engine-side producer) requires the engine and has never executed",
+      "severity": "blocker",
+      "category": "golden-dead-branch",
+      "location": "scripts/compare-golden.sh:26-27; scripts/run-tests-headless.sh (--probe); scripts/local-ci.sh (--bless)",
+      "sources": ["acceptance", "architecture", "blind", "codebase", "edge", "tests"],
+      "verification": "confirmed",
+      "evidence": "compare-golden.sh: `if [ -f docs/goldens/.engine-probe.json ]; then` — repo-wide grep for 'engine-probe' finds only these two consumer lines, no producer. --bless path: `if [ \"$ENGINE_PRESENT\" -eq 0 ]; then echo \"cannot --bless without the engine\"`. Verifier mechanically confirmed the committed golden's values match the standalone runner byte-for-byte (honest standalone-sourced pin), but the engine PPProbe output can never reach the comparison.",
+      "detail": "The ODN-11 cross-runner contract (engine PPProbe ≡ standalone spine-check ≡ golden) is enforced on two of three legs only; the engine leg is unreachable dead code forever, not just at this sha.",
+      "recommended_fix": "In run-tests-headless.sh --probe, write the JSON to docs/goldens/.engine-probe.json (or have local-ci.sh pass --json-out there in gate 6) so gate 7's engine branch becomes reachable; document that --bless re-records the committed golden."
+    },
+    {
+      "id": "B2",
+      "title": "Format gate is false-green: labeled ENGINE: so it skips at this sha although format-check.sh is engine-free (system clang-format fallback), and 8/16 Source files FAIL clang-format when actually run — README/AGENTS/PR all claim the pre-engine 'format, spine, static' loop is green",
+      "severity": "blocker",
+      "category": "gate-integrity",
+      "location": "scripts/local-ci.sh:70 (gate 1 label); scripts/format-check.sh; Source/PacketPlumberCore/PP_{Hash,Rng,Sim}.h, Source/PacketPlumberCoreTests/*.cpp, Source/PacketPlumberEditor/PPProbeCommandlet.{cpp,h}",
+      "sources": ["acceptance", "architecture", "blind", "codebase", "tests"],
+      "verification": "confirmed",
+      "evidence": "GATES[0] = \"ENGINE:Format (clang-format --dry-run on Source/)|scripts/format-check.sh\" → SKIP when ENGINE_PRESENT=0. Verifier ran format-check.sh directly: exit 1 with exactly 8 NOT FORMATTED files (PP_Hash.h, PP_Rng.h, PP_Sim.h, PP_DeterminismTests.cpp, PP_HashTests.cpp, PP_RngTests.cpp, PPProbeCommandlet.cpp, PPProbeCommandlet.h). Homebrew clang-format 22.1.8 present on this machine. README: 'format / spine / static gates run without the engine'; local-ci.sh --fast help: 'gates 1-3 only (the pre-engine loop: format, spine, static)'. Spine headers use one-line braced returns conflicting with the committed Allman .clang-format.",
+      "detail": "The briefing's requirement 'engine-free gates must be green at this sha' is false for format: the gate silently skips and would fail — the exact false-green class AGENTS.md's own pitfalls forbid.",
+      "recommended_fix": "Drop the ENGINE: prefix from gate 1 (the script self-skips gracefully when no clang-format exists) and run clang-format -i over the 8 files; verify --fast goes green."
+    },
+    {
+      "id": "B3",
+      "title": "PPProbe commandlet cannot compile: ParseCommandLine is called with 2 args but UE has only the 3-arg (Tokens, Switches) overload — and even arity-fixed, -seed/-ticks/-json tokens route to Switches, never Tokens",
+      "severity": "blocker",
+      "category": "engine-api",
+      "location": "Source/PacketPlumberEditor/PPProbeCommandlet.cpp:25-26",
+      "sources": ["codebase", "edge"],
+      "verification": "confirmed",
+      "evidence": "`TArray<FString> Tokens; ParseCommandLine(*Params, Tokens);` — the engine's global ParseCommandLine(const TCHAR*, TArray<FString>&, TArray<FString>&) is the only overload; dash-prefixed args are classified as switches (dash-stripped), so the loop `for (const FString& Token : Tokens)` would never see -seed=42/-ticks=100/-json=… and the commandlet would always run defaults.",
+      "detail": "The headless probe entry — a lens-guard requirement of the spine port — is non-runnable as shipped; it fails at compile time, and the parse is wrong even if it compiled.",
+      "recommended_fix": "Use the 3-arg overload, iterate Switches (or UCommandlet's parsed members), match with StartsWith(\"seed=\") after the dash strip; test with the engine once installed."
+    },
+    {
+      "id": "B4",
+      "title": "PPProbeCommandlet.cpp uses LogPPCore without including the header that declares it (PacketPlumberCore.h)",
+      "severity": "blocker",
+      "category": "engine-api",
+      "location": "Source/PacketPlumberEditor/PPProbeCommandlet.cpp:14-21, 76, 77, 93",
+      "sources": ["codebase"],
+      "verification": "confirmed",
+      "evidence": "UE_LOG(LogPPCore, …) used three times; LogPPCore is declared only via `DECLARE_LOG_CATEGORY_EXTERN(LogPPCore, Log, All)` in Source/PacketPlumberCore/PacketPlumberCore.h, which is not in the .cpp's include list (nor in PPProbeCommandlet.h).",
+      "detail": "Second independent compile breaker in the commandlet: undeclared identifier at the first UE_LOG.",
+      "recommended_fix": "#include \"PacketPlumberCore/PacketPlumberCore.h\" (after B5's include-path fix) or move the category into a header both modules share."
+    },
+    {
+      "id": "B5",
+      "title": "Module-prefixed spine includes cannot resolve: headers sit flat in Source/PacketPlumberCore/ (no Public/), no Build.cs adds explicit include paths, yet tests/editor include \"PacketPlumberCore/PP_*.h\" — under BuildSettingsVersion.V5 the PacketPlumberCoreTests and PacketPlumberEditor modules cannot compile",
+      "severity": "blocker",
+      "category": "build-config",
+      "location": "Source/PacketPlumberCoreTests/*.cpp (4 files), Source/PacketPlumberEditor/PPProbeCommandlet.cpp; Source/PacketPlumberCore/PacketPlumberCore.Build.cs",
+      "sources": ["codebase"],
+      "verification": "confirmed",
+      "evidence": "All cross-module includes are module-prefixed (e.g. #include \"PacketPlumberCore/PP_Rng.h\") while the headers live at the module root with no Public/ folder; PacketPlumberCore.Build.cs declares only PCHUsage + PublicDependencyModuleNames — no PublicIncludePaths/PrivateIncludePaths; both .Target.cs pin DefaultBuildSettings = BuildSettingsVersion.V5. Default V5 include rules put the module dir itself on dependents' paths (resolving \"PP_Rng.h\"), never the Source/ parent needed for the prefixed form.",
+      "detail": "Every engine-side translation unit that touches the spine fails include resolution — the UE automation suite and commandlet cannot build when the engine lands.",
+      "recommended_fix": "Either move spine headers to Source/PacketPlumberCore/Public/PacketPlumberCore/ (matching the prefixed includes) or add PublicIncludePaths.Add(Path.Combine(ModuleDirectory, \"../\")) — the standard UE5 layout is the safer fix."
+    },
+    {
+      "id": "B6",
+      "title": "Magic-byte assertion is reversed: FPPStateSerializeVersioned asserts bytes 'P','P','U','E' but the LE serializer emits 'E','U','P','P' for SAVE_MAGIC 0x50505545 — the determinism suite fails at engine time",
+      "severity": "blocker",
+      "category": "spine-contract",
+      "location": "Source/PacketPlumberCoreTests/PP_DeterminismTests.cpp:73-76 vs Source/PacketPlumberCore/PP_SimState.h:18 + PP_Sim.h PutU32",
+      "sources": ["blind"],
+      "verification": "confirmed",
+      "evidence": "SAVE_MAGIC = 0x50505545u; PutU32 writes LSB-first → Buffer[0]=0x45 'E', [1]=0x55 'U', [2]=0x50 'P', [3]=0x50 'P'. Test: TestEqual(\"magic byte 0\", Buffer[0], uint8_t('P')) … 'P','P','U','E'. Exactly one side of the wire contract is wrong.",
+      "detail": "A committed spine test asserting the opposite of the serializer guarantees the PacketPlumber.* suite reports failure the moment the engine builds — the cross-runner contract would false-fail.",
+      "recommended_fix": "Pick one truth: either assert Buffer = 'E','U','P','P' (LE of the constant as written) or change SAVE_MAGIC so LE bytes spell P,P,U,E; document the chosen wire format."
+    }
+  ],
+  "warnings": [
+    {
+      "id": "W1",
+      "title": "Engine discovery env contract diverges: UE_ROOT honored only by local-ci.sh; run-tests-headless.sh and install-engine.sh duplicate find_engine without it",
+      "severity": "warning",
+      "category": "ci-contract",
+      "location": "scripts/local-ci.sh:49-51 vs scripts/run-tests-headless.sh:15-25, scripts/install-engine.sh:11-21",
+      "sources": ["blind", "architecture", "edge"],
+      "verification": "confirmed",
+      "evidence": "grep UE_ROOT scripts/ → only local-ci.sh:43,49,50. The other two copies check UE_EDITOR_PATH + standard globs only; a user following local-ci's hint sets UE_ROOT and the engine-gated scripts still exit 127.",
+      "detail": "Triplicated discovery with divergent contracts false-fails the engine gates for any engine location other than the default install.",
+      "recommended_fix": "Extract one shared find_engine (scripts/lib/engine.sh) sourced by all three, honoring UE_EDITOR_PATH > UE_ROOT > standard paths."
+    },
+    {
+      "id": "W2",
+      "title": "compare-golden.sh omits rng_first4 — the field exists in the golden and both runners' JSON but is never compared",
+      "severity": "warning",
+      "category": "golden-gap",
+      "location": "scripts/compare-golden.sh:44",
+      "sources": ["blind"],
+      "verification": "confirmed",
+      "evidence": "Compared keys: (\"seed\", \"ticks\", \"tick_nonce\", \"state_hash\", \"save_magic\", \"save_version\") — rng_first4 absent from the loop while present in docs/goldens/probe-seed42-ticks100.json and both --json outputs.",
+      "detail": "The first-4-draws RNG vector pin (drawn before the heartbeat re-seed, so not covered by state_hash) is carried but never enforced.",
+      "recommended_fix": "Add \"rng_first4\" to the compared keys tuple."
+    },
+    {
+      "id": "W3",
+      "title": "\"34 checks\" is wrong everywhere: spine_check.cpp executes 15 CHECK statements (25 invocations) but prints/hardcodes 34; README, docs/project-context.md, docs/research-report.{md,html} and the PR body repeat the false count",
+      "severity": "warning",
+      "category": "docs-accuracy",
+      "location": "tests/spine_check.cpp:180; README.md:19; docs/project-context.md:85; docs/research-report.md:23; docs/research-report.html:52; PR body",
+      "sources": ["acceptance", "blind", "codebase", "tests"],
+      "verification": "confirmed",
+      "evidence": "Verifier counted 15 CHECK( statements / 25 runtime executions; live run prints \"spine-check: ALL GREEN (34 checks)\"; grep '34 check' hits all five doc surfaces + PR body.",
+      "detail": "A verifiable acceptance number in the PR body is false — small, but it is exactly the class of claim this review exists to check.",
+      "recommended_fix": "Derive the count (e.g. print the actual check counter) and fix the five doc surfaces + PR description."
+    },
+    {
+      "id": "W4",
+      "title": "The committed golden is asserted by no engine-free gate: compare-golden.sh is gate 7 (ENGINE:), and spine_check prints the golden numbers without asserting them",
+      "severity": "warning",
+      "category": "coverage-gap",
+      "location": "scripts/local-ci.sh:76; tests/spine_check.cpp:161-167",
+      "sources": ["tests"],
+      "verification": "confirmed",
+      "evidence": "--fast runs gates 1-3; none reads docs/goldens/. spine_check --json printf's tick_nonce/state_hash without comparing to the golden. Verifier's manual diff shows they currently match byte-for-byte — the pin is honest, just unenforced pre-engine.",
+      "detail": "A serialization-layout regression (field reorder, magic change) passes gates 1-3 because replay-equality is self-consistent; only the golden pins those bytes.",
+      "recommended_fix": "Move the committed-golden-vs-standalone compare into the fast loop, or add inline CHECKs in spine_check.cpp asserting tick_nonce=2381141952 / state_hash=e8046b49de0f2447."
+    },
+    {
+      "id": "W5",
+      "title": "PP::Step guard branches (backward-tick ignore, bTerminal freeze) have zero tests in either runner",
+      "severity": "warning",
+      "category": "coverage-gap",
+      "location": "Source/PacketPlumberCore/PP_Sim.h:28-31",
+      "sources": ["tests"],
+      "verification": "confirmed",
+      "evidence": "grep for bTerminal/backward across tests/ + PacketPlumberCoreTests/ (excluding PP_Sim.h) returns nothing; both suites only step forward 1..100.",
+      "detail": "State-affecting guards (ODN-1) — a regression that mutates state on backward ticks or after terminal passes all checks in both runners.",
+      "recommended_fix": "Add cases to both runners: step backward and step with bTerminal=true, asserting the state hash is unchanged."
+    },
+    {
+      "id": "W6",
+      "title": "run-tests-headless.sh --probe prints \"probe JSON written\" without asserting the artifact exists; the RESULT=OK log-grep can pass even when the JSON write failed",
+      "severity": "warning",
+      "category": "gate-integrity",
+      "location": "scripts/run-tests-headless.sh:99-108; Source/PacketPlumberEditor/PPProbeCommandlet.cpp:85-92",
+      "sources": ["edge"],
+      "verification": "confirmed",
+      "evidence": "The commandlet logs RESULT=OK before the JSON write; on write failure it returns 1 after the OK line is already in the log. The script greps for RESULT=OK then echoes 'probe JSON written to …' unconditionally — no [ -f ] check.",
+      "detail": "The golden gate could consume a stale/missing engine JSON — success must be asserted on artifacts, per the repo's own pitfall notes.",
+      "recommended_fix": "After the run: [ -s \"$JSON_OUT\" ] || { echo 'probe JSON missing'; exit 1; }"
+    },
+    {
+      "id": "W7",
+      "title": "bin/vision-read is the documented screenshot-verification entry point (AGENTS.md + 6 docs) but exists nowhere — not in the repo, not on PATH, not in the main checkout",
+      "severity": "warning",
+      "category": "docs-ops",
+      "location": "AGENTS.md:29; docs/agent-playbook.md:52; docs/{project-context,research-report.md,research-report.html,spec-bootstrap}.md",
+      "sources": ["acceptance", "blind"],
+      "verification": "confirmed",
+      "evidence": "Verifier: `which vision-read` empty; `ls bin` → No such file or directory; `ls /Users/moses/code/packet-plumber-ue/bin/` → No such file or directory.",
+      "detail": "The MCP screenshot loop's verification step is undriveable as documented; an agent following the playbook dead-ends.",
+      "recommended_fix": "Commit the vision-read wrapper (it lives in the user's tooling) or rewrite the docs to the real invocation (pi vision-read skill / ollama qwen3.8-27b)."
+    },
+    {
+      "id": "W8",
+      "title": "AGENTS.md claims ue-mcp.yml flows are committed project config; the file does not exist in the repo",
+      "severity": "warning",
+      "category": "docs-accuracy",
+      "location": "AGENTS.md:62",
+      "sources": ["blind"],
+      "verification": "confirmed",
+      "evidence": "\"MCP server state (.mcp.json, ue-mcp.yml flows) is committed project config — changes ship in the PR\" vs find: no ue-mcp.yml anywhere in the tree.",
+      "detail": "The agent contract references a committed artifact that was never committed; agents will look for flow config that isn't there.",
+      "recommended_fix": "Commit the ue-mcp.yml (if it exists in the authoring environment) or drop it from the AGENTS.md sentence."
+    },
+    {
+      "id": "W9",
+      "title": "FNV-1a conformance is partially tautological: Fnv1a64(x) == Fnv1a64(x) pins nothing; the only real vector is the empty-input offset basis",
+      "severity": "warning",
+      "category": "test-strength",
+      "location": "tests/spine_check.cpp:104-110; Source/PacketPlumberCoreTests/PP_HashTests.cpp:18-20",
+      "sources": ["blind"],
+      "verification": "confirmed",
+      "evidence": "`CHECK(PP::Fnv1a64(PP, 2) == PP::Fnv1a64(PP, 2), \"fnv1a64(pp) must be deterministic\")` — a pure function compared to itself. The empty-input == FNV64_OFFSET check IS a real vector; nothing else is.",
+      "detail": "A broken FNV implementation that returns a constant nonzero hash passes every current hash test except the empty/offset one.",
+      "recommended_fix": "Pin published FNV-1a-64 vectors (e.g. Fnv1a64(\"a\") = 0xaf63dc4c8601ec8c, Fnv1a64(\"foobar\") = 0x85944171f73967e8) in both runners."
+    },
+    {
+      "id": "W10",
+      "title": ".mcp.json runs an unpinned third-party npm package with agent privileges: npx -y ue-mcp resolves latest on every boot",
+      "severity": "warning",
+      "category": "supply-chain",
+      "location": ".mcp.json:4-5",
+      "sources": ["security"],
+      "verification": "confirmed",
+      "evidence": "\"command\": \"npx\", \"args\": [\"-y\", \"ue-mcp\", \"PacketPlumberUE.uproject\"] — no version pin, -y auto-installs, and the server drives the editor with write access.",
+      "detail": "A moved/compromised latest tag silently becomes the agent's editor driver on next boot — non-reproducible agent tooling.",
+      "recommended_fix": "Pin the package (npx -y ue-mcp@<version> …) and record the pinned version + upgrade step in docs/agent-playbook.md."
+    },
+    {
+      "id": "W11",
+      "title": "Advisory test gate: CONCERNS (P0 100%, P1 ~85%, overall ~85%)",
+      "severity": "warning",
+      "category": "coverage-gate",
+      "location": "N/A",
+      "sources": ["tests"],
+      "verification": "confirmed",
+      "evidence": "P0 (RNG pinned vectors dual-runner + Odin-exact, replay equality, divergence, non-vacuity, serialization determinism; standalone output byte-identical to golden — verifier reproduced) at 100%. P1 ~85%: golden pin unasserted engine-free (W4), engine-vs-standalone unreachable (B1). Overall ~85%: Step guards (W5), capacity guard (N5), ini pin, format integrity untested.",
+      "detail": "Strong P0 spine coverage; the gaps are exactly the gate-wiring items already filed as B1/B2/W4/W5.",
+      "recommended_fix": "Fixing B1, B2, W4, W5 lifts P1 ≥90% and the gate to PASS."
+    }
+  ],
+  "notes": [
+    {
+      "id": "N1",
+      "title": "PPProbeCommandlet.cpp carries two dead includes (HAL/PlatformFileManager.h, Misc/OutputDeviceNull.h)",
+      "severity": "note",
+      "category": "dead-code",
+      "location": "Source/PacketPlumberEditor/PPProbeCommandlet.cpp:3,9",
+      "sources": ["blind"],
+      "verification": "confirmed",
+      "evidence": "No FPlatformFileManager / null-output-device symbol appears in the file; only FFileHelper/FPaths are used."
+    },
+    {
+      "id": "N2",
+      "title": "static-check.py imports os but never uses it",
+      "severity": "note",
+      "category": "dead-code",
+      "location": "scripts/static-check.py:10",
+      "sources": ["blind"],
+      "verification": "confirmed",
+      "evidence": "Script uses json/pathlib/subprocess/sys only; no os. usage."
+    },
+    {
+      "id": "N3",
+      "title": "static-check.py ignores git ls-files failure — outside a git repo the CRLF scan silently passes over zero files",
+      "severity": "note",
+      "category": "gate-integrity",
+      "location": "scripts/static-check.py:64",
+      "sources": ["edge"],
+      "verification": "confirmed",
+      "evidence": "r = subprocess.run([\"git\", \"ls-files\"], …) with no returncode check; the for-loop over stdout then iterates nothing and the check reports all-pass."
+    },
+    {
+      "id": "N4",
+      "title": "local-ci.sh header gate table (8 gates, 'gate 4 engine presence') does not match the 7-entry GATES array",
+      "severity": "note",
+      "category": "docs-accuracy",
+      "location": "scripts/local-ci.sh:10-20 vs 68-76",
+      "sources": ["blind"],
+      "verification": "confirmed",
+      "evidence": "Header lists gate 4 = 'engine presence' and gates up to 8; the array has 7 entries with engine presence performed inline before the gates, shifting numbering by one."
+    },
+    {
+      "id": "N5",
+      "title": "UE-side SerializeVersioned test has no standalone byte-level counterpart: spine_check never asserts magic/version/serialized bytes (hash-only)",
+      "severity": "note",
+      "category": "coverage-gap",
+      "location": "tests/spine_check.cpp vs Source/PacketPlumberCoreTests/PP_DeterminismTests.cpp:64-77",
+      "sources": ["blind"],
+      "verification": "confirmed",
+      "evidence": "The 'Mirrors tests/spine_check.cpp' comment is one-way: the standalone runner exercises serialization only through StateHash; byte-level assertions exist only on the UE side (which is itself broken per B6)."
+    },
+    {
+      "id": "N6",
+      "title": "SerializeState capacity-guard branch (insufficient buffer returns 0) is untested in both runners",
+      "severity": "note",
+      "category": "coverage-gap",
+      "location": "Source/PacketPlumberCore/PP_Sim.h:41-42",
+      "sources": ["tests"],
+      "verification": "confirmed",
+      "evidence": "Both runners call SerializeState only with uint8_t[64] — the OutCapacity < Needed early-return path never executes under test."
+    },
+    {
+      "id": "N7",
+      "title": "ODN-2 fixed-20Hz ini pin has no engine-free assertion (static-check.py doesn't inspect DefaultEngine.ini)",
+      "severity": "note",
+      "category": "coverage-gap",
+      "location": "Config/DefaultEngine.ini:9-10",
+      "sources": ["tests"],
+      "verification": "confirmed",
+      "evidence": "bUseFixedFrameRate=True / FixedFrameRate=20.000000 are pinned in the ini; static-check.py checks uproject/Build.cs/Target.cs/bash -n/CRLF only — a reverted ini tick pin would pass gate 3."
+    },
+    {
+      "id": "N8",
+      "title": "RngRange computes Hi - Lo in int32_t before the uint32 cast — spans over INT32_MAX are signed-overflow UB",
+      "severity": "note",
+      "category": "integer-safety",
+      "location": "Source/PacketPlumberCore/PP_Rng.h:97",
+      "sources": ["edge"],
+      "verification": "confirmed",
+      "evidence": "static_cast<uint32_t>(Hi - Lo) — the subtraction happens in int32_t; UB for e.g. Lo=INT32_MIN, Hi=INT32_MAX. Current callers use small spans."
+    },
+    {
+      "id": "N9",
+      "title": "Step silently swallows backward ticks; the comment's 'logs via the caller' has no logging caller",
+      "severity": "note",
+      "category": "observability",
+      "location": "Source/PacketPlumberCore/PP_Sim.h:28-31",
+      "sources": ["edge"],
+      "verification": "confirmed",
+      "evidence": "Guard returns early; neither PPProbe nor any test logs or asserts on a rejected backward step (grep: no callers reference it)."
+    },
+    {
+      "id": "N10",
+      "title": "PPProbe accepts negative/zero -ticks and non-numeric -seed silently",
+      "severity": "note",
+      "category": "input-validation",
+      "location": "Source/PacketPlumberEditor/PPProbeCommandlet.cpp:33-40",
+      "sources": ["edge"],
+      "verification": "confirmed",
+      "evidence": "Ticks = FCString::Atoi(…) with no <=0 guard; the tick loop then executes zero iterations and RESULT=OK is still printed with the seed-42 initial hash."
+    },
+    {
+      "id": "N11",
+      "title": "Pure sim core module declares unused CoreUObject/Engine dependencies",
+      "severity": "note",
+      "category": "build-config",
+      "location": "Source/PacketPlumberCore/PacketPlumberCore.Build.cs",
+      "sources": ["architecture"],
+      "verification": "confirmed",
+      "evidence": "PacketPlumberCore.cpp includes only PacketPlumberCore.h + ModuleManager (Core); the spine headers are <cstdint>-only. CoreUObject/Engine link cost for nothing."
+    },
+    {
+      "id": "N12",
+      "title": "Editor module declares an unused dependency on the game module PacketPlumber",
+      "severity": "note",
+      "category": "build-config",
+      "location": "Source/PacketPlumberEditor/PacketPlumberEditor.Build.cs",
+      "sources": ["architecture"],
+      "verification": "confirmed",
+      "evidence": "No editor-module file includes anything from PacketPlumber/; only PacketPlumberCore headers are used (PPProbe) — the game module is pulled in only via the Target.cs."
+    },
+    {
+      "id": "N13",
+      "title": "AGENTS.md spine-check rebuild one-liner fails on a fresh clone",
+      "severity": "note",
+      "category": "docs-ops",
+      "location": "AGENTS.md (Running and verifying)",
+      "sources": ["codebase"],
+      "verification": "confirmed",
+      "evidence": "Verifier ran the exact one-liner on this checkout: 'ld: open() failed, errno=2 … for tests/build/spine-check'. local-ci.sh gate 2 does it correctly with mkdir -p tests/build &&."
+    },
+    {
+      "id": "N14",
+      "title": "Playbook security rules omit the same-host browser-origin threat to the unauthenticated editor bridge",
+      "severity": "note",
+      "category": "docs-security",
+      "location": "docs/agent-playbook.md:62-64",
+      "sources": ["security"],
+      "verification": "confirmed",
+      "evidence": "Rules cover 'never expose the port / shared machine / forward' but not browser-origin localhost requests against the unauthenticated ws/http endpoints."
+    },
+    {
+      "id": "N15",
+      "title": "Committed HTML report loads CDN scripts without Subresource Integrity",
+      "severity": "note",
+      "category": "supply-chain",
+      "location": "docs/research-report.html:7-9",
+      "sources": ["security"],
+      "verification": "confirmed",
+      "evidence": "<script src=\"https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js\"></script> and two daisyui stylesheet links — no integrity attributes."
+    }
+  ],
+  "reviewer_agreement": [
+    {"finding": "B1", "sources": 6},
+    {"finding": "B2", "sources": 5},
+    {"finding": "W3", "sources": 4},
+    {"finding": "B3", "sources": 2},
+    {"finding": "W1", "sources": 3},
+    {"finding": "W7", "sources": 2}
+  ],
+  "counts": {"blockers": 6, "warnings": 11, "notes": 15, "total": 32},
+  "verdict": "NEEDS CHANGES",
+  "verdict_class": "MAJOR REWORK (4+ blockers)",
+  "review_event": "--request-changes",
+  "engine_gating_note": "Per the review briefing: engine-gated gates not being runnable at this sha (UE 5.8 not yet downloaded) is documented staging, NOT a defect and NOT counted. The blockers above are all statically verifiable source/config defects that will survive engine install: three compile-breakers in the commandlet/test modules, one reversed spine assertion, one structurally dead golden branch, and one false-green gate claim."
+}

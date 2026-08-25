@@ -1,0 +1,22 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "W9 counters span the full 3000-tick run while the envelope (MIN_LAND and per-host bound) is window-sized — effective landing tolerance ~0.89 not 0.95, and the per-host bound can false-fail a legal at-cap host",
+    "location": "core/demand_test.odin:426-466",
+    "evidence": "WINDOW := SURGE_END - SURGE_START\n\tEXPECTED := 10 * WINDOW // the re-tuned surge: ×10 the era-3 streaming base (1/tick)\n...\tfor tick in u64(1)..=SURGE_END {\n...\t\t\tif p.class == 1 && p.spawn_tick == tick {\n\t\t\t\tstream_spawned += 1\n\t\t\t\tper_tick_host_burst[p.src] += 1\n\t\t\t\tper_host_spawns[p.src] += 1\n...\t// per-terminal window spawns + credit bounds (the W9 envelope)\n...\t\tbound := ceil_cap + accrue * WINDOW / 1000\n\t\tif per_host_spawns[s.topology.node_id[ns]] > bound { credit_ok = false }",
+    "detail": "The counting loop starts at tick 1, not SURGE_START=1200, and has no window filter: ~1200 pre-window base spawns (1/tick × 1200 ticks) inflate stream_spawned, lowering the 0.95×18000 landing floor to ~0.88×18000. The per-host bound (host: 2 + 1333×1800/1000 = 2401) is checked against a 3000-tick count — a host legally at cap all run (~4000 spawns) would false-fail credit_ok; it passes on seed 4243 only because growth spreads the load.",
+    "recommended_fix": "Count only ticks in [SURGE_START, SURGE_END): guard the accumulation with `if tick >= SURGE_START` (or compute the bound with the full run length). Keeps the 0.95 tolerance and the cap×window+burst envelope exact."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "cap_fraction_permille in [1,5] truncates residential accrual to 0 milli — the type becomes permanently spawn-ineligible and residential-sourced demand silently dies inside the validated 1..1000 range",
+    "location": "core/flow.odin:609-612 + core/catalog.odin:731-733",
+    "evidence": "spawn_credit_accrue_milli :: proc(cat: ^Catalogs, type_idx: u16) -> u32 {\n\tnt := &cat.node_types[type_idx]\n\tdividend := i64(cat.balance.cap_fraction_permille) * i64(nt.throughput_units)\n\treturn u32(dividend / i64(cat.balance.packet_bandwidth))\n}\n--- core/catalog.odin ---\n\t\tb.cap_fraction_permille, _ = jint_strict(obj, \"cap_fraction_permille\", -1)\n\t\tif b.cap_fraction_permille < 1 || b.cap_fraction_permille > 1000 {\n\t\t\treturn {\"balance.json\", \"cap_fraction_permille\", \"must be 1..1000 (500 = 50% of the terminal's own throughput — the honest-fraction invariant)\"}\n\t\t}",
+    "detail": "For residential (throughput 5, packet_bandwidth 30), any legal permille ≤ 5 gives floor(permille×5/30) = 0 milli/tick: credit never reaches SPAWN_CREDIT_ELIGIBLE 1000, so residential terminals are never pickable — email demand lands zero with no error. The adjacent comment rejects permille 0 exactly to avoid silent disable, but integer truncation recreates it at the range's low edge.",
+    "recommended_fix": "At catalog load, fail-fast when spawn_credit_accrue_milli(cat, type) == 0 for any terminal type (or floor the accrual at 1 milli per live terminal), keeping the low-permille edge from silently starving a sourcing type."
+  }
+]

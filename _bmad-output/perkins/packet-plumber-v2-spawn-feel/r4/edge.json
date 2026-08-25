@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "rlsw-alpha",
+    "title": "Reveal-faded chip hairline violates the pinned full-alpha rlsw line-alpha trap (DrawRectangleLinesEx alpha < 255)",
+    "location": "app/render/view.odin:1232-1233",
+    "evidence": "\t// the paper chip + ink hairline (full-alpha — the rlsw line-alpha trap)\n\tpaper := v.palette.canvas\n\tpaper.a = u8(f32(paper.a) * fade)\n\trl.DrawRectangleV({x0, y0}, {cw, ch}, paper)\n\tout := v.palette.ink_soft\n\tout.a = u8(255 * fade)\n\trl.DrawRectangleLinesEx({x0, y0, cw, ch}, max(1.0, s * 0.02 * reveal_scale), out)",
+    "detail": "During reveal windows fade ∈ [0.3,1), so the hairline draws at alpha < 255. Per the project's own pinned trap (spawn_fx.odin: \"line alpha is ignored\" in rlsw), goldens capture it solid while the GPU app blends — live-vs-capture divergence in the re-blessed spawn frames.",
+    "recommended_fix": "Keep the hairline pinned out.a = 255 through the reveal (fade only the fills), or draw the outline as four alpha-blended filled rects like the ring annulus."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "underflow",
+    "title": "u64 wrap in T - SPAWN_LEAD_TICKS when the growth interval is below 10 silently suppresses the telegraph ring",
+    "location": "app/render/spawn_fx.odin:330",
+    "evidence": "\twindow := tick + u64(interval) - (tick % u64(interval))\n...\n\tT := fx.telegraph.spawn_tick\n\tif tick < T - SPAWN_LEAD_TICKS || tick > T + SPAWN_BURST_TICKS {",
+    "detail": "T is a multiple of interval; the catalog only enforces interval >= 1 (\"must be >= 1 with all keys present\"). At interval 1..9 the first window T < 10 wraps u64, tick < ~2^64 is always true, and the ring never draws.",
+    "recommended_fix": "Compute the window start in i64 (age := i64(tick) - i64(T) + SPAWN_LEAD_TICKS; if age < 0 return), or reject terminal_spawn_interval_ticks <= SPAWN_LEAD_TICKS at catalog load."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "interval - 5 u64 wrap in the predict test hangs the suite instead of failing when the catalog is zeroed or retuned below 5",
+    "location": "app/render/spawn_fx_test.odin:169-170",
+    "evidence": "\tinterval := u64(cat.balance.terminal_spawn_interval_ticks)\n\ts := sfx_run(&cat, interval - 5) // t75: 5 ticks before the t80 window\n...\n\tfor t in u64(1) ..= ticks {\n\t\tpp.step(&s, t, {}, cat)\n\t}",
+    "detail": "If catalogs_load fails (wrong cwd) interval is 0; interval - 5 wraps to ~2^64 and sfx_run's step loop runs ~forever — a hang, not a test failure. Also fires if the cadence knob retunes below 5.",
+    "recommended_fix": "Guard before the subtraction: expect interval >= SPAWN_LEAD_TICKS + 5 and testing.errorf/return early, e.g. if interval < 15 { testing.errorf(t, ...); return }."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "error-path",
+    "title": "sfx_load_cat's read1 prints the os.read error then returns nil, dropping the error value (catch-and-ignore)",
+    "location": "app/render/spawn_fx_test.odin:47-52",
+    "evidence": "\tread1 :: proc(path: string) -> []u8 {\n\t\tb, err := os.read_entire_file_from_path(path, context.allocator)\n\t\tif err != nil {\n\t\t\tfmt.eprintfln(\"sfx_test: cannot read %s\", path)\n\t\t}\n\t\treturn b\n\t}",
+    "detail": "The error value is discarded after printing; the tests then run against a zeroed catalog, so any failure reports misleading catalog symptoms (or the interval-wrap hang) instead of the IO cause.",
+    "recommended_fix": "Return (b, ok) or track a failed flag; testing.errorf the read failure at the top of each test before touching the catalog."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "allocator",
+    "title": "spawn_fx_init/spawn_fx_destroy have no call sites — the reveals buffer grows unowned on the ambient allocator and is never freed",
+    "location": "app/render/spawn_fx.odin:92-100",
+    "evidence": "spawn_fx_init :: proc(fx: ^Spawn_FX, allocator := context.allocator) {\n\tfx^ = {}\n\tfx.reveals = make([dynamic]Spawn_Reveal, 0, 4, allocator)\n}\n\nspawn_fx_destroy :: proc(fx: ^Spawn_FX) {\n\tdelete(fx.reveals)\n\tfx^ = {}\n}",
+    "detail": "grep over app/ and harness/ finds only spawn_fx_reset calls (app/main.odin:741, harness/run.odin:293). reveals is a zeroed [dynamic] grown on first append via the ambient context.allocator — the declared ownership/teardown pair is dead code.",
+    "recommended_fix": "Either call spawn_fx_init at View creation and spawn_fx_destroy at teardown, or delete the dead procs and document that reveals rides append-on-nil with the ambient allocator."
+  }
+]

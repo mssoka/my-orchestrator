@@ -1,0 +1,52 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "ar-rc13-one-stable-contract",
+    "title": "Panel re-derives terminality client-side; its set already diverges from the server's (omits Completed) and hooks are ignored",
+    "location": "client/src/components/reference_panel.gleam:110-122",
+    "evidence": "client/src/components/reference_panel.gleam:114-122: `fn is_terminal(call: ReferenceCallDetail) -> Bool {\n  case call.status {\n    FormCompleted\n    | Partial\n    | Unreachable\n    | Refused\n    | Objected\n    | ManualRecorded\n    | Failed -> True\n    _ -> False\n  }\n}` — used at line 105 `case list.all(calls, is_terminal) {`. server/src/application/application_detail_handler.gleam:1087-1100: `let terminal = case status {\n    shared_reference_call.FormCompleted -> True\n    ...\n    shared_reference_call.Failed -> True\n    shared_reference_call.Completed -> True\n    _ -> False\n  }\n  shared_reference_call.ReferenceCallHooks(\n    can_record_manual: !terminal,`. No reference to `call.hooks` exists anywhere in reference_panel.gleam (grep: zero hits).",
+    "detail": "Server computes terminality as `!hooks.can_record_manual` (§8.2); the panel re-implements the rule and the sets already differ: `Completed` is terminal server-side but not in the panel's list, so a v2 voice-completed row would flip the sub-line to \"in flight\". Future status additions drift silently.",
+    "recommended_fix": "Derive terminality from the server contract: `!call.hooks.can_record_manual` inside is_terminal (or add Completed to the case), keeping one stable rule per AR-RC13."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "copy-em-dash",
+    "title": "Em-dashes added in implementer-authored shipped strings (unmoderated flag + nudge timeline lines), violating the no-em-dash copy convention",
+    "location": "client/src/copy.gleam:667; client/src/copy.gleam:844; client/src/components/reference_panel.gleam:623",
+    "evidence": "client/src/copy.gleam:667: `pub const refcheck_unmoderated_flag: String = \"Unmoderated referee text — written by the referee, not reviewed by us.\"`; client/src/copy.gleam:844: `pub const refcheck_timeline_nudge_failed: String = \"Applicant nudge — couldn't send\"`; client/src/components/reference_panel.gleam:623: `copy.refcheck_timeline_nudge_skipped <> \" — \" <> skipped.detail`. Architecture §9.3 specifies only a \"display-time warning affordance\" with no copy; UX §7.6 lists only \"Applicant asked to nudge\". Base develop copy.gleam ships zero em-dashes in strings (`git show develop:client/src/copy.gleam | grep '= \".*—'` → none).",
+    "detail": "These three strings are implementer-authored (no spec copy exists for them), so their em-dashes are new violations of the RT no-em-dash rule. Spec-verbatim em-dashes elsewhere (in-flight sub-line, §7.5 signals, confidence line, §7.6 invite line) are fine.",
+    "recommended_fix": "Reword without em-dash: \"Unmoderated referee text, written by the referee and not reviewed by us\"; join the nudge-skipped detail with a comma or colon instead of \" — \"."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "spec-scope-deviation",
+    "title": "Spec'd per-user explainer dismissed state (localStorage rt_refcheck_explainer_dismissed) not implemented — session-scoped only",
+    "location": "client/src/model.gleam:319; client/src/client.gleam:655",
+    "evidence": "Spec OWNS #3 (in-chunk): \"`refcheck_explainer_dismissed: Bool` (hydrated from localStorage `rt_refcheck_explainer_dismissed`)\" and Dev Notes: \"localStorage hydration mirrors the sweep-nudge pattern (`rt_dismissed_sweep_nudges_v2`, `client.gleam:5685`): key `rt_refcheck_explainer_dismissed`\". Worktree: client/src/model.gleam:319 `refcheck_explainer_open: Bool,`; client/src/client.gleam:655 `refcheck_explainer_open: False,` (route-change reset); toggle at client.gleam:3257 `Model(..model, refcheck_explainer_open: !model.refcheck_explainer_open)` with `effect.none()`. `grep -rn rt_refcheck_explainer_dismissed client/` → zero hits.",
+    "detail": "UX §7.3 requires a \"per-user dismissed state\"; the shipped explainer resets to closed on every navigation with no localStorage read/write, so a dismissing landlord is re-shown the explainer on return. ACs don't pin persistence, hence note severity.",
+    "recommended_fix": "Hydrate from and persist to localStorage key rt_refcheck_explainer_dismissed on the toggle (sweep-nudge pattern at client.gleam:5747), or drop the per-user claim from the spec."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "module-organization",
+    "title": "reference_panel.gleam is 1263 lines — 3× the <400 view-module target, bundling view + JSON decoding + signal thresholds",
+    "location": "client/src/components/reference_panel.gleam (whole module)",
+    "evidence": "`wc -l client/src/components/reference_panel.gleam` → 1263; next-largest component leaderboard_view.gleam is 804 lines. JSON/signal logic lives inside the view module: line 905 `fn render_value(key: String, value: Result(Dynamic, Nil)) -> String {`, 1047 `fn worth_knowing_signals(fraud_signals: Option(Dynamic)) -> List(String) {`, 1112 `fn signals_decoder() -> decode.Decoder(Signals) {`, 1213 `fn parsed_result_decoder() -> decode.Decoder(ParsedResult) {`, alongside view_* functions. AGENTS.md target: \"<200 lines for logic modules, <400 lines for view modules\".",
+    "detail": "The component mixes the §7.4 view with result-JSON decoding, per-slot field registries, signal thresholds and word rendering. RC4.3/RC4.4 edits (actions menu, attempt-log export) land on the largest surface in the client, raising change cost.",
+    "recommended_fix": "Extract the result-parsing half (parsed_result_decoder, signals_decoder, worth_knowing_signals, render_value family, slot_field_keys) into components/reference_result.gleam; keep the panel module view-only."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "keyed-lists",
+    "title": "Mini-timeline list is unkeyed although rows use keyed.ul and the list grows as attempt batches arrive",
+    "location": "client/src/components/reference_panel.gleam:553-555",
+    "evidence": "client/src/components/reference_panel.gleam:553-555: `html.ul(\n      [attribute(\"role\", \"list\"), class(\"space-y-1.5\")],\n      list.map(lines, fn(line) {` — html.li children carry no key. Contrast the rows list, line 258: `keyed.ul(\n    [attribute(\"role\", \"list\"), class(\"divide-y divide-slate-100\")],\n    list.map(calls, fn(call) {\n      #(call.reference_call_id, view_row(call, app, expanded))`. Codebase precedent: application_detail_audit_trail.gleam:54 uses `keyed.ul(` for its timeline.",
+    "detail": "AGENTS.md requires keyed elements for dynamic lists with stable IDs. The timeline grows over a row's life (invite → nudge → reminders) and has a stable key available (batch `at` timestamp); unkeyed items invite Lustre DOM-reuse mismatches on refresh.",
+    "recommended_fix": "Use keyed.ul with `#(line.at <> line.label, ...)` for the timeline lines, mirroring the rows list and the audit-trail component."
+  }
+]

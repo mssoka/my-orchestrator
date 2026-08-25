@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "camera-state-transition",
+    "title": "The D-toggle changes play_w without re-clamping the zoomed camera targets — an east-panned zoomed camera leaves the world's east strip rendered under the opaque plate until the next camera input",
+    "location": "app/main.odin:1075 + app/main.odin:1755-1758",
+    "evidence": "effect_overlay: `app.overlay_on = !app.overlay_on` ... `rnd.view_set_rail(&app.view, app.overlay_on)` (no camera re-clamp). camera_update: `fit := rnd.camera_fit(v)` ... `v.scale = fit * app.cam_zoom` / `v.off_x = f32(v.play_w)/2 - app.cam_wx * v.scale` — cam_wx/cam_wx_to are never clamped here; the clamps live only in camera_zoom_at (main.odin:1891-1892), effect_pan (1919) and pullback_feed (1830), all of which pass v.play_w.",
+    "detail": "Zoom ≳1.33 + pan east while D is off (targets clamped against play_w=win_w), then press D: scale re-derives from the narrower fit but cam_wx_to keeps its old east clamp. At 1280×720 the world's right edge lands at screen 882 > play_w 756 (126px hidden under the plate), violating the fits-left-of-rail contract.",
+    "recommended_fix": "On the rail flip (and the resize re-apply), re-clamp the camera targets for the new play_w: run cam_wx_to/cam_wy_to through camera_clamp_center with the current zoom before the next camera_update."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "input-occlusion",
+    "title": "Defect in the B1'' fix's yield: the SLA focus rows' 740px hit rects extend under the rail plate at any window width < 1272 — the swallow (tray-yield only) eats their presses before sla_focus_click",
+    "location": "app/main.odin:1203 + app/main.odin:1979-1981",
+    "evidence": "Swallow at main.odin:1203: `if app.overlay_on && app.stats_valid && rnd.noc_panel_hit(rnd.noc_panel_rect(app.view.win_w, app.view.win_h), pos) && !tray_chip_hit(app, pos) {` / `return true` — sla_focus_click runs later at 1221: `if sla_focus_click(app, pos) {`. Row rect: `sla_row_rect :: proc(v: ^rnd.View, line: int) -> rl.Rectangle {` / `return {8, f32(sla_row_y(v, line) - rnd.hud(v, 2)), 740, f32(rnd.hud(v, 18))}` — raw width 740 → spans 8..748; plate spans [win_w-524, win_w]; `MIN_WIN_W :: 1152`.",
+    "detail": "At win_w ∈ [1152, 1271] (resizable, min-clamped) each SLA row's hit rect overlaps the plate by up to 120px. The rows draw after the rail (draw_sla_gauges inside draw_hud:759 vs rail:719) and the focused-row highlight paints over the plate using the same rect — visible affordance, dead clicks.",
+    "recommended_fix": "Mirror the tray yield: also hit-test the visible sla_row_rects before the swallow in effect_ui_press (or clamp sla_row_rect's width to play_w while the rail is on)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "input-bypass",
+    "title": "The plate press-swallow is unreachable while a router placement is armed — on_ui_press is gated on placing_eff < 0, so presses over the plate fall through to Place_Release",
+    "location": "app/input/mouse.odin:284,417 + app/input/exec.odin:149-160",
+    "evidence": "mouse.odin:284: `if placing_eff < 0 && inp.on_ui_press != nil {`. mouse.odin:417: `append(out, Intent(Place_Release{pos = release_pos}))`. exec.odin Place_Release commit: `cmd := pp.Cmd_Place_Router{type_idx = u16(inp.placing), pos = tile}` / `if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {`.",
+    "detail": "With D on, a placement click over the plate never reaches the swallow (the whole app ui-press callback is skipped while placing). With the world extending under the plate (the un-reclamped-toggle state) the ghost tile is on-map and the edit commits — a router placed invisibly under the plate.",
+    "recommended_fix": "In the placement press branch, swallow when the press lands in noc_panel_rect and overlay_on && stats_valid (the plate owns the press even mid-placement), or re-clamp the camera on the rail toggle so no world sits under the plate."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "input-bypass",
+    "title": "Right-presses have no plate gate — right_click_select can select and open the QoS panel on a pipe hidden under the rail plate",
+    "location": "app/input/mouse.odin:239 + app/input/exec.odin:668-672",
+    "evidence": "mouse.odin:239: `if has_right && !inp.panel_open {` (no plate check). exec.odin right_click_select: `if pid, ok := pipe_hit(inp.topo, inp.cat, wx, wy); ok {` / `inp.sel_pipe = i64(pid)` / `inp.sel_node = -1` / `inp.sel_class = 0`.",
+    "detail": "The plate owns left presses and the wheel but not right presses. When the world extends under the plate (zoomed camera after the D-toggle with no re-clamp), a right-click over the plate hits a plate-hidden pipe — state change on an invisible entity, QoS panel opens with no visible cause.",
+    "recommended_fix": "Gate the right-press branch on the plate rect too (overlay_on && stats_valid && noc_panel_hit → swallow), matching the left-press ownership; or re-clamp the camera on the rail toggle."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "draw-collision",
+    "title": "upgrade_preview_anchor's rail-on position ignores the crisis banner — during an active crisis the banner (drawn after the forecast) overdraws the re-anchored preview card's title band",
+    "location": "app/render/forecast.odin:129-131 vs app/render/crisis.odin:63",
+    "evidence": "forecast.odin: `if view_rail_on(v) {` / `return v.play_w - card_w - pad, NOC_CONTENT_Y + hud(v, 6)` / `}`. crisis.odin: `x := (v.play_w - card_w) / 2 // the playfield center (DOCK-RIGHT: clear of the rail)`. App draw order: draw_forecast_panel at main.odin:1519/1521 precedes draw_crisis_banner at 1533.",
+    "detail": "At 1280, rail on, scale 1.0, health on, ≥2 active crises: banner rect {148,60,460,98} vs preview card origin (506,112,250×h) — the banner paints over the preview's title/first rows (~102×46px), the exact crisis moment the re-anchor was built for.",
+    "recommended_fix": "Drop the rail-on preview below the banner's bottom (pass banner_y + banner height into upgrade_preview_anchor), or draw the preview after the banner."
+  }
+]

@@ -1,0 +1,42 @@
+[
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "input",
+    "title": "Placement movement guard is anchored at a stale app.press — the arming chip-click's own release is measured against it",
+    "location": "app/main.odin:196-235 (handle_input placement path)",
+    "evidence": "\t\tif app.placing >= 0 {\n\t\t\tapp.press = {f32(mx), f32(my)} // placement clicks land on release\n\t\t\treturn\n\t\t}\n...\n\t} else if app.placing >= 0 {\n\t\tapp.drag.active = true\n\t\tapp.drag.placing = app.placing\n\t\tapp.drag.wx = wx\n\t\tapp.drag.wy = wy\n\t\ttile := mouse_tile(app)\n\t\tapp.drag.valid = pp.validate_place(&app.state.topology,\n\t\t\tpp.Cmd_Place_Router{u16(app.placing), tile}, &app.cat)\n\t\tif rl.IsMouseButtonReleased(.LEFT) {\n\t\t\tmoved := rl.Vector2Distance({f32(mx), f32(my)}, app.press) > 6\n\t\t\tif !moved {\n\t\t\t\tcmd := pp.Cmd_Place_Router{type_idx = u16(app.placing), pos = tile}\n...\n\t\t\t\t\ttidx := i32(rts[k])\n\t\t\t\t\tapp.placing = (app.placing == tidx) ? -1 : tidx // click again to cancel\n\t\t\t\t\tapp.drag = {}\n\t\t\t\t\tapp.drag.placing = app.placing",
+    "detail": "The chip-arming branch never resets app.press. The arming click's release frame enters the placement branch and compares against a stale press (a previous placement press near the tray strip, or {0,0} on first arming); a release within 6px of that stale point drops a router with no fresh press.",
+    "recommended_fix": "Reset app.press when arming placement (set it to the chip position or an out-of-window sentinel) so the 6px guard only measures presses made since arming."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "mouse_tile truncates toward zero — clicks in the left letterbox margin place a router at column 0 while the right margin rejects",
+    "location": "app/main.odin:271-276 (mouse_tile) + core/topology.odin:270-272 (placement_valid bounds)",
+    "evidence": "mouse_tile :: proc(app: ^App) -> [2]i32 {\n\tmx, my := rl.GetMouseX(), rl.GetMouseY()\n\twx, wy := rnd.from_screen(&app.view, f32(mx), f32(my))\n\ttile := f32(app.cat.balance.tile_px)\n\treturn {i32(wx / tile), i32(wy / tile)}\n}\n...\n\tif pos[0] < 0 || pos[0] >= bal.map_w_tiles { return false }",
+    "detail": "i32() truncates toward zero: wx in (-26,0) maps to tile 0, which passes placement_valid, so an off-map click in the left margin (screen x 136-160 at 1280x720, map 1040x780, off_x=160) shows a green ghost and drops a router at column 0; the symmetric right margin (tile 40) rejects.",
+    "recommended_fix": "Floor negative world coords (or reject cursors outside the map rect before validating) so both off-map margins behave symmetrically."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "input-validation",
+    "title": "Demo `place` verb narrows i64 parse results to i32 with no range check — out-of-range positions wrap silently",
+    "location": "harness/demo.odin:253-262 (place verb)",
+    "evidence": "\t\t\t\tpx, okx := strconv.parse_int(fields[4], 10)\n\t\t\t\tpy, oky := strconv.parse_int(fields[5], 10)\n\t\t\t\tif !okx || !oky {\n\t\t\t\t\treturn {}, fmt.tprintf(\"bad place position: %s\", line)\n\t\t\t\t}\n\t\t\t\tappend(&d.places, Place_Intent{\n\t\t\t\t\tat_ms = ms,\n\t\t\t\t\ttype_name = strings.clone(fields[3]),\n\t\t\t\t\tpos = {i32(px), i32(py)},\n\t\t\t\t})",
+    "detail": "parse_int returns i64; i32(px) narrows unchecked, so a position like 2^32+5 wraps to an in-grid tile and the placement is silently accepted as legal instead of failing parse. spawn_node shares the pattern; the place verb is the new code.",
+    "recommended_fix": "Range-check px/py against i32 bounds before the cast and return the standard parse error, matching the fail-loud style of the other verbs."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "ordering",
+    "title": "lower_intents appends kind-grouped, not time-ordered — a same-tick draw-before-place applies the draw against the not-yet-placed node",
+    "location": "harness/run.odin:55-90 (lower_intents)",
+    "evidence": "\tfor i in 0..<len(demo.draws) {\n\t\td := &demo.draws[i]\n\t\ttier_idx, ok := pp.pipe_tier_index(cat, d.tier)\n\t\tif !ok {\n\t\t\treturn fmt.tprintf(\"demo %s: unknown pipe tier %q\", demo.name, d.tier)\n\t\t}\n\t\tapply_tick := intent_apply_tick(d, cat.balance.logic_hz)\n\t\tappend(&state.action_log, pp.Command{\n\t\t\tapply_tick = apply_tick,\n\t\t\tkind = pp.Cmd_Draw_Pipe{a = d.a, b = d.b, tier = tier_idx},\n\t\t})\n\t}\n...\n\tfor i in 0..<len(demo.places) {\n\t\tp := &demo.places[i]\n\t\ttype_idx, ok := pp.node_type_index(cat, p.type_name)\n\t\tif !ok {\n\t\t\treturn fmt.tprintf(\"demo %s: unknown node type %q\", demo.name, p.type_name)\n\t\t}\n\t\tapply_tick := u64(max(0, i64(p.at_ms) * i64(cat.balance.logic_hz) / 1000)) + 1\n\t\tappend(&state.action_log, pp.Command{\n\t\t\tapply_tick = apply_tick,\n\t\t\tkind = pp.Cmd_Place_Router{type_idx = type_idx, pos = p.pos},\n\t\t})",
+    "detail": "Draws append before places regardless of at_ms, so `at 500ms place ...` + `at 500ms draw 1 3 ...` applies the draw first — .Missing_Node latches replay_error (loud, but contradicts the app's real-time order and the app-demo parity the harness promises).",
+    "recommended_fix": "Append lowered commands sorted by apply_tick (stable sort), so same-tick cross-kind dependencies apply in time order like the app's fast-path."
+  }
+]

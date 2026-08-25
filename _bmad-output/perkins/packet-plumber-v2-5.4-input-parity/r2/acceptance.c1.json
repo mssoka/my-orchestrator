@@ -1,0 +1,42 @@
+[
+  {
+    "source": "acceptance",
+    "severity": "blocker",
+    "category": "parity",
+    "title": "Chord fix regresses the drag-interrupt swallow latch: Press_Anchor is emitted AFTER Right_Click, undoing was_dragging's latch (old handle_input ended TRUE, new code ends FALSE)",
+    "location": "app/input/mouse.odin:163-171 + app/input/exec.odin:66-70,546-550",
+    "evidence": "mouse.odin (emission order — Right_Click before Press_Anchor):\n\t\t\tappend(out, Intent(Right_Click{pos = right_press}))\n\t\t}\n\t\tif has_left {\n\t\t\t// the right+left chord re-anchored the latch above; a same-frame\n\t\t\t// cancel (the placement Cancel just emitted) would re-latch it — emit\n\t\t\t// the Press_Anchor so the press's reset wins (the old chord ran AFTER\n\t\t\t// the cancel block — Perkins B2)\n\t\t\tappend(out, Intent(Press_Anchor{}))\nexec.odin:\n\tcase Press_Anchor:\n\t\t// the press's branch-top latch reset — must run AFTER a same-frame\n\t\t// ESC/right Cancel so the press's reset wins (the old press block ran\n\t\t// after the cancel block — Perkins B2)\n\t\tinp.press_swallowed = false\nand right_click_select:\n\twas_dragging := inp.drag.active\n\tinp.drag.active = false\n\tinp.drag_to = 0\n\tif was_dragging {\n\t\tinp.press_swallowed = true // an interrupted drag's release must not re-select\n\t}\nOld removed code (patch minus-lines, order = chord reset THEN was_dragging latch):\n-\t\tif rl.IsMouseButtonPressed(.LEFT) {\n-\t\t\tapp.press = {f32(mx), f32(my)}\n-\t\t\tapp.press_swallowed = false\n-\t\t}\n...\n-\t\twas_dragging := app.drag.active\n-\t\tapp.drag.active = false\n-\t\tapp.drag_to = 0\n-\t\tif was_dragging {\n-\t\t\tapp.press_swallowed = true // an interrupted drag's release must not re-select\n-\t\t}",
+    "detail": "Spec: mouse must preserve behavior EXACTLY. On a right+left chord while a draw drag is active, old code netted press_swallowed=TRUE (chord reset, then was_dragging latch); the new intent order (Right_Click latches, then Press_Anchor clears) nets FALSE, so the anchored later release click-selects where the old code suppressed it. Reachable via scripted/mixed-device frames (live mouse can't re-edge a held button); r1 was correct here — the fix-introduced Press_Anchor broke it.",
+    "recommended_fix": "Emit Press_Anchor BETWEEN Cancel and Right_Click (Cancel -> Press_Anchor -> Right_Click) so the drag-interrupt latch lands last, matching the old chord-then-was_dragging order."
+  },
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "input_parity_pad_cursor's first boundary is vacuous: only the FINAL pad_node==0 is asserted, which a dropped/no-op first Dpad_Up also produces",
+    "location": "harness/parity.odin:618-630 (scenario), 820-823 (assert)",
+    "evidence": "Scenario comment + script:\n\t// 17. pad_cursor — W10 pin: the pad_step boundaries — first Dpad_Up lands\n\t// on the LAST alive node (2), the wrap from 2 steps back to 0.\n\t...\n\t\tpad = frames(\n\t\t\tevs(inp.Pad_Button_Press{button = .Dpad_Up}), // first placement -> last (2)\n\t\t\tevs(inp.Pad_Button_Press{button = .Dpad_Down}), // wrap -> 0\n\t\t),\nAssert (final state only):\n\tcase \"input_parity_pad_cursor\":\n\t\tif r, ok := find(runs, devs, .Pad); ok && (!r.pad_has || r.pad_node != 0) {\n\t\t\tappend(fails, fmt.tprintf(\"  %s pad: cursor (has %v, node %d), want node 0 (Up first -> 2, Down wraps -> 0)\", sc.name, r.pad_has, r.pad_node))",
+    "detail": "The comment promises 'first Dpad_Up lands on the LAST alive node (2)'. With no cursor, pad_step's first Dpad_Down lands on node 0 — so a regression that silently drops the Up frame still ends at pad_node==0 and passes. The pinned first-placement boundary (step -1 -> n-1, the edge-hunter finding) is unasserted.",
+    "recommended_fix": "Assert the intermediate state: snapshot pad_node after frame 1 (== 2) as well as after frame 2 (== 0) — e.g. split into two scenarios or add a per-frame checkpoint to the parity driver."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Class-key surface hard-capped at One/Two (Key enum + poll + mapping) while the old handle_input's class loop was catalog-driven (ONE+i for every packet type)",
+    "location": "app/input/mouse.odin:297-303 + app/input/poll.odin:53-54 + app/input/types.odin:37-50",
+    "evidence": "mouse.odin:\n\t\tcase .One, .Two:\n\t\t\t// the per-type class keys — with a pipe selected, 1/2 pick the\n\t\t\t// class the lane keys act on (same executor-gated rationale)\n\t\t\tfor i in 0 ..< len(inp.cat.packet_types) {\n\t\t\t\tif k.key == Key(int(Key.One) + i) {\n\t\t\t\t\tappend(out, Intent(Set_Class{class = u16(i)}))\npoll.odin:\n\tif rl.IsKeyPressed(.ONE) { append(&inp.events, Device_Event(Key_Press{key = .One})) }\n\tif rl.IsKeyPressed(.TWO) { append(&inp.events, Device_Event(Key_Press{key = .Two})) }\nOld removed code (patch minus-lines):\n-\t\tfor i in 0..<len(app.cat.packet_types) {\n-\t\t\tkey := rl.KeyboardKey(int(rl.KeyboardKey.ONE) + i)\n-\t\t\tif rl.IsKeyPressed(key) {\n-\t\t\t\tapp.sel_class = u16(i)\n(data check: data/packet_types.json 'entries' has exactly 2 — email, streaming)",
+    "detail": "The old loop polled KeyboardKey(ONE+i) for every catalog packet type; the new Key enum stops at Two, so a third packet class would silently have no class key (Key(One+2) aliases .E but that case never reaches the loop). No live delta today (catalog has 2 types), but the transcription narrowed a catalog-driven surface with no guard — r1-missed.",
+    "recommended_fix": "Add a compile-time assert (len(cat.packet_types) <= 2) near the Key roster, or extend Key/poll rows to the catalog maximum, so a third class fails loudly instead of silently losing its key."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "terminology",
+    "title": "Stale 'Emphasis'/'Set_Emphasis' labels for Cmd_Set_Weights survive the #55 rename in the parity harness's failure strings + comments",
+    "location": "harness/parity.odin:231, 701-703",
+    "evidence": "\tcase pp.Cmd_Set_Weights:\n\t\treturn fmt.tprintf(\"Emphasis{%d,%v}@%d\", k.pipe, k.weights, c.apply_tick)\nand:\n\t\t\t// the auto-follow wrote a third command (Set_Emphasis with the ladder's\n\t\t\t// weights for the pipe's final assignments — read from the run, never\n\t\t\t// hand-duplicated) — fold it into the expected stream so the equality\n\t\t\t// check covers it.",
+    "detail": "The #55 terminology adoption renamed Cmd_Set_Emphasis -> Cmd_Set_Weights, but the parity test's failure renderer still prints 'Emphasis{...}' and the lane-fold comment says 'Set_Emphasis'. Cosmetic only, but misleading when reading a parity failure bundle against current command names.",
+    "recommended_fix": "Rename the failure-string label to 'Weights{...}' (or 'Set_Weights{...}') and update the comment to 'Set_Weights'."
+  }
+]

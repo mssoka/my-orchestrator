@@ -1,0 +1,32 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "district-cap-leak",
+    "title": "ATTACH member can spawn into a district already at cap — only the cluster's SEED district is cap-checked, the global ring tile's district is not",
+    "location": "core/growth.odin:850-853 (seed-district-only cap check) vs core/growth.odin:954-961 (global ring draw + placement, no district predicate)",
+    "evidence": "core/growth.odin:849-853 — the eligibility check covers only the cluster's seed district:\n\t\t\t\tif board != nil {\n\t\t\t\t\td := map_district_assign(board, t.node_pos[i])\n\t\t\t\t\tif growth_district_live_count(board, t, d) >= growth_district_cap(board, cat, d) {\n\t\t\t\t\t\tcontinue\ncore/growth.odin:954-961 — the ring draw is global and no district predicate follows it:\n\t\t\t\t\trng_size := growth_board_ring_scan(board, t.node_pos[anchor_slot], cat.balance.terminal_min_sep_tiles, cat.balance.growth_groups.radius_tiles, &ring_scratch)\n\t\t\t\t\tif rng_size <= 0 {\n\t\t\t\t\t\tcontinue // degenerate — the anchor's streets are exhausted (defensive)\n\t\t\t\t\t}\n\t\t\t\t\tk := rng_range(rng, 0, rng_size - 1)\n\t\t\t\t\tpos = board.candidates[ring_scratch[k]]\n\t\t\t\t\tif !growth_attach_radius_ok(t, u32(anchor_slot), pos, cat.balance.growth_groups.radius_tiles) {\n\t\t\t\t\t\tcontinue\ngrowth_board_ring_scan (core/growth.odin:605-618) iterates ALL pool tiles with no district filter. The claimed invariant, data/balance.json:22: \"the density ruling's hard bound: 1000 = the blessed 1-in-6 fabric, a district never grows more live terminals than its own pool tiles\". The remaining gates after the draw (growth_attach_radius_ok, growth_seed_sep_ok, growth_pos_valid, growth_connectable — growth.odin:960, 1055-1063) contain no district-cap predicate.",
+    "detail": "An estate straddling a Voronoi boundary (documented by design — PR body: \"estates straddle Voronoi boundaries by design\") can attach a member onto a pool tile in a neighboring district already at cap, pushing that district's live count over its cap. The density \"hard bound\" invariant has no guard on this path.",
+    "recommended_fix": "After the ring draw (growth.odin:958), check the destination tile's district: d_pos := map_district_assign(board, pos); reject via continue when growth_district_live_count(board, t, d_pos) >= growth_district_cap(board, cat, d_pos) (same for growth_board_cluster_has_room if room-checks should match)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "input-validation",
+    "title": "growth_districts values load via jint: a decimal silently truncates and an out-of-i32-range integer wraps through the cast, potentially landing inside the validated 0..1000 range",
+    "location": "core/catalog.odin:967-974 (jint calls) + core/catalog.odin:1599-1607 (jint)",
+    "evidence": "core/catalog.odin:967-968:\n\t\t\tb.growth_districts.district_cap_permille = jint(gobj, \"district_cap_permille\", -1)\n\t\t\tb.growth_districts.seed_weights[int(District_Kind.City)] = jint(gobj, \"seed_weight_city\", -1)\ncore/catalog.odin:1599-1607:\njint :: proc(o: json.Object, key: string, def: i32) -> i32 {\n\tif v, ok := o[key]; ok {\n\t\t#partial switch x in v {\n\t\tcase json.Integer: return i32(x)\n\t\tcase json.Float:   return i32(x)\n\t\t}\n\t}\n\treturn def\n}\nThe codebase's own bar for this trap, core/catalog.odin:1612-1616 (jint_strict): \"an out-of-i32-range integer (|v| > i32::MAX) and ANY other JSON type (string/bool/null) also reject — a huge value must never wrap through the i32 cast (e.g. a cooldown of 2^32+4 silently becoming 4)\".",
+    "detail": "A hand-edited balance.json (the _comment invites user fun-testing of these tunables) with \"seed_weight_city\": 4.5 or 2^32+4 is silently accepted as 4, bypassing the 0..1000 fail-fast. No guard in the diff for the Float-truncation or Integer-wrap path.",
+    "recommended_fix": "Load the growth_districts fields via jint_strict (reject json.Float + out-of-i32-range) like the node_types/pipe_tiers/packet_types catalogs, mapping ok=false to the existing named load error."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "integer-overflow",
+    "title": "dublin-grown ms argument: unbounded parse_u64 multiplied by logic_hz overflows u64 and wraps to a small tick count",
+    "location": "harness/main.odin:133-138 + harness/dublin_shot.odin:177-180",
+    "evidence": "harness/main.odin:133-138:\n\t\tif len(rest) == 2 {\n\t\t\tif v, ok := strconv.parse_u64(rest[1]); ok {\n\t\t\t\trun_ms = v\n\t\t\t} else {\n\t\t\t\tfmt.eprintfln(\"dublin-grown: bad ms %q\", rest[1])\n\t\t\t\tos.exit(2)\nharness/dublin_shot.odin:177-180:\n\tticks := max_ticks\n\tif run_ms > 0 {\n\t\tticks = run_ms * u64(cat.balance.logic_hz) / 1000\n\t}",
+    "detail": "parse_u64 accepts values up to u64::MAX; run_ms ≥ ~9.2e17 with logic_hz 20 overflows the multiply, wraps, and the gate verb silently plays far fewer ticks than requested. No bound check on the product.",
+    "recommended_fix": "Cap or reject the ms argument in main.odin before the multiply (e.g. run_ms > (max(u64)/logic_hz) → error exit), or compute ticks with the division first: run_ms / 1000 * logic_hz."
+  }
+]

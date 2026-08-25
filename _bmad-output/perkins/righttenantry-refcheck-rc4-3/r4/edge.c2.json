@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "blocker",
+    "category": "take-over",
+    "title": "STILL PRESENT (r3): wrong-person awaiting transition still executes the unguarded update_reference_call_status — the taken_over_at backstop is dead SQL pinned only by a vacuous direct-call test",
+    "location": "server/src/reference_checks/form_handler.gleam:1235-1259 (sql/update_reference_call_status.sql:23-24; sql/mark_awaiting_correction_wrong_person.sql:14-16; server/test/integration/reference_checks_actions_integration_test.gleam:1729-1760)",
+    "evidence": "form_handler.gleam:1235-1250: `case row.taken_over_at != \"\" { True -> wisp.redirect(to: \"/reference/\" <> token) False -> ... case row.correction_cycles >= 1 { True -> exhaust_wrong_person(...) False -> case sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated) {`; update_reference_call_status.sql:23-24: `WHERE id = $1 AND status = $5::reference_call_status`; mark_awaiting_correction_wrong_person.sql:14-16: `WHERE id = $1 AND status = 'contact_initiated'::reference_call_status AND taken_over_at IS NULL`; test:1746: `rc_sql.mark_awaiting_correction_wrong_person(db, call)`",
+    "detail": "Handler still calls the unguarded UPDATE; guarded SQL called nowhere in server/src (grep: only sql.gleam + test). The race pin drives the guarded SQL directly, never the POST route — neutralizing the backstop leaves it green. TOCTOU fully open.",
+    "recommended_fix": "Wire mark_awaiting_correction_wrong_person into apply_wrong_person's False arm (0-row = stand down), and rewrite the race test to POST the wrong-person route with take-over interleaved so it bites when the backstop is removed."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "exhaustion",
+    "title": "STILL PRESENT (r3): W3 co-nudge exclusion is keyed on a kind-tag only new code writes — pre-deploy untagged co-nudge entries still match the delivery-failure find and can fabricate exhaustion",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:46-47,62-63,84-85; server/src/reference_checks/sweep.gleam:812-822; supabase/migrations/20260812140000_reference_call_corrected_name.sql:13-18",
+    "evidence": "find_reference_call_by_send_ref.sql:84-85: `WHERE e->>'detail' = $3 AND e->>'outcome' = 'delivered' AND NOT (e ? 'kind')`; sweep.gleam:820: `#(\"kind\", json.string(\"co_nudge\")),` (tag added at df0ea22); pre-rework co-nudges (RC3.5+, 0fdbf93:371 `outcomes_to_json([outcome], now_iso)`) wrote no kind; sweep_advance.sql:18: `SET attempts = attempts || $2::jsonb` (append-only); migration adds only `ADD COLUMN IF NOT EXISTS corrected_name TEXT` / `corrected_at TIMESTAMPTZ` — no attempts backfill",
+    "detail": "A bounce of the applicant's co-nudge address whose send_ref matches a pre-upgrade untagged entry still finds the row: pre-correction -> fabricated awaiting_correction('email_bounced'); post-correction with corrected_at before the co-nudge -> fabricated unreachable + referee_contact_invalid stamp.",
+    "recommended_fix": "Backfill kind='co_nudge' onto legacy co-nudge attempts entries in the migration (e.g. UPDATE ... jsonb UPDATE attempts), or additionally exclude by send-ref namespace so the guard is not keyed on new-writer tagging alone."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "client-state",
+    "title": "STILL PRESENT (r3): N5 single-slot edit — the choice-path overwrite still discards another row's in-progress typed trio (only the success-clear is scoped)",
+    "location": "client/src/client.gleam:3384-3399",
+    "evidence": "`RefcheckSubstitute -> #( Model( ..menu_closed, refcheck_edit: Some(prefill_refcheck_edit( model, call_id, RefcheckEditSubstitute, )), ) ...` and `RefcheckCorrect -> #( ... refcheck_edit: Some(prefill_refcheck_edit( model, call_id, RefcheckEditCorrect, ...` — unconditional replacement of any existing refcheck_edit; no `case model.refcheck_edit { Some(e) if e.call_id == call_id -> ... }` guard and no documented carry",
+    "detail": "Success-clear is call-scoped (3558-3565) but opening substitute/correct on another row still silently overwrites the open edit draft with a fresh prefill — the r3 N5 second half remains.",
+    "recommended_fix": "Scope the choice-open too: if an edit exists for a different call_id, either drop the new action (toast) or explicitly carry the draft forward; document the single-slot discard if intended."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "a11y",
+    "title": "STILL PRESENT (r3): N14 Escape — keydown handler is still on the menu div; the ⋯ button retains focus after a mouse click, so click-then-Escape does nothing",
+    "location": "client/src/components/reference_panel.gleam:745-750",
+    "evidence": "`html.div( [ attribute(\"data-testid\", \"refcheck-menu-\" <> slot), attribute(\"role\", \"menu\"), // r2 (N14): Escape closes the menu (the confirm_modal pattern). event.on( \"keydown\", menu_escape_decoder(msg.UserToggledRefcheckMenu( call.reference_call_id, )), )` — handler on the menu container div; the sibling ⋯ button (line ~720 `event.on_click(msg.UserToggledRefcheckMenu(call.reference_call_id))`) keeps focus after click; no autofocus moves into the menu",
+    "detail": "Keydown bubbles only from descendants: Escape after a mouse-open (focus on the button) never reaches the div handler; it works only after Tab has moved focus into a menu item.",
+    "recommended_fix": "Move the Escape keydown onto the ⋯ button (or autofocus the first menuitem on open), so the natural click-then-Escape flow closes the menu."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "test-quality",
+    "title": "STILL PRESENT (r3): N18 — no_em_dash_test still checks the same character twice in the for_each_copy arm",
+    "location": "client/test/copy_test.gleam:354-357",
+    "evidence": "`pub fn no_em_dash_test() { for_each_copy(fn(s) { case string.contains(s, \"\\u{2014}\") || string.contains(s, \"—\") {` — both literals are U+2014; the duplicate disjunct remains (only the new refcheck_action_strings block at 362-363 was deduplicated)",
+    "detail": "The r3 N18 cleanup touched only the new block; the original for_each_copy arm still compares the identical character twice. Harmless but the audit item is unresolved.",
+    "recommended_fix": "Drop the second disjunct: `case string.contains(s, \"\\u{2014}\") {` in the for_each_copy arm."
+  }
+]

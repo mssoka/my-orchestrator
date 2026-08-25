@@ -1,0 +1,22 @@
+[
+  {
+    "source": "edge",
+    "severity": "blocker",
+    "category": "take-over",
+    "title": "STILL PRESENT (r2): wrong-person route's taken_over_at guard is a stale read — a take-over landing between the row read and the guarded UPDATE still yanks the landlord-handled row into awaiting_correction and dead-ends it",
+    "location": "server/src/reference_checks/form_handler.gleam:1235-1250; server/src/reference_checks/sql/update_reference_call_status.sql:23-24",
+    "evidence": "form_handler.gleam: 'case row.taken_over_at != \"\" { True -> wisp.redirect(to: \"/reference/\" <> token) ... sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated)' — update_reference_call_status.sql: 'WHERE id = $1 AND status = $5::reference_call_status' — no taken_over_at clause",
+    "detail": "Take-over keeps status contact_initiated, so the wrong-person's expected-status guard cannot see it; only the stale pre-read check exists. A take-over committing between lookup_context and the UPDATE lets a landlord-handled row re-enter the correction loop (the r2 blocker's exact class).",
+    "recommended_fix": "Add AND taken_over_at IS NULL to update_reference_call_status.sql (or use a dedicated wrong-person query mirroring mark_awaiting_correction.sql) so the write, not the read, stands down taken-over rows."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "exhaustion",
+    "title": "W1 stale-bounce gate bypass: the contact-fallback match (matched_send_at='') exhausts a corrected row on a redelivered PRE-correction bounce when a partial correction retained the failed channel",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:33-55; server/src/reference_checks/webhooks.gleam:297-298",
+    "evidence": "webhooks.gleam: 'case row.matched_send_at == \"\" || row.send_is_post_correction { True -> exhaust_row(...) False -> Nil }' — find_reference_call_by_send_ref.sql: 'OR ($2 <> '' AND CASE WHEN rc.correction_cycles >= 1 THEN NULLIF(rc.corrected_email, '') ELSE COALESCE(NULLIF(rc.corrected_email, ''), rc.contact_email) END = $2)' with matched_send_at COALESCE((...), '')",
+    "detail": "If the pre-correction send was never appended (crash-mid-tick) and the correction kept the failed channel (e.g. only phone fixed), a redelivered stale bounce matches the corrected-only fallback, reads matched_send_at='' (treated as genuine) and exhausts the in-flight corrected row — stamping referee_contact_invalid while the corrected referee's form is live. The typed gate only sees appended sends.",
+    "recommended_fix": "When correction_cycles >= 1 and the fallback matches a corrected channel, compare the event's at-timestamp to corrected_at (typed, like the appended path) instead of unconditionally treating the fallback as genuine; or record the corrected send's send_ref in the attempts log before send."
+  }
+]

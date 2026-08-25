@@ -1,0 +1,434 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-rc1-1-grapheme-fix.md b/_bmad-output/implementation-artifacts/spec-rc1-1-grapheme-fix.md
+new file mode 100644
+index 00000000..a2d1806a
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-rc1-1-grapheme-fix.md
+@@ -0,0 +1,116 @@
++---
++title: 'RC1.1 deferred: codepoint-bounded client IP/UA slicing'
++type: 'bugfix'
++created: '2026-08-12'
++status: 'done'
++baseline_commit: '96746ec'
++review_loop_iteration: 0
++context: []
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** `request_helpers.client_ip` / `client_user_agent` slice by **graphemes** (Gleam `string.slice`) while the DB CHECK bounds count **characters** (Postgres `length()`) — a multi-codepoint header (emoji ZWJ sequences, combining marks, flags) can exceed the bound post-slice and 500 the write path.
++
++**Approach:** Replace grapheme-based slicing with **codepoint-bounded** slicing in the two helper functions. The helpers feed `cookie_consent_log`, `payment_terms_acceptance`, and `application.submitted_*` — all share the same 64/512 CHECK idiom, so the fix lands in one focused change in `request_helpers.gleam` and applies to all three callers unchanged.
++
++## Boundaries & Constraints
++
++**Always:**
++- Never split a multi-byte character (codepoint-boundary slicing only).
++- Result must never exceed the DB CHECK character bounds: 64 for IP, 512 for UA — for ANY input, including adversarial multi-codepoint headers.
++- One focused change in `request_helpers.gleam`; the three callers (`consent_handler`, `payment_handler`, `application_handler`) need no edits.
++- Regression test with a multi-codepoint header that previously would exceed the bound post-slice, proving the write path no longer 500s.
++- Existing suites green: `make test-server` / `make test-shared` (client untouched).
++
++**Ask First:** (none — deferred-work item pre-approved via briefing)
++
++**Never:**
++- No unrelated refactors, no notification work (RC4.4 owns that).
++- No changes to the SQL CHECK constraints or migrations.
++- No behavior change for single-codepoint-per-grapheme input (ASCII/typical UAs must truncate exactly as before: 64/512 chars).
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| ASCII over-long UA | 600× "U" | exactly 512 chars stored | N/A |
++| ASCII over-long XFF | 500× "9" first hop | exactly 64 chars stored | N/A |
++| Emoji ZWJ-heavy UA (multi-codepoint graphemes) | e.g. repeated family emoji, ≥512 codepoints in first 512 graphemes | stored value ≤512 characters (codepoints); no 500 | never trips CHECK |
++| Emoji/multi-codepoint XFF garbage | ≥64 codepoints in first 64 graphemes | stored value ≤64 characters; no 500 | never trips CHECK |
++| Header absent | no `x-forwarded-for` / `user-agent` | `''` stored; submission unaffected | N/A |
++| XFF with comma list | `"a,b,c"` | first entry only, trimmed, bounded | N/A |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `server/src/request_helpers.gleam` -- `client_ip` (64) and `client_user_agent` (512): replace `string.slice` (grapheme-based) with codepoint-bounded slicing
++- `server/src/consent/consent_handler.gleam` -- caller (cookie_consent_log) — NO edit, verify only
++- `server/src/payment/payment_handler.gleam` -- caller (payment_terms_acceptance) — NO edit, verify only
++- `server/src/application/application_handler.gleam` -- caller (application.submitted_*) — NO edit, verify only
++- `server/test/request_helpers_test.gleam` -- NEW unit tests: codepoint-boundary slicing for both helpers
++- `server/test/integration/gdpr_integration_test.gleam` -- extend overlong-header test (or add) with multi-codepoint UA/XFF proving the /apply write path persists (no 500)
++- `server/test/integration/consent_integration_test.gleam` -- add multi-codepoint UA/XFF consent-write-path test (same CHECK idiom)
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `server/src/request_helpers.gleam` -- codepoint-bounded slice helper + use in both fns -- the core fix
++- [x] `server/test/request_helpers_test.gleam` -- unit tests: emoji-ZWJ UA bounded to 512 codepoints, emoji XFF bounded to 64, ASCII behavior unchanged, absent headers → '' -- lowest-layer pin
++- [x] `server/test/integration/gdpr_integration_test.gleam` -- multi-codepoint UA/XFF through the /apply write path -- proves no 500
++- [x] `server/test/integration/consent_integration_test.gleam` -- multi-codepoint UA through consent write path -- proves no 500 on second caller
++
++**Acceptance Criteria:**
++- Given any header value, when `client_ip` / `client_user_agent` slices it, then the result is cut at codepoint boundaries and its character count ≤ 64 / 512 respectively.
++- Given a multi-codepoint UA (e.g. repeated ZWJ emoji) of any length, when an application submits, then the write persists with `length(submitted_user_agent) <= 512` and HTTP 200 (previously the CHECK tripped → 500).
++- Given the same adversarial UA, when consent is posted, then the row persists (204) with `length(user_agent) <= 512`.
++- Given ASCII input, when sliced, then truncation is byte-identical to the old behavior (exactly 64 / 512).
++- Given no header, then `''` (unchanged).
++
++## Spec Change Log
++
++## Design Notes
++
++Gleam `string.slice` operates on **grapheme clusters** (e.g. 👨👩👧👦 = 1 grapheme, 7 codepoints; combining sequences similar). Postgres `length(text)` counts **characters = codepoints**. So 512 graphemes of ZWJ emoji can be ~3,584 codepoints — the CHECK `length(user_agent) <= 512` rejects the row → 500 on the application write path (payment/consent handlers catch insert errors, but the application transaction aborts).
++
++Fix: `string.to_utf_codepoints |> list.take(max) |> string.from_utf_codepoints` — codepoint-boundary slicing is atomic (never splits a multi-byte char), and the output has ≤ `max` codepoints, so Postgres `length()` can never exceed the CHECK. ASCII/typical UAs are 1 codepoint per grapheme → identical truncation to today.
++
++## Verification
++
++**Commands:**
++- `make test-server` -- green (incl. new request_helpers + integration tests)
++- `make test-shared` -- green (untouched)
++- `cd server && gleam format --check src test` -- formatting clean
++
++**Manual checks (if no CLI):**
++- `git grep -n "string.slice" server/src/request_helpers.gleam` returns nothing
++
++## Suggested Review Order
++
++**The fix (one focused change)**
++
++- Entry point: the shared codepoint-bounded slice helper — the whole fix
++  [`request_helpers.gleam:81`](../../server/src/request_helpers.gleam#L81)
++
++- `client_ip` slices the XFF first hop to 64 codepoints
++  [`request_helpers.gleam:40`](../../server/src/request_helpers.gleam#L40)
++
++- `client_user_agent` slices to 512 codepoints
++  [`request_helpers.gleam:54`](../../server/src/request_helpers.gleam#L54)
++
++**Regression pins**
++
++- Unit: 100 ZWJ family emoji (700 codepoints) must cut to exactly 512
++  [`request_helpers_test.gleam:39`](../../server/test/request_helpers_test.gleam#L39)
++
++- Unit: emoji XFF first hop bounded to 64 codepoints
++  [`request_helpers_test.gleam:65`](../../server/test/request_helpers_test.gleam#L65)
++
++- Integration: /apply write path persists with emoji UA/XFF (was a 500)
++  [`gdpr_integration_test.gleam:2788`](../../server/test/integration/gdpr_integration_test.gleam#L2788)
++
++- Integration: consent write path stays within CHECK bounds
++  [`consent_integration_test.gleam:329`](../../server/test/integration/consent_integration_test.gleam#L329)
+diff --git a/server/src/request_helpers.gleam b/server/src/request_helpers.gleam
+index b4a753e7..c2ba392a 100644
+--- a/server/src/request_helpers.gleam
++++ b/server/src/request_helpers.gleam
+@@ -4,8 +4,22 @@
+ //// payment_handler (payment_terms_acceptance audit), consent_handler
+ //// (cookie_consent_log audit) — both store the values for DPC
+ //// evidentiary purposes. The slicing limits (64 / 512 chars) match
+-//// the DB CHECK constraints on those tables; bumping them in either
+-//// table must bump them here too.
++//// the DB CHECK constraints on the capture tables;
++//// bumping them in either table must bump them here too.
++////
++//// Slicing is **codepoint-bounded** on purpose: Postgres `length()`
++//// counts characters (codepoints), while Gleam `string.slice` counts
++//// graphemes — a single grapheme can span many codepoints (ZWJ emoji
++//// sequences, combining marks, flags), so grapheme slicing can exceed
++//// the CHECK bound post-slice and 500 the write path. The boundary may
++//// land mid-grapheme (e.g. a dangling ZWJ or combining mark) — that is
++//// intentional: the values are stored, never displayed or parsed.
++////
++//// Note: of the three original 64/512 CHECK sites, only
++//// `cookie_consent_log` and `application.submitted_*` still carry the
++//// constraints (the `payment_terms_acceptance` ones were dropped by
++//// the 2026-05-12 constraint-parity migration). Bounding beyond what a
++//// CHECK demands is harmless; the helpers stay uniform for all callers.
+ 
+ import envoy
+ import gleam/http/request
+@@ -18,8 +32,8 @@ import wisp.{type Request}
+ ///
+ /// Cloudflare appends the originating IP first; subsequent entries are
+ /// trusted intermediaries. We take only the first value, trim it, and
+-/// slice to 64 chars (matches the `payment_terms_acceptance.ip_text`
+-/// and `cookie_consent_log.ip_text` CHECK constraints).
++/// slice to 64 characters (matches the `cookie_consent_log.ip_text`
++/// and `application.submitted_ip_text` CHECK constraints).
+ ///
+ /// Returns "" when the header is absent — the DB columns tolerate the
+ /// empty string. We never trust the body for IP attribution.
+@@ -27,22 +41,50 @@ pub fn client_ip(req: Request) -> String {
+   case request.get_header(req, "x-forwarded-for") {
+     Ok(value) ->
+       case string.split_once(value, ",") {
+-        Ok(#(first, _)) -> string.trim(first) |> string.slice(0, 64)
+-        Error(_) -> string.trim(value) |> string.slice(0, 64)
++        Ok(#(first, _)) -> string.trim(first) |> slice_codepoint_bounded(64)
++        Error(_) -> string.trim(value) |> slice_codepoint_bounded(64)
+       }
+     Error(_) -> ""
+   }
+ }
+ 
+-/// User-Agent string truncated to 512 chars (matches the audit-table
++/// User-Agent string truncated to 512 characters (matches the
++/// `cookie_consent_log.user_agent` and `application.submitted_user_agent`
+ /// CHECK constraints). Returns "" when the header is absent.
+ pub fn client_user_agent(req: Request) -> String {
+   case request.get_header(req, "user-agent") {
+-    Ok(value) -> string.slice(value, 0, 512)
++    Ok(value) -> slice_codepoint_bounded(value, 512)
+     Error(_) -> ""
+   }
+ }
+ 
++/// Slices a string to at most `max` Unicode **codepoints**, never
++/// splitting a multi-byte character.
++///
++/// This is deliberately NOT `string.slice` (which counts graphemes):
++/// the DB CHECK constraints bound `length()` — Postgres character
++/// count — so a grapheme-bounded slice of a multi-codepoint header
++/// (ZWJ emoji, combining marks, flags) could exceed the bound and 500
++/// the write path. Codepoint slicing keeps the stored value within the
++/// CHECK bound for every input.
++///
++/// Two deliberate consequences:
++///
++/// - The cut may land mid-grapheme (e.g. 512 codepoints of a ZWJ
++///   family emoji leaves a dangling first member). Harmless — these
++///   values are stored for evidentiary/fraud comparisons, never
++///   displayed or parsed.
++/// - Headers are raw bytes; on a byte that is not a valid UTF-8
++///   codepoint the decoder stops and the remainder is dropped
++///   (truncation, not a crash). The value is then always valid UTF-8
++///   within the bound.
++fn slice_codepoint_bounded(value: String, max: Int) -> String {
++  value
++  |> string.to_utf_codepoints
++  |> list.take(max)
++  |> string.from_utf_codepoints
++}
++
+ /// Cross-site forgery guard for endpoints that intentionally skip CSRF
+ /// (currently just /api/v1/consent — anonymous /apply visitors don't
+ /// have a session credential to mint a CSRF token from). The skip is
+diff --git a/server/test/integration/consent_integration_test.gleam b/server/test/integration/consent_integration_test.gleam
+index 2f5087e8..32bb079b 100644
+--- a/server/test/integration/consent_integration_test.gleam
++++ b/server/test/integration/consent_integration_test.gleam
+@@ -320,6 +320,44 @@ pub fn long_ip_first_hop_is_truncated_test() {
+   len |> should.equal(64)
+ }
+ 
++// Multi-codepoint UA + XFF: each family-emoji grapheme is 7 codepoints,
++// so grapheme slicing (Gleam `string.slice`) can exceed the DB CHECK
++// character bound post-slice and drop the row. Codepoint slicing must
++// keep the stored values within the CHECK bounds — the row persists.
++// (refcheck rc1-1 deferred fix regression pin; same CHECK idiom as
++// payment_terms_acceptance and application.submitted_*.)
++pub fn multi_codepoint_headers_within_check_bounds_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++
++  let resp =
++    post_consent_with_xff(
++      db,
++      valid_body(),
++      string.repeat("👨‍👩‍👧‍👦", 100),
++      string.repeat("👨‍👩‍👧‍👦", 20) <> ", 10.0.0.1",
++    )
++  resp.status |> should.equal(204)
++
++  let ua_len =
++    test_db.query_int(
++      db,
++      "SELECT length(user_agent)::int FROM cookie_consent_log
++       ORDER BY created_at DESC LIMIT 1",
++    )
++    |> should.be_ok
++  ua_len |> should.equal(512)
++
++  let ip_len =
++    test_db.query_int(
++      db,
++      "SELECT length(ip_text)::int FROM cookie_consent_log
++       ORDER BY created_at DESC LIMIT 1",
++    )
++    |> should.be_ok
++  ip_len |> should.equal(64)
++}
++
+ // Missing required field — should 400, write nothing.
+ pub fn missing_field_rejected_test() {
+   use <- unitest.tag("integration")
+diff --git a/server/test/integration/gdpr_integration_test.gleam b/server/test/integration/gdpr_integration_test.gleam
+index 4f3f525f..8cf0faa1 100644
+--- a/server/test/integration/gdpr_integration_test.gleam
++++ b/server/test/integration/gdpr_integration_test.gleam
+@@ -2779,6 +2779,59 @@ pub fn apply_submission_overlong_headers_truncated_test() {
+   ua_len |> should.equal(512)
+ }
+ 
++/// Multi-codepoint headers: each family-emoji grapheme is 7 codepoints,
++/// so 100 graphemes = 700 characters by Postgres `length()`. Grapheme
++/// slicing (Gleam `string.slice`) would keep 512 graphemes = 3584
++/// characters past the 512 CHECK and 500 the write path; codepoint
++/// slicing must keep the stored value within the CHECK bound.
++/// (refcheck rc1-1 deferred fix regression pin.)
++pub fn apply_submission_multi_codepoint_headers_bounded_test() {
++  use <- unitest.tag("integration")
++  let db = setup()
++  let assert Ok(landlord_id) = test_db.seed_landlord(db, 3)
++  let assert Ok(vacancy_id) = test_db.seed_vacancy(db, landlord_id, True)
++  let short_code = fetch_vacancy_short_code(db, vacancy_id)
++  let email = "apply-ack-multicodepoint@example.com"
++
++  let values = apply_form_fixture_values(email: email, has_guarantor: False)
++  let file =
++    simulate.FileUpload(
++      file_name: "reference.pdf",
++      content_type: "application/pdf",
++      content: <<"%PDF-1.4 fake reference body":utf8>>,
++    )
++  // 100 family emoji = 100 graphemes = 700 codepoints for the UA; the
++  // XFF first hop is 20 emoji = 140 codepoints (past the 64 CHECK).
++  let resp =
++    simulate.request(http.Post, "/apply/" <> short_code)
++    |> simulate.multipart_body(values, [#("landlord_ref_primary", file)])
++    |> simulate.header(
++      "x-forwarded-for",
++      string.repeat("👨‍👩‍👧‍👦", 20) <> ", 10.0.0.1",
++    )
++    |> simulate.header("user-agent", string.repeat("👨‍👩‍👧‍👦", 100))
++    |> application_handler.handle_post_form(test_server_config(db), short_code)
++  resp.status |> should.equal(200)
++
++  let app_id = fetch_application_id_by_email(db, email)
++  let assert Ok(ip_len) =
++    test_db.query_int(
++      db,
++      "SELECT length(submitted_ip_text)::int FROM application WHERE id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  ip_len |> should.equal(64)
++  let assert Ok(ua_len) =
++    test_db.query_int(
++      db,
++      "SELECT length(submitted_user_agent)::int FROM application WHERE id = '"
++        <> app_id
++        <> "'::uuid",
++    )
++  ua_len |> should.equal(512)
++}
++
+ /// Retention sweep against a stub Supabase (empty url / key) enqueues
+ /// every document storage_path for later retry rather than silently
+ /// dropping them. Pins the storage_purge creds-missing fallback — a
+diff --git a/server/test/request_helpers_test.gleam b/server/test/request_helpers_test.gleam
+new file mode 100644
+index 00000000..163de27e
+--- /dev/null
++++ b/server/test/request_helpers_test.gleam
+@@ -0,0 +1,98 @@
++//// Unit tests for the shared request inspection helpers.
++////
++//// Pins the codepoint-bounded slicing contract (refcheck rc1-1
++//// deferred fix): the DB CHECK constraints bound Postgres `length()`
++//// (character/codepoint count), so slicing must be codepoint-bounded
++//// — never grapheme-bounded — or a multi-codepoint header (ZWJ emoji,
++//// combining marks, flags) can exceed the bound post-slice and 500
++//// the write path.
++
++import gleam/http
++import gleam/list
++import gleam/string
++import gleeunit/should
++import request_helpers
++import wisp/simulate
++
++fn codepoint_length(value: String) -> Int {
++  value |> string.to_utf_codepoints |> list.length
++}
++
++// A single grapheme that spans 7 codepoints (ZWJ family emoji). One
++// grapheme of this is already 7 characters by Postgres `length()`.
++const family_emoji = "👨‍👩‍👧‍👦"
++
++fn req_with_ua(ua: String) {
++  simulate.request(http.Get, "/")
++  |> simulate.header("user-agent", ua)
++}
++
++fn req_with_xff(xff: String) {
++  simulate.request(http.Get, "/")
++  |> simulate.header("x-forwarded-for", xff)
++}
++
++// The regression the deferred fix exists for: 100 family emoji is 100
++// graphemes but 700 codepoints. Grapheme slicing to 512 would keep
++// all 700 codepoints (512 graphemes of 7 codepoints = 3584) — well
++// past the 512-char CHECK. Codepoint slicing must cut at 512.
++pub fn user_agent_multi_codepoint_sliced_to_512_codepoints_test() {
++  let ua = string.repeat(family_emoji, 100)
++  // Sanity: this is 700 codepoints and only 100 graphemes — the bug's
++  // precondition (multi-codepoint graphemes).
++  codepoint_length(ua) |> should.equal(700)
++  string.length(ua) |> should.equal(100)
++
++  let sliced = request_helpers.client_user_agent(req_with_ua(ua))
++  codepoint_length(sliced) |> should.equal(512)
++}
++
++// ASCII is 1 codepoint per grapheme — codepoint slicing must be
++// byte-identical to the old grapheme slicing for the common case.
++pub fn user_agent_ascii_still_truncates_to_512_test() {
++  let ua = string.repeat("U", 600)
++  let sliced = request_helpers.client_user_agent(req_with_ua(ua))
++  sliced |> should.equal(string.repeat("U", 512))
++}
++
++pub fn user_agent_absent_header_returns_empty_test() {
++  let req = simulate.request(http.Get, "/")
++  request_helpers.client_user_agent(req) |> should.equal("")
++}
++
++// Multi-codepoint garbage in the XFF first hop must be bounded to 64
++// codepoints — same trap as the UA, at the ip_text CHECK bound.
++pub fn client_ip_multi_codepoint_sliced_to_64_codepoints_test() {
++  let xff = string.repeat(family_emoji, 20) <> ", 10.0.0.1"
++  // 20 graphemes = 140 codepoints, over the 64-char ip_text CHECK.
++  codepoint_length(xff) |> should.equal(150)
++
++  let sliced = request_helpers.client_ip(req_with_xff(xff))
++  codepoint_length(sliced) |> should.equal(64)
++}
++
++// ASCII XFF first hop: trim + first-entry-only + 64-char cap, exactly
++// as before the fix.
++pub fn client_ip_ascii_first_hop_bounded_to_64_test() {
++  let xff = string.repeat("9", 500) <> ", 10.0.0.1"
++  let sliced = request_helpers.client_ip(req_with_xff(xff))
++  sliced |> should.equal(string.repeat("9", 64))
++}
++
++pub fn client_ip_takes_first_entry_only_test() {
++  let req = req_with_xff("  203.0.113.42  , 10.0.0.1")
++  request_helpers.client_ip(req) |> should.equal("203.0.113.42")
++}
++
++pub fn client_ip_absent_header_returns_empty_test() {
++  let req = simulate.request(http.Get, "/")
++  request_helpers.client_ip(req) |> should.equal("")
++}
++
++// A multi-codepoint UA shorter than the bound passes through
++// untouched — slicing never mangles values that fit.
++pub fn user_agent_short_multi_codepoint_unchanged_test() {
++  let ua = string.repeat(family_emoji, 3) <> " Mozilla/5.0"
++  let sliced = request_helpers.client_user_agent(req_with_ua(ua))
++  sliced |> should.equal(ua)
++}

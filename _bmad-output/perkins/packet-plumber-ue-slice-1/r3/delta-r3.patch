@@ -1,0 +1,921 @@
+diff --git a/Config/DefaultEngine.ini b/Config/DefaultEngine.ini
+index a41ac2a..9c82a52 100644
+--- a/Config/DefaultEngine.ini
++++ b/Config/DefaultEngine.ini
+@@ -6,7 +6,15 @@
+ ; sim rate in PIE.
+ 
+ [/Script/Engine.Engine]
+-bUseFixedFrameRate=True
++; ODN-2 / UAD-2 (r2 decision): the SIM rate is 20 Hz, owned by the
++; FPPSimDriver accumulator (the sim never reads a clock — PP::Step takes
++; explicit integer ticks). The RENDER clock is NOT pinned to the sim rate:
++; bUseFixedFrameRate=False lets the view run at the display rate (60 fps)
++; so the snapshot interpolation + eased motion (UAD-22 axis 5) are actually
++; reachable — with the old True pin the whole game thread rendered at 20 fps
++; and the 20Hz->60fps easing was structurally unreachable. FixedFrameRate
++; stays as the documented sim-rate reference (the driver uses PP::kLogicHz).
++bUseFixedFrameRate=False
+ FixedFrameRate=20.000000
+ 
+ [/Script/EngineSettings.GameMapsSettings]
+diff --git a/Source/PacketPlumber/PPCommandBus.cpp b/Source/PacketPlumber/PPCommandBus.cpp
+index 73f34fa..63a26aa 100644
+--- a/Source/PacketPlumber/PPCommandBus.cpp
++++ b/Source/PacketPlumber/PPCommandBus.cpp
+@@ -29,7 +29,12 @@ bool FPPCommandBus::SnapToNode(const PP::FTopology &Topology, const FVector2D &S
+ 	// the view + ScreenToGrid use, and the true px distance is compared.
+ 	// (The fit is presentation math — the sim never sees it.)
+ 	const FPPScreenFit Fit = MakeScreenFit(ViewportSize);
+-	const float RadiusPx = static_cast<float>(PP::kSnapRadius);
++	// E4: the radius is in WORLD px (kSnapRadius — the map's coordinate
++	// space); the snap compares in SCREEN px, so the radius scales with the
++	// camera fit (r2 warning: the canon was compared unscaled — at the DPI
++	// 1.386 fit the effective snap was ~49 screen px instead of ~50; at the
++	// design fit it was ~33 instead of ~36 — small but a contract drift).
++	const float RadiusPx = static_cast<float>(PP::kSnapRadius) * Fit.Scale;
+ 
+ 	uint32_t Best = 0;
+ 	float BestD2 = TNumericLimits<float>::Max();
+diff --git a/Source/PacketPlumber/PPRunGameMode.cpp b/Source/PacketPlumber/PPRunGameMode.cpp
+index e085a24..c963d24 100644
+--- a/Source/PacketPlumber/PPRunGameMode.cpp
++++ b/Source/PacketPlumber/PPRunGameMode.cpp
+@@ -151,7 +151,6 @@ void APPRunGameMode::BeginDraw(const FVector2D &ScreenPos)
+ 		ViewportSize = FVector2D(static_cast<float>(VW), static_cast<float>(VH));
+ 	}
+ 	DragStartScreen = ScreenPos;
+-	DragStartGrid = MakeScreenFit(ViewportSize).ScreenToGrid(ScreenPos);
+ 	bDragging = true;
+ }
+ 
+@@ -191,7 +190,6 @@ void APPRunGameMode::EndDraw(const FVector2D &ScreenPos)
+ 		// apply via the live fast-path (validate-then-apply + log apply_tick=next)
+ 		const PP::FEditResult Result = CommandBus.DrawPipe(SimState, Intent);
+ 		LastEditError = Result.Error;
+-		bHasLastEditError = true;
+ 		// The edit lands in the topology immediately; the next Step picks it
+ 		// up (rebuild on gen change). The view refreshes on the next step.
+ 		if (Result.Error == PP::FEditError::None)
+diff --git a/Source/PacketPlumber/PPRunPlayerController.cpp b/Source/PacketPlumber/PPRunPlayerController.cpp
+index dc86ba6..02024a8 100644
+--- a/Source/PacketPlumber/PPRunPlayerController.cpp
++++ b/Source/PacketPlumber/PPRunPlayerController.cpp
+@@ -77,7 +77,10 @@ void APPRunPlayerController::OnDrawStart()
+ 	if (APPRunGameMode *GM = ResolveGameMode())
+ 	{
+ 		float X = 0.0f, Y = 0.0f;
+-		GetMousePosition(X, Y);
++		if (!GetMousePosition(X, Y))
++		{
++			return; // no cursor position this frame (r2 note: unchecked before)
++		}
+ 		GM->BeginDraw(FVector2D(X, Y));
+ 	}
+ }
+@@ -87,7 +90,10 @@ void APPRunPlayerController::OnDrawEnd()
+ 	if (APPRunGameMode *GM = ResolveGameMode())
+ 	{
+ 		float X = 0.0f, Y = 0.0f;
+-		GetMousePosition(X, Y);
++		if (!GetMousePosition(X, Y))
++		{
++			return; // no cursor position this frame
++		}
+ 		GM->EndDraw(FVector2D(X, Y));
+ 	}
+ }
+diff --git a/Source/PacketPlumber/PPRunView.cpp b/Source/PacketPlumber/PPRunView.cpp
+index b2d1afe..cae9460 100644
+--- a/Source/PacketPlumber/PPRunView.cpp
++++ b/Source/PacketPlumber/PPRunView.cpp
+@@ -10,6 +10,7 @@
+ #include "Components/TextBlock.h"
+ #include "Engine/GameViewportClient.h"
+ #include "PPRunGameMode.h"
++#include "PPViewGeometry.h"
+ #include "Styling/SlateBrush.h"
+ 
+ // FSlateRoundedBoxBrush (SlateCore) — rounded corners at any radius; with
+@@ -34,12 +35,6 @@ constexpr float kPacketDiameter = 10.0f;
+ constexpr float kTickInterval = 1.0f / PP::kLogicHz;
+ constexpr int32 kMaxPacketDots = 16; // UAD-8 dot pool cap (slice-1 scale)
+ 
+-// Ease-in-out cubic (MM-style motion feel; presentation-only, never sim).
+-float EaseInOut(float T)
+-{
+-	T = FMath::Clamp(T, 0.0f, 1.0f);
+-	return T < 0.5f ? 4.0f * T * T * T : 1.0f - FMath::Pow(-2.0f * T + 2.0f, 3.0f) / 2.0f;
+-}
+ } // namespace
+ 
+ UPPRunView::UPPRunView(const FObjectInitializer &ObjectInitializer) : Super(ObjectInitializer)
+@@ -138,8 +133,15 @@ UBorder *UPPRunView::MakeRoad(const FVector2D &FromScreen, const FVector2D &ToSc
+ 	UBorder *FillBorder = MakeRibbon(Width, Fill);
+ 
+ 	const FVector2D Center = (FromScreen + ToScreen) * 0.5f;
++	// The slot position is the TOP-LEFT of the widget's layout box. To place
++	// the box so its CENTER (the pivot the rotation uses) sits on the road
++	// midpoint, the anchor must be Center - (Length/2, boxHeight/2) — the r2
++	// blocker: it was Center - (Width/2, Width/2), which put the box center
++	// at Center + ((Length-Width)/2, 0) — every road shifted ~41px along its
++	// axis, disconnecting the roads from the node centers (pixel-proven in
++	// every committed frame).
+ 	UCanvasPanelSlot *CasingSlot = WorldCanvas->AddChildToCanvas(CasingBorder);
+-	CasingSlot->SetPosition(Center - FVector2D((Width + 4.0f) * 0.5f, (Width + 4.0f) * 0.5f));
++	CasingSlot->SetPosition(PPViewGeometry::RoadSlotTopLeft(Center, Length, Width + 4.0f));
+ 	CasingSlot->SetSize(FVector2D(Length, Width + 4.0f));
+ 	FWidgetTransform CasingT;
+ 	CasingT.Angle = Angle;
+@@ -150,7 +152,7 @@ UBorder *UPPRunView::MakeRoad(const FVector2D &FromScreen, const FVector2D &ToSc
+ 	CasingBorder->SetRenderTransformPivot(FVector2D(0.5f, 0.5f));
+ 
+ 	UCanvasPanelSlot *FillSlot = WorldCanvas->AddChildToCanvas(FillBorder);
+-	FillSlot->SetPosition(Center - FVector2D(Width * 0.5f, Width * 0.5f));
++	FillSlot->SetPosition(PPViewGeometry::RoadSlotTopLeft(Center, Length, Width));
+ 	FillSlot->SetSize(FVector2D(Length, Width));
+ 	FWidgetTransform FillT;
+ 	FillT.Angle = Angle;
+@@ -246,53 +248,6 @@ void UPPRunView::RefreshPipes()
+ 	}
+ }
+ 
+-// Packet display position in a given snapshot (the packet's OWN progress at
+-// that tick — looked up by id, so the prev/cur pair yields two positions on
+-// the same edge, which is what makes the inter-snapshot easing real).
+-// Pure function of the snapshot — the sim is never read.
+-FVector2D PacketPosIn(const PPView::FSnapshot &Snap, uint64_t PacketId)
+-{
+-	const PPView::FPacketView *Found = nullptr;
+-	for (const PPView::FPacketView &P : Snap.Packets)
+-	{
+-		if (P.Id == PacketId)
+-		{
+-			Found = &P;
+-			break;
+-		}
+-	}
+-	if (!Found)
+-	{
+-		return FVector2D::ZeroVector; // not in this snapshot (spawned/culled) — caller falls back
+-	}
+-	const PPView::FPacketView &P = *Found;
+-	FVector2D From = FVector2D::ZeroVector;
+-	FVector2D To = FVector2D::ZeroVector;
+-	bool bFrom = false, bTo = false;
+-	for (const PPView::FNodeView &Node : Snap.Nodes)
+-	{
+-		if (Node.Id == P.FromNode)
+-		{
+-			From = FVector2D(static_cast<float>(Node.Pos.X) + 0.5f, static_cast<float>(Node.Pos.Y) + 0.5f);
+-			bFrom = true;
+-		}
+-		if (Node.Id == P.ToNode)
+-		{
+-			To = FVector2D(static_cast<float>(Node.Pos.X) + 0.5f, static_cast<float>(Node.Pos.Y) + 0.5f);
+-			bTo = true;
+-		}
+-	}
+-	if (!bFrom)
+-	{
+-		return FVector2D::ZeroVector;
+-	}
+-	if (!bTo || P.FromNode == P.ToNode)
+-	{
+-		return From;
+-	}
+-	return FMath::Lerp(From, To, EaseInOut(P.Progress));
+-}
+-
+ void UPPRunView::RebuildDotPool()
+ {
+ 	// Pre-create the packet-dot POOL (UAD-8): runtime-added canvas children
+@@ -335,16 +290,21 @@ void UPPRunView::NativeTick(const FGeometry &MyGeometry, float InDeltaTime)
+ 	}
+ 
+ 	const PPView::FSnapshot &Next = GameMode->GetSnapshot();
+-	if (Next.Tick != CurSnapshot.Tick)
++	// Change detection keys on BOTH the tick AND the topology Gen — a draw
++	// applied via the live fast-path bumps Gen at the SAME tick (the r2
++	// warning: the view was Tick-keyed only, so the "appears this frame"
++	// promise was really ≤50 ms). A same-tick Gen change rebuilds the world
++	// without sliding the snapshot pair (the interp pair stays valid).
++	if (Next.Tick != CurSnapshot.Tick || Next.TopologyGen != CurSnapshot.TopologyGen)
+ 	{
+-		// a new sim tick landed: slide the pair. The STATIC world (nodes +
+-		// pipes) rebuilds ONLY when the topology changed (a drawn pipe — the
+-		// golden rule: view rebuilds are topology-scoped, never per-tick, so
+-		// packet dots persist across ticks).
+ 		const bool bTopologyChanged = Next.TopologyGen != CurSnapshot.TopologyGen;
+-		PrevSnapshot = CurSnapshot;
++		const bool bNewTick = Next.Tick != CurSnapshot.Tick;
++		if (bNewTick)
++		{
++			PrevSnapshot = CurSnapshot;
++			ElapsedSinceSnapshot = 0.0f;
++		}
+ 		CurSnapshot = Next;
+-		ElapsedSinceSnapshot = 0.0f;
+ 		if (bTopologyChanged)
+ 		{
+ 			ClearWorld();
+@@ -352,13 +312,16 @@ void UPPRunView::NativeTick(const FGeometry &MyGeometry, float InDeltaTime)
+ 			RefreshNodes();
+ 			RebuildDotPool(); // ClearWorld wiped it (the pool=0 bug)
+ 		}
+-		return;
++		if (bNewTick)
++		{
++			return; // the packet interp runs on same-tick frames only
++		}
+ 	}
+ 	ElapsedSinceSnapshot += InDeltaTime;
+ 
+ 	// eased inter-snapshot fraction (20 Hz sim -> 60 fps view)
+ 	const float Frac = FMath::Clamp(ElapsedSinceSnapshot / kTickInterval, 0.0f, 1.0f);
+-	const float Eased = EaseInOut(Frac);
++	const float Eased = PPViewGeometry::EaseInOut(Frac);
+ 
+ 	// packet dots: pool (UAD-8) keyed by packet id; position = lerp between
+ 	// the packet's position in the prev snapshot and the cur snapshot.
+@@ -399,9 +362,9 @@ void UPPRunView::NativeTick(const FGeometry &MyGeometry, float InDeltaTime)
+ 			// own progress per snapshot — the eased motion is real). A packet
+ 			// absent from the prev snapshot (just spawned) starts at its cur
+ 			// position — no glide from the canvas corner.
+-			const FVector2D ToGrid = PacketPosIn(CurSnapshot, Packet.Id);
+-			const bool bInPrev = PacketPosIn(PrevSnapshot, Packet.Id) != FVector2D::ZeroVector;
+-			const FVector2D FromGrid = bInPrev ? PacketPosIn(PrevSnapshot, Packet.Id) : ToGrid;
++			const FVector2D ToGrid = PPViewGeometry::PacketGridPos(CurSnapshot, Packet.Id);
++			const bool bInPrev = PPViewGeometry::PacketGridPos(PrevSnapshot, Packet.Id) != FVector2D::ZeroVector;
++			const FVector2D FromGrid = bInPrev ? PPViewGeometry::PacketGridPos(PrevSnapshot, Packet.Id) : ToGrid;
+ 			// ease across BOTH the inter-snapshot fraction AND the edge
+ 			// progress (MM-style ease-in-out; arrival settle = the ease-out
+ 			// half of the edge interpolation)
+diff --git a/Source/PacketPlumber/Public/PPCommandBus.h b/Source/PacketPlumber/Public/PPCommandBus.h
+index 74077d3..4764021 100644
+--- a/Source/PacketPlumber/Public/PPCommandBus.h
++++ b/Source/PacketPlumber/Public/PPCommandBus.h
+@@ -74,7 +74,7 @@ struct FDrawIntent
+ 	uint32_t EndNode = 0; // snapped node id (valid when bEndOnNode)
+ };
+ 
+-class FPPCommandBus
++class PACKETPLUMBER_API FPPCommandBus
+ {
+   public:
+ 	// Build + apply a draw command from a drag intent. Returns the edit
+diff --git a/Source/PacketPlumber/Public/PPRunGameMode.h b/Source/PacketPlumber/Public/PPRunGameMode.h
+index ed4cb8b..d660d8a 100644
+--- a/Source/PacketPlumber/Public/PPRunGameMode.h
++++ b/Source/PacketPlumber/Public/PPRunGameMode.h
+@@ -50,12 +50,6 @@ class PACKETPLUMBER_API APPRunGameMode : public AGameModeBase
+ 		return PrevSnapshot;
+ 	}
+ 
+-	// --- the command bus (Enhanced Input routes drags here) ---
+-	FPPCommandBus &GetCommandBus()
+-	{
+-		return CommandBus;
+-	}
+-
+ 	// Test seam (PacketPlumber.Input.*): the sim state + the last edit
+ 	// result, read-only.
+ 	const PP::FSimState &GetSimStateForTest() const
+@@ -97,12 +91,10 @@ class PACKETPLUMBER_API APPRunGameMode : public AGameModeBase
+ 
+ 	// pending drag
+ 	bool bDragging = false;
+-	FVector2D DragStartScreen = FVector2D::ZeroVector; // E4 snap is screen-space
+-	PP::FIntPoint DragStartGrid;
++	FVector2D DragStartScreen = FVector2D::ZeroVector;	 // E4 snap is screen-space
+ 	FVector2D ViewportSize = FVector2D(1280.0f, 720.0f); // refreshed from the PC; design-ref default
+-	// the last edit result, for the status line (rejection feedback)
++	// the last edit result (the input test reads it; rejection UI is [LATER])
+ 	PP::FEditError LastEditError = PP::FEditError::None;
+-	bool bHasLastEditError = false;
+ 
+ 	UPROPERTY()
+ 	TObjectPtr<UPPRunView> RunView = nullptr;
+diff --git a/Source/PacketPlumber/Public/PPRunView.h b/Source/PacketPlumber/Public/PPRunView.h
+index a18d0fa..7b2a460 100644
+--- a/Source/PacketPlumber/Public/PPRunView.h
++++ b/Source/PacketPlumber/Public/PPRunView.h
+@@ -16,7 +16,7 @@
+ //   Router node   #A8A29A  warm gray
+ //   Sink node     #7FA6C9  muted blue
+ //   Packet dot    #3E7CB1  blue dot
+-//   Shadow        black @ 12% alpha, soft blob
++//   Shadow        black @ 14% alpha, soft blob
+ #pragma once
+ 
+ #include "Blueprint/UserWidget.h"
+diff --git a/Source/PacketPlumber/Public/PPSimDriver.h b/Source/PacketPlumber/Public/PPSimDriver.h
+index e2af0a3..9e09de5 100644
+--- a/Source/PacketPlumber/Public/PPSimDriver.h
++++ b/Source/PacketPlumber/Public/PPSimDriver.h
+@@ -35,9 +35,18 @@ class FPPSimDriver
+ 		const uint64_t TargetTick =
+ 			static_cast<uint64_t>(FMath::FloorToDouble(static_cast<double>(AccumulatedSeconds) * SimHz));
+ 		int32 Stepped = 0;
+-		while (State.Tick < TargetTick)
++		while (State.Tick < TargetTick && !State.bTerminal)
+ 		{
++			// the terminal barrier (E17) freezes the run — Step returns
++			// without advancing, so the loop MUST also stop (r2 warning: a
++			// terminal run infinite-looped here; story 1.4's game-over will
++			// hit it).
++			const uint64_t Before = State.Tick;
+ 			PP::Step(State, State.Tick + 1);
++			if (State.Tick == Before)
++			{
++				break; // defensive: a step that didn't advance must not spin
++			}
+ 			++Stepped;
+ 		}
+ 		return Stepped;
+@@ -49,11 +58,6 @@ class FPPSimDriver
+ 		AccumulatedSeconds = 0.0f;
+ 	}
+ 
+-	float GetAccumulatedSeconds() const
+-	{
+-		return AccumulatedSeconds;
+-	}
+-
+   private:
+ 	// The fixed sim rate (ODN-2, pinned in Config/DefaultEngine.ini + PP_Balance.h).
+ 	static constexpr float SimHz = static_cast<float>(PP::kLogicHz);
+diff --git a/Source/PacketPlumber/Public/PPViewGeometry.h b/Source/PacketPlumber/Public/PPViewGeometry.h
+new file mode 100644
+index 0000000..7ae0f08
+--- /dev/null
++++ b/Source/PacketPlumber/Public/PPViewGeometry.h
+@@ -0,0 +1,101 @@
++// PPViewGeometry.h — the view's pure geometry math, extracted for tests
++// (r2 warning: UPPRunView had zero automation coverage — the road-anchor and
++// dot-offset regressions shipped because the math was inline in the widget).
++//
++// Everything here is a pure function of its inputs (no widget state): the
++// fit mapping, the road ribbon's slot anchor, and the packet's grid
++// position. The view calls these; the PacketPlumber.View.Geometry test
++// pins them — a regression in any of the r2 geometry bugs (road anchor,
++// dot +0.5 double-shift) fails the suite before a single frame is captured.
++#pragma once
++
++#include "CoreMinimal.h"
++
++#include "PPCommandBus.h" // FPPScreenFit
++#include "PPViewSnapshot.h"
++
++namespace PPViewGeometry
++{
++
++// MM-style cubic ease-in-out (presentation-only, never sim state).
++inline float EaseInOut(float T)
++{
++	T = FMath::Clamp(T, 0.0f, 1.0f);
++	return T < 0.5f ? 4.0f * T * T * T : 1.0f - FMath::Pow(-2.0f * T + 2.0f, 3.0f) / 2.0f;
++}
++
++// The road ribbon's CanvasPanelSlot top-left anchor. The slot position is
++// the TOP-LEFT of the widget's layout box; the box must be placed so its
++// CENTER (the pivot the UMG rotation uses) sits on the road midpoint. For a
++// box of (Length, BoxHeight) that is Center - (Length/2, BoxHeight/2).
++// (r2 blocker: the view anchored with Width/2 on the length axis, shifting
++// every road ~(Length-Width)/2 along its axis, disconnecting roads from
++// nodes.)
++inline FVector2D RoadSlotTopLeft(const FVector2D &Center, float Length, float BoxHeight)
++{
++	return Center - FVector2D(Length * 0.5f, BoxHeight * 0.5f);
++}
++
++// The fill ribbon's box height for a road of the given width (the casing is
++// BoxHeight = Width + 2*CasingThickness; the fill is the width itself).
++inline float RoadFillHeight(float Width)
++{
++	return Width;
++}
++
++inline float RoadCasingHeight(float Width, float CasingThickness)
++{
++	return Width + 2.0f * CasingThickness;
++}
++
++// The packet's display position in GRID coordinates (raw — the +0.5
++// tile-center offset belongs to the fit mapping, applied exactly ONCE by
++// GridToScreenV; r2 warning: the view baked +0.5 in here AND the fit added
++// it again, so the dot rode half a tile off the road). Pure function of the
++// snapshot — the sim is never read.
++inline FVector2D PacketGridPos(const PPView::FSnapshot &Snap, uint64_t PacketId)
++{
++	const PPView::FPacketView *Found = nullptr;
++	for (const PPView::FPacketView &P : Snap.Packets)
++	{
++		if (P.Id == PacketId)
++		{
++			Found = &P;
++			break;
++		}
++	}
++	if (!Found)
++	{
++		return FVector2D::ZeroVector; // not in this snapshot (spawned/culled)
++	}
++	const PPView::FPacketView &P = *Found;
++	FVector2D From = FVector2D::ZeroVector;
++	FVector2D To = FVector2D::ZeroVector;
++	bool bFrom = false, bTo = false;
++	for (const PPView::FNodeView &Node : Snap.Nodes)
++	{
++		if (Node.Id == P.FromNode)
++		{
++			From = FVector2D(static_cast<float>(Node.Pos.X), static_cast<float>(Node.Pos.Y));
++			bFrom = true;
++		}
++		if (Node.Id == P.ToNode)
++		{
++			To = FVector2D(static_cast<float>(Node.Pos.X), static_cast<float>(Node.Pos.Y));
++			bTo = true;
++		}
++	}
++	if (!bFrom)
++	{
++		return FVector2D::ZeroVector;
++	}
++	if (!bTo || P.FromNode == P.ToNode)
++	{
++		return From;
++	}
++	// EASE the edge progress (the MM arrival-settle feel) — the caller
++	// composes this with the inter-snapshot fraction.
++	return FMath::Lerp(From, To, EaseInOut(P.Progress));
++}
++
++} // namespace PPViewGeometry
+diff --git a/Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h b/Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h
+index 356a2bc..421cb61 100644
+--- a/Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h
++++ b/Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h
+@@ -65,13 +65,14 @@ inline void Step(FSimState &State, uint64_t Tick, const FCommand *Commands = nul
+ 	{
+ 		return;
+ 	}
+-	// Same-tick re-step guard (r1 warning): a backward tick latches, but an
++	// Same-tick re-step guard (r1 + r2): a backward tick latches, but an
+ 	// EQUAL tick silently re-applied commands / double-spawned demand /
+-	// redrew the nonce — the contract was asymmetric. A same-tick re-step
+-	// WITH commands is a replay divergence (the commands were already applied
+-	// at this tick); latch it. A bare same-tick re-step (no commands) is
+-	// deliberately allowed — the step_once test convention re-steps tick 1.
+-	if (Tick == State.Tick && NumCommands > 0)
++	// redrew the nonce / re-ran the flow — the contract was asymmetric and a
++	// bare re-step was STILL state-mutating (r2: the flow's spawn pass is not
++	// idempotent — a same-tick re-step double-spawns). ANY same-tick re-step
++	// is a caller divergence: latch, never silent. (The step_once convention
++	// the Odin allowed is not used here — StepScenario always steps forward.)
++	if (Tick == State.Tick)
+ 	{
+ 		State.ReplayError = true;
+ 		return;
+diff --git a/Source/PacketPlumberCoreTests/PPViewGeometryTests.cpp b/Source/PacketPlumberCoreTests/PPViewGeometryTests.cpp
+new file mode 100644
+index 0000000..54bec4a
+--- /dev/null
++++ b/Source/PacketPlumberCoreTests/PPViewGeometryTests.cpp
+@@ -0,0 +1,144 @@
++// PPViewGeometryTests.cpp — the view's pure geometry math, pinned (r2 warning
++// 9: UPPRunView had zero automation coverage — the road-anchor and dot-offset
++// regressions shipped because the math was inline in the widget).
++//
++// Covers the r2 blocker + warnings at the math layer:
++//  - the road ribbon's slot anchor places the box center on the road midpoint
++//    (the r2 blocker: anchored with Width/2 on the length axis, every road
++//    shifted ~(Length-Width)/2 along its axis, disconnecting roads from nodes)
++//  - the fit mapping adds the +0.5 tile-center offset EXACTLY ONCE (the r2
++//    warning: PacketPosIn baked +0.5 in AND the fit added it again — the dot
++//    rode half a tile off the road)
++//  - the packet's grid position rides the edge at eased progress
++//  - the E4 snap radius scales with the camera fit (world-px canon)
++#include "Misc/AutomationTest.h"
++
++#include "PacketPlumberCore/PP_Sim.h"
++#include "PPCommandBus.h"
++#include "PPViewGeometry.h"
++
++#if WITH_DEV_AUTOMATION_TESTS
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPViewRoadAnchor, "PacketPlumber.View.RoadAnchor",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPViewRoadAnchor::RunTest(const FString &Parameters)
++{
++	// The r2 blocker: a road from A to B must have its rendered center at the
++	// midpoint AND its endpoints at the node centers. The slot anchor is the
++	// box top-left; Center - (Length/2, Height/2) places the box center on
++	// the midpoint.
++	const FVector2D A(100.f, 100.f);
++	const FVector2D B(300.f, 100.f); // horizontal road, length 200
++	const FVector2D Center = (A + B) * 0.5f;
++	const float Width = 14.f;
++
++	// fill box: size (Length, Width) anchored at Center - (L/2, W/2) -> box
++	// center at Center (the rotation pivot sits on the road midpoint).
++	const FVector2D FillTopLeft = PPViewGeometry::RoadSlotTopLeft(Center, 200.f, Width);
++	TestTrue(TEXT("fill anchor x = Center.X - Length/2"), FMath::IsNearlyEqual(FillTopLeft.X, Center.X - 100.f));
++	TestTrue(TEXT("fill anchor y = Center.Y - Width/2"), FMath::IsNearlyEqual(FillTopLeft.Y, Center.Y - 7.f));
++	const FVector2D FillBoxCenter = FillTopLeft + FVector2D(100.f, 7.f);
++	TestTrue(TEXT("fill box center must sit on the road midpoint"), FillBoxCenter.Equals(Center, 0.01f));
++	// the box spans A..B -> the road's rendered endpoints ARE the node centers
++	TestTrue(TEXT("fill box left edge = node A"), FMath::IsNearlyEqual(FillTopLeft.X, A.X));
++	TestTrue(TEXT("fill box right edge = node B"), FMath::IsNearlyEqual(FillTopLeft.X + 200.f, B.X));
++
++	// casing box: (Length, Width+4) anchored the same way
++	const float CasingH = PPViewGeometry::RoadCasingHeight(Width, 2.f);
++	TestTrue(TEXT("casing height = width + 2*casing"), FMath::IsNearlyEqual(CasingH, 18.f));
++	const FVector2D CasingTopLeft = PPViewGeometry::RoadSlotTopLeft(Center, 200.f, CasingH);
++	TestTrue(TEXT("casing box center must sit on the road midpoint"),
++			 (CasingTopLeft + FVector2D(100.f, CasingH * 0.5f)).Equals(Center, 0.01f));
++
++	// a DIAGONAL road (the pivot rotation case): the box center must be the
++	// midpoint regardless of the angle.
++	const FVector2D C(0.f, 0.f);
++	const FVector2D D(80.f, 60.f); // length 100
++	const FVector2D DiagCenter = (C + D) * 0.5f;
++	const FVector2D DiagTopLeft = PPViewGeometry::RoadSlotTopLeft(DiagCenter, 100.f, Width);
++	TestTrue(TEXT("diagonal road: box center on the midpoint"),
++			 (DiagTopLeft + FVector2D(50.f, Width * 0.5f)).Equals(DiagCenter, 0.01f));
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPViewDotOnRoad, "PacketPlumber.View.DotOnRoad",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPViewDotOnRoad::RunTest(const FString &Parameters)
++{
++	// The r2 warning: the dot rode half a tile off the road because the
++	// position math added the +0.5 tile-center offset twice (once in the
++	// packet position, once in the fit mapping). The fit mapping adds it
++	// EXACTLY ONCE — a packet mid-edge must land ON the road between the two
++	// node centers.
++	const FPPScreenFit Fit = MakeScreenFit(FVector2D(1280.f, 720.f)); // scale 0.9231, offset (160,0)
++
++	// a snapshot: nodes at grid (2,2) and (6,2), a packet half-way along
++	PPView::FSnapshot Snap;
++	Snap.Tick = 1;
++	PPView::FNodeView N0;
++	N0.Id = 0;
++	N0.Pos = PP::FIntPoint{2, 2};
++	Snap.Nodes.Add(N0);
++	PPView::FNodeView N1;
++	N1.Id = 1;
++	N1.Pos = PP::FIntPoint{6, 2};
++	Snap.Nodes.Add(N1);
++	PPView::FPacketView P;
++	P.Id = 7;
++	P.FromNode = 0;
++	P.ToNode = 1;
++	P.Progress = 0.5f;
++	P.bOnEdge = true;
++	Snap.Packets.Add(P);
++
++	const FVector2D GridPos = PPViewGeometry::PacketGridPos(Snap, 7);
++	TestTrue(TEXT("packet grid pos must be the edge midpoint (4,2)"), GridPos.Equals(FVector2D(4.f, 2.f), 0.001f));
++
++	// screen space: the dot must sit ON the road segment between the nodes
++	const FVector2D DotScreen = Fit.GridToScreenV(GridPos);
++	const FVector2D N0Screen = Fit.GridToScreen(N0.Pos);
++	const FVector2D N1Screen = Fit.GridToScreen(N1.Pos);
++	TestTrue(TEXT("dot screen x must be between the nodes"), DotScreen.X > N0Screen.X && DotScreen.X < N1Screen.X);
++	TestTrue(TEXT("dot screen x must be the midpoint of the node centers"),
++			 FMath::IsNearlyEqual(DotScreen.X, (N0Screen.X + N1Screen.X) * 0.5f, 0.5f));
++	TestTrue(TEXT("dot screen y must equal the road row (both nodes at y=2)"),
++			 FMath::IsNearlyEqual(DotScreen.Y, N0Screen.Y, 0.5f));
++
++	// a packet absent from the snapshot -> zero (the caller falls back)
++	TestTrue(TEXT("absent packet must yield zero"), PPViewGeometry::PacketGridPos(Snap, 999) == FVector2D::ZeroVector);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPViewSnapScale, "PacketPlumber.View.SnapRadiusScale",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPViewSnapScale::RunTest(const FString &Parameters)
++{
++	// E4: the snap radius is in WORLD px (kSnapRadius); the snap compares in
++	// SCREEN px, so the radius scales with the camera fit (r2 warning 3).
++	// At the 1280x720 design fit (scale 0.9231) the screen radius is ~33 px.
++	const FPPScreenFit Fit = MakeScreenFit(FVector2D(1280.f, 720.f));
++	TestTrue(TEXT("design-fit snap radius must scale to ~33 screen px"),
++			 FMath::IsNearlyEqual(static_cast<float>(PP::kSnapRadius) * Fit.Scale, 33.23f, 0.1f));
++
++	// A node at grid (2,2): its screen center; a point 30 screen px away is
++	// INSIDE the scaled radius; 40 px away is OUTSIDE.
++	PP::FTopology Topo;
++	PP::SpawnNode(Topo, PP::FNodeKind::Terminal, 2, 2);
++	const FVector2D NodeScreen = Fit.GridToScreen(PP::FIntPoint{2, 2});
++
++	uint32_t Hit = 0;
++	const bool bIn = FPPCommandBus::SnapToNode(Topo, NodeScreen + FVector2D(30.f, 0.f), FVector2D(1280.f, 720.f), Hit);
++	TestTrue(TEXT("30 px from the node center must snap (inside the scaled radius)"), bIn);
++	TestEqual(TEXT("the snapped node must be the terminal"), Hit, 0u);
++
++	uint32_t Hit2 = 0;
++	const bool bOut =
++		FPPCommandBus::SnapToNode(Topo, NodeScreen + FVector2D(40.f, 0.f), FVector2D(1280.f, 720.f), Hit2);
++	TestTrue(TEXT("40 px from the node center must NOT snap (outside the scaled radius)"), !bOut);
++	return true;
++}
++
++#endif // WITH_DEV_AUTOMATION_TESTS
+diff --git a/Source/PacketPlumberEditor/PPProbeCommandlet.cpp b/Source/PacketPlumberEditor/PPProbeCommandlet.cpp
+index b86e905..ea578a0 100644
+--- a/Source/PacketPlumberEditor/PPProbeCommandlet.cpp
++++ b/Source/PacketPlumberEditor/PPProbeCommandlet.cpp
+@@ -107,7 +107,12 @@ int32 UPPProbeCommandlet::Main(const FString &Params)
+ 				{
+ 					ReachablePairs += 1;
+ 					TotalHops += static_cast<int32>(Rt.HopCount[Idx]);
+-					FString Line = FString::Printf(TEXT("  routing[%u -> %u]: "), From, Dst);
++					// NODE IDs in the labels (the table indexes by SLOT — r2
++					// note: the dump mixed slot indices and node ids; the
++					// reader must not have to know the table's layout).
++					const uint32_t FromId = State.Topology.NodeId[From];
++					const uint32_t DstId = State.Topology.NodeId[Dst];
++					FString Line = FString::Printf(TEXT("  routing[node%u -> node%u]: "), FromId, DstId);
+ 					for (uint32_t K = 0; K < Rt.HopCount[Idx]; ++K)
+ 					{
+ 						const PP::FHop &H = Rt.Hops[Rt.HopOffset[Idx] + K];
+@@ -128,13 +133,18 @@ int32 UPPProbeCommandlet::Main(const FString &Params)
+ 	{
+ 		const FString Json = FString::Printf(
+ 			TEXT("{\"seed\":%llu,\"ticks\":%d,\"tick_nonce\":%u,\"state_hash\":\"%016llx\",\"rng_first4\":[%u,%u,%u,%u]"
+-				 ",\"save_magic\":\"PPUE\",\"save_version\":2,\"catalog_hash\":\"%016llx\""
++				 ",\"save_magic\":\"PPUE\",\"save_version\":%u,\"catalog_hash\":\"%016llx\""
+ 				 ",\"topology_summary\":{\"nodes\":%d,\"pipes\":%d,\"gen\":%u}"
+ 				 ",\"forwarding_summary\":{\"reachable_pairs\":%d,\"total_hops\":%d}"
+ 				 ",\"flow_summary\":{\"spawned\":%d,\"delivered\":%d,\"live\":%d,\"score\":%d}}\n"),
+ 			Seed, Ticks, State.TickNonce, Hash, FirstOutputs[0], FirstOutputs[1], FirstOutputs[2], FirstOutputs[3],
+-			State.CatalogHash, PP::NodeCount(State.Topology), PP::PipeCount(State.Topology), State.Topology.Gen,
+-			ReachablePairs, TotalHops, static_cast<int32>(State.Flow.Demand.size()), State.Score,
++			PP::SAVE_VERSION, State.CatalogHash, PP::NodeCount(State.Topology), PP::PipeCount(State.Topology),
++			State.Topology.Gen, ReachablePairs, TotalHops,
++			// spawned = delivered + live (the SAME formula as the spine-check
++			// writer — r2 warning: this writer used Demand.size(), which
++			// counts demand ENTRIES, not constructed packets; the two writers
++			// must agree on every key, per SCHEMA.md).
++			State.Score + static_cast<int32>(State.Flow.Packets.size()), State.Score,
+ 			static_cast<int32>(State.Flow.Packets.size()), State.Score);
+ 
+ 		if (!FFileHelper::SaveStringToFile(Json, *FPaths::ConvertRelativePathToFull(JsonPath)))
+diff --git a/docs/goldens/SCHEMA.md b/docs/goldens/SCHEMA.md
+index 58a85ae..2132d2f 100644
+--- a/docs/goldens/SCHEMA.md
++++ b/docs/goldens/SCHEMA.md
+@@ -42,7 +42,7 @@ byte-exact through the re-bless.
+ | `topology_summary.gen` | u32 | the Topology.Gen after the run (every spawn/draw bumps it — the rule-1 rebuild trigger) |
+ | `forwarding_summary.reachable_pairs` | int | (from,dst) slots with ≥1 equal-cost next hop in the final routing table |
+ | `forwarding_summary.total_hops` | int | Σ hop counts over the table (ECMP set sizes) |
+-| `flow_summary.spawned` | int | demand entries fired (packets constructed) |
++| `flow_summary.spawned` | int | packets constructed = delivered + live (the SAME formula on both golden writers — the r2 warning: PPProbe used Demand.size(), which counts demand ENTRIES; unified to delivered + live) |
+ | `flow_summary.delivered` | int | packets delivered at the sink |
+ | `flow_summary.live` | int | in-flight packets at the final tick |
+ | `flow_summary.score` | int | the run score (delivered count — the 1.4 win metric) |
+diff --git a/docs/goldens/screens/slice1-2-drawn-pipe.png b/docs/goldens/screens/slice1-2-drawn-pipe.png
+index 483659c..eb80990 100644
+Binary files a/docs/goldens/screens/slice1-2-drawn-pipe.png and b/docs/goldens/screens/slice1-2-drawn-pipe.png differ
+diff --git a/docs/goldens/screens/slice1-3-packet-mid-traversal.png b/docs/goldens/screens/slice1-3-packet-mid-traversal.png
+index ccdd765..7b52d8b 100644
+Binary files a/docs/goldens/screens/slice1-3-packet-mid-traversal.png and b/docs/goldens/screens/slice1-3-packet-mid-traversal.png differ
+diff --git a/docs/timings.md b/docs/timings.md
+index fcb23af..1ba467b 100644
+--- a/docs/timings.md
++++ b/docs/timings.md
+@@ -91,3 +91,10 @@
+ 2026-08-21T12:41:27	gate 5	ENGINE:Headless automation tests (PacketPlumber.* filter)	PASS	20s
+ 2026-08-21T12:41:58	gate 6	ENGINE:PPProbe commandlet (headless spine probe + negative-args leg)	PASS	31s
+ 2026-08-21T12:42:00	gate 7	ENGINE:Golden compare (PPProbe vs standalone vs docs/goldens/ + mismatch self-test)	PASS	2s
++2026-08-21T15:26:28	gate 1	Format (clang-format --dry-run on Source/)	PASS	1s
++2026-08-21T15:26:29	gate 2	Spine standalone check (ODN-9/11 conformance, no engine)	PASS	1s
++2026-08-21T15:26:29	gate 3	Project static checks (uproject JSON, module/target presence, script syntax)	PASS	0s
++2026-08-21T15:26:32	gate 4	ENGINE:UBT build (Development Editor)	PASS	3s
++2026-08-21T15:26:50	gate 5	ENGINE:Headless automation tests (PacketPlumber.* filter)	PASS	18s
++2026-08-21T15:27:22	gate 6	ENGINE:PPProbe commandlet (headless spine probe + negative-args leg)	PASS	32s
++2026-08-21T15:27:24	gate 7	ENGINE:Golden compare (PPProbe vs standalone vs docs/goldens/ + mismatch self-test)	PASS	2s
+diff --git a/scripts/static-check.py b/scripts/static-check.py
+old mode 100755
+new mode 100644
+index f431b79..0f5ee29
+--- a/scripts/static-check.py
++++ b/scripts/static-check.py
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python3
++#!/ usr / bin / env python3
+ """scripts/static-check.py — project static checks (gate 3, no engine).
+ 
+ Verifies what CAN be verified without the engine, so the pre-engine CI loop
+@@ -27,7 +27,7 @@ def check(cond: bool, msg: str) -> None:
+ 
+ 
+ def main() -> int:
+-    # 1. uproject JSON + expected shape
++# 1. uproject JSON + expected shape
+     uproj = json.loads((ROOT / "PacketPlumberUE.uproject").read_text())
+     modules = {m["Name"] for m in uproj.get("Modules", [])}
+     expected_modules = {"PacketPlumberCore", "PacketPlumber", "PacketPlumberCoreTests", "PacketPlumberEditor"}
+@@ -36,25 +36,25 @@ def main() -> int:
+     check(plugins.get("ModelContextProtocol") is True, "ModelContextProtocol plugin must be enabled")
+     check(plugins.get("PythonScriptPlugin") is True, "PythonScriptPlugin plugin must be enabled")
+ 
+-    # 2. each module has Build.cs + a source cpp
++# 2. each module has Build.cs + a source cpp
+     for name in modules:
+         check((ROOT / "Source" / name / f"{name}.Build.cs").is_file(), f"{name}.Build.cs missing")
+         cpps = list((ROOT / "Source" / name).glob("*.cpp"))
+         check(len(cpps) > 0, f"no .cpp in Source/{name}")
+ 
+-    # 3. targets reference existing modules
++# 3. targets reference existing modules
+     for t in ["PacketPlumber.Target.cs", "PacketPlumberEditor.Target.cs"]:
+         text = (ROOT / "Source" / t).read_text()
+         for m in ["PacketPlumber", "PacketPlumberEditor", "PacketPlumberCoreTests"]:
+             if m in text:
+                 check(m in modules, f"{t} references {m} but it is not in the uproject")
+ 
+-    # 4. script syntax
++# 4. script syntax
+     for sh in sorted((ROOT / "scripts").glob("*.sh")):
+         r = subprocess.run(["bash", "-n", str(sh)], capture_output=True, text=True)
+         check(r.returncode == 0, f"bash -n failed on {sh.name}: {r.stderr.strip()}")
+ 
+-    # 5. CRLF scan on tracked text files (best-effort: git tracked only)
++# 5. CRLF scan on tracked text files(best - effort : git tracked only)
+     r = subprocess.run(["git", "ls-files"], capture_output=True, text=True, cwd=ROOT)
+     check(r.returncode == 0, f"git ls-files failed: {r.stderr.strip()}")
+     for rel in r.stdout.splitlines():
+@@ -64,8 +64,8 @@ def main() -> int:
+         if b"\r\n" in data:
+             check(False, f"CRLF in {rel}")
+ 
+-    # 6. ODN-2 fixed 20 Hz tick pinned in DefaultEngine.ini (engine-free
+-    #    assertion of the sim-rate pin; the presentation side is engine-gated).
++# 6. ODN - 2 fixed 20 Hz tick pinned in DefaultEngine.ini(engine - free
++#assertion of the sim - rate pin; the presentation side is engine - gated).
+     ini = (ROOT / "Config" / "DefaultEngine.ini").read_text()
+     section = None
+     ini_kv = {}
+@@ -79,10 +79,15 @@ def main() -> int:
+         if section is None or "=" not in line:
+             continue
+         ini_kv[f"{section}.{line.split('=', 1)[0].strip()}"] = line.split("=", 1)[1].strip()
+-    check(ini_kv.get("/Script/Engine.Engine.bUseFixedFrameRate", "").lower() == "true",
+-        "bUseFixedFrameRate must be True (ODN-2 fixed tick)")
++#ODN - 2 / UAD - 2(r2 decision) : the SIM rate is 20 Hz — owned by the
++#FPPSimDriver accumulator, NOT by the engine's fixed-frame-rate pin (the
++#sim never reads a clock).bUseFixedFrameRate must be False so the view
++#renders at the display rate(60 fps — the UAD - 22 eased interpolation
++#needs it); FixedFrameRate stays as the documented sim - rate reference.
++    check(ini_kv.get("/Script/Engine.Engine.bUseFixedFrameRate", "").lower() == "false",
++        "bUseFixedFrameRate must be False (UAD-2: the sim rate is the driver accumulator's; the render runs at display rate)")
+     check(ini_kv.get("/Script/Engine.Engine.FixedFrameRate", "") == "20.000000",
+-        "FixedFrameRate must be 20.000000 (ODN-2 fixed tick)")
++        "FixedFrameRate must be 20.000000 (the documented ODN-2 sim rate)")
+ 
+     if FAIL:
+         print(f"\nstatic-check: {len(FAIL)} failure(s)")
+diff --git a/scripts/verify-capture-geometry.py b/scripts/verify-capture-geometry.py
+new file mode 100644
+index 0000000..96c4cda
+--- /dev/null
++++ b/scripts/verify-capture-geometry.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++"""scripts/verify-capture-geometry.py — the capture-pipeline geometry gate.
++
++Verifies a committed T2 frame's geometry (Perkins r2: "add an
++endpoint-vs-node-center geometric check to the capture pipeline"). For the
++slice-1 fixture (3 nodes in a row), the check proves the RENDERED roads
++connect the RENDERED node centers:
++
++  1. locate the amber source + blue sink discs (the terminal colors),
++  2. locate the white road runs on the node row,
++  3. assert the roads' outer caps emerge from the node disc edges (the discs
++     are drawn OVER the road ends, so the road must appear within
++     disc_radius + road_cap of each node center — NOT offset by ~41px as in
++     the r2 road-anchor bug),
++  4. assert the dot (packet-blue) rides the road row (the r2 +0.5 bug made
++     it ride half a tile below).
++
++Exit 0 = the frame's geometry is connected; nonzero = a defect (a regression
++like the r2 road anchor fails here before any human eye is needed).
++"""
++import sys
++from pathlib import Path
++
++from PIL import Image
++
++# Canon palette (view-layer tokens — the capture renders them near-exact)
++AMBER = (245, 208, 133)
++BLUE = (185, 210, 229)
++DOT = (134, 183, 216)
++WHITE = (255, 255, 255)
++# the road-anchor bug shifted roads by ~(Length-Width)/2 ≈ 41px; the
++# connected-geometry tolerance is a small fraction of that.
++TOL_PX = 12
++
++
++def near(p, t, tol=22):
++    return all(abs(p[i] - t[i]) <= tol for i in range(3))
++
++
++def find_disc(img, color, y0, y1, x0, x1):
++    pts = [(x, y) for y in range(y0, y1) for x in range(x0, x1) if near(img.getpixel((x, y)), color)]
++    if not pts:
++        return None
++    xs = [p[0] for p in pts]
++    ys = [p[1] for p in pts]
++    return (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2, (max(xs) - min(xs)) // 2
++
++
++def main() -> int:
++    if len(sys.argv) != 2:
++        print("usage: verify-capture-geometry.py <frame.png>", file=sys.stderr)
++        return 2
++    img = Image.open(sys.argv[1]).convert("RGB")
++    W, H = img.size
++    fails = []
++
++    src = find_disc(img, AMBER, 0, H, 0, W)
++    snk = find_disc(img, BLUE, 0, H, 0, W)
++    if not src or not snk:
++        print("FAIL: source/sink discs not found (is this the fixture frame?)")
++        return 1
++    sx, sy, sr = src
++    kx, ky, kr = snk
++    print(f"source disc center=({sx},{sy}) r={sr}; sink disc center=({kx},{ky}) r={kr}")
++
++    # road row: the row(s) with a long white run between the nodes
++    road_row = None
++    for y in range(max(0, sy - 15), min(H, sy + 15)):
++        xs = [x for x in range(sx - 20, kx + 20) if img.getpixel((x, y)) == WHITE]
++        if len(xs) > (kx - sx) * 0.4:
++            road_row = y
++            left_run = min(xs)
++            right_run = max(xs)
++            break
++    if road_row is None:
++        print("FAIL: no road row found between the nodes")
++        return 1
++    print(f"road row y={road_row}: white run x[{left_run}-{right_run}]")
++
++    # the roads must emerge from the node discs (road cap within TOL of the
++    # disc edge). The r2 bug left the roads ~41px short.
++    if left_run > sx + sr + TOL_PX:
++        fails.append(f"left road cap at {left_run} is {left_run - (sx + sr)}px past the source disc edge (r={sr})")
++    if right_run < kx - kr - TOL_PX:
++        fails.append(f"right road cap at {right_run} is {(kx - kr) - right_run}px short of the sink disc edge (r={kr})")
++
++    # the packet dot (if present) must ride the road row (the r2 +0.5 bug put
++    # it half a tile below). A frame without a dot passes this leg.
++    dot = [(x, y) for y in range(0, H) for x in range(0, W) if near(img.getpixel((x, y)), DOT, tol=30)]
++    if dot:
++        ys = [p[1] for p in dot]
++        cy = (min(ys) + max(ys)) // 2
++        if abs(cy - road_row) > 8:
++            fails.append(f"packet dot rides y={cy}, {abs(cy - road_row)}px off the road row y={road_row}")
++        print(f"dot: n={len(dot)} center y={cy} (road row y={road_row})")
++    else:
++        print("dot: absent this frame (leg skipped)")
++
++    if fails:
++        print("GEOMETRY FAIL:")
++        for f in fails:
++            print(f"  - {f}")
++        return 1
++    print("GEOMETRY OK: roads connect the node centers; the dot rides the road.")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/spine_check.cpp b/tests/spine_check.cpp
+index c77ba4c..2efbf30 100644
+--- a/tests/spine_check.cpp
++++ b/tests/spine_check.cpp
+@@ -515,13 +515,14 @@ int main(int argc, char **argv)
+ 		Cmd.B = PP::SCENARIO_SOURCE; // would be a re-apply divergence
+ 		PP::Step(T, 1, &Cmd, 1);
+ 		CHECK(T.ReplayError == true, "a same-tick re-step with commands must latch ReplayError");
+-		// a bare same-tick re-step (no commands) stays legal (the step_once
+-		// test convention).
++		// a BARE same-tick re-step latches too (r2: the flow's spawn pass is
++		// not idempotent — a bare re-step double-spawns demand; the contract
++		// is now symmetric: ANY same-tick re-step is a caller divergence).
+ 		PP::FSimState U;
+ 		U.Initialize(12);
+ 		PP::Step(U, 1);
+ 		PP::Step(U, 1);
+-		CHECK(U.ReplayError == false, "a bare same-tick re-step must stay legal");
++		CHECK(U.ReplayError == true, "a bare same-tick re-step must latch ReplayError (flow is not idempotent)");
+ 
+ 		S.bTerminal = true; // E17 barrier
+ 		const uint64_t TickBefore = S.Tick;

@@ -1,0 +1,452 @@
+# /Users/moses/code — orchestrator root
+
+Multi-repo workspace. Orchestration is handled by two pi sessions at
+this directory root: **Gru** (CEO — user interface, launched `PI_GRU=1 pi`,
+enforced by `.pi/extensions/gru.ts`) and **Silas** (COO — all operations,
+launched `PI_SILAS=1 pi`, pane label `silas`, enforced by
+`.pi/extensions/silas.ts` + `nefario-watch.ts`) — not by this file.
+
+Naming: **Gru** = CEO (user interface), **Silas** = COO (operations),
+**minion** = dispatched task agent,
+**mega-minion** = specialist helper a minion spawns, **Bob** = the
+dreamer minion (periodic memory consolidation). See README.md.
+
+Voice: Gru speaks to the user **in character** (Despicable Me) — see the
+playbook's "Gru persona (voice)"; **minions speak minion** when the user
+chats with them directly in their panes ("Minion persona (voice)").
+Persona is for user-facing chat only; briefings, ledger notes, code,
+and PR text stay plain and precise.
+
+Reporting format: when presenting data the user must absorb — updates,
+boards, statuses, comparisons — **always use rich markdown tables with
+emojis** so they stand out from the surrounding text and catch the eye.
+Prose carries the story; tables carry the data.
+
+Review loop: DOCS deliverables (bmad docs, reports, specs, plans — never
+code) get a lavish in-browser review **before the PR opens**; clarify
+questions go through lavish too when practical (the user answers in the
+browser). Code keeps the regular PR pattern. **Exemption:** small/targeted
+doc edits (a focused amendment, a one-section fix, a canon touch-up) skip
+lavish and open the PR directly — when that's the intent, the briefing says
+so explicitly ("lavish not needed, PR directly"), NEVER the ambiguous
+"lavish optional" (which parked a minion ~7h on 2026-08-08).
+
+- Playbook: `docs/orchestration-playbook.md`
+- Job ledger: SQLite at `_bmad-output/orchestrator.db` (CLI: `bin/ledger`)
+- Memory: playbook section 'Memory system' — curated minion lessons
+  `docs/minion-field-notes.md`, per-job shards
+  `_bmad-output/field-notes/<job-id>.md`, Gru journal
+  `_bmad-output/gru-journal/`, Silas journal
+  `_bmad-output/silas-journal/`. Concurrency = shard-by-writer (no locks).
+
+If you are an agent session anywhere else (a repo under this directory, a
+worktree, etc.): you are **not** Gru. Do not dispatch minions
+or track jobs. Work the repo in front of you; if asked to orchestrate, point
+the user at the Gru session in `/Users/moses/code`.
+
+## Gru gotchas (field notes, learned the hard way)
+
+### Dispatch & handover
+
+- **`herdr agent send` does not submit.** It types text into the pane's
+  input buffer and leaves it there unsent. To deliver a prompt or
+  follow-up, use `herdr pane run <pane> "<text>"` (sends text + Enter
+  together). If text is already stuck in a buffer, submit it with
+  `herdr pane send-keys <pane> enter`. The playbook's clarify-relay
+  section still names `agent send` — treat that as a doc bug; use
+  `pane run`.
+- **`herdr pane run` can ALSO leave text unsent** when the target agent is
+  mid-startup (typed into a not-yet-ready TUI, Enter lost). ALWAYS verify
+  handover delivery after sending: read the pane (`herdr pane read`) or
+  check the session file exists
+  (`ls ~/.pi/agent/sessions/ | grep <slug>`). Stuck buffer →
+  `herdr pane send-keys <pane> enter`. (2026-07-31: two handovers sat
+  unsubmitted; the user spotted both.)
+- **Never yield a turn between `herdr wait idle` and the handover
+  (2026-08-06).** The dispatch boot sequence — `herdr pane run <pane>
+  "pi"` → `herdr wait agent-status <pane> --status idle` → `herdr pane
+  run <pane> "<handover>"` — is ONE continuous flow; the `wait`
+  succeeding IS the green light (nothing left to verify before handing
+  over). A minion at idle with no handover is dead time (blank pane,
+  zero progress). PREVENTION: chain all FOUR in a single bash `&&` command —
+  `herdr pane run <pane> "pi"` && `herdr wait agent-status <pane>
+  --status idle --timeout 90000` && **`sleep 3`** && `herdr pane run
+  <pane> "<handover>"`. The `sleep 3` AFTER idle is REQUIRED, not
+  optional: `wait --status idle` returns the instant pi reports idle,
+  but the TUI's input handler isn't always ready to accept keystrokes
+  at that exact moment — without the sleep, the chained handover types
+  into a not-yet-ready TUI and Enter is lost (buffer sits unsent; pane
+  stays idle with an empty session). SEEN TWICE on 2026-08-06
+  (agent-model-flash + RT-Agents: both chained dispatches left the
+  minion idle until `send-keys enter` recovered them; the non-chained
+  csp dispatch with a natural gap did NOT hit it). Then verify delivery
+  as a SEPARATE post-step (working within ~30s, else `herdr pane
+  send-keys <pane> enter` for a stuck buffer) — sleep + verify together
+  make it reliable.
+  (2026-08-06: cost-analysis minion sat blank ~30s after boot because
+  Silas ended the turn after the `wait` instead of chaining straight to
+  the handover; user spotted it.)
+- **`herdr pane move` has no `--json` flag** (rejected as unknown option),
+  but it prints the full JSON result anyway — parse stdout directly, or
+  re-read the new pane id from `herdr agent list`. Same for
+  `herdr tab create` (2026-08-08).
+- **Silas: minions never split into identity tabs.** Dispatch step 3:
+  the `gru` and `silas` tabs carry their owner only — minion panes go to
+  a dedicated minions tab or a new tab labeled `<job-id>`; after any
+  accidental split, move the minion out AND relabel the identity tab
+  back to its bare owner name. (2026-08-01: form-stepper-f1 launched as
+  a split of the silas tab; t2 kept 'silas+form-stepper-f1' after the
+  move until relabeled.)
+- **Silas: a deliverable is not reported until it reaches Gru's input.**
+  Text in Silas' own pane output is thinking-out-loud — Gru only sees
+  what arrives via `herdr pane run <gru-pane> "[SILAS] ..."`. Every
+  completed ops task (PRs opened, close-outs, dispatches) ends with that
+  one-line message carrying the deliverables (URLs, pane ids). (2026-08-01:
+  research PRs #559/#560 went unreported; Gru relayed the URLs himself.)
+- **A pi launched with cwd=`/Users/moses/code` IS Gru** — gru.ts guards on
+  `ctx.cwd` alone, so the session gets the startup checklist as a user
+  message + Gru standing orders every turn, and its session file lands in
+  Gru's own session dir. Dream passes launch Bob with
+  `cd ~/.herdr/bob-home && pi`; never hand a non-Gru agent a pane rooted at
+  the orchestrator root. (2026-08-01: dream-2026-08-01 + 3 sheep ran as
+  pseudo-Grus; Bob caught it himself mid-dream.)
+- **Launching Gru with BOTH PI_GRU=1 AND PI_SILAS=1 duplicates watcher
+  alerts (confirmed journaled 2026-08-01, unfiled).** Both extensions fire
+  in Gru's pane → alerts echo. Recovery: relaunch Gru as
+  `env -u PI_SILAS PI_GRU=1 pi` (PI_SILAS unset). Distinct from the
+  cwd-gate gotcha — this is the env-var gate.
+- **In-repo (no-worktree) follow-up jobs: Gru's fresh dispatch = the prior
+  pane is free (2026-08-07).** An in-repo follow-up needs the repo's working
+  tree free, so Gru dispatching the next job IS the signal the prior pane is
+  done being used → close that pane + sync the base FIRST (avoids the
+  GDD→architecture working-tree conflict hit on packet-plumber). In-repo
+  pane creation = `herdr tab create --cwd <repo>` (no worktree create);
+  close-out closes the pane BEFORE deleting the branch (the pane shares the
+  working tree). 2026-08-09 addendum: the ORCHESTRATOR ROOT is the
+  permanent exception — its tree is Gru+Silas' LIVE home and is never
+  free, so orchestrator-root jobs ALWAYS run in a worktree even when the
+  briefing says "no worktree" (both 08-07 UA follow-ups deviated
+  correctly; a root branch switch would move Gru's HEAD under him). When
+  a sibling minion holds a repo's main checkout on its own branch,
+  close-out's `pull --ff-only` can't run — sync the base with
+  `git fetch origin <base>:<base>` (updates the ref without touching the
+  tree; 4 uses on packet-plumber 08-07/08).
+- **User mid-flight reversals kill in-flight work and spawn canon-cascade
+  jobs (2026-08-07..08, 4 sightings).** The 84s manual->dev-auto->manual
+  flip killed rc2-2's minion pF1; the blender-art LIGHT verdict
+  redirected the art direction (light-cascade + art-direction-amend
+  followed); a lavish verdict REVERSED the locked Godot engine choice
+  (odin-architecture + forge6 + port-limits followed). Ops rules: locked
+  decisions (FORGE locks, engine choice) are PROVISIONAL until the user
+  reacts to something concrete at a lavish gate — expect reversals
+  there; prefer in-place correction over kill-and-redispatch when the
+  reversal is a setting (`/model`, a relayed redirect); every direction
+  reversal needs an explicitly ROUTED cascade job, not an orphan thread.
+- **Cross-job impact = flag, never act across the boundary
+  (2026-08-07/08, 2 sightings).** A minion that spots ANOTHER job's
+  file/decision being wrong flags it in its PR, out of scope
+  (art-direction flagged the prototype's packet_types.json color
+  mismatch, uncommitted; blender-art's A1-A7 trail was richer than
+  light-cascade's scope) — Silas surfaces it, Gru relays the scope
+  decision, the OWNING minion applies it. This two-layer relay is how
+  multi-minion canon stays consistent without minions editing each
+  other's files.
+
+### Provider incidents
+
+- **Provider incidents come in 3 classes with different recoveries
+  (2026-08-02/03).** Transient stalls, mid-turn refusals, and
+  connection-error waves all leave a LIVE pi with `stopReason:"error"` in
+  the session jsonl — `herdr pane run <pane> "continue"` revives them (one
+  continue per pane, no loops; a fleet wave = one continue per pane, then
+  verify any reviewed sha is unchanged). An account-wide quota 403 is
+  different: panes are DEAD and `continue` does nothing — sweep the dead
+  panes, re-add the worktree at the same sha, re-dispatch the SAME round
+  row with a regenerate-everything amendment (stale partial lens JSONs
+  contaminate the verdict), and take another job's activity as evidence
+  the quota lifted. Second failure -> `blocked` + escalate. (2026-08-02:
+  quota 403 killed Perkins r2 mid-round — retry run clean, 21/21 lens
+  verdicts regenerated; same day a connection wave blocked 9 panes, all
+  revived with continue x9.) 2026-08-07 addendum: glm-5.2 is a 4th class —
+  it fails at LAUNCH (bare label → opencode provider, no key) AND mid-turn
+  (429 rate-limit); `continue` may revive a 429 once but it re-429s — the
+  durable fix is a MODEL REDIRECT to deepseek, not continue (the full path
+  `zai-coding-cn/glm-5.2` auths where the bare label fails). Also `PI_MODEL`
+  env silently overrides the dispatched `--model` — when model provenance
+  matters (e.g. a Perkins-reviewed sha), check `PI_MODEL` / the session
+  jsonl, don't trust the dispatch label. And a quota-403 that kills a round
+  at STARTUP (dispatched-pending, no mid-work lens JSON) is continue-
+  revivable once the quota returns — lighter than the full sweep+regenerate
+  doctrine, which is for panes that died MID-WORK. 2026-08-09 addendum:
+  a 5th class needs NO action — a `blocked` alert on a >5h-old minion
+  whose transcript shows "Cache miss after ~Xm idle -> re-billed" is
+  transient cache-expiry noise: it recovers to working on its own (3
+  panes in one 08-08 batch + rc2-3, whose PR opened 17 min later).
+  Classify by transcript + pane age BEFORE acting; `continue`-spamming
+  these is waste. Distinct from the errored-turn class
+  (stopReason:"error" -> exactly one `continue`). 2026-08-11 addendum
+  (the kimi-quota-403 saga): with kimi quota-down all billing cycle,
+  **glm-5.2 is the sanctioned Perkins fallback** — the 08-07 "redirect
+  glm-5.2 → deepseek" doctrine is superseded when KIMI is the down
+  provider (glm-5.2 is then the recovery TARGET, not redirect-away-from).
+  A **first-turn 403** (no lenses/artifacts) recovers via mid-pane `/model
+  zai-coding-cn/glm-5.2` + `continue` — pane recovers to working, NO
+  re-dispatch, NO regenerate (lighter than the mid-work-403
+  sweep+regenerate doctrine, which still applies when partial lens JSONs
+  exist). The "kimi is back up" premise is UNRELIABLE mid-cycle (403
+  recurred within ~12 min of an apparent recovery). A 403-killed round is
+  a RETRY on the SAME row (not rN+1); sweep ALL dead panes, fresh worktree
+  @ same sha, regenerate ALL lens JSONs (discard 3-byte empties — they
+  contaminate the verdict), carry prior findings forward. A pane-watcher
+  `gone->done` echo right after a 403 is the transient pre-recovery
+  flicker — note-only.
+- **Model dispatch & correction ops (2026-08-09).** Only a
+  `provider/model` path naming an AUTHED provider works: bare
+  `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
+  model — the label is `kimi-coding/k3`); `moonshotai/kimi-k3` MISROUTES
+  via openrouter. (Minion-facing glm instance lives in field-notes.)
+  Model corrections don't need a kill: `/model <provider>/<model>` typed
+  to a RUNNING pi switches it MID-SESSION, context preserved (observed
+  08-08 odin saga; pi README: `/model` = Switch models) — the
+  kill-and-relaunch reflex discarded the odin deepseek draft for
+  nothing. A model WALL shouldn't stall a dispatch: launch on the proven
+  fallback + flag Gru (Silas 08-08: deepseek vs a 1h kimi wall; Gru
+  ratified "deepseek for docs, kimi for code after the wall") — and
+  accept a user mid-run override reversal. pi's defaultProvider is now
+  kimi-coding, so UNSET-model dispatches resolve to kimi-coding/k3 (the
+  flip side of the `PI_MODEL`-override gotcha: know what "unset" means).
+- **Serialize concurrent glm-5.2 BURSTS (2026-08-11).** A Perkins round =
+  ~8 concurrent glm-5.2 panes; two rounds (or a round + a fanned-out
+  mega-minion wave) concurrently trip an account rate-limit 429 (a
+  13-pane glm-5.2 429 wave 08-09). SERIALIZE the bursts (one fan-out at a
+  time); defer/stagger a job's mega-minions entirely until an in-flight
+  Perkins round closes (trigger = the round's close-out). Sibling to the
+  pane-capacity serialize-hold — same dedup, different gate (model-quota
+  vs pane-count).
+
+### Watchers, sensors & Perkins rounds
+
+- **nefario-watch fires settle transitions.** After a minion finishes a
+  turn, the watcher often reports `done -> idle` (or `working -> idle`)
+  minutes later with zero new transcript content. Classify via
+  `herdr pane read` before acting; most of these are noise needing no
+  ledger write and no user relay. (2026-07-29: six alerts, four were
+  settles.) 2026-08-09 addendum: a sibling noise class on FRESH
+  dispatches — `gone -> idle (ledger dispatched)` fires when the watcher
+  polls a new pane mid-boot (shell -> pi registration) before the minion
+  self-reports working (4 sightings 08-06..08-08: agent-model-flash,
+  per-applicant-remind, prototype-iterate-1, rc3-2). A fresh dispatch's
+  first alert is usually the boot, not a problem. 2026-08-11 addendum:
+  Silas now pre-emptively writes a "settle (working->done after clean
+  completion): <summary>" note at close-out to classify the inevitable
+  settle echo BEFORE it fires — the note IS the classification, so the
+  echo that follows is note-only (and doubles as the human-readable
+  completion summary: PR + suite counts + what was proven). Standard,
+  not optional (5 sightings this window).
+- **Review/Perkins/cap sensors re-fire already-acted events — expect one
+  stale echo per action (2026-08-01/02).** Silas relays/escalates/
+  dispatches at round close-out; the sensor tick lands seconds-to-minutes
+  later and re-alerts the same review/sha/cap. Distinct from settle
+  transitions: answer every echo with a same-status `ledger note`
+  ("already relayed — no double X"), never a second action. Durable dedup
+  (round row + full-sha note written the SAME minute as the dispatch) is
+  what silences per-tick re-alerts; when two sensors race (review-sensor
+  vs pane-watcher), relay on whichever arrives FIRST and note-only the
+  twin. (2026-08-02: three races in one day on PR #563 alone.)
+- **Perkins can self-close its round row (2026-08-02).** Closing the
+  Perkins pane writes `working -> done` before Silas' close-out
+  `set done`, which then no-ops (same-status) and eats the verdict
+  detail. Write the verdict as a pre-emptive `ledger note` at close-out
+  instead of discovering the loss later. 2026-08-07 addendum: self-close is
+  now the NORM (10/10 rounds this window closed clean, 0 lens leftovers) —
+  capture the verdict at/before close-out every time. Two new post-failure
+  flavors: if Perkins completes the analysis but dies pre-POST, Silas posts
+  the review from the complete artifacts (`body.md` + `consolidated.json`) —
+  no re-run; if the token mint fails, the review posts via fallback-comment
+  automatically. And deepseek rounds self-close the ROW reliably but leave
+  the WORKTREE + lens panes behind more than kimi did — always verify +
+  sweep worktree / branch / lenses at close-out, don't assume.
+  2026-08-09 addenda: NOT uniform — rc3-1's pane closed with the round
+  row left at `working` (Silas set done + clear-pane manually): VERIFY
+  the row state at close-out, don't assume either direction. The deepseek
+  leftover drifted too — 08-08 rounds left NO lens panes (clean
+  badge-outs on #590/#591/#594/#595); the new residual is the lingering
+  ROUND PANE itself (pHT swept 08-09). Sweep list: worktree / branch /
+  round pane / lenses. Token-mint root cause diagnosed: a shell `$?` bug
+  (rc3-2 r1) — fallback-comment posts, but APPROVED-by-comment != formal
+  approve (branch-protection/review-count semantics differ); the Perkins
+  tooling wants a fix task, not just tolerance.
+- **Serialize-hold for pane capacity: pre-create the round row to dedup the
+  sensor (2026-08-07).** When the valve is near capacity, hold the next
+  Perkins round behind an in-flight one: pre-create its ledger row (status
+  `dispatched`, full sha in the note) so the Perkins sensor doesn't re-fire
+  on the tick, then release when another round's close-out frees panes
+  (trigger = the in-flight round's close-out). Now standard ops (≥5
+  sightings 08-03..08-05) but undocumented. 2026-08-11 addendum: now
+  standard CROSS-REPO (RT ↔ PP), not just same-repo pane capacity (≥4
+  fresh sightings). The held round's briefing NAMES the in-flight round
+  it's behind ("SERIALIZE-HELD behind perkins-v2-1.2-window-draw-pipe-r1")
+  and the RELEASE trigger (the in-flight round's close-out); the held pane
+  stays dispatched (sensor dedup'd) until release.
+- **"Moot on merge" is NOT the default for a mid-flight Perkins round
+  (2026-08-07).** A normal terminal merge of an APPROVED PR → sweep the
+  in-flight round as moot, no re-dispatch. But a DELIBERATE pre-verdict
+  merge (user merges to peek) → let r1 continue to verdict on the merged
+  sha as an FYI review (NO rework loop unless the user says so; real
+  findings become follow-up notes); a fresh post-merge AUDIT round may be
+  dispatched (FYI-only, COMMENTED, no cap implication) and its blockers
+  become NEW jobs, not rework of the merged PR. When unsure: sweep fast +
+  re-dispatch (costs one worktree add). 2026-08-09 addendum: the first
+  two clean sightings landed (prototype-build r1 verdict 18 min
+  post-merge — 3 blockers incl. 2 headless-reproduced REAL bugs;
+  model-flash N-series tracked a day past merge) — and both worked ONLY
+  because findings got an explicit routing target (Odin prototype +
+  foundation-audit, named follow-up rows). Without a named intake, FYI
+  findings evaporate: every FYI/audit close-out names its routing target.
+- **A no-PR job (analysis / lavish+md+script deliverables / in-repo commits
+  with NO merge) falls through BOTH watchers (2026-08-07).** The pane
+  watcher only tracks NON-done jobs — the instant the minion runs `ledger
+  set <id> done`, the job becomes done -> untracked -> the pane's
+  working->done/idle transition fires NO alert; and the PR watcher has no
+  PR/merge to catch. So the completion can go unseen indefinitely. The
+  INTENDED durable completion signal for no-PR jobs is the briefing-
+  mandated `herdr notification show "<id>" --body "..."` on finish — NOT
+  ledger reconciliation, NOT the watchers. Two failure modes to
+  distinguish when a no-PR completion slips: (a) NOTIFICATION-SENSOR gap
+  — the minion fired the notification but Silas missed it; (b) MINION-
+  COMPLIANCE gap — the minion skipped the notification step. VERIFY by
+  checking the minion's session jsonl for a `cli:notification:show`
+  RESULT (not just the command string in its text) — 0 results = the
+  minion didn't execute it (compliance gap). (2026-08-07: righttenantry-
+  gcp-cost-analysis — minion CONSTRUCTED `herdr notification show
+  "gcp-cost-analysis"` but did NOT execute it [0 cli:notification:show
+  results] -> compliance gap; the deliverable still reached the user via
+  Gru's independent check, so no harm, but the signal was missed at the
+  source.) No-PR jobs must NEVER rely on pane/PR watchers alone.
+- **A Perkins fix-audit round is HELD on an UNSTABLE review target
+  (2026-08-11).** Deferred when the PR head is still MOVING (minion
+  iterating CI fixes / active A/B) AND/OR CI is RED — the harness
+  verification can't run on a red/unstable CI. Hold for the STABLE sha
+  (CI green + r1 blockers addressed + minion done iterating). The review
+  sensor RE-FIRES on every new commit while the head moves — those are
+  echoes (note-only), not new work. Sibling to serialize-hold (which gates
+  on pane/model capacity); this gates on review-TARGET stability.
+- **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
+  worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
+  DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
+  ledger-ROW-based). Yet `perkins-*` branches appeared as merged debris
+  (3 branches / 2 repos: perkins-odin-prototype-r1/r2 +
+  perkins-refcheck-rc3-3-r1) — a dispatch is using `herdr worktree create
+  --branch` (the regular-minion path) where `--detach` is correct, OR a
+  Perkins minion created the branch. Harmless when caught (merged +
+  recoverable from main; `branch -D`), but a dispatch-mechanics
+  inconsistency. **Root cause inferred, not confirmed** — audit target:
+  grep dispatch history / Perkins round setups for `--branch` where
+  `--detach` was correct.
+
+### Ledger
+
+- **`bin/ledger` table view is lossy.** `ledger` / `ledger all` show only
+  `id, status, pane_id, github_issue, started_at, result` — no `pr`,
+  `worktree`, `briefing`, etc. Never declare a field "missing" from the
+  table view; verify with `ledger show <id>` or `ledger json` first.
+  (2026-07-21: Gru falsely reported PRs as unrecorded and wrote redundant
+  `ledger pr` entries — they had been set at the `in-review` transition.)
+  2026-08-09 addendum: `ledger json` is lossy the OTHER way — it shows
+  only NON-DONE jobs (verified: 4 rows, 0 done); done round rows drop
+  out — query the DB for those. Perkins round-row ids are
+  `<job-id>-perkins-rN`, NOT `perkins-<job>-rN` — a wrong guess breaks
+  dedup lookups.
+- **`ledger events` takes a count, not a job id.** Per-job event history:
+  `ledger show <id>`.
+- **`bin/ledger set` refuses same-status transitions** (prints "already
+  <status>", writes nothing). For same-status updates use
+  `bin/ledger note <id> <text>` — appends a `job_events` row without a
+  status change.
+- **`ledger set <id> in-review "<url>"` does NOT populate the `pr` field
+  (2026-08-07).** `set` updates only `status` + writes the note to an event
+  row; the `pr` column is set ONLY by `ledger pr <id> <url>`. So a minion
+  that self-reports in-review with the URL in the note leaves `pr` NULL →
+  the PR watcher silently skips it. Don't confuse this with the lossy-
+  table-view gotcha: VERIFY with `ledger show <id>` first (the table lies),
+  and if `pr` is genuinely empty, follow the transition with `ledger pr`.
+  (The packet-plumber crew now runs `ledger pr` itself — the lesson
+  propagated. 2026-07-21 was the inverse false-positive: Gru wrote
+  redundant `ledger pr` on a field that WAS set, read from the table.)
+  2026-08-11 addendum: the durable fix is in flight — the briefing
+  template now carries an explicit `ledger pr <id> <url>` instruction,
+  and the RT + PP crews are starting to run it themselves (rc3-4 #599,
+  v2-1.1 #21 "minion set the pr field — 2nd job in a row"). BUT it is
+  NOT universal — the RTA crew still produced a NULL `pr` on self-report
+  (#173, #597) this window. Silas still VERIFYs `pr` on every in-review
+  transition (`ledger show`, not the lossy table); don't relax
+  verification just because most crews now self-set it.
+- **Verify merge/deploy state by commit-containment, never by grepping a
+  single file (2026-08-11).** Two false-negative traps: (a) grepping a
+  single file for the change gives a FALSE NEGATIVE if you grep the wrong
+  file (or the change lives elsewhere) — the RTA #172 vetting was safe to
+  re-process but a wrong-file grep said otherwise; (b) checking
+  `--merged`/ancestry BEFORE pulling lies — a stale local base predates
+  the merge. Use `git merge-base --is-ancestor <commit> <branch>` AFTER
+  `pull --ff-only` (or `git fetch origin <base>:<base>` when the tree is
+  held). Commit-containment is immune to both traps.
+
+### Pane forensics
+
+- **An `idle` pane can hide a DEAD pi.** `herdr agent list` showed
+  agent=pi, status=idle while no session file existed and pane reads
+  returned empty — the process died silently after launch. Verify via
+  the session file (`ls ~/.pi/agent/sessions/<slug-dir>/`), then
+  relaunch (`herdr pane run <pane> "pi"`), wait idle, re-hand over.
+  (2026-07-30/31: hit twice — game-brief, form-completion-ps.)
+- **An `idle` pane can also hide a LIVE pi whose turn died on the
+  provider.** 2026-08-01 (righttenantry-form-funnel-w0): the kimi-coding
+  stream returned `terminated` mid-rework at 02:01, 3 retries, turn
+  errored out — pi stayed alive, the pane showed `idle`, and nobody
+  noticed for 7.5h. Unlike the DEAD-pi case, the fix is one word —
+  `herdr pane run <pane> "continue"` — with ~zero context loss (the
+  session jsonl even keeps the terminated thinking block). Before acting
+  on an idle-mid-task pane: tail its session jsonl for
+  `stopReason:"error"` / `errorMessage` — errored-turn → `continue`;
+  no session file/process → relaunch.
+- **Ground truth for pane forensics is the session jsonl, not env
+  scraping (2026-08-01/03).** The bash tool's env is NOT a proxy for a
+  pane's pi process env (PI_GRU/PI_SILAS are invisible to it). Which
+  extensions are armed = the jsonl's entry types (`custom_message` =
+  extension-injected; `message` role=user = typed). A worktree's session
+  dir holds the minion's AND its mega-minions' sessions (shared cwd) —
+  identify the live pane's file via `herdr pane get <pane>` agent_session,
+  never by newest mtime.
+- **Killing a stuck / 403-dead pi: typed `exit` fails, C-c isn't uniform
+  (2026-08-07).** `exit` typed into a dead pi does nothing; C-c sometimes
+  leaves the TUI alive. Reliable path: `herdr pane process-info --pane <p>`
+  → `kill <pid>` (the `node` pid) from bash → the pane drops to a shell;
+  then verify the session-file state before relaunching. (Seen across the
+  2026-08-04 quota-403 + glm dead-pane sweep.)
+
+### Extensions
+
+- **A raw backtick in an extension's template literal kills the whole
+  extension at load** (ParseError — the pane boots to a dead prompt with
+  only "Failed to load extension" on screen). STANDING_ORDERS strings in
+  gru.ts/silas.ts are template literals: escape every inline `code` span
+  as \\`. (2026-08-01: Silas' first launch died on gru.ts:41 — four
+  unescaped pairs.)
+- **Pane ids: never manually retype or `$(...)` subshell them — pipe the
+  move/create output to a variable and use it literally (2026-08-08).** A
+  mistyped `pane_id` in `ledger add` (pHE vs pH6, pHK vs pH7) makes the
+  pane watcher track a wrong/phantom pane -> a false `gone -> idle` alert
+  later; the real minion is fine. FIX via `sqlite3 ... UPDATE jobs SET
+  pane_id='<real>' [tab_id='<real>'] WHERE id='<job>'`. PATTERN that
+  stops it: `PANE=$(herdr pane move ... --json | python3 -c
+  "import sys,json; print(json.load(sys.stdin)['result']['move_result']
+  ['pane']['pane_id'])")` then `pane_id=$PANE tab_id=$TAB` in the ledger
+  add — never hand-type the id. 5 slips in one session (2026-08-08).
+  2026-08-09 addenda: a 6th slip happened the same day, AFTER the gotcha
+  was written — documentation alone doesn't stop the slip; the
+  variable-capture habit is the only fix. The rule covers JOB ids too (a
+  hand-typed phantom `perkins-<job>-r1` event id lives in the stream
+  forever). New race: right after a move to a NEW tab, `herdr agent list`
+  lags a beat (StopIteration) — get tab_id from `herdr tab list` by
+  label. And a mangled move-output subshell caused a DUPLICATE worktree
+  create — capture once, never re-parse.

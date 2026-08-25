@@ -1,0 +1,140 @@
+You are reviewing a code diff. You have read-only access to the repository and may verify the diff's claims against the actual codebase using your available tools.
+
+--- PROJECT CONVENTIONS ---
+The project is RightTenantry, a Gleam/Lustre monorepo. Full conventions live in /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-621-reminder-hint-r1/AGENTS.md — read the sections relevant to your lens (core principles, code style, invariants). Key rules: no `let assert` in production code; all landlord-facing strings live in client/src/copy.gleam (never inline in views); all fallible ops return Result; HTTP calls need explicit timeouts; naming: messages SubjectVerbObject, files snake_case.
+
+--- DIFF ---
+The canonical diff is saved at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-621-reminder-hint/r1/diff.patch — read exactly those bytes (never re-fetch or regenerate the diff). For convenience it is also inlined below:
+
+diff --git a/client/src/components/reference_panel.gleam b/client/src/components/reference_panel.gleam
+index cec2adfe..cc88ecb6 100644
+--- a/client/src/components/reference_panel.gleam
++++ b/client/src/components/reference_panel.gleam
+@@ -1276,10 +1276,14 @@ fn view_attempt_log(call: ReferenceCallDetail, slot: String) -> Element(Msg) {
+   let lines = attempt_log_lines(call)
+   // The cadence hint: an in-flight row still has steps to come (the old
+   // mini-timeline pinned batch-count < 4 — the server-built log counts the
+-  // same way: the cadence runs at most 4 batches).
+-  let has_next_reminder = case call.status {
+-    ContactInitiated -> list.length(send_batches(call.attempt_log)) < 4
+-    _ -> False
++  // same way: the cadence runs at most 4 batches). #621: a taken-over row
++  // never receives another automated message (the sweep excludes taken-over
++  // rows — `sweep_due_reference_calls.sql` keeps `taken_over_at IS NULL`,
++  // and the takeover toast already says "automated messages stopped"), so
++  // the hint must not promise a reminder it will never send.
++  let has_next_reminder = case call.status, taken_over(call) {
++    ContactInitiated, False -> list.length(send_batches(call.attempt_log)) < 4
++    _, _ -> False
+   }
+   html.div([class("space-y-2")], [
+     html.div([class("flex items-center justify-between gap-2")], [
+diff --git a/client/test/components/reference_panel_test.gleam b/client/test/components/reference_panel_test.gleam
+index de53a422..ba995074 100644
+--- a/client/test/components/reference_panel_test.gleam
++++ b/client/test/components/reference_panel_test.gleam
+@@ -1568,6 +1568,58 @@ pub fn taken_over_row_shows_label_chips_and_export_test() {
+   |> should.be_false
+ }
+ 
++/// #621: a taken-over contact_initiated row must NOT promise a future
++/// automated reminder. The cadence sweep excludes taken-over rows
++/// (`sweep_due_reference_calls.sql` keeps `taken_over_at IS NULL`), so the
++/// "Next reminder in ~2 days" hint would be a promise the system never
++/// keeps — the takeover toast already says "automated messages stopped", and
++/// the attempt-log hint must agree. The timeline itself still renders (the
++/// invite + takeover events stay visible); only the future-promise hint is
++/// dropped.
++pub fn taken_over_row_hides_next_reminder_hint_test() {
++  let taken =
++    reference_call.ReferenceCallDetail(
++      ..contact_row("rc-1", ContactInitiated),
++      taken_over_at: Some("2026-08-03T08:00:00Z"),
++      attempt_log: [
++        reference_call.AttemptLogEntry(
++          kind: "invitation_sent",
++          at: "2026-08-01T10:04:00Z",
++          channel: "email",
++          outcome: "delivered",
++          detail: "",
++        ),
++        reference_call.AttemptLogEntry(
++          kind: "taken_over",
++          at: "2026-08-03T08:00:00Z",
++          channel: "",
++          outcome: "",
++          detail: "",
++        ),
++      ],
++    )
++  let html =
++    render_with_actions(
++      calls: [taken],
++      off: False,
++      attestation_on_file: False,
++      expanded: ["rc-1"],
++      menu_open: None,
++      confirm: None,
++      edit: dict.new(),
++      inflight: [],
++    )
++  // The takeover surface renders…
++  html
++  |> string.contains("refcheck-taken-over-landlord_ref")
++  |> should.be_true
++  html |> string.contains("You&#39;re handling this one") |> should.be_true
++  // …and the reminder promise is gone.
++  html
++  |> string.contains("Next reminder in ~2 days if there&#39;s no reply")
++  |> should.be_false
++}
++
+ /// r2 (N5): the §8.3 correction surface opens behind a button — the form is
+ /// never silently always-open (Cancel is meaningful).
+ pub fn awaiting_correction_renders_edit_trio_test() {
+
+
+--- WORKTREE ---
+A checkout at exactly the reviewed sha is at /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-621-reminder-hint-r1 — every verification read happens there.
+
+--- SPEC / CONTEXT ---
+Spec files (read both):
+- Original job briefing: /Users/moses/code/_bmad-output/briefings/righttenantry-refcheck-621-reminder-hint.md
+- GitHub issue #621 (JSON dump): /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-621-reminder-hint/r1/issue-621.json
+
+--- YOUR LENS ---
+You are a pure path tracer. Do not comment on whether the code is good or bad — list only unhandled paths reachable from the changed lines.
+
+Method: mechanically walk every branching path and boundary condition directly reachable from the diff hunks. Derive edge classes from the changed code itself — no fixed checklist. Examples: boundary conditions (empty lists, nulls, zero counts, max sizes), concurrent operations and race conditions, unhandled error paths in new code, external service unavailability (DB, APIs, auth), off-by-one errors, implicit type coercion, state the new code doesn't account for, input the new code doesn't validate.
+
+For each path, determine whether the diff handles it. Report ONLY unhandled paths that lack an explicit guard in the diff; discard handled ones silently. No editorializing.
+
+--- OUTPUT ---
+Return ONE valid JSON array. Each element must match this schema exactly:
+{
+  "source": ""edge"",
+  "severity": "blocker" | "warning" | "note",
+  "category": "<short tag, e.g. auth, boundary, coupling, coverage-gap>",
+  "title": "<one-line summary>",
+  "location": "<file:line | file:hunk | N/A>",
+  "evidence": "<the exact lines you READ from the file/diff that prove the claim, pasted verbatim. Use 'N/A' ONLY for findings that have no possible code reference. Do not paraphrase. Do not reconstruct from memory. If you cannot quote the lines, you have not done the work to file the finding.>",
+  "detail": "<why this is a problem, <=40 words>",
+  "recommended_fix": "<the change to apply, <=40 words>"
+}
+
+FILE-OUTPUT CONTRACT (headless mode): write ONLY your JSON array to the file /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-621-reminder-hint/r1/edge.json using the Write tool — the full absolute path is given, do not derive another location. Then reply with a one-line confirmation. No prose, no markdown fencing in the file.
+
+Output contract:
+- The file contains ONLY the JSON array. No prose, no markdown fencing, no preamble.
+- Empty array [] is valid and expected when you find nothing.
+- Do not invent findings to fill a quota.
+
+ACCURACY MANDATE — this is the most important instruction in this prompt:
+
+NO claim you make will be taken at face value. Every finding you emit will be independently re-verified against the actual codebase before it reaches the report. Findings that fail verification are DISCARDED SILENTLY — they will not appear in the report, you will not be asked to defend them, you get no second chance.
+
+Therefore:
+- Open the file. Read the relevant lines. Do not guess from filenames, do not assume from similar-looking code, do not generalise from one example to another.
+- The `evidence` field must contain the EXACT lines you read. If you cannot paste them, you have not verified the issue and the finding does not belong in your output. A finding without locatable evidence is a hallucination — drop it before it leaves your output.
+- Hedging language ("might", "could", "possibly", "potentially") is a signal that you have not actually verified the issue. Either verify it and report it crisply, or do not report it.
+- Prefer fewer, well-grounded findings over many speculative ones. The user values accuracy over volume — an empty array is a fine and honest answer when nothing is wrong.

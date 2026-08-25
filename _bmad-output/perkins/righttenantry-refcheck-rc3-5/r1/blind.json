@@ -1,0 +1,92 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "data-integrity",
+    "title": "Attempt-log `at` timestamps are always \"\" in production — bootstrap passes now_iso=\"\" and it is stamped verbatim into every attempts[] entry",
+    "location": "server/src/reference_checks/sweep.gleam (new): bootstrap() / run() / outcome_entry()",
+    "evidence": "+  Ok(run(db_conn, deps, \"\", sentry, default_batch_limit))\n+pub fn run(\n+  db: pog.Connection,\n+  deps: send.SendDeps,\n+  now_iso now_iso: String,\n+/// `now_iso` is an ISO-8601 timestamp string, or \"\" to let Postgres default\n+/// to now() (production passes \"\"; tests pin the clock so cadence steps are\n+/// deterministic). `deps` carries the send helpers'\n+fn outcome_entry(outcome: ChannelOutcome, at: String) -> json.Json {\n+  json.object([\n+    #(\"at\", json.string(at)),",
+    "detail": "Bootstrap and handler pass now_iso=\"\"; only the due-SELECT defaults to now(), while Gleam-built attempt entries stamp the literal value into `at`. Production attempt logs carry empty timestamps — warm-handoff email and partial_result render an empty audit trail; tests never assert `at`.",
+    "recommended_fix": "Stamp entries with a real timestamp when now_iso is \"\" (fetch now() in the due-SELECT or use system time), or pass a real ISO string from bootstrap and the handler."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "inconsistency",
+    "title": "Warm-handoff email's attempt-log render is not a mirror of the appended attempts — a hardcoded email/\"reminder_2\" entry replaces the real send entries",
+    "location": "server/src/reference_checks/sweep.gleam (new): step_warm_handoff() / dispatch_warm_handoff()",
+    "evidence": "+  let entries = outcomes_to_json(outcomes, now_iso)\n+  case sql.sweep_advance(db, row_uuid, entries, step_to_terminal, 3) {\n+    Ok(pog.Returned(_, [_])) -> {\n+      // Advance won — dispatch the warm handoff (exactly-once: only the\n+      // advance winner notifies). Best-effort: a dispatch failure is logged,\n+      // never fails the row (the reminder already sent).\n+      dispatch_warm_handoff(db, deps, now_iso, row, context)\n+      WarmHandoff\n+    }\n+  let attempts =\n+    parse_attempts_entries(row.attempts)\n+    |> list.append([\n+      AttemptEntry(\n+        at: now_iso,\n+        channel: \"email\",\n+        outcome: \"reminder_2\",\n+        detail: \"T+96h reminder\",\n+      ),\n+    ])",
+    "detail": "The row's append holds real outcomes (email+sms, sent/skipped/failed via outcome_name); the render adds one hardcoded email/\"reminder_2\" entry instead — wrong channel for sms-only referees and wrong count when both channels sent. The 'mirrored here' comment is false.",
+    "recommended_fix": "Pass the actual appended entries (or parsed outcomes) into dispatch_warm_handoff so the rendered attempt log equals the row's log; drop the synthetic entry."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "spec-contradiction",
+    "title": "Manual-fire route threads live config.sentry, contradicting the spec's 'Handler threads sentry_client.Disabled (manual runs don't escalate)'",
+    "location": "spec OWNS #7 vs server/src/reference_checks/sweep_handler.gleam (new)",
+    "evidence": "+7. **Internal manual-fire route** — `POST /api/v1/internal/reference-checks` (`response_helpers.require_internal_secret`, the digest/verification-reminders precedent). Handler threads `sentry_client.Disabled` (manual runs don't escalate). Wired in `router.gleam`.\n+      let deps =\n+        send.SendDeps(\n+          resend_api_key: config.resend_api_key,\n+          twilio: config.twilio,\n+          sentry: config.sentry,\n+        )\n+      let summary =\n+        sweep.run(\n+          config.db,\n+          deps,\n+          now_iso: \"\",\n+          sentry: config.sentry,\n+          batch_limit: 1000,\n+        )",
+    "detail": "The spec says manual runs must not escalate; the handler builds SendDeps and calls run() with config.sentry, and its header comment states the opposite ('failures escalate to Sentry the same as a scheduled tick'). As shipped, the diff contradicts itself.",
+    "recommended_fix": "Decide the intended posture: pass sentry_client.Disabled per the spec, or update the spec and confirm manual-fire escalation is deliberate."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "failure-path",
+    "title": "AC7's failure path (DB/decode failure mid-tick → status 'failed' + Sentry) is not implemented: guarded-update DB errors stand down silently and the row re-sends every 15 min",
+    "location": "spec AC7 vs server/src/reference_checks/sweep.gleam (new): step_t0/step_co_nudge/step_reminder/step_warm_handoff/step_terminal Error branches",
+    "evidence": "+> **Given** a row that cannot be processed (a DB/decode failure mid-tick)\n+> **When** the tick hits it\n+> **Then** the row terminates `failed` (`outcome` NULL + `terminal_reason`), Sentry captures it, and NO landlord notification fires (§4.6)\n+    // A claim query error is transient (the SELECT worked) — leave the row\n+    // queued so the next tick re-sends + re-claims rather than terminalising\n+    // a row whose invite just went out (an orphaned invite to a dead row).\n+    Error(_) -> StoodDown",
+    "detail": "All five steps' Error branches return StoodDown with no Sentry capture, while AC7 requires failed+Sentry for DB/decode failures mid-tick. A persistent claim/advance error leaves next_attempt_at in the past, so the row is re-selected and re-sent every 15 minutes.",
+    "recommended_fix": "Capture Sentry on the Error branches and mark the row failed after N consecutive errors (per AC7), or amend AC7 to treat DB errors as retryable."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "spec-contradiction",
+    "title": "Cadence horizon computed from current next_attempt_at, contradicting the spec's `next_attempt_at = created_at + 24h/48h/96h/144h` bullets — after downtime the chase stretches past T+144",
+    "location": "spec OWNS #2 vs server/src/reference_checks/sql/sweep_advance.sql:21-23 / sweep_claim_t0.sql:30-31",
+    "evidence": "+   - `attempt_count=0` (status `queued`) → **T0 invite** (email+SMS via `send.send_invite`); guarded `queued → contact_initiated` + append + `next_attempt_at = created_at + 24h`.\n+    next_attempt_at = next_attempt_at + ($3 * interval '1 hour'),\n+-- `increment_hours` is the gap to the NEXT step (24 for T+24/T+48, 48 for\n+-- T+96), added to the row's CURRENT next_attempt_at. Computing from the\n+-- current horizon (not created_at) follows a re-enabled row's re-armed",
+    "detail": "Scope bullets promise created_at-anchored horizons; SQL adds increments to the current next_attempt_at. On-time ticks coincide, but after downtime each step re-anchors later, so the T+144 terminal drifts past 144h. Dev Note 3 documents the choice; the spec wasn't updated.",
+    "recommended_fix": "Reconcile the spec: either compute from created_at (needs a stored anchor) or rewrite the scope bullets to state current-horizon semantics, and pin the drift in AC5."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "code-smell",
+    "title": "mark_failed discards its `reason` — DB terminal_reason is always the generic 'sweep_processing_error' slug",
+    "location": "server/src/reference_checks/sweep.gleam (new): mark_failed()",
+    "evidence": "+    Ok(row_uuid) -> {\n+      let _ = sql.sweep_mark_failed(db, row_uuid, reason_processing_error)\n+      Nil\n+    }\n+    Error(_) -> Nil\n+  }\n+  capture(sentry, row_id, reason, \"processing error\")",
+    "detail": "The specific reason (\"bad reference_call id\", \"attempt_count out of cadence range: N\") goes only to Sentry; the DB's terminal_reason column always reads the constant slug, so the audit row loses why the row failed.",
+    "recommended_fix": "Pass `reason` (or a derived slug) to sweep_mark_failed so terminal_reason records the actual cause."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "observability",
+    "title": "Due-SELECT failure is reported as a successful tick — job exits 0 with 'sweep complete: due=0' and the manual route returns 200 with zeros",
+    "location": "server/src/reference_checks/sweep.gleam (new): run() Error branch; sweep_handler.gleam (new)",
+    "evidence": "+    Error(err) -> {\n+      // The due-SELECT failed — the sweep can't run. Capture + return empty.\n+      capture(sentry, \"\", \"due-select failed: \" <> query_error(err), \"select\")\n+      empty_summary(0)\n+    }\n+        \"reference_checks sweep complete: \"",
+    "detail": "With scheduler retry_count=0 and job max_retries=1, a persistently failing SELECT still completes the job successfully: the liveness log says 'complete' and the manual route 200s with zeros. Only a Sentry background event signals it — against AD-15's 'never silently dead'.",
+    "recommended_fix": "Return an error/non-zero exit (and non-200) when the due-SELECT fails, or log an explicit 'select failed' line so the liveness log cannot read as success."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "spec-contradiction",
+    "title": "Draft detection contradicts Dev Note 5 for \"{}\": code requires a non-empty decoded map, the note says any non-empty/non-'null' string → partial",
+    "location": "Dev Note 5 vs server/src/reference_checks/sweep.gleam (new): has_draft_answers()",
+    "evidence": "+5. **T+144 terminal detection** = `draft_answers` non-empty (`!= '' AND != 'null'`) → `partial`; else `unreachable`. Built via `result.partial_result` / `result.minimal_terminal_result`.\n+fn has_draft_answers(row: sql.SweepDueReferenceCallsRow) -> Bool {\n+  !dict.is_empty(questions.decode_draft(row.draft_answers))\n+}",
+    "detail": "A stored \"{}\" is a non-empty string (partial per the note) but decodes to an empty dict (unreachable per the code). The literal rule and the semantic rule disagree; an empty saved draft silently becomes 'unreachable'.",
+    "recommended_fix": "Make the note and code agree: either treat any stored draft string as partial, or keep the decode-based rule and amend the note."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "exactly-once",
+    "title": "Crash between the guarded advance and the warm-handoff dispatch permanently loses the §8.3 notification — and the dispatch Result is discarded unlogged",
+    "location": "server/src/reference_checks/sweep.gleam (new): step_warm_handoff() / dispatch_warm_handoff()",
+    "evidence": "+    Ok(pog.Returned(_, [_])) -> {\n+      // Advance won — dispatch the warm handoff (exactly-once: only the\n+      // advance winner notifies). Best-effort: a dispatch failure is logged,\n+      // never fails the row (the reminder already sent).\n+      dispatch_warm_handoff(db, deps, now_iso, row, context)\n+      WarmHandoff\n+    }\n+      let _ =\n+        notification_dispatch.notify_reference_unreachable(",
+    "detail": "Advance commits first; a crash before dispatch leaves the row at attempt_count=4 with a silent T+144 terminal — the landlord never gets the warm handoff (at-most-once, not exactly-once). The in-app dispatch error is also swallowed by `let _ =`.",
+    "recommended_fix": "Dispatch before the advance (accepting duplicate risk), or replay a missed notification at T+144; and log the dispatch Result instead of `let _ =`."
+  }
+]

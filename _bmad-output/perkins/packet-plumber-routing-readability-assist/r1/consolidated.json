@@ -1,0 +1,247 @@
+{
+ "job": "packet-plumber-routing-readability-assist",
+ "round": 1,
+ "pr": 40,
+ "reviewed_sha": "b0a6defb18fb8672c7f039a0f6c4ffedb76c7cfa",
+ "failed_layers": [],
+ "counts": {
+  "total_findings": 21,
+  "confirmed": 17,
+  "rejected": 4,
+  "unverifiable_speculative": 0,
+  "blockers": 0,
+  "warnings": 5,
+  "notes": 7,
+  "consolidated": 12
+ },
+ "verification_note": "Empirical gate: odin build app green; tools/lint.sh 5/5 green; odin test core 126/126; tools/harness.sh run 16/16 demos green; tools/harness.sh preview-check 7/7 green; 70/70 golden files byte-identical to baseline 69fc2e5 (sha256); zero core/ files in the diff; LOG_VERSION untouched; no new commands.",
+ "verdict": "READY TO MERGE",
+ "findings": [
+  {
+   "source": [
+    "security",
+    "edge"
+   ],
+   "severity": "warning",
+   "category": "perf-memory",
+   "title": "Per-drag-frame preview rebuild leaks temp-arena memory cumulatively (the app never free_alls)",
+   "location": "app/render/assist.odin:280 (preview_compute -> pp.routing_rebuild) + core/routing.odin:127-130",
+   "evidence": "core/routing.odin:127-130: `dist := make([]i32, int(n), context.temp_allocator)` / `settled := make([]bool, int(n), context.temp_allocator)` / `seen := make([]bool, int(n), context.temp_allocator)` / `min_cost := make([]i32, int(n), context.temp_allocator)` \u2014 4 arrays per rebuild; assist.odin calls `pp.routing_rebuild(&s.rt, &s.topo, cat)` every drag move frame; app/main.odin has NO free_all (grep: free_all appears only in core tests + harness).",
+   "detail": "The app is arena-free (ODN-18 [LATER]); routing_rebuild's 4 temp arrays + the 'route N' aprintf accumulate on the default temp allocator every frame of a drag \u2014 unbounded across a session of heavy dragging.",
+   "recommended_fix": "Either cache rebuild scratch in Preview_Scratch or add a per-frame temp arena with free_all once (harness pattern); note in ODN-18.",
+   "verification": "confirmed",
+   "merged_from": [
+    "security-01",
+    "edge-01"
+   ]
+  },
+  {
+   "source": [
+    "architecture"
+   ],
+   "severity": "warning",
+   "category": "preview-semantics",
+   "title": "A parallel-pipe routing no-op ON the winning path still fires the preview (dag_has_edge is pair membership only)",
+   "location": "app/render/assist.odin:373-381 (dag_has_edge); harness/assist_check.odin S7 pins only the UPSTREAM case",
+   "evidence": "assist.odin: `dag_has_edge :: proc(out: ^Route_Preview, a, b: u32) -> bool { for e in out.edges { if (e.u == a && e.v == b) || (e.u == b && e.v == a) { return true } } return false }` \u2014 pure pair membership; a second pipe on an existing bundle leaves min edge cost (and the table) unchanged, yet the pair is in the DAG -> preview fires with a route number for a draw that changes nothing. The I/O matrix row S7 says 'no glow, no route number for a no-op draw' \u2014 the harness's S7 only covers the pair-UPSTREAM case.",
+   "detail": "Spec intent: 'no packet affected -> no glow, no number' (I/O matrix). A parallel-pipe draw on the winning path affects no routing, but previews anyway \u2014 a misleading 'route N' for a redundant pipe.",
+   "recommended_fix": "Compare the what-if table's DAG cost/path against the pre-draw DAG; suppress the preview when the winning path is unchanged (or document the no-op preview as intended).",
+   "verification": "confirmed",
+   "merged_from": [
+    "arch-02"
+   ]
+  },
+  {
+   "source": [
+    "tests",
+    "blind"
+   ],
+   "severity": "warning",
+   "category": "coverage-gap",
+   "title": "S5 does not pin the E29 mid-flight rule \u2014 the on_edge/heading start is indistinguishable from at_node",
+   "location": "harness/assist_check.odin S5 (cand := pp.Cmd_Draw_Pipe{1, 3, wide} with no 3-4 pipe drawn); app/render/assist.odin preview_compute start selection",
+   "evidence": "S5 pre-draws only 0-1, 1-2, 2-4 and the candidate {1,3,wide} \u2014 node 3 has no onward pipe, so the DAG from EITHER start node 0 (at_node) or node 1 (heading) excludes the candidate; the scenario cannot distinguish `start := p.at_node` from `start = p.heading`. The code is correct (E29: re-decide at heading), but the test that claims to pin it does not.",
+   "detail": "The mid-flight re-decision branch in preview_compute has zero discriminating coverage \u2014 a regression to at_node would pass 7/7.",
+   "recommended_fix": "Redraw S5 so the candidate completes a route reachable from at_node but not from heading (or vice versa); assert the heading-based outcome.",
+   "verification": "confirmed",
+   "merged_from": [
+    "tests-01",
+    "blind-02"
+   ]
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "warning",
+   "category": "coverage-gap",
+   "title": "The app-layer surfaces (R3 glow lifecycle, two-buffer copy, T toggle, nudge) have zero automated pins",
+   "location": "app/main.odin:172-189 (render gate), 393-417 (commit path), 262-277 (T toggle) \u2014 no app test file exists",
+   "evidence": "ls app/*_test* -> none; the harness drives ONLY rnd.preview_compute (assist_check.odin); the round's own field notes record a HIGH-severity glow-buffer bug (shared-buffer first cut rendering a never-committed path) that was caught by review, not by a test \u2014 and the fix (two buffers + glow_gen gate) is still unpinned.",
+   "detail": "A broken glow gate (e.g. glow_gen captured pre-apply), a toggle that doesn't cycle, or a nudge that repeats would ship green \u2014 every one of the four acceptance surfaces is only manually verified.",
+   "recommended_fix": "Add a headless app-level pin (or extend preview-check) exercising commit->glow_gen gate, T cycling, nudge latch, and the cancel-never-corrupts-glow property.",
+   "verification": "confirmed",
+   "merged_from": [
+    "tests-02"
+   ]
+  },
+  {
+   "source": [
+    "architecture",
+    "tests",
+    "codebase"
+   ],
+   "severity": "warning",
+   "category": "test-tautology",
+   "title": "The preview-vs-sim cost cross-check uses a mirrored pricing scan (triplicated min-bundle-cost) \u2014 total cost is anchored only for fixture topologies",
+   "location": "app/render/assist.odin:246 (min_bundle_cost) + harness/assist_check.odin:92 (check_min_cost) + core/routing.odin:218-223 (pass-1 min scan)",
+   "evidence": "assist.odin: `min_bundle_cost :: proc(...) { best := i32(1) << 30; for pi ... { c := cat.pipe_tiers[t.pipe_tier[pi]].cost; if c < best { best = c } } return best }` and the harness's `check_min_cost` is a byte-for-byte copy \u2014 the harness compares preview cost vs sim cost computed by the SAME scan, so a systematic pricing error would pass both; only the literal pins (want 20/10/15) anchor the fixtures.",
+   "detail": "Three copies of the same edge-pricing rule with no shared accessor; the cross-check is partially self-referential for non-fixture topologies.",
+   "recommended_fix": "Export the min-bundle-cost scan from core (the table's pass-1 logic) and have both the preview and the check consume it; keep the literal pins.",
+   "verification": "confirmed",
+   "merged_from": [
+    "arch-01",
+    "tests-03",
+    "codebase-01"
+   ]
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "maintenance",
+   "title": "topology_clone_into hand-copies an explicit field list \u2014 a future Topology field missed here would silently diverge the preview",
+   "location": "app/render/assist.odin:180-226",
+   "evidence": "Verified complete TODAY: all 17 Topology fields (node_alive/id/kind/role/type/pos/next_node_id, pipe_alive/id/a/b/tier/span/weights/lane_over/next_pipe_id, gen) are copied. The hazard is forward-looking: no compile-time completeness check.",
+   "detail": "No present defect \u2014 completeness verified against core/topology.odin. A later slice adding a field without updating the clone list would silently zero/stale it in the what-if.",
+   "recommended_fix": "A comment in core/topology.odin beside the struct, or a clone shared with the core (ODN-18 arena note), so future fields are caught.",
+   "verification": "confirmed",
+   "merged_from": [
+    "blind-04"
+   ]
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "nudge-semantics",
+   "title": "draws_since_nudge counts every successful commit, not 'N successful draws in Full mode'",
+   "location": "app/main.odin:401 (app.draws_since_nudge += 1)",
+   "evidence": "`app.draws_since_nudge += 1` runs unconditionally on every commit; the nudge condition requires assist_mode == .Full at fire time. A player with draws spent in Glow_Only/Off can trigger the nudge after fewer than N Full-mode draws.",
+   "detail": "Minor deviation from the I/O matrix's 'N successful draws, mode Full, nudge unseen' trigger wording.",
+   "recommended_fix": "Increment only when assist_mode == .Full, or reword the spec to 'N successful draws'.",
+   "verification": "confirmed",
+   "merged_from": [
+    "blind-05"
+   ]
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "glow-lifecycle",
+   "title": "A commit with no live preview truncates a still-running R3 glow (glow_until = 0) and leaves the stale glow buffer in place",
+   "location": "app/main.odin:406-408",
+   "evidence": "`if app.preview_live && app.preview.ok { ... } else { app.glow_until = 0 }` \u2014 a dead-end/no-op commit extinguishes the previous draw's glow mid-window; glow.ok stays true with the old DAG (harmless: never rendered with glow_until 0, released at next run start).",
+   "detail": "Defensible design (each commit refocuses the glow) but a literal read of R3 ('keeps glowing for glow_ticks') is truncated by a subsequent no-preview commit.",
+   "recommended_fix": "Either let the old glow run its window, or add a comment naming the truncation as intended.",
+   "verification": "confirmed",
+   "merged_from": [
+    "blind-06"
+   ]
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "glow-lifecycle",
+   "title": "Any active drag blanks the committed R3 glow \u2014 even a drag with no valid candidate",
+   "location": "app/main.odin:180-187 (render gate)",
+   "evidence": "The gate renders the preview only when `app.preview_live && app.preview.ok && app.drag.active`, and the committed glow only when `!app.drag.active` \u2014 an unsnapped/invalid drag hides the running glow for the whole drag (flicker), then it returns on release.",
+   "detail": "Cosmetic flicker during the glow window; the preview-replaces-glow structure is deliberate.",
+   "recommended_fix": "Fall back to the committed glow while `drag.active && !preview.ok` (low priority).",
+   "verification": "confirmed",
+   "merged_from": [
+    "blind-07"
+   ]
+  },
+  {
+   "source": [
+    "edge"
+   ],
+   "severity": "note",
+   "category": "hud-state",
+   "title": "The graduation nudge persists frozen on the Game_Over screen where its dismiss key (T) is dead",
+   "location": "app/main.odin:759 (nudge draw in draw_hud) + 252-258 (Game_Over early return before the T handler)",
+   "evidence": "handle_input returns early for Game_Over (only R/ENTER restart) BEFORE the T toggle; draw_hud still draws the nudge while `app.nudge_until > 0 && app.tick <= app.nudge_until` \u2014 a nudge fired just before game-over lingers with no way to dismiss until restart.",
+   "detail": "Minor UX nit on the frozen end screen.",
+   "recommended_fix": "Gate the nudge draw to app.mode == .Run, or clear nudge_until on game-over.",
+   "verification": "confirmed",
+   "merged_from": [
+    "edge-02"
+   ]
+  },
+  {
+   "source": [
+    "acceptance"
+   ],
+   "severity": "note",
+   "category": "config-deviation",
+   "title": "Graduation N lives in data/assist.json, not balance.json \u2014 deviation documented in-spec and flagged for the human; rationale verified sound",
+   "location": "data/assist.json:1 + app/render/assist.odin:47-57 + _bmad-output/implementation-artifacts/spec-routing-readability-assist.md (Boundaries & Constraints)",
+   "evidence": "The spec's Boundaries section: 'Deviation from the briefing's \"N in balance.json\": balance.json folds every byte into cat.hash -> any field addition re-blesses ALL goldens (violates acceptance 5, STRICT)... Flagged for the human; a future legitimate re-bless can move it.' Fallback defaults exist and malformed values are validated (n > 0; g/t >= 0).",
+   "detail": "Pre-accepted by the lens-guards (assist.json is an allowed cosmetic-class ODN-5 surface). Keep on the human's radar for the next re-bless window.",
+   "recommended_fix": "None now \u2014 move to balance.json at the next legitimate golden re-bless.",
+   "verification": "confirmed",
+   "merged_from": [
+    "acc-02"
+   ]
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "The mutation-test negative control (corrupt a cost -> preview-check goes red) is a manual local run, not committed",
+   "location": ".github/workflows/ci.yml:91-97 (the preview-check step comment)",
+   "evidence": "The CI step comment: 'The negative control is a local run; CI pins the green path.' \u2014 no committed negative pin.",
+   "detail": "The cross-check has no committed negative control (a deliberately-diverged preview must fail).",
+   "recommended_fix": "Commit a drift-style negative pin (corrupt a tier cost, expect FAIL) alongside the drift-check pattern.",
+   "verification": "confirmed",
+   "merged_from": [
+    "tests-04"
+   ]
+  }
+ ],
+ "rejected": [
+  {
+   "source": "blind",
+   "id": "blind-01",
+   "title": "R3 glow dies one frame after commit (glow_gen pre-apply)",
+   "reason": "False: the commit path applies the edit via the ODN-2 fast path BEFORE capturing glow_gen \u2014 `pp.topology_apply_edit(...)` runs first in the same if-block, so app.state.topology.gen is already POST-apply; the render gate `gen == glow_gen` holds for the full window. Manual trace + code read confirmed."
+  },
+  {
+   "source": "blind",
+   "id": "blind-03",
+   "title": "tools/harness.sh unmodified \u2014 preview-check pass-through unverified",
+   "reason": "False: harness.sh forwards args verbatim (`exec ./bin/harness \"$@\"`); empirically ran `tools/harness.sh preview-check` -> 7/7 green, so the script pass-through and the render-package link are proven."
+  },
+  {
+   "source": "blind",
+   "id": "blind-08",
+   "title": "ecmp_pick inputs must match the sim's forward-time pick",
+   "reason": "Speculative 'what if' with no actual mismatch: core/flow.odin:707 calls `ecmp_pick(p.src, p.dst, u8(p.class), p.id, count)` \u2014 byte-identical to the harness's call in packet_path_matches. No divergence exists."
+  },
+  {
+   "source": "acceptance",
+   "id": "acc-01",
+   "title": "fmt brace-collision garbles preview-check FAIL diagnostics",
+   "reason": "False: Odin's fmt is printf-style (%v verbs); curly braces in `fmt.aprintf(\"...want {0-1,1-2}\", ...)` are literal text, not format specifiers. No collision exists."
+  }
+ ]
+}

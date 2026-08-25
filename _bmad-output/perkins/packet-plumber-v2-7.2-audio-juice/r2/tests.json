@@ -1,0 +1,52 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gap",
+    "title": "The 7 new app/audio unit tests are ornamental — no gate, script, or CI step runs `odin test app/audio`",
+    "location": "tools/ci-local.sh:56",
+    "evidence": "tools/ci-local.sh:56 — `  \"Core unit tests (the determinism + topology contracts)|odin test core\"` (gate 2 of 9, the only unit-test gate). .github/workflows/ci.yml:69-70 — `- name: Core unit tests (the determinism + topology contracts)` / `        run: odin test core`. app/audio/audio_test.odin:9 — `// Run: odin test app/audio    (links the stock raylib; pure tests only)`. A repo-wide grep for `odin test` across *.sh / *.yml / Dockerfile.ci returns ONLY those two `odin test core` lines — nothing executes the audio tests (I ran `odin test app/audio` manually: 7/7 pass).",
+    "detail": "These tests are the claimed r1 W2/W5 fix and the ONLY automated pins for caption priority/expiry/reset, wav_pack/synth forms, and variant bounds. Ungated, they silently rot; a caption-logic regression fails no gate.",
+    "recommended_fix": "Extend gate 2 in both tools/ci-local.sh and .github/workflows/ci.yml to `odin test core && odin test app/audio` (the container already links stock raylib for gate 3, so the test target links)."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "M-mute chain (the r1-B1 fix) has zero automated coverage — no scripted .M anywhere, mute on/off boundary untested",
+    "location": "harness/parity.odin:442",
+    "evidence": "The fixed chain (verified in worktree): app/input/poll.odin:61 `if rl.IsKeyPressed(.M) { append(&inp.events, Device_Event(Key_Press{key = .M})) }`; app/input/mouse.odin:128-129 `case .M:` -> `append(out, Intent(Toggle_Mute{}))`; app/input/exec.odin:44-46 `case Toggle_Mute:` -> `if inp.on_mute != nil { inp.on_mute(inp.user, inp) }`. But the parity harness scripts keys only at :442 `evs(inp.Key_Press{key = .Two}), // class 1 (streaming)`, :482 `.E`, :502/.566 `.X`, :532/.585/.675/.699/.718/.736 `.Esc`, :631 `.P` — `grep -rn \"key = .M\" harness/ demos/` returns nothing, and app/audio/audio_test.odin never calls toggle_mute/is_muted (grep-verified).",
+    "detail": "r1's blocker was this exact chain dying silently (poll emitted .M, no mapper collected it). The fix re-wires it, but no test pins any link — the parity pattern that caught that bug class ('a dropped key path fails the assert', Perkins W11) is not applied to .M.",
+    "recommended_fix": "Add a parity leg scripting evs(inp.Key_Press{key = .M}) with a stub on_mute asserting the intent fires, and/or a unit test toggling mute both ways on a zero Audio (device_on=false, so toggle_mute makes no rl calls)."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Asset-fallback error paths manual-only: corrupt-file UnloadSound branch and device-absent fallback have no automated coverage",
+    "location": "app/audio/audio.odin:256",
+    "evidence": "app/audio/audio.odin:256-266 — `load_variant :: proc(path: string, crisis: bool, idx: int) -> rl.Sound {` / `if rl.FileExists(cstring(raw_data(path))) {` / `s := rl.LoadSound(cstring(raw_data(path)))` / `if s.frameCount > 0 {` ... `rl.UnloadSound(s)`. The test file pins only the pure half (app/audio/audio_test.odin header: `// WAV synthesis/packing). No audio device, no raylib calls — the tested`); grep confirms the 7 tests never call load_variant or audio_init.",
+    "detail": "The r1-W6 hygiene branch (failed decode -> UnloadSound before the placeholder fallback) and the no-device silent fallback are the asset contract's error handling; only the happy-path synth forms are tested. Coverage rests on the documented manual smoke check.",
+    "recommended_fix": "Acceptable as documented manual verification (rl-gated by construction); if durability is wanted, factor slot resolution into a pure decision helper and unit-test that."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "New r2 flush variant-cycle for multi-play batches is untested",
+    "location": "app/audio/audio.odin:211",
+    "evidence": "app/audio/audio.odin:211-224 — `audio_flush :: proc(a: ^Audio) {` / `if !a.device_on || a.muted {` ... `for k in 0..<a.pending.crisis_plays {` / `v := (a.pending.crisis_variant + i32(k)) % CRISIS_VARIANTS` / `rl.PlaySound(a.crisis[v])`. grep of app/audio/audio_test.odin confirms no test calls audio_flush; the device gate makes the cycle math unreachable in `odin test` as written.",
+    "detail": "The r1 note-fold changed flush to cycle variants across same-batch plays ((variant+k)%N). That new index math has zero automated coverage; a mistake would mis-pick or panic only in the running app.",
+    "recommended_fix": "Extract the cycle index into a pure helper (e.g. cycle_variant(base, k, n)) and unit-test it; or add a multi-play flush assertion to the manual app-smoke checklist."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "tools/ci-local.sh:56",
+    "evidence": "tools/ci-local.sh:56 — `  \"Core unit tests (the determinism + topology contracts)|odin test core\"` (no gate runs `odin test app/audio`; ci.yml:70 identical). Traceability tally: FULL (gate-executed) = crisis draw, throttled arrival draw, ODN-15 live-vs-replay, per-kind vacuous-guards, variant-from-cosmetic-rng, 29-demo suite unshifted; PARTIAL/none-gated = captions (unit tests no gate runs), asset fallback (error paths manual), reset freshness (ungated unit); NONE = M-mute end-to-end, flush variant-cycle.",
+    "detail": "P0 100% (the determinism spine, both draws, the guards, and suite stability are gate-pinned). P1 ~70%: captions, fallback, and reset pins are ornamental (no gate executes them) and M-mute is manual-only. Overall ~68% (6/11 FULL, 3 PARTIAL, 2 NONE). P1 <80% and overall <80% -> FAIL.",
+    "recommended_fix": "Wire `odin test app/audio` into gate 2 (ci-local.sh + ci.yml) and add one scripted-.M assertion (parity leg or unit test) — that raises P1 to ~90%+ and overall above 80% -> PASS."
+  }
+]

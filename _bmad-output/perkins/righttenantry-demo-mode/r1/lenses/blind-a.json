@@ -1,0 +1,92 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "state-management",
+    "title": "Demo store mutations are discarded — `let _ = next` throws away the updated store at every write site",
+    "location": "client/src/client.gleam (hunks @@ -3063,19 +2516,42 @@, @@ -5589,12 +5946,26 @@, @@ -5776,12 +6147,28 @@, @@ -5874,12 +6261,28 @@)",
+    "evidence": "+                      let #(next, demo_eff) =\n+                        demo_api.mark_application_opened(\n+                          demo_store_of(model),\n...\n+                      let _ = next\n+                      demo_eff\n\nand\n\n+      let #(next, eff) =\n+        demo_api.create_vacancy(\n+          demo_store_of(model),\n...\n+      let _ = next\n+      eff\n\nplus model.gleam: \"+    // `demo_store` is the pure MVU state seeded from the fixtures on /demo\" and the inline comment \"+                  // demo: the store idempotently moves Submitted -> UnderReview.\"",
+    "detail": "DemoStore is documented as pure MVU state, yet every demo write (mark_application_opened, create_vacancy, update_vacancy x2) binds the returned store to `next` and discards it; model.demo_store is never updated, so mutations cannot persist to subsequent reads.",
+    "recommended_fix": "Thread the returned store into the model (e.g. have demo_api return a Msg that stores `next`, or perform the store update in update via demo_update.handle) instead of `let _ = next`."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "missed-branch",
+    "title": "?extended=success refetch and ?payment=success poll/pixel fire real network calls in demo mode",
+    "location": "client/src/client.gleam (handle_browser_change, inside hunk @@ -5275,171 +4803,1000 @@)",
+    "evidence": "+                  let replace_eff =\n+                    modem.replace(route_to_path(route), None, None)\n+                  let refetch_eff =\n+                    vacancy_api.get_detail(vid, msg.ApiReturnedVacancyDetail)\n\nand\n\n+                  let poll_eff = schedule_payment_poll(vid)\n...\n+                  let pixel_eff =\n+                    payment_api.fire_pixel_purchase_for_session(\n+                      session_id,\n+                      msg.AppNoOp,\n+                    )",
+    "detail": "Every other fetch in handle_browser_change got a `case updated_model.demo_mode` demo branch, but the extended=success refetch uses vacancy_api.get_detail unconditionally and the payment=success arm schedules real payment polling plus a real Pixel call — reachable in demo via /vacancies/v-<id>?payment=success.",
+    "recommended_fix": "Gate the payment/extended query-param handlers on `!updated_model.demo_mode` (or branch the refetch to demo_api) so demo navigation never triggers real payment, pixel, or vacancy fetches."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "missed-branch",
+    "title": "Billing route fetch in handle_browser_change is not demo-gated",
+    "location": "client/src/client.gleam (handle_browser_change Billing arm, inside hunk @@ -5275,171 +4803,1000 @@)",
+    "evidence": "+    routes.Billing -> #(\n+      Model(\n+        ..init_profile_form(updated_model),\n+        settings_section: model.BillingSection,\n+        billing_loading: True,\n+      ),\n+      effect.batch([\n+        eff,\n+        settings_api.fetch_billing_history(\n+          on_response: ApiReturnedBillingHistory,\n+        ),\n+      ]),\n+    )",
+    "detail": "In demo mode a user can navigate to /billing (protected but not public, so the `_, True` branch keeps demo mode); the Billing arm fires the real settings_api.fetch_billing_history with the demo CSRF token, contradicting the model.gleam claim that nothing in demo touches the network.",
+    "recommended_fix": "Either exclude Billing/Settings from reachable demo routes, or add a demo branch returning static billing data / effect.none()."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "inconsistency",
+    "title": "Bulk-reject dispatch arms lack a demo branch while their response handler's refetch has one",
+    "location": "client/src/client.gleam (UserClickedMarkAllRejected / UserClickedMarkSelectedRejected vs ApiReturnedBulkReject, hunk @@ -5275,171 +4803,1000 @@)",
+    "evidence": "+    UserClickedMarkSelectedRejected(vid) -> {\n+      let ids = set.to_list(model.selected_for_rejection)\n+      case ids {\n+        [] -> #(model, effect.none())\n+        _ -> #(\n+          Model(..model, bulk_reject_loading: True),\n+          application_api.bulk_reject_applications(\n+            vid,\n+            ids,\n+            \"leaderboard_select\",\n+            model.csrf_token,\n+            ApiReturnedBulkReject,\n+          ),\n\ncontrast:\n\n+            Some(vid) ->\n+              // demo: refetch the leaderboard from the store.\n+              case model.demo_mode {\n+                True ->\n+                  demo_api.fetch_leaderboard(",
+    "detail": "UserClickedMarkAllRejected and UserClickedMarkSelectedRejected call the real application_api.bulk_reject_applications unconditionally, yet ApiReturnedBulkReject's refetch branches on demo_mode — in demo these fire a real state-changing POST with csrf_token \"demo-csrf-token\".",
+    "recommended_fix": "Add a demo_mode branch in both dispatch arms routing to demo_api (or have demo_update intercept these messages), matching the pattern used in the response handler."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "inconsistency",
+    "title": "VacancyEdit is a demo deep-link route but enter_demo seeds no edit state or fetch for it",
+    "location": "client/src/client.gleam (is_demo_route vs enter_demo / demo_entry_effects)",
+    "evidence": "+fn is_demo_route(route: Route) -> Bool {\n+  case route {\n+    routes.Demo -> True\n+    routes.VacancyDetail(id)\n+    | routes.VacancyEdit(id)\n+    | routes.VacancyHandoff(id) -> string.starts_with(id, \"v-\")\n\nvs\n\n+      let request_ids = case route {\n+        routes.VacancyDetail(id) | routes.VacancyHandoff(id) -> #(\n+          Some(id),\n+          None,\n+        )\n+        routes.ApplicationDetail(vid, aid) -> #(Some(vid), Some(aid))\n+        _ -> #(None, None)\n+      }\n\nand demo_entry_effects arms cover only Demo|Dashboard, VacancyDetail|VacancyHandoff, ApplicationDetail, ArchivedVacancies, Comparison, then \"_ -> []\".",
+    "detail": "A fresh load of /vacancies/v-maples/edit boots into demo mode (is_demo_route matches VacancyEdit) but enter_demo sets no vacancy_edit_loading/vacancy_edit_id and demo_entry_effects dispatches no get_for_edit — the edit page renders uninitialised, unlike every other deep-linkable demo route.",
+    "recommended_fix": "Add a routes.VacancyEdit(id) arm to demo_entry_effects dispatching demo_api.get_for_edit and set vacancy_edit_loading/vacancy_edit_id in enter_demo, or drop VacancyEdit from is_demo_route."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "auth",
+    "title": "Exiting demo to a public route drops auth to NotAsked with no session restore and leaves the demo CSRF token",
+    "location": "client/src/client.gleam (BrowserChangedUrl demo-exit branch, hunk @@ -456,647 +485,25 @@)",
+    "evidence": "+        _, True ->\n+          case is_public_route(route) {\n+            True ->\n+              handle_browser_change(\n+                Model(\n+                  ..model,\n+                  demo_mode: False,\n+                  demo_store: None,\n+                  auth: NotAsked,\n+                ),\n+                uri,\n+                route,\n+              )\n\nvs the non-demo init path which includes \"+        auth_api.check_session(ApiReturnedSession),\". enter_demo sets \"+          csrf_token: \"demo-csrf-token\",\" which this exit branch does not clear.",
+    "detail": "A logged-in landlord who visits /demo has model.auth overwritten with the mock landlord; on exit to Landing/Login the SPA keeps auth NotAsked and never re-runs check_session, so they appear logged out (and carry the literal demo CSRF token) until a full page reload.",
+    "recommended_fix": "On demo exit, dispatch auth_api.check_session(ApiReturnedSession) alongside handle_browser_change and reset csrf_token to \"\"."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "docs",
+    "title": "listen_visibility_refresh doc comment was moved onto handle_browser_change, leaving the wrong function documented",
+    "location": "client/src/client.gleam (hunk @@ -5275,171 +4803,1000 @@, function extraction boundary)",
+    "evidence": "+/// fetches branch on `model.demo_mode` so an in-demo navigation fetches\n+/// demo data (see the `// demo:` markers).\n+/// Register a `visibilitychange` listener that silently refreshes /me each\n+/// time a background tab comes back to the foreground. Cheap defence against\n+/// the multi-tab footgun: if tab A accepts the policy, tab B (which would\n+/// otherwise sit on the old modal forever) picks up the new\n+/// server_policy_version the moment the landlord switches back to it.\n+fn handle_browser_change(\n\nand the removal:\n\n-/// Register a `visibilitychange` listener that silently refreshes /me each\n-/// time a background tab comes back to the foreground. Cheap defence against\n-/// the multi-tab footgun: if tab A accepts the policy, tab B (which would\n-/// otherwise sit on the old modal forever) picks up the new\n-/// server_policy_version the moment the landlord switches back to it.\n fn listen_visibility_refresh() -> Effect(Msg) {",
+    "detail": "The extraction glued the visibilitychange doc paragraph onto handle_browser_change's new doc comment while listen_visibility_refresh lost its doc entirely — the comment now describes a function it does not sit on.",
+    "recommended_fix": "Move the visibilitychange paragraph back above listen_visibility_refresh and keep only the navigation-reset doc on handle_browser_change."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "routes.Demo arm in view_protected_page is unreachable given is_protected_route excludes Demo",
+    "location": "client/src/client.gleam (view_page / view_protected_page / is_protected_route hunks)",
+    "evidence": "+    // Demo — ungated by definition: render the demo shell + dashboard\n+    // directly, no auth check. The demo's own data fetches fill the body.\n+    routes.Demo -> view_demo_page(model)\n\nand\n\n+  let content = case route {\n+    routes.Demo -> dashboard.view_dashboard(model)\n\nand\n\n+    routes.Demo\n+    | routes.Landing\n+    | routes.Login\n+    | routes.Signup\n+    | routes.ForgotPassword\n+    | routes.ResetPassword -> False   (is_protected_route)",
+    "detail": "view_page handles Demo before the protected-route fallback and is_protected_route lists Demo in the False branch, so the `routes.Demo -> dashboard.view_dashboard(model)` arm inside view_protected_page can never render — two divergent Demo render paths exist, one dead.",
+    "recommended_fix": "Remove the Demo arm from view_protected_page (or route Demo solely through it) so there is exactly one demo render path."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "routes.Dashboard arm in demo_entry_effects is unreachable; navigating to /demo mid-demo silently re-seeds",
+    "location": "client/src/client.gleam (demo_entry_effects and BrowserChangedUrl demo arm)",
+    "evidence": "+fn demo_entry_effects(store: DemoStore, route: Route) -> Effect(Msg) {\n+  let base = [demo_api.fetch_notifications(store, ApiReturnedNotifications)]\n+  let route_eff = case route {\n+    routes.Demo | routes.Dashboard -> [\n+      demo_api.list_vacancies(store, ApiReturnedDashboardData),\n+    ]\n\nwith doc \"+/// The fetches a fresh demo entry needs for its route: dashboard + bell for\n+/// the demo root, the route's own data for a deep-linked demo route.\"\n\nand call sites: \"+  case is_demo_route(route) {\" (init; Dashboard yields False via is_demo_route's \"_ -> False\") and \"+        routes.Demo, _ -> enter_demo(model, route)\" (BrowserChangedUrl, Demo only).",
+    "detail": "enter_demo is only ever called with routes.Demo or an is_demo_route deep link, so the Dashboard alternative in demo_entry_effects is dead; separately, `routes.Demo, _ -> enter_demo(...)` re-seeds the store even when already in demo, so any link to /demo silently wipes demo state.",
+    "recommended_fix": "Drop the Dashboard alternative from demo_entry_effects, and guard the BrowserChangedUrl Demo arm (e.g. skip re-seed when model.demo_mode is already True) or document the reset-on-/demo behaviour."
+  }
+]

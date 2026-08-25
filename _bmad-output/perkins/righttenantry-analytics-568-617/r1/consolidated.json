@@ -1,0 +1,179 @@
+{
+  "job": "righttenantry-analytics-568-617",
+  "round": 1,
+  "pr": 624,
+  "reviewed_sha": "bdfc620b8dd3625ea370c11cd42293026a75edcd",
+  "reviewers_completed": ["blind", "edge", "acceptance", "security", "architecture", "codebase", "tests"],
+  "failed_layers": [],
+  "total_findings": 17,
+  "confirmed": 16,
+  "rejected": 1,
+  "unverifiable_speculative": 0,
+  "guard_verdicts": {
+    "fire_once_meta_capi": "HOLDS — dispatch_signup_meta fires only on row.is_new=True (upsert xmax=0 insert signal, atomic) and gates internally on consent_check.marketing_granted(req) (auth_handler.gleam:1513-1542). Returning sign-in (is_new=False) fires nothing even with consent (pinned by oauth_returning_signin_fires_no_meta_test). No browser Pixel on the OAuth path (Pixel CompleteRegistration fires only in the password signup response handlers via the echoed meta_event_id, client.gleam:1209/1225) — CAPI alone carries the OAuth event, no CAPI+Pixel double-fire.",
+    "consent_gate_plan5": "HOLDS — consent_check.marketing_granted(req) inside dispatch_signup_meta returns None without consent; OAuth path inherits the gate by calling the same function. Pinned by oauth_insert_skips_meta_without_consent_test.",
+    "auto_create_decision_recorded": "VERIFIED — comments + explicit log lines at auth_handler.gleam:510-522 and session_middleware.gleam:92-104. Decision not re-litigated per round guards.",
+    "first_touch_cookie_lifecycle": "HOLDS — set at initiate only when known params present (clamped, allow-listed), signed, 300s max-age matching pkce_max_age, read at callback, cleared on all 8 terminal OAuth responses. provider=google $set_once fallback verified.",
+    "baseline_583": "UNTOUCHED — identify_with_set_once + capture (signup_completed/login_succeeded) structure unchanged; only the set_once argument changed."
+  },
+  "rejected_findings": [
+    {
+      "source": ["blind"],
+      "title": "dispatch_signup_meta called with row.id where the test's own comment says event_id must never be the landlord row id",
+      "reason": "False premise: dispatch_signup_meta's 3rd parameter IS landlord_uuid by signature (auth_handler.gleam:1513-1518); the event_id is generated inside the function as uuid.v4_string(). The test comment is accurate about the recorded event_id value. No contract violation."
+    }
+  ],
+  "findings": [
+    {
+      "source": ["edge", "codebase"],
+      "severity": "warning",
+      "category": "cookie-lifecycle",
+      "title": "Organic re-initiate does not clear a stale rt_first_touch cookie left by an abandoned attempt, so the callback attributes the new signup to the old attempt's params",
+      "location": "server/src/auth/auth_handler.gleam:1002-1015",
+      "evidence": "case first_touch_cookie.from_initiate_query(wisp.get_query(req)) {\n        [] -> response\n        pairs ->\n          response\n          |> wisp.set_cookie(...)",
+      "detail": "Attempt 1 (paid landing) sets the cookie; user abandons at Google (no callback, no terminal clear); a second organic initiate within 300s hits the `[] -> response` branch which neither overwrites nor clears; the callback then locks the stale params via $set_once, contradicting the module's documented 'no cookie -> provider=google' guarantee.",
+      "recommended_fix": "In the `[] -> response` branch, also apply `first_touch_cookie.clear_cookie(response, req)` so every initiate is set-or-clear.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "warning",
+      "category": "boundary-claim",
+      "title": "'~4KB header budget' protection claim is false for non-ASCII values — clamp is grapheme-based, not byte-based",
+      "location": "server/src/auth/attribution.gleam (clamp_value) + server/src/auth/first_touch_cookie.gleam (from_initiate_query doc)",
+      "evidence": "pub fn clamp_value(raw: String) -> String {\n  raw\n  |> string.trim\n  |> string.slice(0, max_value_len)",
+      "detail": "Verified: stdlib string.slice is grapheme_slice (grapheme clusters, not bytes); uri.query_to_string percent-encodes each UTF-8 byte to %XX (3x). 8 keys x 200 four-byte graphemes => ~19KB percent-encoded, past the ~4KB cookie cap; browsers silently drop the Set-Cookie and attribution is lost (graceful provider=google fallback). The doc's budget claim only holds for ASCII.",
+      "recommended_fix": "Clamp by encoded byte length before cookie_value(), or scope the doc comment to ASCII.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests"],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "title": "Client-side OAuth initiate wiring (UserClickedGoogleSignIn -> query string) has no test",
+      "location": "client/src/client.gleam:2038-2053",
+      "evidence": "query: case model.first_touch_params {\n            [] -> None\n            params -> Some(first_touch.to_query_string(params))\n          }",
+      "detail": "Verified: no client test references UserClickedGoogleSignIn (grep of client/test/). The #617 mechanism's only untested link; a wiring regression silently ships every OAuth signup unattributed — the exact bug this PR fixes. The client.update harness exists (client_test.gleam:164).",
+      "recommended_fix": "Add client.update tests for UserClickedGoogleSignIn: params present -> query on the initiate URI; empty params -> query None.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind", "codebase"],
+      "severity": "note",
+      "category": "test-duplication",
+      "title": "find_set_cookie helper duplicated across six test files (three pre-existing — matches established convention)",
+      "location": "server/test/auth/auth_test.gleam:71 + first_touch_cookie_test.gleam:178 + integration/auth_integration_test.gleam:799",
+      "evidence": "fn find_set_cookie(resp: wisp.Response, name: String) -> Result(String, Nil) {",
+      "detail": "Verified: identical helper now in six files; cookie_attributes_test.gleam:32, csrf_cookie_test.gleam:44 and external_id_cookie_test.gleam:42 pre-date the diff, so the three new copies follow the established per-file convention rather than violating it. Drift risk if Set-Cookie formatting changes.",
+      "recommended_fix": "Leave as-is per convention; if a seventh copy appears, extract one shared helper into server/test/helpers and migrate all call sites.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "note",
+      "category": "test-gap",
+      "title": "Initiate test claims the cookie payload is signed base64url but never asserts it — a wisp.Plain regression would pass",
+      "location": "server/test/auth/auth_test.gleam (oauth_initiate_sets_first_touch_cookie_test)",
+      "evidence": "string.starts_with(cookie, cookie_names.first_touch() <> \"=\")\n  |> should.be_true\n  string.contains(cookie, \"Max-Age=300\")",
+      "detail": "Verified: assertions check only name prefix and Max-Age; a Plain cookie containing the raw query string passes identically, while read_cookie(Signed) would silently return empty in production. The round-trip tests sign via simulate.cookie regardless of how the handler sets it, so nothing else guards the write being signed.",
+      "recommended_fix": "Assert the cookie value contains no 'utm_' substring (or round-trip decode it) so a Plain regression fails the test.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "note",
+      "category": "doc-vs-behavior",
+      "title": "set_once_with_fallback doc claims 'no-op for returning sign-ins' but provider=google is new for every pre-deploy account",
+      "location": "server/src/auth/first_touch_cookie.gleam:96-97",
+      "evidence": "/// for returning sign-ins (their original values are already locked).",
+      "detail": "Verified: pre-deploy OAuth signups locked an EMPTY $set_once set, so provider is not already locked for them; their next sign-in writes provider=google. The behavior is deliberate (PR body documents it as a backfill bonus) — only the doc comment misstates it.",
+      "recommended_fix": "Reword the doc to state provider is written once to any account lacking it.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["security"],
+      "severity": "note",
+      "category": "boundary",
+      "title": "First-touch attribution poisoning: unauthenticated /auth/oauth/google persists attacker-chosen UTM params into a signed cookie, locked into the victim's $set_once on their first Google signup",
+      "location": "server/src/auth/auth_handler.gleam:1002, 1131, 1177",
+      "evidence": "case first_touch_cookie.from_initiate_query(wisp.get_query(req)) {",
+      "detail": "Verified: the public GET initiate route persists attacker-chosen query values on any top-level navigation (first-party Set-Cookie context; SameSite does not block it). Impact is attribution corruption only: values allow-listed, clamped, percent-encoded, signature-verified — no injection or forgery. The same poisoning class pre-exists via crafted landing URLs on the password path (#466); the endpoint is a slightly shorter path to the same surface.",
+      "recommended_fix": "Accept and document as inherent to URL-param attribution, or require a first-party signal (Sec-Fetch-Site: same-origin) on initiate before persisting params.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["architecture"],
+      "severity": "note",
+      "category": "coupling",
+      "title": "set_once_with_fallback hardcodes provider=google inside a provider-agnostic flow",
+      "location": "server/src/auth/first_touch_cookie.gleam:102",
+      "evidence": "[] -> [#(\"provider\", json.string(\"google\"))]",
+      "detail": "Verified: complete_oauth_flow never learns the provider (token_resp has no provider field); the google literal is held correct only by allowed_oauth_providers = [\"google\"] (auth_handler.gleam:972). A second provider would silently misattribute.",
+      "recommended_fix": "Pass the provider into set_once_with_fallback (or thread it from the callback route) rather than hardcoding.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["architecture", "codebase"],
+      "severity": "note",
+      "category": "constant-mirror",
+      "title": "first-touch cookie max-age is a second literal mirroring pkce_max_age, coupled by comment only",
+      "location": "server/src/auth/first_touch_cookie.gleam:30 + server/src/auth/auth_handler.gleam:969",
+      "evidence": "pub const max_age: Int = 300\n// vs\nconst pkce_max_age = 300",
+      "detail": "Verified: two 300 literals in separate modules, coupled only by the docstring 'same max-age as the PKCE verifier'. A future shortening of the PKCE window would silently leave the attribution cookie outliving the flow it tags.",
+      "recommended_fix": "Reference one shared constant (export pkce_max_age or move both windows into a shared auth module).",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["architecture"],
+      "severity": "note",
+      "category": "maintainability",
+      "title": "Attribution key list triplicated (client extractor, signup_decoder, first_touch_cookie.keys) with no enforced sync",
+      "location": "server/src/auth/first_touch_cookie.gleam:35",
+      "evidence": "const keys = [\n  \"utm_source\",\n  \"utm_medium\",\n  \"utm_campaign\",\n  \"utm_content\",\n  \"utm_term\",\n  \"gclid\",\n  \"fbclid\",\n  \"msclkid\",\n]",
+      "detail": "Verified: the same 8 keys live in client/src/helpers/first_touch.gleam, auth_handler.gleam:147-154 (signup_decoder), and first_touch_cookie.keys, joined only by comments. Adding a key to the decoder but not the cookie module silently drops OAuth attribution for it.",
+      "recommended_fix": "Define the server key list once (attribution.gleam, imported by first_touch_cookie) and add a unit test asserting cookie keys == signup body keys.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage-gap",
+      "title": "OAuth callback error branches never exercised; the added clear_cookie calls are untested in situ",
+      "location": "server/src/auth/auth_handler.gleam:1040, 1072, 1081, 1090, 1141, 1258, 1268",
+      "evidence": "|> first_touch_cookie.clear_cookie(req)",
+      "detail": "Verified: 8 clear_cookie call sites; only the success path (integration) and the function itself (unit) are pinned. Branches are pre-existing and untested; additions are one-liners of a unit-tested function — P3.",
+      "recommended_fix": "Acceptable as-is. If hardening: one test driving handle_oauth_callback with an error query param, asserting both first-touch and PKCE cookies expire.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage-gap",
+      "title": "Auto-create log-line changes (issue #568 decision metric) untested — no log-capture harness exists",
+      "location": "server/src/auth/auth_handler.gleam:514-522 + server/src/auth/session_middleware.gleam:96-104",
+      "evidence": "wisp.log_info(\n                \"Login: auto-creating landlord for auth_user_id \"",
+      "detail": "Verified: the decision is recorded in comments + log text per the settled issue steer; the not-firing is pre-existing behavior — the diff only rewrote comments/log strings.",
+      "recommended_fix": "Ship as-is; a log-capture harness for two strings is disproportionate.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage-gate",
+      "title": "Advisory test gate: PASS",
+      "location": "N/A",
+      "evidence": "N/A",
+      "detail": "P0 100% (fire-once + consent gate integration-pinned), P1 100%, overall ~83% (7 FULL / 1 PARTIAL / 1 NONE of 9) >= 80%. The single P2 (client glue) is the only action item.",
+      "recommended_fix": "Add the client.update test for UserClickedGoogleSignIn — closes the P2 gap, overall to ~94%.",
+      "verification": "confirmed"
+    }
+  ],
+  "reviewer_agreement": [
+    "Organic re-initiate stale-cookie gap [edge, codebase] (warning)",
+    "find_set_cookie duplication [blind, codebase] (note)",
+    "max_age mirror [architecture, codebase] (note)"
+  ],
+  "ci_caveat": "The PR's only CI run (31939964256) failed at infrastructure level — no runner was ever assigned to any of the 4 jobs (duration_ms: 0 each, zero steps executed). Not a code signal; needs a rerun before merge.",
+  "verdict": "READY TO MERGE",
+  "verdict_reason": "0 blockers. The round's hard gate (Meta CAPI fire-once + consent gating on the OAuth insert path) holds; #617 cookie lifecycle verified end-to-end; 3 warnings are advisory hardening (stale-cookie clear on organic re-initiate, byte-vs-grapheme clamp doc/behavior, missing client wiring test)."
+}

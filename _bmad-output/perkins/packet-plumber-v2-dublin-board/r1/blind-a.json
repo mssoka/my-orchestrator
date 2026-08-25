@@ -1,0 +1,132 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "doc-code-contradiction",
+    "title": "ATTACH district scoping promised in map.odin/demo/tests but implemented as explicitly global; per-district pool machinery is production-dead",
+    "location": "core/growth.odin:growth_board_ring_scan; core/map.odin:file header",
+    "evidence": "+// board: the ATTACH family draws from the anchor's OWN district's pool (an\n+// estate never crosses a district boundary), and the derived cluster view is\n+// unchanged (radius adjacency) — the district scoping at the DRAW makes\n+// cross-district estates unreachable by construction. The exact interplay is\n+// documented in growth.odin.\n--- vs ---\n+// The ring is GLOBAL (not district-scoped): the estate forms on the streets\n+// the grid gives it — a street crossing a district's Voronoi boundary keeps\n+// its houses together (the streets-rule interplay, documented in the header);\n+// the seed's district labels the estate.\n--- and the scan body has no district filter: ---\n+\tfor k in 0..<len(board.candidates) {\n+\t\tc := board.candidates[k]",
+    "detail": "map.odin's header, the dublin demo comment, and the test header all promise district-scoped ATTACH; the ring scan never reads candidate_district/district_start, so those fields are write-only in production and the documented invariant is unenforced.",
+    "recommended_fix": "Pick one contract: filter ring candidates by the anchor's district (candidate_district + district_start), or delete the per-district fields and correct the map.odin/demo/test comments to match the global ring."
+  },
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "invalid-free",
+    "title": "test_board deletes string-literal district names — freeing static data",
+    "location": "core/map_test.odin:test_board_destroy",
+    "evidence": "+\tappend(&b.districts, Map_District{name = \"A\", pos = {6, 6}})\n+\tappend(&b.districts, Map_District{name = \"B\", pos = {24, 6}})\n--- vs the destroy: ---\n+test_board_destroy :: proc(b: ^Map_Board) {\n+\tdelete(b.candidates)\n+\tdelete(b.candidate_district)\n+\tdelete(b.district_start)\n+\tfor d in b.districts {\n+\t\tdelete(d.name)\n+\t}\n+\tdelete(b.districts)\n+}\n--- the loader clones precisely to make names deletable: ---\n+\t\tappend(&b.districts, Map_District{name = strings_clone(name, allocator), kind = kind, pos = {f32(px), f32(py)}})",
+    "detail": "\"A\"/\"B\" are static string literals; delete(d.name) frees them through the context allocator — invalid free/UB. The loader clones names exactly so map_board_destroy can delete them.",
+    "recommended_fix": "In test_board, clone the names (e.g. strings.clone(\"A\", context.allocator)) or stop deleting d.name in test_board_destroy."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "allocator-mismatch",
+    "title": "map_board_destroy frees cloned strings via the destroy-time context, not the loader's allocator",
+    "location": "core/map.odin:map_board_destroy",
+    "evidence": "+map_board_destroy :: proc(b: ^Map_Board) {\n+\tfor d in b.districts {\n+\t\tdelete(d.name)\n+\t}\n+\tdelete(b.districts)\n+\tdelete(b.attribution)\n--- strings are cloned with the caller's allocator: ---\n+\tb.attribution = strings_clone(attr, allocator)\n--- tests load with temp_allocator then destroy under the default context: ---\n+\tb, err := map_board_load(transmute([]u8)src, &bal, context.temp_allocator)\n+\tdefer map_board_destroy(&b)",
+    "detail": "Dynamic arrays carry their allocator; strings do not. map_board_destroy's string deletes go through whatever context.allocator is current — mismatched free when the board was loaded with a custom allocator (both tests do).",
+    "recommended_fix": "Have map_board_destroy take the board's allocator (stored on Map_Board at load) and free name/attribution through it."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "test-overclaim",
+    "title": "map_test header claims district-containment and E31 pins that the tests never assert",
+    "location": "core/map_test.odin:file header; test_growth_dublin_attach_stays_in_estate_radius",
+    "evidence": "+//   (d) dublin growth spawns land ON the pool (a real-street tile), the E31\n+//       predicates still gate (never an illegal placement), and the ATTACH\n+//       family stays WITHIN the anchor's district (the growth_groups\n+//       interplay: cluster radius/caps apply within districts);\n--- the actual assertions are pool membership, grid bounds, radius only: ---\n+\t\ttesting.expectf(t, on_pool, \"attach spawn %v is NOT on a pool tile\", pos)\n+\t\t// the E31 floor still holds (the existing predicate — belt)\n+\t\ttesting.expectf(t, pos[0] >= 0 && pos[0] < board.w_tiles && pos[1] >= 0 && pos[1] < board.h_tiles,",
+    "detail": "No test asserts district membership of attach spawns, and the comment labeled \"the E31 floor\" checks only grid bounds, not node/pipe separation. The header advertises coverage that does not exist.",
+    "recommended_fix": "Either add the district-membership and min-separation assertions, or rewrite pin (d) to state what is actually checked (pool membership + radius)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "leak-on-error",
+    "title": "map_board_load error paths discard the partially-built board, leaking its allocations",
+    "location": "core/map.odin:map_board_load",
+    "evidence": "+\t\tappend(&b.districts, Map_District{name = strings_clone(name, allocator), kind = kind, pos = {f32(px), f32(py)}})\n--- later errors return a zero struct, dropping everything already appended: ---\n+\tif !map_polys_load(&b.water, obj[\"terrain\"].(json.Object)[\"water\"], true, allocator) {\n+\t\treturn {}, \"map_board_load: malformed terrain.water\"\n+\t}",
+    "detail": "Errors after districts/candidates/render_dots/district_start are allocated return {} — the backing stores are unreachable. App and harness callers discard the failed result without destroy.",
+    "recommended_fix": "On every error return, call map_board_destroy(&b) first (or return the partial board to the caller for cleanup)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "missing-teardown",
+    "title": "Claimed exit/teardown frees are absent from the diff (board + render cache leak)",
+    "location": "app/main.odin:App struct; app/render/dublin.odin:dublin_render_destroy",
+    "evidence": "+\t// (loaded once at boot, freed at exit) and shared with the sim + the\n--- and ---\n+// dublin_render_destroy — free the cache's buffers (called by view teardown).",
+    "detail": "Both resources are new fields, so the frees would be new code — yet no hunk calls map_board_destroy from app/main.odin, and dublin_render_destroy is only called from dublin_render_ensure's rebuild path.",
+    "recommended_fix": "Add the exit free (map_board_destroy(&app.board) when board_ok) and call dublin_render_destroy in the view teardown, or drop the comments."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "unit-mismatch",
+    "title": "Label collision gaps documented as world px but compared against screen-space anchor distances",
+    "location": "app/render/dublin.odin:dublin_draw_labels",
+    "evidence": "+// Label-anchor collision gaps (world px) — the preview's at 2× scale, halved\n+// for the in-game grid (the baywide's relative density).\n+DUBLIN_LABEL_GAP := [6]f32{999, 75, 60, 48, 35, 30}\n--- sizes are scaled world→screen, gaps are not: ---\n+\t\ts := dublin_tile_screen(v, d.pos[0], d.pos[1])\n+\t\tsize := max(8, i32(f32(DUBLIN_LABEL_SIZE[ki]) * v.scale))\n+\t\tfor pl in placed {\n+\t\t\tdx := s.x - pl[0]\n+\t\t\tdy := s.y - pl[1]\n+\t\t\tif dx * dx + dy * dy < gap * gap {",
+    "detail": "s.x/s.y are post-transform screen pixels; gap is a world-px constant applied unscaled. Equivalent only at scale==1 — collision behavior silently changes with zoom while label size scales.",
+    "recommended_fix": "Scale the gap by v.scale at the comparison (gap * v.scale), or document the gaps as screen px at fit zoom."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "stale-comment",
+    "title": "view.odin calls the dublin cache a \"triangulation cache\"; the renderer rasterizes even-odd and no triangulator exists",
+    "location": "app/render/view.odin:View struct; core/map.odin:map_ring_clean",
+    "evidence": "+\t// only READS it, ODN-1); map_draw branches on them. `dublin` is the\n+\t// render-side triangulation cache (dublin.odin), rebuilt when the board\n--- vs ---\n+// no transcendentals, no libm). The terrain rasterization (even-odd\n+// point-in-polygon into a per-world-px cell grid) runs ONCE per board\n--- and map_ring_clean cites a triangulator the renderer never runs: ---\n+// closing/stitch vertex; an ear-clip triangulator needs a simple ring), drop",
+    "detail": "dublin.odin deliberately avoids ear clipping (OSM pinch artifacts); view.odin's \"triangulation cache\" and map_ring_clean's ear-clip rationale describe a design that was replaced.",
+    "recommended_fix": "Update the view.odin comment to \"rasterization cache\" and reword map_ring_clean's rationale (simple ring for the fill, not for a triangulator)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "map_board_pool_lo / map_board_pool_hi are never called",
+    "location": "core/map.odin:map_board_pool_lo",
+    "evidence": "+// map_board_candidate_pool — the global pool range (the SEED family's draw\n+// domain): candidates[0..len). Convenience accessor mirroring the per-district\n+// ranges (district d = candidates[district_start[d]..district_start[d+1])).\n+map_board_pool_lo :: proc(b: ^Map_Board) -> u32 { return 0 }\n+map_board_pool_hi :: proc(b: ^Map_Board) -> u32 { return u32(len(b.candidates)) }",
+    "detail": "No call site anywhere in the diff; growth_board_seed_draw indexes board.candidates directly. Pure dead code.",
+    "recommended_fix": "Delete both accessors (and their comment), or use them in growth_board_seed_draw."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "unused-params",
+    "title": "growth_board_ring_scan ignores its `t: ^Topology` and `alloc` parameters",
+    "location": "core/growth.odin:growth_board_ring_scan",
+    "evidence": "+growth_board_ring_scan :: proc(board: ^Map_Board, t: ^Topology, anchor: [2]i32, sep, radius: i32, ring: ^[dynamic]u32, alloc := context.temp_allocator) -> i32 {\n+\tlo2 := i64(sep) * i64(sep)\n+\thi2 := i64(radius) * i64(radius)\n+\tclear(ring)\n+\tfor k in 0..<len(board.candidates) {",
+    "detail": "The body touches neither t nor alloc — the scan is a pure function of board/anchor/sep/radius, and the default alloc param is never used for appends.",
+    "recommended_fix": "Drop both parameters (and update the three call sites), or use them."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "redundant-code",
+    "title": "district_start zero-fill loop is a no-op (make already zeroes)",
+    "location": "core/map.odin:map_board_load",
+    "evidence": "+\tb.district_start = make([dynamic]u32, len(b.districts) + 1, allocator)\n+\tfor di in 0..<len(b.districts) {\n+\t\tb.district_start[di] = 0 // (filled below; the sentinel at the end)\n+\t}",
+    "detail": "make zeroes the buffer; the loop writes 0 over 0 and its own comment admits it does nothing (\"filled below\"). Dead instructions obscuring the real prefix-sum below.",
+    "recommended_fix": "Delete the loop; keep only the make and the counting/prefix-sum pass."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "duplicated-logic",
+    "title": "board_district_at duplicates the loader's inline nearest-district scan and is production-dead",
+    "location": "core/growth.odin:board_district_at; core/map.odin:map_board_load",
+    "evidence": "+board_district_at :: proc(board: ^Map_Board, pos: [2]i32) -> u16 {\n+\tbest: u16 = 0\n+\tbd2 := max(f32)\n--- the loader keeps its own inline copy instead of calling it: ---\n+\t\tbest: u16 = 0\n+\t\tbd2 := max(f32)\n--- and the comment acknowledges the drift hazard: ---\n+// assignment exactly (same strict-less comparison + best init 0) — a",
+    "detail": "Only the test calls board_district_at; the loader re-implements the identical loop. The \"MUST mirror exactly\" comment documents the drift risk instead of eliminating it by sharing.",
+    "recommended_fix": "Have map_board_load call board_district_at (single source of truth), or delete the proc and let the test reuse the loader's path."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "suspicious-control-flow",
+    "title": "dublin-shot prints usage() on bad args but keeps executing",
+    "location": "harness/main.odin:dublin-shot verb",
+    "evidence": "+\t\tif len(rest) > 1 {\n+\t\t\tusage()\n+\t\t}\n+\t\toutdir := \"bin/dublin-shot\"",
+    "detail": "After printing usage the handler falls through and runs anyway with rest[0], silently ignoring the extra arguments instead of exiting.",
+    "recommended_fix": "Exit after usage() (e.g. usage(); os.exit(2)), matching an argument-error contract."
+  }
+]

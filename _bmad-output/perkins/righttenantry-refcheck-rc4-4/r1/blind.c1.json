@@ -1,0 +1,73 @@
+[
+  {
+    "source": "blind",
+    "severity": "blocker",
+    "category": "completeness",
+    "title": "Client hunks depend on shared symbols that this diff never defines — codec (AC5) and attempt_log payload are unshipped here",
+    "location": "client/src/components/notification_dropdown.gleam (import hunk); client/src/components/reference_panel.gleam (import hunk)",
+    "evidence": "+  ReferenceAwaitingCorrection, ReferenceCompleted, ReferenceDeclined,\n+  ReferenceObjected, ReferenceUnreachable, VacancyClosed, VacancyClosing,\n+  VacancyExtended,\n\n+  type AttemptLogEntry, type ReferenceCallAttempt, type ReferenceCallDetail,\n\n- **EDIT:** `shared/src/shared/notification.gleam` (5 variants + arms) ·\n  `shared/src/shared/reference_call.gleam` (AttemptLogEntry + `attempt_log`\n  key, back-compat decoder) ·",
+    "detail": "Client code imports five reference_* variants, AttemptLogEntry, and a ReferenceCallDetail.attempt_log field, but no shared/ or server/ hunks define them — the spec's own Files list those edits as part of this change. Without them the client cannot compile and AC5 is unshipped.",
+    "recommended_fix": "Include the shared/notification.gleam codec (5 variants + arms), reference_call.gleam AttemptLogEntry/attempt_log decoder, and the server builder/stamp changes in this changeset, or explicitly split this diff."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "logic",
+    "title": "collapse_same_at_sends drops any consecutive same-at line, including lifecycle lines — contradicts its own doc comment",
+    "location": "client/src/components/reference_panel.gleam (collapse_same_at_sends hunk)",
+    "evidence": "+/// Collapse consecutive same-`at` send lines into one (the per-entry wire\n+/// shape emits one line per channel; the display shows one joined batch\n+/// line per `at`). Lifecycle lines pass through untouched.\n+fn collapse_same_at_sends(lines: List(TimelineLine)) -> List(TimelineLine) {\n+  lines\n+  |> list.fold([], fn(acc: List(TimelineLine), line: TimelineLine) {\n+    case acc {\n+      [] -> [line]\n+      [prev, ..rest] if prev.at == line.at -> acc\n+      _ -> [line, ..acc]\n+    }\n+  })\n+  |> list.reverse\n+}",
+
+    "detail": "The guard compares only `at`, not kind: a form_opened/corrected/taken_over/terminal entry sharing its exact timestamp with the previous line is silently dropped from both the rendered timeline and the export, despite the comment promising lifecycle lines pass through untouched.",
+    "recommended_fix": "Restrict the collapse to send kinds (e.g. require prev.kind and line.kind both in invitation_sent/co_nudge/reminder_sent before deduping), or key the dedupe on (at, kind)."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "Terminal label and export-outcome tables omit Completed and Failed — fallbacks misstate finished rows",
+    "location": "client/src/copy.gleam (refcheck_timeline_terminal / refcheck_export_outcome hunks)",
+    "evidence": "+  type ReferenceCallStatus, AwaitingCorrection, Calling, CharacterRef, Completed,\n+  ContactInitiated, EmployerRef, Failed, FormCompleted, LandlordRef,\n\n+    \"form_completed\" -> \"Reference received\"\n+    \"manual_recorded\" -> \"Recorded manually\"\n+    \"partial\" -> \"Form left unfinished\"\n+    _ -> \"In progress\"\n\n+    \"partial\" -> \"Form left unfinished\"\n+    _ -> \"Closed\"",
+    "detail": "Completed and Failed are terminal statuses the panel renders (view_completed handles Completed; Failed has state copy), yet neither new case table has arms for them. A terminal Failed row exports Outcome \"In progress\" — factually wrong for an evidence-grade record.",
+    "recommended_fix": "Add explicit arms for \"completed\" and \"failed\" (and audit scheduled/calling) to refcheck_timeline_terminal and refcheck_export_outcome so terminal rows never fall through to generic labels."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "back-compat",
+    "title": "Legacy payloads without attempt_log render an empty expanded ContactInitiated row — attempt summary deleted with no fallback",
+    "location": "client/src/components/reference_panel.gleam (row_detail hunk)",
+    "evidence": "+  let attempt_log = case call.status, list.is_empty(call.attempt_log) {\n+    Queued, _ -> element.none()\n+    Skipped, _ -> element.none()\n+    _, True -> element.none()\n+    _, False -> view_attempt_log(call, slot)\n+  }\n\n     ContactInitiated ->\n-      html.div([class(\"space-y-3\")], [\n-        view_attempt_summary(call),\n-        case",
+    "detail": "The old ContactInitiated body (view_attempt_summary built from the still-shipped attempts key) is deleted; with attempt_log defaulting to [] for pre-deploy payloads, an in-flight row with no pending takeover confirm now expands to nothing — send history and next-steps hint lost during the rollout window.",
+    "recommended_fix": "Fall back to rendering the attempts-derived summary when attempt_log is empty, or keep view_attempt_summary for ContactInitiated until the server payload with attempt_log is guaranteed in production."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "standards",
+    "title": "New runtime label \"Closed — no reply\" carries an em-dash without the explicit spec-verbatim exclusion the toast got",
+    "location": "client/src/copy.gleam (refcheck_timeline_terminal hunk)",
+    "evidence": "+pub fn refcheck_timeline_terminal(status: String) -> String {\n+  case status {\n+    \"unreachable\" -> \"Closed — no reply\"\n\n- **OQ-5 toast verbatim with its em-dash:** spec copy is excluded from the\n  client em-dash scan by construction (the scan list comment already says so);\n  the toast moves out of `refcheck_action_strings` with a comment. Other\n  implementer-authored strings stay dash-free.",
+    "detail": "The dash-free rule for implementer-authored strings is restated in the spec, and only the OQ-5 toast receives a documented verbatim exclusion. This function's em-dash string got neither, and as a fn result it evades the const-list scan regardless.",
+    "recommended_fix": "If \"Closed — no reply\" is genuinely §7.6 verbatim, document the spec-verbatim exclusion beside the fn; otherwise rephrase dash-free (e.g. \"Closed with no reply\")."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Dropdown test constructs Notification records directly — never exercises the codec decode path AC5 exists to protect",
+    "location": "client/test/client_test.gleam (notification_dropdown_renders_reference_types_test hunk)",
+    "evidence": "+    let notif =\n+      notification.Notification(\n+        id: \"n-ref\",\n\n+    html |> string.contains(\"Reference event\") |> should.be_true",
+    "detail": "AC5's failure mode is the shared decoder rejecting one unknown reference_* type and failing the whole list decode — but this test builds values directly and asserts only the title, and all five types share one icon arm, so neither decode nor per-type rendering is pinned.",
+    "recommended_fix": "Add a shared-level test that decodes a JSON notifications list containing all five reference_* types, and assert the dropdown renders a decoded notification rather than a constructed one."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "consistency",
+    "title": "Spec claims RC4.3 merged (#606) while sprint-status YAML still lists rc4-3 as backlog — dependency tracking contradicts itself",
+    "location": "_bmad-output/implementation-artifacts/sprint-status-refcheck-v1.yaml:88",
+    "evidence": "**Epic:** RC4 (Landlord Reference Panel & Workflow). Depends on RC4.3 (merged, #606).\n\n   rc4-3-row-actions-start-skip-take-over-correct-substitute: backlog\n-  rc4-4-attempt-log-export-notification-completeness: backlog\n+  rc4-4-attempt-log-export-notification-completeness: in-progress",
+    "detail": "The same PR marks RC4.4 in-progress while its declared prerequisite RC4.3 remains backlog in the status file (rc4-1 also still review). The tracking file now contradicts the spec's own dependency claim.",
+    "recommended_fix": "Update the rc4-1/rc4-2/rc4-3 rows in sprint-status-refcheck-v1.yaml to their real states (merged) in the same change that flips rc4-4 to in-progress."
+  }
+]

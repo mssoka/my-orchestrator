@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "integer-overflow",
+    "title": "RngRange: signed-int32 overflow UB on spans > 2^31 in the final Lo + offset addition",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Rng.h:84",
+    "evidence": "// The span is computed in int64 (NOT int32) so spans > INT32_MAX don't\n// overflow (ODN-10: integer math must be well-defined on every target).\ninline int32_t RngRange(FRng &R, int32_t Lo, int32_t Hi)\n{\n\tif (Hi <= Lo)\n\t{\n\t\treturn Lo;\n\t}\n\tconst uint64_t Span = static_cast<uint64_t>(static_cast<int64_t>(Hi) - static_cast<int64_t>(Lo)) + 1;\n\treturn Lo + static_cast<int32_t>((static_cast<uint64_t>(RngNext(R)) * Span) >> 32);\n}\n\nUBSan run against this header (g++ -std=c++17 -fsanitize=undefined, RngSeed(F,0); RngRange(F, INT32_MIN, INT32_MAX)):\n\"PP_Rng.h:84:12: runtime error: signed integer overflow: -2147483648 + -2098628570 cannot be represented in type 'int32_t' (aka 'int')\"",
+    "detail": "For spans > 2^31 with a draw ≥ 2^31, the int32_t cast wraps negative and Lo+offset overflows int32 — undefined behavior, proven by UBSan (seed 0). Violates the function's own ODN-10 well-definedness claim.",
+    "recommended_fix": "Do the addition in int64 and cast once: return (int32_t)((int64_t)Lo + (int64_t)(((uint64_t)RngNext(R) * Span) >> 32)); — the result is always in [Lo, Hi], so no overflow."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "input-validation",
+    "title": "run-tests-headless.sh --probe --json-out with no value passes green with no artifact",
+    "location": "scripts/run-tests-headless.sh:66-84",
+    "evidence": "    JSON_OUT=\"\"\n    if [ \"${1:-}\" = \"--json-out\" ]; then\n      JSON_OUT=\"${2:-}\"\n      shift 2\n    fi\n    ARGS=\"\"\n    [ -n \"$JSON_OUT\" ] && ARGS=\"-json=$(cd \"$ROOT\" && pwd)/$JSON_OUT\"\n\n    if ! grep -q \"PPProbe RESULT=OK\" Saved/Logs/headless-probe.log; then\n...\n    if [ -n \"$JSON_OUT\" ]; then\n      if [ ! -f \"$JSON_OUT\" ]; then\n\nbash simulation of `set -- \"--json-out\"; JSON_OUT=\"${2:-}\"; shift 2` → JSON_OUT=\"\" (verified: rc=1, params unchanged, script continues under set -uo pipefail without -e)",
+    "detail": "With --json-out but no value, JSON_OUT stays empty, ARGS stays empty, the artifact checks (lines 84-93) are skipped, and the probe exits 0 on RESULT=OK — a passing gate with no artifact.",
+    "recommended_fix": "Reject the missing operand before building ARGS: JSON_OUT=\"${2:-}\"; if [ -z \"$JSON_OUT\" ]; then echo \"--json-out requires a path\" >&2; exit 2; fi"
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Step(): equal-tick re-entry unguarded — redraws the nonce for an already-applied tick",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:29-33",
+    "evidence": "inline void Step(FSimState &State, uint64_t Tick)\n{\n\tif (Tick < State.Tick || State.bTerminal)\n\t{\n\t\treturn;\n\t}\n\tState.Tick = Tick;\n\tState.TickNonce = RngNext(State.Rng); // heartbeat draw (ODN-9 owned stream)",
+    "detail": "Only Tick < State.Tick is rejected; Step(S, S.Tick) re-enters, consumes an owned-RNG draw and redraws TickNonce for an already-applied tick — the duplicate-tick boundary is unguarded and untested.",
+    "recommended_fix": "Make Step idempotent on the current tick (return when Tick == State.Tick) or document the redraw; add an equal-tick case to FPPStepGuards and spine_check."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "SerializeState: null Out pointer with sufficient capacity is unguarded",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:39-52",
+    "evidence": "inline size_t SerializeState(const FSimState &State, uint8_t *Out, size_t OutCapacity)\n{\n\tconst size_t Needed = 4 + 4 + 8 + 8 + 4 + 8 + 8 + 1;\n\tif (OutCapacity < Needed)\n\t{\n\t\treturn 0;\n\t}\n\n\tauto PutU32 = [&Out](uint32_t V)\n\t{\n\t\t*Out++ = static_cast<uint8_t>(V & 0xFF);",
+    "detail": "Capacity is guarded; the pointer is not. Out=nullptr with OutCapacity >= 45 writes through null. The sibling primitive Fnv1a64 tolerates nullptr input; SerializeState does not.",
+    "recommended_fix": "Extend the guard: if (Out == nullptr || OutCapacity < Needed) return 0; — matching Fnv1a64's null-input tolerance."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "input-validation",
+    "title": "PPProbe -ticks values ≥ 2^32 silently truncate to the wrong count",
+    "location": "Source/PacketPlumberEditor/PPProbeCommandlet.cpp:51-58",
+    "evidence": "\t\t\tauto/else-if branch: const int32 V = FCString::Atoi(*Switch + 6);\n\t\t\tif (V < 1)\n\t\t\t{\n\t\t\t\tUE_LOG(LogPPProbe, Error, TEXT(\"PPProbe: bad -ticks value '%s' (must be >= 1)\"), *Switch);\n\t\t\t\treturn 1;\n\t\t\t}\n\t\t\tTicks = V;\n\nInstalled engine UE_5.8 Engine/Source/Runtime/Core/Public/GenericPlatform/StandardPlatformString.h:149-152 (TCHAR is WIDECHAR on Mac):\n\tstatic UE_FORCEINLINE_HINT int32 Atoi(const WIDECHAR* String)\n\t{\n\t\treturn (int32)wcstol( String, NULL, 10 );\n\t}",
+    "detail": "FCString::Atoi is (int32)wcstol, so -ticks=4294967297 truncates to 1, passes the V<1 check, and silently runs one tick — contradicting the same function's 'garbage values fail loudly' comment.",
+    "recommended_fix": "Parse ticks with FCString::Strtoi64 and reject values outside [1, INT32_MAX], mirroring the -seed= parsing path, so out-of-range values fail loudly instead of truncating."
+  }
+]

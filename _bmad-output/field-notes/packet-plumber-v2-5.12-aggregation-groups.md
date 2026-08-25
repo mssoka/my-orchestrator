@@ -1,0 +1,5 @@
+# Field notes — packet-plumber-v2-5.12-aggregation-groups (2026-08-19)
+
+- Odin `defer` scopes to the ENCLOSING BLOCK: a `defer` inside an `if` runs at the if-block's end, not the proc's — a temp view "freed with defer" inside an `if len(...) > 0` was use-after-freed before the consumer loop read it, and the unit test PASSED (freed memory not yet reused — silent luck). Proc-scope defers or guard with a bool (`defer if built`).
+- The 5.9 per-terminal credit gate structurally neutralizes any source-pick weight under CREDIT-STARVATION (each terminal is picked at exactly its credit rate, so no weight moves the shares — a 5-home email fixture gave 800/800 permille with and without the group weight). Concentration pins need a credit-RICH fixture (hosts 1333 milli/tick >> the ask) or the pin is vacuous.
+- Permille weight multipliers must MULTIPLY, never `/1000`-divide: `demand_weight × scale` (scale in permille units) is the integer-exact ratio form; `1 × 1750 / 1000 = 1` truncates a weight-1 terminal to no-op and silently kills the concentration.

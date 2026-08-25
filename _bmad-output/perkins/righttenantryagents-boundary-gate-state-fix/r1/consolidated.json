@@ -1,0 +1,132 @@
+{
+  "round": 1,
+  "reviewed_sha": "39443b2cca4add0611b9f437ac7ec362f6d9a2ef",
+  "head_sha_at_review": "39443b2cca4add0611b9f437ac7ec362f6d9a2ef",
+  "diff_source": "gh pr diff 173 --repo solarity-services/RightTenantryAgents (730 lines, 5 files + 1 new test file)",
+  "spec": "briefings/perkins-righttenantryagents-boundary-gate-state-fix-r1.md + righttenantryagents-boundary-gate-state-fix.md + issue #172",
+  "reviewers_completed": ["blind", "edge", "acceptance", "security", "architecture", "codebase", "tests"],
+  "reviewers_total": 7,
+  "failed_layerses": [],
+  "total_findings": 19,
+  "verified_count": 14,
+  "rejected_count": 2,
+  "speculative_count": 3,
+  "findings": [
+    {
+      "title": "Typo regression: 'compliance.review_unparseable' renamed to 'compliance.review_unparsable' (missing 'e') — breaks existing test + stable telemetry contract",
+      "sources": ["blind", "edge", "acceptance", "codebase", "tests"],
+      "severity": "blocker",
+      "category": "regression",
+      "location": "tenant_scorer/callbacks/compliance_enforcement.py:239; tests/unit/test_verification_compliance_judge.py:491",
+      "verification": "confirmed",
+      "detail": "Parent (develop 4e0146f:179) had correct spelling; PR diff hunk @@-176,7+236,7@@ changed it to 'review_unparsable'. test_unparseable_review_emits_failed_rollup now FAILS (full suite 2041 passed / 1 failed, NOT the claimed 2042 green). Structured event names are a documented BQ/Sentry query contract (issue #172 evidence queries 'compliance.review_completed').",
+      "recommended_fix": "Restore the 'e': change line 239 back to \"compliance.review_unparseable\". Accidental unrelated edit; no other change needed."
+    },
+    {
+      "title": "Verdict-stamp producer path is untested — cross-check tests seed STATE_COMPLIANCE_REVIEW_VERDICT by hand, never run the judge callbacks (_stamp_review_verdict) that write it",
+      "sources": ["blind", "tests", "acceptance"],
+      "severity": "warning",
+      "category": "coverage-gap",
+      "location": "tests/unit/test_gate_state_marshalling.py:164 (TestBoundaryGateDefensiveCrossCheck) vs tenant_scorer/callbacks/compliance_enforcement.py:284,359",
+      "verification": "confirmed",
+      "detail": "The cross-check's entire value depends on the stamp being written by the judge callback. Tests verify the read/decide logic by seeding the slot, but no test drives log_boundary_compliance_review / _emit_review_telemetry / _emit_failed_review_rollup and asserts the stamp lands. A bug in the stamp WRITE path (wrong key, wrong judge_kind, missed on a path) would not be caught — the independent witness could be silently absent in production.",
+      "recommended_fix": "Add a test that runs the real after-callback (log_boundary_compliance_review) on a clean + a dirty review and asserts STATE_COMPLIANCE_REVIEW_VERDICT is written with the right judge_kind/passed/violation_count. The existing test_unparseable_review_emits_failed_rollup is a natural place to also assert the passed=False stamp."
+    },
+    {
+      "title": "Defensive cross-check trusts the stamp's 'passed' alone, ignoring its own 'violation_count' — an internally-inconsistent clean+violations stamp would ship flagged prose",
+      "sources": ["security"],
+      "severity": "warning",
+      "category": "fail-open-edge",
+      "location": "tenant_scorer/callbacks/boundary_compliance_remediation.py:334; tenant_scorer/callbacks/final_compliance_remediation.py:278",
+      "verification": "confirmed",
+      "detail": "finalize_*_gate cross-check fires (skips the abort) whenever verdict.get('passed') is True, without consulting verdict['violation_count']. _stamp_review_verdict writes both fields from the same review, so today passed=True implies violation_count=0 — but the guard is brittle: if a future coerce/model change ever yields passed=True with non-empty violations, a None review + that stamp would skip the halt and ship unaudited prose. Defense-in-depth gap on a safety path.",
+      "recommended_fix": "Tighten the cross-check to require both passed is True AND violation_count == 0 before skipping the abort. Cheap, removes the inconsistency window."
+    },
+    {
+      "title": "STATE_PIPELINE_ERROR written via ctx.session.state (plain dict) bypasses the State._delta/event flush — not persisted for session resumption",
+      "sources": ["acceptance", "architecture"],
+      "severity": "note",
+      "category": "persistence",
+      "location": "tenant_scorer/agent.py:632,716; tenant_scorer/callbacks/boundary_compliance_remediation.py:356",
+      "verification": "confirmed",
+      "detail": "Pre-fix finalize_boundary_gate(ctx.state) wrote via State.__setitem__ (records the pipeline node's event_actions.state_delta, flushed at node completion). Post-fix finalize_boundary_gate(ctx.session.state) writes a plain dict — no delta, no event. For a SINGLE invocation this is fine: the in-memory session.state dict is current and build_response_envelope(ctx.state) reads STATE_FINAL_OUTPUT (a cross-node write) reliably (the pipeline ships success envelopes), so STATE_PIPELINE_ERROR written to the same dict is visible too. The lenses' 'error invisible to caller' blocker is rejected on that basis (a global ctx.state staleness would break the whole pipeline, not just the error path; integration test_loop_stop_aborts_pipeline_and_downstream_agents_skip passes). The only real effect: STATE_PIPELINE_ERROR is absent from the node's event delta, so it is not reconstructed from event history on session rewind/replay. Mitigated by rerun_on_resume=True (the node re-runs and re-sets the error).",
+      "recommended_fix": "Optional: have finalize also set the flag on ctx.state (not just session.state) so it lands in the node delta for resumption fidelity; or document that STATE_PIPELINE_ERROR is intentionally invocation-local."
+    },
+    {
+      "title": "Verdict-stamp slot is never cleared (unlike STATE_COMPLIANCE_JUDGE_META); the 'invocation-local' claim leans entirely on temp: scoping",
+      "sources": ["blind", "architecture", "edge"],
+      "severity": "note",
+      "category": "state-hygiene",
+      "location": "tenant_scorer/callbacks/compliance_enforcement.py:159-190; tenant_scorer/agent.py:626,713 (finally pops JUDGE_META only); tenant_scorer/constants.py:83",
+      "verification": "confirmed",
+      "detail": "STATE_COMPLIANCE_REVIEW_VERDICT = 'temp:compliance_review_verdict' is written every judge run but never popped. temp: scoping means it is trimmed from event deltas (_trim_temp_delta_state) so it does NOT persist to storage on Database/Vertex session services — production is safe. But for InMemorySessionService (tests/dev) a reused Session object would carry a prior invocation's stamp. Within one invocation last-write-wins is correct. Low risk, but the docstring's 'invocation-local' guarantee is implemented by prefix convention, not by cleanup.",
+      "recommended_fix": "Optionally pop STATE_COMPLIANCE_REVIEW_VERDICT in the same finally blocks that pop STATE_COMPLIANCE_JUDGE_META, for symmetry + explicit invocation-locality."
+    },
+    {
+      "title": "Fix's inline comment states the wrong mechanism: 'ctx.state snapshot taken at construction' — in ADK 2.2.0 ctx.state._value IS the live session.state dict (captured by reference, not copied)",
+      "sources": ["codebase"],
+      "severity": "note",
+      "category": "doc-accuracy",
+      "location": "tenant_scorer/agent.py:594-597 (diff comment); google/adk/agents/context.py:181-185; google/adk/sessions/state.py:81,85-89",
+      "verification": "confirmed",
+      "detail": "Context.__init__ sets self._state = State(value=invocation_context.session.state, ...) — the SAME dict by reference. The divergence arises when session.state is reassigned to a new dict during a child run (DatabaseSessionService storage merge / branch merge), leaving ctx.state._value pointing at the old dict while ctx.session.state re-reads the current attribute. The comment's 'snapshot taken at construction' is imprecise and could mislead future maintainers.",
+      "recommended_fix": "Reword the comment to: 'ctx.state._value holds a reference to the session.state dict captured at construction; if the session service reassigns session.state during a child run_node, that reference goes stale while ctx.session.state re-reads the live attribute.'"
+    },
+    {
+      "title": "Boundary-gate scrub/repair path still operates on ctx.state (half-migration); inline branch reads the judge output_key via ctx.state too",
+      "sources": ["architecture", "codebase"],
+      "severity": "note",
+      "category": "scope",
+      "location": "tenant_scorer/agent.py:615 (scrub_boundary_violations(ctx.state,...)), :535 (apply_repairs(ctx.state,...)), :268 (inline branch ctx.state.get(fb_key))",
+      "verification": "confirmed",
+      "detail": "Out of scope for this PR per the briefing (minion intentionally left scrub/repair untouched; they pass existing tests and only run on the dirty path, which production confirms works). Noting for completeness: the same ctx.state view the fix migrated away from for the review read is still used for scrub/repair/inline-branch. Not actionable in this PR.",
+      "recommended_fix": "None this PR. Track as a follow-up to audit scrub/repair/inline-branch state views for the same divergence."
+    },
+    {
+      "title": "read_review_verdict docstring promises None for 'malformed shape' but the impl returns any dict with a matching judge_kind",
+      "sources": ["blind"],
+      "severity": "note",
+      "category": "doc-accuracy",
+      "location": "tenant_scorer/callbacks/compliance_enforcement.py:169-188",
+      "verification": "confirmed",
+      "detail": "Impl returns the verdict dict whenever it is a dict with judge_kind matching; it does not validate passed/run_id/attempt. Behavior is SAFE (finalize then checks 'verdict.get(\"passed\") is True', which is False for a malformed stamp → fails closed). Pure doc/impl drift.",
+      "recommended_fix": "Align the docstring: 'returns the stamp dict when present and judge_kind matches; finalize re-validates the passed field.'"
+    },
+    {
+      "title": "Gate identity is stringly-typed with an implicit else — any future review key silently maps to judge_kind 'final'",
+      "sources": ["architecture"],
+      "severity": "note",
+      "category": "robustness",
+      "location": "tenant_scorer/callbacks/compliance_enforcement.py:211-212 (_judge_kind)",
+      "verification": "confirmed",
+      "detail": "_judge_kind returns 'boundary' only for STATE_VERIFICATION_COMPLIANCE_REVIEW, else 'final'. A typo'd/new review key would be treated as 'final', potentially satisfying the wrong gate's cross-check. Narrow (only two keys today) but brittle.",
+      "recommended_fix": "Optional: explicit mapping with a ValueError/None for unknown keys."
+    }
+  ],
+  "rejected": [
+    {
+      "title": "Fail-close error written via ctx.session.state is invisible to ctx.state readers (terminal envelope) under the production state split",
+      "sources": ["acceptance", "architecture"],
+      "rejected_severity": "blocker",
+      "location": "tenant_scorer/agent.py:632,716,797; tenant_scorer/callbacks/envelope.py:64",
+      "reason": "FALSE POSITIVE. build_response_envelope(ctx.state) reads STATE_FINAL_OUTPUT (envelope.py:60) — a cross-node write assembled during the run — and the pipeline ships success envelopes with that data in production. If the production divergence made ctx.state stale for envelope-time reads, the entire pipeline (not just the error path) would fail to produce results. Since it produces results, ctx.state is current at envelope time, and STATE_PIPELINE_ERROR written to the same session.state dict is visible. Integration test test_loop_stop_aborts_pipeline_and_downstream_agents_skip (the STATE_PIPELINE_ERROR -> skip_if_pipeline_error -> error-envelope chain) passes. Kernel retained as a note (event-delta bypass for resumption)."
+    }
+  ],
+  "reviewer_agreement": [
+    "Typo rename 'review_unparseable'->'review_unparsable': 5 independent lenses (blind, edge, acceptance, codebase, tests) — highest confidence."
+  ],
+  "verdict": "NEEDS CHANGES",
+  "verdict_reason": "1 blocker: an accidental unrelated edit renamed the stable telemetry event 'compliance.review_unparseable' to 'review_unparsable' (missing 'e'), breaking test_unparseable_review_emits_failed_rollup (suite is 2041/2042, not the claimed 2042 green) and the BQ/Sentry event-name contract. Trivial one-character fix. The core state-marshalling fix is correct (verified against ADK 2.2.0 semantics + empirical divergence repro + negative control), the fail-closed invariant holds both directions, and #169 is confirmed model-name-only (latent, not a regression).",
+  "perkins_independent_checks": {
+    "adk_state_view_semantics": "CONFIRMED correct: cheatsheet documents ctx.session.state for cross-agent reads (refs 209,247,264); empirical repro shows ctx.state._value goes stale when session.state is reassigned while ctx.session.state stays current; fix reads match.",
+    "fail_closed_invariant_both_directions": "CONFIRMED: genuinely-missing judge (no stamp) still aborts; clean stamp with None review does not abort; dirty/wrong-judge stamp still aborts. Covered by tests + verified in code.",
+    "negative_control": "CONFIRMED: reverting the fix's reads+finalize calls to ctx.state makes 7/16 new tests fail (incl. clean-verdict + genuinely-missing). Tests are real, not tautological.",
+    "no_other_child_output_key_ctx_state_reads_in_gates": "CONFIRMED: remaining ctx.state reads in the gates are STATE_PIPELINE_ERROR (node-local, correct). scrub/apply_repairs ctx.state usage is explicitly out-of-scope (dirty path, works in prod).",
+    "state_pipeline_error_reads_untouched": "CONFIRMED: agent.py:252/578/658 still read ctx.state.",
+    "cross_check_independent_witness": "CONFIRMED: reads a different key (STATE_COMPLIANCE_REVIEW_VERDICT) than the gate's review read; written by the judge callback's own ctx. Not coupled to the gate's read. (Caveat: producer path untested — see warning.)",
+    "issue_169_latent_not_regression": "CONFIRMED: git show --stat fb98f8f (#169) touches only deployment/terraform/README/env/config — model-name-only. The ctx.state read predates #169 (introduced in cb8eb4c / #156 wiring).",
+    "ruff": "clean",
+    "full_unit_suite": "2041 passed, 1 FAILED (the typo), 10 warnings — NOT the claimed 2042 green",
+    "integration_tests": "test_loop_stop_aborts_pipeline_and_downstream_agents_skip + 6 others pass (7 passed, 3 xfailed needing model)"
+  }
+}

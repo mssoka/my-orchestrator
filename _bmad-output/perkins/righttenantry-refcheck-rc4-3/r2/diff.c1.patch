@@ -1,0 +1,2828 @@
+diff --git a/server/src/application/application_detail_handler.gleam b/server/src/application/application_detail_handler.gleam
+index b2db6dbe..d9a1dabf 100644
+--- a/server/src/application/application_detail_handler.gleam
++++ b/server/src/application/application_detail_handler.gleam
+@@ -1066,6 +1066,10 @@ const written_response_disclaimer = "Written response, provenance-checked — no
+ ///   re-enables it to `queued`).
+ /// - `can_substitute_referee`: terminal `objected` / `unreachable` only (§8.2).
+ /// - `can_retry`: `failed` only.
++/// - `can_take_over` (RC4.3 r1): the warm-handoff waiting states (§7.7) —
++///   `queued` / `contact_initiated` / `unreachable` — refined per-row by
++///   `encode_reference_call` with the `taken_over_at` marker (a taken-over
++///   row can never be taken over again).
+ ///
+ /// Hooks are computed from the DECODED status so they always agree with the
+ /// status the wire carries: an unrecognised DB value (impossible today — the
+@@ -1101,6 +1105,23 @@ pub fn compute_hooks_decoded(
+     can_substitute_referee: status == shared_reference_call.Objected
+       || status == shared_reference_call.Unreachable,
+     can_retry: status == shared_reference_call.Failed,
++    can_take_over: status == shared_reference_call.Queued
++      || status == shared_reference_call.ContactInitiated
++      || status == shared_reference_call.Unreachable,
++  )
++}
++
++/// RC4.3 r1: the per-row take-over refinement — a row already taken over
++/// (A7 marker present) can never be taken over again, whatever its status.
++/// The status rule lives in `compute_hooks_decoded`; this is the row-level
++/// half of the hook (AR-RC13).
++pub fn refine_take_over_hook(
++  hooks: shared_reference_call.ReferenceCallHooks,
++  taken_over_at: String,
++) -> shared_reference_call.ReferenceCallHooks {
++  shared_reference_call.ReferenceCallHooks(
++    ..hooks,
++    can_take_over: hooks.can_take_over && taken_over_at == "",
+   )
+ }
+ 
+@@ -1166,7 +1187,9 @@ pub fn encode_reference_call(
+   row: sql.ListReferenceCallsForDetailRow,
+ ) -> json.Json {
+   let attempts = parse_attempt_log(row.attempts)
+-  let hooks = compute_hooks(row.status)
++  let hooks =
++    compute_hooks(row.status)
++    |> refine_take_over_hook(row.taken_over_at)
+   let disclaimer = compute_display_disclaimer(row.result)
+   shared_reference_call.encode_detail(shared_reference_call.ReferenceCallDetail(
+     reference_call_id: row.id,
+@@ -1190,6 +1213,29 @@ pub fn encode_reference_call(
+       "" -> None
+       s -> Some(s)
+     },
++    taken_over_at: case row.taken_over_at {
++      "" -> None
++      s -> Some(s)
++    },
++    contact_name: case row.contact_name {
++      "" -> None
++      s -> Some(s)
++    },
++    contact_email: row.contact_email,
++    contact_phone: row.contact_phone,
++    corrected_name: case row.corrected_name {
++      "" -> None
++      s -> Some(s)
++    },
++    corrected_email: case row.corrected_email {
++      "" -> None
++      s -> Some(s)
++    },
++    corrected_phone: case row.corrected_phone {
++      "" -> None
++      s -> Some(s)
++    },
++    correction_cycles: row.correction_cycles,
+     attempts:,
+     result: case row.result {
+       "" -> None
+diff --git a/server/src/application/sql.gleam b/server/src/application/sql.gleam
+index cbb0a553..ad8602bf 100644
+--- a/server/src/application/sql.gleam
++++ b/server/src/application/sql.gleam
+@@ -2101,6 +2101,14 @@ pub type ListReferenceCallsForDetailRow {
+     next_attempt_at: String,
+     form_opened_at: String,
+     submitted_at: String,
++    taken_over_at: String,
++    contact_name: String,
++    contact_email: Option(String),
++    contact_phone: Option(String),
++    corrected_name: String,
++    corrected_email: String,
++    corrected_phone: String,
++    correction_cycles: Int,
+     attempts: String,
+     result: String,
+   )
+@@ -2143,8 +2151,16 @@ pub fn list_reference_calls_for_detail(
+     use next_attempt_at <- decode.field(6, decode.string)
+     use form_opened_at <- decode.field(7, decode.string)
+     use submitted_at <- decode.field(8, decode.string)
+-    use attempts <- decode.field(9, decode.string)
+-    use result <- decode.field(10, decode.string)
++    use taken_over_at <- decode.field(9, decode.string)
++    use contact_name <- decode.field(10, decode.string)
++    use contact_email <- decode.field(11, decode.optional(decode.string))
++    use contact_phone <- decode.field(12, decode.optional(decode.string))
++    use corrected_name <- decode.field(13, decode.string)
++    use corrected_email <- decode.field(14, decode.string)
++    use corrected_phone <- decode.field(15, decode.string)
++    use correction_cycles <- decode.field(16, decode.int)
++    use attempts <- decode.field(17, decode.string)
++    use result <- decode.field(18, decode.string)
+     decode.success(ListReferenceCallsForDetailRow(
+       id:,
+       ref_slot:,
+@@ -2155,6 +2171,14 @@ pub fn list_reference_calls_for_detail(
+       next_attempt_at:,
+       form_opened_at:,
+       submitted_at:,
++      taken_over_at:,
++      contact_name:,
++      contact_email:,
++      contact_phone:,
++      corrected_name:,
++      corrected_email:,
++      corrected_phone:,
++      correction_cycles:,
+       attempts:,
+       result:,
+     ))
+@@ -2196,6 +2220,20 @@ SELECT
+   -- received\" line (neither the attempts log nor the stored result carries
+   -- the completion instant).
+   COALESCE(submitted_at::text, '') AS submitted_at,
++  -- RC4.3 additive: the warm-handoff takeover marker (A7) — the panel's
++  -- \"You're handling this one\" label + the takeover surface.
++  COALESCE(taken_over_at::text, '') AS taken_over_at,
++  -- RC4.3 additive: the row's own referee trio (snapshot + corrected
++  -- values) — the take-over chips, the §8.3 edit-trio prefill, and the row
++  -- name all read the EFFECTIVE contact (corrected ?? snapshot), which the
++  -- application trio cannot express after a correction or substitution.
++  contact_name,
++  contact_email,
++  contact_phone,
++  COALESCE(corrected_name, '') AS corrected_name,
++  COALESCE(corrected_email, '') AS corrected_email,
++  COALESCE(corrected_phone, '') AS corrected_phone,
++  correction_cycles,
+   attempts::text              AS attempts,
+   -- §4.2: raw referee IP/UA stripped at the read boundary. `#-` deletes a
+   -- path and is a no-op when the path is absent (minimal terminals carry no
+diff --git a/server/src/audit/event_type.gleam b/server/src/audit/event_type.gleam
+index 1e5e4d2c..3a44bbe1 100644
+--- a/server/src/audit/event_type.gleam
++++ b/server/src/audit/event_type.gleam
+@@ -42,6 +42,13 @@ pub type AuditEvent {
+   ReferenceCallObjected
+   ReferenceCallWrongPerson
+   ReferenceCallCorrectionRequested
++  // RC4.3 row actions (AD-16): the landlord-side control-surface events.
++  ReferenceCallTakenOver
++  ReferenceCallCorrected
++  ReferenceCallSubstituted
++  // RC4.3: the one-cycle correction loop exhausts — second failure moves
++  // the row to unreachable with referee_contact_invalid stamped (AD-7).
++  ReferenceCallCorrectionExhausted
+   RefundTermsAccepted
+   ReportDownloaded
+   ReportDownloadFailed
+@@ -85,6 +92,10 @@ pub fn to_string(event: AuditEvent) -> String {
+     ReferenceCallObjected -> "reference_call_objected"
+     ReferenceCallWrongPerson -> "reference_call_wrong_person"
+     ReferenceCallCorrectionRequested -> "reference_call_correction_requested"
++    ReferenceCallTakenOver -> "reference_call_taken_over"
++    ReferenceCallCorrected -> "reference_call_corrected"
++    ReferenceCallSubstituted -> "reference_call_substituted"
++    ReferenceCallCorrectionExhausted -> "reference_call_correction_exhausted"
+     RefundTermsAccepted -> "refund_terms_accepted"
+     ReportDownloaded -> "report_downloaded"
+     ReportDownloadFailed -> "report_download_failed"
+diff --git a/server/src/notification/notification_dispatch.gleam b/server/src/notification/notification_dispatch.gleam
+index fdae4a47..d97dc2d6 100644
+--- a/server/src/notification/notification_dispatch.gleam
++++ b/server/src/notification/notification_dispatch.gleam
+@@ -533,6 +533,38 @@ pub fn notify_reference_awaiting_correction(
+   )
+ }
+ 
++/// RC4.3 correction-exhaustion (AD-7): the second failure terminalized the
++/// row as unreachable. In-app ONLY — the same posture as the awaiting-
++/// correction notification (Q3=B2: no realtime email, avoiding spam when
++/// several referees bounce); the landlord is actively working this row, and
++/// the unreachable surface (take over / substitute) is where they continue.
++/// Copy follows UX §7.9's Unreachable event. Fires exactly once per
++/// exhaustion — the caller gates on the guarded terminal transition.
++pub fn notify_reference_correction_exhausted(
++  db db: pog.Connection,
++  landlord_id landlord_id: Uuid,
++  reference_call_id reference_call_id: Uuid,
++  referee_name referee_name: String,
++  applicant_full_name applicant_full_name: String,
++) -> Result(String, String) {
++  let title = "Couldn't reach this reference"
++  let body =
++    "Couldn't reach "
++    <> referee_name
++    <> " ("
++    <> applicant_full_name
++    <> "'s referee). You can take over from the application page."
++  dispatch(
++    db,
++    landlord_id,
++    sql.ReferenceUnreachable,
++    title,
++    body,
++    "reference_call",
++    reference_call_id,
++  )
++}
++
+ /// Shared dispatch for the three reference events: in-app notification on the
+ /// reference_call entity + a best-effort realtime email linking the landlord
+ /// to the application detail (where the reference panel renders).
+diff --git a/server/src/reference_checks/actions_handler.gleam b/server/src/reference_checks/actions_handler.gleam
+new file mode 100644
+index 00000000..9175f3d4
+--- /dev/null
++++ b/server/src/reference_checks/actions_handler.gleam
+@@ -0,0 +1,664 @@
++//// RC4.3 landlord row actions (Story RC4.3): the control surface the panel
++//// wires to — take over manually (A7 warm handoff), correct the referee
++//// trio (AD-7/A1 landlord-driven correction, one cycle), and substitute a
++//// referee after a terminal objection/unreachable (AD-11 hook semantics).
++//// The pre-trigger start/skip/re-enable APIs live in `trigger.gleam` (RC2.3);
++//// this module owns the row-scoped actions that mutate an existing row.
++////
++//// Every endpoint is ownership-checked (three-UUID + application-ownership
++//// + archived-vacancy prechecks — the `handle_update_status` pattern) and
++//// guarded on the row's expected pre-state (AD-14): a single guarded
++//// UPDATE/INSERT, a 0-row result means someone else transitioned first and
++//// the writer stands down with a branded 409. The row id in the path is
++//// scoped to the application (the SQL guards `application_id`), so a
++//// cross-application row reads as 404, never as a leaked 409.
++////
++//// Correction + substitution write their audit rows INSIDE the same
++//// transaction as the mutation (Tier 1 — the AD-16 trail never diverges
++//// from the state change); takeover follows the webhook posture (guarded
++//// single-UPDATE, then best-effort audit).
++
++import application/sql as app_sql
++import audit/audit_log
++import audit/event_type
++import config.{type ServerConfig}
++import gleam/dynamic/decode
++import gleam/json
++import gleam/list
++import gleam/result
++import gleam/string
++import pog
++import response_helpers
++import retention/audit_log_schema as alog
++import shared/error_code
++import shared/landlord.{type Landlord}
++import wisp.{type Request, type Response}
++import youid/uuid.{type Uuid}
++
++import reference_checks/sql
++import reference_checks/trigger
++
++/// `entity_type` for every `reference_call` lifecycle audit row (AD-16).
++const audit_entity: String = "reference_call"
++
++// ---------------------------------------------------------------------------
++// Take over manually (A7 warm handoff, UX §7.7)
++// ---------------------------------------------------------------------------
++
++/// `POST /api/v1/vacancies/:vid/applications/:aid/reference-checks/:call_id/take-over`
++/// — the landlord takes the check over manually. Guarded on the waiting
++/// states + `unreachable` (§7.7); writes ONLY `taken_over_at` (the sweep
++/// stops sending — its SELECT already filters `taken_over_at IS NULL`), and
++/// the form link stays live: a late completion still guarded-transitions to
++/// `form_completed` and notifies (§8.6).
++pub fn handle_take_over(
++  _req: Request,
++  config: ServerConfig,
++  landlord: Landlord,
++  vacancy_id: String,
++  application_id: String,
++  call_id: String,
++) -> Response {
++  case parse_uuids(application_id, landlord.id, vacancy_id, call_id) {
++    Error(resp) -> resp
++    Ok(#(app_uuid, landlord_uuid, vacancy_uuid, call_uuid)) ->
++      run_action_with_prechecks(
++        config,
++        app_uuid,
++        landlord_uuid,
++        vacancy_uuid,
++        fn() { do_take_over(config, app_uuid, landlord_uuid, call_uuid) },
++      )
++  }
++}
++
++pub fn do_take_over(
++  config: ServerConfig,
++  app_uuid: Uuid,
++  landlord_uuid: Uuid,
++  call_uuid: Uuid,
++) -> Response {
++  let db = config.db
++  // Read first: distinguishes 404 (row absent / another application) from
++  // 409 (row present but not in a take-over-able state / already taken).
++  case read_owned_row(db, app_uuid, call_uuid) {
++    Error(resp) -> resp
++    Ok(row) ->
++      case sql.take_over_reference_call(db, call_uuid, app_uuid) {
++        Ok(pog.Returned(_, [_, ..])) -> {
++          // r1 (N2): the canonical Tier-2 fail-open lifecycle audit (the
++          // trigger's helper — audit-on-state-change, AD-16).
++          trigger.write_lifecycle_audit(
++            config,
++            landlord_uuid,
++            call_uuid,
++            row.ref_slot,
++            row.status,
++            "taken_over",
++            event_type.ReferenceCallTakenOver,
++          )
++          json_ok(json.object([#("taken_over", json.bool(True))]))
++        }
++        Ok(_) ->
++          response_helpers.json_error(
++            error_code.Conflict,
++            "That reference isn't in a state you can take over right now. Refresh and try again.",
++            409,
++          )
++        Error(err) -> {
++          wisp.log_error("reference take-over failed: " <> string.inspect(err))
++          response_helpers.json_error(
++            error_code.ServerError,
++            "Couldn't take over that reference. Give it another go.",
++            500,
++          )
++        }
++      }
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Correct (AD-7/A1 landlord-driven correction, one cycle — UX §8.3)
++// ---------------------------------------------------------------------------
++
++/// `POST /api/v1/vacancies/:vid/applications/:aid/reference-checks/:call_id/correct`
++/// — the landlord edits the slot's trio inline after a delivery failure. The
++/// corrected values land in `corrected_name/email/phone` (the immutable
++/// `contact_*` snapshot is NEVER touched, A1), the application trio is
++/// updated (the applicant's confirmation is the attestation forewarning), and
++/// the row re-queues (`queued`, `next_attempt_at = now()`) so the sweep owns
++/// the fresh invite (AD-14). `correction_cycles` bumps to 1 — the row's
++/// `awaiting_correction` guard IS the one-cycle rule: a second `correct`
++/// call on a non-awaiting row 409s.
++pub fn handle_correct(
++  req: Request,
++  config: ServerConfig,
++  landlord: Landlord,
++  vacancy_id: String,
++  application_id: String,
++  call_id: String,
++) -> Response {
++  use json_body <- wisp.require_json(req)
++  case decode.run(json_body, trio_decoder()) {
++    Error(_) ->
++      response_helpers.json_error(
++        error_code.InvalidPayload,
++        "Couldn't save those details. Check the form and try again.",
++        400,
++      )
++    Ok(trio) ->
++      case validate_trio(trio) {
++        Error(resp) -> resp
++        Ok(clean) ->
++          case parse_uuids(application_id, landlord.id, vacancy_id, call_id) {
++            Error(resp) -> resp
++            Ok(#(app_uuid, landlord_uuid, vacancy_uuid, call_uuid)) ->
++              run_action_with_prechecks(
++                config,
++                app_uuid,
++                landlord_uuid,
++                vacancy_uuid,
++                fn() {
++                  do_correct(
++                    config,
++                    app_uuid,
++                    landlord_uuid,
++                    vacancy_uuid,
++                    call_uuid,
++                    clean,
++                  )
++                },
++              )
++          }
++      }
++  }
++}
++
++pub fn do_correct(
++  config: ServerConfig,
++  app_uuid: Uuid,
++  landlord_uuid: Uuid,
++  vacancy_uuid: Uuid,
++  call_uuid: Uuid,
++  trio: Trio,
++) -> Response {
++  let run = fn(tx: pog.Connection) {
++    // Read first for the 404/409 split + the audit's slot/status.
++    case sql.get_reference_call_by_id(tx, call_uuid) {
++      Error(err) -> Error(DbFailure(err))
++      Ok(pog.Returned(_, [])) -> Error(RowNotFound)
++      Ok(pog.Returned(_, [row, ..])) ->
++        case row.application_id == uuid.to_string(app_uuid) {
++          False -> Error(RowNotFound)
++          True ->
++            case
++              sql.correct_reference_call(
++                tx,
++                call_uuid,
++                app_uuid,
++                trio.name,
++                trio.email,
++                trio.phone,
++              )
++            {
++              Error(err) -> Error(DbFailure(err))
++              // 0 rows: the row left `awaiting_correction` between the read and
++              // the guard (raced, or the guard's one-cycle rule already spent).
++              Ok(pog.Returned(_, [])) -> Error(NotAwaitingCorrection)
++              Ok(pog.Returned(_, [_, ..])) ->
++                case
++                  update_trio(tx, app_uuid, vacancy_uuid, row.ref_slot, trio)
++                {
++                  Error(err) -> Error(DbFailure(err))
++                  Ok(_) ->
++                    case
++                      audit_log.create(
++                        tx,
++                        user_id: landlord_uuid,
++                        event: event_type.ReferenceCallCorrected,
++                        entity_type: audit_entity,
++                        entity_id: call_uuid,
++                        details: json.object([
++                          alog.non_pii(alog.RefSlot, json.string(row.ref_slot)),
++                          alog.non_pii(
++                            alog.From,
++                            json.string("awaiting_correction"),
++                          ),
++                          alog.non_pii(alog.To, json.string("queued")),
++                        ]),
++                      )
++                    {
++                      Ok(_) -> Ok(True)
++                      Error(err) -> Error(DbFailure(err))
++                    }
++                }
++            }
++        }
++    }
++  }
++  case pog.transaction(config.db, run) {
++    Ok(True) -> json_ok(json.object([#("corrected", json.bool(True))]))
++    Error(pog.TransactionRolledBack(RowNotFound)) ->
++      response_helpers.json_error(
++        error_code.NotFound,
++        "That reference check isn't there anymore. Refresh and try again.",
++        404,
++      )
++    Error(pog.TransactionRolledBack(NotAwaitingCorrection)) ->
++      response_helpers.json_error(
++        error_code.Conflict,
++        "That reference isn't waiting on a correction anymore. Refresh and try again.",
++        409,
++      )
++    Error(pog.TransactionRolledBack(NotSubstitutable)) ->
++      // Unreachable from the correct path — the shared ActionError type
++      // keeps the case total.
++      response_helpers.json_error(
++        error_code.Conflict,
++        "That reference can't be changed right now. Refresh and try again.",
++        409,
++      )
++    Error(pog.TransactionRolledBack(DbFailure(err))) ->
++      db_failure("reference correction failed: " <> string.inspect(err))
++    Error(pog.TransactionQueryError(err)) ->
++      db_failure("reference correction failed: " <> string.inspect(err))
++    Ok(_) ->
++      // Unreachable: the run closure only ever returns Ok(True); a
++      // defensive arm keeps the case total.
++      db_failure("reference correction: unexpected transaction result")
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Substitute referee (AD-11 hook semantics — UX §8.2)
++// ---------------------------------------------------------------------------
++
++/// `POST /api/v1/vacancies/:vid/applications/:aid/reference-checks/:call_id/substitute`
++/// — after a terminal `objected`/`unreachable` (the `can_substitute_referee`
++/// set), the landlord swaps in a NEW referee via the same inline edit-trio.
++/// A NEW `reference_call` row is created for the slot (`queued`,
++/// `next_attempt_at = now()` — the sweep owns the invite) with the new trio
++/// as its immutable snapshot; the prior row is retained as history. The
++/// audit entry carries old + new row ids (AD-16). Idempotent: the live-slot
++/// partial unique index makes a double-submit a silent no-op (200 — the
++/// successor row already occupies the slot).
++pub fn handle_substitute(
++  req: Request,
++  config: ServerConfig,
++  landlord: Landlord,
++  vacancy_id: String,
++  application_id: String,
++  call_id: String,
++) -> Response {
++  use json_body <- wisp.require_json(req)
++  case decode.run(json_body, trio_decoder()) {
++    Error(_) ->
++      response_helpers.json_error(
++        error_code.InvalidPayload,
++        "Couldn't save those details. Check the form and try again.",
++        400,
++      )
++    Ok(trio) ->
++      case validate_trio(trio) {
++        Error(resp) -> resp
++        Ok(clean) ->
++          case parse_uuids(application_id, landlord.id, vacancy_id, call_id) {
++            Error(resp) -> resp
++            Ok(#(app_uuid, landlord_uuid, vacancy_uuid, call_uuid)) ->
++              run_action_with_prechecks(
++                config,
++                app_uuid,
++                landlord_uuid,
++                vacancy_uuid,
++                fn() {
++                  do_substitute(
++                    config,
++                    app_uuid,
++                    landlord_uuid,
++                    vacancy_uuid,
++                    call_uuid,
++                    clean,
++                  )
++                },
++              )
++          }
++      }
++  }
++}
++
++pub fn do_substitute(
++  config: ServerConfig,
++  app_uuid: Uuid,
++  landlord_uuid: Uuid,
++  vacancy_uuid: Uuid,
++  call_uuid: Uuid,
++  trio: Trio,
++) -> Response {
++  let run = fn(tx: pog.Connection) {
++    case sql.get_reference_call_by_id(tx, call_uuid) {
++      Error(err) -> Error(DbFailure(err))
++      Ok(pog.Returned(_, [])) -> Error(RowNotFound)
++      Ok(pog.Returned(_, [row, ..])) ->
++        case row.application_id == uuid.to_string(app_uuid) {
++          False -> Error(RowNotFound)
++          True ->
++            case
++              sql.substitute_reference_call(
++                tx,
++                call_uuid,
++                app_uuid,
++                trio.name,
++                trio.email,
++                trio.phone,
++              )
++            {
++              Error(err) -> Error(DbFailure(err))
++              // 0 rows: the row is not objected/unreachable (a different
++              // terminal, or the guard's app-scope failed) — stand down.
++              Ok(pog.Returned(_, [])) -> Error(NotSubstitutable)
++              Ok(pog.Returned(_, [new_row, ..])) ->
++                case new_row.how {
++                  // Idempotent no-op: a live successor already occupies the
++                  // slot (double-submit, or substituting the OLD terminal
++                  // row after a prior substitution). No trio rewrite, no
++                  // duplicate audit — the original did both.
++                  "existing" -> Ok(new_row.id)
++                  _ ->
++                    case
++                      update_trio(
++                        tx,
++                        app_uuid,
++                        vacancy_uuid,
++                        row.ref_slot,
++                        trio,
++                      )
++                    {
++                      Error(err) -> Error(DbFailure(err))
++                      Ok(_) ->
++                        case
++                          audit_log.create(
++                            tx,
++                            user_id: landlord_uuid,
++                            event: event_type.ReferenceCallSubstituted,
++                            entity_type: audit_entity,
++                            entity_id: call_uuid,
++                            details: json.object([
++                              alog.non_pii(
++                                alog.RefSlot,
++                                json.string(row.ref_slot),
++                              ),
++                              alog.non_pii(alog.From, json.string(row.status)),
++                              alog.non_pii(alog.To, json.string("queued")),
++                              // AD-16: the substitution audit carries old + new ids.
++                              alog.non_pii(
++                                alog.OldReferenceCallId,
++                                json.string(uuid.to_string(call_uuid)),
++                              ),
++                              alog.non_pii(
++                                alog.NewReferenceCallId,
++                                json.string(new_row.id),
++                              ),
++                            ]),
++                          )
++                        {
++                          Ok(_) -> Ok(new_row.id)
++                          Error(err) -> Error(DbFailure(err))
++                        }
++                    }
++                }
++            }
++        }
++    }
++  }
++  case pog.transaction(config.db, run) {
++    Ok(new_id) -> {
++      // r1 (N1): the new row gets the same creation-time fraud screening the
++      // viewed trigger applies (parity — best-effort, post-commit).
++      trigger.stamp_creation_fraud_for(
++        config,
++        app_uuid,
++        landlord_uuid,
++        vacancy_uuid,
++        [new_id],
++      )
++      json_ok(
++        json.object([
++          #("substituted", json.bool(True)),
++          #("reference_call_id", json.string(new_id)),
++        ]),
++      )
++    }
++    Error(pog.TransactionRolledBack(RowNotFound)) ->
++      response_helpers.json_error(
++        error_code.NotFound,
++        "That reference check isn't there anymore. Refresh and try again.",
++        404,
++      )
++    Error(pog.TransactionRolledBack(NotSubstitutable)) ->
++      response_helpers.json_error(
++        error_code.Conflict,
++        "That reference can't be substituted right now. Refresh and try again.",
++        409,
++      )
++    Error(pog.TransactionRolledBack(NotAwaitingCorrection)) ->
++      // Unreachable from the substitute path — the shared ActionError type
++      // keeps the case total.
++      response_helpers.json_error(
++        error_code.Conflict,
++        "That reference can't be changed right now. Refresh and try again.",
++        409,
++      )
++    Error(pog.TransactionRolledBack(DbFailure(err))) ->
++      db_failure("reference substitution failed: " <> string.inspect(err))
++    Error(pog.TransactionQueryError(err)) ->
++      db_failure("reference substitution failed: " <> string.inspect(err))
++  }
++}
++
++/// The shared 500 for the row-action transactions.
++fn db_failure(log_line: String) -> Response {
++  wisp.log_error(log_line)
++  response_helpers.json_error(
++    error_code.ServerError,
++    "Couldn't save those details. Give it another go.",
++    500,
++  )
++}
++
++// ---------------------------------------------------------------------------
++// Shared plumbing
++// ---------------------------------------------------------------------------
++
++/// The §8.3 edit-trio body — public so the integration tests can drive the
++/// handlers directly (the trigger-test pattern).
++pub type Trio {
++  Trio(name: String, email: String, phone: String)
++}
++
++/// The §8.3 edit-trio body. `name` is required (the schema's contact_name is
++/// NOT NULL); `email`/`phone` are optional individually but at least one must
++/// be present — a referee needs a reachable channel (the same rule the
++/// trigger applies at creation).
++fn trio_decoder() -> decode.Decoder(Trio) {
++  use name <- decode.field("name", decode.string)
++  use email <- decode.optional_field("email", "", decode.string)
++  use phone <- decode.optional_field("phone", "", decode.string)
++  decode.success(Trio(name:, email:, phone:))
++}
++
++fn validate_trio(trio: Trio) -> Result(Trio, Response) {
++  let name = string.trim(trio.name)
++  let email = string.trim(trio.email)
++  let phone = string.trim(trio.phone)
++  case name, email, phone {
++    "", _, _ ->
++      Error(response_helpers.json_error(
++        error_code.InvalidPayload,
++        "Add the referee's name to save these details.",
++        400,
++      ))
++    _, "", "" ->
++      Error(response_helpers.json_error(
++        error_code.InvalidPayload,
++        "Add an email or phone number to save these details.",
++        400,
++      ))
++    _, _, _ -> Ok(Trio(name:, email:, phone:))
++  }
++}
++
++type ActionError {
++  RowNotFound
++  NotAwaitingCorrection
++  NotSubstitutable
++  DbFailure(pog.QueryError)
++}
++
++/// Parses the four UUIDs every row-action handler receives. On any parse
++/// failure, short-circuits with a branded `InvalidId` 400 — mirrors
++/// `trigger.parse_app_uuids`.
++fn parse_uuids(
++  application_id: String,
++  landlord_id: String,
++  vacancy_id: String,
++  call_id: String,
++) -> Result(#(Uuid, Uuid, Uuid, Uuid), Response) {
++  case
++    uuid.from_string(application_id),
++    uuid.from_string(landlord_id),
++    uuid.from_string(vacancy_id),
++    uuid.from_string(call_id)
++  {
++    Ok(app), Ok(landlord), Ok(vacancy), Ok(call) ->
++      Ok(#(app, landlord, vacancy, call))
++    _, _, _, _ ->
++      Error(response_helpers.json_error(
++        error_code.InvalidId,
++        "That link didn't look right.",
++        400,
++      ))
++  }
++}
++
++/// The ownership + archived-vacancy prechecks shared by every row action —
++/// the `handle_update_status` pattern (mirrored in `trigger.gleam`), plus
++/// the r1 (W10) application↔vacancy binding: a same-owner cross-vacancy
++/// application id in the path must 404, not silently 0-row the trio UPDATE.
++fn run_action_with_prechecks(
++  config: ServerConfig,
++  app_uuid: Uuid,
++  landlord_uuid: Uuid,
++  vacancy_uuid: Uuid,
++  action: fn() -> Response,
++) -> Response {
++  let db = config.db
++  case
++    sql.verify_application_in_vacancy(db, app_uuid, vacancy_uuid, landlord_uuid)
++  {
++    Ok(pog.Returned(_, [row])) if row.match_count > 0 ->
++      case app_sql.verify_vacancy_active(db, vacancy_uuid, landlord_uuid) {
++        Ok(pog.Returned(_, [vacancy_row])) if vacancy_row.is_archived ->
++          response_helpers.json_error(
++            error_code.VacancyUnavailable,
++            "This vacancy is archived. Restore it to continue reviewing applications.",
++            422,
++          )
++        _ -> action()
++      }
++    _ ->
++      response_helpers.json_error(
++        error_code.NotFound,
++        "Application not found",
++        404,
++      )
++  }
++}
++
++/// Reads the row and scopes it to the application: absent row OR a row that
++/// belongs to a different application reads as 404 (never a leaked 409 — a
++/// cross-tenant call id must not reveal another landlord's row).
++fn read_owned_row(
++  db: pog.Connection,
++  app_uuid: Uuid,
++  call_uuid: Uuid,
++) -> Result(sql.GetReferenceCallByIdRow, Response) {
++  case sql.get_reference_call_by_id(db, call_uuid) {
++    Error(_err) ->
++      Error(response_helpers.json_error(
++        error_code.ServerError,
++        "Couldn't load that reference. Give it another go.",
++        500,
++      ))
++    Ok(pog.Returned(_, [])) ->
++      Error(response_helpers.json_error(
++        error_code.NotFound,
++        "That reference check isn't there anymore. Refresh and try again.",
++        404,
++      ))
++    Ok(pog.Returned(_, [row, ..])) ->
++      case row.application_id == uuid.to_string(app_uuid) {
++        False ->
++          Error(response_helpers.json_error(
++            error_code.NotFound,
++            "That reference check isn't there anymore. Refresh and try again.",
++            404,
++          ))
++        True -> Ok(row)
++      }
++  }
++}
++
++/// Updates the application's referee trio for the slot (A1 — the landlord
++/// edits the slot's trio inline; the Off-state chips + future trigger reads
++/// then see the current referee). Returns the affected row count.
++fn update_trio(
++  tx: pog.Connection,
++  app_uuid: Uuid,
++  vacancy_uuid: Uuid,
++  slot: String,
++  trio: Trio,
++) -> Result(Int, pog.QueryError) {
++  case slot {
++    "landlord_ref" ->
++      sql.update_application_referee_trio_landlord(
++        tx,
++        app_uuid,
++        vacancy_uuid,
++        trio.name,
++        trio.email,
++        trio.phone,
++      )
++      |> result.map(row_count)
++    "character_ref" ->
++      sql.update_application_referee_trio_character(
++        tx,
++        app_uuid,
++        vacancy_uuid,
++        trio.name,
++        trio.email,
++        trio.phone,
++      )
++      |> result.map(row_count)
++    "employer_ref" ->
++      sql.update_application_referee_trio_employer(
++        tx,
++        app_uuid,
++        vacancy_uuid,
++        trio.name,
++        trio.email,
++        trio.phone,
++      )
++      |> result.map(row_count)
++    _ -> Error(pog.UnexpectedArgumentCount(expected: 5, got: 0))
++  }
++}
++
++/// The returned-row count of any `pog.Returned` — the trio updates' row
++/// types differ, so each arm maps to this common `Int` immediately.
++fn row_count(returned: pog.Returned(a)) -> Int {
++  list.length(returned.rows)
++}
++
++fn json_ok(body: json.Json) -> Response {
++  wisp.json_response(json.to_string(body), 200)
++}
+diff --git a/server/src/reference_checks/form_handler.gleam b/server/src/reference_checks/form_handler.gleam
+index 0f44ad2b..b1dc1b23 100644
+--- a/server/src/reference_checks/form_handler.gleam
++++ b/server/src/reference_checks/form_handler.gleam
+@@ -1210,40 +1210,123 @@ fn apply_wrong_person(
+       wisp.internal_server_error()
+     }
+     Ok(id_uuid) ->
+-      // AwaitingCorrection is non-terminal but NULLs next_attempt_at (the
+-      // CASE now includes it, AD-7): the sweep never re-sends to the bad
+-      // contact. No notification (the landlord sees the state in RC4); no
+-      // applicant correction email (landlord-driven in v1, §8.3).
+-      case
+-        sql.update_reference_call_status(
+-          config.db,
+-          id_uuid,
+-          sql.AwaitingCorrection,
+-          "",
+-          "contact_invalid",
+-          sql.ContactInitiated,
+-        )
+-      {
+-        Ok(pog.Returned(_, [_, ..])) -> {
+-          audit_terminal(
+-            config.db,
++      // RC4.3 (AD-7): a row that already ran its one correction cycle does
++      // NOT return to awaiting_correction — the second wrong-person response
++      // exhausts: terminalize as unreachable + stamp the
++      // referee_contact_invalid fraud signal (rc3-7's mechanism, LIVE here).
++      case row.correction_cycles >= 1 {
++        True -> exhaust_wrong_person(config, row, id_uuid, token)
++        False ->
++          // AwaitingCorrection is non-terminal but NULLs next_attempt_at (the
++          // CASE now includes it, AD-7): the sweep never re-sends to the bad
++          // contact. No notification (the landlord sees the state in RC4); no
++          // applicant correction email (landlord-driven in v1, §8.3).
++          case
++            sql.update_reference_call_status(
++              config.db,
++              id_uuid,
++              sql.AwaitingCorrection,
++              "",
++              "contact_invalid",
++              sql.ContactInitiated,
++            )
++          {
++            Ok(pog.Returned(_, [_, ..])) -> {
++              audit_terminal(
++                config.db,
++                config.sentry,
++                row,
++                event_type.ReferenceCallWrongPerson,
++                json.null(),
++              )
++              form_pages.view_wrong_person_confirmed()
++              |> ssr_response.to_sensitive_response
++            }
++            Ok(pog.Returned(_, [])) -> wisp.redirect(to: "/reference/" <> token)
++            Error(err) -> {
++              wisp.log_error(
++                "reference wrong-person: status update failed: "
++                <> string.inspect(err),
++              )
++              wisp.internal_server_error()
++            }
++          }
++      }
++  }
++}
++
++/// RC4.3 wrong-person exhaustion (AD-7): same guarded terminal as the
++/// delivery-failure exhaustion — `unreachable` + the minimal §4.6 result
++/// (carrying the attempt log) + referee_contact_invalid stamp + audit +
++/// in-app notification. Best-effort after the guarded transition.
++fn exhaust_wrong_person(
++  config: ServerConfig,
++  row: sql.GetFormContextByFormTokenRow,
++  id_uuid: uuid.Uuid,
++  token: String,
++) -> Response {
++  let result_json =
++    result.minimal_terminal_result(
++      outcome: "unreachable",
++      attempts: row.attempts,
++      note: None,
++    )
++  case
++    sql.exhaust_reference_call(
++      config.db,
++      id_uuid,
++      "unreachable",
++      "contact_invalid",
++      result_json,
++      row.retention_due_at,
++    )
++  {
++    Ok(pog.Returned(_, [_, ..])) -> {
++      case sql.stamp_referee_contact_invalid(config.db, id_uuid) {
++        Ok(_) -> Nil
++        Error(err) ->
++          // r1 (N17): mirror the webhook path — capture to Sentry, never
++          // just a log line (a missing stamp is a silent compliance gap).
++          sentry_client.capture(
+             config.sentry,
+-            row,
+-            event_type.ReferenceCallWrongPerson,
+-            json.null(),
+-          )
+-          form_pages.view_wrong_person_confirmed()
+-          |> ssr_response.to_sensitive_response
+-        }
+-        Ok(pog.Returned(_, [])) -> wisp.redirect(to: "/reference/" <> token)
+-        Error(err) -> {
+-          wisp.log_error(
+-            "reference wrong-person: status update failed: "
+-            <> string.inspect(err),
++            sentry_client.BackgroundEvent(
++              event_type: "ReferenceWrongPersonStampFailed",
++              message: "wrong-person exhaustion: fraud-signal stamp failed: "
++                <> string.inspect(err),
++              level: sentry_client.LevelError,
++              tags: [#("entity_id", row.id)],
++            ),
+           )
+-          wisp.internal_server_error()
+-        }
+       }
++      audit_terminal(
++        config.db,
++        config.sentry,
++        row,
++        event_type.ReferenceCallCorrectionExhausted,
++        json.object([
++          #("terminal_reason", json.string("contact_invalid")),
++        ]),
++      )
++      case uuid.from_string(row.landlord_id) {
++        Ok(landlord_id) ->
++          case
++            notification_dispatch.notify_reference_correction_exhausted(
++              config.db,
++              landlord_id,
++              id_uuid,
++              row.contact_name,
++              row.applicant_first_name <> " " <> row.applicant_last_name,
++            )
++          {
++            Ok(_) -> Nil
++            Error(_) -> Nil
++          }
++        Error(_) -> Nil
++      }
++      form_pages.view_wrong_person_confirmed()
++      |> ssr_response.to_sensitive_response
++    }
++    _ -> wisp.redirect(to: "/reference/" <> token)
+   }
+ }
+ 
+diff --git a/server/src/reference_checks/sql.gleam b/server/src/reference_checks/sql.gleam
+index 34e2450a..e488de90 100644
+--- a/server/src/reference_checks/sql.gleam
++++ b/server/src/reference_checks/sql.gleam
+@@ -144,6 +144,107 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `correct_reference_call` query
++/// defined in `./src/reference_checks/sql/correct_reference_call.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type CorrectReferenceCallRow {
++  CorrectReferenceCallRow(id: String)
++}
++
++/// RC4.3 landlord-driven correction, one cycle (AD-7 as amended by A1, UX
++/// §8.3): the row must be awaiting_correction — that guard IS the one-cycle
++/// rule (after the correction the row is queued; a second `correct` call
++/// 0-rows and the handler 409s). The corrected values land in the
++/// corrected_* columns (NULLIF '' -> NULL); the immutable contact_* snapshot
++/// is NEVER touched. correction_cycles bumps to 1 (max by construction).
++/// 
++/// Re-queue semantics: status -> 'queued', next_attempt_at -> now() so the
++/// cadence sweep (RC3.5) owns the fresh invite (AD-14 — this writer only
++/// transitions + writes evidence, it does NOT send). terminal_reason is
++/// cleared: the failure that sent the row to awaiting_correction is resolved
++/// (the attempts log keeps the history; the fraud lens only stamps
++/// referee_contact_invalid on EXHAUSTION, RC4.3's second-failure path).
++/// 
++/// RC4.3 r1 (Perkins B1): attempt_count resets to 0 and the form token is
++/// cleared so the sweep re-runs the T0 claim — a fresh ~288-bit token is
++/// minted and the invite goes to the CORRECTED contact (the cadence step
++/// dispatch keys off attempt_count: a corrected row that failed at T0 would
++/// otherwise land in step_co_nudge, which can never advance a queued row).
++/// corrected_at stamps the correction instant — the exhaustion gate (r1 W3)
++/// uses it to distinguish genuine post-correction failures from stale
++/// redeliveries of the pre-correction send.
++/// - correct_reference_call(reference_call_id: UUID, application_id: UUID, corrected_name: TEXT, corrected_email: TEXT, corrected_phone: TEXT)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn correct_reference_call(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Uuid,
++  arg_3: String,
++  arg_4: String,
++  arg_5: String,
++) -> Result(pog.Returned(CorrectReferenceCallRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(CorrectReferenceCallRow(id:))
++  }
++
++  "-- RC4.3 landlord-driven correction, one cycle (AD-7 as amended by A1, UX
++-- §8.3): the row must be awaiting_correction — that guard IS the one-cycle
++-- rule (after the correction the row is queued; a second `correct` call
++-- 0-rows and the handler 409s). The corrected values land in the
++-- corrected_* columns (NULLIF '' -> NULL); the immutable contact_* snapshot
++-- is NEVER touched. correction_cycles bumps to 1 (max by construction).
++--
++-- Re-queue semantics: status -> 'queued', next_attempt_at -> now() so the
++-- cadence sweep (RC3.5) owns the fresh invite (AD-14 — this writer only
++-- transitions + writes evidence, it does NOT send). terminal_reason is
++-- cleared: the failure that sent the row to awaiting_correction is resolved
++-- (the attempts log keeps the history; the fraud lens only stamps
++-- referee_contact_invalid on EXHAUSTION, RC4.3's second-failure path).
++--
++-- RC4.3 r1 (Perkins B1): attempt_count resets to 0 and the form token is
++-- cleared so the sweep re-runs the T0 claim — a fresh ~288-bit token is
++-- minted and the invite goes to the CORRECTED contact (the cadence step
++-- dispatch keys off attempt_count: a corrected row that failed at T0 would
++-- otherwise land in step_co_nudge, which can never advance a queued row).
++-- corrected_at stamps the correction instant — the exhaustion gate (r1 W3)
++-- uses it to distinguish genuine post-correction failures from stale
++-- redeliveries of the pre-correction send.
++--- correct_reference_call(reference_call_id: UUID, application_id: UUID, corrected_name: TEXT, corrected_email: TEXT, corrected_phone: TEXT)
++UPDATE reference_call
++SET status = 'queued'::reference_call_status,
++    corrected_name = NULLIF($3, ''),
++    corrected_email = NULLIF($4, ''),
++    corrected_phone = NULLIF($5, ''),
++    correction_cycles = correction_cycles + 1,
++    corrected_at = now(),
++    terminal_reason = NULL,
++    attempt_count = 0,
++    form_token = NULL,
++    form_token_expires_at = NULL,
++    next_attempt_at = now(),
++    updated_at = now()
++WHERE id = $1
++  AND application_id = $2
++  AND status = 'awaiting_correction'::reference_call_status
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.parameter(pog.text(arg_5))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `count_cross_application_contact_reuse` query
+ /// defined in `./src/reference_checks/sql/count_cross_application_contact_reuse.sql`.
+ ///
+@@ -210,6 +311,92 @@ WHERE rc.application_id <> $1
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `exhaust_reference_call` query
++/// defined in `./src/reference_checks/sql/exhaust_reference_call.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type ExhaustReferenceCallRow {
++  ExhaustReferenceCallRow(id: String)
++}
++
++/// RC4.3 correction-exhaustion terminal (AD-7: one correction cycle; a
++/// second failure converts the row to unreachable). Fired by the delivery
++/// failure sites (email bounce / SMS failure webhooks, wrong-person route)
++/// when the row already ran its correction (correction_cycles >= 1): instead
++/// of returning to awaiting_correction — which would silently re-ask the
++/// landlord to correct the same details again — the row terminalizes as
++/// unreachable with the referee_contact_invalid fraud signal stamped
++/// (rc3-7's mechanism, LIVE here; the signal is never fabricated).
++/// 
++/// Guarded single-UPDATE (AD-14): only live pre-correction states
++/// (queued / contact_initiated — the states the sweep sends from) plus the
++/// caller's correction_cycles gate; a 0-row result means someone else
++/// transitioned first and the writer stands down. `outcome` passes as TEXT
++/// with the NULLIF convention (reference_call_status and
++/// reference_call_outcome share constructor names — Squirrel must not emit a
++/// second Gleam type for the outcome enum). purge_after follows the
++/// application's retention schedule (§9.3) when the caller passes it.
++/// - exhaust_reference_call(reference_call_id: UUID, outcome: TEXT, terminal_reason: TEXT, result: TEXT, retention_due_at: TEXT)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn exhaust_reference_call(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: String,
++  arg_3: String,
++  arg_4: Json,
++  arg_5: String,
++) -> Result(pog.Returned(ExhaustReferenceCallRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(ExhaustReferenceCallRow(id:))
++  }
++
++  "-- RC4.3 correction-exhaustion terminal (AD-7: one correction cycle; a
++-- second failure converts the row to unreachable). Fired by the delivery
++-- failure sites (email bounce / SMS failure webhooks, wrong-person route)
++-- when the row already ran its correction (correction_cycles >= 1): instead
++-- of returning to awaiting_correction — which would silently re-ask the
++-- landlord to correct the same details again — the row terminalizes as
++-- unreachable with the referee_contact_invalid fraud signal stamped
++-- (rc3-7's mechanism, LIVE here; the signal is never fabricated).
++--
++-- Guarded single-UPDATE (AD-14): only live pre-correction states
++-- (queued / contact_initiated — the states the sweep sends from) plus the
++-- caller's correction_cycles gate; a 0-row result means someone else
++-- transitioned first and the writer stands down. `outcome` passes as TEXT
++-- with the NULLIF convention (reference_call_status and
++-- reference_call_outcome share constructor names — Squirrel must not emit a
++-- second Gleam type for the outcome enum). purge_after follows the
++-- application's retention schedule (§9.3) when the caller passes it.
++--- exhaust_reference_call(reference_call_id: UUID, outcome: TEXT, terminal_reason: TEXT, result: TEXT, retention_due_at: TEXT)
++UPDATE reference_call
++SET status          = 'unreachable'::reference_call_status,
++    outcome         = NULLIF($2, '')::reference_call_outcome,
++    terminal_reason = $3,
++    result          = $4::jsonb,
++    next_attempt_at = NULL,
++    purge_after     = CASE WHEN $5 = '' THEN purge_after
++                           ELSE $5::timestamptz END,
++    updated_at      = now()
++WHERE id = $1
++  AND status IN ('queued', 'contact_initiated')
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(arg_2))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(json.to_string(arg_4)))
++  |> pog.parameter(pog.text(arg_5))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `find_reference_call_by_send_ref` query
+ /// defined in `./src/reference_checks/sql/find_reference_call_by_send_ref.sql`.
+ ///
+@@ -221,8 +408,13 @@ pub type FindReferenceCallBySendRefRow {
+     id: String,
+     status: String,
+     contact_name: String,
++    correction_cycles: Int,
++    matched_send_at: String,
++    corrected_at: String,
++    attempts: String,
+     landlord_id: String,
+     applicant_full_name: String,
++    retention_due_at: String,
+   )
+ }
+ 
+@@ -231,7 +423,8 @@ pub type FindReferenceCallBySendRefRow {
+ /// the cadence sweep (rc3-5) appended as the `detail` of a `delivered` entry in
+ /// the attempts jsonb. Pass it as send_ref_json = '[{"outcome":"delivered","detail":"<id>"}]';
+ /// jsonb @> containment matches the row whose attempts holds that delivered send.
+-/// FALLBACK: the effective contact (corrected ?? snapshot) — covers the rare
++/// FALLBACK: the effective contact (corrected ?? snapshot — post-correction the
++/// corrected values REPLACE the proven-dead snapshot, r1 W4) — covers the rare
+ /// crash-mid-tick edge where the send went out but the sweep crashed before
+ /// appending. Scoped to live (queued / contact_initiated) rows: a bounce on a
+ /// terminal or already-awaiting row is a no-op anyway (the guarded
+@@ -239,9 +432,17 @@ pub type FindReferenceCallBySendRefRow {
+ /// if a contact is genuinely shared across live rows (the handler logs this).
+ /// 
+ /// Returns the context the handler needs to act: row id + status (for the guarded
+-/// transition), the referee's contact_name + applicant full name (notification
+-/// copy), and the landlord_id (the notification recipient — vacancy.user_id).
+-/// - find_reference_call_by_send_ref(send_ref_json: TEXT, contact_email: TEXT, contact_phone: TEXT)
++/// transition), the referee's EFFECTIVE name (corrected ?? snapshot — r1 W2: the
++/// exhaustion notification must not announce the replaced referee), the one-cycle
++/// gate, and the landlord_id (the notification recipient — vacancy.user_id).
++/// 
++/// RC4.3 r1 (W3): `matched_send_at` is the timestamp of the attempts entry that
++/// matched the send_ref ('' when the match came via the contact fallback), and
++/// `corrected_at` is when the landlord's correction re-queued the row. The
++/// exhaustion gate compares them: only a POST-correction failure exhausts — a
++/// stale/redelivered bounce of the pre-correction send stands down instead of
++/// fabricating referee_contact_invalid on a contact that was never re-tried.
++/// - find_reference_call_by_send_ref(send_ref_json: TEXT, contact_email: TEXT, contact_phone: TEXT, send_ref: TEXT)
+ ///
+ /// > 🐿️ This function was generated automatically using v4.6.0 of
+ /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+@@ -251,19 +452,30 @@ pub fn find_reference_call_by_send_ref(
+   arg_1: String,
+   arg_2: String,
+   arg_3: String,
++  arg_4: String,
+ ) -> Result(pog.Returned(FindReferenceCallBySendRefRow), pog.QueryError) {
+   let decoder = {
+     use id <- decode.field(0, decode.string)
+     use status <- decode.field(1, decode.string)
+     use contact_name <- decode.field(2, decode.string)
+-    use landlord_id <- decode.field(3, decode.string)
+-    use applicant_full_name <- decode.field(4, decode.string)
++    use correction_cycles <- decode.field(3, decode.int)
++    use matched_send_at <- decode.field(4, decode.string)
++    use corrected_at <- decode.field(5, decode.string)
++    use attempts <- decode.field(6, decode.string)
++    use landlord_id <- decode.field(7, decode.string)
++    use applicant_full_name <- decode.field(8, decode.string)
++    use retention_due_at <- decode.field(9, decode.string)
+     decode.success(FindReferenceCallBySendRefRow(
+       id:,
+       status:,
+       contact_name:,
++      correction_cycles:,
++      matched_send_at:,
++      corrected_at:,
++      attempts:,
+       landlord_id:,
+       applicant_full_name:,
++      retention_due_at:,
+     ))
+   }
+ 
+@@ -272,7 +484,8 @@ pub fn find_reference_call_by_send_ref(
+ -- the cadence sweep (rc3-5) appended as the `detail` of a `delivered` entry in
+ -- the attempts jsonb. Pass it as send_ref_json = '[{\"outcome\":\"delivered\",\"detail\":\"<id>\"}]';
+ -- jsonb @> containment matches the row whose attempts holds that delivered send.
+--- FALLBACK: the effective contact (corrected ?? snapshot) — covers the rare
++-- FALLBACK: the effective contact (corrected ?? snapshot — post-correction the
++-- corrected values REPLACE the proven-dead snapshot, r1 W4) — covers the rare
+ -- crash-mid-tick edge where the send went out but the sweep crashed before
+ -- appending. Scoped to live (queued / contact_initiated) rows: a bounce on a
+ -- terminal or already-awaiting row is a no-op anyway (the guarded
+@@ -280,22 +493,55 @@ pub fn find_reference_call_by_send_ref(
+ -- if a contact is genuinely shared across live rows (the handler logs this).
+ --
+ -- Returns the context the handler needs to act: row id + status (for the guarded
+--- transition), the referee's contact_name + applicant full name (notification
+--- copy), and the landlord_id (the notification recipient — vacancy.user_id).
+---- find_reference_call_by_send_ref(send_ref_json: TEXT, contact_email: TEXT, contact_phone: TEXT)
++-- transition), the referee's EFFECTIVE name (corrected ?? snapshot — r1 W2: the
++-- exhaustion notification must not announce the replaced referee), the one-cycle
++-- gate, and the landlord_id (the notification recipient — vacancy.user_id).
++--
++-- RC4.3 r1 (W3): `matched_send_at` is the timestamp of the attempts entry that
++-- matched the send_ref ('' when the match came via the contact fallback), and
++-- `corrected_at` is when the landlord's correction re-queued the row. The
++-- exhaustion gate compares them: only a POST-correction failure exhausts — a
++-- stale/redelivered bounce of the pre-correction send stands down instead of
++-- fabricating referee_contact_invalid on a contact that was never re-tried.
++--- find_reference_call_by_send_ref(send_ref_json: TEXT, contact_email: TEXT, contact_phone: TEXT, send_ref: TEXT)
+ SELECT rc.id::text,
+        rc.status::text,
+-       rc.contact_name,
++       COALESCE(NULLIF(rc.corrected_name, ''), rc.contact_name) AS contact_name,
++       -- RC4.3 additive: the one-cycle correction gate — the exhaustion
++       -- branch (awaiting_correction -> unreachable + referee_contact_invalid)
++       -- fires only when a correction already ran (AD-7).
++       rc.correction_cycles,
++       -- r1 W3: the failing send's timestamp ('' for the contact fallback).
++       COALESCE((
++         SELECT e->>'at'
++         FROM jsonb_array_elements(rc.attempts) AS e
++         WHERE e->>'detail' = $4 AND e->>'outcome' = 'delivered'
++         ORDER BY e->>'at' DESC
++         LIMIT 1
++       ), '') AS matched_send_at,
++       -- r1 W3: the correction instant ('' for never-corrected rows).
++       COALESCE(rc.corrected_at::text, '') AS corrected_at,
++       -- r1 W4: the row's attempt log (the exhaustion terminal's minimal
++       -- result carries it — §4.6 uniform-read rule).
++       COALESCE(rc.attempts::text, '[]') AS attempts,
+        v.user_id::text AS landlord_id,
+-       a.first_name || ' ' || a.last_name AS applicant_full_name
++       a.first_name || ' ' || a.last_name AS applicant_full_name,
++       -- RC4.3 additive: the retention stamp at the exhaustion terminal (§9.3).
++       COALESCE(a.retention_due_at::text, '') AS retention_due_at
+ FROM reference_call rc
+ JOIN application a ON a.id = rc.application_id
+ JOIN vacancy v ON v.id = a.vacancy_id
+ WHERE rc.status IN ('queued', 'contact_initiated')
+   AND (
+     rc.attempts @> NULLIF($1, '')::jsonb
+-    OR ($2 <> '' AND COALESCE(NULLIF(rc.corrected_email, ''), rc.contact_email) = $2)
+-    OR ($3 <> '' AND COALESCE(NULLIF(rc.corrected_phone, ''), rc.contact_phone) = $3)
++    OR ($2 <> '' AND CASE
++         WHEN rc.correction_cycles >= 1 THEN NULLIF(rc.corrected_email, '')
++         ELSE COALESCE(NULLIF(rc.corrected_email, ''), rc.contact_email)
++       END = $2)
++    OR ($3 <> '' AND CASE
++         WHEN rc.correction_cycles >= 1 THEN NULLIF(rc.corrected_phone, '')
++         ELSE COALESCE(NULLIF(rc.corrected_phone, ''), rc.contact_phone)
++       END = $3)
+   )
+ ORDER BY rc.updated_at DESC
+ LIMIT 1;
+@@ -304,6 +550,7 @@ LIMIT 1;
+   |> pog.parameter(pog.text(arg_1))
+   |> pog.parameter(pog.text(arg_2))
+   |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
+   |> pog.returning(decoder)
+   |> pog.execute(db)
+ }
+@@ -533,6 +780,7 @@ pub type GetFormContextByFormTokenRow {
+     contact_phone: Option(String),
+     corrected_email: Option(String),
+     corrected_phone: Option(String),
++    correction_cycles: Int,
+     form_token_expires_at: String,
+     is_expired: String,
+     form_opened_at: String,
+@@ -585,29 +833,30 @@ pub fn get_form_context_by_form_token(
+     use contact_phone <- decode.field(6, decode.optional(decode.string))
+     use corrected_email <- decode.field(7, decode.optional(decode.string))
+     use corrected_phone <- decode.field(8, decode.optional(decode.string))
+-    use form_token_expires_at <- decode.field(9, decode.string)
+-    use is_expired <- decode.field(10, decode.string)
+-    use form_opened_at <- decode.field(11, decode.string)
+-    use draft_answers <- decode.field(12, decode.string)
+-    use attempts <- decode.field(13, decode.string)
+-    use taken_over_at <- decode.field(14, decode.string)
+-    use vacancy_id <- decode.field(15, decode.string)
+-    use landlord_id <- decode.field(16, decode.string)
+-    use retention_due_at <- decode.field(17, decode.string)
+-    use applicant_first_name <- decode.field(18, decode.string)
+-    use applicant_last_name <- decode.field(19, decode.string)
+-    use employer_name <- decode.field(20, decode.optional(decode.string))
+-    use job_title <- decode.field(21, decode.optional(decode.string))
+-    use employment_duration <- decode.field(22, decode.optional(decode.string))
+-    use monthly_income_cents <- decode.field(23, decode.int)
+-    use applicant_email <- decode.field(24, decode.string)
+-    use applicant_phone <- decode.field(25, decode.optional(decode.string))
+-    use submitted_ip_text <- decode.field(26, decode.string)
+-    use submitted_user_agent <- decode.field(27, decode.string)
+-    use fraud_signals <- decode.field(28, decode.string)
+-    use completion_seconds <- decode.field(29, decode.string)
+-    use landlord_display_name <- decode.field(30, decode.string)
+-    use origin_domain <- decode.field(31, decode.string)
++    use correction_cycles <- decode.field(9, decode.int)
++    use form_token_expires_at <- decode.field(10, decode.string)
++    use is_expired <- decode.field(11, decode.string)
++    use form_opened_at <- decode.field(12, decode.string)
++    use draft_answers <- decode.field(13, decode.string)
++    use attempts <- decode.field(14, decode.string)
++    use taken_over_at <- decode.field(15, decode.string)
++    use vacancy_id <- decode.field(16, decode.string)
++    use landlord_id <- decode.field(17, decode.string)
++    use retention_due_at <- decode.field(18, decode.string)
++    use applicant_first_name <- decode.field(19, decode.string)
++    use applicant_last_name <- decode.field(20, decode.string)
++    use employer_name <- decode.field(21, decode.optional(decode.string))
++    use job_title <- decode.field(22, decode.optional(decode.string))
++    use employment_duration <- decode.field(23, decode.optional(decode.string))
++    use monthly_income_cents <- decode.field(24, decode.int)
++    use applicant_email <- decode.field(25, decode.string)
++    use applicant_phone <- decode.field(26, decode.optional(decode.string))
++    use submitted_ip_text <- decode.field(27, decode.string)
++    use submitted_user_agent <- decode.field(28, decode.string)
++    use fraud_signals <- decode.field(29, decode.string)
++    use completion_seconds <- decode.field(30, decode.string)
++    use landlord_display_name <- decode.field(31, decode.string)
++    use origin_domain <- decode.field(32, decode.string)
+     decode.success(GetFormContextByFormTokenRow(
+       id:,
+       application_id:,
+@@ -618,6 +867,7 @@ pub fn get_form_context_by_form_token(
+       contact_phone:,
+       corrected_email:,
+       corrected_phone:,
++      correction_cycles:,
+       form_token_expires_at:,
+       is_expired:,
+       form_opened_at:,
+@@ -656,11 +906,17 @@ SELECT rc.id::text,
+        rc.application_id::text,
+        rc.ref_slot,
+        rc.status::text            AS status,
+-       rc.contact_name,
++       -- r1 W2: the EFFECTIVE referee name (corrected ?? snapshot) — the
++       -- exhaustion notification must not announce the replaced referee.
++       COALESCE(NULLIF(rc.corrected_name, ''), rc.contact_name) AS contact_name,
+        rc.contact_email,
+        rc.contact_phone,
+        rc.corrected_email,
+        rc.corrected_phone,
++       -- RC4.3 additive: the one-cycle correction gate — the wrong-person
++       -- route exhausts (awaiting_correction -> unreachable) only when a
++       -- correction already ran (AD-7).
++       rc.correction_cycles,
+        COALESCE(rc.form_token_expires_at::text, '') AS form_token_expires_at,
+        (rc.form_token_expires_at IS NOT NULL AND rc.form_token_expires_at <= now())::text AS is_expired,
+        COALESCE(rc.form_opened_at::text, '') AS form_opened_at,
+@@ -1607,6 +1863,57 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `rearm_queued_reference_calls` query
++/// defined in `./src/reference_checks/sql/rearm_queued_reference_calls.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type RearmQueuedReferenceCallsRow {
++  RearmQueuedReferenceCallsRow(id: String)
++}
++
++/// RC4.3 r1 (Perkins W6): "Start this check now" on an application whose rows
++/// already exist (the viewed trigger created them) is an idempotent no-op in
++/// the insert — the honest re-arm: nudge every queued row for the application
++/// to due-now so the cadence sweep picks them up on the next tick. Guarded on
++/// queued + not-taken-over (A7: a landlord-handled row is never re-armed).
++/// 0 rows is fine (nothing queued) — the caller treats the re-arm as best-effort.
++/// - rearm_queued_reference_calls(application_id: UUID)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn rearm_queued_reference_calls(
++  db: pog.Connection,
++  arg_1: Uuid,
++) -> Result(pog.Returned(RearmQueuedReferenceCallsRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(RearmQueuedReferenceCallsRow(id:))
++  }
++
++  "-- RC4.3 r1 (Perkins W6): \"Start this check now\" on an application whose rows
++-- already exist (the viewed trigger created them) is an idempotent no-op in
++-- the insert — the honest re-arm: nudge every queued row for the application
++-- to due-now so the cadence sweep picks them up on the next tick. Guarded on
++-- queued + not-taken-over (A7: a landlord-handled row is never re-armed).
++-- 0 rows is fine (nothing queued) — the caller treats the re-arm as best-effort.
++--- rearm_queued_reference_calls(application_id: UUID)
++UPDATE reference_call
++SET next_attempt_at = now(),
++    updated_at = now()
++WHERE application_id = $1
++  AND status = 'queued'::reference_call_status
++  AND taken_over_at IS NULL
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `remint_form_token` query
+ /// defined in `./src/reference_checks/sql/remint_form_token.sql`.
+ ///
+@@ -1963,6 +2270,119 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `substitute_reference_call` query
++/// defined in `./src/reference_checks/sql/substitute_reference_call.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type SubstituteReferenceCallRow {
++  SubstituteReferenceCallRow(id: String, how: String)
++}
++
++/// RC4.3 referee substitution (AD-11 hook semantics, UX §8.2): the landlord
++/// swaps a terminal objected/unreachable referee for a NEW referee via the
++/// inline edit-trio. Guarded on the old row's pre-state (AD-14): only
++/// terminal objected / unreachable rows may be substituted — the exact set
++/// the §8.2 can_substitute_referee hook computes. A 0-row result means the
++/// row was not in that state (e.g. a different terminal); stand down, no
++/// mutation.
++/// 
++/// Idempotency (the live-slot partial unique index): a second substitution
++/// for the same slot — a double-submit, or the landlord re-substituting the
++/// OLD terminal row after a successor already exists (the panel keeps the
++/// prior row as history) — conflicts with the live successor and inserts
++/// nothing. Instead of erroring, the query returns the EXISTING successor's
++/// id with `how = 'existing'` (a 200 no-op, no duplicate row, no duplicate
++/// audit); a real insert returns `how = 'inserted'`. The prior terminal row
++/// is untouched in both cases (retained as history).
++/// 
++/// next_attempt_at = now() — the sweep owns the fresh invite (AD-14).
++/// - substitute_reference_call(reference_call_id: UUID, application_id: UUID, new_name: TEXT, new_email: TEXT, new_phone: TEXT)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn substitute_reference_call(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Uuid,
++  arg_3: String,
++  arg_4: String,
++  arg_5: String,
++) -> Result(pog.Returned(SubstituteReferenceCallRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    use how <- decode.field(1, decode.string)
++    decode.success(SubstituteReferenceCallRow(id:, how:))
++  }
++
++  "-- RC4.3 referee substitution (AD-11 hook semantics, UX §8.2): the landlord
++-- swaps a terminal objected/unreachable referee for a NEW referee via the
++-- inline edit-trio. Guarded on the old row's pre-state (AD-14): only
++-- terminal objected / unreachable rows may be substituted — the exact set
++-- the §8.2 can_substitute_referee hook computes. A 0-row result means the
++-- row was not in that state (e.g. a different terminal); stand down, no
++-- mutation.
++--
++-- Idempotency (the live-slot partial unique index): a second substitution
++-- for the same slot — a double-submit, or the landlord re-substituting the
++-- OLD terminal row after a successor already exists (the panel keeps the
++-- prior row as history) — conflicts with the live successor and inserts
++-- nothing. Instead of erroring, the query returns the EXISTING successor's
++-- id with `how = 'existing'` (a 200 no-op, no duplicate row, no duplicate
++-- audit); a real insert returns `how = 'inserted'`. The prior terminal row
++-- is untouched in both cases (retained as history).
++--
++-- next_attempt_at = now() — the sweep owns the fresh invite (AD-14).
++--- substitute_reference_call(reference_call_id: UUID, application_id: UUID, new_name: TEXT, new_email: TEXT, new_phone: TEXT)
++WITH guard AS (
++  SELECT application_id, ref_slot, owner_label
++  FROM reference_call
++  WHERE id = $1
++    AND application_id = $2
++    AND status IN ('objected', 'unreachable')
++),
++inserted AS (
++  INSERT INTO reference_call (
++    application_id, ref_slot, owner_label,
++    contact_name, contact_email, contact_phone,
++    next_attempt_at
++  )
++  SELECT application_id, ref_slot, owner_label,
++         $3, NULLIF($4, ''), NULLIF($5, ''),
++         now()
++  FROM guard
++  ON CONFLICT (application_id, ref_slot, owner_label) WHERE status NOT IN (
++    'form_completed', 'unreachable', 'refused', 'objected',
++    'manual_recorded', 'failed', 'completed', 'partial'
++  )
++  DO NOTHING
++  RETURNING id::text
++)
++SELECT id::text, 'inserted' AS how FROM inserted
++UNION ALL
++SELECT rc.id::text, 'existing' AS how
++FROM reference_call rc
++WHERE rc.application_id = (SELECT application_id FROM guard LIMIT 1)
++  AND rc.ref_slot = (SELECT ref_slot FROM guard LIMIT 1)
++  AND rc.owner_label = (SELECT owner_label FROM guard LIMIT 1)
++  AND rc.status NOT IN (
++    'form_completed', 'unreachable', 'refused', 'objected',
++    'manual_recorded', 'failed', 'completed', 'partial'
++  )
++  AND NOT EXISTS (SELECT 1 FROM inserted);
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.parameter(pog.text(arg_5))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `sweep_advance` query
+ /// defined in `./src/reference_checks/sql/sweep_advance.sql`.
+ ///
+@@ -2146,6 +2566,7 @@ pub type SweepDueReferenceCallsRow {
+     contact_phone: Option(String),
+     corrected_email: Option(String),
+     corrected_phone: Option(String),
++    correction_cycles: Int,
+     form_token: Option(String),
+     form_opened_at: String,
+     draft_answers: String,
+@@ -2204,19 +2625,20 @@ pub fn sweep_due_reference_calls(
+     use contact_phone <- decode.field(7, decode.optional(decode.string))
+     use corrected_email <- decode.field(8, decode.optional(decode.string))
+     use corrected_phone <- decode.field(9, decode.optional(decode.string))
+-    use form_token <- decode.field(10, decode.optional(decode.string))
+-    use form_opened_at <- decode.field(11, decode.string)
+-    use draft_answers <- decode.field(12, decode.string)
+-    use attempts <- decode.field(13, decode.string)
+-    use created_at <- decode.field(14, decode.string)
+-    use vacancy_id <- decode.field(15, decode.string)
+-    use applicant_first_name <- decode.field(16, decode.string)
+-    use applicant_last_name <- decode.field(17, decode.string)
+-    use applicant_email <- decode.field(18, decode.string)
+-    use retention_due_at <- decode.field(19, decode.string)
+-    use landlord_id <- decode.field(20, decode.string)
+-    use origin_domain <- decode.field(21, decode.string)
+-    use landlord_display_name <- decode.field(22, decode.string)
++    use correction_cycles <- decode.field(10, decode.int)
++    use form_token <- decode.field(11, decode.optional(decode.string))
++    use form_opened_at <- decode.field(12, decode.string)
++    use draft_answers <- decode.field(13, decode.string)
++    use attempts <- decode.field(14, decode.string)
++    use created_at <- decode.field(15, decode.string)
++    use vacancy_id <- decode.field(16, decode.string)
++    use applicant_first_name <- decode.field(17, decode.string)
++    use applicant_last_name <- decode.field(18, decode.string)
++    use applicant_email <- decode.field(19, decode.string)
++    use retention_due_at <- decode.field(20, decode.string)
++    use landlord_id <- decode.field(21, decode.string)
++    use origin_domain <- decode.field(22, decode.string)
++    use landlord_display_name <- decode.field(23, decode.string)
+     decode.success(SweepDueReferenceCallsRow(
+       id:,
+       application_id:,
+@@ -2228,6 +2650,7 @@ pub fn sweep_due_reference_calls(
+       contact_phone:,
+       corrected_email:,
+       corrected_phone:,
++      correction_cycles:,
+       form_token:,
+       form_opened_at:,
+       draft_answers:,
+@@ -2271,11 +2694,19 @@ SELECT rc.id::text,
+        rc.ref_slot,
+        rc.status::text                     AS status,
+        rc.attempt_count,
+-       rc.contact_name,
++       -- RC4.3: the EFFECTIVE referee name (corrected ?? snapshot) — the
++       -- invite/reminder copy addresses the referee by name, and a
++       -- landlord-corrected name must flow into the fresh invite (§8.3).
++       COALESCE(NULLIF(rc.corrected_name, ''), rc.contact_name) AS contact_name,
+        rc.contact_email,
+        rc.contact_phone,
+        rc.corrected_email,
+        rc.corrected_phone,
++       -- r1 W4: the correction gate — the effective-contact rule switches to
++       -- corrected-only once a correction ran (the snapshot is proven dead;
++       -- a cleared channel stays absent instead of falling back to the
++       -- failed address, AD-7 never-re-contact).
++       rc.correction_cycles,
+        rc.form_token,
+        COALESCE(rc.form_opened_at::text, '') AS form_opened_at,
+        COALESCE(rc.draft_answers::text, '')  AS draft_answers,
+@@ -2462,6 +2893,83 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `take_over_reference_call` query
++/// defined in `./src/reference_checks/sql/take_over_reference_call.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type TakeOverReferenceCallRow {
++  TakeOverReferenceCallRow(id: String)
++}
++
++/// RC4.3 warm-handoff takeover (A7, UX §7.7): the landlord takes the check
++/// over manually. Guarded single-UPDATE (AD-14) — the row must be in a
++/// waiting state (queued / contact_initiated) or the unreachable terminal
++/// (§7.7: "from unreachable or any waiting state") and must not already be
++/// taken over. A 0-row result means the row was already taken over,
++/// transitioned elsewhere, or is a terminal the takeover does not apply to
++/// (form_completed / refused / objected / failed / partial / skipped /
++/// awaiting_correction) — stand down, no mutation.
++/// 
++/// Deliberately writes ONLY taken_over_at + next_attempt_at, never status:
++/// `unreachable` is terminal-sticky for every writer (AD-14), but the
++/// takeover marker is not a status change — the row can still late-complete
++/// to form_completed (UX §8.6, A7: "the form link stays live").
++/// 
++/// next_attempt_at is NULL'd so the sweep's cadence index never re-selects
++/// the row even before the A7 `taken_over_at IS NULL` filter is consulted
++/// (belt-and-braces; the sweep SELECT already excludes taken-over rows).
++/// - take_over_reference_call(reference_call_id: UUID, application_id: UUID)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn take_over_reference_call(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Uuid,
++) -> Result(pog.Returned(TakeOverReferenceCallRow), pog.QueryError) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(TakeOverReferenceCallRow(id:))
++  }
++
++  "-- RC4.3 warm-handoff takeover (A7, UX §7.7): the landlord takes the check
++-- over manually. Guarded single-UPDATE (AD-14) — the row must be in a
++-- waiting state (queued / contact_initiated) or the unreachable terminal
++-- (§7.7: \"from unreachable or any waiting state\") and must not already be
++-- taken over. A 0-row result means the row was already taken over,
++-- transitioned elsewhere, or is a terminal the takeover does not apply to
++-- (form_completed / refused / objected / failed / partial / skipped /
++-- awaiting_correction) — stand down, no mutation.
++--
++-- Deliberately writes ONLY taken_over_at + next_attempt_at, never status:
++-- `unreachable` is terminal-sticky for every writer (AD-14), but the
++-- takeover marker is not a status change — the row can still late-complete
++-- to form_completed (UX §8.6, A7: \"the form link stays live\").
++--
++-- next_attempt_at is NULL'd so the sweep's cadence index never re-selects
++-- the row even before the A7 `taken_over_at IS NULL` filter is consulted
++-- (belt-and-braces; the sweep SELECT already excludes taken-over rows).
++--- take_over_reference_call(reference_call_id: UUID, application_id: UUID)
++UPDATE reference_call
++SET taken_over_at = now(),
++    next_attempt_at = NULL,
++    updated_at = now()
++WHERE id = $1
++  AND application_id = $2
++  AND taken_over_at IS NULL
++  AND status IN ('queued', 'contact_initiated', 'unreachable')
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `terminalize_reference_call` query
+ /// defined in `./src/reference_checks/sql/terminalize_reference_call.sql`.
+ ///
+@@ -2546,6 +3054,196 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `update_application_referee_trio_character` query
++/// defined in `./src/reference_checks/sql/update_application_referee_trio_character.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type UpdateApplicationRefereeTrioCharacterRow {
++  UpdateApplicationRefereeTrioCharacterRow(id: String)
++}
++
++/// RC4.3: update the application's referee trio for the character slot
++/// (A1 — the landlord edits the slot's trio inline, audit-logged). Sibling
++/// of update_application_referee_trio_landlord.sql (squirrel cannot codegen
++/// a dynamic column list; each slot is one fixed query).
++/// - update_application_referee_trio_character(application_id: UUID, vacancy_id: UUID, name: TEXT, email: TEXT, phone: TEXT)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn update_application_referee_trio_character(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Uuid,
++  arg_3: String,
++  arg_4: String,
++  arg_5: String,
++) -> Result(
++  pog.Returned(UpdateApplicationRefereeTrioCharacterRow),
++  pog.QueryError,
++) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(UpdateApplicationRefereeTrioCharacterRow(id:))
++  }
++
++  "-- RC4.3: update the application's referee trio for the character slot
++-- (A1 — the landlord edits the slot's trio inline, audit-logged). Sibling
++-- of update_application_referee_trio_landlord.sql (squirrel cannot codegen
++-- a dynamic column list; each slot is one fixed query).
++--- update_application_referee_trio_character(application_id: UUID, vacancy_id: UUID, name: TEXT, email: TEXT, phone: TEXT)
++UPDATE application
++SET character_ref_name = NULLIF($3, ''),
++    character_ref_email = NULLIF($4, ''),
++    character_ref_phone = NULLIF($5, '')
++WHERE id = $1
++  AND vacancy_id = $2
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.parameter(pog.text(arg_5))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `update_application_referee_trio_employer` query
++/// defined in `./src/reference_checks/sql/update_application_referee_trio_employer.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type UpdateApplicationRefereeTrioEmployerRow {
++  UpdateApplicationRefereeTrioEmployerRow(id: String)
++}
++
++/// RC4.3: update the application's referee trio for the employer slot
++/// (A1 — the landlord edits the slot's trio inline, audit-logged). Sibling
++/// of update_application_referee_trio_landlord.sql (squirrel cannot codegen
++/// a dynamic column list; each slot is one fixed query).
++/// - update_application_referee_trio_employer(application_id: UUID, vacancy_id: UUID, name: TEXT, email: TEXT, phone: TEXT)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn update_application_referee_trio_employer(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Uuid,
++  arg_3: String,
++  arg_4: String,
++  arg_5: String,
++) -> Result(
++  pog.Returned(UpdateApplicationRefereeTrioEmployerRow),
++  pog.QueryError,
++) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(UpdateApplicationRefereeTrioEmployerRow(id:))
++  }
++
++  "-- RC4.3: update the application's referee trio for the employer slot
++-- (A1 — the landlord edits the slot's trio inline, audit-logged). Sibling
++-- of update_application_referee_trio_landlord.sql (squirrel cannot codegen
++-- a dynamic column list; each slot is one fixed query).
++--- update_application_referee_trio_employer(application_id: UUID, vacancy_id: UUID, name: TEXT, email: TEXT, phone: TEXT)
++UPDATE application
++SET employer_ref_name = NULLIF($3, ''),
++    employer_ref_email = NULLIF($4, ''),
++    employer_ref_phone = NULLIF($5, '')
++WHERE id = $1
++  AND vacancy_id = $2
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.parameter(pog.text(arg_5))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
++/// A row you get from running the `update_application_referee_trio_landlord` query
++/// defined in `./src/reference_checks/sql/update_application_referee_trio_landlord.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type UpdateApplicationRefereeTrioLandlordRow {
++  UpdateApplicationRefereeTrioLandlordRow(id: String)
++}
++
++/// RC4.3: update the application's referee trio for a slot (A1 — the
++/// landlord edits the slot's trio inline, audit-logged; the applicant's
++/// verbal/message confirmation is the forewarning the attestation evidences,
++/// so no re-attestation step). Used by BOTH the correction flow (the
++/// corrected values) and the substitution flow (the new referee), so the
++/// Off-state chips + the trigger's slot selection read the current referee.
++/// 
++/// The slot column set is chosen by the CALLER via three separate queries
++/// (landlord_ref / character_ref / employer_ref) — squirrel cannot codegen a
++/// dynamic column list, and three fixed queries keep the UPDATE guards
++/// trivial. Each query is scoped by application id + vacancy id (defense in
++/// depth: the handler already verified ownership).
++/// - update_application_referee_trio_landlord(application_id: UUID, vacancy_id: UUID, name: TEXT, email: TEXT, phone: TEXT)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn update_application_referee_trio_landlord(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Uuid,
++  arg_3: String,
++  arg_4: String,
++  arg_5: String,
++) -> Result(
++  pog.Returned(UpdateApplicationRefereeTrioLandlordRow),
++  pog.QueryError,
++) {
++  let decoder = {
++    use id <- decode.field(0, decode.string)
++    decode.success(UpdateApplicationRefereeTrioLandlordRow(id:))
++  }
++
++  "-- RC4.3: update the application's referee trio for a slot (A1 — the
++-- landlord edits the slot's trio inline, audit-logged; the applicant's
++-- verbal/message confirmation is the forewarning the attestation evidences,
++-- so no re-attestation step). Used by BOTH the correction flow (the
++-- corrected values) and the substitution flow (the new referee), so the
++-- Off-state chips + the trigger's slot selection read the current referee.
++--
++-- The slot column set is chosen by the CALLER via three separate queries
++-- (landlord_ref / character_ref / employer_ref) — squirrel cannot codegen a
++-- dynamic column list, and three fixed queries keep the UPDATE guards
++-- trivial. Each query is scoped by application id + vacancy id (defense in
++-- depth: the handler already verified ownership).
++--- update_application_referee_trio_landlord(application_id: UUID, vacancy_id: UUID, name: TEXT, email: TEXT, phone: TEXT)
++UPDATE application
++SET landlord_ref_name = NULLIF($3, ''),
++    landlord_ref_email = NULLIF($4, ''),
++    landlord_ref_phone = NULLIF($5, '')
++WHERE id = $1
++  AND vacancy_id = $2
++RETURNING id::text;
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
++  |> pog.parameter(pog.text(arg_3))
++  |> pog.parameter(pog.text(arg_4))
++  |> pog.parameter(pog.text(arg_5))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ /// A row you get from running the `update_reference_call_status` query
+ /// defined in `./src/reference_checks/sql/update_reference_call_status.sql`.
+ ///
+@@ -2619,6 +3317,62 @@ RETURNING id::text;
+   |> pog.execute(db)
+ }
+ 
++/// A row you get from running the `verify_application_in_vacancy` query
++/// defined in `./src/reference_checks/sql/verify_application_in_vacancy.sql`.
++///
++/// > 🐿️ This type definition was generated automatically using v4.6.0 of the
++/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub type VerifyApplicationInVacancyRow {
++  VerifyApplicationInVacancyRow(match_count: Int)
++}
++
++/// RC4.3 r1 (Perkins W10): bind the path vacancy to the path application. The
++/// ownership precheck verifies landlord↔application; this closes the
++/// application↔vacancy gap so a same-owner cross-vacancy application id in the
++/// URL (which passed the ownership check) can no longer silently 0-row the
++/// application-trio UPDATE and return a misleading 200. 0 rows = the
++/// application does not live in the path vacancy — the handler 404s.
++/// - verify_application_in_vacancy(application_id: UUID, vacancy_id: UUID, landlord_id: UUID)
++///
++/// > 🐿️ This function was generated automatically using v4.6.0 of
++/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
++///
++pub fn verify_application_in_vacancy(
++  db: pog.Connection,
++  arg_1: Uuid,
++  arg_2: Uuid,
++  arg_3: Uuid,
++) -> Result(pog.Returned(VerifyApplicationInVacancyRow), pog.QueryError) {
++  let decoder = {
++    use match_count <- decode.field(0, decode.int)
++    decode.success(VerifyApplicationInVacancyRow(match_count:))
++  }
++
++  "-- RC4.3 r1 (Perkins W10): bind the path vacancy to the path application. The
++-- ownership precheck verifies landlord↔application; this closes the
++-- application↔vacancy gap so a same-owner cross-vacancy application id in the
++-- URL (which passed the ownership check) can no longer silently 0-row the
++-- application-trio UPDATE and return a misleading 200. 0 rows = the
++-- application does not live in the path vacancy — the handler 404s.
++--- verify_application_in_vacancy(application_id: UUID, vacancy_id: UUID, landlord_id: UUID)
++SELECT count(*)::int AS match_count
++FROM application a
++WHERE a.id = $1
++  AND a.vacancy_id = $2
++  AND EXISTS (
++    SELECT 1 FROM vacancy v
++    WHERE v.id = a.vacancy_id AND v.user_id = $3
++  );
++"
++  |> pog.query
++  |> pog.parameter(pog.text(uuid.to_string(arg_1)))
++  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
++  |> pog.parameter(pog.text(uuid.to_string(arg_3)))
++  |> pog.returning(decoder)
++  |> pog.execute(db)
++}
++
+ // --- Enums -------------------------------------------------------------------
+ 
+ /// Corresponds to the Postgres `reference_call_status` enum.
+diff --git a/server/src/reference_checks/sweep.gleam b/server/src/reference_checks/sweep.gleam
+index e39e35f6..fa0576d7 100644
+--- a/server/src/reference_checks/sweep.gleam
++++ b/server/src/reference_checks/sweep.gleam
+@@ -702,19 +702,34 @@ fn build_context(
+   )
+ }
+ 
+-/// Effective email (corrected ?? snapshot, AD-7).
+-fn effective_email(row: sql.SweepDueReferenceCallsRow) -> option.Option(String) {
+-  case row.corrected_email {
+-    Some(e) -> Some(e)
+-    None -> row.contact_email
++/// Effective email (AD-7, r1 W4): once a correction ran (correction_cycles
++/// >= 1) the snapshot is PROVEN DEAD — the corrected value IS the contact, and
++/// a cleared channel stays absent (never falling back to the failed address;
++/// AD-7's never-re-contact rule). Before any correction, corrected ?? snapshot.
++pub fn effective_email(
++  row: sql.SweepDueReferenceCallsRow,
++) -> option.Option(String) {
++  case row.correction_cycles >= 1 {
++    True -> row.corrected_email
++    False ->
++      case row.corrected_email {
++        Some(e) -> Some(e)
++        None -> row.contact_email
++      }
+   }
+ }
+ 
+-/// Effective phone (corrected ?? snapshot, AD-7).
+-fn effective_phone(row: sql.SweepDueReferenceCallsRow) -> option.Option(String) {
+-  case row.corrected_phone {
+-    Some(p) -> Some(p)
+-    None -> row.contact_phone
++/// Effective phone (AD-7, r1 W4) — same corrected-replaces-snapshot rule.
++pub fn effective_phone(
++  row: sql.SweepDueReferenceCallsRow,
++) -> option.Option(String) {
++  case row.correction_cycles >= 1 {
++    True -> row.corrected_phone
++    False ->
++      case row.corrected_phone {
++        Some(p) -> Some(p)
++        None -> row.contact_phone
++      }
+   }
+ }
+ 
+diff --git a/server/src/reference_checks/trigger.gleam b/server/src/reference_checks/trigger.gleam
+index 3e18b6c1..bbdb696c 100644
+--- a/server/src/reference_checks/trigger.gleam
++++ b/server/src/reference_checks/trigger.gleam
+@@ -111,6 +111,23 @@ pub fn run_create_checks(
+   app_uuid: Uuid,
+   landlord_uuid: Uuid,
+   vacancy_uuid: Uuid,
++) -> Result(CreateOutcome, CreateError) {
++  run_create_checks_slot(config, app_uuid, landlord_uuid, vacancy_uuid, None)
++}
++
++/// RC4.3 per-row variant: `run_create_checks` with an optional slot filter —
++/// `Some(slot)` creates checks for that slot only (UX §7.4's per-reference
++/// "Start this check now"; the `?slot=` query the RC2.3 spec pre-declared
++/// for the UI that demands it). `None` is today's whole-application
++/// behaviour (the viewed trigger + the plain start call). Slot selection
++/// and every other rule (declined suppression, no-contact skip,
++/// idempotency) apply identically.
++pub fn run_create_checks_slot(
++  config: ServerConfig,
++  app_uuid: Uuid,
++  landlord_uuid: Uuid,
++  vacancy_uuid: Uuid,
++  slot_filter: Option(String),
+ ) -> Result(CreateOutcome, CreateError) {
+   let db = config.db
+   case
+@@ -132,7 +149,14 @@ pub fn run_create_checks(
+         // application — no rows, no audits. (None = pre-v1 application —
+         // proceeds, per AD-2.)
+         Some("declined") -> Ok(Suppressed)
+-        _ -> create_eligible_slots(config, app_uuid, landlord_uuid, data)
++        _ ->
++          create_eligible_slots(
++            config,
++            app_uuid,
++            landlord_uuid,
++            data,
++            slot_filter,
++          )
+       }
+     // A single-row SELECT by application id; >1 row is impossible.
+     Ok(_) -> Error(ApplicationNotFound)
+@@ -144,6 +168,7 @@ fn create_eligible_slots(
+   app_uuid: Uuid,
+   landlord_uuid: Uuid,
+   data: sql.GetApplicationReferenceDataRow,
++  slot_filter slot_filter: Option(String),
+ ) -> Result(CreateOutcome, CreateError) {
+   // The landlord-ref slot and the character-ref slot are ONE slot in two
+   // flavours (AD-13): character-ref is used when the applicant never rented
+@@ -177,6 +202,14 @@ fn create_eligible_slots(
+   // way to reach them (email or phone). contact_name is NOT NULL in the
+   // schema, so a nameless slot can never receive a row.
+   let eligible = list.filter(candidates, trio_has_contact)
++  // RC4.3 per-row start: when a slot is requested, keep only that slot —
++  // the other slot is untouched (UX §7.4's per-reference start). An
++  // unknown/absent-slot filter falls through to `eligible` (the requested
++  // slot simply isn't in the candidates — nothing to create).
++  let eligible = case slot_filter {
++    None -> eligible
++    Some(requested) -> list.filter(eligible, fn(slot) { slot.0 == requested })
++  }
+ 
+   let run = fn(tx: pog.Connection) {
+     list.try_fold(eligible, [], fn(created, slot) {
+@@ -216,6 +249,39 @@ fn create_eligible_slots(
+ 
+ // -- Phase 1 fraud-signals stamp (rc3-7, AD-10) ------------------------------
+ 
++/// The RC4.3 substitute path applies the same creation-time screening to its
++/// NEW row (parity with trigger-created rows — r1 N1). Exported so the
++/// actions handler can stamp after its insert transaction commits.
++/// Best-effort: a read failure logs and skips (AD-10 — a missing signal is
++/// honest, never fabricated).
++pub fn stamp_creation_fraud_for(
++  config: ServerConfig,
++  app_uuid: Uuid,
++  landlord_uuid: Uuid,
++  vacancy_uuid: Uuid,
++  created_ids: List(String),
++) -> Nil {
++  case created_ids {
++    [] -> Nil
++    _ ->
++      case
++        sql.get_application_reference_data(
++          config.db,
++          app_uuid,
++          landlord_uuid,
++          vacancy_uuid,
++        )
++      {
++        Ok(pog.Returned(_, [data])) ->
++          stamp_creation_fraud(config, app_uuid, data, created_ids)
++        _ ->
++          wisp.log_warning(
++            "reference substitute: creation-fraud stamp skipped (reference-data read failed)",
++          )
++      }
++  }
++}
++
+ /// Stamp the creation-time `fraud_signals` on the application's NEWLY-CREATED
+ /// reference rows only: pure-DB reuse signals + the Twilio line-type lookup +
+ /// honest placeholders (`form_session: null`). Runs AFTER the creation tx
+@@ -393,11 +459,51 @@ fn create_one_slot(
+ /// trigger would (declined-suppression applies identically — the feature is
+ /// off for a declined application regardless of who initiates).
+ pub fn handle_start(
++  req: Request,
++  config: ServerConfig,
++  landlord: Landlord,
++  vacancy_id: String,
++  application_id: String,
++) -> Response {
++  let requested_slot = slot_query(req)
++  case requested_slot {
++    Some(slot) ->
++      case is_valid_slot(slot) {
++        False ->
++          response_helpers.json_error(
++            error_code.InvalidPayload,
++            "Couldn't start that check. Unknown reference type.",
++            400,
++          )
++        True ->
++          run_start_action(
++            req,
++            config,
++            landlord,
++            vacancy_id,
++            application_id,
++            requested_slot,
++          )
++      }
++    None ->
++      run_start_action(
++        req,
++        config,
++        landlord,
++        vacancy_id,
++        application_id,
++        requested_slot,
++      )
++  }
++}
++
++fn run_start_action(
+   _req: Request,
+   config: ServerConfig,
+   landlord: Landlord,
+   vacancy_id: String,
+   application_id: String,
++  requested_slot: Option(String),
+ ) -> Response {
+   case parse_app_uuids(application_id, landlord.id, vacancy_id) {
+     Error(resp) -> resp
+@@ -409,14 +515,34 @@ pub fn handle_start(
+         vacancy_uuid,
+         fn() {
+           case
+-            run_create_checks(config, app_uuid, landlord_uuid, vacancy_uuid)
++            run_create_checks_slot(
++              config,
++              app_uuid,
++              landlord_uuid,
++              vacancy_uuid,
++              requested_slot,
++            )
+           {
+-            Ok(_) ->
++            Ok(_) -> {
++              // r1 (W6): "Start this check now" on an application whose
++              // rows already exist (the auto-trigger created them) is an
++              // insert no-op — the honest re-arm nudges every queued row to
++              // due-now so the sweep picks them up on the next tick (the
++              // §7.4 promise "sends the invite now"). Best-effort.
++              case sql.rearm_queued_reference_calls(config.db, app_uuid) {
++                Ok(_) -> Nil
++                Error(err) ->
++                  wisp.log_warning(
++                    "reference-checks start re-arm failed: "
++                    <> string.inspect(err),
++                  )
++              }
+               json_ok(
+                 json.object([
+                   #("started", json.bool(True)),
+                 ]),
+               )
++            }
+             Error(ApplicationNotFound) ->
+               response_helpers.json_error(
+                 error_code.NotFound,
+@@ -439,6 +565,30 @@ pub fn handle_start(
+   }
+ }
+ 
++/// Reads the optional `?slot=` query param (RC4.3 per-row start — the
++/// RC2.3 spec pre-declared this variant "if the UI demands it"; the §7.4
++/// wireframe is per-reference). Absent = whole-application start (today's
++/// behaviour). Invalid values are rejected by `handle_start` before any
++/// work runs.
++fn slot_query(req: Request) -> Option(String) {
++  case req.query {
++    None -> None
++    Some(query_string) ->
++      query_string
++      |> string.split("&")
++      |> list.fold(None, fn(acc, pair) {
++        case acc {
++          Some(_) -> acc
++          None ->
++            case pair {
++              "slot=" <> slot -> Some(slot)
++              _ -> None
++            }
++        }
++      })
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // Skip API (FR-RC4 + A6)
+ // ---------------------------------------------------------------------------
+@@ -1045,7 +1195,10 @@ fn json_ok(body: json.Json) -> Response {
+ 
+ /// Writes a skip/re-enable lifecycle audit, fail-open (Tier 2) — the state
+ /// transition has already committed; an audit failure is observability-only.
+-fn write_lifecycle_audit(
++/// The canonical Tier-2 fail-open lifecycle audit (AD-16) — exported so the
++/// RC4.3 actions handler's takeover audit reuses it instead of duplicating
++/// the pattern (r1 N2).
++pub fn write_lifecycle_audit(
+   config: ServerConfig,
+   landlord_uuid: Uuid,
+   row_uuid: Uuid,
+diff --git a/server/src/reference_checks/webhooks.gleam b/server/src/reference_checks/webhooks.gleam
+index b5616a36..7212404b 100644
+--- a/server/src/reference_checks/webhooks.gleam
++++ b/server/src/reference_checks/webhooks.gleam
+@@ -24,12 +24,16 @@ import gleam/dynamic/decode
+ import gleam/http/request
+ import gleam/json
+ import gleam/list
++import gleam/option.{None}
++import gleam/order
+ import gleam/result
++import gleam/string
+ import inbound_email/svix
+ import notification/notification_dispatch
+ import notification/sms_client
+ import notification/twilio_webhook
+ import pog
++import reference_checks/result as ref_result
+ import reference_checks/sql
+ import response_helpers
+ import sentry/sentry_client
+@@ -229,7 +233,7 @@ fn process_twilio_event(
+ // never crashes the acked webhook).
+ // ---------------------------------------------------------------------------
+ 
+-fn apply_delivery_failure(
++pub fn apply_delivery_failure(
+   db db: pog.Connection,
+   sentry sentry: sentry_client.Sentry,
+   source source: String,
+@@ -263,6 +267,7 @@ fn apply_delivery_failure(
+       send_ref_json,
+       contact_email,
+       contact_phone,
++      send_ref,
+     )
+   {
+     Ok(pog.Returned(_, [row, ..])) ->
+@@ -275,45 +280,87 @@ fn apply_delivery_failure(
+             [#("id", row.id)],
+           )
+         Ok(reference_call_id) ->
+-          // 2. Guarded transition (sticky + idempotent in one UPDATE).
+-          case
+-            sql.mark_awaiting_correction(db, reference_call_id, terminal_reason)
+-          {
+-            Ok(pog.Returned(_, [_, ..])) -> {
+-              // 3. Real transition — write the AD-16 audit + the in-app
+-              // notification. Both are best-effort (a failure here is
+-              // captured but does not roll back the transition).
+-              write_audit(
+-                db,
+-                sentry,
+-                reference_call_id,
+-                source,
+-                terminal_reason,
+-              )
+-              case uuid.from_string(row.landlord_id) {
+-                Ok(landlord_id) ->
+-                  notification_dispatch.notify_reference_awaiting_correction(
++          // 2. Guarded transition. RC4.3 (AD-7): a row that already ran its
++          // correction cycle does NOT return to awaiting_correction — the
++          // second failure exhausts: terminalize as unreachable + stamp the
++          // referee_contact_invalid fraud signal (rc3-7's mechanism, LIVE
++          // here). Otherwise the pre-existing awaiting_correction path.
++          case row.correction_cycles >= 1 {
++            True -> {
++              // r1 (W3): only a POST-correction failure exhausts. A
++              // stale/redelivered bounce of the pre-correction send (its
++              // timestamp predates corrected_at) describes a failure the
++              // correction already resolved — stand down, never fabricate
++              // referee_contact_invalid on a contact that was never
++              // re-tried. The contact-fallback match (no send id — the
++              // crash-mid-tick edge) is treated as genuine.
++              let genuine_failure = case row.matched_send_at {
++                "" -> True
++                at ->
++                  case row.corrected_at {
++                    "" -> True
++                    corrected ->
++                      // ISO timestamps — lexical compare is chronological.
++                      string.compare(at, corrected) != order.Lt
++                  }
++              }
++              case genuine_failure {
++                True ->
++                  exhaust_row(
+                     db,
+-                    landlord_id,
++                    sentry,
+                     reference_call_id,
+-                    row.contact_name,
+-                    row.applicant_full_name,
++                    row,
++                    source,
++                    terminal_reason,
+                   )
+-                  |> ignore_result
+-                Error(_) ->
+-                  capture(
++                False -> Nil
++              }
++            }
++            False ->
++              case
++                sql.mark_awaiting_correction(
++                  db,
++                  reference_call_id,
++                  terminal_reason,
++                )
++              {
++                Ok(pog.Returned(_, [_, ..])) -> {
++                  // 3. Real transition — write the AD-16 audit + the in-app
++                  // notification. Both are best-effort (a failure here is
++                  // captured but does not roll back the transition).
++                  write_audit(
++                    db,
+                     sentry,
+-                    "ReferenceWebhookCorruptLandlordId",
+-                    "non-uuid landlord_id",
+-                    [#("landlord_id", row.landlord_id)],
++                    reference_call_id,
++                    source,
++                    terminal_reason,
+                   )
++                  case uuid.from_string(row.landlord_id) {
++                    Ok(landlord_id) ->
++                      notification_dispatch.notify_reference_awaiting_correction(
++                        db,
++                        landlord_id,
++                        reference_call_id,
++                        row.contact_name,
++                        row.applicant_full_name,
++                      )
++                      |> ignore_result
++                    Error(_) ->
++                      capture(
++                        sentry,
++                        "ReferenceWebhookCorruptLandlordId",
++                        "non-uuid landlord_id",
++                        [#("landlord_id", row.landlord_id)],
++                      )
++                  }
++                }
++                _ ->
++                  // 0 rows = the row was terminal / already awaiting_correction
++                  // between find and mark (a concurrent writer). Sticky +
++                  // idempotent — stand down, no audit/notification.
++                  Nil
+               }
+-            }
+-            _ ->
+-              // 0 rows = the row was terminal / already awaiting_correction
+-              // between find and mark (a concurrent writer). Sticky +
+-              // idempotent — stand down, no audit/notification.
+-              Nil
+           }
+       }
+     Ok(_) ->
+@@ -338,6 +385,43 @@ fn write_audit(
+   reference_call_id: uuid.Uuid,
+   source: String,
+   terminal_reason: String,
++) -> Nil {
++  write_audit_event(
++    db,
++    sentry,
++    reference_call_id,
++    source,
++    terminal_reason,
++    event_type.ReferenceCallCorrectionRequested,
++  )
++}
++
++/// RC4.3 correction-exhaustion audit (AD-16 terminal transition with
++/// outcome): same shape as `write_audit`, distinct event.
++fn write_exhaustion_audit(
++  db: pog.Connection,
++  sentry: sentry_client.Sentry,
++  reference_call_id: uuid.Uuid,
++  source: String,
++  terminal_reason: String,
++) -> Nil {
++  write_audit_event(
++    db,
++    sentry,
++    reference_call_id,
++    source,
++    terminal_reason,
++    event_type.ReferenceCallCorrectionExhausted,
++  )
++}
++
++fn write_audit_event(
++  db: pog.Connection,
++  sentry: sentry_client.Sentry,
++  reference_call_id: uuid.Uuid,
++  source: String,
++  terminal_reason: String,
++  event: event_type.AuditEvent,
+ ) -> Nil {
+   let details =
+     json.object([
+@@ -347,7 +431,7 @@ fn write_audit(
+   case
+     audit_log.create_system(
+       db,
+-      event: event_type.ReferenceCallCorrectionRequested,
++      event:,
+       entity_type: "reference_call",
+       entity_id: reference_call_id,
+       details:,
+@@ -368,6 +452,83 @@ fn write_audit(
+ // Event classification + decoders
+ // ---------------------------------------------------------------------------
+ 
++/// RC4.3 correction-exhaustion (AD-7): the guarded terminal for a row that
++/// already ran its one correction cycle. Terminalize -> unreachable with the
++/// minimal §4.6 result (carrying the attempt log), stamp the
++/// referee_contact_invalid fraud signal (rc3-7's mechanism — LIVE here), audit
++/// (AD-16 terminal with outcome), and notify in-app. All best-effort after
++/// the guarded transition (the webhook posture; the guarded UPDATE is the
++/// authority).
++fn exhaust_row(
++  db: pog.Connection,
++  sentry: sentry_client.Sentry,
++  reference_call_id: uuid.Uuid,
++  row: sql.FindReferenceCallBySendRefRow,
++  source: String,
++  terminal_reason: String,
++) -> Nil {
++  let result_json =
++    ref_result.minimal_terminal_result(
++      outcome: "unreachable",
++      attempts: row.attempts,
++      note: None,
++    )
++  case
++    sql.exhaust_reference_call(
++      db,
++      reference_call_id,
++      "unreachable",
++      terminal_reason,
++      result_json,
++      row.retention_due_at,
++    )
++  {
++    Ok(pog.Returned(_, [_, ..])) -> {
++      // Real transition — stamp the fraud signal + audit + notify.
++      case sql.stamp_referee_contact_invalid(db, reference_call_id) {
++        Ok(_) -> Nil
++        Error(err) ->
++          capture(
++            sentry,
++            "ReferenceWebhookStampFailed",
++            "stamp_referee_contact_invalid failed: "
++              <> query_error_to_string(err),
++            [],
++          )
++      }
++      write_exhaustion_audit(
++        db,
++        sentry,
++        reference_call_id,
++        source,
++        terminal_reason,
++      )
++      case uuid.from_string(row.landlord_id) {
++        Ok(landlord_id) ->
++          notification_dispatch.notify_reference_correction_exhausted(
++            db,
++            landlord_id,
++            reference_call_id,
++            row.contact_name,
++            row.applicant_full_name,
++          )
++          |> ignore_result
++        Error(_) ->
++          capture(
++            sentry,
++            "ReferenceWebhookCorruptLandlordId",
++            "non-uuid landlord_id",
++            [#("landlord_id", row.landlord_id)],
++          )
++      }
++    }
++    _ ->
++      // 0 rows: someone transitioned first (sticky terminals / a concurrent
++      // writer) — stand down, no stamp/audit/notification.
++      Nil
++  }
++}
++
+ /// Map a Resend event type to the terminal_reason slug, or "" if the event is
+ /// not actionable (delivered / opened / clicked / delivery_delayed / sent / …).
+ /// `delivery_delayed` is deliberately NOT actionable (transient — Resend
+diff --git a/server/src/retention/audit_log_schema.gleam b/server/src/retention/audit_log_schema.gleam
+index e60c7f5d..7020d82f 100644
+--- a/server/src/retention/audit_log_schema.gleam
++++ b/server/src/retention/audit_log_schema.gleam
+@@ -83,6 +83,9 @@ pub type NonPiiKey {
+   NewClosesAt
+   PreviousStatus
+   RefSlot
++  // RC4.3 substitution audit (AD-16): the old + new reference_call row ids.
++  OldReferenceCallId
++  NewReferenceCallId
+ }
+ 
+ pub fn pii_to_string(key: PiiKey) -> String {
+@@ -140,6 +143,8 @@ pub fn non_pii_to_string(key: NonPiiKey) -> String {
+     NewClosesAt -> "new_closes_at"
+     PreviousStatus -> "previous_status"
+     RefSlot -> "ref_slot"
++    OldReferenceCallId -> "old_reference_call_id"
++    NewReferenceCallId -> "new_reference_call_id"
+   }
+ }
+ 
+@@ -213,6 +218,11 @@ pub const all_non_pii: List(NonPiiKey) = [
+   NewClosesAt,
+   PreviousStatus,
+   RefSlot,
++  // RC4.3 substitution audit (AD-16) — r1 (W11): the old + new row ids are
++  // non-PII keys; register them so the pseudonymisation path + registry
++  // tests cover them.
++  OldReferenceCallId,
++  NewReferenceCallId,
+ ]
+ 
+ pub fn all_pii_keys() -> List(String) {
+diff --git a/server/src/router.gleam b/server/src/router.gleam
+index 0313d967..a485188c 100644
+--- a/server/src/router.gleam
++++ b/server/src/router.gleam
+@@ -42,6 +42,7 @@ import notification/notification_handler
+ import payment/payment_handler
+ import payment/webhook_handler
+ import pog
++import reference_checks/actions_handler
+ import reference_checks/form_handler
+ import reference_checks/sweep_handler
+ import reference_checks/trigger
+@@ -435,6 +436,95 @@ pub fn handle_request(ctx: Context, req: Request) -> Response {
+         slot,
+       )
+     }
++    // RC4.3 row actions (Story RC4.3): take over manually (A7), correct the
++    // referee trio (AD-7/A1), and substitute a referee after a terminal
++    // objection/unreachable (AD-11 hook semantics). Row-scoped (the call id
++    // comes from the panel payload); ownership + archived prechecks + the
++    // guarded pre-state transitions live in `actions_handler` (AD-14).
++    http.Post,
++      [
++        "api",
++        "v1",
++        "vacancies",
++        vacancy_id,
++        "applications",
++        application_id,
++        "reference-checks",
++        call_id,
++        "take-over",
++      ]
++    -> {
++      use req, landlord <- session_middleware.require_session(
++        req,
++        ctx.config.db,
++        ctx.config.sentry,
++        supabase_config(ctx.config),
++      )
++      actions_handler.handle_take_over(
++        req,
++        ctx.config,
++        landlord,
++        vacancy_id,
++        application_id,
++        call_id,
++      )
++    }
++    http.Post,
++      [
++        "api",
++        "v1",
++        "vacancies",
++        vacancy_id,
++        "applications",
++        application_id,
++        "reference-checks",
++        call_id,
++        "correct",
++      ]
++    -> {
++      use req, landlord <- session_middleware.require_session(
++        req,
++        ctx.config.db,
++        ctx.config.sentry,
++        supabase_config(ctx.config),
++      )
++      actions_handler.handle_correct(
++        req,
++        ctx.config,
++        landlord,
++        vacancy_id,
++        application_id,
++        call_id,
++      )
++    }
++    http.Post,
++      [
++        "api",
++        "v1",
++        "vacancies",
++        vacancy_id,
++        "applications",
++        application_id,
++        "reference-checks",
++        call_id,
++        "substitute",
++      ]
++    -> {
++      use req, landlord <- session_middleware.require_session(
++        req,
++        ctx.config.db,
++        ctx.config.sentry,
++        supabase_config(ctx.config),
++      )
++      actions_handler.handle_substitute(
++        req,
++        ctx.config,
++        landlord,
++        vacancy_id,
++        application_id,
++        call_id,
++      )
++    }
+     // Auto-open transition — the SPA POSTs this after the GET detail
+     // response if the application is still Submitted. CSRF-protected via
+     // the standard middleware (POST is not on the skip-list); the SQL's

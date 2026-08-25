@@ -1,0 +1,1347 @@
+diff --git a/Source/PacketPlumberCoreTests/PPInputTests.cpp b/Source/PacketPlumberCoreTests/PPInputTests.cpp
+new file mode 100644
+index 0000000..59efdf4
+--- /dev/null
++++ b/Source/PacketPlumberCoreTests/PPInputTests.cpp
+@@ -0,0 +1,126 @@
++// PPInputTests.cpp — the UAD-12 input surface, headless (Perkins r1 blocker 1).
++//
++// Regression pin for the null-action bug: UE calls SetupInputComponent BEFORE
++// BeginPlay, so runtime-created actions must exist from the CONSTRUCTOR — a
++// BindAction(nullptr) can never match an action instance, and the mouse
++// never reaches the draw bus. This test:
++//   1. constructs the controller and asserts the input assets exist (the r1
++//      regression — they were created in BeginPlay, so SetupInputComponent
++//      captured null),
++//   2. asserts the mapping context maps LMB to both draw actions,
++//   3. synthesizes the action trigger: constructs the action instance and
++//      executes the bound delegate (the same Execute path Enhanced Input
++//      fires), asserting the GameMode's BeginDraw/EndDraw receive the drag,
++//   4. drives a full draw through the controller seam and asserts the pipe
++//      lands in the sim (the end-to-end mouse path, minus the OS mouse).
++#include "Misc/AutomationTest.h"
++
++#include "PacketPlumberCore/PP_Sim.h"
++#include "EnhancedInputComponent.h"
++#include "InputAction.h"
++#include "InputMappingContext.h"
++#include "PPRunGameMode.h"
++#include "PPRunPlayerController.h"
++
++#if WITH_DEV_AUTOMATION_TESTS
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPInputAssetsExistAtBind, "PacketPlumber.Input.AssetsExistAtBind",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPInputAssetsExistAtBind::RunTest(const FString &Parameters)
++{
++	// The r1 regression: assets were created in BeginPlay, but
++	// SetupInputComponent runs BEFORE BeginPlay (SetPlayer -> InitInputSystem),
++	// so BindAction captured null. Constructing the controller must yield
++	// non-null assets immediately.
++	APPRunPlayerController *PC = NewObject<APPRunPlayerController>(GetTransientPackage());
++	TestNotNull(TEXT("draw mapping context must exist at construction"), PC->GetDrawMappingContext());
++	TestNotNull(TEXT("draw start action must exist at construction"), PC->GetDrawStartAction());
++	TestNotNull(TEXT("draw end action must exist at construction"), PC->GetDrawEndAction());
++
++	// LMB must map to BOTH actions (press starts the drag, release ends it).
++	const UInputMappingContext *IMC = PC->GetDrawMappingContext();
++	int32 StartMaps = 0, EndMaps = 0;
++	for (const FEnhancedActionKeyMapping &Mapping : IMC->GetMappings())
++	{
++		if (Mapping.Action == PC->GetDrawStartAction() && Mapping.Key == EKeys::LeftMouseButton)
++		{
++			++StartMaps;
++		}
++		if (Mapping.Action == PC->GetDrawEndAction() && Mapping.Key == EKeys::LeftMouseButton)
++		{
++			++EndMaps;
++		}
++	}
++	TestEqual(TEXT("LMB must map to DrawStart"), StartMaps, 1);
++	TestEqual(TEXT("LMB must map to DrawEnd"), EndMaps, 1);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPInputTriggerSynthesized, "PacketPlumber.Input.TriggerSynthesized",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPInputTriggerSynthesized::RunTest(const FString &Parameters)
++{
++	// A GameMode owning a fresh run arena (BeginPlay does not fire for a
++	// bare NewObject — seed the sim explicitly).
++	APPRunGameMode *GM = NewObject<APPRunGameMode>(GetTransientPackage());
++	GM->StartRun();
++
++	APPRunPlayerController *PC = NewObject<APPRunPlayerController>(GetTransientPackage());
++	PC->TestGameMode = GM;
++
++	// Wire the EnhancedInputComponent + bind like the controller does (the
++	// assets exist — the r1 fix). Execute() on the returned binding is the
++	// same path the engine fires.
++	UEnhancedInputComponent *EIC = NewObject<UEnhancedInputComponent>(PC);
++	FEnhancedInputActionEventBinding &StartBinding = EIC->BindAction(PC->GetDrawStartAction(), ETriggerEvent::Started,
++																	 PC, &APPRunPlayerController::FireDrawStartForTest);
++	FEnhancedInputActionEventBinding &EndBinding = EIC->BindAction(PC->GetDrawEndAction(), ETriggerEvent::Completed, PC,
++																   &APPRunPlayerController::FireDrawEndForTest);
++
++	TestTrue(TEXT("start binding must reference the action"), StartBinding.GetAction() == PC->GetDrawStartAction());
++	TestTrue(TEXT("end binding must reference the action"), EndBinding.GetAction() == PC->GetDrawEndAction());
++
++	// Synthesize the drag: press at the source node's screen area, release at
++	// the router's (design-reference 1280x720 fit: source grid(2,2) ->
++	// x=160+2.5*26*0.9231=220, router grid(6,2) -> x=160+6.5*26*0.9231=316).
++	// BeginDraw/EndDraw snap + validate + apply through the command bus; a
++	// valid draw lands a pipe in the sim.
++	const FVector2D SourceScreen(220.f, 62.f);
++	const FVector2D RouterScreen(316.f, 62.f);
++	FInputActionInstance StartInstance(PC->GetDrawStartAction());
++	FInputActionInstance EndInstance(PC->GetDrawEndAction());
++
++	// DIRECT seam call first (isolates the routing from the binding layer):
++	// if this fails, the ResolveGameMode/GM path is broken; if it passes but
++	// the binding path fails, the binding layer is broken.
++	TestTrue(TEXT("the injected GameMode must resolve through the seam"), PC->ResolveGameMode() == GM);
++	PC->TestScreenPos = SourceScreen;
++	PC->FireDrawStartForTest(StartInstance);
++	PC->TestScreenPos = RouterScreen;
++	PC->FireDrawEndForTest(EndInstance);
++	TestEqual(TEXT("direct seam calls must create one pipe"), PP::PipeCount(GM->GetSimStateForTest().Topology), 1);
++	TestEqual(TEXT("direct seam calls must log the draw"), GM->GetSimStateForTest().ActionLog.size(),
++			  static_cast<size_t>(1));
++
++	// BINDING leg on a FRESH run (the direct leg already consumed the pipe):
++	// Execute() on the returned binding is the same path the engine fires.
++	GM->StartRun();
++	PC->TestScreenPos = SourceScreen;
++	StartBinding.Execute(StartInstance);
++	PC->TestScreenPos = RouterScreen;
++	EndBinding.Execute(EndInstance);
++
++	TestEqual(TEXT("both trigger bindings must have fired"), PC->FireCount, 4);
++	// the snap + validate result is visible on the GM (rejection feedback)
++	TestEqual(TEXT("the binding leg must have been accepted (no rejection)"), GM->GetLastEditErrorForTest(),
++			  PP::FEditError::None);
++	TestEqual(TEXT("the binding leg must create one pipe in the sim"), PP::PipeCount(GM->GetSimStateForTest().Topology),
++			  1);
++	TestEqual(TEXT("the action log must carry the draw (apply_tick = next)"), GM->GetSimStateForTest().ActionLog.size(),
++			  static_cast<size_t>(1));
++	return true;
++}
++
++#endif // WITH_DEV_AUTOMATION_TESTS
+diff --git a/Source/PacketPlumberCoreTests/PPSimDriverTests.cpp b/Source/PacketPlumberCoreTests/PPSimDriverTests.cpp
+new file mode 100644
+index 0000000..fe943be
+--- /dev/null
++++ b/Source/PacketPlumberCoreTests/PPSimDriverTests.cpp
+@@ -0,0 +1,62 @@
++// PPSimDriverTests.cpp — the UAD-2 fixed-tick driver, engine-side.
++// The accumulator math is pure: Advance(Delta) returns the tick count and
++// the sim lands exactly on TargetTick = floor(Accum * 20). The [FinLT]
++// clamp (0.25 s/frame) caps catch-up steps. Mirrors the story-1.1 exit
++// criteria ("the accumulator driver unit-tested").
++#include "Misc/AutomationTest.h"
++
++#include "PacketPlumberCore/PP_Sim.h"
++#include "PPSimDriver.h"
++
++#if WITH_DEV_AUTOMATION_TESTS
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPDriverAccumulator, "PacketPlumber.Driver.Accumulator",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPDriverAccumulator::RunTest(const FString &Parameters)
++{
++	PP::FSimState State;
++	State.Initialize(42);
++	FPPSimDriver Driver;
++
++	// 0.05 s at 20 Hz -> exactly 1 tick.
++	const int32 S1 = Driver.Advance(State, 0.05f);
++	TestEqual(TEXT("0.05s must step exactly 1 tick"), S1, 1);
++	TestEqual(TEXT("sim tick must land on 1"), State.Tick, static_cast<uint64_t>(1));
++
++	// 1.0 s in 0.25s chunks (the clamp) -> 5 steps each, 20 total.
++	State.Initialize(42);
++	Driver.Reset();
++	int32 Total = 0;
++	for (int32 I = 0; I < 4; ++I)
++	{
++		Total += Driver.Advance(State, 1.0f); // clamped to 0.25 -> 5 ticks each
++	}
++	TestEqual(TEXT("4 x 1.0s (clamped) must step 20 ticks"), Total, 20);
++	TestEqual(TEXT("sim tick must land on 20"), State.Tick, static_cast<uint64_t>(20));
++
++	// A tiny delta below one tick steps NOTHING (the accumulator holds it).
++	State.Initialize(42);
++	Driver.Reset();
++	const int32 S2 = Driver.Advance(State, 0.01f);
++	TestEqual(TEXT("0.01s must not step yet"), S2, 0);
++	TestEqual(TEXT("accumulator must hold sub-tick time"), State.Tick, static_cast<uint64_t>(0));
++	// 0.05 total would sit exactly on the tick boundary — float rounding makes
++	// that brittle (0.01f+0.04f = 0.0499999...); use a value safely past it.
++	const int32 S3 = Driver.Advance(State, 0.045f); // 0.055 total -> 1.1 ticks
++	TestEqual(TEXT("0.045s more must complete tick 1"), S3, 1);
++	TestEqual(TEXT("sim tick must land on 1 after accumulation"), State.Tick, static_cast<uint64_t>(1));
++
++	// The float never enters the sim: two drivers stepping the same tick
++	// sequence produce identical hashes (ODN-10/UAD-2).
++	PP::FSimState A, B;
++	A.Initialize(7);
++	B.Initialize(7);
++	FPPSimDriver DA, DB;
++	DA.Advance(A, 0.05f);
++	DB.Advance(B, 0.05f);
++	TestEqual(TEXT("same tick sequence must hash identically"), PP::StateHash(A), PP::StateHash(B));
++	return true;
++}
++
++#endif // WITH_DEV_AUTOMATION_TESTS
+diff --git a/Source/PacketPlumberCoreTests/PPViewGeometryTests.cpp b/Source/PacketPlumberCoreTests/PPViewGeometryTests.cpp
+new file mode 100644
+index 0000000..54bec4a
+--- /dev/null
++++ b/Source/PacketPlumberCoreTests/PPViewGeometryTests.cpp
+@@ -0,0 +1,144 @@
++// PPViewGeometryTests.cpp — the view's pure geometry math, pinned (r2 warning
++// 9: UPPRunView had zero automation coverage — the road-anchor and dot-offset
++// regressions shipped because the math was inline in the widget).
++//
++// Covers the r2 blocker + warnings at the math layer:
++//  - the road ribbon's slot anchor places the box center on the road midpoint
++//    (the r2 blocker: anchored with Width/2 on the length axis, every road
++//    shifted ~(Length-Width)/2 along its axis, disconnecting roads from nodes)
++//  - the fit mapping adds the +0.5 tile-center offset EXACTLY ONCE (the r2
++//    warning: PacketPosIn baked +0.5 in AND the fit added it again — the dot
++//    rode half a tile off the road)
++//  - the packet's grid position rides the edge at eased progress
++//  - the E4 snap radius scales with the camera fit (world-px canon)
++#include "Misc/AutomationTest.h"
++
++#include "PacketPlumberCore/PP_Sim.h"
++#include "PPCommandBus.h"
++#include "PPViewGeometry.h"
++
++#if WITH_DEV_AUTOMATION_TESTS
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPViewRoadAnchor, "PacketPlumber.View.RoadAnchor",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPViewRoadAnchor::RunTest(const FString &Parameters)
++{
++	// The r2 blocker: a road from A to B must have its rendered center at the
++	// midpoint AND its endpoints at the node centers. The slot anchor is the
++	// box top-left; Center - (Length/2, Height/2) places the box center on
++	// the midpoint.
++	const FVector2D A(100.f, 100.f);
++	const FVector2D B(300.f, 100.f); // horizontal road, length 200
++	const FVector2D Center = (A + B) * 0.5f;
++	const float Width = 14.f;
++
++	// fill box: size (Length, Width) anchored at Center - (L/2, W/2) -> box
++	// center at Center (the rotation pivot sits on the road midpoint).
++	const FVector2D FillTopLeft = PPViewGeometry::RoadSlotTopLeft(Center, 200.f, Width);
++	TestTrue(TEXT("fill anchor x = Center.X - Length/2"), FMath::IsNearlyEqual(FillTopLeft.X, Center.X - 100.f));
++	TestTrue(TEXT("fill anchor y = Center.Y - Width/2"), FMath::IsNearlyEqual(FillTopLeft.Y, Center.Y - 7.f));
++	const FVector2D FillBoxCenter = FillTopLeft + FVector2D(100.f, 7.f);
++	TestTrue(TEXT("fill box center must sit on the road midpoint"), FillBoxCenter.Equals(Center, 0.01f));
++	// the box spans A..B -> the road's rendered endpoints ARE the node centers
++	TestTrue(TEXT("fill box left edge = node A"), FMath::IsNearlyEqual(FillTopLeft.X, A.X));
++	TestTrue(TEXT("fill box right edge = node B"), FMath::IsNearlyEqual(FillTopLeft.X + 200.f, B.X));
++
++	// casing box: (Length, Width+4) anchored the same way
++	const float CasingH = PPViewGeometry::RoadCasingHeight(Width, 2.f);
++	TestTrue(TEXT("casing height = width + 2*casing"), FMath::IsNearlyEqual(CasingH, 18.f));
++	const FVector2D CasingTopLeft = PPViewGeometry::RoadSlotTopLeft(Center, 200.f, CasingH);
++	TestTrue(TEXT("casing box center must sit on the road midpoint"),
++			 (CasingTopLeft + FVector2D(100.f, CasingH * 0.5f)).Equals(Center, 0.01f));
++
++	// a DIAGONAL road (the pivot rotation case): the box center must be the
++	// midpoint regardless of the angle.
++	const FVector2D C(0.f, 0.f);
++	const FVector2D D(80.f, 60.f); // length 100
++	const FVector2D DiagCenter = (C + D) * 0.5f;
++	const FVector2D DiagTopLeft = PPViewGeometry::RoadSlotTopLeft(DiagCenter, 100.f, Width);
++	TestTrue(TEXT("diagonal road: box center on the midpoint"),
++			 (DiagTopLeft + FVector2D(50.f, Width * 0.5f)).Equals(DiagCenter, 0.01f));
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPViewDotOnRoad, "PacketPlumber.View.DotOnRoad",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPViewDotOnRoad::RunTest(const FString &Parameters)
++{
++	// The r2 warning: the dot rode half a tile off the road because the
++	// position math added the +0.5 tile-center offset twice (once in the
++	// packet position, once in the fit mapping). The fit mapping adds it
++	// EXACTLY ONCE — a packet mid-edge must land ON the road between the two
++	// node centers.
++	const FPPScreenFit Fit = MakeScreenFit(FVector2D(1280.f, 720.f)); // scale 0.9231, offset (160,0)
++
++	// a snapshot: nodes at grid (2,2) and (6,2), a packet half-way along
++	PPView::FSnapshot Snap;
++	Snap.Tick = 1;
++	PPView::FNodeView N0;
++	N0.Id = 0;
++	N0.Pos = PP::FIntPoint{2, 2};
++	Snap.Nodes.Add(N0);
++	PPView::FNodeView N1;
++	N1.Id = 1;
++	N1.Pos = PP::FIntPoint{6, 2};
++	Snap.Nodes.Add(N1);
++	PPView::FPacketView P;
++	P.Id = 7;
++	P.FromNode = 0;
++	P.ToNode = 1;
++	P.Progress = 0.5f;
++	P.bOnEdge = true;
++	Snap.Packets.Add(P);
++
++	const FVector2D GridPos = PPViewGeometry::PacketGridPos(Snap, 7);
++	TestTrue(TEXT("packet grid pos must be the edge midpoint (4,2)"), GridPos.Equals(FVector2D(4.f, 2.f), 0.001f));
++
++	// screen space: the dot must sit ON the road segment between the nodes
++	const FVector2D DotScreen = Fit.GridToScreenV(GridPos);
++	const FVector2D N0Screen = Fit.GridToScreen(N0.Pos);
++	const FVector2D N1Screen = Fit.GridToScreen(N1.Pos);
++	TestTrue(TEXT("dot screen x must be between the nodes"), DotScreen.X > N0Screen.X && DotScreen.X < N1Screen.X);
++	TestTrue(TEXT("dot screen x must be the midpoint of the node centers"),
++			 FMath::IsNearlyEqual(DotScreen.X, (N0Screen.X + N1Screen.X) * 0.5f, 0.5f));
++	TestTrue(TEXT("dot screen y must equal the road row (both nodes at y=2)"),
++			 FMath::IsNearlyEqual(DotScreen.Y, N0Screen.Y, 0.5f));
++
++	// a packet absent from the snapshot -> zero (the caller falls back)
++	TestTrue(TEXT("absent packet must yield zero"), PPViewGeometry::PacketGridPos(Snap, 999) == FVector2D::ZeroVector);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPViewSnapScale, "PacketPlumber.View.SnapRadiusScale",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPViewSnapScale::RunTest(const FString &Parameters)
++{
++	// E4: the snap radius is in WORLD px (kSnapRadius); the snap compares in
++	// SCREEN px, so the radius scales with the camera fit (r2 warning 3).
++	// At the 1280x720 design fit (scale 0.9231) the screen radius is ~33 px.
++	const FPPScreenFit Fit = MakeScreenFit(FVector2D(1280.f, 720.f));
++	TestTrue(TEXT("design-fit snap radius must scale to ~33 screen px"),
++			 FMath::IsNearlyEqual(static_cast<float>(PP::kSnapRadius) * Fit.Scale, 33.23f, 0.1f));
++
++	// A node at grid (2,2): its screen center; a point 30 screen px away is
++	// INSIDE the scaled radius; 40 px away is OUTSIDE.
++	PP::FTopology Topo;
++	PP::SpawnNode(Topo, PP::FNodeKind::Terminal, 2, 2);
++	const FVector2D NodeScreen = Fit.GridToScreen(PP::FIntPoint{2, 2});
++
++	uint32_t Hit = 0;
++	const bool bIn = FPPCommandBus::SnapToNode(Topo, NodeScreen + FVector2D(30.f, 0.f), FVector2D(1280.f, 720.f), Hit);
++	TestTrue(TEXT("30 px from the node center must snap (inside the scaled radius)"), bIn);
++	TestEqual(TEXT("the snapped node must be the terminal"), Hit, 0u);
++
++	uint32_t Hit2 = 0;
++	const bool bOut =
++		FPPCommandBus::SnapToNode(Topo, NodeScreen + FVector2D(40.f, 0.f), FVector2D(1280.f, 720.f), Hit2);
++	TestTrue(TEXT("40 px from the node center must NOT snap (outside the scaled radius)"), !bOut);
++	return true;
++}
++
++#endif // WITH_DEV_AUTOMATION_TESTS
+diff --git a/Source/PacketPlumberCoreTests/PP_DeterminismTests.cpp b/Source/PacketPlumberCoreTests/PP_DeterminismTests.cpp
+index bba0163..ebbd013 100644
+--- a/Source/PacketPlumberCoreTests/PP_DeterminismTests.cpp
++++ b/Source/PacketPlumberCoreTests/PP_DeterminismTests.cpp
+@@ -54,28 +54,35 @@ bool FPPStateSerializeVersioned::RunTest(const FString &Parameters)
+ 	S.Initialize(7);
+ 	PP::Step(S, 1);
+ 
+-	uint8_t Buffer[64];
++	uint8_t Buffer[4096];
+ 	const size_t N = PP::SerializeState(S, Buffer, sizeof(Buffer));
+-	TestEqual(TEXT("serialized size must be the versioned header + fields (45)"), N, static_cast<size_t>(45));
+-
+-	// Wire format (ODN-11, documented): the versioned header is a u32 magic
+-	// whose LITTLE-ENDIAN bytes spell "PPUE" (0x50 0x50 0x55 0x45 = 'P','P','U','E')
+-	// followed by u32 save_version=1, then seed/tick/tick_nonce/rng/terminal,
++	TestEqual(TEXT("serialized size must be the v2 layout (98 for a fresh state)"), N, static_cast<size_t>(98));
++
++	// Wire format (ODN-11, documented — schema single-sourced in
++	// docs/goldens/SCHEMA.md): the versioned header is a u32 magic whose
++	// LITTLE-ENDIAN bytes spell "PPUE" (0x50 0x50 0x55 0x45 = 'P','P','U','E')
++	// followed by u32 save_version=2 (slice-1 v2 layout — the deliberate
++	// re-bless: catalog_hash/score/replay_error/topology/flow/action-log
++	// sections added), then seed/tick/tick_nonce/rng/terminal/catalog_hash,
+ 	// every field little-endian. SAVE_MAGIC (0x45555050) is the byte-swapped
+ 	// ASCII so the LE serializer emits exactly "PPUE".
+ 	TestEqual(TEXT("magic byte 0"), Buffer[0], uint8_t('P'));
+ 	TestEqual(TEXT("magic byte 1"), Buffer[1], uint8_t('P'));
+ 	TestEqual(TEXT("magic byte 2"), Buffer[2], uint8_t('U'));
+ 	TestEqual(TEXT("magic byte 3"), Buffer[3], uint8_t('E'));
+-	TestEqual(TEXT("save version"), Buffer[4], uint8_t(1));
++	TestEqual(TEXT("save version"), Buffer[4], uint8_t(2));
++	// header = 4+4+8+8+4+8+8 = 44; terminal flag at 44 (false for a live run);
++	// catalog_hash (the empty-set hash = FNV64_OFFSET) starts at 45.
++	TestEqual(TEXT("terminal flag offset 44"), Buffer[44], uint8_t(0));
++	TestEqual(TEXT("catalog_hash LE low byte at 45"), Buffer[45], uint8_t(0x25));
+ 
+ 	// Capacity guard: an undersized buffer must fail (0) without writing.
+-	uint8_t Small[44];
++	uint8_t Small[97];
+ 	TestEqual(TEXT("undersized buffer must return 0"), PP::SerializeState(S, Small, sizeof(Small)),
+ 			  static_cast<size_t>(0));
+ 
+ 	// Round-trip stability: serializing twice yields identical bytes.
+-	uint8_t Buffer2[64];
++	uint8_t Buffer2[4096];
+ 	const size_t N2 = PP::SerializeState(S, Buffer2, sizeof(Buffer2));
+ 	TestEqual(TEXT("serialize length must be stable"), N, N2);
+ 	TestTrue(TEXT("serialize bytes must be stable"), FMemory::Memcmp(Buffer, Buffer2, N) == 0);
+@@ -87,14 +94,16 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPStepGuards, "PacketPlumber.Determinism.StepG
+ 
+ bool FPPStepGuards::RunTest(const FString &Parameters)
+ {
+-	// Backward tick is ignored (ODN-2): Tick/TickNonce stay put.
++	// Backward tick latches ReplayError (never silent — the latch arrives
++	// with real commands, slice 1) while Tick/TickNonce stay put (ODN-2).
+ 	PP::FSimState S;
+ 	S.Initialize(9);
+ 	PP::Step(S, 5);
+ 	const uint32_t Nonce5 = S.TickNonce;
+ 	PP::Step(S, 3);
+-	TestEqual(TEXT("backward tick must be ignored (tick stays)"), S.Tick, static_cast<uint64_t>(5));
+-	TestEqual(TEXT("backward tick must be ignored (nonce stays)"), S.TickNonce, Nonce5);
++	TestEqual(TEXT("backward tick must not advance the tick"), S.Tick, static_cast<uint64_t>(5));
++	TestEqual(TEXT("backward tick must not advance the nonce"), S.TickNonce, Nonce5);
++	TestTrue(TEXT("backward tick must latch ReplayError (never silent)"), S.ReplayError);
+ 	PP::Step(S, 6);
+ 	TestEqual(TEXT("a later tick must still advance after a swallowed one"), S.Tick, static_cast<uint64_t>(6));
+ 	TestTrue(TEXT("a later tick must redraw the nonce"), S.TickNonce != Nonce5);
+diff --git a/Source/PacketPlumberCoreTests/PP_Slice1SimTests.cpp b/Source/PacketPlumberCoreTests/PP_Slice1SimTests.cpp
+new file mode 100644
+index 0000000..cdca7ae
+--- /dev/null
++++ b/Source/PacketPlumberCoreTests/PP_Slice1SimTests.cpp
+@@ -0,0 +1,282 @@
++// PP_Slice1SimTests.cpp — the slice-1 dual-runner assertions, UE side.
++// Mirrors tests/spine_check.cpp CHECKs (story 1.1: the extended dual-runner
++// suite — topology / routing / bundles / flow / golden scenario). Same
++// headers, same numbers on both surfaces (UAD-17); the golden scenario is
++// built by PP_Scenario.h — the SAME builder the standalone runner and the
++// PPProbe commandlet use, so the three surfaces cannot drift.
++#include "Misc/AutomationTest.h"
++
++#include "PacketPlumberCore/PP_Scenario.h"
++#include "PacketPlumberCore/PP_Sim.h"
++
++#if WITH_DEV_AUTOMATION_TESTS
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPTopologyRules, "PacketPlumber.Topology.Rules",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPTopologyRules::RunTest(const FString &Parameters)
++{
++	// E3 self-loop, E26 terminal-pair, span rule, monotonic ids (E11).
++	PP::FTopology T;
++	const uint32_t Src = PP::SpawnNode(T, PP::FNodeKind::Terminal, 2, 2);
++	const uint32_t Rtr = PP::SpawnNode(T, PP::FNodeKind::Junction, 6, 2);
++	const uint32_t Snk = PP::SpawnNode(T, PP::FNodeKind::Terminal, 10, 2);
++	TestEqual(TEXT("node ids must be monotonic from 0 (E11)"), Src, 0u);
++	TestEqual(TEXT("node ids must be monotonic (1)"), Rtr, 1u);
++	TestEqual(TEXT("node ids must be monotonic (2)"), Snk, 2u);
++
++	TestTrue(TEXT("span metric 4 tiles horizontal"), PP::SpanBetween(PP::FIntPoint{2, 2}, PP::FIntPoint{6, 2}) == 4);
++	TestTrue(TEXT("span metric 3-4-5 triangle"), PP::SpanBetween(PP::FIntPoint{0, 0}, PP::FIntPoint{3, 4}) == 5);
++
++	TestTrue(TEXT("self-loop must reject (E3)"),
++			 PP::ApplyDraw(T, Src, Src, PP::TIER_STANDARD).Error == PP::FEditError::SelfLoop);
++	TestTrue(TEXT("terminal pair must reject (E26)"),
++			 PP::ApplyDraw(T, Src, Snk, PP::TIER_STANDARD).Error == PP::FEditError::TerminalToTerminal);
++	TestTrue(TEXT("missing node must reject"),
++			 PP::ApplyDraw(T, Src, 99, PP::TIER_STANDARD).Error == PP::FEditError::MissingNode);
++
++	PP::FTopology T2;
++	const uint32_t N0 = PP::SpawnNode(T2, PP::FNodeKind::Terminal, 0, 0);
++	const uint32_t N1 = PP::SpawnNode(T2, PP::FNodeKind::Junction, 20, 0);
++	TestTrue(TEXT("20-tile span must reject on standard (max 14)"),
++			 PP::ApplyDraw(T2, N0, N1, PP::TIER_STANDARD).Error == PP::FEditError::SpanExceedsTier);
++
++	const uint32_t GenBefore = T.Gen;
++	const PP::FEditResult R = PP::ApplyDraw(T, Src, Rtr, PP::TIER_STANDARD);
++	TestTrue(TEXT("source->router draw must apply"), R.Error == PP::FEditError::None && R.PipeId == 0);
++	TestTrue(TEXT("a draw must bump gen (rule-1 rebuild trigger)"), T.Gen == GenBefore + 1);
++	TestTrue(TEXT("cached pipe span must be the integer distance"), T.PipeSpan[0] == 4);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPRoutingECMP, "PacketPlumber.Routing.ECMP",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPRoutingECMP::RunTest(const FString &Parameters)
++{
++	// The symmetric diamond: two equal-cost paths source->sink (cost 20 each).
++	PP::FTopology T;
++	const uint32_t S4 = PP::SpawnNode(T, PP::FNodeKind::Terminal, 0, 0);
++	const uint32_t RA = PP::SpawnNode(T, PP::FNodeKind::Junction, 4, 0);
++	const uint32_t RB = PP::SpawnNode(T, PP::FNodeKind::Junction, 0, 4);
++	const uint32_t DK = PP::SpawnNode(T, PP::FNodeKind::Terminal, 4, 4);
++	PP::ApplyDraw(T, S4, RA, PP::TIER_STANDARD);
++	PP::ApplyDraw(T, S4, RB, PP::TIER_STANDARD);
++	PP::ApplyDraw(T, RA, DK, PP::TIER_STANDARD);
++	PP::ApplyDraw(T, RB, DK, PP::TIER_STANDARD);
++
++	PP::FRoutingTable Rt;
++	PP::RoutingRebuild(Rt, T);
++
++	uint32_t Off = 0, Cnt = 0;
++	TestTrue(TEXT("equal-cost ECMP set must have two hops"), PP::EqualCostHops(Rt, T, S4, DK, Off, Cnt) && Cnt == 2);
++	const uint32_t Pick1 = PP::EcmpPick(S4, DK, 0, 7, Cnt);
++	TestTrue(TEXT("ECMP pick must be stable per packet (flow affinity)"), Pick1 == PP::EcmpPick(S4, DK, 0, 7, Cnt));
++	TestTrue(TEXT("ECMP pick must index the set"), Pick1 < Cnt);
++	bool Spread = false;
++	for (uint64_t Id = 1; Id <= 16; ++Id)
++	{
++		if (PP::EcmpPick(S4, DK, 0, Id, Cnt) != Pick1)
++		{
++			Spread = true;
++		}
++	}
++	TestTrue(TEXT("ECMP picks must spread across the equal-cost set"), Spread);
++
++	// identical topology -> byte-identical table (pure function)
++	PP::FRoutingTable RtB;
++	PP::RoutingRebuild(RtB, T);
++	TestTrue(TEXT("identical topology must rebuild an identical table"), Rt.Hops.size() == RtB.Hops.size());
++	TestTrue(TEXT("identical topology must rebuild byte-identical hops"),
++			 FMemory::Memcmp(Rt.Hops.data(), RtB.Hops.data(), Rt.Hops.size() * sizeof(PP::FHop)) == 0);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPBundleCapSum, "PacketPlumber.Bundles.CapIsSum",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPBundleCapSum::RunTest(const FString &Parameters)
++{
++	// Rule 3: bundled cap = STATIC SUM at table-build (15+15, and 15+40 mixed).
++	PP::FTopology T;
++	const uint32_t A = PP::SpawnNode(T, PP::FNodeKind::Junction, 0, 0);
++	const uint32_t B = PP::SpawnNode(T, PP::FNodeKind::Junction, 4, 0);
++	PP::ApplyDraw(T, A, B, PP::TIER_STANDARD);
++	PP::ApplyDraw(T, A, B, PP::TIER_STANDARD);
++	PP::FBundles Bu;
++	PP::BundlesRebuild(Bu, T);
++	TestEqual(TEXT("two parallel pipes must bundle into one pooled link"), Bu.N, 1u);
++	TestEqual(TEXT("bundled cap must be the static sum (15+15)"), Bu.BundleCap[0], 30u);
++	TestEqual(TEXT("bundle member count must be 2"), Bu.BundleCount[0], 2u);
++
++	PP::FTopology T2;
++	const uint32_t C = PP::SpawnNode(T2, PP::FNodeKind::Junction, 0, 0);
++	const uint32_t D = PP::SpawnNode(T2, PP::FNodeKind::Junction, 4, 0);
++	PP::ApplyDraw(T2, C, D, PP::TIER_STANDARD);
++	PP::ApplyDraw(T2, C, D, PP::TIER_WIDE);
++	PP::FBundles Bu2;
++	PP::BundlesRebuild(Bu2, T2);
++	TestEqual(TEXT("mixed-tier bundle cap must sum member capacities (15+40)"), Bu2.BundleCap[0], 55u);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPFlowDeliverE29, "PacketPlumber.Flow.DeliverAndE29",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPFlowDeliverE29::RunTest(const FString &Parameters)
++{
++	// Story 1.3: a packet spawns at tick 5, forwards per-hop, delivers at 10.
++	PP::FSimState S;
++	PP::BuildProbeScenario(S);
++	PP::StepScenario(S, 5);
++	TestEqual(TEXT("one packet must spawn at tick 5"), S.Flow.Packets.size(), static_cast<size_t>(1));
++	TestTrue(TEXT("the spawned packet must be on the first edge after the forward pass"), S.Flow.Packets[0].OnEdge);
++	TestTrue(TEXT("packet must head for the router"), S.Flow.Packets[0].Heading == PP::SCENARIO_ROUTER);
++	TestTrue(TEXT("a joiner must not consume bandwidth the tick it forwards"), S.Flow.Packets[0].ProgressUnits == 0);
++	PP::StepScenario(S, 7);
++	TestTrue(TEXT("packet must arrive at the router after 2 serve ticks"),
++			 !S.Flow.Packets[0].OnEdge && S.Flow.Packets[0].AtNode == PP::SCENARIO_ROUTER);
++	PP::StepScenario(S, 10);
++	TestEqual(TEXT("the packet must deliver at tick 10 (score 1)"), S.Score, 1);
++	TestTrue(TEXT("delivered packets must be culled"), S.Flow.Packets.empty());
++
++	// E29: a severed edge drops the packet back to its departure node; it
++	// re-forwards against the rebuilt table (no stale spawn-time route).
++	PP::FSimState S2;
++	PP::BuildProbeScenario(S2);
++	PP::StepScenario(S2, 5);
++	uint32_t Slot = 0;
++	PP::PipeSlot(S2.Topology, 0, Slot);
++	S2.Topology.PipeAlive[Slot] = 0;
++	S2.Topology.Gen += 1;
++	PP::Step(S2, 6);
++	TestEqual(TEXT("the packet must survive the severance"), S2.Flow.Packets.size(), static_cast<size_t>(1));
++	TestTrue(TEXT("E29: a severed-edge packet must drop back to its departure node"),
++			 !S2.Flow.Packets[0].OnEdge && S2.Flow.Packets[0].AtNode == PP::SCENARIO_SOURCE);
++	TestTrue(TEXT("a severed drop-back re-tries fresh"), S2.Flow.Packets[0].WaitingTicks == 0);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPGoldenScenario, "PacketPlumber.Determinism.GoldenScenario",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPGoldenScenario::RunTest(const FString &Parameters)
++{
++	// The committed golden asserted engine-side (same numbers as
++	// docs/goldens/probe-seed42-ticks100.json + the spine-check inline CHECKs
++	// — re-bless updates BOTH + the engine probe via PPProbe).
++	PP::FSimState State;
++	PP::BuildProbeScenario(State);
++	PP::StepScenario(State, 100);
++	const uint64_t Hash = PP::StateHash(State);
++
++	TestEqual(TEXT("golden run must end at tick 100"), State.Tick, static_cast<uint64_t>(100));
++	TestEqual(TEXT("golden tick_nonce must match the committed golden"), State.TickNonce, 2381141952u);
++	TestEqual(TEXT("golden state_hash must match the committed golden"), Hash, 0x5e440f9c5a28892aull);
++	TestTrue(TEXT("golden catalog_hash must be the empty-set hash (no catalogs in slice 1)"),
++			 State.CatalogHash == PP::FNV64_OFFSET);
++	TestEqual(TEXT("golden score must be 10 delivered"), State.Score, 10);
++	TestEqual(TEXT("golden must carry one in-flight packet at tick 100"), State.Flow.Packets.size(),
++			  static_cast<size_t>(1));
++	TestEqual(TEXT("golden topology gen must be 5 (3 spawns + 2 draws)"), State.Topology.Gen, 5u);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPApplyEditLiveFastPath, "PacketPlumber.Sim.ApplyEditLiveFastPath",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPApplyEditLiveFastPath::RunTest(const FString &Parameters)
++{
++	// The LIVE fast-path (r1 warning: zero coverage before): ApplyEdit
++	// validates + applies immediately + logs apply_tick = next; a rejected
++	// edit logs nothing; replay from the recorded log converges byte-
++	// identically at the step boundary (ODN-2).
++	PP::FSimState Live, Replay;
++	PP::BuildProbeScenario(Live);
++	PP::BuildProbeScenario(Replay);
++	Live.ActionLog.clear();
++	Replay.ActionLog.clear();
++
++	PP::FCommand Draw;
++	Draw.Kind = PP::FCommandKind::DrawPipe;
++	Draw.A = PP::SCENARIO_SOURCE;
++	Draw.B = PP::SCENARIO_ROUTER;
++	Draw.Tier = PP::TIER_STANDARD;
++	const PP::FEditResult Res = PP::ApplyEdit(Live, Draw);
++	TestTrue(TEXT("ApplyEdit must accept a valid draw"), Res.Error == PP::FEditError::None);
++	TestEqual(TEXT("ApplyEdit must apply the pipe immediately"), PP::PipeCount(Live.Topology), 1);
++	TestTrue(TEXT("ApplyEdit must log with apply_tick = next (ODN-2)"),
++			 Live.ActionLog.size() == 1 && Live.ActionLog[0].ApplyTick == 1);
++
++	PP::FCommand Bad;
++	Bad.Kind = PP::FCommandKind::DrawPipe;
++	Bad.A = PP::SCENARIO_SOURCE;
++	Bad.B = PP::SCENARIO_SOURCE; // self-loop (E3)
++	Bad.Tier = PP::TIER_STANDARD;
++	TestTrue(TEXT("ApplyEdit must reject a self-loop"), PP::ApplyEdit(Live, Bad).Error == PP::FEditError::SelfLoop);
++	TestEqual(TEXT("a rejected edit must not log"), Live.ActionLog.size(), static_cast<size_t>(1));
++
++	PP::Step(Live, 1);
++	Replay.ActionLog = Live.ActionLog; // the recorded log IS the replay input
++	PP::StepScenario(Replay, 1);
++	TestEqual(TEXT("live ApplyEdit path and the replay path must converge at the step boundary"), PP::StateHash(Live),
++			  PP::StateHash(Replay));
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPE29Recovery, "PacketPlumber.Flow.E29Recovery",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPE29Recovery::RunTest(const FString &Parameters)
++{
++	// E29 recovery — the full loop (r1 warning: drop-back was asserted,
++	// re-route + redelivery never tested): sever the first edge, the packet
++	// drops back, THEN repair the path and the packet delivers.
++	PP::FSimState S;
++	PP::BuildProbeScenario(S);
++	PP::StepScenario(S, 5); // packet on edge source->router
++	uint32_t Slot = 0;
++	PP::PipeSlot(S.Topology, 0, Slot);
++	S.Topology.PipeAlive[Slot] = 0;
++	S.Topology.Gen += 1;
++	PP::Step(S, 6); // E29 drop-back
++	TestEqual(TEXT("E29: the packet must survive the severance"), S.Flow.Packets.size(), static_cast<size_t>(1));
++	TestTrue(TEXT("E29: the packet must drop back to its departure node"),
++			 !S.Flow.Packets[0].OnEdge && S.Flow.Packets[0].AtNode == PP::SCENARIO_SOURCE);
++	S.Topology.PipeAlive[Slot] = 1; // repair the path
++	S.Topology.Gen += 1;
++	PP::StepScenario(S, 12);
++	TestEqual(TEXT("E29 recovery: the re-routed packet must deliver"), S.Score, 1);
++	TestTrue(TEXT("E29 recovery: delivered packets must be culled"), S.Flow.Packets.empty());
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPPMixedTierSteering, "PacketPlumber.Routing.MixedTierSteering",
++								 EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FPPMixedTierSteering::RunTest(const FString &Parameters)
++{
++	// The capacity-cost ladder (user ruling 2026-08-13): a fat wide pipe
++	// (cost 5) must win over a narrow one (cost 20) between the same pair.
++	PP::FTopology T;
++	const uint32_t Src = PP::SpawnNode(T, PP::FNodeKind::Terminal, 0, 0);
++	const uint32_t A = PP::SpawnNode(T, PP::FNodeKind::Junction, 4, 0);
++	const uint32_t B = PP::SpawnNode(T, PP::FNodeKind::Junction, 0, 4);
++	const uint32_t Snk = PP::SpawnNode(T, PP::FNodeKind::Terminal, 4, 4);
++	PP::ApplyDraw(T, Src, A, PP::TIER_NARROW);
++	PP::ApplyDraw(T, A, Snk, PP::TIER_NARROW);
++	PP::ApplyDraw(T, Src, B, PP::TIER_WIDE);
++	PP::ApplyDraw(T, B, Snk, PP::TIER_WIDE);
++	PP::FRoutingTable Rt;
++	PP::RoutingRebuild(Rt, T);
++	uint32_t Off = 0, Cnt = 0;
++	TestTrue(TEXT("mixed tiers: only the fat path may be equal-cost"),
++			 PP::EqualCostHops(Rt, T, Src, Snk, Off, Cnt) && Cnt == 1);
++	if (Cnt == 1)
++	{
++		TestTrue(TEXT("mixed tiers: the wide (cost 5) path must win the ladder"), Rt.Hops[Off].Node == B);
++	}
++	return true;
++}
++
++#endif // WITH_DEV_AUTOMATION_TESTS
+diff --git a/Source/PacketPlumberCoreTests/PacketPlumberCoreTests.Build.cs b/Source/PacketPlumberCoreTests/PacketPlumberCoreTests.Build.cs
+index 8b249af..2622802 100644
+--- a/Source/PacketPlumberCoreTests/PacketPlumberCoreTests.Build.cs
++++ b/Source/PacketPlumberCoreTests/PacketPlumberCoreTests.Build.cs
+@@ -13,6 +13,10 @@ public class PacketPlumberCoreTests : ModuleRules
+ 			"CoreUObject",
+ 			"Engine",
+ 			"PacketPlumberCore",
++			"PacketPlumber",
++			"EnhancedInput",
++			"InputCore",
++			"UMG",
+ 		});
+ 	}
+ }
+diff --git a/Source/PacketPlumberEditor/PPProbeCommandlet.cpp b/Source/PacketPlumberEditor/PPProbeCommandlet.cpp
+index bd74273..ea578a0 100644
+--- a/Source/PacketPlumberEditor/PPProbeCommandlet.cpp
++++ b/Source/PacketPlumberEditor/PPProbeCommandlet.cpp
+@@ -1,4 +1,11 @@
+ // PPProbeCommandlet.cpp — the headless spine probe.
++//
++// Slice 1 (story 1.1): the probe now runs the FULL golden scenario
++// (PP_Scenario.h — the SAME builder the standalone spine-check and the
++// automation tests use, so the three surfaces cannot drift, UAD-17), dumps
++// the routing table, and writes the extended v2 golden JSON
++// (topology/forwarding/flow summaries + catalog_hash — schema single-sourced
++// in docs/goldens/SCHEMA.md).
+ #include "PPProbeCommandlet.h"
+ 
+ // Module-local log category (UE 5.8 log categories are not exported across
+@@ -7,6 +14,7 @@
+ DEFINE_LOG_CATEGORY_STATIC(LogPPProbe, Log, All);
+ 
+ #include "PacketPlumberCore/PP_Rng.h"
++#include "PacketPlumberCore/PP_Scenario.h"
+ #include "PacketPlumberCore/PP_Sim.h"
+ #include "Misc/FileHelper.h"
+ #include "Misc/Paths.h"
+@@ -23,7 +31,8 @@ int32 UPPProbeCommandlet::Main(const FString &Params)
+ 	// --- parse -seed= / -ticks= / -json= (loose; defaults keep it runnable).
+ 	// Command-line switches arrive dash-stripped in the Switches array
+ 	// ("seed=42", not "-seed=42"); garbage values fail loudly (never
+-	// silently fall back to defaults mid-run).
++	// silently fall back to defaults mid-run). Negative-args coverage: the
++	// --probe-negative leg of the headless gate asserts these fail.
+ 	uint64_t Seed = 42;
+ 	int32 Ticks = 100;
+ 	FString JsonPath;
+@@ -62,34 +71,81 @@ int32 UPPProbeCommandlet::Main(const FString &Params)
+ 		}
+ 	}
+ 
+-	// --- run the spine (identical code path the automation tests exercise)
++	// --- run the golden scenario (the SAME builder every surface uses).
++	// The scenario seeds itself (42 by default) and logs the fixture draws
++	// with apply_tick=1; StepScenario feeds the log through the replay path.
+ 	PP::FSimState State;
+-	State.Initialize(Seed);
++	PP::BuildProbeScenario(State, Seed); // the SAME builder every surface uses
++	PP::StepScenario(State, static_cast<uint64_t>(Ticks));
+ 
+ 	uint32_t FirstOutputs[4] = {0, 0, 0, 0};
+-	for (int32 I = 0; I < 4; ++I)
+ 	{
+-		FirstOutputs[I] = PP::RngNext(State.Rng);
++		PP::FRng R;
++		PP::RngSeed(R, Seed);
++		for (int32 I = 0; I < 4; ++I)
++		{
++			FirstOutputs[I] = PP::RngNext(R);
++		}
+ 	}
+ 
+-	// Re-seed so the heartbeat stream is untouched by the vector probe above.
+-	State.Initialize(Seed);
+-	for (int32 I = 0; I < Ticks; ++I)
++	const uint64_t Hash = PP::StateHash(State);
++
++	// --- routing-table dump (the story-1.1 "now dumping a routing table"):
++	// per (from, dst) equal-cost next-hop sets, insertion-order, plus the
++	// summary the golden pins.
++	int32 ReachablePairs = 0;
++	int32 TotalHops = 0;
+ 	{
+-		PP::Step(State, static_cast<uint64_t>(I + 1));
++		const PP::FRoutingTable &Rt = State.Routing;
++		const uint32_t N = Rt.N;
++		for (uint32_t From = 0; From < N; ++From)
++		{
++			for (uint32_t Dst = 0; Dst < N; ++Dst)
++			{
++				const uint64_t Idx = static_cast<uint64_t>(From) * N + Dst;
++				if (Rt.HopCount[Idx] > 0)
++				{
++					ReachablePairs += 1;
++					TotalHops += static_cast<int32>(Rt.HopCount[Idx]);
++					// NODE IDs in the labels (the table indexes by SLOT — r2
++					// note: the dump mixed slot indices and node ids; the
++					// reader must not have to know the table's layout).
++					const uint32_t FromId = State.Topology.NodeId[From];
++					const uint32_t DstId = State.Topology.NodeId[Dst];
++					FString Line = FString::Printf(TEXT("  routing[node%u -> node%u]: "), FromId, DstId);
++					for (uint32_t K = 0; K < Rt.HopCount[Idx]; ++K)
++					{
++						const PP::FHop &H = Rt.Hops[Rt.HopOffset[Idx] + K];
++						Line += FString::Printf(TEXT("node%u(pipe%u) "), H.Node, H.Pipe);
++					}
++					UE_LOG(LogPPProbe, Display, TEXT("%s"), *Line);
++				}
++			}
++		}
++		UE_LOG(LogPPProbe, Display, TEXT("PPProbe routing summary: %d reachable pairs, %d total hops (gen %u)"),
++			   ReachablePairs, TotalHops, State.Topology.Gen);
+ 	}
+ 
+-	const uint64_t Hash = PP::StateHash(State);
+-
+ 	// --- optional JSON artifact FIRST (CI golden surface). Written (or
+ 	// failed loudly) BEFORE RESULT=OK so a log-grep can never pass a probe
+-	// whose artifact write failed.
++	// whose artifact write failed. Schema: docs/goldens/SCHEMA.md.
+ 	if (!JsonPath.IsEmpty())
+ 	{
+ 		const FString Json = FString::Printf(
+ 			TEXT("{\"seed\":%llu,\"ticks\":%d,\"tick_nonce\":%u,\"state_hash\":\"%016llx\",\"rng_first4\":[%u,%u,%u,%u]"
+-				 ",\"save_magic\":\"PPUE\",\"save_version\":1}\n"),
+-			Seed, Ticks, State.TickNonce, Hash, FirstOutputs[0], FirstOutputs[1], FirstOutputs[2], FirstOutputs[3]);
++				 ",\"save_magic\":\"PPUE\",\"save_version\":%u,\"catalog_hash\":\"%016llx\""
++				 ",\"topology_summary\":{\"nodes\":%d,\"pipes\":%d,\"gen\":%u}"
++				 ",\"forwarding_summary\":{\"reachable_pairs\":%d,\"total_hops\":%d}"
++				 ",\"flow_summary\":{\"spawned\":%d,\"delivered\":%d,\"live\":%d,\"score\":%d}}\n"),
++			Seed, Ticks, State.TickNonce, Hash, FirstOutputs[0], FirstOutputs[1], FirstOutputs[2], FirstOutputs[3],
++			PP::SAVE_VERSION, State.CatalogHash, PP::NodeCount(State.Topology), PP::PipeCount(State.Topology),
++			State.Topology.Gen, ReachablePairs, TotalHops,
++			// spawned = delivered + live (the SAME formula as the spine-check
++			// writer — r2 warning: this writer used Demand.size(), which
++			// counts demand ENTRIES, not constructed packets; the two writers
++			// must agree on every key, per SCHEMA.md).
++			State.Score + static_cast<int32>(State.Flow.Packets.size()), State.Score,
++			static_cast<int32>(State.Flow.Packets.size()), State.Score);
+ 
+ 		if (!FFileHelper::SaveStringToFile(Json, *FPaths::ConvertRelativePathToFull(JsonPath)))
+ 		{
+@@ -100,9 +156,11 @@ int32 UPPProbeCommandlet::Main(const FString &Params)
+ 	}
+ 
+ 	// --- report
+-	const FString Report = FString::Printf(
+-		TEXT("PPProbe seed=%llu ticks=%d tick_nonce=%u state_hash=%016llx rng0=[%u %u %u %u]"), Seed, Ticks,
+-		State.TickNonce, Hash, FirstOutputs[0], FirstOutputs[1], FirstOutputs[2], FirstOutputs[3]);
++	const FString Report =
++		FString::Printf(TEXT("PPProbe seed=%llu ticks=%d tick_nonce=%u state_hash=%016llx score=%d live=%d topo_gen=%u "
++							 "rng0=[%u %u %u %u]"),
++						Seed, Ticks, State.TickNonce, Hash, State.Score, static_cast<int32>(State.Flow.Packets.size()),
++						State.Topology.Gen, FirstOutputs[0], FirstOutputs[1], FirstOutputs[2], FirstOutputs[3]);
+ 
+ 	UE_LOG(LogPPProbe, Display, TEXT("%s"), *Report);
+ 	UE_LOG(LogPPProbe, Display, TEXT("PPProbe RESULT=OK"));
+diff --git a/scripts/compare-golden.sh b/scripts/compare-golden.sh
+index 44a0e1e..619f554 100755
+--- a/scripts/compare-golden.sh
++++ b/scripts/compare-golden.sh
+@@ -3,6 +3,13 @@
+ # standalone spine-check's recorded JSON, plus (when gate 6 ran with the
+ # engine) the engine PPProbe's .engine-probe.json. Same seed/ticks ->
+ # identical state_hash is the cross-runner determinism contract (ODN-11).
++# The schema is single-sourced in docs/goldens/SCHEMA.md — KEYS below must
++# mirror it exactly (adding a key means updating SCHEMA.md + the golden +
++# the spine-check --json printf + the PPProbe printf).
++#
++#   scripts/compare-golden.sh              # the 3-way compare (gate 7)
++#   scripts/compare-golden.sh --self-test  # negative-branch coverage: a
++#                                          # corrupted golden MUST fail loud
+ set -uo pipefail
+ 
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+@@ -13,6 +20,85 @@ ENGINE_PROBE="docs/goldens/.engine-probe.json"
+ TMP="$(mktemp -d)"
+ trap 'rm -rf "$TMP"' EXIT
+ 
++# The KEYS enforced on every surface (SCHEMA.md — single source of truth).
++# Flat keys + dotted subkeys; the compare resolves dotted paths against the
++# JSON objects. state_hash is the load-bearing cross-runner contract; the
++# summaries pin the topology/forwarding/flow evidence the slice-1 golden
++# extended with.
++KEYS=(
++  "seed" "ticks" "tick_nonce" "state_hash" "save_magic" "save_version"
++  "catalog_hash" "rng_first4"
++  "topology_summary.nodes" "topology_summary.pipes" "topology_summary.gen"
++  "forwarding_summary.reachable_pairs" "forwarding_summary.total_hops"
++  "flow_summary.spawned" "flow_summary.delivered" "flow_summary.live" "flow_summary.score"
++)
++
++resolve_key() {
++  # resolve a dotted key path in a JSON doc via python (a/b/c -> doc["a"]["b"]["c"])
++  python3 -c "
++import json, sys
++doc = json.load(open(sys.argv[1]))
++v = doc
++for part in '${1}'.split('.'):
++    v = v[part]
++if isinstance(v, list):
++    print(json.dumps(v))
++else:
++    print(v)
++" "$2"
++}
++
++compare() {
++  # compare <a.json> <b.json> <label> — exit 1 with the offending keys on mismatch
++  local a="$1" b="$2" label="$3" bad=0 k va vb
++  for k in "${KEYS[@]}"; do
++    va="$(resolve_key "$k" "$a")" || { echo "  key $k missing in $a"; bad=1; continue; }
++    vb="$(resolve_key "$k" "$b")" || { echo "  key $k missing in $b"; bad=1; continue; }
++    if [ "$va" != "$vb" ]; then
++      echo "  $k: $va vs $vb"
++      bad=1
++    fi
++  done
++  if [ "$bad" -eq 1 ]; then
++    echo "GOLDEN MISMATCH: $label"
++    return 1
++  fi
++  local hash
++  hash="$(resolve_key "state_hash" "$a")"
++  echo "golden OK ($label): state_hash=$hash"
++  return 0
++}
++
++if [ "${1:-}" = "--self-test" ]; then
++  # Negative-branch coverage: the compare MUST fail loud on a corrupted
++  # golden (a silent pass on mismatch would false-green the gate).
++  if [ ! -f "$GOLDEN" ]; then
++    echo "golden missing: $GOLDEN" >&2
++    exit 1
++  fi
++  ./tests/build/spine-check --json > "$TMP/standalone.json" 2>/dev/null || {
++    echo "self-test: spine-check --json failed" >&2
++    exit 1
++  }
++  python3 -c "
++import json, sys
++doc = json.load(open(sys.argv[1]))
++doc['state_hash'] = '0000000000000000'
++doc['flow_summary']['score'] = 999
++json.dump(doc, open(sys.argv[2], 'w'))
++" "$GOLDEN" "$TMP/corrupt.json"
++  if compare "$TMP/corrupt.json" "$TMP/standalone.json" "self-test corrupted golden" >"$TMP/selftest.out" 2>&1; then
++    echo "SELF-TEST FAIL: a corrupted golden passed the compare (must fail loud)" >&2
++    exit 1
++  fi
++  grep -q "GOLDEN MISMATCH" "$TMP/selftest.out" || {
++    echo "SELF-TEST FAIL: mismatch not reported as such" >&2
++    exit 1
++  }
++  echo "compare-golden self-test OK (corrupted golden rejected loudly)"
++  exit 0
++fi
++
+ if [ ! -f "$GOLDEN" ]; then
+   echo "golden missing: $GOLDEN — run scripts/local-ci.sh --bless after the first engine build" >&2
+   exit 1
+@@ -27,35 +113,18 @@ rc=$?
+ # compared additionally when gate 6 produced it. Every key carried by the
+ # golden is enforced — including rng_first4 (drawn before the re-seed, so
+ # state_hash alone would not cover it).
+-if python3 - "$GOLDEN" "$TMP/standalone.json" "committed golden vs standalone spine-check" <<'PY'
+-import json, sys
+-KEYS = ("seed", "ticks", "tick_nonce", "state_hash", "save_magic", "save_version", "rng_first4")
+-a = json.load(open(sys.argv[1]))
+-b = json.load(open(sys.argv[2]))
+-bad = [k for k in KEYS if a.get(k) != b.get(k)]
+-if bad:
+-    print("GOLDEN MISMATCH:", ", ".join(f"{k}: {a.get(k)} vs {b.get(k)}" for k in bad))
+-    sys.exit(1)
+-print(f"golden OK ({sys.argv[3]}): state_hash={a['state_hash']}")
+-PY
+-then
++if compare "$GOLDEN" "$TMP/standalone.json" "committed golden vs standalone spine-check"; then
+   :
+ else
+   exit 1
+ fi
+ 
+ if [ -f "$ENGINE_PROBE" ]; then
+-  python3 - "$ENGINE_PROBE" "$TMP/standalone.json" "engine PPProbe vs standalone spine-check" <<'PY'
+-import json, sys
+-KEYS = ("seed", "ticks", "tick_nonce", "state_hash", "save_magic", "save_version", "rng_first4")
+-a = json.load(open(sys.argv[1]))
+-b = json.load(open(sys.argv[2]))
+-bad = [k for k in KEYS if a.get(k) != b.get(k)]
+-if bad:
+-    print("ENGINE PROBE MISMATCH:", ", ".join(f"{k}: {a.get(k)} vs {b.get(k)}" for k in bad))
+-    sys.exit(1)
+-print(f"engine probe OK ({sys.argv[3]}): state_hash={a['state_hash']}")
+-PY
++  if compare "$ENGINE_PROBE" "$TMP/standalone.json" "engine PPProbe vs standalone spine-check"; then
++    :
++  else
++    exit 1
++  fi
+ else
+   echo "no engine probe at $ENGINE_PROBE — engine leg not run this session (committed golden still asserted)"
+ fi
+diff --git a/scripts/local-ci.sh b/scripts/local-ci.sh
+index 1c9357b..e5c14b0 100755
+--- a/scripts/local-ci.sh
++++ b/scripts/local-ci.sh
+@@ -55,31 +55,53 @@ ENGINE_CMD="$(find_engine || true)"
+ # silent PASS, never a false FAIL). The format gate is NOT engine-gated:
+ # format-check.sh self-skips only when no clang-format >= 14 exists.
+ GATES=(
+-  "Format (clang-format --dry-run on Source/)|scripts/format-check.sh"
++  "SKIPABLE:Format (clang-format --dry-run on Source/)|scripts/format-check.sh"
+   "Spine standalone check (ODN-9/11 conformance, no engine)|mkdir -p tests/build && g++ -std=c++17 -O2 -Wall -Wextra -I Source/PacketPlumberCore/Public tests/spine_check.cpp -o tests/build/spine-check && tests/build/spine-check"
+   "Project static checks (uproject JSON, module/target presence, script syntax)|python3 scripts/static-check.py"
+   "ENGINE:UBT build (Development Editor)|scripts/run-tests-headless.sh --build-only"
+   "ENGINE:Headless automation tests (PacketPlumber.* filter)|scripts/run-tests-headless.sh --tests"
+-  "ENGINE:PPProbe commandlet (headless spine probe)|scripts/run-tests-headless.sh --probe --json-out docs/goldens/.engine-probe.json"
+-  "ENGINE:Golden compare (PPProbe vs standalone vs docs/goldens/)|scripts/compare-golden.sh"
++  "ENGINE:PPProbe commandlet (headless spine probe + negative-args leg)|scripts/run-tests-headless.sh --probe --json-out docs/goldens/.engine-probe.json && scripts/run-tests-headless.sh --probe-negative"
++  "ENGINE:Golden compare (PPProbe vs standalone vs docs/goldens/ + mismatch self-test)|scripts/compare-golden.sh && scripts/compare-golden.sh --self-test"
+ )
+ 
+ # run_gates <count> — first <count> gates, stop-on-fail, summarize.
+ run_gates() {
+-  local n="$1" results=() rc=0 i=0 label cmd entry status
++  local n="$1" results=() rc=0 i=0 label cmd entry status out
+   for entry in "${GATES[@]:0:$n}"; do
+     i=$((i + 1))
+     label="${entry%%|*}"
+     cmd="${entry#*|}"
++    display="$label"
++    [[ "$display" == SKIPABLE:* ]] && display="${display#SKIPABLE:}"
+     status="PASS"
+     echo ""
+-    echo "── gate $i/$n — $label"
++    echo "── gate $i/$n — $display"
+     local t0
+     t0=$(date +%s)
+     if [[ "$label" == ENGINE:* ]] && [ "$ENGINE_PRESENT" -eq 0 ]; then
+       echo "   ⏭️  SKIP (no Unreal Engine found — see scripts/install-engine.sh)"
+       status="SKIP"
+       results+=("⏭️   gate $i  $label  (skipped: no engine)")
++    elif [[ "$label" == SKIPABLE:* ]]; then
++      # SELF-SKIPPING gates (e.g. format without a clang-format): the gate
++      # script prints "SKIP: ..." and exits 0 — record SKIP, never PASS
++      # (the SKIP-vs-PASS distinction is real: a skipped gate is not proof).
++      out="$(bash -c "$cmd" 2>&1)"
++      local gate_rc=$?
++      if [ "$gate_rc" -eq 0 ] && [[ "$out" == *"SKIP:"* ]]; then
++        echo "   ⏭️  SKIP (self-skipped by the gate script)"
++        status="SKIP"
++        results+=("⏭️   gate $i  $label  (skipped: self-skip)")
++      elif [ "$gate_rc" -ne 0 ]; then
++        rc=$gate_rc
++        echo "   ❌ FAIL (exit $rc)"
++        echo "$out" | tail -5
++        results+=("❌  gate $i  $label")
++        status="FAIL"
++      else
++        echo "   ✅ PASS"
++        results+=("✅  gate $i  $label")
++      fi
+     elif bash -c "$cmd"; then
+       echo "   ✅ PASS"
+       results+=("✅  gate $i  $label")
+@@ -95,7 +117,7 @@ run_gates() {
+     t1=$(date +%s)
+     dt=$((t1 - t0))
+     [ "$status" != "SKIP" ] && echo "   ⏱  ${dt}s"
+-    printf '%s\tgate %d\t%s\t%s\t%ds\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$i" "$label" "$status" "$dt" >> docs/timings.md
++    printf '%s\tgate %d\t%s\t%s\t%ds\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$i" "$display" "$status" "$dt" >> docs/timings.md
+     [ "$status" = "FAIL" ] && break
+   done
+   echo ""
+@@ -122,5 +144,18 @@ fi
+ if [ "$FAST" -eq 1 ]; then
+   run_gates 3
+ else
++  # U-E2 hygiene: the full suite (editor boots + probes) must not dirty the
++  # tracked tree. Snapshot BEFORE the gates; assert identical AFTER — a new
++  # Config/ edit or untracked file created by a gate run fails loud.
++  dirty_before="$(git status --porcelain -- Config/ 2>/dev/null)"
+   run_gates "${#GATES[@]}"
++  gate_rc=$?
++  dirty_after="$(git status --porcelain -- Config/ 2>/dev/null)"
++  if [ "$dirty_before" != "$dirty_after" ]; then
++    echo "❌ U-E2 FAIL: the gate run dirtied Config/ — editor boot wrote tracked/untracked files:" >&2
++    diff <(printf '%s\n' "$dirty_before") <(printf '%s\n' "$dirty_after") >&2 || true
++    echo "  (DefaultEngine.ini AndroidFileServer section + untracked DefaultInput.ini must stay absent — see U-E2.)" >&2
++    exit 1
++  fi
++  exit "$gate_rc"
+ fi
+diff --git a/scripts/run-tests-headless.sh b/scripts/run-tests-headless.sh
+index ce1cd6e..8277e09 100755
+--- a/scripts/run-tests-headless.sh
++++ b/scripts/run-tests-headless.sh
+@@ -9,6 +9,7 @@
+ #   scripts/run-tests-headless.sh --tests        # Automation RunTests PacketPlumber
+ #   scripts/run-tests-headless.sh --probe        # PPProbe commandlet (default seed 42, 100 ticks)
+ #   scripts/run-tests-headless.sh --probe --json-out <path>
++#   scripts/run-tests-headless.sh --probe-negative  # PPProbe bad-args fail-loud leg (U-E7)
+ set -uo pipefail
+ 
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+@@ -94,8 +95,34 @@ case "${1:-}" in
+     fi
+     exit $rc
+     ;;
++  --probe-negative)
++    # U-E7 negative-args coverage: bad -seed / -ticks must FAIL LOUD. Truth
++    # is in the LOG, not the process exit code (UE's commandlet exit-code
++    # propagation is engine-version-dependent): the commandlet must log the
++    # error and must NEVER log RESULT=OK.
++    fail=0
++    for bad in "-seed=abc" "-ticks=0"; do
++      tag="${bad#-}"
++      tag="${tag//=/_}"
++      "$ENGINE_CMD" "$UPROJECT" \
++        -unattended -nopause -nullrhi -nosound -nosplash \
++        -run=PPProbe $bad \
++        -abslog="$ROOT/Saved/Logs/headless-probe-negative-${tag}.log"
++      log="Saved/Logs/headless-probe-negative-${tag}.log"
++      if grep -q "PPProbe RESULT=OK" "$log"; then
++        echo "negative-args leg FAIL: PPProbe reported OK for bad arg '$bad'" >&2
++        fail=1
++      elif ! grep -Eq "PPProbe: bad -(seed|ticks)" "$log"; then
++        echo "negative-args leg FAIL: no fail-loud error logged for '$bad'" >&2
++        fail=1
++      else
++        echo "negative-args leg OK: '$bad' failed loud (error logged, no RESULT=OK)"
++      fi
++    done
++    exit $fail
++    ;;
+   *)
+-    echo "usage: run-tests-headless.sh [--build-only|--tests|--probe]" >&2
++    echo "usage: run-tests-headless.sh [--build-only|--tests|--probe|--probe-negative]" >&2
+     exit 2
+     ;;
+ esac
+diff --git a/scripts/static-check.py b/scripts/static-check.py
+old mode 100755
+new mode 100644
+index f431b79..0f5ee29
+--- a/scripts/static-check.py
++++ b/scripts/static-check.py
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python3
++#!/ usr / bin / env python3
+ """scripts/static-check.py — project static checks (gate 3, no engine).
+ 
+ Verifies what CAN be verified without the engine, so the pre-engine CI loop
+@@ -27,7 +27,7 @@ def check(cond: bool, msg: str) -> None:
+ 
+ 
+ def main() -> int:
+-    # 1. uproject JSON + expected shape
++# 1. uproject JSON + expected shape
+     uproj = json.loads((ROOT / "PacketPlumberUE.uproject").read_text())
+     modules = {m["Name"] for m in uproj.get("Modules", [])}
+     expected_modules = {"PacketPlumberCore", "PacketPlumber", "PacketPlumberCoreTests", "PacketPlumberEditor"}
+@@ -36,25 +36,25 @@ def main() -> int:
+     check(plugins.get("ModelContextProtocol") is True, "ModelContextProtocol plugin must be enabled")
+     check(plugins.get("PythonScriptPlugin") is True, "PythonScriptPlugin plugin must be enabled")
+ 
+-    # 2. each module has Build.cs + a source cpp
++# 2. each module has Build.cs + a source cpp
+     for name in modules:
+         check((ROOT / "Source" / name / f"{name}.Build.cs").is_file(), f"{name}.Build.cs missing")
+         cpps = list((ROOT / "Source" / name).glob("*.cpp"))
+         check(len(cpps) > 0, f"no .cpp in Source/{name}")
+ 
+-    # 3. targets reference existing modules
++# 3. targets reference existing modules
+     for t in ["PacketPlumber.Target.cs", "PacketPlumberEditor.Target.cs"]:
+         text = (ROOT / "Source" / t).read_text()
+         for m in ["PacketPlumber", "PacketPlumberEditor", "PacketPlumberCoreTests"]:
+             if m in text:
+                 check(m in modules, f"{t} references {m} but it is not in the uproject")
+ 
+-    # 4. script syntax
++# 4. script syntax
+     for sh in sorted((ROOT / "scripts").glob("*.sh")):
+         r = subprocess.run(["bash", "-n", str(sh)], capture_output=True, text=True)
+         check(r.returncode == 0, f"bash -n failed on {sh.name}: {r.stderr.strip()}")
+ 
+-    # 5. CRLF scan on tracked text files (best-effort: git tracked only)
++# 5. CRLF scan on tracked text files(best - effort : git tracked only)
+     r = subprocess.run(["git", "ls-files"], capture_output=True, text=True, cwd=ROOT)
+     check(r.returncode == 0, f"git ls-files failed: {r.stderr.strip()}")
+     for rel in r.stdout.splitlines():
+@@ -64,8 +64,8 @@ def main() -> int:
+         if b"\r\n" in data:
+             check(False, f"CRLF in {rel}")
+ 
+-    # 6. ODN-2 fixed 20 Hz tick pinned in DefaultEngine.ini (engine-free
+-    #    assertion of the sim-rate pin; the presentation side is engine-gated).
++# 6. ODN - 2 fixed 20 Hz tick pinned in DefaultEngine.ini(engine - free
++#assertion of the sim - rate pin; the presentation side is engine - gated).
+     ini = (ROOT / "Config" / "DefaultEngine.ini").read_text()
+     section = None
+     ini_kv = {}
+@@ -79,10 +79,15 @@ def main() -> int:
+         if section is None or "=" not in line:
+             continue
+         ini_kv[f"{section}.{line.split('=', 1)[0].strip()}"] = line.split("=", 1)[1].strip()
+-    check(ini_kv.get("/Script/Engine.Engine.bUseFixedFrameRate", "").lower() == "true",
+-        "bUseFixedFrameRate must be True (ODN-2 fixed tick)")
++#ODN - 2 / UAD - 2(r2 decision) : the SIM rate is 20 Hz — owned by the
++#FPPSimDriver accumulator, NOT by the engine's fixed-frame-rate pin (the
++#sim never reads a clock).bUseFixedFrameRate must be False so the view
++#renders at the display rate(60 fps — the UAD - 22 eased interpolation
++#needs it); FixedFrameRate stays as the documented sim - rate reference.
++    check(ini_kv.get("/Script/Engine.Engine.bUseFixedFrameRate", "").lower() == "false",
++        "bUseFixedFrameRate must be False (UAD-2: the sim rate is the driver accumulator's; the render runs at display rate)")
+     check(ini_kv.get("/Script/Engine.Engine.FixedFrameRate", "") == "20.000000",
+-        "FixedFrameRate must be 20.000000 (ODN-2 fixed tick)")
++        "FixedFrameRate must be 20.000000 (the documented ODN-2 sim rate)")
+ 
+     if FAIL:
+         print(f"\nstatic-check: {len(FAIL)} failure(s)")
+diff --git a/scripts/verify-capture-geometry.py b/scripts/verify-capture-geometry.py
+new file mode 100644
+index 0000000..96c4cda
+--- /dev/null
++++ b/scripts/verify-capture-geometry.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++"""scripts/verify-capture-geometry.py — the capture-pipeline geometry gate.
++
++Verifies a committed T2 frame's geometry (Perkins r2: "add an
++endpoint-vs-node-center geometric check to the capture pipeline"). For the
++slice-1 fixture (3 nodes in a row), the check proves the RENDERED roads
++connect the RENDERED node centers:
++
++  1. locate the amber source + blue sink discs (the terminal colors),
++  2. locate the white road runs on the node row,
++  3. assert the roads' outer caps emerge from the node disc edges (the discs
++     are drawn OVER the road ends, so the road must appear within
++     disc_radius + road_cap of each node center — NOT offset by ~41px as in
++     the r2 road-anchor bug),
++  4. assert the dot (packet-blue) rides the road row (the r2 +0.5 bug made
++     it ride half a tile below).
++
++Exit 0 = the frame's geometry is connected; nonzero = a defect (a regression
++like the r2 road anchor fails here before any human eye is needed).
++"""
++import sys
++from pathlib import Path
++
++from PIL import Image
++
++# Canon palette (view-layer tokens — the capture renders them near-exact)
++AMBER = (245, 208, 133)
++BLUE = (185, 210, 229)
++DOT = (134, 183, 216)
++WHITE = (255, 255, 255)
++# the road-anchor bug shifted roads by ~(Length-Width)/2 ≈ 41px; the
++# connected-geometry tolerance is a small fraction of that.
++TOL_PX = 12
++
++
++def near(p, t, tol=22):
++    return all(abs(p[i] - t[i]) <= tol for i in range(3))
++
++
++def find_disc(img, color, y0, y1, x0, x1):
++    pts = [(x, y) for y in range(y0, y1) for x in range(x0, x1) if near(img.getpixel((x, y)), color)]
++    if not pts:
++        return None
++    xs = [p[0] for p in pts]
++    ys = [p[1] for p in pts]
++    return (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2, (max(xs) - min(xs)) // 2
++
++
++def main() -> int:
++    if len(sys.argv) != 2:
++        print("usage: verify-capture-geometry.py <frame.png>", file=sys.stderr)
++        return 2
++    img = Image.open(sys.argv[1]).convert("RGB")
++    W, H = img.size
++    fails = []
++
++    src = find_disc(img, AMBER, 0, H, 0, W)
++    snk = find_disc(img, BLUE, 0, H, 0, W)
++    if not src or not snk:
++        print("FAIL: source/sink discs not found (is this the fixture frame?)")
++        return 1
++    sx, sy, sr = src
++    kx, ky, kr = snk
++    print(f"source disc center=({sx},{sy}) r={sr}; sink disc center=({kx},{ky}) r={kr}")
++
++    # road row: the row(s) with a long white run between the nodes
++    road_row = None
++    for y in range(max(0, sy - 15), min(H, sy + 15)):
++        xs = [x for x in range(sx - 20, kx + 20) if img.getpixel((x, y)) == WHITE]
++        if len(xs) > (kx - sx) * 0.4:
++            road_row = y
++            left_run = min(xs)
++            right_run = max(xs)
++            break
++    if road_row is None:
++        print("FAIL: no road row found between the nodes")
++        return 1
++    print(f"road row y={road_row}: white run x[{left_run}-{right_run}]")
++
++    # the roads must emerge from the node discs (road cap within TOL of the
++    # disc edge). The r2 bug left the roads ~41px short.
++    if left_run > sx + sr + TOL_PX:
++        fails.append(f"left road cap at {left_run} is {left_run - (sx + sr)}px past the source disc edge (r={sr})")
++    if right_run < kx - kr - TOL_PX:
++        fails.append(f"right road cap at {right_run} is {(kx - kr) - right_run}px short of the sink disc edge (r={kr})")
++
++    # the packet dot (if present) must ride the road row (the r2 +0.5 bug put
++    # it half a tile below). A frame without a dot passes this leg.
++    dot = [(x, y) for y in range(0, H) for x in range(0, W) if near(img.getpixel((x, y)), DOT, tol=30)]
++    if dot:
++        ys = [p[1] for p in dot]
++        cy = (min(ys) + max(ys)) // 2
++        if abs(cy - road_row) > 8:
++            fails.append(f"packet dot rides y={cy}, {abs(cy - road_row)}px off the road row y={road_row}")
++        print(f"dot: n={len(dot)} center y={cy} (road row y={road_row})")
++    else:
++        print("dot: absent this frame (leg skipped)")
++
++    if fails:
++        print("GEOMETRY FAIL:")
++        for f in fails:
++            print(f"  - {f}")
++        return 1
++    print("GEOMETRY OK: roads connect the node centers; the dot rides the road.")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

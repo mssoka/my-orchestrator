@@ -1,0 +1,32 @@
+[
+  {
+    "source": "architecture",
+    "severity": "blocker",
+    "category": "take-over",
+    "title": "STILL PRESENT (r3): the wrong-person awaiting UPDATE as executed is still unguarded on taken_over_at — the dedicated backstop SQL is unwired (orphan) and the race pin is vacuous",
+    "location": "server/src/reference_checks/form_handler.gleam:1235-1258; server/src/reference_checks/sql/update_reference_call_status.sql:23-24; server/src/reference_checks/sql/mark_awaiting_correction_wrong_person.sql:14-15; server/test/integration/reference_checks_actions_integration_test.gleam:1729-1760",
+    "evidence": "form_handler.gleam:1235 `case row.taken_over_at != \"\" { True -> wisp.redirect(to: \"/reference/\" <> token) False ->` then :1250 `sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated)`; update_reference_call_status.sql:23-24 `WHERE id = $1 AND status = $5::reference_call_status`; mark_awaiting_correction_wrong_person.sql `WHERE id = $1 AND status = 'contact_initiated'::reference_call_status AND taken_over_at IS NULL`; grep: mark_awaiting_correction_wrong_person called only at integration test 1746/1758 `rc_sql.mark_awaiting_correction_wrong_person(db, call)` — no src call site; test drives do_take_over + the SQL function DIRECTLY, never handle_wrong_person_post",
+    "detail": "Handler still executes the unguarded update_reference_call_status (no taken_over_at AND no correction_cycles guard); the guarded mark_awaiting_correction_wrong_person ships dead — an orphan module. The r3-rework pin calls the guarded SQL directly while the handler uses a different UPDATE: exactly the vacuous pin the mandate forbids. Read-time row.taken_over_at check (and row.correction_cycles>=1 gate, :1242) cannot close the TOCTOU window; webhook leg is SQL-backstopped, wrong-person leg is not.",
+    "recommended_fix": "Wire apply_wrong_person's awaiting transition to sql.mark_awaiting_correction_wrong_person (0 rows = stand down redirect), add AND correction_cycles = 0 to that SQL, and rewrite the race test to POST the real form route so neutralizing the backstop turns it red."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "substitution",
+    "title": "STILL PRESENT (r3): N20 — trio_matches_row aligned to the SNAPSHOT basis, not the mandated effective-name basis; the two no-op detectors still disagree",
+    "location": "server/src/reference_checks/actions_handler.gleam:700-712",
+    "evidence": "fn trio_matches_row(\n  row: sql.ListReferenceCallsForApplicationRow,\n  trio: Trio,\n) -> Bool {\n  trio.name == row.contact_name\n  && trio.email == option.unwrap(row.contact_email, \"\")\n  && trio.phone == option.unwrap(row.contact_phone, \"\")\n}",
+    "detail": "r4 mandate asked for the effective basis (COALESCE(NULLIF(corrected_name,''),contact_name)); the fix instead made all three fields snapshot-based. trio_matches (:690) uses effective, trio_matches_row uses snapshot, so after a successor correction a re-submit of the current effective trio 409s 'already replaced' instead of the idempotent 200.",
+    "recommended_fix": "Compare the submitted trio against the successor's effective trio (corrected ?? snapshot, ''-normalised) to satisfy the idempotent no-op contract; add corrected_name to the row if needed."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "robustness",
+    "title": "STILL PRESENT (r3): N14sql — the send_is_post_correction cast guard is prefix-anchored only; timestamp-prefixed garbage still raises and drops the delivery-failure event",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:58-62",
+    "evidence": "CASE WHEN e->>'at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}'\n                THEN (e->>'at')::timestamptz >= rc.corrected_at\n                ELSE false END",
+    "detail": "The regex has no trailing anchor, so a malformed 'at' that merely starts like a timestamp ('2026-08-01 08:00:00garbage') passes the guard and the ::timestamptz cast raises, erroring the whole find query. Fix is real for non-timestamp garbage but the r3 raise-and-drop mode survives for prefix-matching values.",
+    "recommended_fix": "Anchor the regex end ($) or wrap the cast in a CASE WHEN e->>'at' ~ '...regex...' THEN ... ELSE false END that only casts on a full match, keeping the raise window closed for all malformed input."
+  }
+]

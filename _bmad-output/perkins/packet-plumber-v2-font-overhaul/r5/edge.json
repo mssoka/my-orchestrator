@@ -1,0 +1,22 @@
+[
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "resource-leak",
+    "title": "font_merge_fallback failure paths leak the main/fallback glyph arrays and per-glyph bitmaps",
+    "location": "app/render/view.odin:1399-1426",
+    "evidence": "\tif missing_n == len(cps) {\n\t\t// the main font carries NONE of the requested codepoints — a broken\n\t\t// asset, not a merge case. Fail loudly (the loader doctrine).\n\t\treturn nil, 0\n\t}\n\tfdata, ferr := os.read_entire_file_from_path(fallback_path, context.temp_allocator)\n\tif ferr != nil {\n\t\t// B1-residual (r3): the main font lacks glyphs AND the fallback is\n\t\t// unreadable — returning ok would silently ship an atlas without ⚠\n\t\t// (the CI pin would be the only net). Fail loudly instead.\n\t\treturn nil, 0\n\t}\n...\n\tmerged := cast([^]rl.GlyphInfo)rl.MemAlloc(c.uint(size_of(rl.GlyphInfo) * int(total)))\n\tif merged == nil {\n\t\trl.MemFree(glyphs)\n\t\treturn nil, 0\n\t}",
+    "detail": "On the ferr/missing_n==len(cps) returns, glyphs (LoadFontData array + ~95 stbtt bitmaps) is never freed; on merged==nil, fg leaks; the completeness-fail MemFree(merged) leaks glyphs, fg, and every glyph bitmap. The ferr path runs on every negative-control test.",
+    "recommended_fix": "Free before each error return: rl.UnloadFontData(glyphs, count) on the ferr/none/merged-nil paths; free fg's block there; on completeness-fail free glyphs, fg, and merged blocks (UnloadFontData-style per-glyph frees)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "resource-leak",
+    "title": "font_test teardown frees only glyph-array blocks — per-glyph bitmaps, recs, and discarded fonts leak",
+    "location": "app/render/font_test.odin:29",
+    "evidence": "\tdefer rl.MemFree(glyphs) // test-side: the merged glyph block is raylib-owned (r3 note)\n...\n\t_, atlas, ok := font_atlas_build_from_file(FONT_ASSET)\n\tif ok {\n\t\trl.UnloadImage(atlas) // note (r4): the guard test discards the atlas — free it\n\t}\n...\n\tdefer rl.UnloadImage(am)\n\tbody, ab, okb := font_atlas_build_from_file(FONT_ASSET)\n\tif !okb {\n\t\ttesting.expect(t, false, \"the committed body font must load\")\n\t\treturn\n\t}\n\tdefer rl.UnloadImage(ab)",
+    "detail": "MemFree(glyphs) frees only the array; raylib frees glyphs[i].image.data per glyph solely via UnloadFontData (rtext.c:993-1000, exposed as rl.UnloadFontData). Guard/tabular tests discard whole fonts — glyph arrays, recs, bitmaps all leak. Raylib-side memory, so the tracking allocator never sees it.",
+    "recommended_fix": "Replace MemFree(glyphs) with rl.UnloadFontData(glyphs, count); in the guard/tabular tests also UnloadFontData the returned fonts' glyphs and MemFree their recs, alongside the existing atlas UnloadImage calls."
+  }
+]

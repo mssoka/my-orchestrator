@@ -1,0 +1,42 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "duplication",
+    "title": "Un-forwardable-pile measurement implemented twice: warnings.odin inline loop vs node_health_measure",
+    "location": "core/node_health.odin:73-85 vs core/warnings.odin:189-201",
+    "evidence": "core/warnings.odin:189-201 (warning_evaluate): `for i in 0..<len(f.packets) {\n\t\tp := &f.packets[i]\n\t\tif p.delivered || p.on_edge { continue }\n\t\tif p.waiting_ticks == 0 { continue }\n\t\tfor ns in 0..<len(t.node_alive) {\n\t\t\tif t.node_alive[ns] && t.node_id[ns] == p.at_node {\n\t\t\t\tnload[ns] += i64(cat.balance.packet_bandwidth)\n\t\t\t\tbreak` ... then `new = strain_level(nload[ns] * 100 / throughput, w.node_amber_pct, w.node_red_pct)`. core/node_health.odin:73-90 (node_health_measure): `for i in 0..<len(flow.packets) {\n\t\tp := &flow.packets[i]\n\t\tif p.delivered || p.on_edge {\n\t\t\tcontinue\n\t\t}\n\t\tif p.at_node != node_id {\n\t\t\tcontinue\n\t\t}\n\t\tif p.waiting_ticks == 0 {\n\t\t\tcontinue // the no-flicker contract: fresh spawns/transits never strain\n\t\t}\n\t\tunits += bw\n\t}\n\tif throughput > 0 {\n\t\tpct = u32(units * 100 / u64(throughput))\n\t}`",
+    "detail": "Two code sites implement the identical stuck-pile÷throughput measure. Any semantic change (waiting_ticks, bandwidth, throughput) is now a two-site edit; the coherence test catches output drift only after the fact. The PR's 'one measurement family, two consumers' is not realized in code.",
+    "recommended_fix": "Have warning_evaluate's node pass consume node_health_measure per slot (or extract a shared stuck-load accumulator both passes read) — one implementation, two consumers; the never-serialized node_health array separation is unchanged."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "pattern-fit",
+    "title": "Hover inspect card ignores the repo's entity-anchored-panel clamp convention (off-window / under tray)",
+    "location": "app/render/node_health.odin:50-56",
+    "evidence": "app/render/node_health.odin:50-56: `s := v.tile_px * v.scale\n\tx := i32(anchor.x) + i32(s * 0.7)\n\ty := i32(anchor.y) + i32(s * 0.5)\n\tcard := rl.Color{255, 252, 244, 240}\n\trl.DrawRectangle(x, y, NODE_HEALTH_CARD_W, NODE_HEALTH_CARD_H, card)` (NODE_HEALTH_CARD_W :: i32(232), no viewport/tray clamp). Contrast app/render/popover.odin:44-46: `// popover_rect — the panel rect anchored at an entity's screen position\n// (anchor + 18 right, -20 up; flips left when the right edge would leave the\n// window; clamped into the viewport, ABOVE the tray band, and fully inside a\n// small window).` with popover_rect's `if x + POPOVER_W > f32(v.win_w) { x = anchor.x - POPOVER_W - 18 }` etc.",
+    "detail": "The existing anchored-panel pattern (popover_rect) documents and implements viewport + tray-band clamping because the window is resizable and nodes sit anywhere on the map. The new card anchors below-right unclamped, clipping off-screen for edge nodes.",
+    "recommended_fix": "Clamp the card rect the way popover_rect does (flip left near the right edge, clamp into v.win_w/v.win_h, clear of TRAY_CLEAR) — the View already carries win_w/win_h."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Input sampling + world picking inside draw_hud instead of handle_input",
+    "location": "app/main.odin:1215-1226",
+    "evidence": "app/main.odin:1215-1226 (inside draw_hud :: proc at 1106): `if (app.mode == .Run || app.mode == .Paused) && app.placing < 0 && !app.drag.active {\n\t\tmx, my := rl.GetMouseX(), rl.GetMouseY()\n\t\twx, wy := rnd.from_screen(&app.view, f32(mx), f32(my))\n\t\tif id, ok := snap_node(app, wx, wy); ok {`. The only other mouse reads in main.odin are 526 (handle_input: `mx, my := rl.GetMouseX(), rl.GetMouseY()` after the key handling) and 939 (mouse_tile helper); draw_demolish_popover instead reads stored `app.sel_node`.",
+    "detail": "Hover target is interaction state computed in the draw pass, deviating from the codebase's handle_input → App state → draw convention (sel_node, drag, glow). No test or golden can address it, and 5.4 input parity can't reach a draw-pass-only hover.",
+    "recommended_fix": "Resolve the hovered node in handle_input into App state (e.g. app.hover_node, same guards), and have draw_hud only render the card from it."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "duplication",
+    "title": "State glyph/color vocabulary duplicated between the ring and the inspect card",
+    "location": "app/render/node_health.odin:23-30 vs app/render/view.odin:364-371",
+    "evidence": "app/render/node_health.odin:23-30: `node_health_card_state :: proc(lvl: pp.Strain_Level, p: ^Palette) -> (name: string, col: rl.Color, glyph: string) {\n\tif lvl == .Amber {\n\t\treturn \"STRAINED\", p.state_strain, \"!\"\n\t}\n\tif lvl == .Red {\n\t\treturn \"CRITICAL\", p.state_critical, \"!!\"\n\t}\n\treturn \"HEALTHY\", p.state_healthy, \"\"` — its comment claims \"(mirrors the ring's triad — one shared state vocabulary)\". app/render/view.odin:364-371 (draw_health_ring): `glyph := \"!\"\n\tif lvl == .Red {\n\t\tcol = p.state_critical\n\t\tadvance = 2\n\t\tglyph = \"!!\"\n\t}`",
+    "detail": "The lvl→glyph/color mapping exists twice in the render package; the 'mirror' is enforced by duplication, not structure, so ring and card can drift silently (no test pins the glyph strings).",
+    "recommended_fix": "Extract a shared render-package helper (lvl → glyph + color) that both draw_health_ring and node_health_card_state consume."
+  }
+]

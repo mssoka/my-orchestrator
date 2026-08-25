@@ -1,0 +1,42 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "state-hygiene",
+    "title": "still present since round 4: demo exit from a dirty edit page clears demo state BEFORE the unsaved-changes guard fires",
+    "location": "client/src/client.gleam:492-497 (clear then handle_browser_change); client/src/client.gleam:5404-5412 (guard inside handle_browser_change)",
+    "evidence": "client.gleam:492-497: '        _, True ->\n          case is_public_route(route) {\n            True ->\n              // Exiting the demo must clear every demo-populated store field\n              // — a stale Success(vacancies) would leak the fake vacancies\n              // onto a real landlord's dashboard after signup.\n              handle_browser_change(model |> model.clear_demo_state, uri, route)'. client.gleam:5404-5412: '  // Unsaved changes guard: intercept navigation away from edit page\n  let #(updated_model, eff) = case model.route, route {\n    routes.VacancyEdit(edit_id), r ->\n      case r {\n        routes.VacancyEdit(_) -> #(updated_model, eff)\n        _ ->\n          case model.vacancy_edit_has_unsaved_changes {'. model.gleam clear_demo_state clears demo_mode/demo_store/auth/csrf/vacancies/... but not vacancy_edit_* fields.",
+    "detail": "Public-route demo exit still clears demo state first; the guard then runs on a post-clear model — choosing \"stay\" strands a non-demo VacancyEdit with restored/NotAsked auth. Same order as r4.",
+    "recommended_fix": "Run the unsaved-changes guard before clear_demo_state on demo exits (or skip clearing until the guard resolves to leave)."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "no-network",
+    "title": "still present since round 4: latent policy re-acceptance modal could surface in demo and fire a real accept_policy POST (UserAcceptedPolicy is EXEMPT_ARMS, not intercepted)",
+    "location": "client/src/client.gleam:1375-1386; scripts/lint_demo_network.py:62; client/src/demo/demo_fixtures.gleam:26; shared/src/shared/policy_highlights.gleam:18",
+    "evidence": "client.gleam:1375-1386: '    UserAcceptedPolicy ->\n      case model.policy_reaccept_loading {\n        True -> #(model, effect.none())\n        False -> #(\n          Model(..model, policy_reaccept_loading: True),\n          auth_api.accept_policy(\n            version: model.server_policy_version,\n            csrf_token: model.csrf_token,'. lint EXEMPT_ARMS contains '\"UserAcceptedPolicy\",'. demo_fixtures.gleam:26: '\"accepted_policy_version\\\":\\\"2026-05-23\\\"}\"' with comment 'matches the current server policy version (shared/policy_highlights) so the re-acceptance modal never fires inside the demo'; policy_highlights.gleam:18: 'pub const version: String = \"2026-05-23\"'. demo_update.gleam has no UserAcceptedPolicy interception; enter_demo does not reset server_policy_version.",
+    "detail": "Safety rests on the fixture string tracking the server version: after any future policy bump, an authed landlord entering demo re-arms the modal and UserAcceptedPolicy fires a real POST with the demo csrf.",
+    "recommended_fix": "Clear server_policy_version in enter_demo (or intercept UserAcceptedPolicy in demo_update.handle with a no-op/exit)."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "data-exposure",
+    "title": "still present since round 4: demo comparison ids and sweep-nudge dismissals write to real web storage",
+    "location": "client/src/client.gleam:4953-4957, 5429-5437",
+    "evidence": "client.gleam:4953-4957: '    UserDismissedSweepNudge(application_id) -> {\n      let updated_dismissed =\n        set.insert(model.dismissed_sweep_nudges, application_id)\n      save_dismissed_sweep_nudges(set.to_list(updated_dismissed))'. client.gleam:5429-5433: '  // Reset comparison_ids when vacancy changes\n  let updated_model = case get_vacancy_id(model.route), get_vacancy_id(route) {\n    Some(old_vid), Some(new_vid) if old_vid != new_vid -> {\n      save_comparison_ids([])'. Neither message is intercepted in demo_update.gleam (grep: no match), so both arms run in demo mode and persist to the real landlord's localStorage.",
+    "detail": "Demo-mode dispatches persist fixture ids (v-maples etc.) into real web storage; after exit/signup the real app hydrates them into live comparison/sweep-nudge state.",
+    "recommended_fix": "Branch these persistence calls on !model.demo_mode (in-memory only), mirroring the // demo: branches elsewhere."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "W11's optimistic unread_count fix landed but its model-level pin stays vacuous — demo_model() starts at unread_count 0",
+    "location": "client/src/demo/demo_update.gleam:566-571; client/test/demo/demo_flow_test.gleam:592-600; client/src/model.gleam:695",
+    "evidence": "demo_update.gleam:568-571: '      // W11 (r4): clear the badge optimistically like the real arm — the\n      // store mutation alone leaves the bell's unread count stale.\n      #(Model(..model, demo_store: Some(next), unread_count: 0), eff)'. model.gleam:695 (inside initial()): '    unread_count: 0,'. demo_flow_test.gleam:592-600: 'pub fn demo_mark_all_read_mutates_store_test() {\n  let m = demo_model()\n  let #(after, _) = client.update(m, msg.UserClickedMarkAllRead)\n  ...\n  after.unread_count |> should.equal(0)' — demo_model() builds from model.initial() with no unread_count override, so the assert holds even if the optimistic set is reverted.",
+    "detail": "The behavior fix is real and bites in the browser, but reverting `unread_count: 0` in the demo arm stays green — the r4 pin-vacuity half of W11 was not addressed.",
+    "recommended_fix": "Set unread_count: 2 on the pin's model before dispatching UserClickedMarkAllRead so the 0 assert distinguishes the optimistic update."
+  }
+]

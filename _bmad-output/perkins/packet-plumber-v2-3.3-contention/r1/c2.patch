@@ -1,0 +1,1050 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-3-3-contention.md b/_bmad-output/implementation-artifacts/spec-3-3-contention.md
+new file mode 100644
+index 0000000..a5e988b
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-3-3-contention.md
+@@ -0,0 +1,125 @@
++---
++title: 'Story 3.3 — Node serialization + contention drop ladder'
++type: 'feature'
++created: '2026-08-13'
++status: 'in-review'
++review_loop_iteration: 0
++baseline_commit: 2e3acab77e1edebd779f3a2f1c998df2907cced2
++context:
++  - '{project-root}/_bmad-output/planning-artifacts/architecture/odin-architecture-v1.md'
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** Pipes have no serialization: every on-edge packet advances at the full bundle capacity each tick (unlimited parallel channels), so there is no queueing, no contention, and no drop — the QoS differentiator's second half (the serialization visual + contention drops) is missing.
++
++**Approach:** Add the 3.3 half of ODN-3 inside `flow_step`: per-bundle, per-lane bounded queues with lane-ordered serialization service (Express → Standard → Best, work-conserving gap-fill + a WRR floor — E7, no starvation), the E9 drop ladder (BE → Standard → Express) when a lane queue is full, and the E22 pool-exhaustion backstop (global in-flight cap, drops the lowest-priority lane first). Drops emit `Packet_Dropped{class, reason}` events. All 3.3 state is DERIVED (no new Packet fields, no new serialized Flow_State fields). Plus the **spatial-lane canon (user ruling 2026-08-12, base 2e3acab)**: every pipe renders THREE painted lane strokes (width = WFQ allocation share) and every packet rides IN its lane (lateral offset) end-to-end — the serialization visual at nodes + the T2 goldens show packets in lanes. This supersedes 3.2's length-segment stripes and the default-pipe-unchanged render rule: **all** pipe-containing T2 goldens re-bless by canon (documented).
++
++## Boundaries & Constraints
++
++**Always:**
++- Service model = **cyclic WRR windows** per bundle per tick: walk lanes E→S→B; each ready lane is entitled to its WFQ budget (Σ member `lane_caps`) per window, floored to 1 unit when its budget is 0 (E7 — ≥1 slot per non-empty lane per window); a lane with no queued packets is skipped (work-conserving — the pipe is never idle while a packet waits); windows repeat until the bundle capacity is consumed or no packet is ready. A lone packet in ANY lane gets the full capacity per tick (light-demo transits unchanged).
++- Lane FIFO within a queue = **array order** (spawn order; documented deviation from strict join order — deterministic, no extra serialized state).
++- The queue, the bounds, and the service are **per bundle** (parallel pipes pool — members' `lane_caps` sum; a packet's lane resolves from ITS representative pipe via `qos_lane_of`).
++- **E9 admission ladder:** when a packet would join a (bundle, lane) queue at `lane_queue_packets` (full), shed the NEWEST packet of the lowest-priority NON-EMPTY lane (walk BE→S→E); the arriving packet itself drops when it is the shed target (its lane is the lowest non-empty). The shed packet is spliced from the array (order-preserving); the arriving packet joins. `lane_queue_packets` + `pool_max_packets` are `balance.json` keys (data-driven, fail-fast validated ≥ 1, folded into catalog_hash).
++- **E22 spawn guard** inside `flow_spawn`: at `pool_max_packets`, the same ladder over in-flight packets (lane = on-edge → `qos_lane_of(its pipe)`, else class `default_lane`); the arriving packet drops when its lane is the shed target.
++- Drops emit `EVENT_TAG_PACKET_DROPPED` with `{class u16, reason u8}` (`Queue_Overflow` / `Pool_Exhaustion`); the event payload serializes **only for the new tag** (append-only; old runs' event bytes unchanged). LOG_VERSION stays 3, no new commands.
++- Determinism spine: array-only walks, integer math, no new serialized fields; existing light demos' T1 stays byte-identical (catalog_hash header re-bless is the only T1 shift). T2 pixels re-bless across all pipe demos — the spatial-lane canon repaints every pipe (3 lane strokes) + every on-edge packet (lateral lane offset); a deliberate, documented re-bless, not a drift.
++- **Spatial-lane render (canon 2e3acab):** each pipe (bundle) paints 3 lateral lane strokes perpendicular to its direction — stroke widths = Σ member `lane_caps` / total × pipe width (a zero-share lane draws no stroke — a missing stripe; the bands abut, so the base/core do not peek through); packets on a pipe draw laterally offset into their lane's band center (`qos_lane_of(p.edge, class)`); queued packets (on-edge, progress 0) therefore pile at the node in lane order — the serialization visual. At-node packets (no pipe yet) stay centered. Band layout is a pure function of (caps, width) — deterministic.
++
++**Ask First:** none — queue bounds + pool cap values are delegated ("tunables are YOUR call", data-driven).
++
++**Never:** No new Packet fields (golden stability). No new serialized Flow_State fields (ditto). No 3.4 SLA, no severance-drop event (the 2.3 silent cull stays silent — demolish.dem's event stream must not change), no new player commands, no per-class `bandwidth_demand` (catalog field stays unused — flag in the PR), no LB mechanics (lint gate 5), no silent golden re-bless: if an existing golden shifts for a reason other than documented contention, STOP and flag.
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| HAPPY_PATH | one packet on a pipe (any lane) | full capacity per tick — transit unchanged from 3.2 | n/a |
++| E7 floor | budget {0,0,0} lane ready, capacity left | 1 unit per window for the ready lane while capacity remains | n/a |
++| E7 no-starvation | caps {9,4,2}, continuous Express arrivals | Standard + Best still receive their budgets every window | n/a |
++| E9 ladder | lane full; lower-priority lane non-empty | shed that lane's NEWEST packet (Queue_Overflow event), admit the arrival | n/a |
++| E9 self-shed | lane full; it IS the lowest non-empty | the arriving packet drops (Queue_Overflow) — queue stays at bound | n/a |
++| E22 pool | pool at `pool_max_packets`; spawn arrives | the ladder sheds the lowest-priority non-empty lane's newest; the arrival is admitted ONLY when that target is STRICTLY lower priority than its own lane, else the arrival drops (the inversion guard — an Express resident never pays for a Standard arrival) | n/a |
++| Replay | run with drops, re-sim from the action log | identical drop events + queue state — byte-identical hashes (E10) | replay gate rejects divergence |
++
++## Code Map
++
++- `core/qos.odin` -- `qos_serialize` (pure per-window budget + E7 floor)
++- `core/flow.odin` -- the serialization service (cyclic WRR windows per bundle), the E9 admission ladder, the E22 spawn guard, drop splicing + events
++- `core/types.odin` -- `Drop_Reason`, `Event.class/reason`, `EVENT_TAG_PACKET_DROPPED`
++- `core/serialize.odin` -- tag-conditional event payload in `state_writer`
++- `core/catalog.odin` + `data/balance.json` -- `lane_queue_packets` + `pool_max_packets` parse/validate
++- `core/determinism_test.odin` -- test-catalog defaults for the new keys
++- `core/flow_test.odin` + `core/qos_test.odin` -- E7/E9/E22 pins
++- `app/render/view.odin` -- the spatial-lane render: 3 lateral lane strokes per bundle (width = allocation share) + per-packet lateral lane offset (shared band-layout helper); replaces 3.2's length-segment stripes
++- `harness/demo.odin` + `harness/run.odin` -- optional `spawn ... <class>` field (legacy demand, class defaults to email)
++- `demos/qos_contention.dem` (NEW) -- the launchable oversubscription demo
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `data/balance.json` -- add `lane_queue_packets` (6) + `pool_max_packets` (512) -- the data-driven bounds (ODN-5)
++- [x] `core/catalog.odin` -- parse + fail-fast validate the two keys (≥ 1) -- ODN-5
++- [x] `core/qos.odin` -- `qos_serialize` (per-window budget: E7 floor, clamp to remaining) -- the pure ODN-3 proc
++- [x] `core/types.odin` -- `Drop_Reason`, `Event` payload fields, `EVENT_TAG_PACKET_DROPPED` -- the drop record
++- [x] `core/flow.odin` -- forward-pass admission (E9 ladder, splice drops, events) + the per-bundle cyclic WRR service + the E22 spawn guard -- the story's heart
++- [x] `core/serialize.odin` -- tag-conditional drop payload in `state_writer` -- golden stability
++- [x] `core/determinism_test.odin` -- test-catalog defaults (lane_queue_packets 6, pool_max_packets 512)
++- [x] `core/qos_test.odin` -- E7/E9/E22 pins + replay-with-drops pin (the contracts landed here, the QoS contract home; `flow_test.odin` stayed unmodified)
++- [x] `core/catalog_test.odin` -- fail-fast rows for the new keys
++- [x] `app/render/view.odin` -- the spatial-lane render: `bundle_lane_caps` helper + 3 lateral lane strokes per bundle (always, width = share) + packet lateral offset by lane (queued packets pile by lane at nodes) -- the canon visual
++- [x] `harness/demo.odin` + `harness/run.odin` -- optional spawn class (back-compat: defaults to email)
++- [x] `demos/qos_contention.dem` (NEW) -- oversubscribe a pipe with email(BE)/streaming(E) traffic; captures show the queue + BE-first drops WITH packets in lanes
++- [x] Golden pass -- run ALL demos; re-bless deliberately: new demo blessed; catalog_hash header re-bless (T1) + full T2 re-bless for pipe demos (spatial-lane canon repaint); any further per-tick T1 shift documented (expected: ecmp/qos/qos_emphasis where contention engages)
++
++**Acceptance Criteria:**
++- Given `qos_serialize` + the cyclic service, when a pipe carries multi-lane traffic, then packets exit in lane order with no starvation under continuous Express (E7); a lone packet in any lane crosses at full capacity.
++- Given a full (bundle, lane) queue, when a new packet would join, then the E9 ladder sheds the lowest-priority non-empty lane's newest packet; the arrival drops when it is the shed target; every emptiness combo is pinned.
++- Given the pool at `pool_max_packets`, when a spawn arrives, then E22 drops the lowest-priority lane first; every drop emits `Packet_Dropped{class, reason}` and the run replays byte-identically (E10).
++- Given the new `qos_contention.dem`, when run through the harness, then its T1 + T2 goldens are blessed deliberately; existing demos' T1 hashes shift ONLY where contention genuinely engages (documented) + the catalog_hash header re-bless; T2 pixels re-bless across all pipe demos (the spatial-lane canon repaint, documented).
++- Given the app, when a pipe is oversubscribed, then best-effort packets visibly drop first, the queue exits in lane order, and packets ride their painted lane end-to-end (the launchable increment).
++
++## Spec Change Log
++
++- 2026-08-12 (mid-work canon, user ruling): base moved to `2e3acab` (spatial lanes —
++  three painted lane strokes per pipe, packets ride their lane) then `8ece056` (no
++  auto-assigned lanes — every type rides Standard until the player categorizes; lane
++  speed = priority — motion is a per-lane readout). Amendments: the render became a
++  first-class deliverable (view.odin strokes + lateral offsets + lane-speed fraction),
++  `default_lane` is pinned to Standard at catalog load (the sim never assigns lanes),
++  all pipe-containing T2 goldens re-bless by canon, and the spec body above was updated
++  in place. The service model, bounds, ladders, and T1-stability mechanism are
++  unchanged by the canons.
++
++- 2026-08-12 (step-04 review swarm, 2 hunters): (a) E22's shed rule was
++  `shed_lane != arrive_lane` — priority-inverting (an Express resident could pay for a
++  Standard arrival); corrected to STRICTLY-lower-priority-only (`shed_lane > arrive_lane`)
++  + a pin (Case C). (b) The Packet_Arrived event moved to the cull pass — the same-tick
++  event stream is spawn-ordered again (the 2.x single-pass order), so event ordering can
++  never shift a T1 on its own. (c) Zero-share-lane wording corrected: the bands abut, so
++  no base/core peek-through (comments + spec). (d) `lower_spawns` now propagates an
++  unknown-class error like `lower_nodes` (was a silent demand truncation). KEEP: the
++  cyclic-WRR service, the derived-state golden mechanism, the E9 ladder + pending-drop
++  exclusion, the ascending-sort splice, per-bundle queues, the spatial-lane render.
++
++## Design Notes
++
++- **Cyclic WRR windows are the work-conserving gap-fill.** One window = one E→S→B walk; each ready lane gets its WFQ budget (floor 1 when zero); empty lanes are skipped so their budget flows to the next ready lane in the walk. Windows repeat until the bundle's capacity is consumed. This is why a lone packet in ANY lane gets the full capacity (the prototype's downward-only carry starved a lone Express packet — rejected). Known, documented bias: when Best is empty, its budget flows to the next window's Express head (Express-favored), never starving Standard/Best (the floor).
++- **Golden-stability mechanism (mirrors 3.2's sparse serialization):** all 3.3 state is derived — queue membership is `(on_edge, edge)`, lanes are `qos_lane_of`, budgets are `lane_caps` + `qos_serialize`. No Packet fields, no Flow_State serialized fields, no new commands (LOG_VERSION stays 3). The drop event payload writes only for the new tag. T1 shifts ONLY when packets genuinely share a pipe (ecmp's 2-apart spawn pairs if the ECMP hash collides them; qos/qos_emphasis era-3 traffic saturates) — that shift IS the story, documented in the PR.
++- **Spatial lanes (canon 2e3acab):** the band layout (three lateral strokes + per-lane band centers) is a pure function of (Σ member `lane_caps`, pipe width) — shared by draw_bundles (strokes) + draw_packets (packet offset). Replaces 3.2's length-proportional segments. 3.2's default-pipe-unchanged rule is superseded: strokes draw on every pipe (a balanced pipe = three equal strokes). The base tier-color pipe draws underneath (a zero-share lane shows the base — "demoted to nothing").
++- **Splice, don't flag:** a dropped packet is removed from `f.packets` (order-preserving shift, collected indices applied descending after the forward pass) — no `delivered` misuse, no new fields. Arrivals still increment `score`; drops never do.
++- **Lane of a queued packet** = `qos_lane_of(t, cat, p.edge, p.class)` (its own representative pipe — per-pipe overrides hold per member of a bundle). At-node packets use the class `default_lane` for the E22 ladder only.
++- **Demo:** `qos_contention.dem` — fixture qos + 0-1/1-2/3-1/4-1 draws; `lane` overrides put email on Best-effort + streaming on Express on pipe 0; ~50ms spawn bursts both ways 0↔2 oversubscribe pipe 0; captures show the pile + BE-first drops, packets visibly in their lanes. The `spawn <class>` extension is harness-only (run setup rides both live + replay paths — safe).
++
++## Verification
++
++**Commands:**
++- `odin test core -debug` -- all suites green incl. the new E7/E9/E22 pins
++- `tools/lint.sh` -- all 5 gates green
++- `tools/harness.sh run` -- all demos PASS (T1 + T2 re-blessed deliberately per the canon + contention documentation)
++- `tools/harness.sh save qos_contention` -- bless the new golden, then `tools/harness.sh run` again -- PASS
++- `tools/harness.sh drift-check` -- every mutation rejected
++- `odin build app` + run -- oversubscribe a pipe → best-effort drops first, the queue exits by lane
+diff --git a/app/render/palette.odin b/app/render/palette.odin
+index b6476ea..0876fc4 100644
+--- a/app/render/palette.odin
++++ b/app/render/palette.odin
+@@ -34,6 +34,11 @@ Palette :: struct {
+ 	lane_standard:    rl.Color,
+ 	lane_best_effort: rl.Color,
+ 	sel_halo:         rl.Color, // 3.2: the selected-pipe halo (translucent amber)
++	// 3.3 canon (user ruling 2026-08-12): LANE SPEED = priority — packets
++	// move fastest on Express, slowest on Best-effort; motion is a per-lane
++	// readout alongside position + stroke width. Per-mille of the true
++	// along-edge fraction (1000 = full speed, 0 = frozen). Cosmetic only.
++	lane_speeds: [3]i32, // [Express, Standard, Best-effort]
+ }
+ 
+ DEFAULT_PALETTE_JSON :: #load("../../data/palette.json")
+@@ -83,6 +88,27 @@ palette_load :: proc(source: []byte = DEFAULT_PALETTE_JSON) -> Palette {
+ 	p.lane_standard = jcol(obj, "lane_standard", {108, 122, 142, 255})
+ 	p.lane_best_effort = jcol(obj, "lane_best_effort", {88, 152, 108, 255})
+ 	p.sel_halo = jcol(obj, "sel_halo", {232, 181, 68, 90})
++	// 3.3: lane-speed readout (per-mille of the true along-edge fraction).
++	// Any non-integer element falls back to the DEFAULTS for the whole array
++	// (review: a partial parse would freeze one lane at speed 0 silently).
++	if arr, ok := obj["lane_speeds"].(json.Array); ok && len(arr) == 3 {
++		ok_all := true
++		for i in 0..<3 {
++			if _, okn := arr[i].(json.Integer); !okn {
++				ok_all = false
++				break
++			}
++		}
++		if ok_all {
++			for i in 0..<3 {
++				p.lane_speeds[i] = i32(arr[i].(json.Integer))
++			}
++		} else {
++			p.lane_speeds = {1000, 850, 700}
++		}
++	} else {
++		p.lane_speeds = {1000, 850, 700}
++	}
+ 	return p
+ }
+ 
+@@ -112,6 +138,7 @@ fallback_palette :: proc() -> Palette {
+ 	p.lane_standard = {108, 122, 142, 255}
+ 	p.lane_best_effort = {88, 152, 108, 255}
+ 	p.sel_halo = {232, 181, 68, 90}
++	p.lane_speeds = {1000, 850, 700}
+ 	return p
+ }
+ 
+diff --git a/app/render/view.odin b/app/render/view.odin
+index 5cf7d1d..95f3df4 100644
+--- a/app/render/view.odin
++++ b/app/render/view.odin
+@@ -81,7 +81,7 @@ draw_world :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp
+ 	map_draw(v)
+ 	draw_bundles(v, topo, bundles, flow)
+ 	draw_nodes(v, topo)
+-	draw_packets(v, topo, flow)
++	draw_packets(v, topo, bundles, flow)
+ 	if drag.active && drag.placing < 0 {
+ 		draw_ghost(v, topo, drag)
+ 	}
+@@ -120,29 +120,79 @@ map_draw :: proc(v: ^View) {
+ 
+ // BUNDLE_EXTRA_WIDTH — how much wider a bundle grows per extra member pipe
+ // (the "fatter pooled link" read). A single-member bundle adds 0, so a lone
+-// pipe renders at exactly its tier width (slice-1 T2 goldens stay pixel-
+-// identical); each additional parallel pipe fattens the pooled edge.
++// pipe renders at exactly its tier width; each additional parallel pipe
++// fattens the pooled edge.
+ BUNDLE_EXTRA_WIDTH :: f32(2.5)
+ 
++// bundle_lane_caps_view — Σ member pipe lane_caps for a bundle slot (the
++// pooled link's lane allocation — the spatial-lane canon: stroke widths +
++// packet lateral offsets are proportional to these). Mirrors core's
++// bundle_lane_caps over the view's (topo, bundles, flow) tuple (the view has
++// no Run_State). Deterministic slot-order scan.
++bundle_lane_caps_view :: proc(topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State, bi: u32) -> (caps: [3]u32) {
++	for ps in 0..<len(topo.pipe_alive) {
++		if !topo.pipe_alive[ps] { continue }
++		if int(ps) >= len(bundles.pipe_bundle) { continue }
++		if bundles.pipe_bundle[ps] != bi { continue }
++		if int(ps) < len(flow.lane_caps) {
++			c := flow.lane_caps[ps]
++			caps[0] += c[0]
++			caps[1] += c[1]
++			caps[2] += c[2]
++		}
++	}
++	return
++}
++
++// Lane_Bands — the spatial-lane cross-section layout of one pipe/bundle: the
++// per-lane band WIDTHS (proportional to the lane caps — the WFQ share) and
++// the per-lane band CENTER offsets from the pipe centerline, in the pipe's
++// width units. Pure function of (caps, total_width) — deterministic, shared
++// by the stroke render + the packet lateral offsets (canon 2e3acab).
++Lane_Bands :: struct {
++	widths:  [3]f32,
++	centers: [3]f32, // offset from the centerline, in width units (-0.5..0.5)
++}
++
++lane_bands :: proc(caps: [3]u32, width: f32) -> Lane_Bands {
++	b: Lane_Bands
++	total := u64(caps[0]) + u64(caps[1]) + u64(caps[2])
++	if total == 0 || width <= 0 {
++		// degenerate (no allocation / zero width) — all bands collapsed
++		return b
++	}
++	cum: f32 = 0
++	for lane in 0..<3 {
++		share := f32(u64(caps[lane])) / f32(total)
++		b.widths[lane] = width * share
++		b.centers[lane] = (cum + share * 0.5) - 0.5
++		cum += share
++	}
++	return b
++}
++
+ // draw_bundles — Story 2.1: render ONE fat edge per parallel-pipe bundle (cap
+ // = sum). Parallel pipes between a pair pool into a single wider link whose
+ // render width grows with the member count (the pooled-capacity read); a
+ // multi-member bundle also carries a glowing pipe_fiber inner core so it reads
+ // as one unified link, not a stack of overlapping pipes. A single-member
+-// bundle renders at exactly its tier width with no extra core — byte-identical
+-// to the 1.2-1.4 per-pipe draw (so the slice-1 goldens are unchanged). The
+-// view reads ONLY the derived bundles + topology (ODN-1).
++// bundle renders at exactly its tier width. The view reads ONLY the derived
++// bundles + topology (ODN-1).
+ //
+-// Story 3.2 lane stripes: when a bundle's member pipes carry a NON-DEFAULT
+-// lane allocation (an emphasis edit), the pooled edge draws 3 lane bands
+-// (Express/Standard/Best-effort) whose widths are proportional to the member
+-// caps summed across the bundle (the pooled link carries the same 3 lanes —
+-// the bundle ruling). Default pipes draw ZERO stripes — byte-identical to the
+-// pre-QoS render, so the existing T2 goldens cannot shift. `flow` supplies the
+-// derived per-pipe lane caps (Flow_State.lane_caps, computed in flow_step).
++// 3.3 spatial-lane canon (user ruling 2026-08-12, commit 2e3acab): every
++// pipe paints THREE lane strokes (Express/Standard/Best-effort) running
++// ALONGSIDE each other — lateral bands across the pipe's width, each stroke's
++// width = the lane's WFQ allocation share (Σ member lane_caps); a zero-share
++// lane draws no stroke (a MISSING stripe — the neighboring bands abut, so the
++// base pipe / fiber core do not peek through on allocated pipes; the
++// zero-weight lane simply has no band). Supersedes 3.2's length-proportional
++// segments + the default-pipe-unchanged rule: strokes draw on EVERY pipe (a
++// balanced pipe = three equal strokes), so pipe-containing T2 goldens re-bless
++// by canon. The fiber core draws UNDER the strokes (hidden on allocated
++// pipes — the lane read always wins; visible only before the first flow_step,
++// when lane_caps are still empty).
+ draw_bundles :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State) {
+ 	p := v.palette
+-	def_w := v.catalogs.balance.lane_presets[v.catalogs.balance.default_preset_idx].weights
+ 	for bi in 0..<int(bundles.n) {
+ 		lo, hi := bundles.bundle_lo[bi], bundles.bundle_hi[bi]
+ 		sa, oka := pp.node_slot(topo, lo)
+@@ -156,66 +206,40 @@ draw_bundles :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^
+ 		count := bundles.bundle_count[bi]
+ 		col := tier_pipe_color(v, tier)
+ 		width := (tier_pipe_width(v, tier) + f32(count-1)*BUNDLE_EXTRA_WIDTH) * v.scale
++		// direction + perpendicular (the lateral axis the lanes stack along)
++		dx, dy := b.x - a.x, b.y - a.y
++		len_ := rl.Vector2Length({dx, dy})
++		if len_ <= 0 {
++			continue
++		}
++		ux, uy := dx / len_, dy / len_
++		nx, ny := -uy, ux // unit normal (one consistent side)
+ 		rl.DrawLineEx(a, b, width, col)
+ 		// rounded caps (a clean look + hides the square line ends)
+ 		rl.DrawCircleV(a, width * 0.5, col)
+ 		rl.DrawCircleV(b, width * 0.5, col)
+-		// 3.2 lane segments — ONLY when a member pipe's weights deviate from the
+-		// default preset. The lane caps are summed across the bundle's members
+-		// (slot-order scan of the pipe_bundle map — deterministic, ODN-10); the
+-		// pipe then draws as Express→Standard→Best segments whose LENGTHS are
+-		// proportional to the caps (the "who gets bandwidth" read — length gives
+-		// far better proportion resolution than cross-width bands at fit scale).
+-		// A zero-weight lane draws no segment (demoted to nothing). Default pipes
+-		// draw zero segments — byte-identical to the pre-QoS render, so the
+-		// existing T2 goldens cannot shift.
+-		caps_sum: [3]u32
+-		non_default := false
+-		for ps in 0..<len(topo.pipe_alive) {
+-			if !topo.pipe_alive[ps] { continue }
+-			if int(ps) >= len(bundles.pipe_bundle) { continue }
+-			if bundles.pipe_bundle[ps] != u32(bi) { continue }
+-			if topo.pipe_weights[ps] != def_w {
+-				non_default = true
+-			}
+-			if int(ps) < len(flow.lane_caps) {
+-				c := flow.lane_caps[ps]
+-				caps_sum[0] += c[0]
+-				caps_sum[1] += c[1]
+-				caps_sum[2] += c[2]
+-			}
+-		}
+-		total_caps := u64(caps_sum[0]) + u64(caps_sum[1]) + u64(caps_sum[2])
+-		if non_default && total_caps > 0 {
+-			lane_cols := [3]rl.Color{p.lane_express, p.lane_standard, p.lane_best_effort}
+-			// segment boundary positions along the pipe (pure float lerp)
+-			boundary: [3]f32
+-			acc: u64 = 0
+-			for lane in 0..<3 {
+-				acc += u64(caps_sum[lane])
+-				boundary[lane] = f32(acc) / f32(total_caps)
+-			}
+-			start := f32(0)
+-			for lane in 0..<3 {
+-				if caps_sum[lane] == 0 { continue }
+-				end := boundary[lane]
+-				pa := rl.Vector2{a.x + (b.x-a.x)*start, a.y + (b.y-a.y)*start}
+-				pb := rl.Vector2{a.x + (b.x-a.x)*end, a.y + (b.y-a.y)*end}
+-				rl.DrawLineEx(pa, pb, width, lane_cols[lane])
+-				rl.DrawCircleV(pa, width * 0.5, lane_cols[lane])
+-				rl.DrawCircleV(pb, width * 0.5, lane_cols[lane])
+-				start = end
+-			}
+-		}
+-		// the glowing inner core: on fiber (the modernization read, A4) OR on a
+-		// multi-member bundle (the pooled-link read — one fat edge, not a stack).
+-		// Drawn AFTER the lane segments so an emphasized wide-fiber bundle keeps
+-		// its core visible over the segment colors. For default pipes there are
+-		// no segments, so the draw order is byte-identical to the pre-QoS render.
++		// the glowing inner core (modernization / pooled-link read) — UNDER the
++		// lane strokes so the lane colors always read (canon 2e3acab)
+ 		is_fiber := v.catalogs.pipe_tiers[tier].id == "wide"
+ 		if is_fiber || count > 1 {
+ 			rl.DrawLineEx(a, b, width * 0.45, v.palette.pipe_fiber)
+ 		}
++		// 3.3 spatial lanes — three lateral strokes, width = the WFQ share
++		// (Σ member lane_caps). Always drawn (a balanced pipe = three equal
++		// strokes — "a plain router" reads as three equal lanes).
++		caps := bundle_lane_caps_view(topo, bundles, flow, u32(bi))
++		bands := lane_bands(caps, width)
++		lane_cols := [3]rl.Color{p.lane_express, p.lane_standard, p.lane_best_effort}
++		for lane in 0..<3 {
++			if bands.widths[lane] <= 0 {
++				continue
++			}
++			pa := rl.Vector2{a.x + nx*bands.centers[lane]*width, a.y + ny*bands.centers[lane]*width}
++			pb := rl.Vector2{b.x + nx*bands.centers[lane]*width, b.y + ny*bands.centers[lane]*width}
++			rl.DrawLineEx(pa, pb, bands.widths[lane], lane_cols[lane])
++			rl.DrawCircleV(pa, bands.widths[lane] * 0.5, lane_cols[lane])
++			rl.DrawCircleV(pb, bands.widths[lane] * 0.5, lane_cols[lane])
++		}
+ 	}
+ }
+ 
+@@ -299,7 +323,14 @@ draw_router :: proc(v: ^View, id: u32, c: rl.Vector2) {
+ // the node. Pure read of the flow snapshot + topology (ODN-1). The along-edge
+ // fraction IS the lerp the story spec calls for ("lerped positions between
+ // snapshots" — between the pipe's two endpoint nodes).
+-draw_packets :: proc(v: ^View, topo: ^pp.Topology, flow: ^pp.Flow_State) {
++//
++// 3.3 spatial-lane canon (user rulings 2026-08-12): every on-edge packet
++// rides IN its lane — laterally offset into its lane's band (the bundle's
++// stroke layout) — and moves AT LANE SPEED (the palette's per-mille lane
++// speed scales the along-edge fraction: Express streaks, Standard cruises,
++// Best-effort crawls). Queued packets (on-edge, progress 0) therefore pile at
++// the departure node in lane order — the serialization visual.
++draw_packets :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, flow: ^pp.Flow_State) {
+ 	bandwidth := u32(v.catalogs.balance.packet_bandwidth)
+ 	for i in 0..<len(flow.packets) {
+ 		p := &flow.packets[i]
+@@ -330,10 +361,47 @@ draw_packets :: proc(v: ^View, topo: ^pp.Topology, flow: ^pp.Flow_State) {
+ 			}
+ 			depart := node_screen(v, topo.node_pos[ds])
+ 			arrive := node_screen(v, topo.node_pos[as_])
++			dx, dy := arrive.x - depart.x, arrive.y - depart.y
++			// 3.3: the packet's lane (its own representative pipe) + the lane
++			// speed readout (palette per-mille) + the lateral band offset.
++			lane := pp.qos_lane_of(topo, v.catalogs, p.edge, p.class)
+ 			frac := f32(pp.packet_progress_frac(p, bandwidth)) / 256.0
+-			pos = {
+-				depart.x + (arrive.x - depart.x) * frac,
+-				depart.y + (arrive.y - depart.y) * frac,
++			if int(lane) < 3 {
++				ppm := v.palette.lane_speeds[lane]
++				if ppm > 0 {
++					frac = min(1.0, frac * f32(ppm) / 1000.0)
++				} else {
++					frac = 0
++				}
++			}
++			pos = {depart.x + dx * frac, depart.y + dy * frac}
++			if int(ps) < len(bundles.pipe_bundle) && bundles.pipe_bundle[ps] != pp.NO_BUNDLE {
++				bnd := bundles.pipe_bundle[ps]
++				caps := bundle_lane_caps_view(topo, bundles, flow, bnd)
++				// The lateral axis + width MUST match draw_bundles: the bundle's
++				// CANONICAL lo->hi direction and its max-member tier (review F1/F4:
++				// the packet's own depart->arrive direction mirrors the normal on
++				// the hi->lo traversal and would render the packet in the WRONG
++				// band; the packet's own pipe tier mis-centers mixed-tier bundles).
++				lo_id := bundles.bundle_lo[bnd]
++				hi_id := bundles.bundle_hi[bnd]
++				los, lok := pp.node_slot(topo, lo_id)
++				his, hok := pp.node_slot(topo, hi_id)
++				tier := bundles.bundle_tier[bnd]
++				count := bundles.bundle_count[bnd]
++				width := (tier_pipe_width(v, tier) + f32(count-1)*BUNDLE_EXTRA_WIDTH) * v.scale
++				if lok && hok && width > 0 {
++					bx := node_screen(v, topo.node_pos[his]).x - node_screen(v, topo.node_pos[los]).x
++					by := node_screen(v, topo.node_pos[his]).y - node_screen(v, topo.node_pos[los]).y
++					blen := rl.Vector2Length({bx, by})
++					if blen > 0 {
++						bands := lane_bands(caps, width)
++						if int(lane) < 3 {
++							pos.x += (-by / blen) * bands.centers[lane] * width
++							pos.y += (bx / blen) * bands.centers[lane] * width
++						}
++					}
++				}
+ 			}
+ 		} else {
+ 			ns, ok := pp.node_slot(topo, p.at_node)
+diff --git a/demos/qos_contention.dem b/demos/qos_contention.dem
+new file mode 100644
+index 0000000..2ed252f
+--- /dev/null
++++ b/demos/qos_contention.dem
+@@ -0,0 +1,481 @@
++# qos_contention.dem — Story 3.3's launchable: the serialization visual + the
++# contention drop ladder (E7/E9). Pipe 0 (res 0 -> router 1) is oversubscribed
++# ~2.4x with two classes the PLAYER categorized (canon 2026-08-12 — nothing
++# auto-assigns): email -> Best-effort, streaming -> Express. A ~25ms burst
++# alternating both ways (0->2 email, 2->0 streaming) saturates pipe 0:
++# best-effort drops first (the E9 ladder), the queue exits by lane, packets
++# ride their painted lane end-to-end at lane speed. Pipes 3-1/4-1 stay
++# uncategorized plain routers (all Standard) — the no-auto contrast.
++seed 4242
++run 12000ms
++fixture qos
++expect hash stable
++at 100ms draw 0 1 standard
++at 100ms draw 1 2 standard
++at 100ms draw 3 1 standard
++at 100ms draw 4 1 standard
++at 100ms lane 0 email best_effort
++at 100ms lane 0 streaming express
++capture at 1000ms
++capture at 3000ms
++capture at 10000ms
++at 500ms spawn 0 2 email
++at 525ms spawn 2 0 streaming
++at 550ms spawn 0 2 email
++at 575ms spawn 2 0 streaming
++at 600ms spawn 0 2 email
++at 625ms spawn 2 0 streaming
++at 650ms spawn 0 2 email
++at 675ms spawn 2 0 streaming
++at 700ms spawn 0 2 email
++at 725ms spawn 2 0 streaming
++at 750ms spawn 0 2 email
++at 775ms spawn 2 0 streaming
++at 800ms spawn 0 2 email
++at 825ms spawn 2 0 streaming
++at 850ms spawn 0 2 email
++at 875ms spawn 2 0 streaming
++at 900ms spawn 0 2 email
++at 925ms spawn 2 0 streaming
++at 950ms spawn 0 2 email
++at 975ms spawn 2 0 streaming
++at 1000ms spawn 0 2 email
++at 1025ms spawn 2 0 streaming
++at 1050ms spawn 0 2 email
++at 1075ms spawn 2 0 streaming
++at 1100ms spawn 0 2 email
++at 1125ms spawn 2 0 streaming
++at 1150ms spawn 0 2 email
++at 1175ms spawn 2 0 streaming
++at 1200ms spawn 0 2 email
++at 1225ms spawn 2 0 streaming
++at 1250ms spawn 0 2 email
++at 1275ms spawn 2 0 streaming
++at 1300ms spawn 0 2 email
++at 1325ms spawn 2 0 streaming
++at 1350ms spawn 0 2 email
++at 1375ms spawn 2 0 streaming
++at 1400ms spawn 0 2 email
++at 1425ms spawn 2 0 streaming
++at 1450ms spawn 0 2 email
++at 1475ms spawn 2 0 streaming
++at 1500ms spawn 0 2 email
++at 1525ms spawn 2 0 streaming
++at 1550ms spawn 0 2 email
++at 1575ms spawn 2 0 streaming
++at 1600ms spawn 0 2 email
++at 1625ms spawn 2 0 streaming
++at 1650ms spawn 0 2 email
++at 1675ms spawn 2 0 streaming
++at 1700ms spawn 0 2 email
++at 1725ms spawn 2 0 streaming
++at 1750ms spawn 0 2 email
++at 1775ms spawn 2 0 streaming
++at 1800ms spawn 0 2 email
++at 1825ms spawn 2 0 streaming
++at 1850ms spawn 0 2 email
++at 1875ms spawn 2 0 streaming
++at 1900ms spawn 0 2 email
++at 1925ms spawn 2 0 streaming
++at 1950ms spawn 0 2 email
++at 1975ms spawn 2 0 streaming
++at 2000ms spawn 0 2 email
++at 2025ms spawn 2 0 streaming
++at 2050ms spawn 0 2 email
++at 2075ms spawn 2 0 streaming
++at 2100ms spawn 0 2 email
++at 2125ms spawn 2 0 streaming
++at 2150ms spawn 0 2 email
++at 2175ms spawn 2 0 streaming
++at 2200ms spawn 0 2 email
++at 2225ms spawn 2 0 streaming
++at 2250ms spawn 0 2 email
++at 2275ms spawn 2 0 streaming
++at 2300ms spawn 0 2 email
++at 2325ms spawn 2 0 streaming
++at 2350ms spawn 0 2 email
++at 2375ms spawn 2 0 streaming
++at 2400ms spawn 0 2 email
++at 2425ms spawn 2 0 streaming
++at 2450ms spawn 0 2 email
++at 2475ms spawn 2 0 streaming
++at 2500ms spawn 0 2 email
++at 2525ms spawn 2 0 streaming
++at 2550ms spawn 0 2 email
++at 2575ms spawn 2 0 streaming
++at 2600ms spawn 0 2 email
++at 2625ms spawn 2 0 streaming
++at 2650ms spawn 0 2 email
++at 2675ms spawn 2 0 streaming
++at 2700ms spawn 0 2 email
++at 2725ms spawn 2 0 streaming
++at 2750ms spawn 0 2 email
++at 2775ms spawn 2 0 streaming
++at 2800ms spawn 0 2 email
++at 2825ms spawn 2 0 streaming
++at 2850ms spawn 0 2 email
++at 2875ms spawn 2 0 streaming
++at 2900ms spawn 0 2 email
++at 2925ms spawn 2 0 streaming
++at 2950ms spawn 0 2 email
++at 2975ms spawn 2 0 streaming
++at 3000ms spawn 0 2 email
++at 3025ms spawn 2 0 streaming
++at 3050ms spawn 0 2 email
++at 3075ms spawn 2 0 streaming
++at 3100ms spawn 0 2 email
++at 3125ms spawn 2 0 streaming
++at 3150ms spawn 0 2 email
++at 3175ms spawn 2 0 streaming
++at 3200ms spawn 0 2 email
++at 3225ms spawn 2 0 streaming
++at 3250ms spawn 0 2 email
++at 3275ms spawn 2 0 streaming
++at 3300ms spawn 0 2 email
++at 3325ms spawn 2 0 streaming
++at 3350ms spawn 0 2 email
++at 3375ms spawn 2 0 streaming
++at 3400ms spawn 0 2 email
++at 3425ms spawn 2 0 streaming
++at 3450ms spawn 0 2 email
++at 3475ms spawn 2 0 streaming
++at 3500ms spawn 0 2 email
++at 3525ms spawn 2 0 streaming
++at 3550ms spawn 0 2 email
++at 3575ms spawn 2 0 streaming
++at 3600ms spawn 0 2 email
++at 3625ms spawn 2 0 streaming
++at 3650ms spawn 0 2 email
++at 3675ms spawn 2 0 streaming
++at 3700ms spawn 0 2 email
++at 3725ms spawn 2 0 streaming
++at 3750ms spawn 0 2 email
++at 3775ms spawn 2 0 streaming
++at 3800ms spawn 0 2 email
++at 3825ms spawn 2 0 streaming
++at 3850ms spawn 0 2 email
++at 3875ms spawn 2 0 streaming
++at 3900ms spawn 0 2 email
++at 3925ms spawn 2 0 streaming
++at 3950ms spawn 0 2 email
++at 3975ms spawn 2 0 streaming
++at 4000ms spawn 0 2 email
++at 4025ms spawn 2 0 streaming
++at 4050ms spawn 0 2 email
++at 4075ms spawn 2 0 streaming
++at 4100ms spawn 0 2 email
++at 4125ms spawn 2 0 streaming
++at 4150ms spawn 0 2 email
++at 4175ms spawn 2 0 streaming
++at 4200ms spawn 0 2 email
++at 4225ms spawn 2 0 streaming
++at 4250ms spawn 0 2 email
++at 4275ms spawn 2 0 streaming
++at 4300ms spawn 0 2 email
++at 4325ms spawn 2 0 streaming
++at 4350ms spawn 0 2 email
++at 4375ms spawn 2 0 streaming
++at 4400ms spawn 0 2 email
++at 4425ms spawn 2 0 streaming
++at 4450ms spawn 0 2 email
++at 4475ms spawn 2 0 streaming
++at 4500ms spawn 0 2 email
++at 4525ms spawn 2 0 streaming
++at 4550ms spawn 0 2 email
++at 4575ms spawn 2 0 streaming
++at 4600ms spawn 0 2 email
++at 4625ms spawn 2 0 streaming
++at 4650ms spawn 0 2 email
++at 4675ms spawn 2 0 streaming
++at 4700ms spawn 0 2 email
++at 4725ms spawn 2 0 streaming
++at 4750ms spawn 0 2 email
++at 4775ms spawn 2 0 streaming
++at 4800ms spawn 0 2 email
++at 4825ms spawn 2 0 streaming
++at 4850ms spawn 0 2 email
++at 4875ms spawn 2 0 streaming
++at 4900ms spawn 0 2 email
++at 4925ms spawn 2 0 streaming
++at 4950ms spawn 0 2 email
++at 4975ms spawn 2 0 streaming
++at 5000ms spawn 0 2 email
++at 5025ms spawn 2 0 streaming
++at 5050ms spawn 0 2 email
++at 5075ms spawn 2 0 streaming
++at 5100ms spawn 0 2 email
++at 5125ms spawn 2 0 streaming
++at 5150ms spawn 0 2 email
++at 5175ms spawn 2 0 streaming
++at 5200ms spawn 0 2 email
++at 5225ms spawn 2 0 streaming
++at 5250ms spawn 0 2 email
++at 5275ms spawn 2 0 streaming
++at 5300ms spawn 0 2 email
++at 5325ms spawn 2 0 streaming
++at 5350ms spawn 0 2 email
++at 5375ms spawn 2 0 streaming
++at 5400ms spawn 0 2 email
++at 5425ms spawn 2 0 streaming
++at 5450ms spawn 0 2 email
++at 5475ms spawn 2 0 streaming
++at 5500ms spawn 0 2 email
++at 5525ms spawn 2 0 streaming
++at 5550ms spawn 0 2 email
++at 5575ms spawn 2 0 streaming
++at 5600ms spawn 0 2 email
++at 5625ms spawn 2 0 streaming
++at 5650ms spawn 0 2 email
++at 5675ms spawn 2 0 streaming
++at 5700ms spawn 0 2 email
++at 5725ms spawn 2 0 streaming
++at 5750ms spawn 0 2 email
++at 5775ms spawn 2 0 streaming
++at 5800ms spawn 0 2 email
++at 5825ms spawn 2 0 streaming
++at 5850ms spawn 0 2 email
++at 5875ms spawn 2 0 streaming
++at 5900ms spawn 0 2 email
++at 5925ms spawn 2 0 streaming
++at 5950ms spawn 0 2 email
++at 5975ms spawn 2 0 streaming
++at 6000ms spawn 0 2 email
++at 6025ms spawn 2 0 streaming
++at 6050ms spawn 0 2 email
++at 6075ms spawn 2 0 streaming
++at 6100ms spawn 0 2 email
++at 6125ms spawn 2 0 streaming
++at 6150ms spawn 0 2 email
++at 6175ms spawn 2 0 streaming
++at 6200ms spawn 0 2 email
++at 6225ms spawn 2 0 streaming
++at 6250ms spawn 0 2 email
++at 6275ms spawn 2 0 streaming
++at 6300ms spawn 0 2 email
++at 6325ms spawn 2 0 streaming
++at 6350ms spawn 0 2 email
++at 6375ms spawn 2 0 streaming
++at 6400ms spawn 0 2 email
++at 6425ms spawn 2 0 streaming
++at 6450ms spawn 0 2 email
++at 6475ms spawn 2 0 streaming
++at 6500ms spawn 0 2 email
++at 6525ms spawn 2 0 streaming
++at 6550ms spawn 0 2 email
++at 6575ms spawn 2 0 streaming
++at 6600ms spawn 0 2 email
++at 6625ms spawn 2 0 streaming
++at 6650ms spawn 0 2 email
++at 6675ms spawn 2 0 streaming
++at 6700ms spawn 0 2 email
++at 6725ms spawn 2 0 streaming
++at 6750ms spawn 0 2 email
++at 6775ms spawn 2 0 streaming
++at 6800ms spawn 0 2 email
++at 6825ms spawn 2 0 streaming
++at 6850ms spawn 0 2 email
++at 6875ms spawn 2 0 streaming
++at 6900ms spawn 0 2 email
++at 6925ms spawn 2 0 streaming
++at 6950ms spawn 0 2 email
++at 6975ms spawn 2 0 streaming
++at 7000ms spawn 0 2 email
++at 7025ms spawn 2 0 streaming
++at 7050ms spawn 0 2 email
++at 7075ms spawn 2 0 streaming
++at 7100ms spawn 0 2 email
++at 7125ms spawn 2 0 streaming
++at 7150ms spawn 0 2 email
++at 7175ms spawn 2 0 streaming
++at 7200ms spawn 0 2 email
++at 7225ms spawn 2 0 streaming
++at 7250ms spawn 0 2 email
++at 7275ms spawn 2 0 streaming
++at 7300ms spawn 0 2 email
++at 7325ms spawn 2 0 streaming
++at 7350ms spawn 0 2 email
++at 7375ms spawn 2 0 streaming
++at 7400ms spawn 0 2 email
++at 7425ms spawn 2 0 streaming
++at 7450ms spawn 0 2 email
++at 7475ms spawn 2 0 streaming
++at 7500ms spawn 0 2 email
++at 7525ms spawn 2 0 streaming
++at 7550ms spawn 0 2 email
++at 7575ms spawn 2 0 streaming
++at 7600ms spawn 0 2 email
++at 7625ms spawn 2 0 streaming
++at 7650ms spawn 0 2 email
++at 7675ms spawn 2 0 streaming
++at 7700ms spawn 0 2 email
++at 7725ms spawn 2 0 streaming
++at 7750ms spawn 0 2 email
++at 7775ms spawn 2 0 streaming
++at 7800ms spawn 0 2 email
++at 7825ms spawn 2 0 streaming
++at 7850ms spawn 0 2 email
++at 7875ms spawn 2 0 streaming
++at 7900ms spawn 0 2 email
++at 7925ms spawn 2 0 streaming
++at 7950ms spawn 0 2 email
++at 7975ms spawn 2 0 streaming
++at 8000ms spawn 0 2 email
++at 8025ms spawn 2 0 streaming
++at 8050ms spawn 0 2 email
++at 8075ms spawn 2 0 streaming
++at 8100ms spawn 0 2 email
++at 8125ms spawn 2 0 streaming
++at 8150ms spawn 0 2 email
++at 8175ms spawn 2 0 streaming
++at 8200ms spawn 0 2 email
++at 8225ms spawn 2 0 streaming
++at 8250ms spawn 0 2 email
++at 8275ms spawn 2 0 streaming
++at 8300ms spawn 0 2 email
++at 8325ms spawn 2 0 streaming
++at 8350ms spawn 0 2 email
++at 8375ms spawn 2 0 streaming
++at 8400ms spawn 0 2 email
++at 8425ms spawn 2 0 streaming
++at 8450ms spawn 0 2 email
++at 8475ms spawn 2 0 streaming
++at 8500ms spawn 0 2 email
++at 8525ms spawn 2 0 streaming
++at 8550ms spawn 0 2 email
++at 8575ms spawn 2 0 streaming
++at 8600ms spawn 0 2 email
++at 8625ms spawn 2 0 streaming
++at 8650ms spawn 0 2 email
++at 8675ms spawn 2 0 streaming
++at 8700ms spawn 0 2 email
++at 8725ms spawn 2 0 streaming
++at 8750ms spawn 0 2 email
++at 8775ms spawn 2 0 streaming
++at 8800ms spawn 0 2 email
++at 8825ms spawn 2 0 streaming
++at 8850ms spawn 0 2 email
++at 8875ms spawn 2 0 streaming
++at 8900ms spawn 0 2 email
++at 8925ms spawn 2 0 streaming
++at 8950ms spawn 0 2 email
++at 8975ms spawn 2 0 streaming
++at 9000ms spawn 0 2 email
++at 9025ms spawn 2 0 streaming
++at 9050ms spawn 0 2 email
++at 9075ms spawn 2 0 streaming
++at 9100ms spawn 0 2 email
++at 9125ms spawn 2 0 streaming
++at 9150ms spawn 0 2 email
++at 9175ms spawn 2 0 streaming
++at 9200ms spawn 0 2 email
++at 9225ms spawn 2 0 streaming
++at 9250ms spawn 0 2 email
++at 9275ms spawn 2 0 streaming
++at 9300ms spawn 0 2 email
++at 9325ms spawn 2 0 streaming
++at 9350ms spawn 0 2 email
++at 9375ms spawn 2 0 streaming
++at 9400ms spawn 0 2 email
++at 9425ms spawn 2 0 streaming
++at 9450ms spawn 0 2 email
++at 9475ms spawn 2 0 streaming
++at 9500ms spawn 0 2 email
++at 9525ms spawn 2 0 streaming
++at 9550ms spawn 0 2 email
++at 9575ms spawn 2 0 streaming
++at 9600ms spawn 0 2 email
++at 9625ms spawn 2 0 streaming
++at 9650ms spawn 0 2 email
++at 9675ms spawn 2 0 streaming
++at 9700ms spawn 0 2 email
++at 9725ms spawn 2 0 streaming
++at 9750ms spawn 0 2 email
++at 9775ms spawn 2 0 streaming
++at 9800ms spawn 0 2 email
++at 9825ms spawn 2 0 streaming
++at 9850ms spawn 0 2 email
++at 9875ms spawn 2 0 streaming
++at 9900ms spawn 0 2 email
++at 9925ms spawn 2 0 streaming
++at 9950ms spawn 0 2 email
++at 9975ms spawn 2 0 streaming
++at 10000ms spawn 0 2 email
++at 10025ms spawn 2 0 streaming
++at 10050ms spawn 0 2 email
++at 10075ms spawn 2 0 streaming
++at 10100ms spawn 0 2 email
++at 10125ms spawn 2 0 streaming
++at 10150ms spawn 0 2 email
++at 10175ms spawn 2 0 streaming
++at 10200ms spawn 0 2 email
++at 10225ms spawn 2 0 streaming
++at 10250ms spawn 0 2 email
++at 10275ms spawn 2 0 streaming
++at 10300ms spawn 0 2 email
++at 10325ms spawn 2 0 streaming
++at 10350ms spawn 0 2 email
++at 10375ms spawn 2 0 streaming
++at 10400ms spawn 0 2 email
++at 10425ms spawn 2 0 streaming
++at 10450ms spawn 0 2 email
++at 10475ms spawn 2 0 streaming
++at 10500ms spawn 0 2 email
++at 10525ms spawn 2 0 streaming
++at 10550ms spawn 0 2 email
++at 10575ms spawn 2 0 streaming
++at 10600ms spawn 0 2 email
++at 10625ms spawn 2 0 streaming
++at 10650ms spawn 0 2 email
++at 10675ms spawn 2 0 streaming
++at 10700ms spawn 0 2 email
++at 10725ms spawn 2 0 streaming
++at 10750ms spawn 0 2 email
++at 10775ms spawn 2 0 streaming
++at 10800ms spawn 0 2 email
++at 10825ms spawn 2 0 streaming
++at 10850ms spawn 0 2 email
++at 10875ms spawn 2 0 streaming
++at 10900ms spawn 0 2 email
++at 10925ms spawn 2 0 streaming
++at 10950ms spawn 0 2 email
++at 10975ms spawn 2 0 streaming
++at 11000ms spawn 0 2 email
++at 11025ms spawn 2 0 streaming
++at 11050ms spawn 0 2 email
++at 11075ms spawn 2 0 streaming
++at 11100ms spawn 0 2 email
++at 11125ms spawn 2 0 streaming
++at 11150ms spawn 0 2 email
++at 11175ms spawn 2 0 streaming
++at 11200ms spawn 0 2 email
++at 11225ms spawn 2 0 streaming
++at 11250ms spawn 0 2 email
++at 11275ms spawn 2 0 streaming
++at 11300ms spawn 0 2 email
++at 11325ms spawn 2 0 streaming
++at 11350ms spawn 0 2 email
++at 11375ms spawn 2 0 streaming
++at 11400ms spawn 0 2 email
++at 11425ms spawn 2 0 streaming
++at 11450ms spawn 0 2 email
++at 11475ms spawn 2 0 streaming
++at 11500ms spawn 0 2 email
++at 11525ms spawn 2 0 streaming
++at 11550ms spawn 0 2 email
++at 11575ms spawn 2 0 streaming
++at 11600ms spawn 0 2 email
++at 11625ms spawn 2 0 streaming
++at 11650ms spawn 0 2 email
++at 11675ms spawn 2 0 streaming
++at 11700ms spawn 0 2 email
++at 11725ms spawn 2 0 streaming
++at 11750ms spawn 0 2 email
++at 11775ms spawn 2 0 streaming
++at 11800ms spawn 0 2 email
++at 11825ms spawn 2 0 streaming
++at 11850ms spawn 0 2 email
++at 11875ms spawn 2 0 streaming
++at 11900ms spawn 0 2 email
++at 11925ms spawn 2 0 streaming
++at 11950ms spawn 0 2 email
++at 11975ms spawn 2 0 streaming
+diff --git a/harness/demo.odin b/harness/demo.odin
+index 9e0aa5e..070fb21 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -26,10 +26,14 @@ Draw_Intent :: struct {
+ // Spawn_Intent — a trivial 1.3 flow demand entry: spawn one packet `src -> dst`
+ // at `at_ms`. Lowered into Flow_State.demand (run setup — NOT the action log,
+ // like the fixture). The pressure-plan director (weighted picks) lands in slice 3.
++// 3.3: `class` is optional (default email) — the contention demo categorizes
++// traffic per class onto lanes (the player's lever); run setup rides both the
++// live + replay paths, so it stays replay-determinate.
+ Spawn_Intent :: struct {
+ 	at_ms: i64,
+ 	src:   u32, // fixture node id
+ 	dst:   u32, // fixture node id
++	class: string, // packet_types id; empty = email (back-compat)
+ }
+ 
+ // Demolish_Kind — which entity a Demolish_Intent tombstones (a pipe or a
+@@ -249,15 +253,25 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 				}
+ 				append(&d.draws, Draw_Intent{at_ms = ms, a = u32(fa), b = u32(fb), tier = fields[5]})
+ 			case "spawn":
++				// at <n>ms spawn <from> <to> [class] — the class is 3.3-optional
++				// (defaults to email; back-compat with every pre-3.3 demo).
+ 				if len(fields) < 5 {
+-					return {}, fmt.tprintf("bad spawn at-line (want: at <n>ms spawn <from> <to>): %s", line)
++					return {}, fmt.tprintf("bad spawn at-line (want: at <n>ms spawn <from> <to> [class]): %s", line)
+ 				}
+ 				fa, oka := strconv.parse_uint(fields[3], 10)
+ 				fb, okb := strconv.parse_uint(fields[4], 10)
+ 				if !oka || !okb {
+ 					return {}, fmt.tprintf("bad spawn endpoints: %s", line)
+ 				}
+-				append(&d.spawns, Spawn_Intent{at_ms = ms, src = u32(fa), dst = u32(fb)})
++				cls := ""
++				if len(fields) >= 6 {
++					// CLONED — the class string outlives the temp-allocated demo
++					// text (the same lifetime rule as spawn_node/place type
++					// names: the per-tick free_all would turn it into garbage;
++					// the replay gate re-parses the demo and hits it).
++					cls = strings.clone(fields[5])
++				}
++				append(&d.spawns, Spawn_Intent{at_ms = ms, src = u32(fa), dst = u32(fb), class = cls})
+ 			case "demolish":
+ 				// at <n>ms demolish pipe <id>  |  at <n>ms demolish node <id>
+ 				if len(fields) < 5 {
+diff --git a/harness/run.odin b/harness/run.odin
+index d2b30eb..35be49d 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -150,6 +150,9 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ 		for p in demo.places {
+ 			delete(p.type_name) // cloned at parse, same lifetime rule
+ 		}
++		for s in demo.spawns {
++			delete(s.class) // 3.3: cloned at parse, same lifetime rule
++		}
+ 		delete(demo.nodes)
+ 		delete(demo.draws)
+ 		delete(demo.spawns)
+@@ -267,12 +270,26 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx) -
+ // lower_spawns — seed a run's flow demand from a demo's spawn intents (run
+ // setup — NOT the action log; re-created identically on every replay, like the
+ // fixture). Shared by run_demo (live) + replay_hashes (replay) so the flow is
+-// replay-determinate: the demand is identical in both paths.
+-lower_spawns :: proc(state: ^pp.Run_State, spawns: []Spawn_Intent, hz: i32) {
++// replay-determinate: the demand is identical in both paths. The optional
++// class (3.3) resolves against the catalog; an unknown class is a demo-
++// authoring error (review F5: fail LOUD like an unknown tier — the error
++// propagates through demo_apply_setup, never a silent truncation of the
++// demand list).
++lower_spawns :: proc(state: ^pp.Run_State, spawns: []Spawn_Intent, hz: i32, cat: ^pp.Catalogs) -> string {
++	email_idx, _ := pp.class_index(cat, "email")
+ 	for s in spawns {
+ 		tick := u64(max(0, i64(s.at_ms) * i64(hz) / 1000))
+-		pp.flow_seed_demand(&state.flow, tick, s.src, s.dst)
++		cls := u16(email_idx)
++		if s.class != "" {
++			ci, okc := pp.class_index(cat, s.class)
++			if !okc {
++				return fmt.tprintf("unknown spawn class %q", s.class)
++			}
++			cls = u16(ci)
++		}
++		pp.flow_seed_demand(&state.flow, tick, s.src, s.dst, cls)
+ 	}
++	return ""
+ }
+ 
+ // Session_Cfg — a demo's win/lose run setup (1.4): the deliver-N goal + the
+@@ -324,7 +341,9 @@ demo_apply_setup :: proc(state: ^pp.Run_State, cfg: ^Demo_Replay, cat: ^pp.Catal
+ 	if e := lower_nodes(state, cfg.name, cfg.nodes[:], cat); e != "" {
+ 		return e
+ 	}
+-	lower_spawns(state, cfg.spawns[:], cat.balance.logic_hz)
++	if e := lower_spawns(state, cfg.spawns[:], cat.balance.logic_hz, cat); e != "" {
++		return e
++	}
+ 	apply_session(state, cfg.session, cat.balance.logic_hz)
+ 	return ""
+ }
+@@ -338,6 +357,10 @@ demo_replay_destroy :: proc(cfg: ^Demo_Replay) {
+ 	for n in cfg.nodes {
+ 		delete(n.type_name)
+ 	}
++	for s in cfg.spawns {
++		delete(s.class) // 3.3: parse-time clones (the demo struct's own copies
++		// are never freed by the replay loader — cfg owns them here)
++	}
+ 	delete(cfg.nodes)
+ 	delete(cfg.spawns)
+ }
+

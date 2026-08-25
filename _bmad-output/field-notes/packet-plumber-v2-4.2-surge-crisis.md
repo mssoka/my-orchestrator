@@ -1,0 +1,5 @@
+# field notes — packet-plumber-v2-4.2-surge-crisis
+
+- The E9 lane queue at admission is the flow's ONLY saturation evidence — the SETTLED queue oscillates ±1-2 around the bound on the service/completion phase, so an engine that scans eval-time state alone chatters or misses saturation; make the drop event carry its shed bundle (admission-time truth) + add resolve hysteresis (bound−margin + no-drop + no-bound-lane) or the trigger/resolve pair fires every few ticks on any marginal network.
+- The basic router's 4-port cap is a fixture-design constraint, not a detail: a "fix" that adds pipes to a full router silently rejects (Router_Ports_Full → replay_error latched) — swap (demolish-then-draw) or size the healthy fixture to 2 pipes/side; a single path can never carry the 20/tick surge (6-pack lane bound) — "within capacity" REQUIRES multi-route ECMP or lane-splitting.
+- Build the harness ONLY via tools/harness.sh (ODN_ROOT=the rlsw shadow) — a bare `odin build harness` links the stock GPU raylib and produces R/B-swapped golden frames (921600/921600 pixel diffs) that look like a render bug.

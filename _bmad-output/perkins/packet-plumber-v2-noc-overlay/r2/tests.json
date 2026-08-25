@@ -1,0 +1,72 @@
+[
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "E2E D-toggle proof is manual-only: no automated assertion that ON/OFF captures differ, CI never executes the drive",
+    "location": "app/main.odin:614-623",
+    "evidence": "app/main.odin:614-623:\n\t\twhen #config(PP_DEBUG, false) {\n\t\t\tif app.noc_e2e {\n\t\t\t\tswitch app.noc_e2e_frame {\n\t\t\t\tcase NOC_E2E_CAPTURE_ON:\n\t\t\t\t\trl.TakeScreenshot(\"bin/noc-e2e-on.png\")\n\t\t\t\tcase NOC_E2E_CAPTURE_OFF:\n\t\t\t\t\trl.TakeScreenshot(\"bin/noc-e2e-off.png\")\n\t\t\t\t}\n\t\t\t\tif app.noc_e2e_frame >= NOC_E2E_EXIT {\n\t\t\t\t\tbreak\ntools/run-dev.sh:38:  PP_NOC_E2E=1 ./bin/app-dev\ntools/ci-local.sh gate 8: \"PP_DEBUG overlay builds (compile gate)|odin build app -define:PP_DEBUG=true -out:app-debug.bin && odin build harness -define:PP_DEBUG=true -out:bin/harness-debug\"",
+    "detail": "The PR's headline behavior (D toggles the panel in a real run) is verified only by human-inspected PNGs. The unit test pins intent-to-effect, but nothing machine-checks the rendered result; CI gate 8 compiles the e2e code without running it.",
+    "recommended_fix": "Add an automated post-run assertion: pixel-compare bin/noc-e2e-on.png vs -off.png (panel rect must differ, rest identical), wired into a gate or run-dev.sh --e2e itself."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "AC3 stream-neutrality proof (sidecar vs goldens/<demo>.t1) has no automated gate — the diff is human-run only",
+    "location": "harness/overlay.odin:143-146",
+    "evidence": "harness/overlay.odin:143-146:\n\t// v2-noc AC3: the per-tick T1 stream sidecar — `diff` against\n\t// goldens/<demo>.t1 proves the overlay is stream-neutral (hash-equal with\n\t// the overlay ON vs the blessed OFF stream).\n\tt1_out := fmt.aprintf(\"bin/overlay-%s-%dms.t1\", demo, cap_ms)\n\twrite_manifest_at(t1_out, demo, &d, cat.hash, hz, hashes[:])",
+    "detail": "The acceptance's byte-identity check is a manual `diff` command; no CI gate invokes overlay-check. Project testing rule: acceptance criteria become durable tests, not PR prose. Purity unit tests cover the mechanism, not the emitted stream.",
+    "recommended_fix": "Add a harness.sh verb/gate: run bin/harness-debug overlay-check <demo> <ms>, then diff tail -n +7 of sidecar vs goldens/<demo>.t1, failing on mismatch."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "noc_log_line bundle/pipe/lane resolution (map-wide, gone, lane lookup) has zero test coverage — compile-gated out of gate-2 tests",
+    "location": "app/render/noc_overlay.odin:807-831",
+    "evidence": "app/render/noc_overlay.odin:807-808:\n\tif e.bundle == pp.NO_BUNDLE || int(e.bundle) >= len(bundles.bundle_lo) {\n\t\treturn fmt.tprintf(\"t%-6d %-5s %2s map-wide\", e.tick, cls, reason)\nnoc_overlay.odin:825-827:\n\tif !found {\n\t\tpipe = \"gone\"\n\t}\nnoc_overlay.odin:300/905: when #config(PP_DEBUG, false) { ... } encloses noc_log_line (800)",
+    "detail": "The spec's edge-case matrix rows (stale slot renders \"gone\"; E22 rows show \"map-wide\") are real lookup logic with no durable test; gate 2 runs `odin test app/render` without PP_DEBUG, compiling this code out.",
+    "recommended_fix": "Hoist noc_log_line above the PP_DEBUG gate (it is pure — no raylib calls) and add a @(test) pinning map-wide, gone, and lane-letter rows against a small topology/bundles fixture."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "boundary",
+    "title": "App-side rejection dedup latch is untested; same-tick same-kind double rejections undercount",
+    "location": "app/main.odin:492-493",
+    "evidence": "app/main.odin:492-493:\n\t\t\t\tif app.input.last_reject != .None && (app.input.reject_tick != app.noc_reject_tick || app.input.last_reject != app.noc_reject_kind) {\n\t\t\t\t\trnd.noc_feed_reject(&app.noc_feed, app.input.last_reject)",
+    "detail": "Only the feed-level noc_feed_reject is unit-tested. The latch condition treats (same tick, same kind) as not-new, so two distinct rejections of one kind in one tick count once; no test pins this boundary.",
+    "recommended_fix": "Extract the latch as a pure helper (old tick/kind, new tick/kind) -> bool and @(test) transition, repeat, and same-tick-different-kind cases."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "noc_panel_rows measure/draw agreement untested — stale sel_pipe counts 4 phantom rows, skewing the scroll clamp",
+    "location": "app/render/noc_overlay.odin:478-480",
+    "evidence": "app/render/noc_overlay.odin:478-480 (measure):\n\tif sel_pipe >= 0 {\n\t\trows += 4 // section + offered + carried + drops\n\t}\nnoc_overlay.odin:692-695 (draw):\n\tif sel_pipe >= 0 {\n\t\tps, ok := pp.pipe_slot(topo, u32(sel_pipe))\n\t\tif ok {",
+    "detail": "When pipe_slot fails (stale selection — the R2-N7 dead-pipe case), draw emits 0 rows but measure counted 4; scroll max overestimates, leaving blank scroll tail. No test pins measure == drawn rows.",
+    "recommended_fix": "Count the sel_pipe section only when the pipe resolves (pass ok/stats-match into the measure), and add a @(test) comparing noc_panel_rows to a dry-run row count."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coupling",
+    "title": "Queue-row predicate hardcodes 70 in measure and draw, untied to canon pipe_amber_pct and untested",
+    "location": "app/render/noc_overlay.odin:497-499",
+    "evidence": "app/render/noc_overlay.odin:497-499 (noc_queue_rows):\n\tn := 0\n\tfor p in stats.pipes {\n\t\tif p.q[0] + p.q[1] + p.q[2] > 0 || p.util_pct >= 70 {\nnoc_overlay.odin:636,643 (draw):\n\tamber_pct := cat.balance.warnings.pipe_amber_pct\n...\n\t\tif p.q[0] + p.q[1] + p.q[2] == 0 && p.util_pct < 70 {\n\t\t\tcontinue",
+    "detail": "The row-selection threshold restates balance.json's 70 (ODN-5 numbers single-source) while bar colors derive from the catalog via the tested noc_level ladder; a canon change silently diverges row selection from colors.",
+    "recommended_fix": "Thread amber_pct from the catalog into noc_queue_rows and the draw-side skip (mirroring noc_level), and pin the inclusion boundary with a @(test)."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: CONCERNS",
+    "location": "tools/ci-local.sh:46-56",
+    "evidence": "tools/ci-local.sh gate 2: \"Core unit tests (the determinism + topology contracts)|mkdir -p bin && odin test core && for i in 1 2 3; do odin test app -out:bin/app-test || exit 1; done && odin test app/render -out:bin/render-test && odin test app/input -out:bin/input-test ...\" (no PP_DEBUG define)\ntools/ci-local.sh gate 8: \"PP_DEBUG overlay builds (compile gate)|odin build app -define:PP_DEBUG=true -out:app-debug.bin && odin build harness -define:PP_DEBUG=true -out:bin/harness-debug\" (compile only, never run)",
+    "detail": "P0 determinism ~100% (purity + incremental==one-shot @(test)s, gate-4 goldens; ON-leg stream proof manual). P1 D-toggle ~80-85%: intent chain unit-FULL, real-run render proof manual-only. P2 noc_log_line 0%. Overall ~85%.",
+    "recommended_fix": "Automate the two manual proofs: a gate running overlay-check + sidecar diff vs goldens, and an e2e on/off capture pixel-assert; ungate pure helpers (noc_log_line) for unit tests. Raises P1 ≥90% → PASS."
+  }
+]

@@ -1,0 +1,52 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gap",
+    "title": "W8 bundle-replication pin is vacuous for load columns: the record is read post-drain (tick 20) where both members report all-zero load",
+    "location": "core/stats_test.odin:257,288-301",
+    "evidence": "test_stats_bundle_member_replication steps `for tick in u64(1)..=20 {` then computes ONE record after the loop and asserts:\n```\n\t\ttesting.expect_value(t, m0.cap_units, u32(30))\n\t\ttesting.expect_value(t, m1.cap_units, u32(30))\n\t\t// identical load columns (the pooled link)\n\t\ttesting.expect_value(t, m0.offered, m1.offered)\n\t\ttesting.expect_value(t, m0.carried, m1.carried)\n\t\ttesting.expect_value(t, m0.dropped, m1.dropped)\n\t\ttesting.expect_value(t, m0.util_pct, m1.util_pct)\n\t\ttesting.expect_value(t, m0.q, m1.q)\n\t\t// lane columns are per-pipe but the flow allocates the same default\n\t\t// preset to both (balanced 1:1:1) — the caps are identical here\n\t\ttesting.expect(t, m0.w == m1.w, \"default weights are per-pipe but identical\")\n\t\t// the offered==carried+drops invariant holds for members too\n\t\ttesting.expect(t, m0.offered == m0.carried + u64(m0.dropped) * 30, \"member offered invariant\")\n```\nVerified by replicating the exact test shape (seed 99, era 0, 2x Cmd_Draw_Pipe{a=r,b=g,tier=1} + g->h, 10 email seeds ticks 1..10) against the worktree core package: at the assertion point (after tick 20) both members read `m0[cap=30 off=0 car=0 dr=0 util=0 q=[0,0,0]] m1[cap=30 off=0 car=0 dr=0 util=0 q=[0,0,0]]` — every load-column equality is 0==0 and the member offered invariant is 0==0+0*30. At ticks 1..8 the same run's members carry identical NON-ZERO load `m0[cap=30 off=30 car=30 dr=0 util=100 q=[0,1,0]] m1[...]` (probe output), and harness `run bundle --stats-out` shows live member rows `P,57,1,...,30,30,30,0,100,...,0,1,0` / `P,57,2,...,30,30,30,0,100,...,0,1,0` — discriminating data exists mid-flight.",
+    "detail": "The r2 claim 'W8 fixed: 2-member bundle replication pinned' is incomplete: only cap_units=30 discriminates (per-pipe read would give 15). A regression making members read per-pipe instead of bundle load keeps offered/carried/dropped/util/q equalities green (both zero).",
+    "recommended_fix": "Compute the record at a mid-flight tick (e.g. tick 3, or per-tick in the loop) and assert m0/m1 load columns are identical AND non-zero (offered==30, util==100, q==[0,1,0]) — one-line change; mid-flight data verified present."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "W6 D-row aggregation semantic (one row per (pipe,class,reason) with summed count) is unpinned — duplicate-row regressions stay green",
+    "location": "core/stats_test.odin:206-229",
+    "evidence": "The D-row assertions in test_stats_derivation_congested:\n```\n\tfor d in rec.drops {\n\t\ttesting.expect(t, d.reason == u8(Drop_Reason.Queue_Overflow), \"D rows are E9 only (E22 excluded)\")\n\t\ttesting.expect(t, d.count >= 1, \"D-row counts are >= 1\")\n\t\tfound := false\n\t\tfor p in rec.pipes {\n\t\t\tif p.pipe == d.pipe {\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\ttesting.expect(t, found, \"every D row names a live pipe\")\n\t}\n\t// per-pipe: dropped column == sum of its D-row counts (the replication)\n\tfor p in rec.pipes {\n\t\tsum_d := u32(0)\n\t\tfor d in rec.drops {\n\t\t\tif d.pipe == p.pipe {\n\t\t\t\tsum_d += d.count\n\t\t\t}\n\t\t}\n\t\ttesting.expect_value(t, p.dropped, sum_d)\n\t}\n```\nNo assertion checks triple uniqueness or an exact count. Probe of the tick-12 record shows the scenario does exercise aggregation (`D pipe=1 class=1 reason=0 count=2` — two same-kind sheds in one tick), but if stats_compute's find-or-append (core/stats.odin 'if d.pipe == pipe && d.class == site.class && d.reason == u8(site.reason) { d.count += 1 ... }') regressed to append-per-shed (two rows of count 1), sum_d stays 2==2 and every assertion passes.",
+    "detail": "The r2 claim 'D rows aggregate per (pipe,class,reason)' is behaviorally true in code but unpinned: the documented stream format ('multiple same-kind sheds in one tick sum into one row — the count column is meaningful') can silently change shape with all tests and stats-check byte-compare green (both sides drift together).",
+    "recommended_fix": "Add an assertion that no two rows in rec.drops share (pipe,class,reason) — e.g. a double loop asserting uniqueness — and/or pin the known tick-12 shape (one row, pipe 1, class 1, count 2)."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "App-side and harness CLI error paths for --stats-out (W1 exit 2, W2 exit 1, single-demo guard) have no automated coverage",
+    "location": "app/main.odin:146-149; harness/main.odin:127-130",
+    "evidence": "app/main.odin:\n```\n\t\tif os.args[i] == \"--stats-out\" {\n\t\t\tif i+1 >= len(os.args) || stats_path != \"\" {\n\t\t\t\tfmt.eprintln(\"usage: app [--stats-out <path>]\")\n\t\t\t\tos.exit(2)\n\t\t\t}\n```\nplus the exit-1 write-failure defer (`os.exit(1)` after `stats stream write failed`), and harness/main.odin:\n```\n\tif stats_out != \"\" && len(filtered) != 1 {\n\t\tfmt.eprintln(\"harness: --stats-out requires exactly one demo\")\n\t\tos.exit(2)\n\t}\n```\nNo test in the diff or worktree exercises any of these paths (no @(test) exists under app/; the harness guard is only run manually). The happy paths are pinned indirectly (shared stats_emit via test_stats_emit_path; harness stream via stats-check in CI).",
+    "detail": "The spec's I/O matrix error rows (dangling flag, unwritable path, >1 demo) are exactly the r1 W1/W2 fixes, yet only manual verification covers them; a regression to silent telemetry-off would pass the suite.",
+    "recommended_fix": "Add a harness-level test (or extend drift-check-style verb) asserting `run a b --stats-out x` and a dangling `--stats-out` exit 2; document the app paths as manual-checklist items in the PR body."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "No literal pin of the CSV row format or the G-row field passthroughs (gen/score/meter) — format regressions pass byte-identity tests",
+    "location": "core/stats.odin:289-302; core/stats_test.odin:76-96",
+    "evidence": "core/stats.odin serializer:\n```\n\tfmt.sbprintf(sb, \"G,%d,%d,%016x,%d,%d\\n\",\n\t\trec.tick, rec.gen, rec.sim_hash, rec.score, rec.meter)\n\tfor c in rec.classes {\n\t\tfmt.sbprintf(sb, \"C,%d,%d,%d,%d,%d,%d,%d,%d,%d\\n\", ...\n```\nThe only content-level assertions anywhere are substring checks in test_stats_emit_path (`strings.contains(out, fmt.tprintf(\"G,1,\"))`, `strings.contains(out, \"P,\")`, `!strings.contains(out, \"# pp stats stream\")`); the byte-identity and replay-identity tests compare the serializer against itself. No test asserts a literal expected row (column order/count, %016x hash width) or expect_value on rec.gen/rec.score/rec.meter.",
+    "detail": "A column swap (e.g. wE/wS) or a wrong G-row field copies identically into live and replay streams — all 164 tests, stats-check, and CI stay green while the documented format silently changes.",
+    "recommended_fix": "Pin one literal row of each kind (e.g. the PR-body tick-21 excerpt as an expected-string test) and expect_value the G-row record fields (gen/score/meter) in test_stats_derivation_congested."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "N/A (gate assessment; per-behavior evidence in the findings above)",
+    "detail": "P0 ~3/4 fully pinned (~88%): replay-identity PASS (stats-check green on pause/qos_contention/bundle incl. CI; unit test), shared-emission PASS, overlay golden-safety PASS (25/25 demos byte-identical, both app builds, compile gate), record math PARTIAL — class-row/B1 pins verified non-vacuous with real values (loss 50/90%, avg 250/400ms, latches) and W7 D-row accounting non-vacuous (dropped=2==Σ counts), but W8 bundle load-replication pin asserts 0==0 (P0 gap) and D-row aggregation uniqueness is unasserted. P1 ≈ 85% (app CLI error paths + failed-demo stream write manual-only). Overall ≈ 85%.",
+    "recommended_fix": "Re-pin test_stats_bundle_member_replication at a mid-flight tick with non-zero member loads (probe-verified: ticks 1-8 carry off=30/car=30/util=100) and add a D-row triple-uniqueness assertion — both one-line changes; with them the gate passes (P0 100%, P1 ≥90%)."
+  }
+]

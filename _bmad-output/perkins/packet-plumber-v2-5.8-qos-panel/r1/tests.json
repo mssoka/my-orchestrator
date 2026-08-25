@@ -1,0 +1,52 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gap",
+    "title": "P1 gap: app-side QoS panel lifecycle (clobber gate, derived AUTO/MANUAL mode, revert-to-auto, auto-follow trigger) has zero test coverage at any tier",
+    "location": "app/qos_panel.odin:154",
+    "evidence": "app/qos_panel.odin:148-166 (read at the reviewed sha):\n\t// Gate the auto-follow on the pipe's PRE-EDIT derived mode: an AUTO pipe\n\t// (weights == the ladder's current result) follows its assignments — a\n\t// MANUAL pipe (the player hand-tuned weights) keeps them until an explicit\n\t// [Auto]/[Revert] (the ruling's \"revertible to auto\"). A silent clobber of\n\t// player work on the panel's primary affordance would be a UX bug.\n\twas_auto := !qos_mode_manual(app, ps)\n\tcmd := pp.Cmd_Set_Lane{pipe = pipe, class = class, lane = lane}\n\tif _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {\n\t\tappend(&app.state.action_log, pp.Command{\n\t\t\tapply_tick = app.tick + 1,\n\t\t\tkind = cmd,\n\t\t})\n\t\tif was_auto {\n\t\t\tqos_apply_auto(app, pipe)\n\t\t}\nCoverage absence verified: `ls app/*_test.odin harness/*_test.odin` → \"No such file or directory\"; `grep -rn \"qos_mode_manual|qos_apply_auto|qos_revert\" app/*_test.odin core/*_test.odin` → no matches; `grep -rn \"draw_hud|draw_qos_panel|App\\b\" harness/*.odin` → no matches (harness/main.odin imports only `pp \"../core\"`). The E2E tier authors the outcome directly, not the app logic: demos/qos_auto.dem ends `at 3000ms lane 1 streaming express` / `at 3000ms lane 1 email best_effort` / `at 3000ms weights 1 50 30 20` — the weights command is harness-authored; demos/qos_manual.dem has no `lane` directive after `weights 1 60 25 15`, so no manual-then-assign or revert scenario is captured anywhere.",
+    "detail": "Spec AC behaviors (immediate split follow, manual marking, revert-to-auto) live only in app/qos_panel.odin with no app tests; the harness drives core only. A clobber-gate regression silently destroys player tuning while every gate stays green.",
+    "recommended_fix": "Extract the mode/gate decisions into pure procs and pin them: manual pipe + assignment keeps weights; auto pipe assignment writes the ladder set; revert restores the ladder set."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "v3-log rejection by the v4 reader is unpinned — version-gate tests cover only v2 and v99",
+    "location": "core/determinism_test.odin:337",
+    "evidence": "core/serialize.odin log_read gates on exact version: `if r_u32(&r) != LOG_VERSION do return {}, nil, false` (LOG_VERSION :: u32(4) after this PR). The only old-version pins: core/determinism_test.odin:337-340 `fut[4] = 99 // bump the version field (second u32, little-endian)` / `fut[5], fut[6], fut[7] = 0, 0, 0` / `_, _, future := log_read(fut, context.temp_allocator)` / `testing.expect(t, !future, \"unknown version must reject\")`; core/placement_test.odin:417-420 `v2[4] = 2 // version field (second u32, little-endian)` / `v2[5], v2[6], v2[7] = 0, 0, 0` / `_, _, old := log_read(v2, context.temp_allocator)` / `testing.expect(t, !old, \"a version-2 log must reject cleanly (LOG_VERSION 3)\")` — note the stale \"(LOG_VERSION 3)\" comment. `grep -rn \"v3|version-3\" core/*_test.odin` → no log/version hits; no test sets bytes[4] = 3.",
+    "detail": "The load-bearing payload evolution requires v3 logs rejected by the v4 reader. A future v3-compat shim (translate preset→weights) passes both existing pins while breaking the E10 contract silently.",
+    "recommended_fix": "Add a rejection pin writing version bytes = 3 (mirroring the v2 pin in placement_test), and update its stale \"(LOG_VERSION 3)\" comment to v4."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "P2 gap: app panel edge behaviors (never-drop zeroed-lane cycle guard, ±5 nudge clamping, preset bounds) have no tests",
+    "location": "app/qos_panel.odin:187",
+    "evidence": "app/qos_panel.odin:186-193 (read in the diff, new file, and verified at sha): `if never_drop {` / `ps, ok := pp.pipe_slot(&app.state.topology, u32(app.sel_pipe))` / `if !ok {` / `return` / `}` / `if app.state.topology.pipe_weights[ps][next] == 0 {` / `continue` / `}` — the cycle deadlock guard. app/qos_panel.odin:223: `nv = max(0, min(pp.MAX_WEIGHT, nv))` — the ±5 clamp. No test file references qos_cycle_class_lane or qos_nudge (`grep -rn \"qos_cycle_class_lane|qos_nudge\" app/*_test.odin core/*_test.odin` → no matches; no app test files exist).",
+    "detail": "The cycle guard was a review-driven fix (never-drop class deadlocking on a zeroed lane); the nudge clamp is the manual editor's only domain bound. Both are unpinned — P2 behaviors with zero coverage.",
+    "recommended_fix": "Pin the extracted helpers: cycle offers only positive-weight lanes for never-drop classes (all-zeroed → Invalid_Weights); nudge clamps at 0 and MAX_WEIGHT; out-of-range preset is a no-op."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Catalog ladder validation upper bound (value > MAX_WEIGHT) is unexercised",
+    "location": "core/catalog.odin:913",
+    "evidence": "core/catalog.odin:913-915: `if w64 < 1 || w64 > MAX_WEIGHT {` / `return {\"balance.json\", \"lane_auto_reserve_ladder\", fmt.tprintf(\"row %d weight must be in 1..MAX_WEIGHT\", ri+1)}`. The new catalog_test cases (core/catalog_test.odin:544-564) pin missing, wrong row count, wrong arity, zero share (`{\"ladder zero share\", replace1(BAL_VALID, `[50, 30, 20]`, `[50, 30, 0]`, 1), \"must be in 1..MAX_WEIGHT\"}`), non-descending, non-int — only the <1 side of the range check; no case exceeds MAX_WEIGHT (1000).",
+    "detail": "The w64 > MAX_WEIGHT branch of the fail-fast loader check has no test; a regression dropping the upper bound (e.g. accepting [2000, 30]) would pass the suite.",
+    "recommended_fix": "Add a case: replace1(BAL_VALID, `[100]`, `[1001]`) expecting the \"must be in 1..MAX_WEIGHT\" load error."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "Suite verified at the reviewed sha: `odin test core` → \"Finished 167 tests in 499.723ms. All tests were successful.\" P0 core invariants all FULL: test_qos_auto_weights_ladder (core/qos_test.odin:776, pins untouched/{70,30,0}/{50,30,20}/{0,70,30}/{0,100,0}/second-pipe), test_qos_bus_rejections_e6 (:123, negative/MAX_WEIGHT+1/all-zero/E6/missing-pipe), test_qos_serialization_sparse_and_roundtrip (:208) + test_qos_replay_byte_identical (:391, arbitrary {60,25,15}), test_qos_auto_weights_never_drop_safe (:833, assigned + unassigned with banking default_lane = LANE_EXPRESS), catalog ladder fail-fast (6 cases). P1 app-surface behaviors ~0-40%: demos author `at 3000ms weights 1 50 30 20` directly (demos/qos_auto.dem); harness/main.odin imports only `pp \"../core\"`; `ls app/*_test.odin` → no such file.",
+    "detail": "P0 = 100% (all load-bearing core invariants pinned, suite green). P1 ≈ 0-40% (clobber gate, derived mode, revert, auto-follow wiring untested). Overall ≈ 60%. P1 <80% and overall <80% → FAIL.",
+    "recommended_fix": "Extract panel decision logic (mode derivation, clobber gate, cycle skip, nudge clamp) into pure procs and pin them in core; add the v3-log rejection pin and the ladder upper-bound case; then re-gate."
+  }
+]

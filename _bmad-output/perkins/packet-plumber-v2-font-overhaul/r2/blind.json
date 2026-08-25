@@ -1,0 +1,102 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "teardown-regression",
+    "title": "rl.CloseAudioDevice() deleted with no seam replacement — audio device never closed on normal builds",
+    "location": "app/audio/audio.odin:audio_destroy",
+    "evidence": " // audio_destroy — unload the sounds + close the device (app teardown).\n audio_destroy :: proc(a: ^Audio) {\n 	if a.device_on {\n-\t\tfor s in a.crisis { rl.UnloadSound(s) }\n...\n-\trl.CloseAudioDevice()\n }",
+    "detail": "The PP_SW_AUDIO seam wraps every other lifecycle call but defines no audio_close_device; the close was simply deleted, so non-SW builds leak the device at teardown while the comment still promises it.",
+    "recommended_fix": "Add audio_close_device to both seam branches (no-op under PP_SW_AUDIO, rl.CloseAudioDevice otherwise) and restore the call in audio_destroy."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "tool-accuracy",
+    "title": "Gallery/font-check candidate swap replaces only the body font — header and NOC surfaces render the shipped family for every candidate",
+    "location": "app/gallery.odin:gallery_arm; harness/font_check.odin:font_check",
+    "evidence": "+\t\tapp.view.font = f\n+\told_font := rc.view.font\n+\trc.view.font = f\n+\tdraw_text_h :: proc(app: ^App, txt: string, x, y: i32, size: i32, col: rl.Color) {\n+\t\trnd.draw_text_font(app.view.font_header, txt, x, y, size, col)\n+\t}\n+2. **2026-08-22/23 (lavish A/B gallery)** — 6 families rendered on the SAME real game screens (specimen text ladder, live crisis frame, title, QoS panel, NOC overlay, win toast) through the software rasterizer;",
+    "detail": "Title, toasts, crisis banner (font_header) and NOC rows (font_mono) draw shipped Plex regardless of candidate, contradicting the PR body's per-family comparison on those surfaces.",
+    "recommended_fix": "Swap all three fonts in gallery_arm and font_check (load the candidate's header/mono variants), so per-candidate captures actually reflect the candidate."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "dead-code",
+    "title": "Claimed gallery retry budget is a dead field — polls can spin forever",
+    "location": "app/gallery.odin:Gallery struct / gallery_frame",
+    "evidence": "+\tretries:  int, // N11: the condition-poll frame budget (GALLERY_MAX_RETRIES)\n+\tcase .Draw_Release:\n+\t\tif !pipe_live(app) {\n+\t\t\tgallery.wait = 5 // the commit lands via the executor — poll\n+\t\t\treturn false\n+\t\t}",
+    "detail": "retries is never read or written and GALLERY_MAX_RETRIES is never defined; every condition poll (pipe, sel_pipe, overlay, panel) retries wait=5 unbounded — a hung capture runs forever.",
+    "recommended_fix": "Increment gallery.retries per poll miss and bail out (log + exit) at a GALLERY_MAX_RETRIES constant, resetting on success — or remove the field."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "stale-comment",
+    "title": "font_check.odin comments contradict the pipeline this same diff ships",
+    "location": "harness/font_check.odin:draw_specimen / font_check step 1",
+    "evidence": "+\t// draw_row copies the string's raw UTF-8 BYTES (the game's draw_text_c\n+\t// truncates every rune to a byte — ASCII-only canon; the specimen's ⚠\n+\t// rows need the real UTF-8 encoding to reach the atlas).\n+\t// load_hud_font — a failed load is FATAL, never a silent fallback-font\n+\tfor b in transmute([]u8)(txt) {\n+\t\tappend(&cbuf, b)\n+\t}",
+    "detail": "The comment claims draw_text_c truncates runes, but this diff rewrites it to copy raw UTF-8; another comment cites deleted load_hud_font, whose recipe was the silent default fallback.",
+    "recommended_fix": "Update both comments: the shipped helper copies raw UTF-8 bytes; the loader recipe is fail-loud load_font_file."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "stale-comment",
+    "title": "noc_row ladder comment still documents the pre-overhaul sizes",
+    "location": "app/render/noc_overlay.odin:noc_row",
+    "evidence": " // `size` is the font size (>= 14 body, 10 labels — the hierarchy ladder).\n noc_row :: proc(v: ^View, cur, scroll, visible: i32, txt: string, size: i32, col: rl.Color) -> i32 {\n \t\tif noc_row_visible(cur, scroll, visible) {\n-\t\t\tdraw_text_c(v, txt, NOC_PANEL_X + 6, noc_row_y(cur, scroll), size, col)\n+\t\t\tdraw_mono_c(v, txt, NOC_PANEL_X + 6, noc_row_y(cur, scroll), size, col)",
+    "detail": "The contract comment says 14px body / 10px labels while this diff draws 15px body rows and 12px section labels — the claimed comment fixes missed this one.",
+    "recommended_fix": "Update the ladder comment to the shipped sizes (15 body, 12-13 labels)."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "silent-degradation",
+    "title": "Missing fallback font asset passes load_fonts silently — outside the fail-loud contract",
+    "location": "app/render/view.odin:font_merge_fallback",
+    "evidence": "+\tfdata, ferr := os.read_entire_file_from_path(fallback_path, context.temp_allocator)\n+\tif ferr != nil {\n+\t\treturn glyphs, count // no fallback file — the missing glyphs stay missing\n+\t}\n+// ok=false on ANY failure — the raylib default is NEVER substituted here",
+    "detail": "A deleted or unreadable noto_sans_symbols2 asset yields ok=true — app and harness run without the ⚠ glyph, silently; only the CI negative-control pin would notice.",
+    "recommended_fix": "Treat an unreadable committed fallback as failure (return nil, 0), or guard FONT_FALLBACK_ASSET existence in load_fonts."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "resource-leak",
+    "title": "Font tests discard caller-owned atlas and glyph arrays despite the documented ownership contract",
+    "location": "app/render/font_test.odin:font_guard_reports_missing_asset",
+    "evidence": "+\t_, _, ok := font_atlas_build_from_file(FONT_ASSET)\n+\ttesting.expect(t, ok, \"the committed HUD family must load\")\n+// The caller owns the atlas image (upload + UnloadImage, or just UnloadImage).",
+    "detail": "The guard test drops the returned atlas, recs and MemAlloc'd merged glyph arrays on success; font_probe_warning frees nothing either — the render suite leaks per call.",
+    "recommended_fix": "UnloadImage the atlas and free glyphs/recs (or UnloadFont the data-stage font) in the tests and the probe."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "formatting",
+    "title": "audio_flush replacements misindented (extra leading tab)",
+    "location": "app/audio/audio.odin:audio_flush",
+    "evidence": " \tfor k in 0..<a.pending.crisis_plays {\n \t\tv := (a.pending.crisis_variant + i32(k)) % CRISIS_VARIANTS\n-\t\trl.PlaySound(a.crisis[v])\n+\t\t\taudio_play_sound(a.crisis[v])",
+    "detail": "All four audio_play_sound replacement lines in audio_flush carry an extra tab versus the two-tab lines they replace — misindented inside otherwise uniform loops.",
+    "recommended_fix": "Re-indent the four lines to match the surrounding block."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "dead-branch",
+    "title": "Identical when/else EndDrawing branches — no-op conditional with misleading comment",
+    "location": "app/main.odin:main loop EndDrawing",
+    "evidence": "+\t\twhen #config(PP_DEBUG, false) {\n+\t\t\trl.EndDrawing()\n+\t\t} else {\n+\t\t\trl.EndDrawing()\n+\t\t}",
+    "detail": "Both branches are byte-identical, so the conditional does nothing; the adjacent comment says 'Release builds carry nothing' while the else branch carries EndDrawing.",
+    "recommended_fix": "Collapse to a single rl.EndDrawing() call and keep only the post-flush ordering comment."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "inconsistent-change",
+    "title": "Upgrade preview keeps raw pixel sizes while every sibling panel was converted to hud() scaling",
+    "location": "app/render/forecast.odin:draw_upgrade_preview",
+    "evidence": "-\tdraw_text_c(v, \"UPGRADE PREVIEW\", x, y, 16, p.ink)\n+\tdraw_header_c(v, \"UPGRADE PREVIEW\", x, y, 17, p.ink) // 2026-08-23: panel header -> SemiBold + bigger\n-\t\tdraw_text_c(v, \"WEATHER REPORT\", x, y, hud(v, 16), p.ink)\n+\t\tdraw_header_c(v, \"WEATHER REPORT\", x, y, hud(v, 17), p.ink) // 2026-08-22: panel header -> SemiBold; 08-23: bigger-text ruling",
+    "detail": "Forecast/health/settings/QoS headers ride hud(v, …) but the upgrade preview passes raw 17/15 — the a11y text-scale knob still won't scale this panel.",
+    "recommended_fix": "Wrap the upgrade-preview sizes in hud(v, …) so the panel joins the same ladder and scale."
+  }
+]

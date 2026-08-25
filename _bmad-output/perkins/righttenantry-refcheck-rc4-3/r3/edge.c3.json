@@ -1,0 +1,52 @@
+[
+  {
+    "source": "edge",
+    "severity": "blocker",
+    "category": "take-over-race",
+    "title": "STILL PRESENT (r2): wrong-person route's taken-over stand-down is read-time only — a take-over racing the wrong-person POST still yanks a landlord-handled row into awaiting_correction",
+    "location": "server/src/reference_checks/form_handler.gleam:1235-1254 + server/src/reference_checks/sql/update_reference_call_status.sql:23",
+    "evidence": "form_handler.gleam: 'case row.taken_over_at != \"\" { True -> wisp.redirect(to: \"/reference/\" <> token) False -> ... sql.update_reference_call_status(config.db, id_uuid, sql.AwaitingCorrection, \"\", \"contact_invalid\", sql.ContactInitiated)' ; update_reference_call_status.sql: 'WHERE id = $1 AND status = $5::reference_call_status' (no taken_over_at filter)",
+    "detail": "Take-over writes only taken_over_at, leaving status contact_initiated, so the guarded UPDATE matches and flips a just-taken-over row to awaiting_correction. Sweep excludes it, complete_reference_call requires contact_initiated, panel hides menu on taken-over rows — dead-end, the r2 blocker invariant. mark_awaiting_correction got the write-time guard; this leg did not.",
+    "recommended_fix": "Add 'AND taken_over_at IS NULL' to update_reference_call_status.sql (or a dedicated wrong-person query mirroring mark_awaiting_correction.sql) so the write re-checks what the read checked."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "take-over-race",
+    "title": "sweep_terminal / sweep_mark_failed lack the taken_over_at write guard — a take-over racing the T+144h terminalization lands on a taken-over row and kills the §8.6 live form link",
+    "location": "server/src/reference_checks/sql/sweep_terminal.sql:30-32 ; server/src/reference_checks/sql/sweep_mark_failed.sql:21-22",
+    "evidence": "sweep_terminal.sql: 'WHERE id = $1 AND status = 'contact_initiated' AND attempt_count = 4' — no taken_over_at filter; sweep_mark_failed.sql: 'WHERE id = $1 AND status IN ('queued', 'contact_initiated')' — no taken_over_at filter; every other sweep write (sweep_claim_t0, sweep_advance) carries 'AND taken_over_at IS NULL'",
+    "detail": "The sweep SELECT excludes taken-over rows but the terminal UPDATE re-checks only status/attempt_count. A take-over committing between SELECT and UPDATE terminalizes the just-taken-over row (partial/unreachable), so the §7.7 'form link stays live' / §8.6 late-completion promise dies; partial+taken_over is unrecoverable.",
+    "recommended_fix": "Add 'AND taken_over_at IS NULL' to sweep_terminal.sql and sweep_mark_failed.sql, matching sweep_claim_t0/sweep_advance; a 0-row result stands down the tick."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "client-state",
+    "title": "STILL PRESENT (r2 N5): single-slot refcheck_edit — opening a second row's substitute/correct edit or any action success still silently discards another row's in-progress typed trio",
+    "location": "client/src/client.gleam:3385-3391 ; client/src/client.gleam:3554-3558",
+    "evidence": "'RefcheckSubstitute -> #( Model(..menu_closed, refcheck_edit: Some(prefill_refcheck_edit(model, call_id, RefcheckEditSubstitute))), effect.none() )' ; Ok arm: 'let cleared = Model(..model, refcheck_edit: None, refcheck_confirm: None, ...)'",
+    "detail": "The behind-a-button + closing-Cancel halves of r2 N5 are fixed, but the overwrite path is unchanged: choosing substitute/correct on another row (or any action's success) unconditionally replaces/clears the open edit, discarding unsaved typed values with no guard or prompt.",
+    "recommended_fix": "Preserve an open edit for a different call_id (only overwrite when the new choice targets the same row), or confirm discarding unsaved trio values before replacing."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "a11y",
+    "title": "STILL PRESENT (r2 N14, partial): Escape closes the menu only when focus is inside the menu — after clicking ⋯ (focus stays on the trigger) Escape leaves the menu open",
+    "location": "client/src/components/reference_panel.gleam:732-737",
+    "evidence": "'event.on( \"keydown\", menu_escape_decoder(msg.UserToggledRefcheckMenu(call.reference_call_id)) )' attached to the menu div (a sibling of the ⋯ button); no autofocus moves focus into the menu on open (confirm_modal uses attribute.autofocus(True))",
+    "detail": "Keydown bubbles from the focused ⋯ button through its ancestors, never through the sibling menu div, so the handler fires only once focus is on a menuitem. The natural click-⋯-then-Escape flow does nothing.",
+    "recommended_fix": "Attach the Escape decoder to the row container/relative wrapper (an ancestor of the trigger), or autofocus the first menuitem on open like confirm_modal."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "stale-response",
+    "title": "AppCompletedRefcheckExport toasts unconditionally — a clipboard result settling after navigation lands 'Attempt log copied' on an unrelated page",
+    "location": "client/src/client.gleam:3519-3530",
+    "evidence": "'AppCompletedRefcheckExport(_call_id, result) -> case result { Ok(_) -> add_toast(Model(..model, clipboard_copied: None), copy.refcheck_toast_exported, ToastSuccess) ...' — no route/call-presence guard (the r2 W3 fix guards only ApiReturnedRefcheckAction)",
+    "detail": "The export click copies via a promise; if the landlord navigates before it settles, the success/failure toast fires on the new page — the same stale-toast class r2 W3 fixed for row actions, unguarded for the export leg.",
+    "recommended_fix": "Route the export response through refcheck_response_is_current (or clear clipboard_copied on route change) so stale results drop silently."
+  }
+]

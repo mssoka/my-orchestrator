@@ -1,0 +1,1 @@
+NOTE: no GitHub issue exists for story 5.5 (gh issue list: only #48 pause overlay, #34 follow-up intake, #6 brand marks — none related). The spec is the original job briefing + this story card extract.

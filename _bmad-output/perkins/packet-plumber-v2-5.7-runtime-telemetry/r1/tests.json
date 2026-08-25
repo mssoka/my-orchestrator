@@ -1,0 +1,92 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gap",
+    "title": "P0 record math unasserted: loss_pct, avg_latency_ms, per-class accumulator mapping and SLA latch copy have no value-level pin",
+    "location": "core/stats_test.odin:96",
+    "evidence": "core/stats_test.odin:4-6 claims the pin: \"//   (a) derivation — util_pct/offered/carried/class loss% + latency math match //       the sim's own numbers on a congested run (the formulas are pinned, not //       prose);\" — but the only class assertions (stats_test.odin:95-116) are: \"testing.expect(t, len(rec.classes) >= 2, \\\"congested run must have class rows\\\")\" followed immediately by pipe-row checks (cap_units/carried/util/offered/caps). core/stats.odin:133-140 computes the unpinned math: \"row.loss_pct = u32(acc.dropped * 100 / demand)\" / \"row.avg_latency_ms = acc.total_latency_ms / acc.delivered\" / \"row.sla_lat = state.flow.sla_breach[c][u8(Sla_Metric.Latency)]\" / \"row.sla_loss = state.flow.sla_breach[c][u8(Sla_Metric.Loss)]\"",
+    "detail": "The lens-assigned P0 (CSV correctness of loss%, avg latency, per-class aggregation) has no assertions; the byte-identity tests pass on identically-wrong values, and the stats copy is a separate proc from sla_evaluate, so a C-row formula regression ships undetected.",
+    "recommended_fix": "Extend test_stats_derivation_congested: for each rec.classes row assert loss_pct == u32(dropped*100/(delivered+dropped)), avg_latency_ms == total_latency_ms/delivered, demand/delivered/dropped == state.flow.sla[c] fields, and latches == flow.sla_breach."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "D-row drop accounting (per-member replication, class/reason, E22 exclusion) and offered equality never asserted",
+    "location": "core/stats_test.odin:110",
+    "evidence": "The full derivation assertion block (stats_test.odin:98-116) contains no reference to rec.drops; offered is only bounded: \"testing.expect(t, p.offered >= p.carried, \\\"offered (carried + drops) >= carried\\\")\". The unasserted emission code is core/stats.odin:201-216: \"// --- per-tick E9 drop rows (per live member pipe, class, reason) -------- // drop_sites append order (deterministic); a shed bundle replicates to // every live member (the pooled link shed them). E22 (NO_BUNDLE) sites are // skipped — map-wide, class rows own them.\"",
+    "detail": "The D rows are the by-class/by-reason drop breakdown the user ordered telemetry for; zero assertions exist (not even len(rec.drops) > 0), and offered==carried+dropped*bw can drift while the ≥ bound stays green.",
+    "recommended_fix": "On the congested shape assert len(rec.drops) > 0, count == live members of the shedding bundle, class/reason fields match drop_sites, E22 sites excluded, and offered == carried + dropped*30."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Bundle-member replication semantics (spec I/O matrix scenario) untested",
+    "location": "core/stats.odin:201",
+    "evidence": "Committed spec I/O matrix (_bmad-output/implementation-artifacts/spec-5-7-runtime-telemetry.md:75): \"| pipe in a 2-member bundle | parallel pipes (bundle.dem) | each member pipe row carries the BUNDLE's load columns (pooled link) + its own lane weights/caps | dead pipe → no row |\" — but test_congested_run (stats_test.odin:54-72) draws only two serial pipes (r→g, g→h), no parallel bundle; no test builds a 2-member bundle.",
+    "detail": "The pooled-link row semantics (members share cap/offered/carried/dropped/util/q) are load-bearing honesty of the stream; a member-row divergence is symmetric, so stats-check byte-identity passes despite wrong per-member numbers.",
+    "recommended_fix": "Add a parallel-pipe unit test: two live members of one bundle must emit identical load columns (cap/offered/carried/dropped/util_pct/q) with distinct w/c; dead member emits no row."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "App-side stats emission loop has zero automated coverage; the unit mirror mirrors the harness loop, not the app's",
+    "location": "app/main.odin:234",
+    "evidence": "app/main.odin:219-242: \"events_before := len(app.state.events)\" ... \"if app.stats_live || app.overlay_on {\" ... \"h := pp.state_hash(&app.state, app.state.events[events_before:], &cat, context.temp_allocator)\" ... \"pp.stats_write_csv(&app.stats_sb, &app.stats)\" — vs the test mirror stats_stream_of (stats_test.odin:40): \"clear(&state.events)\" — the harness drain convention, not the app's mark convention.",
+    "detail": "AC2 (app stream matches harness format, replay-identical) is verified only manually. The app re-implements the emission loop (mark-based hash slice, per-step compute, exit write, restart append); divergence from the pinned harness loop is caught by nothing.",
+    "recommended_fix": "Factor the per-step mark-based emission (compute+serialize after each step) into one core helper both binaries call, and unit-pin it without clearing events per tick; or add that mirror test."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "PP_DEBUG-gated code (debug_overlay.odin, overlay.odin, D toggle) has no automated compile or render gate",
+    "location": ".github/workflows/ci.yml:75",
+    "evidence": ".github/workflows/ci.yml:64-97 run steps: \"run: tools/lint.sh\" / \"run: odin test core\" / \"run: odin build app -out:app.bin\" / \"run: tools/harness.sh run\" / \"run: tools/harness.sh drift-check\" / \"run: tools/harness.sh preview-check\" — no step builds with -define:PP_DEBUG=true; grep for PP_DEBUG in tools/ and .github/ returns zero hits. (Verified manually: odin build app -define:PP_DEBUG=true succeeds today, rc=0.)",
+    "detail": "The gated files compile only under the define; an API/type drift inside any `when #config(PP_DEBUG, false)` block breaks every debug build while all six lint gates, tests, and CI stay green — the AC3 vehicle silently rots.",
+    "recommended_fix": "Add a suite/CI step `odin build app -define:PP_DEBUG=true` (and the PP_DEBUG harness, which contains overlay.odin) so the compile-excluded surface is compile-pinned on every run."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "stats-check (the AC1 end-to-end replay-identity pin) is not wired into the automated suite",
+    "location": "harness/main.odin:67",
+    "evidence": "harness/main.odin:67-70: \"if verb == \\\"stats-check\\\" { if len(rest) != 1 { usage() }\" — single-demo verb only; ci.yml invokes run/drift-check/preview-check via tools/harness.sh (\"exec ./bin/harness \\\"$@\\\"\") but never stats-check; the pin ran only as documented manual invocations (PR body: \"Green on: boot, pause ... qos_contention, demolish_node, router_tiers\").",
+    "detail": "Sibling negative gates (drift-check, preview-check) run in CI per repo convention; the new determinism-spine pin is manual-only, so a future regression of replay-identity would surface only if a developer remembers the verb.",
+    "recommended_fix": "Accept multiple demos in stats-check and add a suite/CI step looping it over all demos beside drift-check and preview-check."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "--stats-out CLI error paths untested: duplicate/missing flag token, ≠1 demo, unwritable path",
+    "location": "harness/main.odin:117",
+    "evidence": "harness/main.odin:117-127: \"if rest[i] == \\\"--stats-out\\\" { if i+1 >= len(rest) || stats_out != \\\"\\\" { usage() }\" ... \"fmt.eprintln(\\\"harness: --stats-out requires exactly one demo\\\"); os.exit(2)\" — no test exercises these branches; app/main.odin:143-146 silently ignores a missing path token: \"if os.args[i] == \\\"--stats-out\\\" && i+1 < len(os.args) { stats_path = os.args[i+1] }\"; spec line 71 promises \"flag with ≠1 demo → usage error; unwritable path → logged failure (never silent)\".",
+    "detail": "The spec's error-handling column is implemented but unasserted anywhere; the app's silent-off on a missing token is an inconsistency no test would catch (happy-path-only coverage where error handling is specified).",
+    "recommended_fix": "Add flag-parse smoke tests for duplicate/missing token and ≠1 demo, and one unwritable-path run asserting the harness/app failure is logged, not silent."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "AC5 full-suite verification record is contradictory: spec checkbox unchecked, PR body claims green",
+    "location": "_bmad-output/implementation-artifacts/spec-5-7-runtime-telemetry.md:109",
+    "evidence": "Committed spec line 109: \"- [ ] Full suite: `odin test core` + harness build (shadow ODIN_ROOT) + `harness run` all green, goldens byte-identical -- AC5.\" vs _pr_body.md:101-103: \"- `odin test core` — 162 tests green (158 existing + 4 new).\" ... \"- `harness run` — 25/25 demos green; goldens BYTE-identical (AC4).\" (Independently re-verified here: odin test core → \"Finished 162 tests ... All tests were successful.\")",
+    "detail": "The load-bearing golden-safety claim (AC4) rests on a manual run whose own spec artifact marks it incomplete; no committed run artifact exists for the byte-identical goldens check.",
+    "recommended_fix": "Tick the AC5 checkbox only after a recorded full-suite run and reference the run log/artifact in the PR body."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "N/A",
+    "detail": "P0 ≈ 82%: byte-identity live==replay 95% (durable unit pin; e2e verb manual-only), shared-serializer 90% (same procs both sides, verified), golden-safety 100% (structural gates + existing golden suite), CSV record math ~45% (util/carried pinned; loss%, avg latency, per-class aggregation, D-rows unasserted). P1 ≈ 15% (app emission loop 0%, PP_DEBUG compile gate 0%, stats-check automation 50%, bundle replication 0%). Overall ≈ 65%. P0 <100% and P1 <80% → FAIL.",
+    "recommended_fix": "Pin C-row/D-row/bundle-replication values in stats_test; wire stats-check and a PP_DEBUG build into the suite; factor the app emission loop into a shared, pinned helper. Re-gate: P0 100%, P1 ≥90% → PASS."
+  }
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "golden-consistency",
+    "title": "flow_summary.spawned is computed by two different formulas on the two golden writer surfaces",
+    "location": "tests/spine_check.cpp:641 (vs Source/PacketPlumberEditor/PPProbeCommandlet.cpp:137)",
+    "evidence": "tests/spine_check.cpp:641: `static_cast<int>(State.Flow.Packets.size()) + State.Score, // spawned = delivered + live` — PPProbeCommandlet.cpp:137: `ReachablePairs, TotalHops, static_cast<int32>(State.Flow.Demand.size()), State.Score,` — docs/goldens/SCHEMA.md:45: `| `flow_summary.spawned` | int | demand entries fired (packets constructed) |`",
+    "detail": "spine-check emits packets-constructed (matches SCHEMA.md); PPProbe emits Demand.size(), which counts never-fired future demand entries. They equal 11 only because the last entry fires at tick 98 ≤ 100 — the single-sourcing invariant is already violated in code.",
+    "recommended_fix": "Make both writers use one formula (State.Score + State.Flow.Packets.size(), the schema's 'packets constructed'); Demand.size() silently includes entries with Tick past the run end."
+  },
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "determinism-boundary",
+    "title": "A bare same-tick re-step is allowed yet re-runs the flow: double-spawns that tick's demand with no ReplayError latch",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:74",
+    "evidence": "PP_Sim.h:72-78: `// deliberately allowed — the step_once test convention re-steps tick 1.\n\tif (Tick == State.Tick && NumCommands > 0)\n\t{\n\t\tState.ReplayError = true;\n\t\treturn;\n\t}\n\tState.Tick = Tick;` — then line 120: `State.Score += FlowStep(State.Flow, Tick, State.Topology, State.Routing, State.Bundles);` — PP_Flow.h:130: `if (Req.Tick != Tick)`. Verified empirically: after StepScenario(S,5), a bare Step(S,5) yields packets=2, NextPacketId=2, ReplayError=0.",
+    "detail": "The r1 asymmetry fix latches only the with-commands case; the no-commands re-step still re-spawns demand, re-serves edges, redraws the nonce — a silent replay-divergence class the ODN replay-equality contract exists to prevent.",
+    "recommended_fix": "Return early on Tick == State.Tick regardless of NumCommands (the step_once test only asserts ReplayError==false, which a no-op preserves), or latch both cases."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "coupling",
+    "title": "ApplyEdit + StepScenario mixing double-applies a logged draw silently; the live/replay mode split is prose-only",
+    "location": "Source/PacketPlumberCore/Public/PacketPlumberCore/PP_Sim.h:41",
+    "evidence": "PP_Sim.h:41-47: `inline FEditResult ApplyEdit(FSimState &State, const FCommand &Cmd)\n{\n\tFEditResult Result = ApplyDraw(State.Topology, Cmd.A, Cmd.B, Cmd.Tier);\n\tif (Result.Error == FEditError::None)\n\t{\n\t\tState.ActionLog.push_back(FLoggedCommand{State.Tick + 1, Cmd});` — PP_Scenario.h:92: `if (E.ApplyTick == Tick)` feeds every log entry to Step. Verified empirically: ApplyEdit then StepScenario(S,1) → pipes=2, log=1, ReplayError=0 (duplicate parallel pipe is legal).",
+    "detail": "Step cannot distinguish replay input from an already-applied live command. Shipped callers are correct (PPSimDriver.h:40 uses bare `PP::Step(State, State.Tick + 1)`; the r1 test comments 'live: no commands (already applied)'), but the invariant is convention-only.",
+    "recommended_fix": "Add a structural guard: e.g. an AppliedThrough tick on the state that StepScenario/Step cross-checks, or reject a command whose (apply_tick, payload) was already applied — divergence should latch, not create a legal duplicate pipe."
+  }
+]

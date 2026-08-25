@@ -1,0 +1,124 @@
+{
+  "round": 2,
+  "round_kind": "fix-audit",
+  "reviewed_sha": "b1ebd960691ec880739de171a512e1cd1b68fdb8",
+  "head_sha_at_review": "b1ebd960691ec880739de171a512e1cd1b68fdb8",
+  "r1_reviewed_sha": "39443b2cca4add0611b9f437ac7ec362f6d9a2ef",
+  "diff_source": "gh pr diff 173 --repo solarity-services/RightTenantryAgents (943 lines, 5 source files + 1 new test file)",
+  "spec": "briefings/perkins-righttenantryagents-boundary-gate-state-fix-r2.md + righttenantryagents-boundary-gate-state-fix.md + issue #172",
+  "reviewers_completed": ["blind", "edge", "acceptance", "security", "architecture", "codebase", "tests"],
+  "reviewers_total": 7,
+  "failed_layers": [],
+  "total_findings": 12,
+  "verified_count": 12,
+  "rejected_count": 0,
+  "speculative_count": 0,
+
+  "fix_audit": {
+    "blocker": {
+      "r1_B1_telemetry_event_name_typo": {
+        "r1_severity": "blocker",
+        "status": "FIXED",
+        "verification": "compliance_enforcement.py:239 restored to 'compliance.review_unparseable' (matches parent 4e0146f:179). test_unparseable_review_emits_failed_rollup (test_verification_compliance_judge.py:492) asserts the restored name. pyproject.toml:101 codespell ignore-words-list now includes 'unparseable'. NO other stable token renamed by the sed: 'compliance.repair_unparsable' (compliance_enforcement.py:435) is a SEPARATE frozen token that was always spelled 'unparsable' in the parent (4e0146f:356) — not a victim. 'coerce_json_state.unparsable' + 'compliance_repair.unparsable' unchanged from parent. codespell + ruff clean; full unit suite 2049 passed."
+      }
+    },
+    "warning": {
+      "r1_W1_producer_path_untested": {
+        "r1_severity": "warning",
+        "status": "FIXED",
+        "verification": "5 REAL producer-path tests added: test_clean_review_stamps_passed_verdict / test_dirty_review_stamps_failed_verdict_with_count / test_unparsable_review_stamps_failed_verdict (boundary, test_verification_compliance_judge.py:601-672) + test_clean_final_review_stamps_passed_verdict / test_unparsable_final_review_stamps_failed_verdict (final, test_final_compliance_reviewer.py:398-438). They drive the REAL log_boundary_compliance_review / log_final_compliance_review callbacks (not hand-seeded stamps) and assert judge_kind/run_id/attempt/passed/parseable/violation_count off the judge's OWN ctx. All pass."
+      },
+      "r1_W2_crosscheck_trusts_passed_alone": {
+        "r1_severity": "warning",
+        "status": "FIXED",
+        "verification": "Both finalize guards now require 'verdict.get(\"passed\") is True AND verdict.get(\"violation_count\") == 0' (boundary_compliance_remediation.py:335-338, final_compliance_remediation.py:281-284). Clean path still does NOT abort (test_none_review_with_clean_stamp_does_not_abort for both gates). Inconsistent stamp (passed=True, violation_count>0) DOES abort (test_passed_true_with_violations_still_fail_closes for both gates: boundary count=2, final count=1). The three load-bearing invariants all hold."
+      }
+    },
+    "notes_carry_forward": {
+      "summary": "All 6 r1 notes remain present (the r2 delta scope was B1+W1+W2 only; none of the notes were in scope to fix). None worsened; one (the ctx.state comment) was re-asserted in new r2 comment lines.",
+      "r1_note1_state_pipeline_error_event_delta_bypass": "still present since round 1 (boundary_compliance_remediation.py:360 / final:301). Mitigated by rerun_on_resume=True.",
+      "r1_note2_verdict_stamp_slot_never_cleared": "still present since round 1 (agent.py:628,713 finally pops JUDGE_META only). See NEW note N2 below for an additional hygiene location.",
+      "r1_note3_ctx_state_comment_imprecise": "still present since round 1 AND re-asserted in new r2 comment lines (agent.py:596,675). See NEW note N4.",
+      "r1_note4_read_review_verdict_docstring_drift": "still present since round 1 (compliance_enforcement.py:169-188 docstring promises None for 'malformed shape' but impl returns any dict with matching judge_kind). Safe (finalize re-validates passed).",
+      "r1_note5_judge_kind_stringly_typed_implicit_else": "still present since round 1 (compliance_enforcement.py:212).",
+      "r1_note6_half_migrated_scrub_repair_ctx_state": "still present since round 1 (agent.py:615 scrub_boundary_violations(ctx.state,...)). Out of scope; dirty path works in prod."
+    }
+  },
+
+  "findings_new": [
+    {
+      "title": "Defensive cross-check only guards review=None — a stale DIRTY review from a prior attempt can still beat a clean stamp on a re-judge",
+      "sources": ["blind", "edge"],
+      "severity": "note",
+      "category": "defense-in-depth-gap",
+      "location": "tenant_scorer/callbacks/boundary_compliance_remediation.py:324-371 (same shape final_compliance_remediation.py:271-301); gate loop tenant_scorer/agent.py:598-628",
+      "verification": "confirmed (code structure) / reachability unverified",
+      "detail": "The cross-check (passed AND violation_count==0) lives INSIDE 'if review is None:'. The gate loop never clears STATE_VERIFICATION_COMPLIANCE_REVIEW between attempts (only JUDGE_META is popped in finally). So in a multi-attempt gate where a prior dirty attempt left a dirty review in the slot AND the final clean attempt's output_key write is lost to a state-prop failure while its stamp lands, finalize reads the stale dirty review (non-None) -> skips the cross-check -> fail-closes on stale data, dropping the clean verdict (the #172 harm, residual multi-attempt case). Code-structure gap confirmed by 2 independent lenses; whether the 'stamp lands but output_key lost' window is reachable is unverified (both ride the same child->parent state merge). Pre-existing since r1 (r2 only added violation_count to the condition; did not touch the review=None gating). All three load-bearing invariants still hold.",
+      "recommended_fix": "Cheap + closes the gap: clear the review slot before each re-judge so a lost final write yields None and hits the existing cross-check; OR extend the cross-check to a parseable-but-dirty review whose stamp records a later clean attempt (attempt mismatch)."
+    },
+    {
+      "title": "STATE_COMPLIANCE_REVIEW_VERDICT absent from state_init._COMPLIANCE_REVIEW_KEYS entry-clearing — a reused InMemory session can carry a prior invocation's clean stamp",
+      "sources": ["edge"],
+      "severity": "note",
+      "category": "state-hygiene",
+      "location": "tenant_scorer/callbacks/state_init.py:55-61, 236-238; tenant_scorer/constants.py:83",
+      "verification": "confirmed",
+      "detail": "state_init clears _COMPLIANCE_REVIEW_KEYS (VERIFICATION/FINAL review + repair keys + JUDGE_META) to '' at pipeline entry so 'a stale review from a previous invocation must never be read as this run's verdict' — but the new stamp key is NOT in that list. Extends r1 note #2. Production (Vertex/Database) is safe: ADK trims temp: keys from persisted deltas. InMemorySessionService (tests/dev) reuses the session dict, so a prior invocation's clean stamp could survive and satisfy a new run's cross-check if that run's judge produces nothing AND its callback does not re-stamp.",
+      "recommended_fix": "Add STATE_COMPLIANCE_REVIEW_VERDICT to _COMPLIANCE_REVIEW_KEYS in state_init.py (and optionally pop it in the gate finally blocks alongside JUDGE_META)."
+    },
+    {
+      "title": "Stamp's 'parseable' field is write-only dead state; the prop-failure warning hardcodes review_parseable=False though the triggering stamp always has parseable=True",
+      "sources": ["blind", "architecture"],
+      "severity": "note",
+      "category": "dead-state",
+      "location": "tenant_scorer/callbacks/compliance_enforcement.py:164 (write); guards boundary_compliance_remediation.py:334-338 + final_compliance_remediation.py:280-284 (read only passed/violation_count); warning extra boundary:339-346 + final:285-292",
+      "verification": "confirmed",
+      "detail": "Grep confirms no get('parseable') reader of the stamp in tenant_scorer/; both guards consume only passed/violation_count/judge_kind. passed=True is only ever stamped with parseable=True (_emit_review_telemetry), so every firing of the clean_verdict_state_prop_failure warning concerns a parseable verdict, yet the warning logs review_parseable=False (hardcoded) — conflating 'slot missing at finalize' with 'judge output unparseable' in the BQ/Sentry contract.",
+      "recommended_fix": "Drop 'parseable' from the stamp (+ its test assertions), or log the stamp's actual value: 'review_parseable': verdict.get('parseable')."
+    },
+    {
+      "title": "r1 imprecise ctx.state comment re-asserted in NEW r2 comment lines ('snapshot taken at construction' — ADK wraps session.state by reference)",
+      "sources": ["acceptance", "architecture"],
+      "severity": "note",
+      "category": "doc-accuracy",
+      "location": "tenant_scorer/agent.py:594-597, 670-676; tenant_scorer/callbacks/boundary_compliance_remediation.py:311-315",
+      "verification": "confirmed (carry-forward since r1, re-added)",
+      "detail": "ADK 2.2.0 Context.__init__ sets self._state = State(value=session.state, ...) — the SAME dict by reference, not a copy. The None-read divergence arises only when the session service REASSIGNS session.state mid-run. The new r2 comments repeat the r1-flagged imprecise 'snapshot taken at construction' wording and could mislead future maintainers about when ctx.state goes stale.",
+      "recommended_fix": "Reword to: 'ctx.state._value references the session.state dict captured at construction; if the session service reassigns session.state during a child run_node, that reference goes stale while ctx.session.state re-reads the live attribute.'"
+    },
+    {
+      "title": "Final gate lacks the dirty-stamp (passed=False) fail-close test the boundary gate has, at both gate + finalize levels",
+      "sources": ["codebase"],
+      "severity": "note",
+      "category": "coverage-gap",
+      "location": "tests/unit/test_gate_state_marshalling.py:298-321 (TestFinalGateDefensiveCrossCheck); :381-426 (TestFinalizeFinalGateCrossCheck)",
+      "verification": "confirmed",
+      "detail": "Boundary gate pins the dirty-stamp direction at gate level (test_dirty_stamp_does_not_prevent_abort, :176) + finalize level (test_none_review_with_dirty_stamp_fail_closes, :340). The parallel final-gate classes test only clean-stamp / no-stamp / passed=True-with-violations. The W2 hardening itself IS tested for both gates (test_passed_true_with_violations_still_fail_closes). The dirty-stamp path runs the same fall-through branch as the tested no-stamp case, so risk is low — but the explicit dirty-stamp assertion is unpinned for the final gate.",
+      "recommended_fix": "Mirror the boundary classes: add test_dirty_stamp_does_not_prevent_abort to TestFinalGateDefensiveCrossCheck and test_none_review_with_dirty_stamp_fail_closes to TestFinalizeFinalGateCrossCheck with judge_kind 'final'."
+    }
+  ],
+
+  "advisory_gate": {
+    "source": "tests",
+    "title": "Advisory test gate: PASS",
+    "detail": "Full unit suite 2049 passed (10 warnings); test_gate_state_marshalling.py 18 passed; no skips/xfails; no tautological asserts. B1 event-name + core state-view fix (both gates, clean+missing) + W1 producer path + W2 inconsistent-stamp hardening all traced to real passing tests. Codespell + ruff clean. P0=100%, P1>=90%, overall>=80%."
+  },
+
+  "reviewer_agreement": [
+    "Stale-dirty-review vs clean-stamp cross-check gap: 2 independent lenses (blind + edge) confirmed the code structure (cross-check gated on review=None; slot never cleared between attempts). Highest-confidence NEW finding — reachability of the triggering window is the only open question."
+  ],
+
+  "perkins_independent_checks": {
+    "b1_event_name_restored_no_other_token_renamed": "CONFIRMED: compliance_enforcement.py:239 'compliance.review_unparseable' (== parent 4e0146f:179); the separate 'compliance.repair_unparsable' (:435) was always 'unparsable' in parent (:356) — distinct frozen token, not a sed victim; coerce_json_state.unparsable + compliance_repair.unparsable unchanged. codespell ignore 'unparseable' at pyproject.toml:101.",
+    "w1_producer_tests_real": "CONFIRMED: 5 tests call the real log_boundary/final_compliance_review callbacks (not hand-seeded) and assert all 6 stamp fields off the judge ctx. All pass.",
+    "w2_hardening_both_directions": "CONFIRMED: both guards require passed is True AND violation_count==0; clean (0 violations) does not abort; inconsistent (passed=True, violation_count>0) aborts; both gates covered.",
+    "core_fix_unchanged": "CONFIRMED: all gate reads use ctx.session.state (agent.py:603,628,677,693,713); the 3 ctx.state.get(STATE_PIPELINE_ERROR) reads (:252,578,658) are node-local early-exits (correct); scrub_boundary_violations(ctx.state,...) at :615 is the out-of-scope r1 note #6. finalize signatures now 'State | dict' (W2-era, correct).",
+    "load_bearing_invariant_all_three_directions": "CONFIRMED: (1) genuinely-missing judge -> fail-close; (2) clean stamp + None review -> does NOT abort; (3) inconsistent stamp (passed=True, violation_count>0) -> fail-close. (A 4th direction — stale dirty review + clean stamp — is NOT in the stated invariant and is filed as note N1.)",
+    "suite_claim_real": "CONFIRMED: uv run pytest tests/unit -q -> '2049 passed, 10 warnings in 12.51s'. ruff check . -> All checks passed!. uv run --group lint codespell -> exit 0.",
+    "no_new_regressions_in_delta": "CONFIRMED: r2 delta (39443b2..b1ebd96) is strictly B1 (1-char event-name restore + codespell ignore-word) + W1 (5 producer tests) + W2 (2 'and violation_count==0' additions + 2 W2 tests). Nothing beyond that scope; core gate reads untouched."
+  },
+
+  "verdict": "READY TO MERGE",
+  "verdict_reason": "Fix-audit clean: r1 blocker B1 (telemetry event-name typo) FIXED with the contract intact and no other token renamed; r1 warnings W1 (producer-path tests) + W2 (violation_count hardening) FIXED with real tests covering both directions; the core state-marshalling fix is unchanged and correct. 0 blockers, 0 warnings. The 5 new notes are all non-blocking defense-in-depth / state-hygiene / doc-accuracy / coverage nits (the lead one — stale-dirty-review vs clean-stamp — is pre-existing since r1, outside the stated invariant, and its reachability is unverified). All 6 r1 notes carry forward unchanged (out of r2 scope). Suite 2049 passed; ruff + codespell clean.",
+  "review_event": "approve"
+}

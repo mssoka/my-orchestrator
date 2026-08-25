@@ -1,0 +1,62 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "exhaust-gate",
+    "title": "exhaust_reference_call documents a correction_cycles>=1 gate that its WHERE clause does not contain",
+    "location": "server/src/reference_checks/sql/exhaust_reference_call.sql:28-29",
+    "evidence": "+-- failure sites (email bounce / SMS failure webhooks, wrong-person route)\n+-- when the row already ran its correction (correction_cycles >= 1): instead\n+-- Guarded single-UPDATE (AD-14): only live pre-correction states\n+-- (queued / contact_initiated — the states the sweep sends from) plus the\n+-- caller's correction_cycles gate; a 0-row result means someone else\n+-- transitioned first and the writer stands down.\nWHERE id = $1\n  AND status IN ('queued', 'contact_initiated')\nRETURNING id::text;",
+    "detail": "The documented firing condition (correction_cycles >= 1) exists only in the header and as a caller obligation — the SQL itself fires on any never-corrected live row. The suite calls rc_sql.exhaust_reference_call directly, so a first-failure row can be terminalized and then stamped, the fabricated signal the header calls impossible.",
+    "recommended_fix": "Add AND correction_cycles >= 1 to the WHERE so the one-cycle rule lives in the SQL, or reword the header to state the SQL is deliberately unguarded."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "timestamp-format",
+    "title": "W3 gate compares mismatched timestamp formats — a same-day stale bounce can compare as post-correction and falsely exhaust",
+    "location": "server/src/reference_checks/sql/find_reference_call_by_send_ref.sql (r1 W3 hunk)",
+    "evidence": "+       COALESCE((\n+         SELECT e->>'at'\n+         FROM jsonb_array_elements(rc.attempts) AS e\n+         WHERE e->>'detail' = $4 AND e->>'outcome' = 'delivered'\n+         ORDER BY e->>'at' DESC\n+         LIMIT 1\n+       ), '') AS matched_send_at,\n+       -- r1 W3: the correction instant ('' for never-corrected rows).\n+       COALESCE(rc.corrected_at::text, '') AS corrected_at,\n+       SET attempts = attempts || jsonb_build_array(jsonb_build_object('at', to_char(now(), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), 'channel', 'email', 'outcome', 'delivered', 'detail', 'new_send_1')),",
+    "detail": "matched_send_at is 'T'/'Z' ISO text from attempts; corrected_at is timestamptz::text (space separator, session-timezone offset). Lexically 'T' (0x54) > ' ' (0x20), so any same-day send sorts after the correction instant — a pre-correction redelivery compares as post-correction and falsely exhausts + stamps. Tests span different days only, so they cannot catch it.",
+    "recommended_fix": "Emit corrected_at via the same to_char('YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') format (or compare parsed timestamps), and add a same-day stale-bounce test."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "takeover-correct",
+    "title": "correct on a taken-over row re-queues into a state the sweep permanently ignores",
+    "location": "server/src/reference_checks/sql/correct_reference_call.sql:32-36 / sweep_claim_t0.sql:32-34",
+    "evidence": "+    attempt_count = 0,\n+    form_token = NULL,\n+    form_token_expires_at = NULL,\n+    next_attempt_at = now(),\n+    updated_at = now()\n+WHERE id = $1\n+  AND application_id = $2\n+  AND status = 'awaiting_correction'::reference_call_status\nRETURNING id::text;\n+  -- r1 (N12): a take-over landing between the due-SELECT and the send must\n+  -- not be followed by a T0 invite — the landlord is handling it (A7).\n+  AND taken_over_at IS NULL",
+    "detail": "correct clears form_token and re-arms the clock but never clears taken_over_at; the T0 claim (and advance, due-SELECT) all guard taken_over_at IS NULL. The B1-promised fresh invite can never fire for a taken-over row — only manual record can advance it, and the corrected contact is never re-invited.",
+    "recommended_fix": "Clear taken_over_at in correct_reference_call (or the handler) when re-queueing, or explicitly reject correct on taken-over rows."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "stale-form-state",
+    "title": "Correction clears the token but not form_opened_at/draft_answers — the prior referee's form state survives into the re-invite",
+    "location": "server/src/reference_checks/sql/correct_reference_call.sql:32-34 / sweep_due_reference_calls.sql (form_opened_at, draft_answers)",
+    "evidence": "+    attempt_count = 0,\n+    form_token = NULL,\n+    form_token_expires_at = NULL,\n        rc.form_token,\n        COALESCE(rc.form_opened_at::text, '') AS form_opened_at,\n        COALESCE(rc.draft_answers::text, '')  AS draft_answers,",
+    "detail": "sweep_due (the re-invite read) selects form_opened_at and draft_answers; a wrong-person row corrected via B1 keeps both. The fresh invite carries the previous referee's opened-at and draft answers instead of a clean form state.",
+    "recommended_fix": "Also NULL form_opened_at and draft_answers in correct_reference_call so the corrected referee's re-invite starts with clean state."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "vacuous-control",
+    "title": "New payload negative control is vacuous — the sentinel string appears nowhere in the diff",
+    "location": "server/test/integration/reference_detail_payload_integration_test.gleam (payload_does_carry_public_reference_data_test)",
+    "evidence": "+  // RC4.3 note: the referee's CONTACT snapshot now legitimately rides the\n+  // payload (the §7.7 take-over chips + §8.3 edit prefill need it) — the\n+  // negative control moved to a still-internal marker (form_token is never\n+  // selected by the detail read).\n+  string.contains(body, \"form_token_internal_sentinel\") |> should.be_false",
+    "detail": "Unless a fixture outside this diff seeds a form_token with exactly 'form_token_internal_sentinel', the assertion cannot fail — a real form_token leak carrying any other value passes. The replaced control (a real seeded email absent from the body) actually bit.",
+    "recommended_fix": "Seed the fixture row's form_token with the sentinel value before fetching so the absence assertion has teeth."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "substitute-existing",
+    "title": "Substitute's 'existing' successor can be a skipped/awaiting_correction row — 200 with no queued successor",
+    "location": "server/src/reference_checks/sql/substitute_reference_call.sql:22-32",
+    "evidence": "+  ON CONFLICT (application_id, ref_slot, owner_label) WHERE status NOT IN (\n+    'form_completed', 'unreachable', 'refused', 'objected',\n+    'manual_recorded', 'failed', 'completed', 'partial'\n+  )\n+  DO NOTHING\n+  AND rc.status NOT IN (\n+    'form_completed', 'unreachable', 'refused', 'objected',\n+    'manual_recorded', 'failed', 'completed', 'partial'\n+  )",
+    "detail": "The live-slot predicates exclude only the listed terminals; 'skipped' and 'awaiting_correction' rows both conflict and qualify as 'existing'. Substituting a terminal row when such a row occupies the slot returns a 200 no-op — the landlord's new referee is never queued or invited.",
+    "recommended_fix": "Restrict the conflict/existing predicates (and the matching partial index) to invite-able states such as queued/contact_initiated, or 409 when the occupant is not invite-able."
+  }
+]

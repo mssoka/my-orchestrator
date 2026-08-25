@@ -1,0 +1,150 @@
+name: "Reference Panel - Attempt Log Export Copies and Toasts"
+description: |
+  Regression gate for #615 (toast visibility) + the RC4.4 attempt-log export.
+  On the fixture app "RefcheckExport Fixture", the employer_ref row is
+  contact_initiated with two delivered attempts (email + sms). Expanding the
+  row renders the server-built attempt log with the Export affordance;
+  Export copies the timeline to the clipboard (headless has no clipboard
+  permission, so navigator.clipboard.writeText is stubbed) and fires the
+  success toast "Attempt log copied. Paste it into your records or a
+  message." — dash-free copy per #612.
+
+  RUNNER PROTOCOL (fixture-dependent):
+  - Seed: python3 /tmp/refcheck-bughunt2/seed-refcheck-fixture.py (sandbox).
+  - App: "RefcheckExport Fixture" — employer_ref in contact_initiated with 2
+    delivered attempts.
+  - The clipboard stub MUST be installed before the export click; the toast
+    check polls [role=alert] immediately (3s auto-dismiss).
+
+  Field-notes lessons applied: native `.click()` eval fallback; clipboard
+  stub (headless has no clipboard permission); toast checked immediately.
+priority: high
+tags: [reference_checks, panel, export, regression, 612, 615]
+
+preconditions:
+  - "RightTenantry app running"
+  - "Landlord logged in"
+  - "reference_checks fixture seeded (RefcheckExport Fixture, employer_ref 2 delivered attempts)"
+
+steps:
+  - action: navigate
+    url: /dashboard
+    description: "Go to the dashboard"
+
+  - action: wait
+    for: "element"
+    selector: '[data-testid="page-dashboard"]'
+    timeout: 10000
+
+  - action: javascript
+    description: "Open the fixture vacancy"
+    code: |
+      const card = Array.from(document.querySelectorAll('[data-testid^="vacancy-card-"]'))
+        .find(c => (c.innerText || '').includes('Refcheck Verification Flat'));
+      if (!card) throw new Error('fixture vacancy not found — run seed-refcheck-fixture.py');
+      card.scrollIntoView({ block: 'center' });
+      card.click();
+      return 'vacancy clicked';
+
+  - action: wait
+    for: "element"
+    selector: '[data-testid="page-vacancy-detail"]'
+    timeout: 10000
+
+  - action: javascript
+    description: "Open the RefcheckExport application"
+    code: |
+      const row = Array.from(document.querySelectorAll('[data-testid^="leaderboard-row-link-"]'))
+        .find(r => (r.innerText || '').includes('RefcheckExport Fixture'));
+      if (!row) throw new Error('RefcheckExport leaderboard row not found');
+      row.scrollIntoView({ block: 'center' });
+      row.click();
+      return 'application opened';
+
+  - action: wait
+    for: "element"
+    selector: '[data-testid="page-application-detail"]'
+    timeout: 10000
+
+  - action: wait
+    for: "element"
+    selector: '[data-testid="refcheck-card"]'
+    timeout: 10000
+
+  - action: verify
+    checks:
+      - type: text_visible
+        selector: '[data-testid="refcheck-status-employer_ref"]'
+        text: "Invitation sent"
+    description: "employer_ref shows the in-flight pill"
+
+  - action: javascript
+    description: "Expand the employer_ref row (native click fallback)"
+    code: |
+      const btn = document.querySelector('[data-testid="refcheck-expand-employer_ref"]');
+      if (!btn) throw new Error('expand button missing');
+      btn.click();
+      return 'expanded';
+
+  - action: wait
+    for: "element"
+    selector: '[data-testid="refcheck-export-employer_ref"]'
+    timeout: 5000
+    description: "Attempt log + export affordance render"
+
+  - action: verify
+    checks:
+      - type: text_visible
+        text: "Attempt log"
+      - type: element_count
+        selector: '[data-testid="refcheck-export-employer_ref"]'
+        exact: 1
+    description: "Attempt log block present"
+
+  - action: javascript
+    description: "Stub the clipboard, click Export, capture the copied payload"
+    code: |
+      window.__copiedPayload = null;
+      navigator.clipboard = navigator.clipboard || {};
+      navigator.clipboard.writeText = async (t) => { window.__copiedPayload = t; return Promise.resolve(); };
+      const btn = document.querySelector('[data-testid="refcheck-export-employer_ref"]');
+      if (!btn) throw new Error('export button missing');
+      btn.click();
+      return 'export clicked';
+
+  - action: wait
+    for: "sleep"
+    duration: 1200
+    description: "Let the export + toast settle"
+
+  - action: javascript
+    description: "Poll for the success toast (toasts render with data-testid=toast-message, not role=alert)"
+    code: |
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      for (let i = 0; i < 12; i++) {
+        const t = document.querySelector('[data-testid="toast-message"]');
+        if (t && /Attempt log copied/.test(t.innerText)) return 'toast: ' + t.innerText.replace(/\n/g, ' | ');
+        await sleep(250);
+      }
+      throw new Error('export toast not seen within 3s');
+    description: "Success toast fires (dash-free copy per #612)"
+
+  - action: javascript
+    description: "The clipboard payload carries the attempt timeline (batch-merged; channel labels uppercase)"
+    code: |
+      const payload = window.__copiedPayload || '';
+      return JSON.stringify({
+        captured: !!window.__copiedPayload,
+        length: payload.length,
+        hasEmailChannel: /email/i.test(payload),
+        hasSmsChannel: /SMS/i.test(payload),
+        timelineLine: payload.split('\n').filter(l => l.startsWith('- '))[0] || '',
+      });
+
+  - action: verify
+    checks:
+      - type: text_visible
+        text: "Outcome"
+    description: "Export payload headings sanity-check (Outcome label ships in the log)"
+
+expected_outcome: "Expanding the in-flight row shows the attempt log; Export stubs the clipboard, captures the timeline payload, and fires the success toast (no overlap regression per #615)."

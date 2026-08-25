@@ -1,0 +1,159 @@
+{
+  "round": "r1",
+  "job": "righttenantry-refcheck-rc1-1-grapheme-fix",
+  "pr": 608,
+  "reviewed_sha": "c25201910827ec49f6a58ccad15929b43c64eb32",
+  "diff_file": "/Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc1-1-grapheme-fix/r1/diff.patch",
+  "diff_stats": { "lines": 434, "chunked": false },
+  "lenses": {
+    "total": 7,
+    "completed": 7,
+    "failed_layers": [],
+    "retries": 0
+  },
+  "wave_validation": {
+    "blind": "OK 5 findings",
+    "edge": "OK 2 findings",
+    "acceptance": "OK 1 findings",
+    "security": "OK 1 findings",
+    "architecture": "OK 0 findings",
+    "codebase": "OK 1 findings",
+    "tests": "OK 3 findings"
+  },
+  "raw_findings": 13,
+  "verification": {
+    "confirmed": 12,
+    "rejected": 1,
+    "unverifiable_speculative": 0,
+    "rejected_detail": [
+      "blind blocker 'slice_codepoint_bounded cannot compile (to_utf_codepoints returns Result)' — FALSE: gleam_stdlib 0.70.0 src/gleam/string.gleam:646 declares `pub fn to_utf_codepoints(string: String) -> List(UtfCodepoint)` and :695 `pub fn from_utf_codepoints(List(UtfCodepoint)) -> String` (no Results). Server compiled and `gleam test` passed 1484 tests at this exact sha — the fix compiles and runs."
+    ]
+  },
+  "reviewer_agreement": [
+    "PTA CHECK-citation inconsistency — reported independently by acceptance, blind, and codebase lenses; confirmed against supabase/migrations/20260512182900_constraint_parity_with_staging.sql (drops payment_terms_acceptance_ip_text_check / payment_terms_acceptance_user_agent_check) and consent_integration_test.gleam:327-328."
+  ],
+  "findings": [
+    {
+      "source": ["acceptance", "blind", "codebase"],
+      "severity": "note",
+      "category": "docs",
+      "title": "New consent-test comment (and spec) cite payment_terms_acceptance as a live 64/512 CHECK site; the parity migration dropped those CHECKs and this same PR's request_helpers doc says so",
+      "location": "server/test/integration/consent_integration_test.gleam:327-328; _bmad-output/implementation-artifacts/spec-rc1-1-grapheme-fix.md:17; server/src/request_helpers.gleam:15-17",
+      "evidence": "consent_integration_test.gleam:327-328: '// (refcheck rc1-1 deferred fix regression pin; same CHECK idiom as // payment_terms_acceptance and application.submitted_*.)' vs request_helpers.gleam:15-17: '//// Note: of the three original 64/512 CHECK sites, only //// `cookie_consent_log` and `application.submitted_*` still carry the //// constraints (the `payment_terms_acceptance` ones were dropped by //// the 2026-05-12 constraint-parity migration).' vs supabase/migrations/20260512182900_constraint_parity_with_staging.sql:52-53: 'ALTER TABLE payment_terms_acceptance DROP CONSTRAINT IF EXISTS payment_terms_acceptance_ip_text_check; ALTER TABLE payment_terms_acceptance DROP CONSTRAINT IF EXISTS payment_terms_acceptance_user_agent_check;'",
+      "detail": "Doc-only inconsistency introduced/reinforced by this PR's new files. Zero functional impact: the test targets cookie_consent_log (which does carry the CHECK), and PTA's columns remain bounded uniformly by the helper.",
+      "recommended_fix": "Reword the consent-test comment (and, if editable, the frozen spec note) to reference only cookie_consent_log and application.submitted_* as live CHECK sites, matching the corrected request_helpers.gleam module comment.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["security"],
+      "severity": "note",
+      "category": "boundary",
+      "title": "client_ip still crashes on invalid UTF-8 in X-Forwarded-For: string.trim raises badarg before slice_codepoint_bounded's decoder runs — the 'truncation, not a crash' doc contract holds only for the UA path",
+      "location": "server/src/request_helpers.gleam:44-45 (trim before decode); doc claim at :72-73",
+      "evidence": "request_helpers.gleam:44-45: 'Ok(#(first, _)) -> string.trim(first) |> slice_codepoint_bounded(64)' / 'Error(_) -> string.trim(value) |> slice_codepoint_bounded(64)'; doc: '/// - Headers are raw bytes; on a byte that is not a valid UTF-8 codepoint the decoder stops and the remainder is dropped (truncation, not a crash).' Empirically: erl -eval 'io:format(\"~p\", [(catch string:trim(<<255,97>>))])' -> {'EXIT',{{badarg,...}}}. Old code also trimmed identically (string.slice also raised on invalid UTF-8), so this is pre-existing, not a regression.",
+      "detail": "A raw 0xFF byte in XFF still 500s /apply/consent before the new decoder is reached. Pre-existing (old code identical), raw-socket clients only; the fix's documented truncation guarantee is overstated for client_ip.",
+      "recommended_fix": "Trim/split bytes before decoding, or document that client_ip's trim path predates the decoder guarantee. Out of this PR's scope either way.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["edge"],
+      "severity": "note",
+      "category": "input-validation",
+      "title": "NUL (U+0000) in a header passes slice_codepoint_bounded untouched; Postgres rejects 0x00 in text, so the write path can still 500 for raw-socket clients",
+      "location": "server/src/request_helpers.gleam:81-86",
+      "evidence": "gleam_stdlib 0.70.0 to_utf_codepoints_loop: 'case bit_array { <<first:utf8_codepoint, rest:bytes>> -> to_utf_codepoints_loop(rest, [first, ..acc]) _ -> list.reverse(acc) }' — NUL is valid UTF-8 so it is kept; mist's header parser accepts NUL (decode_packet httph_bin verified by lens); psql verified: INSERT of E'\\x00' -> ERROR: invalid byte sequence for encoding \"UTF8\": 0x00.",
+      "detail": "Same 500 class the fix exists to eliminate, triggered by NUL instead of length. Pre-existing (old string.slice also kept NUL), out of scope for a codepoint-bounds fix, browsers/proxies never send NUL.",
+      "recommended_fix": "Not required for this PR. If ever hardened: strip C0 control bytes (0x00-0x1F) at the header boundary before slicing.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["edge"],
+      "severity": "note",
+      "category": "docs",
+      "title": "Doc comment 'never displayed or parsed' omits the DSAR export, which serializes submitted_ip_text/submitted_user_agent into the data subject's export",
+      "location": "server/src/request_helpers.gleam:72-73 vs server/src/dsar/dsar_handler.gleam:378-379",
+      "evidence": "request_helpers.gleam:72-73: '/// - The cut may land mid-grapheme ... Harmless — these values are stored for evidentiary/fraud comparisons, never displayed or parsed.' vs dsar_handler.gleam:378-379: '#(\"submitted_ip_text\", json.string(app.submitted_ip_text)), #(\"submitted_user_agent\", json.string(app.submitted_user_agent)),'",
+      "detail": "A dangling ZWJ or lone emoji member from a mid-grapheme cut lands in the applicant's DSAR export JSON. JSON stays valid; impact is cosmetic display of stored evidence.",
+      "recommended_fix": "Name the DSAR export consumer in the module comment (or accept the trade-off explicitly). Doc-only; no behavior change needed.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "note",
+      "category": "docs",
+      "title": "XFF unit-test comment says 140 codepoints; the assertion on the same string says 150",
+      "location": "server/test/request_helpers_test.gleam:67",
+      "evidence": "request_helpers_test.gleam:66-68: 'let xff = string.repeat(family_emoji, 20) <> \", 10.0.0.1\" // 20 graphemes = 140 codepoints, over the 64-char ip_text CHECK. codepoint_length(xff) |> should.equal(150)'",
+      "detail": "Comment describes only the emoji portion (140); the assertion counts the full string including the 10-codepoint ', 10.0.0.1' suffix. Reads as a contradiction without that inference.",
+      "recommended_fix": "Amend comment: '20 graphemes = 140 codepoints, plus 10 for \", 10.0.0.1\", = 150 total.'",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "note",
+      "category": "docs",
+      "title": "request_helpers header comment still enumerates only payment_handler and consent_handler ('both store the values') while the diff's own doc comments add application.submitted_*",
+      "location": "server/src/request_helpers.gleam:4-8",
+      "evidence": "request_helpers.gleam:4-8: '//// `client_ip` and `client_user_agent` were duplicated across //// payment_handler (payment_terms_acceptance audit), consent_handler //// (cookie_consent_log audit) — both store the values for DPC //// evidentiary purposes.' vs :58-59: '/// User-Agent string truncated to 512 characters (matches the /// `cookie_consent_log.user_agent` and `application.submitted_user_agent` /// CHECK constraints).'",
+      "detail": "The header is a historical-origin statement (duplication story), so not false, but as a consumer map it omits application_handler — partially-updated comment.",
+      "recommended_fix": "Add application_handler (application.submitted_*) to the header's consumer list and reword 'both' to 'all callers'.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["blind"],
+      "severity": "note",
+      "category": "docs",
+      "title": "GDPR test comment misstates what grapheme slicing would retain for its own 100-grapheme input (says 512 graphemes = 3584; would actually keep all 100 graphemes = 700 codepoints)",
+      "location": "server/test/integration/gdpr_integration_test.gleam:2782-2785",
+      "evidence": "gdpr_integration_test.gleam:2783-2785: '/// so 100 graphemes = 700 characters by Postgres `length()`. Grapheme /// slicing (Gleam `string.slice`) would keep 512 graphemes = 3584 /// characters past the 512 CHECK and 500 the write path;' — the pinned input is 100 graphemes, so old slicing would keep 700 codepoints, not 3584. The sibling unit-test comment states it correctly.",
+      "detail": "The 3584 figure is the general worst case (512 graphemes x 7 codepoints); for this test's own input the retained value would be 700 codepoints. Doc nit; the pin itself is correct.",
+      "recommended_fix": "Reword: 'grapheme slicing would keep all 700 codepoints (100 graphemes), past the 512 CHECK'; reserve 3584 for the general case.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage-gap",
+      "title": "Payment caller (payment_terms_acceptance) has no regression pin on stored ip_text/user_agent values",
+      "location": "server/src/payment/payment_handler.gleam:157-158",
+      "evidence": "payment_handler.gleam:157-158: 'let ip_text = request_helpers.client_ip(req) let user_agent = request_helpers.client_user_agent(req)' — grep for user_agent|ip_text in server/test/integration/payment_integration_test.gleam returns 0 matches; tests there only count rows.",
+      "detail": "P3 gap: no unit or integration test asserts the stored PTA values. Note PTA's CHECKs are dropped (no 500 risk there), so the pin would only catch a caller-side behavior revert.",
+      "recommended_fix": "Optional: add a payment integration test posting accept-terms with an emoji-heavy UA/XFF and assert stored length(user_agent)<=512 / length(ip_text)<=64.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage-gap",
+      "title": "XFF no-comma branch (string.split_once Error path) lacks a multi-codepoint pin",
+      "location": "server/src/request_helpers.gleam:46-47",
+      "evidence": "request_helpers.gleam:45-47: 'Ok(#(first, _)) -> string.trim(first) |> slice_codepoint_bounded(64) Error(_) -> string.trim(value) |> slice_codepoint_bounded(64)' — all new emoji unit tests use the comma path; the Error branch is only covered by pre-existing ASCII tests that cannot distinguish codepoint from grapheme slicing.",
+      "detail": "P3 gap: a revert of just this branch to string.slice would escape the new pins. Same helper is called, so only a deliberate partial revert would regress.",
+      "recommended_fix": "Optional: add a unit test with an emoji-only x-forwarded-for (no comma) asserting exactly 64 codepoints.",
+      "verification": "confirmed"
+    },
+    {
+      "source": ["tests"],
+      "severity": "note",
+      "category": "coverage-gate",
+      "title": "Advisory test gate: PASS",
+      "location": "N/A",
+      "evidence": "make test-server: 1484 passed / 501 skipped at c252019 (reproduced by Perkins); request_helpers_test.gleam pins codepoint_length == 512/64, ASCII byte-identical, absent -> '', short passthrough, first-entry-only; gdpr_integration_test.gleam:2788 apply_submission_multi_codepoint_headers_bounded_test (status 200, ip_len 64, ua_len 512) and consent_integration_test.gleam:329 multi_codepoint_headers_within_check_bounds_test (status 204, ua_len 512, ip_len 64) both pass in isolation (Perkins-verified).",
+      "detail": "All 8 unit + 2 integration behaviours traced FULL. Negative control real for all 4 new tests under string.slice revert (2 unit + 2 integration, incl. /apply 500 path). P0 100%, P1 100%, overall ~95%; only P3 gaps (payment pin, no-comma branch).",
+      "recommended_fix": "None required; two optional P3 pins noted separately.",
+      "verification": "confirmed"
+    }
+  ],
+  "verdict": "READY TO MERGE",
+  "verdict_rule": "0 blockers -> READY TO MERGE",
+  "note_on_suite": "Perkins full-suite integration re-run: 499 passed + 2 failures, both in ai_integration_test at test_db.seed_landlord (scoring_gate_payment_unlocks_one_vacancy_only_test, burst_scorer_skips_already_scored_test). Verified NOT related to this PR: module untouched by the diff, both pass in isolation (62/62 ai module run green), failures are seed-dependent parallel-execution artifacts of unitest's shared-DB truncate-per-test model (parallel_threshold=50; ai module has 62 tests). Minion's own run at the same sha was 501 green.",
+  "verification_command_results": {
+    "make test-server (gleam test)": "1484 passed, no failures, 501 skipped, EXIT=0",
+    "gleam format --check src test": "clean",
+    "integration ai_invalid utf-8 module isolation": "62 passed, no failures",
+    "integration consent new test": "1 passed",
+    "integration gdpr new test": "1 passed",
+    "psql NUL check": "ERROR: invalid byte sequence for encoding \"UTF8\": 0x00 (Postgres rejects NUL)",
+    "erl string:trim invalid utf8": "badarg EXIT (security note confirmed)"
+  }
+}

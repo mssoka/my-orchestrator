@@ -1,0 +1,52 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gap",
+    "title": "Sub-tick interpolation core (interp_continuous guard + packet_interp_pos row-roll/snap) has zero automated coverage — manual evidence only",
+    "location": "app/render/view.odin:1306",
+    "evidence": "app/render/view.odin:1306-1308:\n\t\tif interp_alpha < 1.0 {\n\t\t\tpos, trail_world, trail_n = packet_interp_pos(v, topo, p, pos, tick, interp_alpha)\n\t\t}\n\ntools/ci-local.sh:56 (the CI gate that already tests app/render):\n  \"Core unit tests (the determinism + topology contracts)|mkdir -p bin && odin test core && for i in 1 2 3; do odin test app -out:bin/app-test || exit 1; done && odin test app/render -out:bin/render-test && odin test app/audio -out:bin/audio-test && odin test harness -out:bin/harness-test\"\n\nrepo-wide grep for interp_continuous|packet_interp_pos|packet_interp_reset|packet_interp_prune|pkt_interp outside view.odin (no *_test.odin file appears):\napp/main.odin:614:\trnd.packet_interp_reset(&app.view)\nharness/motion_strip.odin:115:\trnd.packet_interp_reset(&rc.view) // a fresh cache per invocation (belt+braces)",
+    "detail": "P0 critical path of this round's hard bar (identity-guarded snap on spawn/sever/reroute, no ghosts). Traceable only to manual artifacts: motion-strip verb is in no CI gate (.github/workflows/ci.yml has no motion entry); T1/T2/replay run at alpha=1.0 and never execute it.",
+    "recommended_fix": "Add app/render/motion_test.odin pinning interp_continuous's four continuous kinds + every teleport snap + row-roll alpha 0/1 endpoints; it joins the existing `odin test app/render` CI gate (hud_test.odin precedent)."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Trail ring push/shift invariants untested anywhere",
+    "location": "app/render/view.odin:315-331",
+    "evidence": "app/render/view.odin:315-331:\n\tif moved {\n\t\t// the DRAWN world position (the lerped one — echoes lag the live\n\t\t// packet by the same glide)\n\t\tdwx, dwy := from_screen(v, out.x, out.y)\n\t\ttrail := row.trail\n\t\tif row.trail_n < len(trail) {\n\t\t\t// append at [n] — 0 is the oldest, n-1 the newest\n\t\t\ttrail[row.trail_n] = {dwx, dwy}\n\t\t\trow.trail_n += 1\n\t\t} else {\n\t\t\t// full — drop the oldest, shift, newest at [2]\n\t\t\tfor k in 0..<len(trail) - 1 {\n\t\t\t\ttrail[k] = trail[k + 1]\n\t\t\t}\n\t\t\ttrail[2] = {dwx, dwy}",
+    "detail": "P2 gap: ring ordering (oldest [0], newest [2]), capacity handoff, and the 0.5px moved-gate are pinned by no @(test) and no golden (trails never render at alpha=1.0). A shift regression mis-orders or smears echoes silently.",
+    "recommended_fix": "Unit-test via packet_interp_pos across ≥4 consecutive pushes: assert trail_n ≤ 3, slot order oldest→newest, and that a stationary packet pushes nothing."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Reduced-motion echo-off gate is unreachable by every automated gate — a11y_reduced golden cannot exercise it",
+    "location": "app/render/view.odin:1349",
+    "evidence": "app/render/view.odin:1306-1308:\n\t\tif interp_alpha < 1.0 {\n\t\t\tpos, trail_world, trail_n = packet_interp_pos(v, topo, p, pos, tick, interp_alpha)\n\t\t}\napp/render/view.odin:1349:\n\t\tif trail_n > 0 && !v.reduced_motion {\nharness/run.odin:489-490 (the golden capture — interp_alpha defaulted to 1.0, so trail_n is always 0):\n\t\t\t\timg := capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health,\n\t\t\t\t\tstate.health_enabled, sim_tick, state.era, state.seed, prev)",
+    "detail": "P2 gap: the E9.2/7.3 canon contract (echoes off, glide stays) is only exercisable via manual `motion-strip` of an a11y demo; the a11y_reduced T2 golden pins pulse_read's reduced path only, never the trail branch.",
+    "recommended_fix": "Add a unit assertion of the draw predicate (trail_n>0 && !reduced_motion), or gate a motion-strip a11y_reduced interp run asserting zero echo pixels appear."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "packet_interp_prune bound and run-start cache reset have no coverage",
+    "location": "app/render/view.odin:186-198",
+    "evidence": "app/render/view.odin:186-198:\n\tlive := len(flow.packets)\n\tif len(v.pkt_interp) <= max(128, live*2+64) {\n\t\treturn\n\t}\n\tfresh := make(map[u64]Packet_Interp_Entry, live+16)\n\tfor p in flow.packets {\n\t\tif e, ok := v.pkt_interp[p.id]; ok {\n\t\t\tfresh[p.id] = e\n\t\t}\n\t}\n\tdelete(v.pkt_interp)\n\tv.pkt_interp = fresh\napp/main.odin:614:\trnd.packet_interp_reset(&app.view)",
+    "detail": "P3 gap: the monotonic-id row bound and the stale-row reset across runs are app-path hygiene with no test; a prune regression grows the map unboundedly in long sessions.",
+    "recommended_fix": "Extend the motion unit test: prune keeps only live ids and no-ops under threshold; reset empties the map."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "N/A",
+    "detail": "P0 (sub-tick interpolation + identity guard) 0% automated — manual evidence only. P1 snapshot-exact default path 100% (46/46 demos green, verified by running the harness). Packet-size re-bless + motion T1/replay 100%. Overall ≈43% (3/7 behaviors gated). P0 <100% → FAIL.",
+    "recommended_fix": "Ship app/render/motion_test.odin (interp_continuous identity cases, row-roll endpoints, trail ring order, prune/reset) in the existing `odin test app/render` CI gate — raises P0/P2 to 100%, gate flips to PASS."
+  }
+]

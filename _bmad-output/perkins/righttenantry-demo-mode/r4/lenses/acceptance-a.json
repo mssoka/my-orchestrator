@@ -1,0 +1,102 @@
+[
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "session",
+    "title": "still present since round 3: entering demo clobbers a live landlord session; exit downgrades auth to NotAsked",
+    "location": "client/src/client.gleam:5802 (enter_demo); client/src/model.gleam:751 (clear_demo_state)",
+    "evidence": "enter_demo: 'Model(\n          ..model,\n          route:,\n          auth: Success(landlord),\n          csrf_token: \"demo-csrf-token\",' — unconditional overwrite. clear_demo_state: 'demo_mode: False,\n    demo_store: None,\n    auth: NotAsked,'",
+    "detail": "A logged-in landlord who opens /demo loses SPA session state and exits to auth NotAsked, forcing a client-side re-auth despite an intact session cookie. Unchanged from r3 (carried since round 2).",
+    "recommended_fix": "Preserve the pre-demo auth on entry and restore it on exit, or re-check session on exit."
+  },
+  {
+    "source": "acceptance",
+    "severity": "warning",
+    "category": "ordering",
+    "title": "still present since round 3: demo exit from a dirty edit page clears demo state before the unsaved-changes guard fires",
+    "location": "client/src/client.gleam:491-497 (clear before handle_browser_change), 5391-5400 (dirty-edit guard)",
+    "evidence": "Exit arm: 'True ->\n              // Exiting the demo must clear every demo-populated store field\n              // — a stale Success(vacancies) would leak the fake vacancies\n              // onto a real landlord's dashboard after signup.\n              handle_browser_change(model |> model.clear_demo_state, uri, route)'. Guard: 'case model.vacancy_edit_has_unsaved_changes {\n            True -> #(\n              Model(\n                ..updated_model,\n                route: model.route,\n                show_unsaved_changes_prompt: True,'. clear_demo_state (model.gleam:747-768) does not reset vacancy_edit_has_unsaved_changes.",
+    "detail": "On exit-to-public from a dirty demo edit, the guard still sees the dirty flag against already-cleared demo state and modem.replace bounces back to /vacancies/<fixture-id>/edit, where demo_mode is now False and a real get_for_edit fetch fires.",
+    "recommended_fix": "Run the dirty-edit guard before clearing demo state, or suppress the prompt when the destination exits the demo."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "boundary",
+    "title": "After demo exit, in-session navigation (browser Back) to a v- fixture deep link fires real API calls — the is_demo_route guard exists only at boot",
+    "location": "client/src/client.gleam:499 (_, False arm); 5902-5915 (is_demo_route only called from init)",
+    "evidence": "'_, False -> handle_browser_change(model, uri, route)' with no is_demo_route check; handle_browser_change then runs 'routes.VacancyDetail(id) | routes.VacancyHandoff(id) -> ... vacancy_api.get_detail(id, ApiReturnedVacancyDetail)'. is_demo_route is invoked only in init: 'case is_demo_route(route) {'",
+    "detail": "Post-exit Back to /vacancies/v-maples issues real get_detail/leaderboard fetches for a fixture id (401 unauthenticated after clear_demo_state). Boot path re-enters demo; in-session path never does — the two disagree.",
+    "recommended_fix": "Check is_demo_route in the BrowserChangedUrl _, False arm and re-enter demo (or strip the fetch) for v- prefixed ids."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "analytics",
+    "title": "still present since round 3: deep-link demo boots fire only demo_entry; demo_entry_effects has no per-surface capture_event",
+    "location": "client/src/client.gleam:5861-5899 (demo_entry_effects), 5784 (only demo_entry)",
+    "evidence": "demo_entry_effects body: 'let base = [demo_api.fetch_notifications(store, ApiReturnedNotifications)]\n  let route_eff = case route {\n    routes.Demo | routes.Dashboard -> [\n      demo_api.list_vacancies(store, ApiReturnedDashboardData),\n    ]' — no capture_event anywhere; the navigation path fires them at 5214/5320/5348/5434.",
+    "detail": "A fresh boot into /vacancies/v-maples counts demo_entry but not demo_vacancy_open, while the identical in-session navigation counts both. Spec AC7 analytics undercount the shared-URL entry path.",
+    "recommended_fix": "Fire the matching surface event in demo_entry_effects' route arms."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "storage",
+    "title": "still present since round 3: comparison deep link passes persisted real localStorage ids into the demo store",
+    "location": "client/src/client.gleam:5885-5893 (demo_entry_effects Comparison arm)",
+    "evidence": "'routes.Comparison(vid) -> [\n      demo_api.fetch_comparison(\n        store,\n        vid,\n        load_comparison_ids(),\n        ApiReturnedComparisonDetails,\n      ),\n    ]'",
+    "detail": "A real landlord's persisted comparison ids (real UUIDs) are looked up in the demo store on boot; the navigation path's empty-ids guard is skipped, so the demo comparison deep link lands empty/erroring.",
+    "recommended_fix": "Mirror the navigation path's empty-ids guard and prefer fixture ids in demo."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "ux",
+    "title": "still present since round 3: failed demo seed desyncs model.route from the browser URL",
+    "location": "client/src/client.gleam:5852-5855 (enter_demo Error arm)",
+    "evidence": "'Error(_) -> #(\n      Model(..model, route: routes.Landing, demo_mode: False, demo_store: None),\n      effect.none(),\n    )'",
+    "detail": "On seed failure the address bar stays /demo while Landing renders; no navigation effect, no feedback, no session check.",
+    "recommended_fix": "Return modem.replace(\"/\", None, None) so the rendered route matches the URL."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "ux",
+    "title": "still present since round 3: edit deep-link boot renders the empty editable form for the first frame — enter_demo never sets vacancy_edit_loading",
+    "location": "client/src/client.gleam:5845-5847; client/src/pages/vacancy_edit.gleam:22-24",
+    "evidence": "enter_demo sets only '// A deep-linked demo edit page needs its id set so the\n          // get_for_edit response is accepted and the form can load.\n          vacancy_edit_id: edit_id,' — no vacancy_edit_loading. vacancy_edit.gleam: 'case model.vacancy_edit_loading {\n        True -> view_loading_skeleton()\n        False ->' renders the form.",
+    "detail": "The payload lands (r2-B4 fix holds) but the first frame shows the empty form instead of the skeleton on a /vacancies/v-*/edit boot.",
+    "recommended_fix": "Set vacancy_edit_loading: True in enter_demo when the boot route is VacancyEdit."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "storage",
+    "title": "still present since round 3: demo comparison toggles and sweep-nudge dismissals write to the real product's localStorage",
+    "location": "client/src/client.gleam:3527, 3541 (save_comparison_ids), 4938 (save_dismissed_sweep_nudges)",
+    "evidence": "'UserToggledComparison(id) -> ... save_comparison_ids(new_ids)' (no demo guard; UserToggledComparison is not intercepted in demo_update.gleam) and 'UserDismissedSweepNudge(application_id) -> ... save_dismissed_sweep_nudges(set.to_list(updated_dismissed))'.",
+    "detail": "Demo interactions persist demo ids into the real product's localStorage keys; a demo -> signup path hydrates real screens with demo comparison ids. Scope guard: 'no persistence of any kind'.",
+    "recommended_fix": "Namespace demo storage keys or skip persistence while demo_mode."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "latent",
+    "title": "still present since round 3: UserAcceptedPolicy is not intercepted in demo_update — a surfaced policy modal would fire a real accept_policy POST",
+    "location": "client/src/demo/demo_update.gleam:482 (fallback); client/src/client.gleam:1356-1366 (real POST)",
+    "evidence": "demo_update.handle: '_ -> fallback(model, msg)' (no UserAcceptedPolicy arm; grep confirms absence). update_inner: 'UserAcceptedPolicy ->\n      case model.policy_reaccept_loading {\n        True -> #(model, effect.none())\n        False -> #(\n          Model(..model, policy_reaccept_loading: True),\n          auth_api.accept_policy('",
+    "detail": "Latent: fixture accepted_policy_version is pinned, but a server policy bump surfaces the modal inside demo and the click POSTs with the bogus demo CSRF token. No-network pillar gap of the r1-B8 class.",
+    "recommended_fix": "Intercept UserAcceptedPolicy in demo_update (no-op with toast), keeping the lint manifest honest."
+  },
+  {
+    "source": "acceptance",
+    "severity": "note",
+    "category": "duplication",
+    "title": "still present since round 3 (partial): download_timeout remains duplicated with divergent signatures; only store_of was de-duplicated",
+    "location": "client/src/client.gleam:6890; client/src/demo/demo_update.gleam:838",
+    "evidence": "client.gleam: 'fn download_timeout(analysis_id: String, delay_ms: Int) -> Effect(Msg) {'; demo_update.gleam: '/// 90s download timeout — mirrors client.gleam's `download_timeout` so a\n/// slow static asset (unlikely) still surfaces the brand-voice toast.\nfn download_timeout(id: String) -> Effect(Msg) {'",
+    "detail": "The r3 note covered both helper pairs; demo_store_of now delegates to demo_update.store_of (client.gleam:5919-5921), but the two download_timeout variants still diverge in signature and body.",
+    "recommended_fix": "Lift download_timeout to the shared demo helper home alongside store_of."
+  }
+]

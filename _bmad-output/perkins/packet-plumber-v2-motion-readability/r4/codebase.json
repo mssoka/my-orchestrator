@@ -1,0 +1,102 @@
+[
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "indexing",
+    "title": "[still present since r3] W4's check_manifest_prefix misaligns stepped-tick hashes against the wall-window manifest — motion-strip falsely refuses valid strips on paused demos (reproduced, exit 2)",
+    "location": "harness/motion_strip.odin:141-153 + harness/run.odin:402-406",
+    "evidence": "run.odin (blessed manifest is wall-window-indexed — paused windows append too):\n\t\tif paused {\n\t\t\t// paused: no step, no event drain — the hash MUST equal the\n\t\t\t// window baseline (state stable). ...\n\t\t\tappend(&hashes, pp.state_hash(&state, state.events[before:], cat, context.temp_allocator))\n\nmotion_strip.odin (only STEPPED ticks append):\n\t\tpaused := paused_at(cfg.pauses[:], w, hz)\n\t\tif !paused {\n\t\t\tsim_tick += 1\n\t\t\t...\n\t\t\tappend(&hashes, pp.state_hash(&state, state.events[before:], cat, context.temp_allocator))\n\t\t}\n\nExecuted: `./bin/harness motion-strip pause 71000 72000 100 /tmp/mp-pause-test2` →\n\"motion-strip: T1 drift — T1: STATE DIVERGENCE at tick 1211: 568780a239c47780 != golden 09bbc05e1b830b64\"\n\"motion-strip: refusing to emit a strip from a divergent timeline (re-bless deliberately)\" exit=2.\ngoldens/pause.t1: tick 1211 = 09bbc05e1b830b64 (paused-stable, pause spans wall ticks 1211..1400); tick 1401 = 568780a239c47780 — the strip's sim-tick-1211 hash is CORRECT (equals manifest tick 1401) but is compared against manifest index 1211 (the paused hash).",
+    "detail": "The W4 fix collects hashes only for stepped ticks but compares them positionally against the blessed manifest, which run_demo indexes per wall window (paused windows included). Any strip window that steps ticks after a pause falsely reports divergence and aborts.",
+    "recommended_fix": "Index-align: build the strip's hash array per wall window (append the stable-state hash for paused windows, like run_demo), or track the wall-window index per stepped tick and compare manifest[wall_tick-1]. Verify with `motion-strip pause 71000 72000 100`."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "test-integrity",
+    "title": "[still present since r3] W3 half-fixed: interp_continuous now reads p.delivered, but the delivery pin STILL passes via anchor mismatch — deleting the delivered guard breaks no test",
+    "location": "app/render/motion_test.odin:211-218 + app/render/view.odin:172-178",
+    "evidence": "view.odin:172-178 (the predicate fix — real):\n\t// here: delivery is the terminal teleport (Perkins r3 W3: the predicate\n\t// must READ the flag for the 'delivery snap' pin to be real).\n\tif p.delivered {\n\t\treturn false\n\t}\n\nmotion_test.odin:211-218 (the pin — unchanged from r3):\n\tp.delivered = true\n\t// a delivered packet's anchor is irrelevant — the draw loop skips it\n\t// BEFORE the interp; the guard's job is to snap any attempted transition\n\tp.on_edge = false\n\tp.at_node = 2\n\ttesting.expect(t, !interp_continuous(&topo, 0, 1, 0, true, &p), \"delivered transition must snap\")\n\nEntry is (edge=0, heading=1, on_edge=true); with the delivered guard removed the predicate takes the arrival branch `entry_heading == p.at_node` → 1 == 2 → false — the assertion still passes. The r3 prescription \"a test with at_node == heading\" was not delivered.",
+    "detail": "Production semantics are fixed (the flag is read), but the pin remains vacuous for the delivered path: a regression deleting `if p.delivered { return false }` passes all 33 render tests and every gate silently.",
+    "recommended_fix": "Make the anchor CONTINUOUS so only the flag decides: set p.at_node = 1 == entry_heading (arrival-shaped) with p.delivered = true, assert false; keep a companion assert that the same packet with delivered=false is continuous."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "doc-vs-code",
+    "title": "motion_strip.odin header still claims \"T1 manifest + replay gate are NOT re-verified here\" — contradicts the W4 check_manifest_prefix call added in the same commit; plus an orphaned usage-comment fragment",
+    "location": "harness/motion_strip.odin:13-16,24-26",
+    "evidence": "Lines 24-26: \"T1 manifest + replay gate are NOT re-verified\n// here (run_demo does that) — this verb is a RENDER-ONLY evidence tool; it\n// never touches goldens.\" — but lines 156-168 now call check_manifest_prefix(demo_name, &demo, cat.hash, hz, hashes[:], &fails) and abort on drift.\nLines 13-16 (orphaned fragment from the N9 rewording): \"//     snapshot positions at the capture ms; the +15% packet size applies in\n//     both modes — only the glide differs)\n//     the golden path (the harness's draw_world default) — so the same verb\n//     produces both the \"before\" (quantized) and \"after\" (interpolated)\" — the parenthetical closes at \"differs)\" and \"the golden path …\" dangles.",
+    "detail": "The file-header documentation contradicts the code it precedes: a reader trusting the header would believe the strip has no T1 net. The dangling fragment is leftover from the r3 N9 comment edit.",
+    "recommended_fix": "Update the header to state the manifest PREFIX is verified per stepped tick; delete the orphaned \"the golden path (…)\" continuation line."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "doc-placement",
+    "title": "interp_continuous's doc comment is physically attached to interp_alpha_from_accum — the r4 helper was inserted mid-comment (view.odin:135-166)",
+    "location": "app/render/view.odin:135-166",
+    "evidence": "Line 135: \"// interp_continuous — may the render lerp between the row's anchor (the\" … the comment runs continuously into line 143: \"// interp_alpha_from_accum — the ONE interpolation-activation derivation\" with no blank line, then line 153 defines \"interp_alpha_from_accum :: proc(running: bool, accum, tick_seconds: f64) -> f32 {\" and only line 166 defines \"interp_continuous :: proc(\".",
+    "detail": "The activation helper was spliced between interp_continuous's doc comment and its definition, so the lerp-semantics doc precedes the wrong proc. Confusing for future readers; doc-tooling would bind it to interp_alpha_from_accum.",
+    "recommended_fix": "Move the interp_alpha_from_accum definition+comment below interp_continuous (or above the comment block) so each proc owns its doc."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "code-hygiene",
+    "title": "motion_pixel.odin: NEGATIVE CONTROL comment block duplicated verbatim (lines 150-155 == 156-161)",
+    "location": "harness/motion_pixel.odin:150-161",
+    "evidence": "\t// NEGATIVE CONTROL (the B1 failure mode): a dropped interp_alpha at the\n\t// call site defaults to 1.0 → every frame draws the SNAPSHOT position →\n\t// all three centroids identical → the midpoint assertion passes vacuously.\n\t// The endpoints MUST differ: the alpha=0 base is the T-1 snapshot, the\n\t// alpha=1 target is the T snapshot — equal endpoints prove the interp\n\t// path never ran (no roll, no lerp).\n\t// NEGATIVE CONTROL (the B1 failure mode): a dropped interp_alpha at the\n\t// call site defaults to 1.0 → every frame draws the SNAPSHOT position →\n\t// all three centroids identical → the midpoint assertion passes vacuously.\n\t// The endpoints MUST differ: the alpha=0 base is the T-1 snapshot, the\n\t// alpha=1 target is the T snapshot — equal endpoints prove the interp path\n\t// never ran (no roll, no lerp). The comparison is the COMBINED distance —",
+    "detail": "The same 6-line comment appears twice back-to-back — an unreviewed hand-merge artifact in the new B1 gate file.",
+    "recommended_fix": "Delete the first copy, keep the second (which carries the COMBINED-distance addendum)."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "code-hygiene",
+    "title": "motion_pixel.odin ships scratch/dead code: \"— hmm, no:\" in the proc doc, dead `_ = bw`, unused core:os + core:strings imports, and a y-band comment that mismatches the scan",
+    "location": "harness/motion_pixel.odin:20-21,90,96,130,138",
+    "evidence": "Line 96 (run_motion_pixel doc): \"// alpha=1 the T position (frac 0.5) — hmm, no: the row rolls per tick, so\" — thinking-out-loud text, the exact class r3 N1 flagged in motion_test.odin.\nLines 89-90: \"\tpk.progress_units = (bw * 3) / 8 // frac 0.375 at tick 4\n\t_ = bw\" — `_ = bw` is a no-op after bw is used.\nLines 20-21: \"import \\\"core:os\\\"\nimport \\\"core:strings\\\"\" — grep finds zero `os.` and zero `strings.` references in the file.\nLine 130 comment: \"// along world y=10 (screen y ≈ 240 at the fit camera) — scan y 190..300\" vs line 138 call: \"motion_pixel_centroid(img, 430, 610, 225, 255)\" — actual band is y 225..255.",
+    "detail": "The new 181-line B1 gate file carries review-scratch leftovers: a 'hmm' mid-sentence, a dead statement, two unused imports, and a scan-band comment that disagrees with the code.",
+    "recommended_fix": "Rewrite the doc sentence without the 'hmm, no' self-correction; delete `_ = bw` and the two unused imports; fix the comment to state the 225..255 band."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "doc-drift",
+    "title": "Stale motion-test count: README and the new ci.yml comment say 13 pins; motion_test.odin now contains 18 @(test)s",
+    "location": "app/render/motion_test.odin (18 hits) + _bmad-output/implementation-artifacts/packet-plumber-v2-motion-readability/README.md:70 + .github/workflows/ci.yml:73",
+    "evidence": "`grep -c \"@(test)\" app/render/motion_test.odin` → 18 (r3's 13 + the r4 additions: activation_running_clamps_accum_fraction, activation_not_running_snapshot_exact, trail_ring_order_and_fill, trail_ring_stationary_no_push, trail_fades_newest_strongest). README.md:70: \"`app/render/motion_test.odin` (13 new `@(test)`s, in the gate-2 render test\"; ci.yml:73: \"# motion-readability pins live here: motion_test.odin's 13 interp\".",
+    "detail": "Same class as r3 N13 (stale 46→47 demo count): the r4 fix commit added 5 tests without updating the two prose counts that reference them.",
+    "recommended_fix": "Update README and the ci.yml comment to 18 (or drop the hardcoded count)."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "duplication",
+    "title": "check_manifest_prefix duplicates check_manifest's ~28-line header block verbatim and silently drops the manifest-corrupt check (ticks header vs hash-line count)",
+    "location": "harness/manifest.odin:146-199 vs harness/manifest.odin:104-141",
+    "evidence": "check_manifest lines 113-125 and check_manifest_prefix lines 155-167 are line-for-line identical (version/seed/catalog_hash/logic_hz checks). check_manifest additionally has:\n\tif m.ticks != i64(len(m.hashes)) {\n\t\tappend(fails, fmt.tprintf(\"T1: manifest corrupt — ticks header %d but %d hash lines\",\n\t\t\tm.ticks, len(m.hashes)))\n\t\tok = false\n\t}\ncheck_manifest_prefix has no equivalent, so a corrupt manifest passes the strip's net.",
+    "detail": "Two copies of the header-drift logic must now be edited in lockstep; the prefix variant also omits the corrupt-manifest guard run_demo's checker carries.",
+    "recommended_fix": "Extract a shared check_manifest_header(m, demo, catalog_hash, logic_hz, fails) helper called by both; include the ticks-vs-hashes guard in it."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "fix-audit",
+    "title": "[fixed since r3] W1 — the GitHub workflow now runs the app/render (and app/input/app/audio/harness) unit suites plus the motion-pixel gate; verified green locally",
+    "location": ".github/workflows/ci.yml:73-75,96-97",
+    "evidence": "ci.yml: \"- name: Render/input/audio/harness unit tests (incl. the motion-readability pins)\" / \"run: mkdir -p bin && odin test app -out:bin/app-test && odin test app/render -out:bin/render-test && odin test app/input -out:bin/input-test && odin test app/audio -out:bin/audio-test && odin test harness -out:bin/harness-test\" and \"- name: Motion-readability activation (rlsw pixel midpoint)\" / \"run: tools/harness.sh motion-pixel\". Executed at this sha: app 22/22, app/render 33/33, app/input 3/3, app/audio 10/10, harness 2/2 tests green; `./bin/harness motion-pixel` → \"motion-pixel: PASS — the alpha=0.5 packet pixel is the snapshot midpoint\" exit=0.",
+    "detail": "The local-mirror/remote parity gap is closed: the motion pins and the activation gate now execute in the remote workflow.",
+    "recommended_fix": "N/A (fix-audit confirmation; only the stale '13' count comment remains — see the doc-drift finding)."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "fix-audit",
+    "title": "[fixed since r3] W4 (substance) — the strip's T1 drift net is real: check_manifest_prefix exists, matches the .t1 format, and blocks divergent timelines for pause-free demos",
+    "location": "harness/manifest.odin:146-199 + harness/motion_strip.odin:105-107,152-168",
+    "evidence": "check_manifest_prefix :: proc(demo_name: string, demo: ^Demo, catalog_hash: u64, logic_hz: i32, hashes: []u64, fails: ^[dynamic]string) -> bool — reuses manifest_path/read_manifest (same file, format matches goldens/motion.t1: \"t1 1\\ndemo motion\\nseed 42\\nlogic_hz 20\\ncatalog_hash …\\nticks 60\" + per-tick hex lines). motion_strip collects per-stepped-tick hashes and calls check_manifest_prefix, aborting with exit 2 on any mismatch. Executed: `motion-strip motion 2200 2600 17` green (before=snapshot and after both exit 0, measure tool reproduces 30.6→11.2px).",
+    "detail": "The mechanical net r3 asked for landed and works — but its stepped-tick indexing misfires on paused demos (see the separate warning finding); this note confirms only the substance.",
+    "recommended_fix": "N/A beyond the indexing fix reported separately."
+  }
+]

@@ -1,0 +1,90 @@
+# Perkins lens prompt — tests (chunk 4 of 5 — light-demo goldens (the negative proof), round 1)
+
+**You are the `tests` lens. Your assigned `source` tag is `tests`. Your output file is `/Users/moses/code/_bmad-output/perkins/packet-plumber-v2-4.1-warning-forecast/r1/tests-c4.json`.**
+
+You are ONE lens in a Perkins automated PR-review swarm (round 1 of 3). Perkins reviews; lenses find; nobody fixes. You run as a pi agent with read-only access to a git worktree pinned at the reviewed sha.
+
+## Your inputs (READ THESE)
+- CANONICAL DIFF — chunk 4 of 5 — light-demo goldens (the negative proof), 1437 lines, 19 files (review exactly these bytes): /Users/moses/code/_bmad-output/perkins/packet-plumber-v2-4.1-warning-forecast/r1/c4.patch
+- WORKTREE (verify every claim against the actual code here — your ground truth, detached at sha 9820a55): /Users/moses/.herdr/worktrees/packet-plumber/perkins-v2-4.1-warning-forecast-r1
+- SPEC / CONTEXT (read the sections named; full files):
+  - Perkins briefing (your charter + lens-guards): /Users/moses/code/_bmad-output/perkins/packet-plumber-v2-4.1-warning-forecast/r1/spec/perkins-briefing-r1.md
+  - Job briefing (the implementing minion's spec): /Users/moses/code/_bmad-output/perkins/packet-plumber-v2-4.1-warning-forecast/r1/spec/job-briefing.md
+  - Story 4.1 card: /Users/moses/code/_bmad-output/perkins/packet-plumber-v2-4.1-warning-forecast/r1/spec/stories-v2.md (Story 4.1 card at line 362; slice-4 framing above it)
+  - Implementation spec (the minion's frozen spec — acceptance matrix + code map + the RE-BLESS cause-docs): /Users/moses/code/_bmad-output/perkins/packet-plumber-v2-4.1-warning-forecast/r1/spec/spec-4-1-warning-forecast.md — copy the diff's first file (identical to the worktree copy at _bmad-output/implementation-artifacts/spec-4-1-warning-forecast.md); the re-bless documentation lives in "Boundaries" + "Design Notes"
+  - Architecture invariants: /Users/moses/code/_bmad-output/perkins/packet-plumber-v2-4.1-warning-forecast/r1/spec/odin-architecture-v1.md — ODN-11 save = seed + action log (~line 687), §11.7 edge-case table (line 1592; E9/E10 at ~1608-1609), §6.x per-link buffering + lane bound (line ~964), T1 hash contract (line ~1353), the golden-stability rule (~line 1397)
+
+
+## The PR (scope)
+v2 Story 4.1 — the LIGHT-demo goldens wave (chunk 4 of 5): goldens/boot|bundle|demolish|draw|ecmp|flow|lose|place|win (.t1 + .log.bin; lose/03000ms.png is in the diff). The re-bless has TWO documented causes: (a) catalog_hash fold — the balance.json warnings block shifts EVERY .t1 hash line + .log.bin header (mechanical; the hash bytes ride inside the stream); (b) waiting_ticks bytes in per-packet serialization (mechanical — the field rides the T1 hash). The NEGATIVE PROOF: boot/draw/flow/win/bundle/ecmp/place/demolish T2s (PNGs) are byte-identical — NONE of their PNGs may appear in this diff; lose/03000ms.png is the ONE documented T2 shift in this chunk (lose.dem's own stuck packet — the demo's scenario IS the strain: the residential telegraphs 🔴, cause-documented in the implementation spec). Verify: zero per-tick .t1 lines that look like BEHAVIORAL drift beyond the fold+field bytes (can't re-derive hashes by hand — instead verify the manifest STRUCTURE: header fields, tick counts, seed/demo names, hash consistency); PNGs exactly {lose/03000ms.png} — nothing else; .log.bin headers re-blessed (3-4 line diffs = binary header bytes).
+
+## ⚠️ CRITICAL lens-guards — READ BEFORE FILING ANYTHING (prevents false positives)
+- **🚨 THE ODN-11 RE-BLESS — verify the CAUSE-DOCUMENTATION, don't auto-flag.** Re-blessed deliberately: (a) catalog_hash fold — mechanical (new balance.json warnings block folds into EVERY .t1 hash line + .log.bin header, because catalog_hash bytes ride INSIDE the T1 hash stream); (b) waiting_ticks rides the per-packet T1 hash (4 new bytes per in-flight packet per tick — mechanical; the field is documented in serialize.odin); (c) T2 telegraph shifts — cause-documented PER DEMO in the implementation spec (sla + qos_contention + qos_emphasis + qos 65s + lose; boot/draw/flow/win/bundle/ecmp/place/demolish T2s byte-identical — the negative proof). VERIFY the negative proof (those demos' PNGs absent from the diff) + the cause-docs. A re-bless with an unaccounted shift (a negative-proof demo's PNG in the diff, a relief frame shifting, a zero-traffic demo's T2 moving) = a BLOCKER.
+- **🚨 THE NO-FLICKER CONTRACT — load-bearing.** Node strain uses `Packet.waiting_ticks` (a NEW serialized field — packets that FAILED a forward attempt; incremented in flow.odin's forward pass when no route exists, cleared on every successful forward / E29 drop-back / delivery). A HEALTHY transit must NEVER strain: a fresh spawn or fresh transit arrival that forwards next tick has waiting_ticks 0. A flicker (a healthy node flashing a warning) or a strain signal without a real backlog = a blocker. Also: `waiting_ticks` is NEW SERIALIZED STATE — LOG_VERSION must stay 3 and old-log acceptance stays intact [E10]; the action-log FORMAT must be unchanged (the field rides the T1 state hash — the writer-only canonical dump — NOT the log records). A log-format change or LOG_VERSION bump = a blocker.
+- **PIPE PRESSURE vs [E9].** Pressure = fullest lane queue depth on the bundle ÷ its E9 bound (`lane_queue_packets × packet_bandwidth`). A lane at its bound = 100% = the ladder is dropping. A pressure computation disconnected from the real E9 bound (wrong bound, wrong lane, off-by-one at the bound) = a real defect.
+- **FORECAST READS THE SCHEDULE, NEVER FIRES.** The forecast derives from era set-pieces in [start−lead, start+duration) with exact countdowns — it must be PURE (no state mutation beyond the derived rows, no events, no side effects, no win/lose interaction). A forecast that mutates state or fires events = a blocker.
+- **EVENTS TAGS 6/7 + SIGN/TARGET.** Warning_Raised/Cleared with sign+target, tag-conditional payload like the 3.3/3.4 events (bytes written ONLY for tags 6/7 — append-only); replay byte-identity pinned (warnings_test replay test + the T1). A broken tag or a payload written unconditionally (breaking pre-4.1 event byte-identity) = a real defect.
+- **NEVER COLOR ALONE.** Health rings + !/!! glyphs + tick-derived pulse (pinned 16-step table, no transcendentals) — the warning render must be distinguishable without color (art-direction §6.1). A color-only warning render = a blocker.
+- **WEATHER REPORT PANEL — ZERO PIXELS WHEN EMPTY.** The panel is shared app/harness and renders nothing when no warnings are active (golden-stability). A panel that draws pixels while empty = a real defect.
+- **ERA-3 SANDBOX (goal/cap 0 — win/lose is 4.3's).** The app session intentionally has no win/lose. Do NOT flag "win/lose not implemented" — 4.3 owns it. The launchable must still be launchable + the demos honest.
+- **No re-open of slice-1..3.4 findings** (merged + Perkins-approved) — carry-forward only.
+- **Em-dashes are FINE in Packet-Plumber copy** (the RT CI ban does NOT apply to PP).
+- **The base is `v2`** (slices 1–3 + 3.5 + 3.2–3.4 + canon). demand.odin / routing.odin / qos.odin / win_lose.odin are BASE files — read-only context, not review targets.
+- **CONTEXT NOTE (not a finding):** possible bmad-tooling quirk (edits briefly mis-resolving to the main checkout; Silas syncs it). Review the PR content as-is at the sha.
+
+## Legitimate findings here WOULD be
+- **A negative-proof PNG in the diff**: boot/draw/flow/win/bundle/ecmp/place/demolish PNGs must be byte-identical (absent). The ONLY documented T2 shift in this chunk is lose/03000ms.png. Anything else = unaccounted drift = a blocker.
+- **A .t1 header mismatch**: demo name, seed, or tick count changed (they must NOT — only the hash lines + catalog_hash header line re-bless); catalog_hash != bd13d5dfba445d80.
+- **A stale .log.bin** (3-4 line diff = binary header re-bless; a log.bin with NO diff despite the fold = stale bless = inconsistency).
+- **A light demo whose .t1 didn't shift at all** (hash lines identical to afe505119369d195-era values) — a stale bless hides a real divergence.
+
+## OUTPUT CONTRACT (follow exactly)
+Write ONLY a valid JSON array to your output file (named below). No prose, no markdown fencing, no preamble, no trailing commentary. `[]` is valid and expected when you find nothing — do NOT invent findings to fill a quota.
+Each element MUST match this schema exactly:
+{
+  "source": "<your assigned source value>",
+  "severity": "blocker" | "warning" | "note",
+  "category": "<short tag>",
+  "title": "<one-line summary>",
+  "location": "<file:line | file:hunk | N/A>",
+  "evidence": "<the EXACT lines you READ from the file/diff that prove the claim, pasted verbatim. 'N/A' ONLY for findings with no possible code reference. Do not paraphrase; do not reconstruct from memory.>",
+  "detail": "<why this is a problem, <=40 words; for acceptance findings quote the violated spec phrase>",
+  "recommended_fix": "<the change to apply, <=40 words>"
+}
+
+ACCURACY MANDATE — the most important instruction: NO claim you make will be taken at face value. Every finding will be independently re-verified against the actual worktree before it reaches the report. Findings whose `evidence` cannot be located verbatim, or whose claim contradicts the code, are DISCARDED SILENTLY — no defense, no second chance. Therefore: OPEN the file, READ the cited lines. Quote them verbatim in `evidence`. Hedging ("might", "could", "possibly") signals you have NOT verified — either verify and report crisply, or drop it. Prefer fewer well-grounded findings over many speculative ones. An empty array is an honest, fine answer.
+
+## YOUR LENS BRIEF
+
+Test coverage analysis via traceability.
+
+For each behaviour change in the diff, trace to a test (new in the diff, or existing). Classify as FULL / PARTIAL / NONE coverage. Emit one finding per gap with severity:
+- blocker: P0 gap (critical path, happy + core error) OR P1 coverage <80%
+- warning: P1 gap at 80–89% OR P2 gap
+- note: P3 gap
+
+The P0 critical paths here: the no-flicker contract (a healthy transit never strains — the transit-arrival case specifically, the documented reason the spawn-tick exclusion alone was insufficient), the strain math pins (70/90 ladder, 1 stuck packet on a router = amber 75%, 2 = red 150%, residential any = red 600%), pipe pressure vs the E9 bound (lone packet 17% healthy, lane at bound 100% = dropping, pressure replicating to member pipes), one-event-per-transition (None→Amber, Amber→Red, Red→Amber, Red→None, Amber→None — the cleared sign must name the level that ENDED), the forecast window boundaries (before lead / in window countdown / active 0 + NOW / after end), the forecast's purity (never fires), replay byte-identity with warning events + forecast rows [E10], the tag-conditional event serialization pin (pre-4.1 event bytes unchanged), LOG_VERSION stays 3, the zero-traffic neutrality (E24 — no events, no section bytes), the era-3 sandbox session (goal 0/cap 0), the new balance.json warnings fail-fast rows, and the warn.dem golden (T1 + T2 + replay gate).
+
+Blind-spot heuristics to check:
+- New/modified behavior without matching coverage (e.g. is there a test for the transition Red→Amber easing? for the forecast 'after end' row absence? for the dead-node-slot never-warns path? for a demolished node's resident packets?)
+- Happy-path-only coverage where error handling is implied (fail-fast rows — tested?)
+- New state transitions without boundary tests (strain exactly at 69/70/89/90/91; lane at exactly the bound)
+
+Test level mix: flag mismatches as findings.
+
+Finally, emit ONE additional finding representing the advisory gate:
+- title: "Advisory test gate: PASS" | "...CONCERNS" | "...FAIL"
+- category: "coverage-gate"
+- severity: PASS → note, CONCERNS → warning, FAIL → blocker
+- detail: rationale with coverage percentages
+- recommended_fix: what would raise the gate
+
+Gate thresholds:
+- PASS: P0 100%, P1 ≥90%, overall ≥80%
+- CONCERNS: P0 100%, P1 80–89%, overall ≥80%
+- FAIL: P0 <100%, or P1 <80%, or overall <80%
+
+`source` = "tests".
+
+## DONE
+Write your JSON array to `/Users/moses/code/_bmad-output/perkins/packet-plumber-v2-4.1-warning-forecast/r1/tests-c4.json` and stop. Do not fix anything. Do not run the interactive fix flow.

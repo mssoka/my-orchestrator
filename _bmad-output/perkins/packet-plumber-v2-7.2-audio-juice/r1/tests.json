@@ -1,0 +1,72 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gap",
+    "title": "P0: M-mute has zero test coverage and the chain is actually broken — mouse_map never maps Key.M to Toggle_Mute",
+    "location": "app/input/mouse.odin:314-341 (phase-2 switch), app/input/poll.odin:58-60",
+    "evidence": "poll.odin:60: `if rl.IsKeyPressed(.M) { append(&inp.events, Device_Event(Key_Press{key = .M})) }` — but mouse.odin's ONLY key switches handle: `case .X, .Delete:` (Demolish), `case .U:` (Arm_Preview), `case .One, .Two:` (Set_Class), `case .E:` / `case .S:` / `case .B:` (Set_Lane), `case: // phase-1 keys already handled` — and phase-1 emits only `Toggle_Pause{}`/`Toggle_Overlay{}`/`Toggle_Assist{}`/`Cancel{}`. `rg \"case \\.M|Mute\" app/input/mouse.odin` → no matches (exit 1). exec.odin:44: `case Toggle_Mute:` is therefore unreachable dead code; gate 9 (input-parity) has no M scenario.",
+    "detail": "P0 happy-path gap: the only mute control never fires; README and PR claim M works. No gate could catch it — the missing link proves the missing test.",
+    "recommended_fix": "Add `case .M: append(out, Intent(Toggle_Mute{}))` to mouse_map phase-2, plus an input-parity scenario feeding Key_Press{.M} and asserting the on_mute effect fires."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gap",
+    "title": "P1 at 0%: captions (text, 40-tick dwell, expiry, live-while-muted, mute pill) have no automated coverage anywhere",
+    "location": "app/main.odin:1301-1321, app/audio/audio.odin:218-227",
+    "evidence": "draw_audio_caption (main.odin:1301) draws `txt = \"audio muted - press M\"` / caption text via `au.caption_live(&app.audio, app.tick)`; but the harness T2 path calls `capture_frame(rc, &state.topology, &state.bundles, &state.flow, &state.crisis, &state.health, state.health_enabled, sim_tick, state.era, prev)` — no caption/HUD state, so no golden can see captions. `rg -l -F \"@(test)\"` lists only core/*_test.odin + app/render/forecast.odin — no app/audio tests.",
+    "detail": "Acceptance criterion 1 (\"captions shown\") and the a11y contract are pinned by no test; set_caption/caption_live/crisis_caption are pure and trivially testable.",
+    "recommended_fix": "Add unit tests for set_caption/caption_live (dwell, expiry boundary, overwrite) and crisis_caption text; ideally a parity-style frame asserting caption state after synthetic alert events."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Golden cannot prove the crisis→sting draw: vacuous-guard counts TOTAL draws, not per-kind",
+    "location": "harness/run.odin:458-463, demos/audio.dem:14-16",
+    "evidence": "The guard is only `if audio_consumer_on && audio_consumer.draws == 0 { append(&fails, \"audio consumer drew nothing — the golden is vacuous (no alert events?)\") }` — a single u64 incremented by BOTH branches (`a.draws += 1` after the crisis rng_range and after the arrival rng_range). The demo relies on the 4.2 surge firing at tick 1200 inside the 1400-tick window (`# the surge fires at tick 1200 = 60 s`).",
+    "detail": "P2: if a rebalance ever delays the surge past tick 1400, the crisis branch silently loses all coverage while the guard still passes on arrival draws alone.",
+    "recommended_fix": "Track per-kind counters (crisis_draws, arrival_draws) on Audio and fail the golden unless BOTH are > 0 for the audio demo."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Arrival throttle (ARRIVAL_MIN_GAP_TICKS=2, e.tick-keyed, suppressed = silent AND uncaptioned) is unasserted by every gate",
+    "location": "app/audio/audio.odin:167-180",
+    "evidence": "`if e.tick < a.arrival_last_tick + ARRIVAL_MIN_GAP_TICKS { continue }` — the throttle touches only the cosmetic stream and pending/caption state, neither of which enters `pp.state_hash`; the golden's vacuous-guard only needs draws>0. Deleting the throttle check passes all 9 ci gates (hashes and draws unchanged in kind). No @(test) exists in app/audio.",
+    "detail": "P2: the documented throttle policy (≤1 click/2 ticks, catch-up suppression, suppressed-arrival caption suppression) has zero regression protection; a buzz regression ships silently.",
+    "recommended_fix": "Add a pure consumer_consume test: events at ticks t, t+1, t+2 → assert pending.arrival_plays and caption behavior at each boundary."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Asset fallback and placeholder synth path untested: corrupt-file guard, wav_pack RIFF output, device-absent init",
+    "location": "app/audio/audio.odin:230-265, 268+",
+    "evidence": "load_variant: `if s.frameCount > 0 { rl.SetSoundVolume(...); return s }` then falls through to `wave := synth_wav(crisis, idx)` / `rl.LoadWaveFromMemory(cstring(\".wav\"), raw_data(wave), ...)`; wav_pack hand-writes the RIFF header (`put_cstr(buf[0:], \"RIFF\")` ... `put_u32_le(buf[40:], u32(data_len))`). `rg -l -F \"@(test)\"` → only core/*_test.odin + app/render/forecast.odin; nothing exercises any audio proc.",
+    "detail": "P2: the error paths the brief names (device-absent fallback, corrupt asset file, empty/truncated synth) are happy-path-only; a broken placeholder WAV would surface only as silence at runtime.",
+    "recommended_fix": "Unit-test synth_wav/wav_pack (RIFF header fields, sample count) and load_variant's frameCount<=0 fallback with a fake path; keep tests raylib-free where possible."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "P3: per-run freshness (audio_reset_run + audio_mark=0) has no coverage across restarts",
+    "location": "app/main.odin:541-546, app/audio/audio.odin:139-144",
+    "evidence": "start_run does `app.audio_mark = 0; au.audio_reset_run(&app.audio)` and audio_reset_run sets `a.arrival_last_tick = 0; a.caption = {}; a.pending = {}` — app-side lifecycle exercised by no harness demo (the harness consumer never restarts a run) and no unit test.",
+    "detail": "P3: a stale throttle position or caption leaking across restarts is cosmetic-only (ODN-15-safe by construction) but unpinned.",
+    "recommended_fix": "A two-run unit test: consume events, call audio_reset_run, assert arrival_last_tick/caption/pending cleared and audio_mark semantics re-established."
+  },
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: FAIL",
+    "location": "N/A",
+    "evidence": "N/A",
+    "detail": "P0 0% (mute chain untested AND broken); P1 ≈62% (captions 0%, crisis-draw unpinned per-kind, arrival-draw/throttle partial; determinism + vacuous-guard 100%); overall ≈45% (3 FULL, 3 PARTIAL, 4 NONE of 10 behaviours). Fails all three thresholds.",
+    "recommended_fix": "Fix + parity-pin the M→Toggle_Mute mapping; add per-kind draw assertions to the harness guard; add pure consumer/caption/throttle/synth unit tests and a restart-freshness test; re-run gates 4 and 9."
+  }
+]

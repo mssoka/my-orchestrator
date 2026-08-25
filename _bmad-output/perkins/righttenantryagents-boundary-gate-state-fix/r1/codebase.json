@@ -1,0 +1,42 @@
+[
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "test-failure",
+    "title": "Log-event rename breaks existing test: compliance.review_unparseable -> review_unparsable leaves test_unparseable_review_emits_failed_rollup failing",
+    "location": "tenant_scorer/callbacks/compliance_enforcement.py:236-239, tests/unit/test_verification_compliance_judge.py:470,491",
+    "evidence": "compliance_enforcement.py:239: '\"compliance.review_unparsable\",'; test_verification_compliance_judge.py:470: '`compliance.review_unparseable` WARNING carries the same dimensions.\"\"\"'; test_verification_compliance_judge.py:491: 'r for r in caplog.records if r.message == \"compliance.review_unparseable\"'; pre-fix compliance_enforcement.py:179: '\"compliance.review_unparseable\",'",
+    "detail": "The diff renamed the structured event name (spelling-only change, unrelated to #172) without updating the existing test. Verified: pytest tests/unit -> 2041 passed, 1 FAILED on the reviewed sha, so the '2042 unit tests green' claim is false. Project convention states event-name strings are a stable observable contract queried in BigQuery/Sentry; the rename silently orphans dashboards/alerts keyed on the old name.",
+    "recommended_fix": "Restore the name 'compliance.review_unparseable' (or rename in the same commit and update test line 491 + flag any BQ/Sentry references to the old name)."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "state-view-mechanism",
+    "title": "Fix's stated mechanism ('ctx.state snapshot taken at construction') contradicts installed google-adk==2.2.0: ctx.state._value IS the live session.state dict",
+    "location": "tenant_scorer/agent.py:594-597 (diff comment); google/adk/agents/context.py:182; google/adk/sessions/state.py:81,85-89",
+    "evidence": "context.py:182: 'value=invocation_context.session.state,'; state.py:81: 'self._value = value'; state.py:85-89: 'def __getitem__(self, key: str) -> Any: if key in self._delta: ... return self._value[key]'; agent.py:596-597: 'from this node's ctx.state snapshot taken at construction — / so ctx.state.get(...) returns None one call after run_node'",
+    "detail": "Context builds State(value=session.state, delta=...) with a live reference, no copy. Empirical run of a Workflow pipeline node calling run_node on a child emitting an event state_delta (the output_key path): ctx.state.get(key) returned the child's write immediately after run_node, and ctx.state._value is session.state == True. Under these semantics ctx.state and ctx.session.state are the SAME dict, so the primary read/write changes are behavior-neutral; only the stamp cross-check changes behavior. If the production failure's true mechanism is not the claimed snapshot divergence, the primary fix does not address it (the pinned production evidence is real, but the stated mechanism is not reproducible against the pinned ADK version).",
+    "recommended_fix": "Re-verify the production failure against the actual 2.2.0 state semantics (the blocking event-delta append, delta-first reads) and correct the mechanism claim in the comments/docstrings; confirm the stamp cross-check is the effective fix or find the true divergence."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "consistency",
+    "title": "Inline branch still reads the judge's output_key via ctx.state (agent.py:268) and passes ctx.state to finalize_inline_branch — inconsistent with the fix's own 'ctx.state is broken' rationale",
+    "location": "tenant_scorer/agent.py:263-270",
+    "evidence": "agent.py:263-266: '# Write the raw session dict, NOT ctx.state[...]: a State.__setitem__ / # would cache the key in this branch's delta and then shadow the / # judge's own output_key write on read (State.get checks delta first).'; agent.py:268: 'if not ctx.state.get(fb_key):'; agent.py:270: 'finalize_inline_branch(ctx.state, verifier_key)'",
+    "detail": "The pre-existing comment at 263-266 describes delta-first reads over the LIVE dict (only coherent with live-reference semantics, i.e. ctx.state sees child writes) — direct evidence against the snapshot theory in the same file as the fix. Per the fix's own rationale, line 268 would be the same bug unfixed; per actual 2.2.0 semantics it works. The fix should acknowledge this read or align it.",
+    "recommended_fix": "Either switch the inline-branch read/finalize call to ctx.session.state for consistency with the fix's rationale, or update the fix's comments to state that ctx.state reads of child output_keys are valid where no node-local delta shadows the key."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "test-realism",
+    "title": "New regression tests use a fabricated stale-snapshot ctx; they guard the read pattern but do not reproduce the production divergence",
+    "location": "tests/unit/test_gate_state_marshalling.py:63-76",
+    "evidence": "test_gate_state_marshalling.py:71-72: 'self.state = State({}, {})' and docstring: 'the InMemory recorder harness cannot provide (InMemory shares the live dict, so the divergence never appears there)'",
+    "detail": "The fake ctx's State({}, {}) snapshot is a synthetic model of the claimed divergence that 'never appears' in the real InMemory flow (per the tests' own docstring). Negative control verified: 11/16 tests fail on pre-fix source, so they are a genuine pattern guard — but they cannot catch a regression of the actual production mechanism.",
+    "recommended_fix": "No change required if the mechanism finding is resolved; otherwise add an integration test on the real InMemory flow asserting the gate reads the judge's output_key after run_node."
+  }
+]

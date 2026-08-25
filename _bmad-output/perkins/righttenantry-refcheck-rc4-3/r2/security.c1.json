@@ -1,0 +1,32 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "fraud-signal-integrity",
+    "title": "STILL PRESENT (r1): W3 stale-bounce exhaustion gate is broken by a timestamp-format mismatch — same-day redelivered pre-correction bounces still exhaust the row and fabricate referee_contact_invalid",
+    "location": "server/src/reference_checks/webhooks.gleam:297-305; server/src/reference_checks/sql/find_reference_call_by_send_ref.sql:36-42; server/src/reference_checks/sweep.gleam:178-182",
+    "evidence": "webhooks.gleam:297-305: \"let genuine_failure = case row.matched_send_at { \"\" -> True at -> case row.corrected_at { \"\" -> True corrected -> // ISO timestamps — lexical compare is chronological. string.compare(at, corrected) != order.Lt } }\" | find_reference_call_by_send_ref.sql:36-42: \"COALESCE(( SELECT e->>'at' FROM jsonb_array_elements(rc.attempts) AS e WHERE e->>'detail' = $4 AND e->>'outcome' = 'delivered' ORDER BY e->>'at' DESC LIMIT 1 ), '') AS matched_send_at, ... COALESCE(rc.corrected_at::text, '') AS corrected_at,\" | sweep.gleam:178-182: \"pub fn now_iso() -> String { timestamp.system_time() |> timestamp.to_rfc3339(calendar.utc_offset) }\"",
+    "detail": "Attempts 'at' is RFC3339 'T' format (to_rfc3339, e.g. 2026-08-14T09:00:00Z); corrected_at::text is Postgres space format (2026-08-14 09:10:00+00). 'T'(0x54)>' '(0x20), so a same-day pre-correction send compares AFTER corrected_at: the redelivered bounce exhausts and stamps fabricated referee_contact_invalid. The stale test pins a different day (2026-08-01 vs now()), hiding it.",
+    "recommended_fix": "Normalize both sides to one format (e.g. SELECT to_char(corrected_at,'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') or compare EXTRACT(EPOCH FROM corrected_at) against the parsed 'at') before the lexical compare; add a same-day stale-bounce integration test."
+  },
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "stale-response",
+    "title": "STILL PRESENT (r1): W8 late-response guard is partial — a stale ApiReturnedRefcheckAction still toasts on unrelated pages because the id-match guard has no route check and application_detail survives navigation away from the detail route",
+    "location": "client/src/client.gleam:3522-3528; client/src/client.gleam:6584-6603; client/src/client.gleam:552-558; client/src/client.gleam:6605-6613",
+    "evidence": "client.gleam:3522-3528: \"ApiReturnedRefcheckAction(call_id, action, result) -> // r1 (W8): the late-response guard the fire helpers' comments promise — // a stale answer after the landlord navigated away is dropped (the // inflight marker is keyed by call id and cleared by the route reset). case find_refcheck_call(model, call_id) {\" | client.gleam:6584-6597: \"fn find_refcheck_call(model: Model, call_id: String) -> Option(reference_call.ReferenceCallDetail) { case model.application_detail { Success(detail) -> ...\" | route-change-away block (552-558) clears only \"open_dispatched: set.new(), application_detail_request_id: None,\" | refetch_refcheck_effect (6605-6613): \"case model.route { routes.ApplicationDetail(vid, aid) -> ... _ -> effect.none() }\"",
+    "detail": "application_detail is not cleared when leaving the detail route (only application_detail_request_id/open_dispatched are), so a late response for a call still present in the retained detail passes the id-match guard and toasts on dashboard/vacancy pages; only the refetch is route-guarded. Comment's 'cleared by the route reset' promise is false for non-detail exits.",
+    "recommended_fix": "Clear application_detail (or the refcheck action state) on route change away from ApplicationDetail, or add a model.route ApplicationDetail check inside the ApiReturnedRefcheckAction guard before toasting."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "transaction-integrity",
+    "title": "do_correct/do_substitute discard update_trio's affected-row count: a 0-row trio UPDATE still writes the audit and returns 200 — the silent-0-row pattern W10 fixed, repeated inside the transaction",
+    "location": "server/src/reference_checks/actions_handler.gleam:210-231 (do_correct); 368-386 (do_substitute)",
+    "evidence": "actions_handler.gleam:210-213: \"case update_trio(tx, app_uuid, vacancy_uuid, row.ref_slot, trio) { Error(err) -> Error(DbFailure(err)) Ok(_) -> case audit_log.create( tx, user_id: landlord_uuid, event: event_type.ReferenceCallCorrected, ...\" | actions_handler.gleam:614-635: \"fn update_trio(...) -> Result(Int, pog.QueryError) { ... |> result.map(row_count)\"",
+    "detail": "The trio UPDATE's returned row count (result.map(row_count)) is discarded; a 0-row result (application's vacancy_id changed between the outside-transaction precheck and the transaction) still writes the correction/substitution audit and returns 200 with a misleading success, mirroring the W10 silent-0-row bug.",
+    "recommended_fix": "Match on the row count: a 0-row update_trio should fail the transaction (Error(RowNotFound)) so the audit is never written and the client gets a 404/409 instead of 200."
+  }
+]

@@ -1,0 +1,2871 @@
+diff --git a/_bmad-output/planning-artifacts/sprints/stories-v2.md b/_bmad-output/planning-artifacts/sprints/stories-v2.md
+index c193954..52190db 100644
+--- a/_bmad-output/planning-artifacts/sprints/stories-v2.md
++++ b/_bmad-output/planning-artifacts/sprints/stories-v2.md
+@@ -911,6 +911,25 @@ transition stub on the reserved `[LATER]` seam `[ODN-16, §6.6]`.*
+ 
+ - **Edge-case contracts:** `[E15]` advance-blocked-on-crisis. **Golden:** T1 of the advance.
+ - **Launchable increment:** meet the gate → the era advances.
++- **Status:** implemented 2026-08-19 — PR open (the advance gate: `balance.json`
++  `advance` block (milestone_window_ticks 600 = 30s @ 20Hz prototype tuning — GDD
++  full-game ~8-12 min/era + sla_uptime_pct 95); the condition-eval composes on the
++  6.1 seam (the gate is the trigger — the 6.1 request→latch→fire mechanics pinned;
++  a scripted `advance` still works, gated the same way); the three conditions —
++  sustained per-class SLA ≥ sla_uptime_pct across the era's active classes over the
++  milestone window (the gate's OWN E30-style rolling window, diffed from the 3.4
++  SLA accumulators), all in-service legacy pipes modernized (the 6.3 seam predicate:
++  a pipe is legacy iff its tier < the era's newest unlocked tier, against 6.1's era
++  infra table), and no active crisis `[E15]`; `Era_Advance_Blocked{reason}` event
++  (tag 14) makes each block path observable; run-setup `advance gate on` (like
++  health/growth — disabled = the 6.1 mechanics, byte-identical; un-advanced demos
++  fold-only re-bless, fold-checked + byte-verified); goldens `advance_fire.dem`
++  (conditions met → fires), `advance_block_sla.dem`, `advance_block_legacy.dem`
++  (each block branch T1-pinned); the E15 crisis block is unit-pinned (the real
++  catalog's only crisis is the era-3 surge, and era 3 is the terminal era — a
++  crisis-block golden would need era-4 content, out of scope); the deliberate
++  catalog-fold re-bless (the `advance` block) — fold-check PASS + .log.bin
++  header-only + T2 byte-identical).
+ 
+ ### Story 6.3 — Upgrade lifecycle (legacy decay)
+ 
+diff --git a/_bmad-output/pr-bodies/6.2.md b/_bmad-output/pr-bodies/6.2.md
+new file mode 100644
+index 0000000..e834366
+--- /dev/null
++++ b/_bmad-output/pr-bodies/6.2.md
+@@ -0,0 +1,137 @@
++# Story 6.2 — Advance trigger (the modernization gate)
++
++Advance requires sustaining SLA ≥ 95% across active classes for the milestone
++window **and** modernizing all in-service legacy pipes **and** no active
++crisis. The era advances only when all three hold; an active crisis BLOCKS
++advance `[E15]`; unmodernized legacy pipes block advance. "Meet the gate → the
++era advances" — the gate is the trigger.
++
++## The gate formula
++
++The gate composes on the 6.1 seam (era_step's condition-eval replaces the
++scripted request as the trigger — the request→latch→fire mechanics pinned in
++6.1 never change; a scripted `advance` still works, gated the same way).
++
++- **Window:** `advance.milestone_window_ticks` (600 = 30s @ 20Hz — prototype
++  value; the GDD full-game assumption is ~8–12 min/era `[ASSUMPTION: prototype
++  tuning]`). The run must have traversed the window before the gate evaluates
++  (tick ≥ window) — the pre-window period is a sustain precondition, not a
++  block.
++- **SLA measure:** per ACTIVE class (the current era's roster —
++  `era_class_unlocked`), the WINDOWED delivery ratio `delivered/(delivered+
++  dropped)` over the last `milestone_window_ticks` ≥ `advance.sla_uptime_pct`
++  (95). Built on the 3.4 SLA metrics via the gate's OWN E30-style rolling ring
++  (per-tick deltas diffed from the serialized flow accumulators — DERIVED,
++  never serialized; rebuilt identically on replay, same status as health's
++  ring). E24: a class with zero completed demand in the window measures
++  nothing (neutral); at least one active class must have completed demand
++  (the vacuous-pass guard).
++- **Legacy predicate (the 6.3 seam):** a pipe is LEGACY iff its tier is below
++  the current era's NEWEST unlocked tier (`era_newest_tier`, from 6.1's era
++  infrastructure table). All in-service (alive) legacy pipes must be
++  modernized (demolish+redraw at the era's newest tier today; 6.3 owns the
++  real legacy model — draw-era tracking + decay — and replaces this predicate
++  at the documented seam). Demolished pipes are out of service and do not
++  block.
++- **Crisis (E15):** no active crisis (the 4.2 signal). An active crisis
++  blocks; the gate re-evaluates deterministically every tick, so when the
++  crisis clears (and the other conditions hold) the advance fires.
++
++**Block priority (observable):** `Era_Advance_Blocked{reason}` emits on the
++ENTER of a blocked state, deduped (never every tick). Reason priority:
++Crisis > Legacy > Sla (E15 is the headline contract and masks the quieter
++terms).
++
++## What shipped
++
++- **`core/era.odin`** — the gate (evaluated in `era_step` when
++  `advance_gate_enabled`): `era_gate_update` (the milestone-window ring),
++  `era_gate_block` (the three conditions), `era_newest_tier` /
++  `era_pipe_is_legacy` (the 6.3 seam predicate), `event_emit_advance_blocked`.
++  Disabled (the zero value) = the 6.1 mechanics byte-identical.
++- **`core/types.odin`** — `Advance_Block_Reason`, `Era_Gate_State` (derived,
++  never serialized), `Run_State.advance_gate_enabled` + `.era_gate`, event tag
++  `EVENT_TAG_ERA_ADVANCE_BLOCKED` (14).
++- **`data/balance.json` + `core/catalog.odin`** — the `advance` block
++  (milestone_window_ticks + sla_uptime_pct), fail-fast validated like its
++  siblings (missing key = load error; window 1..10000; bar 1..100).
++- **`core/serialize.odin`** — the tag-14 payload (append-only; no LOG_VERSION
++  bump — no new command).
++- **Harness** — `advance gate on` run-setup directive (threaded through
++  `Demo_Replay` live + replay; the drift-check gains the `advance_gate_flip`
++  divergence class, mirroring the growth-flip pin — the gate run-setup is
++  replay-determinate, not silently ignorable).
++- **Goldens** — `advance_fire.dem` (conditions met → fires: era 2 healthy,
++  the window elapses at 30s with 100% windowed SLA, the gate fires 2→3,
++  streaming unlocks), `advance_block_sla.dem` (a standard-pipe bottleneck
++  flooded → windowed ratio ~55% < 95% → `{Sla}`, era stays 2),
++  `advance_block_legacy.dem` (a narrow stub in service in era 2 → `{Legacy}`,
++  era stays 2). The E15 crisis block is UNIT-pinned (test table era 4 + the
++  real surge — a real-catalog crisis-block golden is impossible: the real
++  catalog's only crisis is the era-3 surge, and era 3 is the terminal era;
++  a golden would need era-4 content, out of scope).
++
++## Tests
++
++- **`core/advance_gate_test.odin`** (10 new): the fire path (healthy era 2 →
++  era 3, no block events); each block path (Sla, Legacy, and the E15 crisis
++  block — a real engine crisis defers the advance until it clears + the SLA
++  window recovers, then fires); replay identity for a gate-fired run (live vs
++  replay byte-identical); the window-not-elapsed precondition; E24
++  zero-completion neutrality (an idle network cannot vacuous-pass); last-era
++  inertness (era 3 in the real 3-era table emits nothing); a scripted request
++  under the gate still fires gated; the disabled gate keeps the 6.1
++  mechanics.
++- **`core/catalog_test.odin`** — the `advance` block's fail-fast rows (missing
++  / zero / negative / oversized window; 0 / 101% bar).
++- GWT (stories-v2 6.2) demonstrably green: fire path + every block path
++  tested.
++
++## Verification
++
++- `tools/ci-local.sh --mac` **10/10** (purity gates, 215 core tests, app
++  build, golden harness 40 demos + replay gate, palcheck, drift-check (271
++  mutations incl. the new advance_gate_flip class), preview-check, PP_DEBUG
++  builds, stats-check, input-parity 24/24).
++- **The deliberate re-bless** (the `advance` balance block folds into
++  catalog_hash): fold-check PASS (boot's tick-1 shift is the catalog fold
++  alone — bytes 33..40, mechanically proven); `.log.bin` re-bless header-only
++  (byte-verified: only the catalog_hash field differs, commands byte-
++  identical); T2 pixels byte-identical (zero `.png` churn); the 3 new gate
++  demos' goldens are deliberate additions. **Un-advanced demos are
++  byte-identical**: the gate is run-setup-opt-in, so every existing demo
++  without `advance gate on` keeps its sim unchanged (fold-only re-bless).
++
++## Decisions & rationale
++
++- **The gate is the trigger** (the 6.1 seam's first option: condition-eval
++  replaces the scripted request). The launchable increment is "meet the gate →
++  the era advances" — the player sustains + modernizes + avoids crises and the
++  era advances by itself. The request→latch→fire mechanics stay pinned; a
++  scripted `Cmd_Era_Advance` still works and is gated identically.
++- **Run-setup opt-in (`advance gate on`)**: mirrors health/growth. The gate is
++  a pure function of serialized state — replay re-derives it, so the flag is
++  run setup, never a log byte (the drift-check flip class pins this). Opt-in
++  keeps every pre-6.2 demo byte-identical (only the catalog fold shifts them).
++- **The gate's windowed SLA is its OWN ring, not health's**: the milestone
++  window (~8-12 min/era full-game) is a different duration than the health
++  meter's window; coupling them would tie the advance gate to the health
++  meter's tuning. Same E30 pattern, own window.
++- **Legacy predicate = tier < era's newest tier** (against 6.1's era infra
++  table): the MVP advance (2→3) requires modernizing narrows to standard; the
++  3→4 advance (full-game) requires modernizing to wide. Documented as the 6.3
++  seam — 6.3 replaces it with draw-era tracking + decay.
++- **E15 crisis block is unit-pinned, not golden**: the real catalog's only
++  crisis is the era-3 surge, and era 3 is the last era (no forward target).
++  A real-catalog crisis-block golden would require era-4 content (out of
++  scope — eras 4-6 are full-game). The unit test uses the test-table era 4 +
++  the real surge fixture (the 6.1 E14 scenario) and pins the full
++  deferral→recovery→fire arc.
++
++## Follow-ups (out of scope, named)
++
++- **6.3** — the real legacy model (draw-era tracking + decay): replaces the
++  `era_pipe_is_legacy` predicate at the documented seam; adds the tier-up
++  command.
++- **App-side advance trigger** — the gate is inert in the app (era 3 =
++  terminal); a player-facing advance rides a future era-4 slice.
+diff --git a/core/advance_gate_test.odin b/core/advance_gate_test.odin
+new file mode 100644
+index 0000000..0868931
+--- /dev/null
++++ b/core/advance_gate_test.odin
+@@ -0,0 +1,467 @@
++package core
++
++// advance_gate_test.odin — Story 6.2's durable contracts (arch §6.6, GDD M4):
++// the era-advance modernization gate. Pins:
++//   (a) the FIRE path — all three conditions hold (sustained windowed SLA
++//       >= 95% across the era's active classes, all in-service legacy pipes
++//       modernized, no active crisis) -> the advance fires (era+1, the gate
++//       is the trigger — no scripted request needed);
++//   (b) each BLOCK path — the SLA term (windowed ratio < 95%), the legacy
++//       term (an in-service pipe below the era's newest tier), and the E15
++//       crisis term (an active crisis blocks; the gate re-evaluates when the
++//       crisis clears) — each observable via Era_Advance_Blocked{reason};
++//   (c) the milestone-window SLA MEASUREMENT itself (the E30 ring: windowed
++//       delivery ratio, E24 zero-completion neutrality, the window-elapsed
++//       precondition);
++//   (d) replay determinism — the gate is a pure function of serialized state,
++//       so a gate-fired live run replays byte-identically;
++//   (e) the last-era inertness (a real 3-era table: era 3 has no forward
++//       target — the gate emits nothing).
++
++import "core:testing"
++
++
++// era_test_catalog_3 — the test table WITHOUT era 4 (the real catalog's shape:
++// eras 1-3, era 3 terminal). The fire tests use this so a fired advance to era
++// 3 leaves the gate INERT (no post-fire legacy artifact from a test-only era 4).
++era_test_catalog_3 :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalogs {
++	cat3 := era_test_catalog(cat, allocator)
++	pop(&cat3.eras) // era 4 was the last row — drop it
++	return cat3
++}
++
++// gate_fixture — a healthy era-2 network: residential(0) @{8,15},
++// residential(1) @{14,15} (the res->res email sink set), router(2) @{20,15}
++// (the fixture's router; the director needs a junction for routing), all
++// drawn STANDARD (the era-2 newest tier — NOT legacy). The era-2 email
++// spec (res->res volume 2) flows with zero drops -> windowed SLA 100%.
++gate_fixture :: proc(s: ^Run_State, cat: ^Catalogs) {
++	res_idx, _ := node_type_index(cat, "residential")
++	rt_idx, _ := node_type_index(cat, "router_basic")
++	r0 := topology_spawn_node(&s.topology, res_idx, {8, 15}, cat)
++	r1 := topology_spawn_node(&s.topology, res_idx, {14, 15}, cat)
++	g := topology_spawn_node(&s.topology, rt_idx, {20, 15}, cat)
++	sla_draw(s, cat, r0, g, "standard", 1)
++	sla_draw(s, cat, r1, g, "standard", 1)
++}
++
++// gate_record_run — step a run collecting the FULL event stream + the
++// per-tick hashes (the ODN-14 drain convention — collect as you step). The
++// gate tests need the Era_Advance_Blocked + Era_Advanced events.
++gate_record_run :: proc(s: ^Run_State, ticks: u64, cat: ^Catalogs) -> ([dynamic]u64, [dynamic]Event) {
++	hashes := make([dynamic]u64, 0, ticks)
++	events := make([dynamic]Event, 0, 8)
++	start := s.tick + 1
++	for tick in start ..< start + ticks {
++		before := len(s.events)
++		batch := make([dynamic]Command, 0, 4, context.temp_allocator)
++		for cmd in s.action_log {
++			if cmd.apply_tick == tick {
++				append(&batch, cmd)
++			}
++		}
++		step(s, tick, batch[:], cat)
++		for e in s.events[before:] {
++			append(&events, e)
++		}
++		append(&hashes, state_hash(s, s.events[before:], cat, context.temp_allocator))
++		clear(&s.events)
++		free_all(context.temp_allocator)
++	}
++	return hashes, events
++}
++
++// gate_advance_events — the era gate's own events (Era_Advance_Blocked +
++// Era_Advanced), in order.
++gate_advance_events :: proc(evs: []Event, allocator := context.allocator) -> [dynamic]Event {
++	out := make([dynamic]Event, 0, 4, allocator)
++	for e in evs {
++		if e.tag == EVENT_TAG_ERA_ADVANCE_BLOCKED || e.tag == EVENT_TAG_ERA_ADVANCED {
++			append(&out, e)
++		}
++	}
++	return out
++}
++
++@(test)
++test_advance_gate_fires_when_conditions_hold :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	era_test_catalog_3(cat) // eras 1-3 only — a fired era 2->3 leaves the gate inert
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 42, cat.hash, TEST_LOGIC_HZ)
++	s.era = 2
++	s.advance_gate_enabled = true
++	gate_fixture(&s, cat)
++
++	// healthy era-2 email flow; the milestone window (600) elapses at tick 600
++	// with 100% windowed SLA -> the gate fires era 2->3 on its own (the gate
++	// is the trigger — no scripted request in the log).
++	_, evs := gate_record_run(&s, 700, cat)
++	defer delete(evs)
++
++	ga := gate_advance_events(evs[:])
++	defer delete(ga)
++	testing.expect(t, len(ga) >= 1, "the gate must emit an advance event")
++	testing.expect_value(t, s.era, u8(3))
++	testing.expect_value(t, s.era_advance_to, u8(0))
++	testing.expect(t, !s.replay_error, "an honest gate-fired advance must not latch replay_error")
++	// exactly one fire, no block (the healthy run never enters a blocked state)
++	fires := 0
++	blocks := 0
++	for e in ga {
++		if e.tag == EVENT_TAG_ERA_ADVANCED { fires += 1 }
++		if e.tag == EVENT_TAG_ERA_ADVANCE_BLOCKED { blocks += 1 }
++	}
++	testing.expect_value(t, fires, 1)
++	testing.expect_value(t, blocks, 0)
++}
++
++@(test)
++test_advance_gate_replay_identity :: proc(t: ^testing.T) {
++	// the story's determinism pin: a gate-fired live run and its replay (same
++	// seed + setup + log, gate enabled in BOTH paths — the flag is run setup)
++	// reproduce byte-identical per-tick hashes. The gate is a pure function of
++	// serialized state (flow.sla accumulators + topology + crisis registry +
++	// era + tick) + catalogs; the milestone ring is derived, never serialized.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	era_test_catalog_3(cat) // eras 1-3 only
++	defer catalogs_destroy(cat)
++
++	live: Run_State
++	defer run_destroy(&live)
++	run_init(&live, 7, cat.hash, TEST_LOGIC_HZ)
++	live.era = 2
++	live.advance_gate_enabled = true
++	gate_fixture(&live, cat)
++	live_hashes, _ := gate_record_run(&live, 700, cat)
++	defer delete(live_hashes)
++	testing.expect_value(t, live.era, u8(3))
++	testing.expect(t, !live.replay_error, "live run must not latch replay_error")
++
++	replayed: Run_State
++	defer run_destroy(&replayed)
++	run_init(&replayed, 7, cat.hash, TEST_LOGIC_HZ)
++	replayed.era = 2
++	replayed.advance_gate_enabled = true // run setup — re-created identically on replay
++	gate_fixture(&replayed, cat)
++	delete(replayed.action_log)
++	replayed.action_log = clone_log(live.action_log)
++	replay_hashes, _ := gate_record_run(&replayed, 700, cat)
++	defer delete(replay_hashes)
++
++	testing.expect_value(t, replayed.era, u8(3))
++	testing.expect(t, !replayed.replay_error, "replay must not latch replay_error (ODN-11 critical)")
++	diverged := false
++	for i in 0..<len(live_hashes) {
++		if live_hashes[i] != replay_hashes[i] {
++			diverged = true
++		}
++	}
++	testing.expectf(t, !diverged, "REPLAY DIVERGENCE with the advance gate: live vs replay hashes differ")
++}
++
++@(test)
++test_advance_gate_sla_block :: proc(t: ^testing.T) {
++	// the SLA block path: a healthy-LEGACY topology flooded hard enough that
++	// the windowed delivery ratio sits below 95% — the gate reports .Sla and
++	// never fires. Standard pipes (era-2 newest tier) keep the legacy term out
++	// of the way; no crisis. E24: a zero-completion window measures nothing —
++	// we flood, so demand exists.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	era_test_catalog(cat)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 11, cat.hash, TEST_LOGIC_HZ)
++	s.era = 2
++	s.advance_gate_enabled = true
++	res_idx, _ := node_type_index(cat, "residential")
++	rt_idx, _ := node_type_index(cat, "router_basic")
++	// ONE standard pipe res0->router + res1->router: the shared router pipe
++	// (res1->router) is the bottleneck — flood email res1->router with 6/tick
++	// (the E9 lane bound is 6, so the queue saturates and sheds).
++	r0 := topology_spawn_node(&s.topology, res_idx, {8, 15}, cat)
++	r1 := topology_spawn_node(&s.topology, res_idx, {14, 15}, cat)
++	g := topology_spawn_node(&s.topology, rt_idx, {20, 15}, cat)
++	sla_draw(&s, cat, r0, g, "standard", 1)
++	sla_draw(&s, cat, r1, g, "standard", 1)
++	for tick in u64(2)..=400 {
++		flow_seed_demand(&s.flow, tick, r1, g, u16(0)) // legacy path — floods bypass the credit cap
++	}
++
++	_, evs := gate_record_run(&s, 700, cat)
++	defer delete(evs)
++
++	ga := gate_advance_events(evs[:])
++	defer delete(ga)
++	testing.expect(t, s.era == u8(2), "the SLA-blocked advance must never fire")
++	testing.expect(t, !s.replay_error, "the SLA block must not latch replay_error")
++	saw_sla := false
++	for e in ga {
++		if e.tag == EVENT_TAG_ERA_ADVANCE_BLOCKED && Advance_Block_Reason(e.reason) == .Sla {
++			saw_sla = true
++		}
++	}
++	testing.expect(t, saw_sla, "the gate must emit Era_Advance_Blocked{Sla}")
++}
++
++@(test)
++test_advance_gate_legacy_block_and_modernize :: proc(t: ^testing.T) {
++	// the legacy block path + the modernization recovery: a NARROW pipe in
++	// service in era 2 (era 2's newest tier is standard) blocks the advance;
++	// demolishing the narrow + redrawing standard modernizes -> the gate
++	// re-evaluates and fires. The healthy-email flow keeps the SLA term out
++	// of the way; no crisis.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	era_test_catalog(cat)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 5, cat.hash, TEST_LOGIC_HZ)
++	s.era = 2
++	s.advance_gate_enabled = true
++	res_idx, _ := node_type_index(cat, "residential")
++	rt_idx, _ := node_type_index(cat, "router_basic")
++	r0 := topology_spawn_node(&s.topology, res_idx, {8, 15}, cat)
++	r1 := topology_spawn_node(&s.topology, res_idx, {14, 15}, cat)
++	g := topology_spawn_node(&s.topology, rt_idx, {20, 15}, cat)
++	// the traffic path: standard (modern). The legacy pipe: a NARROW stub
++	// r1->router (6 tiles — within narrow max_span 10; tier 0 < era-2 newest
++	// standard) — in service, unmodernized.
++	sla_draw(&s, cat, r0, g, "standard", 1)
++	sla_draw(&s, cat, r1, g, "standard", 1)
++	sla_draw(&s, cat, r1, g, "narrow", 2) // parallel narrow stub — LEGACY in era 2
++
++	// modernize at tick 400: demolish the narrow stub (pipe 2), redraw standard.
++	append(&s.action_log, Command{apply_tick = 400, kind = Cmd_Demolish_Pipe{pipe = 2}})
++	append(&s.action_log, Command{apply_tick = 401, kind = Cmd_Draw_Pipe{a = r1, b = g, tier = 1}}) // standard
++
++	_, evs := gate_record_run(&s, 700, cat)
++	defer delete(evs)
++
++	ga := gate_advance_events(evs[:])
++	defer delete(ga)
++	testing.expect(t, s.era == u8(3), "after modernization the gate must fire")
++	testing.expect(t, !s.replay_error, "the modernize path must not latch replay_error")
++	saw_legacy := false
++	for e in ga {
++		if e.tag == EVENT_TAG_ERA_ADVANCE_BLOCKED && Advance_Block_Reason(e.reason) == .Legacy {
++			saw_legacy = true
++		}
++	}
++	testing.expect(t, saw_legacy, "the gate must emit Era_Advance_Blocked{Legacy} while the narrow is in service")
++}
++
++@(test)
++test_advance_gate_crisis_block_e15 :: proc(t: ^testing.T) {
++	// E15 — an active crisis BLOCKS the advance (the headline contract). The
++	// test-table era 4 gives era 3 a forward target; the real surge set-piece
++	// + the saturated narrow fixture fire a REAL crisis (the 6.1 E14 scenario).
++	// While the crisis is active the gate reports .Crisis and never fires; when
++	// the crisis clears (the wides fix lands), the SLA window recovers and the
++	// gate re-evaluates and fires era 3->4 — deterministic.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	era_test_catalog(cat)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 13, cat.hash, TEST_LOGIC_HZ)
++	s.era = 3 // test table: era 4 exists -> era 3 can advance
++	s.advance_gate_enabled = true
++	crisis_seed_fixture(&s, cat) // narrows res->router (pipe 0) + router->host (pipe 1) — saturated by the surge
++	// the fix (the 6.1 E14 remedy): demolish the narrows @1499, wides @1500.
++	append(&s.action_log, Command{apply_tick = 1499, kind = Cmd_Demolish_Pipe{pipe = 0}})
++	append(&s.action_log, Command{apply_tick = 1499, kind = Cmd_Demolish_Pipe{pipe = 1}})
++	sla_draw(&s, cat, 0, 1, "wide", 1500)
++	sla_draw(&s, cat, 0, 1, "wide", 1500)
++	sla_draw(&s, cat, 1, 2, "wide", 1500)
++	sla_draw(&s, cat, 1, 2, "wide", 1500)
++
++	_, evs := gate_record_run(&s, 2500, cat)
++	defer delete(evs)
++
++	ga := gate_advance_events(evs[:])
++	defer delete(ga)
++	// the fire must land AFTER the crisis resolves (E14/E15: never mid-crisis)
++	saw_resolve := false
++	fire_tick: u64 = max(u64)
++	for e in evs {
++		if e.tag == EVENT_TAG_CRISIS_RESOLVED {
++			saw_resolve = true
++		}
++		if e.tag == EVENT_TAG_ERA_ADVANCED {
++			fire_tick = e.tick
++		}
++	}
++	testing.expect(t, saw_resolve, "the crisis must resolve (the fixture's fix works)")
++	testing.expect(t, s.era == u8(4), "after the crisis clears + SLA recovers, the gate must fire")
++	testing.expect(t, !s.replay_error, "the E15 re-evaluation must not latch replay_error")
++	saw_crisis := false
++	for e in ga {
++		if e.tag == EVENT_TAG_ERA_ADVANCE_BLOCKED && Advance_Block_Reason(e.reason) == .Crisis {
++			saw_crisis = true
++		}
++	}
++	testing.expect(t, saw_crisis, "the gate must emit Era_Advance_Blocked{Crisis} while the crisis is active")
++}
++
++@(test)
++test_advance_gate_window_not_elapsed :: proc(t: ^testing.T) {
++	// the milestone-window precondition: before the window (600 ticks) elapses,
++	// the gate cannot fire even on a perfectly healthy network (you haven't
++	// "sustained SLA for the milestone window" yet).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	era_test_catalog(cat)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 3, cat.hash, TEST_LOGIC_HZ)
++	s.era = 2
++	s.advance_gate_enabled = true
++	gate_fixture(&s, cat)
++
++	_, evs := gate_record_run(&s, 400, cat) // 400 < 600
++	defer delete(evs)
++	testing.expect(t, s.era == u8(2), "the gate must not fire before the milestone window elapses")
++	ga := gate_advance_events(evs[:])
++	defer delete(ga)
++	fires := 0
++	for e in ga {
++		if e.tag == EVENT_TAG_ERA_ADVANCED { fires += 1 }
++	}
++	testing.expect_value(t, fires, 0)
++}
++
++@(test)
++test_advance_gate_zero_demand_neutral :: proc(t: ^testing.T) {
++	// E24 neutrality on the SLA term: a run with NO completed demand in the
++	// window measures nothing — the SLA term is NOT met (a vacuous pass would
++	// let an idle network advance). The gate stays blocked (.Sla), never fires.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	era_test_catalog(cat)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	s.era = 2
++	s.advance_gate_enabled = true
++	gate_fixture(&s, cat) // topology only — the director spawns NOTHING (no demand)
++	// era 2's demand spec needs a residential SINK set — gate_fixture provides
++	// two residentials, but the director's weighted_random pick needs sources;
++	// to make this a TRUE zero-demand run, pin the demand OUT: era 2's plan is
++	// built from cat.demand.eras[era-1].entries — keep them, but draw NO pipes
++	// so nothing delivers. Simplest honest zero-completion: leave the fixture
++	// undrawn (the pipes above are the flow's only route; without them nothing
++	// delivers). Rebuild the run without the draws:
++	run_destroy(&s)
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	s.era = 2
++	s.advance_gate_enabled = true
++	// spawn the nodes only — NO pipes -> nothing can deliver (zero completion)
++	res_idx, _ := node_type_index(cat, "residential")
++	rt_idx, _ := node_type_index(cat, "router_basic")
++	topology_spawn_node(&s.topology, res_idx, {8, 15}, cat)
++	topology_spawn_node(&s.topology, res_idx, {14, 15}, cat)
++	topology_spawn_node(&s.topology, rt_idx, {20, 15}, cat)
++
++	_, evs := gate_record_run(&s, 700, cat)
++	defer delete(evs)
++	testing.expect(t, s.era == u8(2), "a zero-completion window must never pass the SLA term")
++	ga := gate_advance_events(evs[:])
++	defer delete(ga)
++	fires := 0
++	for e in ga {
++		if e.tag == EVENT_TAG_ERA_ADVANCED { fires += 1 }
++	}
++	testing.expect_value(t, fires, 0)
++}
++
++@(test)
++test_advance_gate_inert_last_era :: proc(t: ^testing.T) {
++	// the real catalog stops at era 3: era 3 has NO forward target, so the
++	// enabled gate is INERT — it emits nothing and never fires (the app's
++	// era-3 runs + the terminal era stay byte-identical).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat) // NO era_test_catalog — the real 3-era table
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 9, cat.hash, TEST_LOGIC_HZ)
++	s.era = 3
++	s.advance_gate_enabled = true
++	res, rt, host := test_seed_fixture(&s, cat)
++	sla_draw(&s, cat, res, rt, "standard", 1)
++	sla_draw(&s, cat, rt, host, "standard", 1)
++
++	_, evs := gate_record_run(&s, 200, cat)
++	defer delete(evs)
++	testing.expect(t, s.era == u8(3), "the last era can never advance")
++	ga := gate_advance_events(evs[:])
++	defer delete(ga)
++	testing.expect(t, len(ga) == 0, "the gate must be inert at the last era (no events, no fire)")
++}
++
++@(test)
++test_advance_gate_scripted_request_still_gated :: proc(t: ^testing.T) {
++	// the 6.1 request->latch->fire mechanics stay: a SCRIPTED advance under the
++	// gate fires only when the gate passes (a healthy window). The gate does
++	// not bypass the conditions for a scripted request.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	era_test_catalog(cat)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 21, cat.hash, TEST_LOGIC_HZ)
++	s.era = 2
++	s.advance_gate_enabled = true
++	gate_fixture(&s, cat)
++	append(&s.action_log, Command{apply_tick = 100, kind = Cmd_Era_Advance{to_era = 3}})
++
++	_, evs := gate_record_run(&s, 700, cat)
++	defer delete(evs)
++	testing.expect_value(t, s.era, u8(3))
++	testing.expect(t, !s.replay_error, "a gated scripted advance must not latch replay_error")
++}
++
++@(test)
++test_advance_gate_era_advance_disabled_keeps_61_mechanics :: proc(t: ^testing.T) {
++	// run-setup back-compat: the DISABLED gate (the zero value) keeps the 6.1
++	// mechanics — a scripted advance fires on the E14 crisis gate alone, even
++	// BEFORE the milestone window would have elapsed (the pre-6.2 demos stay
++	// byte-identical).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	era_test_catalog(cat)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 2, cat.hash, TEST_LOGIC_HZ)
++	s.era = 2
++	// advance_gate_enabled stays FALSE (the zero value)
++	gate_fixture(&s, cat)
++	append(&s.action_log, Command{apply_tick = 100, kind = Cmd_Era_Advance{to_era = 3}})
++
++	_, evs := gate_record_run(&s, 200, cat)
++	defer delete(evs)
++	testing.expect(t, s.era == u8(3), "the disabled gate must keep the 6.1 immediate-fire mechanics")
++	testing.expect(t, !s.replay_error, "the 6.1 path must not latch replay_error")
++}
+diff --git a/core/catalog.odin b/core/catalog.odin
+index fc3779a..4946e21 100644
+--- a/core/catalog.odin
++++ b/core/catalog.odin
+@@ -217,6 +217,9 @@ Balance :: struct {
+ 	// 4.3: the Network Health numbers (arch §6.5 — the prototype's proven
+ 	// tuning scaled to 20 Hz; ODN-5 single source).
+ 	health: Health_Balance,
++	// 6.2: the era-advance gate numbers (GDD M4 — the modernization gate's
++	// sustain window + the per-class delivery bar; arch §6.6).
++	advance: Advance_Balance,
+ 	// 5.6: the placement-separation rules (user ruling 2026-08-14, GDD M3) —
+ 	// router↔router vs router↔terminal are DIFFERENT distances; data-driven
+ 	// playtest tunables (the old blanket 7-tile const moved here — its own
+@@ -300,6 +303,20 @@ Health_Balance :: struct {
+ 	grace_refill_streak_ticks: i32, // healthy ticks before the refill starts (>= 1)
+ }
+ 
++// Advance_Balance — the 6.2 era-advance gate tunables (balance.json `advance`
++// block; GDD M4 "Era milestone window (sustain to advance)" — [ASSUMPTION:
++// prototype tuning] + arch §6.6). milestone_window_ticks = the sustain window:
++// the run must have delivered at or above sla_uptime_pct per active class
++// ACROSS the last milestone_window_ticks before the era can advance (a rolling
++// window, the E30 pattern — the gate re-evaluates every tick once the window
++// has elapsed). sla_uptime_pct = the per-class delivery bar (95 = the GDD
++// "SLA uptime ≥ 95%" row); it is the ADVANCE bar, distinct from the per-class
++// max_loss_pct/latency_tol_ms breach tolerances the health layer drains on.
++Advance_Balance :: struct {
++	milestone_window_ticks: i32, // the sustain window in ticks (>= 1, <= 10000)
++	sla_uptime_pct:         i32, // the per-class delivery bar, 1..100
++}
++
+ // Placement_Balance — the 5.6 placement-separation tunables (balance.json
+ // `placement` block; GDD M3 + user ruling 2026-08-14). router_router_sep_tiles
+ // = the min gap between two player-placed junctions (playtest 4);
+@@ -906,6 +923,23 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 		if b.health.grace_refill_per_tick < 1 || b.health.grace_refill_streak_ticks < 1 {
+ 			return {"balance.json", "health.grace_refill_per_tick/grace_refill_streak_ticks", "must be >= 1 (the gradual-refill never-lose guard)"}
+ 		}
++		// 6.2: the era-advance gate block (GDD M4 — the modernization gate's
++		// tunables). Fail-fast like its siblings: a MISSING key defaults to -1
++		// (a partial block is a load error, never a silent zero-window/silent
++		// 0% bar); the window must be 1..10000 (the ring is classes x window —
++		// a huge window is a memory foot-gun, mirroring health.window_ticks);
++		// the bar must be 1..100 (a 0% bar would make every run instantly
++		// advance-eligible and break the 95% canon).
++		if aobj, oka := obj["advance"].(json.Object); oka {
++			b.advance.milestone_window_ticks = jint(aobj, "milestone_window_ticks", -1)
++			b.advance.sla_uptime_pct = jint(aobj, "sla_uptime_pct", -1)
++		}
++		if b.advance.milestone_window_ticks < 1 || b.advance.milestone_window_ticks > 10000 {
++			return {"balance.json", "advance.milestone_window_ticks", "must be 1..10000 with all keys present (the sustain window; the ring is classes x window)"}
++		}
++		if b.advance.sla_uptime_pct < 1 || b.advance.sla_uptime_pct > 100 {
++			return {"balance.json", "advance.sla_uptime_pct", "must be 1..100 (the per-class delivery bar — the 95% advance canon)"}
++		}
+ 		if mp, okm := obj["map"].(json.Object); okm {
+ 			b.map_w_tiles = jint(mp, "w_tiles", 0)
+ 			b.map_h_tiles = jint(mp, "h_tiles", 0)
+diff --git a/core/catalog_test.odin b/core/catalog_test.odin
+index ee675d1..b84abba 100644
+--- a/core/catalog_test.odin
++++ b/core/catalog_test.odin
+@@ -69,6 +69,10 @@ BAL_VALID :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_b
+     "grace_refill_per_tick": 5,
+     "grace_refill_streak_ticks": 50
+   },
++  "advance": {
++    "milestone_window_ticks": 600,
++    "sla_uptime_pct": 95
++  },
+   "lane_presets": [
+     {"id": "balanced", "display_name": "Balanced", "weights": [1, 1, 1]},
+     {"id": "express_heavy", "display_name": "Express-heavy", "weights": [4, 2, 1]},
+@@ -489,6 +493,25 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		check_reject_bal(t, r.doc, r.rule)
+ 	}
+ 
++	// --- 6.2 balance.json `advance` block negative rows ---------------------
++	advance_rows := []struct {
++		label, doc, rule: string
++	}{
++		// a MISSING key defaults to -1 (the warnings-block convention) — a
++		// partial block is a load error, never a silent zero-window (the ring
++		// divides by it) or a silent 0% bar (the 95% canon).
++		{"milestone missing", replace1(BAL_VALID, `"milestone_window_ticks": 600,`, ``, 1), "must be 1..10000 with all keys present"},
++		{"milestone zero", replace1(BAL_VALID, `"milestone_window_ticks": 600`, `"milestone_window_ticks": 0`, 1), "must be 1..10000 with all keys present"},
++		{"milestone negative", replace1(BAL_VALID, `"milestone_window_ticks": 600`, `"milestone_window_ticks": -5`, 1), "must be 1..10000 with all keys present"},
++		// the ring is classes x window — a huge window is a memory foot-gun
++		{"milestone too big", replace1(BAL_VALID, `"milestone_window_ticks": 600`, `"milestone_window_ticks": 20000`, 1), "must be 1..10000 with all keys present"},
++		{"sla pct zero", replace1(BAL_VALID, `"sla_uptime_pct": 95`, `"sla_uptime_pct": 0`, 1), "must be 1..100 (the per-class delivery bar"},
++		{"sla pct 101", replace1(BAL_VALID, `"sla_uptime_pct": 95`, `"sla_uptime_pct": 101`, 1), "must be 1..100 (the per-class delivery bar"},
++	}
++	for r in advance_rows {
++		check_reject_bal(t, r.doc, r.rule)
++	}
++
+ 	// --- 5.6 balance.json `placement` block negative rows -------------------
+ 	// a MISSING key defaults to -1 (the warnings-block convention) — a partial
+ 	// placement block is a load error, never a silent zero-separation that
+diff --git a/core/determinism_test.odin b/core/determinism_test.odin
+index a3a9135..1b686dd 100644
+--- a/core/determinism_test.odin
++++ b/core/determinism_test.odin
+@@ -112,6 +112,14 @@ test_catalog :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalog
+ 		win_uptime_pct = 90, grace_refill_per_tick = 5,
+ 		grace_refill_streak_ticks = 50,
+ 	}
++	// 6.2: the era-advance gate numbers (mirrors data/balance.json `advance`) —
++	// the milestone window must be non-zero (the gate ring divides by it) and
++	// the SLA bar must be the real 95 (a 0 default would silently make every
++	// gate run advance-eligible).
++	cat.balance.advance = Advance_Balance{
++		milestone_window_ticks = 600,
++		sla_uptime_pct = 95,
++	}
+ 	// 3.1: the packet-class roster (mirrors data/packet_types.json — email = 0,
+ 	// streaming = 1; the class index is the Packet.class discriminator).
+ 	// 4.3: the per-class health numbers (grace + drain severity) mirror the
+diff --git a/core/era.odin b/core/era.odin
+index e751d8e..a90d539 100644
+--- a/core/era.odin
++++ b/core/era.odin
+@@ -1,7 +1,8 @@
+ package core
+ 
+ // era.odin — the S6 Era State Machine (arch §6.6, [LATER] seam — now live for
+-// Story 6.1). The era FSM owns the ACTIVE era + the ADVANCE mechanic:
++// Story 6.1, gated for 6.2). The era FSM owns the ACTIVE era + the ADVANCE
++// mechanic:
+ //
+ //   - Active era: Run_State.era (run setup / log header start it; the FSM
+ //     advances it). Every era-dependent system reads it the same way it
+@@ -13,28 +14,40 @@ package core
+ //     state.era_advance_to.
+ //   - The fire: era_step (called inside core.step at the reserved S6 seam —
+ //     after health_update, before win_lose_eval, per arch §4) executes the
+-//     advance when the E14 gate passes: NO ACTIVE CRISIS. An active crisis
+-//     DEFERS the advance (state.era_advance_to stays latched) until the
+-//     crisis clears — deterministic (the crisis lifecycle is itself replay-
+-//     deterministic), and the new era's demand signature never spawns
+-//     mid-crisis [E14]. Firing bumps state.era, loads the new era's unlocks
+-//     (the roster + infra table ride the catalog; era_step's observable
+-//     effect is the era flip + the Era_Advanced event + the demand plan
+-//     switching next tick), and clears the latch.
++//     advance when the gate passes. Firing bumps state.era, loads the new
++//     era's unlocks (the roster + infra table ride the catalog; era_step's
++//     observable effect is the era flip + the Era_Advanced event + the demand
++//     plan switching next tick), and clears the latch.
+ //
+-//   6.2 gate surface: the advance CONDITIONS (sustain SLA >= 95% across the
+-//   milestone window AND modernized legacy AND no active crisis — E15) are
+-//   story 6.2's scope. 6.2 composes on this seam: it either gates what
+-//   REQUESTs an advance (the condition-eval replaces the scripted request as
+-//   the trigger) or tightens era_advance_blocked — the request->latch->fire
+-//   mechanics pinned here never change.
++//   6.2 gate surface (story 6.2 — the modernization gate): when
++//   Run_State.advance_gate_enabled (run setup), the condition-eval in
++//   era_step REPLACES the scripted request as the trigger (the 6.1 seam's
++//   first option): the gate is evaluated EVERY tick and fires the advance
++//   (era+1) when all three conditions hold —
+ //
+-//   Determinism (the spine): the request rides the action log (E10 — replay
+-//   re-applies the identical command), the deferral is a pure function of the
+-//   replay-deterministic crisis registry, and the fire is a pure function of
+-//   (log, seed, catalogs) — byte-identical on replay. state.era + the pending
+-//   latch ride the T1 hash (serialize.odin — era_advance_to absent-when-0), so
+-//   the era-advanced state is itself a golden.
++//       sustain SLA >= sla_uptime_pct across the era's active classes for the
++//       milestone window (the rolling windowed delivery ratio over the last
++//       advance.milestone_window_ticks, the E30 ring pattern) AND all
++//       in-service legacy pipes are modernized (the 6.3 seam predicate: a
++//       pipe is legacy iff its tier < the era's newest unlocked tier) AND no
++//       active crisis (E15 — the 4.2 signal).
++//
++//   Each block path is OBSERVABLE: Era_Advance_Blocked{reason} emits on the
++//   ENTER of a blocked state (deduped — never every tick), and the fire is
++//   Era_Advanced. An active crisis BLOCKS [E15]; the gate re-evaluates
++//   deterministically every tick, so when the crisis clears (and the other
++//   conditions hold) the advance fires — the deferral is a pure function of
++//   the replay-deterministic crisis lifecycle. A scripted Cmd_Era_Advance
++//   still works under the gate (it latches; the fire is gated the same way).
++//   The request→latch→fire mechanics pinned here never change.
++//
++//   Determinism (the spine): the gate is a PURE FUNCTION of serialized state
++//   (flow.sla accumulators + topology pipes + crisis.active + era + tick) and
++//   catalogs — the milestone-window ring is DERIVED (never serialized, like
++//   health's ring; rebuilt identically on replay), so the fire tick and the
++//   block events are byte-identical on replay. state.era + the pending latch
++//   ride the T1 hash (serialize.odin — era_advance_to absent-when-0), so the
++//   era-advanced state is itself a golden.
+ 
+ // event_emit_era — append an Era_Advanced event with the NEW era as payload
+ // (the Event.class field carries it, tag-conditional — see serialize.odin's
+@@ -43,6 +56,188 @@ event_emit_era :: proc(state: ^Run_State, tick: u64, new_era: u8) {
+ 	append(&state.events, Event{tick = tick, tag = EVENT_TAG_ERA_ADVANCED, class = u16(new_era)})
+ }
+ 
++// event_emit_advance_blocked — append an Era_Advance_Blocked event with its
++// reason payload (6.2, ODN-14): the Advance_Block_Reason byte (the Event.reason
++// field, tag-conditional in the serializer). Append-only — pre-6.2 streams
++// byte-identical.
++event_emit_advance_blocked :: proc(state: ^Run_State, tick: u64, reason: Advance_Block_Reason) {
++	append(&state.events, Event{tick = tick, tag = EVENT_TAG_ERA_ADVANCE_BLOCKED, reason = u8(reason)})
++}
++
++// era_gate_make / era_gate_destroy — the 6.2 gate state lifetime (mirrors
++// health_make/health_destroy; ODN-18 arena discipline lands later).
++era_gate_make :: proc(g: ^Era_Gate_State, allocator := context.allocator) {
++	g^ = {}
++	g.ring = make([dynamic]Window_Tick, 0, 4, allocator)
++	g.win_delivered = make([dynamic]u64, 0, 4, allocator)
++	g.win_dropped = make([dynamic]u64, 0, 4, allocator)
++	g.prev_delivered = make([dynamic]u64, 0, 4, allocator)
++	g.prev_dropped = make([dynamic]u64, 0, 4, allocator)
++}
++
++era_gate_destroy :: proc(g: ^Era_Gate_State) {
++	delete(g.ring)
++	delete(g.win_delivered)
++	delete(g.win_dropped)
++	delete(g.prev_delivered)
++	delete(g.prev_dropped)
++}
++
++// era_gate_ensure — grow the gate's per-class arrays + flat ring up to `n`
++// classes with the catalog window (mirror of health_ensure; APPEND-ONLY —
++// existing slots never move). The ring tail is explicitly zeroed (never trust
++// a resize's new memory).
++era_gate_ensure :: proc(g: ^Era_Gate_State, cat: ^Catalogs, n: int) {
++	win := u32(cat.balance.advance.milestone_window_ticks)
++	want := n * int(win)
++	if win != g.window_ticks || len(g.ring) != want {
++		old_len := len(g.ring)
++		g.window_ticks = win
++		resize(&g.ring, want)
++		for i in old_len..<want {
++			g.ring[i] = {}
++		}
++	}
++	for len(g.win_delivered) < n {
++		append(&g.win_delivered, 0)
++		append(&g.win_dropped, 0)
++		append(&g.prev_delivered, 0)
++		append(&g.prev_dropped, 0)
++	}
++}
++
++// era_gate_update — the gate's per-tick milestone-window measurement (6.2):
++// diff the flow's cumulative SLA accumulators into a rolling ring of the last
++// milestone_window_ticks per-tick deltas (the E30 pattern, mirror of
++// health_update's ring section), so the windowed delivery ratio per class is a
++// pure function of the serialized accumulators (replay-rebuilt identically).
++// Called from era_step every tick the gate is enabled. Same-tick re-step
++// safety: the diff (prev_* scratch) sees delta 0 on a re-step — the accepted
++// 4.2 convention (the ring slot may be overwritten with zeros on a same-tick
++// re-step; the harness drains per step, the app never re-steps, replay never
++// re-steps, so replay equality holds).
++era_gate_update :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
++	g := &state.era_gate
++	n := len(state.flow.sla)
++	if n > len(cat.packet_types) {
++		n = len(cat.packet_types)
++	}
++	if n == 0 {
++		return
++	}
++	era_gate_ensure(g, cat, n)
++	win := u64(g.window_ticks)
++	for c in 0..<n {
++		acc := &state.flow.sla[c]
++		dd := acc.delivered - g.prev_delivered[c]
++		dp := acc.dropped - g.prev_dropped[c]
++		g.prev_delivered[c] = acc.delivered
++		g.prev_dropped[c] = acc.dropped
++		slot := int(c) * int(g.window_ticks) + int(tick % win)
++		g.win_delivered[c] += dd - u64(g.ring[slot].delivered)
++		g.win_dropped[c] += dp - u64(g.ring[slot].dropped)
++		g.ring[slot] = Window_Tick{delivered = u32(dd), dropped = u32(dp)}
++	}
++}
++
++// era_newest_tier — the current era's newest unlocked pipe tier (the 6.2
++// legacy predicate's bar against 6.1's era infrastructure table): the max
++// tier index in the era's unlock_pipe_tiers. The 6.3 seam: the real legacy
++// model (per-pipe draw era + decay) replaces this predicate; until then, "a
++// pipe drawn below the era's newest tier is legacy" is the 6.1-table
++// stand-in the story pins.
++era_newest_tier :: proc(cat: ^Catalogs, era: u8) -> (u16, bool) {
++	row, ok := era_row(cat, era)
++	if !ok {
++		return 0, false
++	}
++	newest: u16 = 0
++	for t in row.unlock_pipe_tiers {
++		if t > newest {
++			newest = t
++		}
++	}
++	return newest, len(row.unlock_pipe_tiers) > 0
++}
++
++// era_pipe_is_legacy — the 6.2 legacy-pipe predicate (the 6.3 seam). A pipe
++// is LEGACY iff its tier is below the current era's NEWEST unlocked tier (the
++// 6.1 era infra table): in era 2 (unlocks narrow+standard) a narrow pipe is
++// legacy and must be modernized (demolish+redraw at standard/wide, or the
++// 6.3 tier-up) before the era can advance; in era 3 (unlocks wide) narrow +
++// standard are legacy. 6.3 owns the real legacy state (draw-era tracking +
++// decay); this predicate is the documented seam.
++era_pipe_is_legacy :: proc(cat: ^Catalogs, era: u8, tier: u16) -> bool {
++	newest, ok := era_newest_tier(cat, era)
++	if !ok {
++		return false
++	}
++	return tier < newest
++}
++
++// era_gate_sla_ok — the sustain-SLA condition: for every ACTIVE class (in the
++// current era's roster, era_class_unlocked) with completed demand in the
++// milestone window, the windowed delivery ratio >= sla_uptime_pct; and at
++// least one active class HAS completed demand (E24 — a zero-completion window
++// measures nothing; the vacuous-pass guard). The window must have ELAPSED
++// (tick >= milestone_window_ticks — "sustaining for the milestone window"
++// means the window itself traversed). The window is anchored at the era's
++// start (the run's setup era = tick 0 for the MVP single advance; the ring
++// rolls continuously).
++era_gate_sla_ok :: proc(state: ^Run_State, cat: ^Catalogs) -> bool {
++	if state.tick < u64(cat.balance.advance.milestone_window_ticks) {
++		return false
++	}
++	g := &state.era_gate
++	found := false
++	for c in 0..<len(g.win_delivered) {
++		if int(c) >= len(cat.packet_types) {
++			continue
++		}
++		if !era_class_unlocked(cat, state.era, u16(c)) {
++			continue // only the era's ACTIVE classes are measured
++		}
++		completed := g.win_delivered[c] + g.win_dropped[c]
++		if completed == 0 {
++			continue // E24: zero-completion measures nothing (neutral)
++		}
++		found = true
++		if g.win_delivered[c] * 100 < completed * u64(cat.balance.advance.sla_uptime_pct) {
++			return false
++		}
++	}
++	return found
++}
++
++// era_gate_legacy_ok — the modernized-legacy condition: no IN-SERVICE (alive)
++// pipe is legacy (tier below the era's newest unlocked tier). Demolished
++// (tombstoned) pipes are out of service and do not block.
++era_gate_legacy_ok :: proc(state: ^Run_State, cat: ^Catalogs) -> bool {
++	for i in 0..<len(state.topology.pipe_alive) {
++		if state.topology.pipe_alive[i] && era_pipe_is_legacy(cat, state.era, state.topology.pipe_tier[i]) {
++			return false
++		}
++	}
++	return true
++}
++
++// era_gate_block — the full advance gate (6.2, E15): the first failing
++// condition in a defined priority (Crisis > Legacy > Sla — an active crisis
++// is the headline contract and masks the quieter terms). None = the gate
++// passes (advance may fire).
++era_gate_block :: proc(state: ^Run_State, cat: ^Catalogs) -> Advance_Block_Reason {
++	if len(state.crisis.active) > 0 {
++		return .Crisis
++	}
++	if !era_gate_legacy_ok(state, cat) {
++		return .Legacy
++	}
++	if !era_gate_sla_ok(state, cat) {
++		return .Sla
++	}
++	return .None
++}
++
+ // era_advance_validate — the apply-time validation for Cmd_Era_Advance (the
+ // command-apply loop in core.step calls this before latching). to_era must be
+ // in the era table (1..len(cat.eras)) AND strictly forward (to_era > the era
+@@ -65,30 +260,69 @@ era_advance_latch :: proc(state: ^Run_State, c: Cmd_Era_Advance) {
+ 	state.era_advance_to = c.to_era
+ }
+ 
+-// era_advance_blocked — the E14 gate: an advance may NOT fire while a crisis
+-// is active (an active crisis PRESERVES through the advance — E14's first
+-// half; the new era's demand must not spawn mid-crisis — E14's second half).
+-// Story 6.2 composes the full advance gate here (sustain-SLA + modernized
+-// legacy + no-crisis — E15); the no-crisis term is decided NOW (this story).
++// era_advance_blocked — the 6.1 E14 gate: an advance may NOT fire while a
++// crisis is active (an active crisis PRESERVES through the advance — E14's
++// first half; the new era's demand must not spawn mid-crisis — E14's second
++// half). Under the 6.2 gate this is subsumed by era_gate_block (the .Crisis
++// term, E15); the standalone proc keeps the DISABLED-gate path identical to
++// 6.1 (byte-identical demos).
+ era_advance_blocked :: proc(state: ^Run_State) -> bool {
+ 	return len(state.crisis.active) > 0
+ }
+ 
+ // era_step — the S6 seam (called inside core.step AFTER health_update, BEFORE
+-// win_lose_eval — arch §4's reserved slot, [LATER] now live). Executes a
+-// pending advance when the E14 gate passes: bumps the active era, loads the
+-// new era's unlocks (the roster + infrastructure table are catalog data —
+-// validated at load; the demand signature switches by construction: the
+-// director reads cat.demand.eras[era-1] on every tick, so the NEXT tick's
+-// flow spawns under the new signature), emits Era_Advanced, and clears the
+-// latch. Deferred (latch held) while a crisis is active — the fire tick is a
+-// pure function of the crisis lifecycle (deterministic).
++// win_lose_eval — arch §4's reserved slot, [LATER] now live).
++//
++// GATE ENABLED (6.2): the condition-eval replaces the scripted request as the
++// trigger — the gate is evaluated every tick once the milestone window has
++// ELAPSED (tick >= advance.milestone_window_ticks; the pre-window sustain
++// period is a precondition, NOT a block — no events before it); when all
++// three conditions hold the advance fires (era+1; a scripted latch, if any,
++// is fired instead). Each block path is observable (Era_Advance_Blocked on
++// the enter, deduped). The last era cannot advance (the gate is inert — no
++// events, no fire).
++//
++// GATE DISABLED (6.1 back-compat): a pending scripted advance fires when the
++// E14 gate passes (no active crisis) — the pinned 6.1 mechanics, byte-identical.
+ era_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+-	if state.era_advance_to == 0 {
+-		return
+-	}
+-	if era_advance_blocked(state) {
+-		return // E14 — an active crisis defers the advance until it clears
++	if state.advance_gate_enabled {
++		// the last era has no forward target — the gate is inert (the app's
++		// era-3 runs + the real catalog's terminal era never fire/emit).
++		if state.era == 0 || int(state.era) >= len(cat.eras) {
++			return
++		}
++		era_gate_update(state, tick, cat)
++		// the milestone window must have ELAPSED before the gate evaluates:
++		// "sustaining SLA for the milestone window" is a precondition, not a
++		// block path (no events before it).
++		if tick < u64(cat.balance.advance.milestone_window_ticks) {
++			state.era_gate.last_block = .None
++			return
++		}
++		reason := era_gate_block(state, cat)
++		// observability: emit on the ENTER of a blocked state (or a reason
++		// change), deduped — never every tick (the anti-chatter rule).
++		if reason != state.era_gate.last_block {
++			state.era_gate.last_block = reason
++			if reason != .None {
++				event_emit_advance_blocked(state, tick, reason)
++			}
++		}
++		if reason != .None {
++			return // blocked — deferral (E15 + the new terms); the latch holds
++		}
++		// the gate is the trigger: no pending request -> latch era+1
++		if state.era_advance_to == 0 {
++			state.era_advance_to = state.era + 1
++		}
++	} else {
++		// 6.1 mechanics unchanged
++		if state.era_advance_to == 0 {
++			return
++		}
++		if era_advance_blocked(state) {
++			return // E14 — an active crisis defers the advance until it clears
++		}
+ 	}
+ 	new_era := state.era_advance_to
+ 	state.era = new_era
+diff --git a/core/serialize.odin b/core/serialize.odin
+index 3cec98f..a3ef36d 100644
+--- a/core/serialize.odin
++++ b/core/serialize.odin
+@@ -470,6 +470,9 @@ w_event_payload :: proc(w: ^Writer, e: Event) {
+ 	if e.tag == EVENT_TAG_ERA_ADVANCED {
+ 		w_u8(w, u8(e.class)) // 6.1: the NEW era (1..6 fits a u8; class is the shared payload field)
+ 	}
++	if e.tag == EVENT_TAG_ERA_ADVANCE_BLOCKED {
++		w_u8(w, e.reason) // 6.2: the Advance_Block_Reason byte (the gate's block path)
++	}
+ }
+ 
+ // --- the action log (ODN-11 binary) -------------------------------------------
+diff --git a/core/types.odin b/core/types.odin
+index 850c405..452869e 100644
+--- a/core/types.odin
++++ b/core/types.odin
+@@ -401,7 +401,7 @@ Event :: struct {
+ 	tick:      u64,
+ 	tag:       u8, // 0 = (none); see the EVENT_TAG_* constants below
+ 	class:     u16, // Packet_Dropped / Sla_Threshold_Crossed / crisis payload: the class
+-	reason:    u8,  // Packet_Dropped payload: Drop_Reason
++	reason:    u8,  // Packet_Dropped payload: Drop_Reason; Era_Advance_Blocked (6.2): Advance_Block_Reason
+ 	metric:    u8,  // Sla_Threshold_Crossed payload: Sla_Metric
+ 	direction: u8,  // Sla_Threshold_Crossed payload: Sla_Direction
+ 	sign:      u8,  // Warning_Raised / Warning_Cleared payload: Warning_Sign
+@@ -428,6 +428,7 @@ EVENT_TAG_GRACE_STARTED :: u8(10)  // 4.3: a class entered its grace countdown (
+ EVENT_TAG_GRACE_EXPIRED :: u8(11)  // 4.3: a class's grace ran out while still breached (class payload)
+ EVENT_TAG_METER_CHANGED :: u8(12)  // 4.3: the health meter moved (meter-pct payload byte)
+ EVENT_TAG_ERA_ADVANCED :: u8(13)   // 6.1: the era FSM advanced the active era (class payload = the NEW era)
++EVENT_TAG_ERA_ADVANCE_BLOCKED :: u8(14) // 6.2: the advance gate blocked the era advance (reason payload = Advance_Block_Reason)
+ 
+ // Outcome — the latched terminal result (1.4 stub). None while the run is in
+ // play; Won/Lost once win_lose_eval appends the terminal event. The terminal-
+@@ -446,6 +447,42 @@ event_emit :: proc(state: ^Run_State, tick: u64, tag: u8) {
+ 	append(&state.events, Event{tick = tick, tag = tag})
+ }
+ 
++// Advance_Block_Reason — WHY the 6.2 advance gate is blocking the era advance
++// (the observable block paths the story pins: SLA < 95% sustained, an
++// unmodernized legacy pipe in service, or an active crisis [E15]). Carried by
++// the Era_Advance_Blocked event payload (the Event.reason byte, tag-
++// conditional). The gate reports the FIRST failing condition in a defined
++// priority order (Crisis > Legacy > Sla — E15 is the headline contract; the
++// other terms are only reported when nothing more urgent fails).
++Advance_Block_Reason :: enum u8 {
++	None,   // the gate is not blocking (advance may fire)
++	Crisis, // E15 — an active crisis blocks the advance (the 4.2 signal)
++	Legacy, // an in-service pipe is below the era's newest tier (6.3 seam)
++	Sla,    // an active class sustained < sla_uptime_pct over the milestone window
++}
++
++// Era_Gate_State — the 6.2 advance gate's DERIVED measurement (arch §6.6):
++// the per-class milestone-window SLA ring (the E30 pattern, sized to the
++// advance block's window) + the block-reason edge latch. NEVER serialized —
++// rebuilt identically on replay from the serialized flow accumulators + tick
++// history (same status as health's ring/lane_caps). The gate's observable
++// surface is the event stream (Era_Advance_Blocked / Era_Advanced) + the era
++// byte, both already in the T1 hash.
++Era_Gate_State :: struct {
++	// the milestone-window ring (flat: slot = class × window + tick % window,
++	// mirror of health's ring) + the rolling windowed sums + the accumulator-
++	// diff scratch, all per class (grown on the class's first demand):
++	ring:         [dynamic]Window_Tick,
++	win_delivered: [dynamic]u64,
++	win_dropped:   [dynamic]u64,
++	prev_delivered: [dynamic]u64,
++	prev_dropped:   [dynamic]u64,
++	window_ticks:  u32, // the catalog's advance.milestone_window_ticks (0 = unset)
++	// the block-reason edge latch (the enter-edge dedup: emit only on reason
++	// transitions, never every tick — the anti-chatter rule):
++	last_block:   Advance_Block_Reason,
++}
++
+ // Run_State — the authoritative sim state (ODN-1/13). One value per run,
+ // created fresh per run (reset = make a new one), passed by pointer. No globals
+ // (ODN-13); no maps anywhere (ODN-10).
+@@ -472,6 +509,12 @@ Run_State :: struct {
+ 	health:       Health_State,         // 4.3: S5 — the meter + grace + window + surge tracking
+ 	growth_enabled: bool,             // 5.1: the director's map growth is live (run setup, like health_enabled — NOT serialized; its observable state is the spawned terminals, which ride the topology section of the T1 hash). Disabled (the zero value) = every legacy run stays static + its rng stream untouched.
+ 	growth_last_tick: u64,            // 5.1: the last executed tick the growth branch RAN on (a non-serialized run-scoped marker, same status as routing_gen — rebuilt identically on replay, never in the T1 hash). The same-tick re-step guard: the pre-existing step_once test convention re-steps a tick, and a re-step must not re-plan + re-apply growth (the rng would not have advanced between the two calls, so a re-plan could find a SECOND valid spot and double-spawn). Setting it on EVERY enabled tick (spawn window or not) also makes a re-step consume zero rng.
++	// 6.2: the era-advance gate is live (run setup, like health_enabled/growth_enabled
++	// — NOT serialized; its observable state is the event stream + the era byte).
++	// Disabled (the zero value) = the 6.1 mechanics unchanged (a scripted advance
++	// fires on the E14 crisis gate alone), so every legacy demo stays byte-identical.
++	advance_gate_enabled: bool,
++	era_gate: Era_Gate_State,          // 6.2: the gate's DERIVED measurement (never serialized — rebuilt identically on replay)
+ 	terminal:     bool,                // 1.4: latched once Run_Won/Run_Lost emitted (the barrier, E17)
+ 	outcome:      Outcome,             // 1.4: which terminal event fired (None while non-terminal)
+ 	action_log:   [dynamic]Command,    // the replay artifact (ODN-11)
+@@ -500,6 +543,7 @@ run_init :: proc(state: ^Run_State, seed: u64, catalog_hash: u64, logic_hz: i32,
+ 	flow_init(&state.flow, allocator)
+ 	crisis_make(&state.crisis, allocator)
+ 	health_make(&state.health, allocator)
++	era_gate_make(&state.era_gate, allocator)
+ 	rng_seed(&state.rng, seed)
+ }
+ 
+@@ -514,4 +558,5 @@ run_destroy :: proc(state: ^Run_State) {
+ 	flow_destroy(&state.flow)
+ 	crisis_destroy(&state.crisis)
+ 	health_destroy(&state.health)
++	era_gate_destroy(&state.era_gate)
+ }
+diff --git a/data/balance.json b/data/balance.json
+index bb06658..e6a9517 100644
+--- a/data/balance.json
++++ b/data/balance.json
+@@ -1,72 +1,98 @@
+ {
+-  "_comment": "Balance catalog (GDD § Numerical Design, ODN-5). Single source for every tunable number. All state-affecting values are int (ODN-10). logic_hz=20 is the fixed-timestep tick rate (ODN-2). snap_radius = inclusive node-snap radius in world px (E4). packet_bandwidth = the bandwidth units a packet must accumulate to cross one edge (1.3 flow; transit ticks = ceil(packet_bandwidth / pipe.capacity_units), so a standard pipe (cap 15) takes 2 ticks). lane_presets = the 3.2 emphasis-dial positions (GDD M2 lever 2), per-pipe lane WFQ weights, data-driven — the 5.8 panel keeps them as manual quick-sets; default_lane_preset is the resting position every pipe starts on + the E5 all-zero fallback. lane_auto_reserve_ladder = the 5.8 assignment-driven auto-reservation (user ruling 2026-08-14, GDD M2 / ODN-3): rows[n-1] = the split for n in-play lanes — [100] · [70,30] · [50,30,20], strictly descending (higher-priority lane reserves more). In-play lanes = the lanes the player assigned + Standard (always reserved — the default home of un-categorized types, canon-safe); untouched pipes keep the default preset, not the ladder (no-QoS goldens stay byte-stable). Playtest-tunable; load-fail-fast validated (ODN-5). lane_queue_packets = the 3.3 per-(bundle, lane) queue bound — when a lane queue is full, the E9 drop precedence sheds the lowest-priority non-empty lane. pool_max_packets = the 3.3 global in-flight pool cap — the E22 backstop (pool exhaustion drops the lowest-priority lane first; one saturated link can never absorb the whole pool and starve the map). map.* = the design-grid world the camera fits into the 1280x720 window. placement.* = the 5.6 placement-separation rules (user ruling 2026-08-14, GDD M3): router↔router 4 tiles (playtest-tunable); router↔terminal = the snap-disambiguation floor + a small readability margin (~2 tiles — the floor derives from snap_radius: a terminal 1 tile away sits inside the 36px snap radius, so the smallest unambiguous gap is ceil(36/26) = 2 tiles). Terminals never block router placement the way the old blanket 7-tile rule did. cap_fraction_permille = the 5.9 per-terminal source demand cap (spec-traffic-model Thread 2): accrue = fraction × throughput ÷ packet_bandwidth milli-packets/tick per terminal, uniformly (500 = 50% — endpoints never self-congest). growth_groups = the 5.12 aggregation-group tunables (spec-traffic-model Thread 3 + the estates ruling, user 2026-08-17 night): the group-bias growth draw (a majority of draws bias toward existing clusters, a minority stay uniform — NOT 100% clustered) + the director's group-scoped demand weight. bias_prob_permille = the biased-draw fraction (750 = 0.75, the ruling's 0.7–0.8; a 0 or 1000 would break the estates+isolated mix); min_members/max_members = the estate size band (3–8); radius_tiles = the group radius + the derived-cluster adjacency threshold (5 — MUST exceed GROWTH_MIN_SEP_TILES = 3, the E31 packing floor); member_weight_permille = the per-member source-pick-weight bonus (250 — aggregate group demand rises as members join).",
+-  "logic_hz": 20,
+-  "max_ticks": 100000,
+-  "snap_radius": 36,
+-  "packet_bandwidth": 30,
+-  "lane_queue_packets": 6,
+-  "pool_max_packets": 512,
+-  "cap_fraction_permille": 500,
+-  "growth_groups": {
+-    "_comment": "5.12 aggregation groups (spec-traffic-model Thread 3 + the estates ruling, user 2026-08-17 night — 'homes grouped together in estates ... but NOT 100% of the time'): the group bias is a SOFT PREFERENCE inside the E31 validity envelope (bias draw first, E31 on the biased candidate, rejection-sampling unchanged; the uplink is never forced — the player wires it). bias_prob_permille = the fraction of growth draws that bias toward an existing cluster (750 = 0.75 — the majority-clustered, minority-isolated mix); min_members/max_members = the estate size band (growth extends only clusters below the cap); radius_tiles = the group radius + the derived-cluster adjacency threshold (MUST exceed GROWTH_MIN_SEP_TILES = 3, the E31 packing floor); member_weight_permille = the director's group-scoped demand weight (a member's source-pick weight scales with its estate's size — aggregate group demand rises as members join, the surge is an aggregation event at the shared uplink).",
+-    "bias_prob_permille": 750,
+-    "min_members": 3,
+-    "max_members": 8,
+-    "radius_tiles": 5,
+-    "member_weight_permille": 250
++ "_comment": "Balance catalog (GDD \u00a7 Numerical Design, ODN-5). Single source for every tunable number. All state-affecting values are int (ODN-10). logic_hz=20 is the fixed-timestep tick rate (ODN-2). snap_radius = inclusive node-snap radius in world px (E4). packet_bandwidth = the bandwidth units a packet must accumulate to cross one edge (1.3 flow; transit ticks = ceil(packet_bandwidth / pipe.capacity_units), so a standard pipe (cap 15) takes 2 ticks). lane_presets = the 3.2 emphasis-dial positions (GDD M2 lever 2), per-pipe lane WFQ weights, data-driven \u2014 the 5.8 panel keeps them as manual quick-sets; default_lane_preset is the resting position every pipe starts on + the E5 all-zero fallback. lane_auto_reserve_ladder = the 5.8 assignment-driven auto-reservation (user ruling 2026-08-14, GDD M2 / ODN-3): rows[n-1] = the split for n in-play lanes \u2014 [100] \u00b7 [70,30] \u00b7 [50,30,20], strictly descending (higher-priority lane reserves more). In-play lanes = the lanes the player assigned + Standard (always reserved \u2014 the default home of un-categorized types, canon-safe); untouched pipes keep the default preset, not the ladder (no-QoS goldens stay byte-stable). Playtest-tunable; load-fail-fast validated (ODN-5). lane_queue_packets = the 3.3 per-(bundle, lane) queue bound \u2014 when a lane queue is full, the E9 drop precedence sheds the lowest-priority non-empty lane. pool_max_packets = the 3.3 global in-flight pool cap \u2014 the E22 backstop (pool exhaustion drops the lowest-priority lane first; one saturated link can never absorb the whole pool and starve the map). map.* = the design-grid world the camera fits into the 1280x720 window. placement.* = the 5.6 placement-separation rules (user ruling 2026-08-14, GDD M3): router\u2194router 4 tiles (playtest-tunable); router\u2194terminal = the snap-disambiguation floor + a small readability margin (~2 tiles \u2014 the floor derives from snap_radius: a terminal 1 tile away sits inside the 36px snap radius, so the smallest unambiguous gap is ceil(36/26) = 2 tiles). Terminals never block router placement the way the old blanket 7-tile rule did. cap_fraction_permille = the 5.9 per-terminal source demand cap (spec-traffic-model Thread 2): accrue = fraction \u00d7 throughput \u00f7 packet_bandwidth milli-packets/tick per terminal, uniformly (500 = 50% \u2014 endpoints never self-congest). growth_groups = the 5.12 aggregation-group tunables (spec-traffic-model Thread 3 + the estates ruling, user 2026-08-17 night): the group-bias growth draw (a majority of draws bias toward existing clusters, a minority stay uniform \u2014 NOT 100% clustered) + the director's group-scoped demand weight. bias_prob_permille = the biased-draw fraction (750 = 0.75, the ruling's 0.7\u20130.8; a 0 or 1000 would break the estates+isolated mix); min_members/max_members = the estate size band (3\u20138); radius_tiles = the group radius + the derived-cluster adjacency threshold (5 \u2014 MUST exceed GROWTH_MIN_SEP_TILES = 3, the E31 packing floor); member_weight_permille = the per-member source-pick-weight bonus (250 \u2014 aggregate group demand rises as members join).",
++ "logic_hz": 20,
++ "max_ticks": 100000,
++ "snap_radius": 36,
++ "packet_bandwidth": 30,
++ "lane_queue_packets": 6,
++ "pool_max_packets": 512,
++ "cap_fraction_permille": 500,
++ "growth_groups": {
++  "_comment": "5.12 aggregation groups (spec-traffic-model Thread 3 + the estates ruling, user 2026-08-17 night \u2014 'homes grouped together in estates ... but NOT 100% of the time'): the group bias is a SOFT PREFERENCE inside the E31 validity envelope (bias draw first, E31 on the biased candidate, rejection-sampling unchanged; the uplink is never forced \u2014 the player wires it). bias_prob_permille = the fraction of growth draws that bias toward an existing cluster (750 = 0.75 \u2014 the majority-clustered, minority-isolated mix); min_members/max_members = the estate size band (growth extends only clusters below the cap); radius_tiles = the group radius + the derived-cluster adjacency threshold (MUST exceed GROWTH_MIN_SEP_TILES = 3, the E31 packing floor); member_weight_permille = the director's group-scoped demand weight (a member's source-pick weight scales with its estate's size \u2014 aggregate group demand rises as members join, the surge is an aggregation event at the shared uplink).",
++  "bias_prob_permille": 750,
++  "min_members": 3,
++  "max_members": 8,
++  "radius_tiles": 5,
++  "member_weight_permille": 250
++ },
++ "placement": {
++  "_comment": "5.6 placement separation (user ruling 2026-08-14, GDD M3 \u00a7placement): router_router_sep_tiles = the min router\u2194router gap (playtest value 4); router_terminal_sep_tiles = the snap-disambiguation floor in whole tiles \u2014 ceil(snap_radius/tile_px) = ceil(36/26) = 2, the smallest gap whose world-px distance clears the inclusive 36px snap radius (a terminal 1 tile away would be ambiguous). The ruling's \"~2\" IS this floor (the margin is the rounding-up itself). Terminals never block router placement beyond this floor.",
++  "router_router_sep_tiles": 4,
++  "router_terminal_sep_tiles": 2
++ },
++ "warnings": {
++  "_comment": "Story 4.1 warning-sign thresholds + lead times (art-direction \u00a76.1 'Trigger [balance.json]'; GDD Numerical Design). Integer percents; leads in ticks @ 20Hz (30s=600, 10s=200, 20s=400). The UI telegraph reads the leads; the T1 pins the levels + the catalog_hash pins these numbers.",
++  "node_amber_pct": 70,
++  "node_red_pct": 90,
++  "pipe_amber_pct": 70,
++  "pipe_red_pct": 90,
++  "node_congested_lead_ticks": 600,
++  "node_critical_lead_ticks": 200,
++  "pipe_congestion_lead_ticks": 400
++ },
++ "health": {
++  "_comment": "Story 4.3 Network Health numbers (arch \u00a76.5; the proven-fun prototype's tuning scaled to 20 Hz). window_ticks = the rolling measurement window (the E30 seam \u2014 the prototype's 100 @ 10 Hz = 10 s -> 200 @ 20 Hz). exit_margin_pct/exit_margin_ms = the E30 hysteresis band (a class exits only meaningfully under its tolerance \u2014 the prototype's 93-exit vs 90-enter, per class). drain_cap_pct_per_tick = the E16 per-tick cap (never instant; >= 100/cap ticks to empty \u2014 the prototype's meter_drain_per_tick_max 2). recharge_pct_per_tick = healthy recovery (the prototype's 1). win_uptime_pct = the GDD MVP surge-survival win threshold (the prototype's 90). grace_refill_per_tick + grace_refill_streak_ticks = the never-lose guard (a recovered class's grace refills gradually, only after a sustained healthy streak \u2014 the prototype's 5/50; consecutive episodes burn the shared countdown). Per-class grace + severity live on packet_types.json entries (hard-SLA classes drain fast).",
++  "window_ticks": 200,
++  "exit_margin_pct": 3,
++  "exit_margin_ms": 40,
++  "drain_cap_pct_per_tick": 2,
++  "recharge_pct_per_tick": 1,
++  "win_uptime_pct": 90,
++  "grace_refill_per_tick": 5,
++  "grace_refill_streak_ticks": 50
++ },
++ "advance": {
++  "_comment": "Story 6.2 era-advance gate (GDD M4 / arch \u00a76.6): the modernization gate's tunables. milestone_window_ticks = the era's milestone sustain window (the window the player must hold per-class SLA >= sla_uptime_pct to advance \u2014 prototype value 600 = 30s @ 20Hz; the GDD full-game assumption is ~8-12 min/era [ASSUMPTION: prototype tuning]); sla_uptime_pct = the era-advance per-class delivery bar (95 \u2014 GDD 'sustain SLA uptime >= 95%'). The gate evaluates every tick once the window has elapsed; an active crisis blocks [E15]; unmodernized legacy pipes block (the 6.3 seam predicate).",
++  "milestone_window_ticks": 600,
++  "sla_uptime_pct": 95
++ },
++ "lane_presets": [
++  {
++   "id": "balanced",
++   "display_name": "Balanced",
++   "weights": [
++    1,
++    1,
++    1
++   ]
+   },
+-  "placement": {
+-    "_comment": "5.6 placement separation (user ruling 2026-08-14, GDD M3 §placement): router_router_sep_tiles = the min router↔router gap (playtest value 4); router_terminal_sep_tiles = the snap-disambiguation floor in whole tiles — ceil(snap_radius/tile_px) = ceil(36/26) = 2, the smallest gap whose world-px distance clears the inclusive 36px snap radius (a terminal 1 tile away would be ambiguous). The ruling's \"~2\" IS this floor (the margin is the rounding-up itself). Terminals never block router placement beyond this floor.",
+-    "router_router_sep_tiles": 4,
+-    "router_terminal_sep_tiles": 2
++  {
++   "id": "express_heavy",
++   "display_name": "Express-heavy",
++   "weights": [
++    4,
++    2,
++    1
++   ]
+   },
+-  "warnings": {
+-    "_comment": "Story 4.1 warning-sign thresholds + lead times (art-direction §6.1 'Trigger [balance.json]'; GDD Numerical Design). Integer percents; leads in ticks @ 20Hz (30s=600, 10s=200, 20s=400). The UI telegraph reads the leads; the T1 pins the levels + the catalog_hash pins these numbers.",
+-    "node_amber_pct": 70,
+-    "node_red_pct": 90,
+-    "pipe_amber_pct": 70,
+-    "pipe_red_pct": 90,
+-    "node_congested_lead_ticks": 600,
+-    "node_critical_lead_ticks": 200,
+-    "pipe_congestion_lead_ticks": 400
+-  },
+-  "health": {
+-    "_comment": "Story 4.3 Network Health numbers (arch §6.5; the proven-fun prototype's tuning scaled to 20 Hz). window_ticks = the rolling measurement window (the E30 seam — the prototype's 100 @ 10 Hz = 10 s -> 200 @ 20 Hz). exit_margin_pct/exit_margin_ms = the E30 hysteresis band (a class exits only meaningfully under its tolerance — the prototype's 93-exit vs 90-enter, per class). drain_cap_pct_per_tick = the E16 per-tick cap (never instant; >= 100/cap ticks to empty — the prototype's meter_drain_per_tick_max 2). recharge_pct_per_tick = healthy recovery (the prototype's 1). win_uptime_pct = the GDD MVP surge-survival win threshold (the prototype's 90). grace_refill_per_tick + grace_refill_streak_ticks = the never-lose guard (a recovered class's grace refills gradually, only after a sustained healthy streak — the prototype's 5/50; consecutive episodes burn the shared countdown). Per-class grace + severity live on packet_types.json entries (hard-SLA classes drain fast).",
+-    "window_ticks": 200,
+-    "exit_margin_pct": 3,
+-    "exit_margin_ms": 40,
+-    "drain_cap_pct_per_tick": 2,
+-    "recharge_pct_per_tick": 1,
+-    "win_uptime_pct": 90,
+-    "grace_refill_per_tick": 5,
+-    "grace_refill_streak_ticks": 50
+-  },
+-  "lane_presets": [
+-    {
+-      "id": "balanced",
+-      "display_name": "Balanced",
+-      "weights": [1, 1, 1]
+-    },
+-    {
+-      "id": "express_heavy",
+-      "display_name": "Express-heavy",
+-      "weights": [4, 2, 1]
+-    },
+-    {
+-      "id": "best_effort_heavy",
+-      "display_name": "Best-effort-heavy",
+-      "weights": [1, 2, 4]
+-    }
++  {
++   "id": "best_effort_heavy",
++   "display_name": "Best-effort-heavy",
++   "weights": [
++    1,
++    2,
++    4
++   ]
++  }
++ ],
++ "default_lane_preset": "balanced",
++ "lane_auto_reserve_ladder": [
++  [
++   100
+   ],
+-  "default_lane_preset": "balanced",
+-  "lane_auto_reserve_ladder": [
+-    [100],
+-    [70, 30],
+-    [50, 30, 20]
++  [
++   70,
++   30
+   ],
+-  "map": {
+-    "w_tiles": 40,
+-    "h_tiles": 30,
+-    "tile_px": 26
+-  }
+-}
++  [
++   50,
++   30,
++   20
++  ]
++ ],
++ "map": {
++  "w_tiles": 40,
++  "h_tiles": 30,
++  "tile_px": 26
++ }
++}
+\ No newline at end of file
+diff --git a/demos/advance_block_legacy.dem b/demos/advance_block_legacy.dem
+new file mode 100644
+index 0000000..383b302
+--- /dev/null
++++ b/demos/advance_block_legacy.dem
+@@ -0,0 +1,25 @@
++# advance_block_legacy.dem — Story 6.2 golden: the era-advance gate BLOCKED by
++# the legacy condition (an in-service pipe below the era's newest tier). Era 2,
++# `advance gate on` (run setup — the gate is the trigger; replay re-derives it
++# from the serialized state).
++#
++# The traffic path is healthy-MODERN (standard pipes — era 2's newest tier; the
++# email res->res flow delivers at ~100%, so the SLA term cannot mask this
++# branch), BUT one extra pipe is a NARROW stub (tier 0 < standard) drawn in
++# service at ~9.2 tiles (within narrow max_span 10). The legacy predicate (the
++# 6.3 seam: a pipe is legacy iff its tier < the era's newest unlocked tier) is
++# true for that pipe, so at the milestone window's end (tick 600 = 30000ms) the
++# gate reports Era_Advance_Blocked{Legacy} and the era STAYS 2 — the block path
++# is T1-pinned (the event + the un-advanced era byte). 6.3 owns the real legacy
++# model (draw-era tracking + decay); this predicate is the documented seam.
++seed 90210
++run 70000ms
++era 2
++fixture qos
++advance gate on
++at 0ms draw 0 1 standard
++at 0ms draw 1 2 standard
++at 0ms draw 3 1 standard
++at 0ms draw 3 1 narrow
++capture at 15000ms
++capture at 60000ms
+diff --git a/demos/advance_block_sla.dem b/demos/advance_block_sla.dem
+new file mode 100644
+index 0000000..087e0ca
+--- /dev/null
++++ b/demos/advance_block_sla.dem
+@@ -0,0 +1,1308 @@
++# advance_block_sla.dem — Story 6.2 golden: the era-advance gate BLOCKED by
++# the SLA condition (windowed delivery ratio below the 95% bar). Era 2,
++# `advance gate on` (run setup — the gate is the trigger; replay re-derives
++# it from the serialized state). The topology is healthy-MODERN (standard
++# pipes only — nothing legacy, so the legacy term cannot mask this branch)
++# but OVERLOADED: two residentials flood email through the shared
++# router->host standard pipe (15 u/s vs ~2 packets/tick of 30-bw email —
++# the E9 lane queue saturates and sheds). The flood spans the WHOLE
++# milestone window (600 ticks = 30s) and beyond, so the windowed delivery
++# ratio stays well under 95% at the window's end: the gate reports
++# Era_Advance_Blocked{Sla} and the era STAYS 2 — the block path is
++# T1-pinned (the event + the un-advanced era byte).
++#
++# The spawn flood uses `at <n>ms spawn` (legacy §1a demand — fixed
++# src/dst, no director rng; it bypasses the 5.9 source credit cap the way
++# sla.dem's does, so the drops are deterministic and sustained).
++seed 4243
++run 70000ms
++era 2
++fixture qos
++advance gate on
++at 0ms draw 0 1 standard
++at 0ms draw 1 2 standard
++at 0ms draw 3 1 standard
++at 0ms draw 4 1 standard
++at 0ms spawn 3 2 email
++at 50ms spawn 4 2 email
++at 100ms spawn 3 2 email
++at 150ms spawn 4 2 email
++at 200ms spawn 3 2 email
++at 250ms spawn 4 2 email
++at 300ms spawn 3 2 email
++at 350ms spawn 4 2 email
++at 400ms spawn 3 2 email
++at 450ms spawn 4 2 email
++at 500ms spawn 3 2 email
++at 550ms spawn 4 2 email
++at 600ms spawn 3 2 email
++at 650ms spawn 4 2 email
++at 700ms spawn 3 2 email
++at 750ms spawn 4 2 email
++at 800ms spawn 3 2 email
++at 850ms spawn 4 2 email
++at 900ms spawn 3 2 email
++at 950ms spawn 4 2 email
++at 1000ms spawn 3 2 email
++at 1050ms spawn 4 2 email
++at 1100ms spawn 3 2 email
++at 1150ms spawn 4 2 email
++at 1200ms spawn 3 2 email
++at 1250ms spawn 4 2 email
++at 1300ms spawn 3 2 email
++at 1350ms spawn 4 2 email
++at 1400ms spawn 3 2 email
++at 1450ms spawn 4 2 email
++at 1500ms spawn 3 2 email
++at 1550ms spawn 4 2 email
++at 1600ms spawn 3 2 email
++at 1650ms spawn 4 2 email
++at 1700ms spawn 3 2 email
++at 1750ms spawn 4 2 email
++at 1800ms spawn 3 2 email
++at 1850ms spawn 4 2 email
++at 1900ms spawn 3 2 email
++at 1950ms spawn 4 2 email
++at 2000ms spawn 3 2 email
++at 2050ms spawn 4 2 email
++at 2100ms spawn 3 2 email
++at 2150ms spawn 4 2 email
++at 2200ms spawn 3 2 email
++at 2250ms spawn 4 2 email
++at 2300ms spawn 3 2 email
++at 2350ms spawn 4 2 email
++at 2400ms spawn 3 2 email
++at 2450ms spawn 4 2 email
++at 2500ms spawn 3 2 email
++at 2550ms spawn 4 2 email
++at 2600ms spawn 3 2 email
++at 2650ms spawn 4 2 email
++at 2700ms spawn 3 2 email
++at 2750ms spawn 4 2 email
++at 2800ms spawn 3 2 email
++at 2850ms spawn 4 2 email
++at 2900ms spawn 3 2 email
++at 2950ms spawn 4 2 email
++at 3000ms spawn 3 2 email
++at 3050ms spawn 4 2 email
++at 3100ms spawn 3 2 email
++at 3150ms spawn 4 2 email
++at 3200ms spawn 3 2 email
++at 3250ms spawn 4 2 email
++at 3300ms spawn 3 2 email
++at 3350ms spawn 4 2 email
++at 3400ms spawn 3 2 email
++at 3450ms spawn 4 2 email
++at 3500ms spawn 3 2 email
++at 3550ms spawn 4 2 email
++at 3600ms spawn 3 2 email
++at 3650ms spawn 4 2 email
++at 3700ms spawn 3 2 email
++at 3750ms spawn 4 2 email
++at 3800ms spawn 3 2 email
++at 3850ms spawn 4 2 email
++at 3900ms spawn 3 2 email
++at 3950ms spawn 4 2 email
++at 4000ms spawn 3 2 email
++at 4050ms spawn 4 2 email
++at 4100ms spawn 3 2 email
++at 4150ms spawn 4 2 email
++at 4200ms spawn 3 2 email
++at 4250ms spawn 4 2 email
++at 4300ms spawn 3 2 email
++at 4350ms spawn 4 2 email
++at 4400ms spawn 3 2 email
++at 4450ms spawn 4 2 email
++at 4500ms spawn 3 2 email
++at 4550ms spawn 4 2 email
++at 4600ms spawn 3 2 email
++at 4650ms spawn 4 2 email
++at 4700ms spawn 3 2 email
++at 4750ms spawn 4 2 email
++at 4800ms spawn 3 2 email
++at 4850ms spawn 4 2 email
++at 4900ms spawn 3 2 email
++at 4950ms spawn 4 2 email
++at 5000ms spawn 3 2 email
++at 5050ms spawn 4 2 email
++at 5100ms spawn 3 2 email
++at 5150ms spawn 4 2 email
++at 5200ms spawn 3 2 email
++at 5250ms spawn 4 2 email
++at 5300ms spawn 3 2 email
++at 5350ms spawn 4 2 email
++at 5400ms spawn 3 2 email
++at 5450ms spawn 4 2 email
++at 5500ms spawn 3 2 email
++at 5550ms spawn 4 2 email
++at 5600ms spawn 3 2 email
++at 5650ms spawn 4 2 email
++at 5700ms spawn 3 2 email
++at 5750ms spawn 4 2 email
++at 5800ms spawn 3 2 email
++at 5850ms spawn 4 2 email
++at 5900ms spawn 3 2 email
++at 5950ms spawn 4 2 email
++at 6000ms spawn 3 2 email
++at 6050ms spawn 4 2 email
++at 6100ms spawn 3 2 email
++at 6150ms spawn 4 2 email
++at 6200ms spawn 3 2 email
++at 6250ms spawn 4 2 email
++at 6300ms spawn 3 2 email
++at 6350ms spawn 4 2 email
++at 6400ms spawn 3 2 email
++at 6450ms spawn 4 2 email
++at 6500ms spawn 3 2 email
++at 6550ms spawn 4 2 email
++at 6600ms spawn 3 2 email
++at 6650ms spawn 4 2 email
++at 6700ms spawn 3 2 email
++at 6750ms spawn 4 2 email
++at 6800ms spawn 3 2 email
++at 6850ms spawn 4 2 email
++at 6900ms spawn 3 2 email
++at 6950ms spawn 4 2 email
++at 7000ms spawn 3 2 email
++at 7050ms spawn 4 2 email
++at 7100ms spawn 3 2 email
++at 7150ms spawn 4 2 email
++at 7200ms spawn 3 2 email
++at 7250ms spawn 4 2 email
++at 7300ms spawn 3 2 email
++at 7350ms spawn 4 2 email
++at 7400ms spawn 3 2 email
++at 7450ms spawn 4 2 email
++at 7500ms spawn 3 2 email
++at 7550ms spawn 4 2 email
++at 7600ms spawn 3 2 email
++at 7650ms spawn 4 2 email
++at 7700ms spawn 3 2 email
++at 7750ms spawn 4 2 email
++at 7800ms spawn 3 2 email
++at 7850ms spawn 4 2 email
++at 7900ms spawn 3 2 email
++at 7950ms spawn 4 2 email
++at 8000ms spawn 3 2 email
++at 8050ms spawn 4 2 email
++at 8100ms spawn 3 2 email
++at 8150ms spawn 4 2 email
++at 8200ms spawn 3 2 email
++at 8250ms spawn 4 2 email
++at 8300ms spawn 3 2 email
++at 8350ms spawn 4 2 email
++at 8400ms spawn 3 2 email
++at 8450ms spawn 4 2 email
++at 8500ms spawn 3 2 email
++at 8550ms spawn 4 2 email
++at 8600ms spawn 3 2 email
++at 8650ms spawn 4 2 email
++at 8700ms spawn 3 2 email
++at 8750ms spawn 4 2 email
++at 8800ms spawn 3 2 email
++at 8850ms spawn 4 2 email
++at 8900ms spawn 3 2 email
++at 8950ms spawn 4 2 email
++at 9000ms spawn 3 2 email
++at 9050ms spawn 4 2 email
++at 9100ms spawn 3 2 email
++at 9150ms spawn 4 2 email
++at 9200ms spawn 3 2 email
++at 9250ms spawn 4 2 email
++at 9300ms spawn 3 2 email
++at 9350ms spawn 4 2 email
++at 9400ms spawn 3 2 email
++at 9450ms spawn 4 2 email
++at 9500ms spawn 3 2 email
++at 9550ms spawn 4 2 email
++at 9600ms spawn 3 2 email
++at 9650ms spawn 4 2 email
++at 9700ms spawn 3 2 email
++at 9750ms spawn 4 2 email
++at 9800ms spawn 3 2 email
++at 9850ms spawn 4 2 email
++at 9900ms spawn 3 2 email
++at 9950ms spawn 4 2 email
++at 10000ms spawn 3 2 email
++at 10050ms spawn 4 2 email
++at 10100ms spawn 3 2 email
++at 10150ms spawn 4 2 email
++at 10200ms spawn 3 2 email
++at 10250ms spawn 4 2 email
++at 10300ms spawn 3 2 email
++at 10350ms spawn 4 2 email
++at 10400ms spawn 3 2 email
++at 10450ms spawn 4 2 email
++at 10500ms spawn 3 2 email
++at 10550ms spawn 4 2 email
++at 10600ms spawn 3 2 email
++at 10650ms spawn 4 2 email
++at 10700ms spawn 3 2 email
++at 10750ms spawn 4 2 email
++at 10800ms spawn 3 2 email
++at 10850ms spawn 4 2 email
++at 10900ms spawn 3 2 email
++at 10950ms spawn 4 2 email
++at 11000ms spawn 3 2 email
++at 11050ms spawn 4 2 email
++at 11100ms spawn 3 2 email
++at 11150ms spawn 4 2 email
++at 11200ms spawn 3 2 email
++at 11250ms spawn 4 2 email
++at 11300ms spawn 3 2 email
++at 11350ms spawn 4 2 email
++at 11400ms spawn 3 2 email
++at 11450ms spawn 4 2 email
++at 11500ms spawn 3 2 email
++at 11550ms spawn 4 2 email
++at 11600ms spawn 3 2 email
++at 11650ms spawn 4 2 email
++at 11700ms spawn 3 2 email
++at 11750ms spawn 4 2 email
++at 11800ms spawn 3 2 email
++at 11850ms spawn 4 2 email
++at 11900ms spawn 3 2 email
++at 11950ms spawn 4 2 email
++at 12000ms spawn 3 2 email
++at 12050ms spawn 4 2 email
++at 12100ms spawn 3 2 email
++at 12150ms spawn 4 2 email
++at 12200ms spawn 3 2 email
++at 12250ms spawn 4 2 email
++at 12300ms spawn 3 2 email
++at 12350ms spawn 4 2 email
++at 12400ms spawn 3 2 email
++at 12450ms spawn 4 2 email
++at 12500ms spawn 3 2 email
++at 12550ms spawn 4 2 email
++at 12600ms spawn 3 2 email
++at 12650ms spawn 4 2 email
++at 12700ms spawn 3 2 email
++at 12750ms spawn 4 2 email
++at 12800ms spawn 3 2 email
++at 12850ms spawn 4 2 email
++at 12900ms spawn 3 2 email
++at 12950ms spawn 4 2 email
++at 13000ms spawn 3 2 email
++at 13050ms spawn 4 2 email
++at 13100ms spawn 3 2 email
++at 13150ms spawn 4 2 email
++at 13200ms spawn 3 2 email
++at 13250ms spawn 4 2 email
++at 13300ms spawn 3 2 email
++at 13350ms spawn 4 2 email
++at 13400ms spawn 3 2 email
++at 13450ms spawn 4 2 email
++at 13500ms spawn 3 2 email
++at 13550ms spawn 4 2 email
++at 13600ms spawn 3 2 email
++at 13650ms spawn 4 2 email
++at 13700ms spawn 3 2 email
++at 13750ms spawn 4 2 email
++at 13800ms spawn 3 2 email
++at 13850ms spawn 4 2 email
++at 13900ms spawn 3 2 email
++at 13950ms spawn 4 2 email
++at 14000ms spawn 3 2 email
++at 14050ms spawn 4 2 email
++at 14100ms spawn 3 2 email
++at 14150ms spawn 4 2 email
++at 14200ms spawn 3 2 email
++at 14250ms spawn 4 2 email
++at 14300ms spawn 3 2 email
++at 14350ms spawn 4 2 email
++at 14400ms spawn 3 2 email
++at 14450ms spawn 4 2 email
++at 14500ms spawn 3 2 email
++at 14550ms spawn 4 2 email
++at 14600ms spawn 3 2 email
++at 14650ms spawn 4 2 email
++at 14700ms spawn 3 2 email
++at 14750ms spawn 4 2 email
++at 14800ms spawn 3 2 email
++at 14850ms spawn 4 2 email
++at 14900ms spawn 3 2 email
++at 14950ms spawn 4 2 email
++at 15000ms spawn 3 2 email
++at 15050ms spawn 4 2 email
++at 15100ms spawn 3 2 email
++at 15150ms spawn 4 2 email
++at 15200ms spawn 3 2 email
++at 15250ms spawn 4 2 email
++at 15300ms spawn 3 2 email
++at 15350ms spawn 4 2 email
++at 15400ms spawn 3 2 email
++at 15450ms spawn 4 2 email
++at 15500ms spawn 3 2 email
++at 15550ms spawn 4 2 email
++at 15600ms spawn 3 2 email
++at 15650ms spawn 4 2 email
++at 15700ms spawn 3 2 email
++at 15750ms spawn 4 2 email
++at 15800ms spawn 3 2 email
++at 15850ms spawn 4 2 email
++at 15900ms spawn 3 2 email
++at 15950ms spawn 4 2 email
++at 16000ms spawn 3 2 email
++at 16050ms spawn 4 2 email
++at 16100ms spawn 3 2 email
++at 16150ms spawn 4 2 email
++at 16200ms spawn 3 2 email
++at 16250ms spawn 4 2 email
++at 16300ms spawn 3 2 email
++at 16350ms spawn 4 2 email
++at 16400ms spawn 3 2 email
++at 16450ms spawn 4 2 email
++at 16500ms spawn 3 2 email
++at 16550ms spawn 4 2 email
++at 16600ms spawn 3 2 email
++at 16650ms spawn 4 2 email
++at 16700ms spawn 3 2 email
++at 16750ms spawn 4 2 email
++at 16800ms spawn 3 2 email
++at 16850ms spawn 4 2 email
++at 16900ms spawn 3 2 email
++at 16950ms spawn 4 2 email
++at 17000ms spawn 3 2 email
++at 17050ms spawn 4 2 email
++at 17100ms spawn 3 2 email
++at 17150ms spawn 4 2 email
++at 17200ms spawn 3 2 email
++at 17250ms spawn 4 2 email
++at 17300ms spawn 3 2 email
++at 17350ms spawn 4 2 email
++at 17400ms spawn 3 2 email
++at 17450ms spawn 4 2 email
++at 17500ms spawn 3 2 email
++at 17550ms spawn 4 2 email
++at 17600ms spawn 3 2 email
++at 17650ms spawn 4 2 email
++at 17700ms spawn 3 2 email
++at 17750ms spawn 4 2 email
++at 17800ms spawn 3 2 email
++at 17850ms spawn 4 2 email
++at 17900ms spawn 3 2 email
++at 17950ms spawn 4 2 email
++at 18000ms spawn 3 2 email
++at 18050ms spawn 4 2 email
++at 18100ms spawn 3 2 email
++at 18150ms spawn 4 2 email
++at 18200ms spawn 3 2 email
++at 18250ms spawn 4 2 email
++at 18300ms spawn 3 2 email
++at 18350ms spawn 4 2 email
++at 18400ms spawn 3 2 email
++at 18450ms spawn 4 2 email
++at 18500ms spawn 3 2 email
++at 18550ms spawn 4 2 email
++at 18600ms spawn 3 2 email
++at 18650ms spawn 4 2 email
++at 18700ms spawn 3 2 email
++at 18750ms spawn 4 2 email
++at 18800ms spawn 3 2 email
++at 18850ms spawn 4 2 email
++at 18900ms spawn 3 2 email
++at 18950ms spawn 4 2 email
++at 19000ms spawn 3 2 email
++at 19050ms spawn 4 2 email
++at 19100ms spawn 3 2 email
++at 19150ms spawn 4 2 email
++at 19200ms spawn 3 2 email
++at 19250ms spawn 4 2 email
++at 19300ms spawn 3 2 email
++at 19350ms spawn 4 2 email
++at 19400ms spawn 3 2 email
++at 19450ms spawn 4 2 email
++at 19500ms spawn 3 2 email
++at 19550ms spawn 4 2 email
++at 19600ms spawn 3 2 email
++at 19650ms spawn 4 2 email
++at 19700ms spawn 3 2 email
++at 19750ms spawn 4 2 email
++at 19800ms spawn 3 2 email
++at 19850ms spawn 4 2 email
++at 19900ms spawn 3 2 email
++at 19950ms spawn 4 2 email
++at 20000ms spawn 3 2 email
++at 20050ms spawn 4 2 email
++at 20100ms spawn 3 2 email
++at 20150ms spawn 4 2 email
++at 20200ms spawn 3 2 email
++at 20250ms spawn 4 2 email
++at 20300ms spawn 3 2 email
++at 20350ms spawn 4 2 email
++at 20400ms spawn 3 2 email
++at 20450ms spawn 4 2 email
++at 20500ms spawn 3 2 email
++at 20550ms spawn 4 2 email
++at 20600ms spawn 3 2 email
++at 20650ms spawn 4 2 email
++at 20700ms spawn 3 2 email
++at 20750ms spawn 4 2 email
++at 20800ms spawn 3 2 email
++at 20850ms spawn 4 2 email
++at 20900ms spawn 3 2 email
++at 20950ms spawn 4 2 email
++at 21000ms spawn 3 2 email
++at 21050ms spawn 4 2 email
++at 21100ms spawn 3 2 email
++at 21150ms spawn 4 2 email
++at 21200ms spawn 3 2 email
++at 21250ms spawn 4 2 email
++at 21300ms spawn 3 2 email
++at 21350ms spawn 4 2 email
++at 21400ms spawn 3 2 email
++at 21450ms spawn 4 2 email
++at 21500ms spawn 3 2 email
++at 21550ms spawn 4 2 email
++at 21600ms spawn 3 2 email
++at 21650ms spawn 4 2 email
++at 21700ms spawn 3 2 email
++at 21750ms spawn 4 2 email
++at 21800ms spawn 3 2 email
++at 21850ms spawn 4 2 email
++at 21900ms spawn 3 2 email
++at 21950ms spawn 4 2 email
++at 22000ms spawn 3 2 email
++at 22050ms spawn 4 2 email
++at 22100ms spawn 3 2 email
++at 22150ms spawn 4 2 email
++at 22200ms spawn 3 2 email
++at 22250ms spawn 4 2 email
++at 22300ms spawn 3 2 email
++at 22350ms spawn 4 2 email
++at 22400ms spawn 3 2 email
++at 22450ms spawn 4 2 email
++at 22500ms spawn 3 2 email
++at 22550ms spawn 4 2 email
++at 22600ms spawn 3 2 email
++at 22650ms spawn 4 2 email
++at 22700ms spawn 3 2 email
++at 22750ms spawn 4 2 email
++at 22800ms spawn 3 2 email
++at 22850ms spawn 4 2 email
++at 22900ms spawn 3 2 email
++at 22950ms spawn 4 2 email
++at 23000ms spawn 3 2 email
++at 23050ms spawn 4 2 email
++at 23100ms spawn 3 2 email
++at 23150ms spawn 4 2 email
++at 23200ms spawn 3 2 email
++at 23250ms spawn 4 2 email
++at 23300ms spawn 3 2 email
++at 23350ms spawn 4 2 email
++at 23400ms spawn 3 2 email
++at 23450ms spawn 4 2 email
++at 23500ms spawn 3 2 email
++at 23550ms spawn 4 2 email
++at 23600ms spawn 3 2 email
++at 23650ms spawn 4 2 email
++at 23700ms spawn 3 2 email
++at 23750ms spawn 4 2 email
++at 23800ms spawn 3 2 email
++at 23850ms spawn 4 2 email
++at 23900ms spawn 3 2 email
++at 23950ms spawn 4 2 email
++at 24000ms spawn 3 2 email
++at 24050ms spawn 4 2 email
++at 24100ms spawn 3 2 email
++at 24150ms spawn 4 2 email
++at 24200ms spawn 3 2 email
++at 24250ms spawn 4 2 email
++at 24300ms spawn 3 2 email
++at 24350ms spawn 4 2 email
++at 24400ms spawn 3 2 email
++at 24450ms spawn 4 2 email
++at 24500ms spawn 3 2 email
++at 24550ms spawn 4 2 email
++at 24600ms spawn 3 2 email
++at 24650ms spawn 4 2 email
++at 24700ms spawn 3 2 email
++at 24750ms spawn 4 2 email
++at 24800ms spawn 3 2 email
++at 24850ms spawn 4 2 email
++at 24900ms spawn 3 2 email
++at 24950ms spawn 4 2 email
++at 25000ms spawn 3 2 email
++at 25050ms spawn 4 2 email
++at 25100ms spawn 3 2 email
++at 25150ms spawn 4 2 email
++at 25200ms spawn 3 2 email
++at 25250ms spawn 4 2 email
++at 25300ms spawn 3 2 email
++at 25350ms spawn 4 2 email
++at 25400ms spawn 3 2 email
++at 25450ms spawn 4 2 email
++at 25500ms spawn 3 2 email
++at 25550ms spawn 4 2 email
++at 25600ms spawn 3 2 email
++at 25650ms spawn 4 2 email
++at 25700ms spawn 3 2 email
++at 25750ms spawn 4 2 email
++at 25800ms spawn 3 2 email
++at 25850ms spawn 4 2 email
++at 25900ms spawn 3 2 email
++at 25950ms spawn 4 2 email
++at 26000ms spawn 3 2 email
++at 26050ms spawn 4 2 email
++at 26100ms spawn 3 2 email
++at 26150ms spawn 4 2 email
++at 26200ms spawn 3 2 email
++at 26250ms spawn 4 2 email
++at 26300ms spawn 3 2 email
++at 26350ms spawn 4 2 email
++at 26400ms spawn 3 2 email
++at 26450ms spawn 4 2 email
++at 26500ms spawn 3 2 email
++at 26550ms spawn 4 2 email
++at 26600ms spawn 3 2 email
++at 26650ms spawn 4 2 email
++at 26700ms spawn 3 2 email
++at 26750ms spawn 4 2 email
++at 26800ms spawn 3 2 email
++at 26850ms spawn 4 2 email
++at 26900ms spawn 3 2 email
++at 26950ms spawn 4 2 email
++at 27000ms spawn 3 2 email
++at 27050ms spawn 4 2 email
++at 27100ms spawn 3 2 email
++at 27150ms spawn 4 2 email
++at 27200ms spawn 3 2 email
++at 27250ms spawn 4 2 email
++at 27300ms spawn 3 2 email
++at 27350ms spawn 4 2 email
++at 27400ms spawn 3 2 email
++at 27450ms spawn 4 2 email
++at 27500ms spawn 3 2 email
++at 27550ms spawn 4 2 email
++at 27600ms spawn 3 2 email
++at 27650ms spawn 4 2 email
++at 27700ms spawn 3 2 email
++at 27750ms spawn 4 2 email
++at 27800ms spawn 3 2 email
++at 27850ms spawn 4 2 email
++at 27900ms spawn 3 2 email
++at 27950ms spawn 4 2 email
++at 28000ms spawn 3 2 email
++at 28050ms spawn 4 2 email
++at 28100ms spawn 3 2 email
++at 28150ms spawn 4 2 email
++at 28200ms spawn 3 2 email
++at 28250ms spawn 4 2 email
++at 28300ms spawn 3 2 email
++at 28350ms spawn 4 2 email
++at 28400ms spawn 3 2 email
++at 28450ms spawn 4 2 email
++at 28500ms spawn 3 2 email
++at 28550ms spawn 4 2 email
++at 28600ms spawn 3 2 email
++at 28650ms spawn 4 2 email
++at 28700ms spawn 3 2 email
++at 28750ms spawn 4 2 email
++at 28800ms spawn 3 2 email
++at 28850ms spawn 4 2 email
++at 28900ms spawn 3 2 email
++at 28950ms spawn 4 2 email
++at 29000ms spawn 3 2 email
++at 29050ms spawn 4 2 email
++at 29100ms spawn 3 2 email
++at 29150ms spawn 4 2 email
++at 29200ms spawn 3 2 email
++at 29250ms spawn 4 2 email
++at 29300ms spawn 3 2 email
++at 29350ms spawn 4 2 email
++at 29400ms spawn 3 2 email
++at 29450ms spawn 4 2 email
++at 29500ms spawn 3 2 email
++at 29550ms spawn 4 2 email
++at 29600ms spawn 3 2 email
++at 29650ms spawn 4 2 email
++at 29700ms spawn 3 2 email
++at 29750ms spawn 4 2 email
++at 29800ms spawn 3 2 email
++at 29850ms spawn 4 2 email
++at 29900ms spawn 3 2 email
++at 29950ms spawn 4 2 email
++at 30000ms spawn 3 2 email
++at 30050ms spawn 4 2 email
++at 30100ms spawn 3 2 email
++at 30150ms spawn 4 2 email
++at 30200ms spawn 3 2 email
++at 30250ms spawn 4 2 email
++at 30300ms spawn 3 2 email
++at 30350ms spawn 4 2 email
++at 30400ms spawn 3 2 email
++at 30450ms spawn 4 2 email
++at 30500ms spawn 3 2 email
++at 30550ms spawn 4 2 email
++at 30600ms spawn 3 2 email
++at 30650ms spawn 4 2 email
++at 30700ms spawn 3 2 email
++at 30750ms spawn 4 2 email
++at 30800ms spawn 3 2 email
++at 30850ms spawn 4 2 email
++at 30900ms spawn 3 2 email
++at 30950ms spawn 4 2 email
++at 31000ms spawn 3 2 email
++at 31050ms spawn 4 2 email
++at 31100ms spawn 3 2 email
++at 31150ms spawn 4 2 email
++at 31200ms spawn 3 2 email
++at 31250ms spawn 4 2 email
++at 31300ms spawn 3 2 email
++at 31350ms spawn 4 2 email
++at 31400ms spawn 3 2 email
++at 31450ms spawn 4 2 email
++at 31500ms spawn 3 2 email
++at 31550ms spawn 4 2 email
++at 31600ms spawn 3 2 email
++at 31650ms spawn 4 2 email
++at 31700ms spawn 3 2 email
++at 31750ms spawn 4 2 email
++at 31800ms spawn 3 2 email
++at 31850ms spawn 4 2 email
++at 31900ms spawn 3 2 email
++at 31950ms spawn 4 2 email
++at 32000ms spawn 3 2 email
++at 32050ms spawn 4 2 email
++at 32100ms spawn 3 2 email
++at 32150ms spawn 4 2 email
++at 32200ms spawn 3 2 email
++at 32250ms spawn 4 2 email
++at 32300ms spawn 3 2 email
++at 32350ms spawn 4 2 email
++at 32400ms spawn 3 2 email
++at 32450ms spawn 4 2 email
++at 32500ms spawn 3 2 email
++at 32550ms spawn 4 2 email
++at 32600ms spawn 3 2 email
++at 32650ms spawn 4 2 email
++at 32700ms spawn 3 2 email
++at 32750ms spawn 4 2 email
++at 32800ms spawn 3 2 email
++at 32850ms spawn 4 2 email
++at 32900ms spawn 3 2 email
++at 32950ms spawn 4 2 email
++at 33000ms spawn 3 2 email
++at 33050ms spawn 4 2 email
++at 33100ms spawn 3 2 email
++at 33150ms spawn 4 2 email
++at 33200ms spawn 3 2 email
++at 33250ms spawn 4 2 email
++at 33300ms spawn 3 2 email
++at 33350ms spawn 4 2 email
++at 33400ms spawn 3 2 email
++at 33450ms spawn 4 2 email
++at 33500ms spawn 3 2 email
++at 33550ms spawn 4 2 email
++at 33600ms spawn 3 2 email
++at 33650ms spawn 4 2 email
++at 33700ms spawn 3 2 email
++at 33750ms spawn 4 2 email
++at 33800ms spawn 3 2 email
++at 33850ms spawn 4 2 email
++at 33900ms spawn 3 2 email
++at 33950ms spawn 4 2 email
++at 34000ms spawn 3 2 email
++at 34050ms spawn 4 2 email
++at 34100ms spawn 3 2 email
++at 34150ms spawn 4 2 email
++at 34200ms spawn 3 2 email
++at 34250ms spawn 4 2 email
++at 34300ms spawn 3 2 email
++at 34350ms spawn 4 2 email
++at 34400ms spawn 3 2 email
++at 34450ms spawn 4 2 email
++at 34500ms spawn 3 2 email
++at 34550ms spawn 4 2 email
++at 34600ms spawn 3 2 email
++at 34650ms spawn 4 2 email
++at 34700ms spawn 3 2 email
++at 34750ms spawn 4 2 email
++at 34800ms spawn 3 2 email
++at 34850ms spawn 4 2 email
++at 34900ms spawn 3 2 email
++at 34950ms spawn 4 2 email
++at 35000ms spawn 3 2 email
++at 35050ms spawn 4 2 email
++at 35100ms spawn 3 2 email
++at 35150ms spawn 4 2 email
++at 35200ms spawn 3 2 email
++at 35250ms spawn 4 2 email
++at 35300ms spawn 3 2 email
++at 35350ms spawn 4 2 email
++at 35400ms spawn 3 2 email
++at 35450ms spawn 4 2 email
++at 35500ms spawn 3 2 email
++at 35550ms spawn 4 2 email
++at 35600ms spawn 3 2 email
++at 35650ms spawn 4 2 email
++at 35700ms spawn 3 2 email
++at 35750ms spawn 4 2 email
++at 35800ms spawn 3 2 email
++at 35850ms spawn 4 2 email
++at 35900ms spawn 3 2 email
++at 35950ms spawn 4 2 email
++at 36000ms spawn 3 2 email
++at 36050ms spawn 4 2 email
++at 36100ms spawn 3 2 email
++at 36150ms spawn 4 2 email
++at 36200ms spawn 3 2 email
++at 36250ms spawn 4 2 email
++at 36300ms spawn 3 2 email
++at 36350ms spawn 4 2 email
++at 36400ms spawn 3 2 email
++at 36450ms spawn 4 2 email
++at 36500ms spawn 3 2 email
++at 36550ms spawn 4 2 email
++at 36600ms spawn 3 2 email
++at 36650ms spawn 4 2 email
++at 36700ms spawn 3 2 email
++at 36750ms spawn 4 2 email
++at 36800ms spawn 3 2 email
++at 36850ms spawn 4 2 email
++at 36900ms spawn 3 2 email
++at 36950ms spawn 4 2 email
++at 37000ms spawn 3 2 email
++at 37050ms spawn 4 2 email
++at 37100ms spawn 3 2 email
++at 37150ms spawn 4 2 email
++at 37200ms spawn 3 2 email
++at 37250ms spawn 4 2 email
++at 37300ms spawn 3 2 email
++at 37350ms spawn 4 2 email
++at 37400ms spawn 3 2 email
++at 37450ms spawn 4 2 email
++at 37500ms spawn 3 2 email
++at 37550ms spawn 4 2 email
++at 37600ms spawn 3 2 email
++at 37650ms spawn 4 2 email
++at 37700ms spawn 3 2 email
++at 37750ms spawn 4 2 email
++at 37800ms spawn 3 2 email
++at 37850ms spawn 4 2 email
++at 37900ms spawn 3 2 email
++at 37950ms spawn 4 2 email
++at 38000ms spawn 3 2 email
++at 38050ms spawn 4 2 email
++at 38100ms spawn 3 2 email
++at 38150ms spawn 4 2 email
++at 38200ms spawn 3 2 email
++at 38250ms spawn 4 2 email
++at 38300ms spawn 3 2 email
++at 38350ms spawn 4 2 email
++at 38400ms spawn 3 2 email
++at 38450ms spawn 4 2 email
++at 38500ms spawn 3 2 email
++at 38550ms spawn 4 2 email
++at 38600ms spawn 3 2 email
++at 38650ms spawn 4 2 email
++at 38700ms spawn 3 2 email
++at 38750ms spawn 4 2 email
++at 38800ms spawn 3 2 email
++at 38850ms spawn 4 2 email
++at 38900ms spawn 3 2 email
++at 38950ms spawn 4 2 email
++at 39000ms spawn 3 2 email
++at 39050ms spawn 4 2 email
++at 39100ms spawn 3 2 email
++at 39150ms spawn 4 2 email
++at 39200ms spawn 3 2 email
++at 39250ms spawn 4 2 email
++at 39300ms spawn 3 2 email
++at 39350ms spawn 4 2 email
++at 39400ms spawn 3 2 email
++at 39450ms spawn 4 2 email
++at 39500ms spawn 3 2 email
++at 39550ms spawn 4 2 email
++at 39600ms spawn 3 2 email
++at 39650ms spawn 4 2 email
++at 39700ms spawn 3 2 email
++at 39750ms spawn 4 2 email
++at 39800ms spawn 3 2 email
++at 39850ms spawn 4 2 email
++at 39900ms spawn 3 2 email
++at 39950ms spawn 4 2 email
++at 40000ms spawn 3 2 email
++at 40050ms spawn 4 2 email
++at 40100ms spawn 3 2 email
++at 40150ms spawn 4 2 email
++at 40200ms spawn 3 2 email
++at 40250ms spawn 4 2 email
++at 40300ms spawn 3 2 email
++at 40350ms spawn 4 2 email
++at 40400ms spawn 3 2 email
++at 40450ms spawn 4 2 email
++at 40500ms spawn 3 2 email
++at 40550ms spawn 4 2 email
++at 40600ms spawn 3 2 email
++at 40650ms spawn 4 2 email
++at 40700ms spawn 3 2 email
++at 40750ms spawn 4 2 email
++at 40800ms spawn 3 2 email
++at 40850ms spawn 4 2 email
++at 40900ms spawn 3 2 email
++at 40950ms spawn 4 2 email
++at 41000ms spawn 3 2 email
++at 41050ms spawn 4 2 email
++at 41100ms spawn 3 2 email
++at 41150ms spawn 4 2 email
++at 41200ms spawn 3 2 email
++at 41250ms spawn 4 2 email
++at 41300ms spawn 3 2 email
++at 41350ms spawn 4 2 email
++at 41400ms spawn 3 2 email
++at 41450ms spawn 4 2 email
++at 41500ms spawn 3 2 email
++at 41550ms spawn 4 2 email
++at 41600ms spawn 3 2 email
++at 41650ms spawn 4 2 email
++at 41700ms spawn 3 2 email
++at 41750ms spawn 4 2 email
++at 41800ms spawn 3 2 email
++at 41850ms spawn 4 2 email
++at 41900ms spawn 3 2 email
++at 41950ms spawn 4 2 email
++at 42000ms spawn 3 2 email
++at 42050ms spawn 4 2 email
++at 42100ms spawn 3 2 email
++at 42150ms spawn 4 2 email
++at 42200ms spawn 3 2 email
++at 42250ms spawn 4 2 email
++at 42300ms spawn 3 2 email
++at 42350ms spawn 4 2 email
++at 42400ms spawn 3 2 email
++at 42450ms spawn 4 2 email
++at 42500ms spawn 3 2 email
++at 42550ms spawn 4 2 email
++at 42600ms spawn 3 2 email
++at 42650ms spawn 4 2 email
++at 42700ms spawn 3 2 email
++at 42750ms spawn 4 2 email
++at 42800ms spawn 3 2 email
++at 42850ms spawn 4 2 email
++at 42900ms spawn 3 2 email
++at 42950ms spawn 4 2 email
++at 43000ms spawn 3 2 email
++at 43050ms spawn 4 2 email
++at 43100ms spawn 3 2 email
++at 43150ms spawn 4 2 email
++at 43200ms spawn 3 2 email
++at 43250ms spawn 4 2 email
++at 43300ms spawn 3 2 email
++at 43350ms spawn 4 2 email
++at 43400ms spawn 3 2 email
++at 43450ms spawn 4 2 email
++at 43500ms spawn 3 2 email
++at 43550ms spawn 4 2 email
++at 43600ms spawn 3 2 email
++at 43650ms spawn 4 2 email
++at 43700ms spawn 3 2 email
++at 43750ms spawn 4 2 email
++at 43800ms spawn 3 2 email
++at 43850ms spawn 4 2 email
++at 43900ms spawn 3 2 email
++at 43950ms spawn 4 2 email
++at 44000ms spawn 3 2 email
++at 44050ms spawn 4 2 email
++at 44100ms spawn 3 2 email
++at 44150ms spawn 4 2 email
++at 44200ms spawn 3 2 email
++at 44250ms spawn 4 2 email
++at 44300ms spawn 3 2 email
++at 44350ms spawn 4 2 email
++at 44400ms spawn 3 2 email
++at 44450ms spawn 4 2 email
++at 44500ms spawn 3 2 email
++at 44550ms spawn 4 2 email
++at 44600ms spawn 3 2 email
++at 44650ms spawn 4 2 email
++at 44700ms spawn 3 2 email
++at 44750ms spawn 4 2 email
++at 44800ms spawn 3 2 email
++at 44850ms spawn 4 2 email
++at 44900ms spawn 3 2 email
++at 44950ms spawn 4 2 email
++at 45000ms spawn 3 2 email
++at 45050ms spawn 4 2 email
++at 45100ms spawn 3 2 email
++at 45150ms spawn 4 2 email
++at 45200ms spawn 3 2 email
++at 45250ms spawn 4 2 email
++at 45300ms spawn 3 2 email
++at 45350ms spawn 4 2 email
++at 45400ms spawn 3 2 email
++at 45450ms spawn 4 2 email
++at 45500ms spawn 3 2 email
++at 45550ms spawn 4 2 email
++at 45600ms spawn 3 2 email
++at 45650ms spawn 4 2 email
++at 45700ms spawn 3 2 email
++at 45750ms spawn 4 2 email
++at 45800ms spawn 3 2 email
++at 45850ms spawn 4 2 email
++at 45900ms spawn 3 2 email
++at 45950ms spawn 4 2 email
++at 46000ms spawn 3 2 email
++at 46050ms spawn 4 2 email
++at 46100ms spawn 3 2 email
++at 46150ms spawn 4 2 email
++at 46200ms spawn 3 2 email
++at 46250ms spawn 4 2 email
++at 46300ms spawn 3 2 email
++at 46350ms spawn 4 2 email
++at 46400ms spawn 3 2 email
++at 46450ms spawn 4 2 email
++at 46500ms spawn 3 2 email
++at 46550ms spawn 4 2 email
++at 46600ms spawn 3 2 email
++at 46650ms spawn 4 2 email
++at 46700ms spawn 3 2 email
++at 46750ms spawn 4 2 email
++at 46800ms spawn 3 2 email
++at 46850ms spawn 4 2 email
++at 46900ms spawn 3 2 email
++at 46950ms spawn 4 2 email
++at 47000ms spawn 3 2 email
++at 47050ms spawn 4 2 email
++at 47100ms spawn 3 2 email
++at 47150ms spawn 4 2 email
++at 47200ms spawn 3 2 email
++at 47250ms spawn 4 2 email
++at 47300ms spawn 3 2 email
++at 47350ms spawn 4 2 email
++at 47400ms spawn 3 2 email
++at 47450ms spawn 4 2 email
++at 47500ms spawn 3 2 email
++at 47550ms spawn 4 2 email
++at 47600ms spawn 3 2 email
++at 47650ms spawn 4 2 email
++at 47700ms spawn 3 2 email
++at 47750ms spawn 4 2 email
++at 47800ms spawn 3 2 email
++at 47850ms spawn 4 2 email
++at 47900ms spawn 3 2 email
++at 47950ms spawn 4 2 email
++at 48000ms spawn 3 2 email
++at 48050ms spawn 4 2 email
++at 48100ms spawn 3 2 email
++at 48150ms spawn 4 2 email
++at 48200ms spawn 3 2 email
++at 48250ms spawn 4 2 email
++at 48300ms spawn 3 2 email
++at 48350ms spawn 4 2 email
++at 48400ms spawn 3 2 email
++at 48450ms spawn 4 2 email
++at 48500ms spawn 3 2 email
++at 48550ms spawn 4 2 email
++at 48600ms spawn 3 2 email
++at 48650ms spawn 4 2 email
++at 48700ms spawn 3 2 email
++at 48750ms spawn 4 2 email
++at 48800ms spawn 3 2 email
++at 48850ms spawn 4 2 email
++at 48900ms spawn 3 2 email
++at 48950ms spawn 4 2 email
++at 49000ms spawn 3 2 email
++at 49050ms spawn 4 2 email
++at 49100ms spawn 3 2 email
++at 49150ms spawn 4 2 email
++at 49200ms spawn 3 2 email
++at 49250ms spawn 4 2 email
++at 49300ms spawn 3 2 email
++at 49350ms spawn 4 2 email
++at 49400ms spawn 3 2 email
++at 49450ms spawn 4 2 email
++at 49500ms spawn 3 2 email
++at 49550ms spawn 4 2 email
++at 49600ms spawn 3 2 email
++at 49650ms spawn 4 2 email
++at 49700ms spawn 3 2 email
++at 49750ms spawn 4 2 email
++at 49800ms spawn 3 2 email
++at 49850ms spawn 4 2 email
++at 49900ms spawn 3 2 email
++at 49950ms spawn 4 2 email
++at 50000ms spawn 3 2 email
++at 50050ms spawn 4 2 email
++at 50100ms spawn 3 2 email
++at 50150ms spawn 4 2 email
++at 50200ms spawn 3 2 email
++at 50250ms spawn 4 2 email
++at 50300ms spawn 3 2 email
++at 50350ms spawn 4 2 email
++at 50400ms spawn 3 2 email
++at 50450ms spawn 4 2 email
++at 50500ms spawn 3 2 email
++at 50550ms spawn 4 2 email
++at 50600ms spawn 3 2 email
++at 50650ms spawn 4 2 email
++at 50700ms spawn 3 2 email
++at 50750ms spawn 4 2 email
++at 50800ms spawn 3 2 email
++at 50850ms spawn 4 2 email
++at 50900ms spawn 3 2 email
++at 50950ms spawn 4 2 email
++at 51000ms spawn 3 2 email
++at 51050ms spawn 4 2 email
++at 51100ms spawn 3 2 email
++at 51150ms spawn 4 2 email
++at 51200ms spawn 3 2 email
++at 51250ms spawn 4 2 email
++at 51300ms spawn 3 2 email
++at 51350ms spawn 4 2 email
++at 51400ms spawn 3 2 email
++at 51450ms spawn 4 2 email
++at 51500ms spawn 3 2 email
++at 51550ms spawn 4 2 email
++at 51600ms spawn 3 2 email
++at 51650ms spawn 4 2 email
++at 51700ms spawn 3 2 email
++at 51750ms spawn 4 2 email
++at 51800ms spawn 3 2 email
++at 51850ms spawn 4 2 email
++at 51900ms spawn 3 2 email
++at 51950ms spawn 4 2 email
++at 52000ms spawn 3 2 email
++at 52050ms spawn 4 2 email
++at 52100ms spawn 3 2 email
++at 52150ms spawn 4 2 email
++at 52200ms spawn 3 2 email
++at 52250ms spawn 4 2 email
++at 52300ms spawn 3 2 email
++at 52350ms spawn 4 2 email
++at 52400ms spawn 3 2 email
++at 52450ms spawn 4 2 email
++at 52500ms spawn 3 2 email
++at 52550ms spawn 4 2 email
++at 52600ms spawn 3 2 email
++at 52650ms spawn 4 2 email
++at 52700ms spawn 3 2 email
++at 52750ms spawn 4 2 email
++at 52800ms spawn 3 2 email
++at 52850ms spawn 4 2 email
++at 52900ms spawn 3 2 email
++at 52950ms spawn 4 2 email
++at 53000ms spawn 3 2 email
++at 53050ms spawn 4 2 email
++at 53100ms spawn 3 2 email
++at 53150ms spawn 4 2 email
++at 53200ms spawn 3 2 email
++at 53250ms spawn 4 2 email
++at 53300ms spawn 3 2 email
++at 53350ms spawn 4 2 email
++at 53400ms spawn 3 2 email
++at 53450ms spawn 4 2 email
++at 53500ms spawn 3 2 email
++at 53550ms spawn 4 2 email
++at 53600ms spawn 3 2 email
++at 53650ms spawn 4 2 email
++at 53700ms spawn 3 2 email
++at 53750ms spawn 4 2 email
++at 53800ms spawn 3 2 email
++at 53850ms spawn 4 2 email
++at 53900ms spawn 3 2 email
++at 53950ms spawn 4 2 email
++at 54000ms spawn 3 2 email
++at 54050ms spawn 4 2 email
++at 54100ms spawn 3 2 email
++at 54150ms spawn 4 2 email
++at 54200ms spawn 3 2 email
++at 54250ms spawn 4 2 email
++at 54300ms spawn 3 2 email
++at 54350ms spawn 4 2 email
++at 54400ms spawn 3 2 email
++at 54450ms spawn 4 2 email
++at 54500ms spawn 3 2 email
++at 54550ms spawn 4 2 email
++at 54600ms spawn 3 2 email
++at 54650ms spawn 4 2 email
++at 54700ms spawn 3 2 email
++at 54750ms spawn 4 2 email
++at 54800ms spawn 3 2 email
++at 54850ms spawn 4 2 email
++at 54900ms spawn 3 2 email
++at 54950ms spawn 4 2 email
++at 55000ms spawn 3 2 email
++at 55050ms spawn 4 2 email
++at 55100ms spawn 3 2 email
++at 55150ms spawn 4 2 email
++at 55200ms spawn 3 2 email
++at 55250ms spawn 4 2 email
++at 55300ms spawn 3 2 email
++at 55350ms spawn 4 2 email
++at 55400ms spawn 3 2 email
++at 55450ms spawn 4 2 email
++at 55500ms spawn 3 2 email
++at 55550ms spawn 4 2 email
++at 55600ms spawn 3 2 email
++at 55650ms spawn 4 2 email
++at 55700ms spawn 3 2 email
++at 55750ms spawn 4 2 email
++at 55800ms spawn 3 2 email
++at 55850ms spawn 4 2 email
++at 55900ms spawn 3 2 email
++at 55950ms spawn 4 2 email
++at 56000ms spawn 3 2 email
++at 56050ms spawn 4 2 email
++at 56100ms spawn 3 2 email
++at 56150ms spawn 4 2 email
++at 56200ms spawn 3 2 email
++at 56250ms spawn 4 2 email
++at 56300ms spawn 3 2 email
++at 56350ms spawn 4 2 email
++at 56400ms spawn 3 2 email
++at 56450ms spawn 4 2 email
++at 56500ms spawn 3 2 email
++at 56550ms spawn 4 2 email
++at 56600ms spawn 3 2 email
++at 56650ms spawn 4 2 email
++at 56700ms spawn 3 2 email
++at 56750ms spawn 4 2 email
++at 56800ms spawn 3 2 email
++at 56850ms spawn 4 2 email
++at 56900ms spawn 3 2 email
++at 56950ms spawn 4 2 email
++at 57000ms spawn 3 2 email
++at 57050ms spawn 4 2 email
++at 57100ms spawn 3 2 email
++at 57150ms spawn 4 2 email
++at 57200ms spawn 3 2 email
++at 57250ms spawn 4 2 email
++at 57300ms spawn 3 2 email
++at 57350ms spawn 4 2 email
++at 57400ms spawn 3 2 email
++at 57450ms spawn 4 2 email
++at 57500ms spawn 3 2 email
++at 57550ms spawn 4 2 email
++at 57600ms spawn 3 2 email
++at 57650ms spawn 4 2 email
++at 57700ms spawn 3 2 email
++at 57750ms spawn 4 2 email
++at 57800ms spawn 3 2 email
++at 57850ms spawn 4 2 email
++at 57900ms spawn 3 2 email
++at 57950ms spawn 4 2 email
++at 58000ms spawn 3 2 email
++at 58050ms spawn 4 2 email
++at 58100ms spawn 3 2 email
++at 58150ms spawn 4 2 email
++at 58200ms spawn 3 2 email
++at 58250ms spawn 4 2 email
++at 58300ms spawn 3 2 email
++at 58350ms spawn 4 2 email
++at 58400ms spawn 3 2 email
++at 58450ms spawn 4 2 email
++at 58500ms spawn 3 2 email
++at 58550ms spawn 4 2 email
++at 58600ms spawn 3 2 email
++at 58650ms spawn 4 2 email
++at 58700ms spawn 3 2 email
++at 58750ms spawn 4 2 email
++at 58800ms spawn 3 2 email
++at 58850ms spawn 4 2 email
++at 58900ms spawn 3 2 email
++at 58950ms spawn 4 2 email
++at 59000ms spawn 3 2 email
++at 59050ms spawn 4 2 email
++at 59100ms spawn 3 2 email
++at 59150ms spawn 4 2 email
++at 59200ms spawn 3 2 email
++at 59250ms spawn 4 2 email
++at 59300ms spawn 3 2 email
++at 59350ms spawn 4 2 email
++at 59400ms spawn 3 2 email
++at 59450ms spawn 4 2 email
++at 59500ms spawn 3 2 email
++at 59550ms spawn 4 2 email
++at 59600ms spawn 3 2 email
++at 59650ms spawn 4 2 email
++at 59700ms spawn 3 2 email
++at 59750ms spawn 4 2 email
++at 59800ms spawn 3 2 email
++at 59850ms spawn 4 2 email
++at 59900ms spawn 3 2 email
++at 59950ms spawn 4 2 email
++at 60000ms spawn 3 2 email
++at 60050ms spawn 4 2 email
++at 60100ms spawn 3 2 email
++at 60150ms spawn 4 2 email
++at 60200ms spawn 3 2 email
++at 60250ms spawn 4 2 email
++at 60300ms spawn 3 2 email
++at 60350ms spawn 4 2 email
++at 60400ms spawn 3 2 email
++at 60450ms spawn 4 2 email
++at 60500ms spawn 3 2 email
++at 60550ms spawn 4 2 email
++at 60600ms spawn 3 2 email
++at 60650ms spawn 4 2 email
++at 60700ms spawn 3 2 email
++at 60750ms spawn 4 2 email
++at 60800ms spawn 3 2 email
++at 60850ms spawn 4 2 email
++at 60900ms spawn 3 2 email
++at 60950ms spawn 4 2 email
++at 61000ms spawn 3 2 email
++at 61050ms spawn 4 2 email
++at 61100ms spawn 3 2 email
++at 61150ms spawn 4 2 email
++at 61200ms spawn 3 2 email
++at 61250ms spawn 4 2 email
++at 61300ms spawn 3 2 email
++at 61350ms spawn 4 2 email
++at 61400ms spawn 3 2 email
++at 61450ms spawn 4 2 email
++at 61500ms spawn 3 2 email
++at 61550ms spawn 4 2 email
++at 61600ms spawn 3 2 email
++at 61650ms spawn 4 2 email
++at 61700ms spawn 3 2 email
++at 61750ms spawn 4 2 email
++at 61800ms spawn 3 2 email
++at 61850ms spawn 4 2 email
++at 61900ms spawn 3 2 email
++at 61950ms spawn 4 2 email
++at 62000ms spawn 3 2 email
++at 62050ms spawn 4 2 email
++at 62100ms spawn 3 2 email
++at 62150ms spawn 4 2 email
++at 62200ms spawn 3 2 email
++at 62250ms spawn 4 2 email
++at 62300ms spawn 3 2 email
++at 62350ms spawn 4 2 email
++at 62400ms spawn 3 2 email
++at 62450ms spawn 4 2 email
++at 62500ms spawn 3 2 email
++at 62550ms spawn 4 2 email
++at 62600ms spawn 3 2 email
++at 62650ms spawn 4 2 email
++at 62700ms spawn 3 2 email
++at 62750ms spawn 4 2 email
++at 62800ms spawn 3 2 email
++at 62850ms spawn 4 2 email
++at 62900ms spawn 3 2 email
++at 62950ms spawn 4 2 email
++at 63000ms spawn 3 2 email
++at 63050ms spawn 4 2 email
++at 63100ms spawn 3 2 email
++at 63150ms spawn 4 2 email
++at 63200ms spawn 3 2 email
++at 63250ms spawn 4 2 email
++at 63300ms spawn 3 2 email
++at 63350ms spawn 4 2 email
++at 63400ms spawn 3 2 email
++at 63450ms spawn 4 2 email
++at 63500ms spawn 3 2 email
++at 63550ms spawn 4 2 email
++at 63600ms spawn 3 2 email
++at 63650ms spawn 4 2 email
++at 63700ms spawn 3 2 email
++at 63750ms spawn 4 2 email
++at 63800ms spawn 3 2 email
++at 63850ms spawn 4 2 email
++at 63900ms spawn 3 2 email
++at 63950ms spawn 4 2 email
++at 64000ms spawn 3 2 email
++capture at 15000ms
++capture at 60000ms
+diff --git a/demos/advance_fire.dem b/demos/advance_fire.dem
+new file mode 100644
+index 0000000..fe83551
+--- /dev/null
++++ b/demos/advance_fire.dem
+@@ -0,0 +1,32 @@
++# advance_fire.dem — Story 6.2's named golden: the era-advance gate FIRES
++# (conditions met -> the era advances). The run starts in era 2 (email-only —
++# streaming is LOCKED by the era roster). `advance gate on` enables the 6.2
++# modernization gate (run setup — re-created identically on replay; the gate
++# is a pure function of serialized state, so the fire tick is replay-
++# determinate WITHOUT a logged command).
++#
++# The three conditions hold across the milestone window (600 ticks = 30s):
++#   - SLA: the healthy era-2 email flow (res->router->host over STANDARD
++#     pipes) delivers at ~100% — the windowed ratio stays above the 95% bar;
++#   - legacy: all in-service pipes are STANDARD (era 2's newest unlocked tier
++#     — no pipe is below it, so nothing is legacy);
++#   - crisis: era 2 has no crisis set-piece — no active crisis.
++# At the first tick the window has elapsed (tick 600 = 30000ms) the gate
++# passes and era_step fires era 2->3 on its own (the gate is the trigger —
++# NO scripted advance in the log). The Era_Advanced event emits, the era byte
++# flips, and era 3's unlocks load: streaming becomes available + the demand
++# signature switches (streaming content_host->res joins the plan from the
++# NEXT tick). T1 pins the fired state; the captures show email-only traffic
++# pre-advance and streaming triangles joining post-advance ("meet the gate ->
++# the era advances").
++seed 20261
++run 70000ms
++era 2
++fixture qos
++advance gate on
++at 0ms draw 0 1 standard
++at 0ms draw 1 2 standard
++at 0ms draw 3 1 standard
++at 0ms draw 4 1 standard
++capture at 15000ms
++capture at 60000ms
+diff --git a/harness/demo.odin b/harness/demo.odin
+index 1db7d00..fddf0ee 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -169,6 +169,7 @@ Demo :: struct {
+ 	preview_events:     [dynamic]Preview_Intent,  // Job C / R4: `at <n>ms preview <pipe> <tier>` (render-only)
+ 	advances:           [dynamic]Advance_Intent,  // 6.1: `at <n>ms advance <era>` (a LOGGED command — the era FSM's input)
+ 	growth_on:          bool,    // 5.1: `growth on` — the director's map growth (run setup, like the fixture)
++	advance_gate_on:    bool,    // 6.2: `advance gate on` — the era-advance modernization gate (run setup; disabled = the 6.1 mechanics, byte-identical)
+ 
+ 	captures:           [dynamic]i64, // T2 capture times (ms)
+ 	win_goal:           u32, // 1.4: packets to deliver for a WIN (0 = win/lose disabled)
+@@ -534,6 +535,20 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 				return {}, fmt.tprintf("bad growth (want: growth on): %s", line)
+ 			}
+ 			d.growth_on = true
++		case "advance":
++			// advance gate on — the 6.2 era-advance modernization gate (run
++			// setup, like growth on / health on: re-created identically on
++			// every replay, never a logged command — the gate is a pure
++			// function of serialized state, so the replay re-derives the same
++			// fire/block decisions). Disabled (the default) = the 6.1
++			// mechanics unchanged (a scripted `at <n>ms advance <era>` fires
++			// on the E14 crisis gate alone), so every legacy demo stays
++			// byte-identical. The gate is inert at the last era (no forward
++			// target) and at era 0 (no FSM).
++			if len(fields) < 2 || fields[1] != "gate" || len(fields) < 3 || fields[2] != "on" {
++				return {}, fmt.tprintf("bad advance (want: advance gate on): %s", line)
++			}
++			d.advance_gate_on = true
+ 		case "lose":
+ 			// lose cap <n>ms — the tick-cap lose condition (1.4 run setup)
+ 			if len(fields) < 3 || fields[1] != "cap" {
+diff --git a/harness/drift.odin b/harness/drift.odin
+index af95a9d..2499bfb 100644
+--- a/harness/drift.odin
++++ b/harness/drift.odin
+@@ -101,6 +101,29 @@ drift_check :: proc(cat: ^pp.Catalogs) -> i32 {
+ 				fmt.printf("  drift %-14s %-16s rejected (OK)\n", name, "growth_flip")
+ 			}
+ 		}
++		// 6.2: the advance-gate-flip divergence class — advance_gate_on is run
++		// setup (the .dem file), NOT a log byte, so no byte mutation can
++		// exercise it. For a gate demo, re-simming the blessed log with the
++		// gate toggled OFF must DIVERGE from the manifest (the live run's gate
++		// fired/blocked; the flipped replay does not) — the mirror of the
++		// growth-flip pin: it proves the gate run-setup is replay-determinate,
++		// not silently ignorable. Only gate demos qualify.
++		if demo_cfg.advance_gate_on {
++			flipped := demo_cfg
++			flipped.advance_gate_on = false
++			fails := make([dynamic]string, context.temp_allocator)
++			replayed, accepted := replay_hashes(lpath, cat, ticks, &flipped, &fails)
++			delete(fails)
++			ok := !accepted || !seq_equal(replayed[:], man.hashes[:])
++			delete(replayed)
++			checked += 1
++			if !ok {
++				fmt.eprintfln("drift-check: %s: FAIL — gate ACCEPTED an advance-gate-flipped replay (the gate is not replay-determinate)", name)
++				bad += 1
++			} else {
++				fmt.printf("  drift %-14s %-16s rejected (OK)\n", name, "advance_gate_flip")
++			}
++		}
+ 		free_all(context.temp_allocator)
+ 	}
+ 	if checked == 0 {
+diff --git a/harness/run.odin b/harness/run.odin
+index 663e368..bdbf001 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -606,6 +606,7 @@ Demo_Replay :: struct {
+ 	spawns:      [dynamic]Spawn_Intent,
+ 	pauses:      [dynamic]Pause_Event, // 5.3: the driver pause schedule (run setup)
+ 	growth_on:   bool, // 5.1: the director's map growth (run setup, like the fixture)
++	advance_gate_on: bool, // 6.2: the era-advance gate (run setup, like the fixture)
+ 	session:     Session_Cfg,
+ }
+ 
+@@ -631,6 +632,7 @@ demo_apply_setup :: proc(state: ^pp.Run_State, cfg: ^Demo_Replay, cat: ^pp.Catal
+ 	}
+ 	apply_session(state, cfg.session, cat.balance.logic_hz)
+ 	state.growth_enabled = cfg.growth_on // 5.1: run setup — re-created identically on every replay
++	state.advance_gate_enabled = cfg.advance_gate_on // 6.2: run setup — re-created identically on every replay
+ 	return ""
+ }
+ 
+@@ -683,6 +685,7 @@ load_demo_replay :: proc(demo_name: string) -> Demo_Replay {
+ 	cfg.session.health_on = demo.health_on    // 4.3
+ 	cfg.session.surge_win_pct = demo.surge_win_pct // 4.3
+ 	cfg.growth_on = demo.growth_on // 5.1: run setup — re-created identically on replay
++	cfg.advance_gate_on = demo.advance_gate_on // 6.2: run setup — re-created identically on replay
+ 	delete(demo.demolishes) // r1 note: the sibling loaders leaked this too
+ 	delete(demo.emphasis)   // 3.2
+ 	delete(demo.lanes)      // 3.2

@@ -1,0 +1,72 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "error-handling",
+    "title": "map_board_load error returns leak the partially-built board",
+    "location": "core/map.odin:319",
+    "evidence": "append(&b.districts, Map_District{name = strings_clone(name, allocator), kind = kind, pos = {f32(px), f32(py)}}) ... return {}, \"map_board_load: malformed spawn candidate\" (same pattern at map.odin:296,300,305,327,335,380,388,410,413,416,419,422). Empirically verified: `odin test` on a load failing at 'malformed spawn candidate' reports `+++ leak 256B @ 0xCD4800038 [map.odin:319:map_board_load()]`.",
+    "detail": "`return {}` overwrites the named return `b`, orphaning every allocation made before the error (district name clones, attribution, candidates, render_dots, district_start, partial polys). The app's fallback path keeps running with leaked memory; dev leak-CI would flag it.",
+    "recommended_fix": "On every error return, destroy the partial board first (e.g. set err, defer-run map_board_destroy(&b) when err != \"\") before zeroing the named return."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "test_board_destroy deletes string literals — invalid free that aborts under the default allocator",
+    "location": "core/map_test.odin:64",
+    "evidence": "append(&b.districts, Map_District{name = \"A\", pos = {6, 6}})\nappend(&b.districts, Map_District{name = \"B\", pos = {6, 6}}) ... test_board_destroy: for d in b.districts {\n\t\tdelete(d.name)\n\t}. Suite output: `+++ bad free @ 0x104FEB690 [map_test.odin:64:test_board_destroy()]` (×4). Standalone repro of delete() on a literal: \"Abort trap: 6\", exit 134.",
+    "detail": "delete() on static string data frees read-only memory. Odin's test tracking allocator only warns, but under a plain default allocator the process aborts (verified SIGABRT). Latent crash on every run of the two new growth tests.",
+    "recommended_fix": "In test_board, build names with make/cloned bytes (or a shared heap string) so test_board_destroy's delete is legal — or drop the delete loop for literals."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "coupling",
+    "title": "Slices/strings allocated with the `allocator` param are freed via context.allocator — bad frees",
+    "location": "core/map.odin:398",
+    "evidence": "counts := make([]u32, len(b.districts), allocator)\ndefer delete(counts) ... map_board_destroy: for d in b.districts {\n\t\tdelete(d.name)\n\t} ... strings_clone: out := make([]u8, len(s), allocator). Suite output: `+++ bad free @ 0xBFF001F2C [map.odin:398:map_board_load()]` and `+++ bad free @ 0xBFF001F06 [map.odin:133:map_board_destroy()]`.",
+    "detail": "Plain slices and strings don't carry their allocator; delete() frees via context.allocator. Any caller passing a non-default allocator (both shipped tests pass temp_allocator) gets bad frees; app/harness only survive because their param happens to equal context.allocator.",
+    "recommended_fix": "Free slices/strings explicitly with the `allocator` param (mem.free(raw_data(x), len, allocator)), or store dynamic arrays which carry their allocator."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "error-handling",
+    "title": "dublin-shot exits 0 (success) when PNG export fails",
+    "location": "harness/dublin_shot.odin:48",
+    "evidence": "if !rl.ExportImage(img, cpath) {\n\t\tfmt.eprintfln(\"dublin-shot: failed to write %s\", out)\n\t} ... fmt.printfln(\"dublin-shot: board captures written to %s/baywide.png + %s/templebar.png\", outdir, outdir)\n\treturn 0",
+    "detail": "ExportImage failure is printed but never propagated: run_dublin_shot unconditionally returns 0 and prints success, so a scripted KYLE gate passes with missing captures.",
+    "recommended_fix": "Have dublin_shot_capture return bool, OR the failures in run_dublin_shot, and return non-zero when any capture fails to write."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Docs claim district-scoped ATTACH draws; the implemented ring is global and the invariant is unpinned",
+    "location": "core/map.odin:34",
+    "evidence": "core/map.odin header: \"the ATTACH family draws from the anchor's OWN district's pool (an estate never crosses a district boundary), and the derived cluster view is unchanged (radius adjacency) — the district scoping at the DRAW makes cross-district estates unreachable by construction.\" Against growth.odin:537-546: \"The ring is GLOBAL (not district-scoped)\" with `for k in 0..<len(board.candidates) { ... append(ring, u32(k)) }` (no district filter). demos/dublin_board.dem: \"the ATTACH family draws from the anchor's district pool — a cluster never crosses a district boundary\". map_test.odin:13 claims \"family stays WITHIN the anchor's district\" but no test asserts it.",
+    "detail": "Three shipped documents state an invariant no code enforces: district_start/candidate_district are read by no growth code (grep-verified), and cross-district estates are reachable by construction. Stage-2 work reading map.odin/demos inherits a false contract.",
+    "recommended_fix": "Align the map.odin header, demo header, and test comment with the ruled global-ring interplay — or actually scope the ring via district_start and pin it with a test."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Board and Dublin render cache have no teardown despite comments claiming one exists",
+    "location": "core/map.odin:130",
+    "evidence": "map_board_destroy doc: \"call once when the process is done with it — the app frees at exit, the harness's board cache lives for the process\". dublin.odin:87: \"// dublin_render_destroy — free the cache's buffers (called by view teardown).\" Grep: map_board_destroy is called only from core/map_test.odin; dublin_render_destroy only from dublin_render_ensure (dublin.odin:104). app/main.odin defers catalogs_destroy/audio_destroy (lines 276/329) but never map_board_destroy(&app.board).",
+    "detail": "The app never frees the board (plus its ~811KB terrain_cells cache) at exit; the only callers are the tests. The code's own contract comments assert teardown wiring that does not exist; dev tracking-allocator runs flag it.",
+    "recommended_fix": "Call map_board_destroy(&app.board) and dublin_render_destroy at app exit alongside the existing catalogs/audio teardown defers — or correct the comments."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "coupling",
+    "title": "Growth ring scratch allocates via implicit context.allocator in core; the `alloc` parameter is dead",
+    "location": "core/growth.odin:537",
+    "evidence": "growth_board_ring_scan :: proc(board: ^Map_Board, t: ^Topology, anchor: [2]i32, sep, radius: i32, ring: ^[dynamic]u32, alloc := context.temp_allocator) -> i32 { ... if d2 >= lo2 && d2 <= hi2 {\n\t\t\tappend(ring, u32(k)) — `alloc` is never referenced. Plus: \"// v2-dublin-board: the attach ring scratch (temp-allocated per window —\" above `ring_scratch: [dynamic]u32` (a nil array whose appends fall back to context.allocator), and `ring: [dynamic]u32` in growth_board_cluster_has_room (line 559).",
+    "detail": "The comment claims temp-allocation but no explicit allocator is wired (ODN-18: core never makes without an explicit allocator argument); allocations ride whatever context.allocator the step caller holds, and the declared `alloc` param is unused.",
+    "recommended_fix": "Create the scratch/ring arrays with make(..., context.temp_allocator) so appends use the intended arena, and remove or actually use the dead alloc parameter."
+  }
+]

@@ -1,0 +1,121 @@
+{
+  "job": "righttenantry-refcheck-rc3-6",
+  "round": 1,
+  "reviewed_sha": "6751de1e3bec78bf411a389bc346e0cc0d789962",
+  "pr": 602,
+  "failed_layers": [],
+  "reviewers_completed": ["blind", "edge", "acceptance", "security", "architecture", "codebase", "tests"],
+  "raw_findings_count": 16,
+  "verification": {
+    "confirmed": 15,
+    "rejected": 1,
+    "demoted": 1,
+    "note": "The idempotency-claim finding (4-source agreement: blind+security+edge+architecture) was CONFIRMED as real code but DEMOTED blocker->warning: the claim's case result is discarded, but no double-apply occurs because find_reference_call_by_send_ref + mark_awaiting_correction are both scoped status IN ('queued','contact_initiated'), and resend_redelivery_is_idempotent_test asserts audit/notification counts stay at 1 (passes). Rejected: blind's 'email.complaint vs email.complained' — the code matches Resend's real event type (email.complained); the spec text is the typo."
+  },
+  "counts": { "blockers": 0, "warnings": 1, "notes": 8 },
+  "verdict": "READY TO MERGE",
+  "findings": [
+    {
+      "severity": "warning",
+      "sources": ["blind", "security", "edge", "architecture"],
+      "category": "idempotency / dead-code / misleading-comments",
+      "title": "Idempotency claim result is discarded — the claim gates nothing (dead defense-in-depth layer); misleading 'Stand down' / 'never double-applies' comments",
+      "location": "server/src/reference_checks/webhooks.gleam:237-262 (apply_delivery_failure, step 1)",
+      "evidence": "case sql.claim_webhook_event(db, event_id, source) { Ok(pog.Returned(_, [_, ..])) -> Nil  Ok(_) -> { wisp.log_info(\"...duplicate event ignored...\"); Nil }  Error(err) -> { capture(sentry, ...); Nil } }  // then unconditionally: case sql.find_reference_call_by_send_ref(...)",
+      "detail": "DEMOTEb from blocker. The case is a discarded expression (Gleam has no early return); every branch yields Nil and step 2 (find+mark) runs unconditionally. The 'Stand down' / 'never double-applies' comments overstate it. HOWEVER no double-apply occurs: find_reference_call_by_send_ref + mark_awaiting_correction are both scoped WHERE status IN ('queued','contact_initiated'), so a re-delivered event finds 0 rows (row is now awaiting_correction) and no-ops. resend_redelivery_is_idempotent_test asserts audit_count==1 + notification_count==1 (passes; CI green). The claim is a redundant/dead layer, not a live dedup gate.",
+      "recommended_fix": "Either remove the dead claim + correct the comments to describe the actual idempotency mechanism (find/mark live-status scoping), or keep it as an observability hook but document it does NOT gate. Do NOT make it early-return on 0 rows — that would turn a crash-after-claim-before-mark into a lost transition (at-most-once); the current fall-through gives better completion semantics via find/mark.",
+      "verification": "confirmed-code, demoted-severity"
+    },
+    {
+      "severity": "note",
+      "sources": ["blind", "acceptance"],
+      "category": "ac8 / spec-contradiction",
+      "title": "AC8 says entity_id = vacancy, but the notification is created on the reference_call entity (mirrors the existing reference notifications)",
+      "location": "server/src/notification/notification_dispatch.gleam:531-532 (notify_reference_awaiting_correction)",
+      "evidence": "dispatch(db, landlord_id, sql.ReferenceAwaitingCorrection, title, body, \"reference_call\", reference_call_id,)  // sibling dispatch_reference_notification (notify_reference_unreachable etc.) ALSO uses \"reference_call\"/reference_call_id",
+      "detail": "Spec AC8 + Dev Note 3 say 'entity_id = vacancy (mirror notify_reference_unreachable)' — but notify_reference_unreachable itself uses reference_call (via dispatch_reference_notification). Spec self-contradicts; the minion mirrored the existing consistent pattern (all reference notifications use the reference_call entity). No live breakage; confirm which entity the dashboard/vacancy-panel groups on for RC4.3.",
+      "recommended_fix": "Clarify the spec contradiction. If the vacancy-panel badge needs vacancy scoping, switch to vacancy_id; otherwise update AC8/Dev Note 3 to say reference_call (matching the mirror).",
+      "verification": "confirmed, demoted warning->note"
+    },
+    {
+      "severity": "note",
+      "sources": ["blind"],
+      "category": "ac3 / observability",
+      "title": "Missing-signature (missing-header) rejections log but don't capture to Sentry — AC3 says capture",
+      "location": "server/src/reference_checks/webhooks.gleam:71-75 (svix.extract_headers Error) + :141-145 (missing X-Twilio-Signature)",
+      "evidence": "Error(reason) -> { wisp.log_warning(\"resend-events webhook missing svix headers: \" <> reason); reject_unauthorized() }  // no sentry_client.capture — unlike the bad-signature branch which DOES capture (ResendWebhookSignatureFailed / TwilioWebhookSignatureFailed)",
+      "detail": "AC3 requires 'the verification failure is captured to Sentry' for 'invalid, malformed, or missing signature'. The bad-signature path IS captured; the missing-HEADER path (extract_headers Error / no X-Twilio-Signature) only log_warning. Minor observability gap on a less-suspicious code path.",
+      "recommended_fix": "Add a sentry_client.capture to the missing-header branches (mirror the bad-signature captures) for AC3 completeness, or amend AC3 to scope Sentry to the bad-signature path only.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": ["acceptance"],
+      "category": "ac3 / replay-window",
+      "title": "AC3's Twilio replay-window/timestamp clause is unaddressed (verifier takes no timestamp)",
+      "location": "server/src/notification/twilio_webhook.gleam:12-31 (verify_signature)",
+      "evidence": "pub fn verify_signature(auth_token, url, params, provided_signature) -> Result(Nil, Nil) { ... crypto.secure_compare(...) }  // no timestamp parameter; handler parses none",
+      "detail": "AC3 says reject 'for Twilio, a stale/future-tolerant timestamp outside the replay window'. Twilio's signing model has NO signed timestamp (HMAC over url+sorted params only), so this is not implementable via the signature; replay is functionally mitigated by the idempotency layer (claim_webhook_event) instead. The Resend/svix path DOES have a 5-min replay window (reused from inbound_email/svix.gleam). Literal AC text for Twilio is unmet.",
+      "recommended_fix": "Amend AC3 to reflect that Twilio replay protection is via idempotency (not a signed timestamp), or add an explicit Twilio timestamp-window check if a timestamp param is available in the callback.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": ["acceptance"],
+      "category": "consistency / terminal-reason-slug",
+      "title": "terminal_reason slug 'email_failed' diverges from spec AC1 example and the PR's own SQL docstring 'delivery_failed'",
+      "location": "server/src/reference_checks/webhooks.gleam:393 (resend_terminal_reason) vs server/src/reference_checks/sql/mark_awaiting_correction.sql:11",
+      "evidence": "webhooks.gleam: \"email.failed\" -> \"email_failed\"   // mark_awaiting_correction.sql docstring: '-- ... email_complaint, delivery_failed, sms_failed, sms_undelivered)'   // spec AC1: 'terminal_reason is stamped (e.g. email_bounced/email_complaint/delivery_failed)'",
+      "detail": "Code stamps 'email_failed' for the email.failed event; the spec AC1 example AND the new SQL docstring both say 'delivery_failed'. No live consumer (rc3-7's referee_contact_invalid fraud signal isn't built yet), but the inconsistency could bite rc3-7 if it matches on the docstring/spec slug.",
+      "recommended_fix": "Pick one slug and align code + spec + docstring (either email_failed everywhere, or delivery_failed everywhere) before rc3-7 reads terminal_reason.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": ["edge"],
+      "category": "observability / misleading-comment",
+      "title": "notify_reference_awaiting_correction Result discarded via ignore_result — failure is logged (not Sentry'd); adjacent comment claims 'captured'",
+      "location": "server/src/reference_checks/webhooks.gleam:299-318",
+      "evidence": "notification_dispatch.notify_reference_awaiting_correction(...) |> ignore_result   // comment: 'Both are best-effort (a failure here is captured but does not roll back the transition).'   // dispatch() on Error only does wisp.log_warning, no sentry capture",
+      "detail": "ignore_result returns Nil for Ok and Error, so a notification insert failure is swallowed by the handler. dispatch() does log_warning internally (so it's not fully silent), but it is NOT Sentry-captured, and the 'captured' comment overstates it. Best-effort is intended (AC8), so functionally fine.",
+      "recommended_fix": "Soften the comment to 'logged, not Sentry-captured' for accuracy, or add a capture in the handler's Error branch if notification failures should be observable.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": ["architecture", "codebase"],
+      "category": "dry / duplication",
+      "title": "New query_error_to_string is a byte-identical copy of notification_dispatch.debug_query_error (3rd copy in ai/scoring_gate.gleam)",
+      "location": "server/src/reference_checks/webhooks.gleam:475 (mirrors server/src/notification/notification_dispatch.gleam:704; also server/src/ai/scoring_gate.gleam:95)",
+      "evidence": "fn query_error_to_string(err: pog.QueryError) -> String { case err { pog.PostgresqlError(code, name, message) -> \"PostgreSQL \" <> code ... } }  // comment: 'mirrors notification_dispatch.debug_query_error — local copy because that one is private'",
+      "detail": "The pog.QueryError stringifier now exists in three private copies (RT AGENTS.md: 'DRY: extract helpers when logic repeats 2+ places'). The minion acknowledged it (the existing one is private, can't import). Minor.",
+      "recommended_fix": "Extract a public shared pog.QueryError stringifier (e.g. in a db/helpers or response_helpers module) and replace the three private copies.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": ["tests"],
+      "category": "coverage-gap",
+      "title": "Twilio Disabled-config branch (AC7) has no test",
+      "location": "server/src/reference_checks/webhooks.gleam:141-145 (sms_client.Disabled -> reject_forbidden())",
+      "evidence": "sms_client.Disabled -> { wisp.log_warning(\"twilio-sms webhook received but Twilio is Disabled\"); reject_forbidden() }   // grep across server/test: no test exercises the Disabled config",
+      "detail": "AC7 specifies the Disabled rejection posture; the branch is documented behaviour with no test. Low-risk (the branch is a one-line reject).",
+      "recommended_fix": "Add a unit test that posts to /webhooks/twilio-sms with config.twilio = Disabled and asserts 403 + no state change.",
+      "verification": "confirmed"
+    },
+    {
+      "severity": "note",
+      "sources": ["tests"],
+      "category": "coverage-gap",
+      "title": "Twilio redelivery idempotency untested (only Resend redelivery has a test)",
+      "location": "server/src/reference_checks/webhooks.gleam:204 (process_twilio_event, event_id = message_sid <> \":\" <> status)",
+      "evidence": "resend_redelivery_is_idempotent_test (line 123) covers the Resend path; no equivalent Twilio redelivery test. The Twilio event_id construction (sid:status) is Twilio-specific.",
+      "detail": "The shared idempotency path (apply_delivery_failure) is exercised by the Resend test, but the Twilio-specific event_id (MessageSid:status) construction + redelivery is untested. Minor given the shared path, but the Twilio keying is distinct.",
+      "recommended_fix": "Add a Twilio redelivery test (same MessageSid:status twice -> one transition/audit/notification), mirroring resend_redelivery_is_idempotent_test.",
+      "verification": "confirmed"
+    }
+  ],
+  "advisory_test_gate": "PASS (tests lens): P0 100% (signature rejection both webhooks, bounce->awaiting_correction both channels, idempotency, objection stickiness all covered); P1 >=90%; overall >=80%. Two minor Twilio coverage notes (Disabled branch, Twilio redelivery) do not drop the gate.",
+  "ci_status": "GREEN — Migration safety, Format/Lint/Unit/Build, Integration Tests, Terraform all pass at 6751de1",
+  "em_dash_check": "clean — no em-dashes in changed user-facing files"
+}

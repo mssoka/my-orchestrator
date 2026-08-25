@@ -1,0 +1,22 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "state-machine",
+    "title": "checkout.session.async_payment_failed is unhandled — a failed delayed payment leaves the row pending with no audit, notification, or deterministic transition",
+    "location": "server/src/payment/webhook_handler.gleam:310-330",
+    "evidence": "            \"checkout.session.completed\"\n            | \"checkout.session.async_payment_succeeded\" ->\n              handle_checkout_completed(...)\n            \"checkout.session.expired\" ->\n              handle_checkout_failed(config, event_id, session_id, vacancy_id)\n            // Unknown event type — ack without claiming. We only consume\n            // a row in `processed_stripe_event` for events we actually\n            // handle, so a future arm can be added without retroactively\n            // marking historical events as processed.\n            _ -> wisp.json_response(\"{}\", 200)",
+    "detail": "The new state machine settles PendingPayment via checkout.session.async_payment_succeeded but has no arm for its documented failure twin, checkout.session.async_payment_failed (Stripe: 'You might also want to listen for and handle checkout.session.async_payment_failed'). It hits the silent unknown arm: unclaimed, unlogged, no fail_payment, no PaymentFailed audit, no notification. Reachable for pre-deploy in-flight async sessions the diff itself acknowledges (idempotency-tag rationale). Row stays pending until a later, unconnected session-expiry flips it to failed — silently.",
+    "recommended_fix": "Add an async_payment_failed arm that runs fail_payment by session id + PaymentFailed audit (same machinery as handle_checkout_failed), acking 200; the landlord then sees 'failed' and can retry."
+  },
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "100%-off promo redemption completes with payment_status=\"no_payment_required\" — the gate strands the order permanently: no settle/fail/expired event will ever fire",
+    "location": "server/src/payment/webhook_handler.gleam:412",
+    "evidence": "          // M-1 gate. Anything other than \"paid\" is a payment that hasn't\n          // settled (async method in flight, failed, or a structurally\n          // missing field). Claim the event so a Stripe replay is a\n          // Duplicate, then stop: no complete_payment, no unlock, no\n          // burst scoring, no audit. The row stays `pending` — that IS\n          // the deterministic waiting state — and the vacancy stays\n          // locked. Ack 200 below so Stripe doesn't retry-storm.\n          case payment_status {\n            \"paid\" ->\n              run_completed_side_effects(...)\n            _ -> Ok(PendingPayment)\n          }",
+    "detail": "Sessions set allow_promotion_codes=true (stripe_client.gleam:177), and the code's own contract documents 100% promos: 'ZERO is a valid settled amount: checkout enables allow_promotion_codes, and a 100% promotion code settles the session at amount_total: 0'. Stripe fires completed with payment_status=\"no_payment_required\" and no PaymentIntent for free orders; no async settle/fail or expired event ever follows. Gate claims the event, row stuck pending forever, vacancy locked forever, no audit, no recovery — pre-deploy this order completed at amount_cents=0 and unlocked.",
+    "recommended_fix": "Treat \"no_payment_required\" as a valid completion (amount_total 0): run the completed machinery for it so free promo orders unlock, keeping \"processing\"/\"unpaid\"/missing on the pending path."
+  }
+]

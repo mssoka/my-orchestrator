@@ -1,0 +1,42 @@
+[
+  {
+    "source": "acceptance-a",
+    "severity": "warning",
+    "category": "missing-implementation",
+    "title": "Refresh/deep-link on demo edit route (/vacancies/v-*/edit) boots demo but never loads the edit payload — empty form, save targets id \"\"",
+    "location": "client/src/client.gleam:5738 (demo_entry_effects), client/src/client.gleam:5776 (is_demo_route)",
+    "evidence": "is_demo_route includes the edit route: `routes.VacancyDetail(id)\n    | routes.VacancyEdit(id)\n    | routes.VacancyHandoff(id) -> string.starts_with(id, \"v-\")` — but demo_entry_effects has no VacancyEdit arm (arms are Demo|Dashboard, VacancyDetail|VacancyHandoff, ApplicationDetail, ArchivedVacancies, Comparison, then `_ -> []`), and enter_demo's request_ids case only handles VacancyDetail|VacancyHandoff|ApplicationDetail (`_ -> #(None, None)`). model.gleam defaults: `vacancy_edit_loading: False,` / `vacancy_edit_id: \"\",`. vacancy_edit.gleam renders `case model.vacancy_edit_loading { True -> view_loading_skeleton() False -> html.div(...view_form(model)...) }`.",
+    "detail": "AC1 requires 'create/edit/archive vacancy' clickable in demo and refresh re-entry is deliberately designed (is_demo_route covers VacancyEdit). But a refresh on /vacancies/v-maples/edit re-enters demo with vacancy_edit_loading=False and no fetch, rendering an empty 'Edit vacancy' form; saving calls demo_api.update_vacancy with vacancy_edit_id \"\" and errors. In-SPA navigation works (handle_browser_change has the demo branch) — only the refresh/deep-link path is broken.",
+    "recommended_fix": "Add a routes.VacancyEdit(id) arm to demo_entry_effects dispatching demo_api.get_for_edit, and set vacancy_edit_loading: True + vacancy_edit_id: Some id in enter_demo for that route (mirroring the handle_browser_change demo branch)."
+  },
+  {
+    "source": "acceptance-a",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Unguarded real-endpoint effects in handle_browser_change fire while demo_mode=True; the no-network lint only covers client/src/demo/",
+    "location": "client/src/client.gleam:5449-5524 (payment/extended query arms), client/src/client.gleam:5656-5666 (Billing arm); .github/workflows/test.yml:130-143",
+    "evidence": "Unlike the neighboring fetch arms, these carry no `case model.demo_mode` guard: `let poll_eff = schedule_payment_poll(vid)` + `payment_api.fire_pixel_purchase_for_session(session_id, msg.AppNoOp)` (?payment=success), `let refetch_eff = vacancy_api.get_detail(vid, msg.ApiReturnedVacancyDetail)` + a second `payment_api.fire_pixel_purchase_for_session(ext_session_id, msg.AppNoOp)` (?extended=success), and `settings_api.fetch_billing_history(on_response: ApiReturnedBillingHistory)` (routes.Billing). The lint's scope: `VIOLATIONS=$(grep -rn \"rsvp\\|api_helpers\" client/src/demo/ --include=\"*.gleam\" || true)` — client.gleam is not scanned, so a missing demo guard there compiles and passes the lint.",
+    "detail": "Guard 6 / scope guard: 'no Stripe/email/AI endpoint invocation from demo mode'. These paths are reachable only via crafted history/back-button navigation (typed URLs full-reload and exit demo; the shell hides settings/billing links), so practical impact is low — but the claimed proof ('demo mode issues NO writes to real endpoints', CI grep lint) structurally cannot catch a missing demo_mode branch in client.gleam, and three such branches exist.",
+    "recommended_fix": "Add `case updated_model.demo_mode { True -> effect.none(), False -> ... }` guards to the payment=success, extended=success, and Billing arms in handle_browser_change; optionally extend the lint or demo_flow_test to cover BrowserChangedUrl-driven fetches in demo mode."
+  },
+  {
+    "source": "acceptance-a",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Demo mode writes demo fixture ids to shared web storage (rt_comparison_ids sessionStorage, rt_dismissed_sweep_nudges localStorage) — small exceptions to 'refresh = reset'",
+    "location": "client/src/client.gleam:3480/3494/3501/3531 (save_comparison_ids), client/src/client.gleam:4881 (save_dismissed_sweep_nudges), client/src/client.gleam:6511-6540",
+    "evidence": "UserToggledComparison in update_inner calls `save_comparison_ids(new_ids)` and is not intercepted by demo_update (absent from its import/intercept list); storage is shared with the live app: `storage.set_item(ss, \"rt_comparison_ids\", value)` via storage.session(). init reads it back: `let initial_comparison_ids = load_comparison_ids()`, and demo_entry_effects' Comparison arm uses `load_comparison_ids()`. UserDismissedSweepNudge likewise calls `save_dismissed_sweep_nudges(set.to_list(updated_dismissed))` (localStorage) with no demo_update interception.",
+    "detail": "Briefing AC2: 'refresh and reset both wipe demo state' / 'no persistence of any kind'. Core store state does wipe, but a demo comparison selection survives refresh via sessionStorage and can overwrite a real landlord's same-tab selection with fixture ids (self-heals on vacancy change). reset_demo also leaves comparison_ids untouched. Benign, but undocumented exceptions to the stated non-persistence contract.",
+    "recommended_fix": "Either intercept UserToggledComparison/UserClearedComparison/UserDismissedSweepNudge in demo_update to skip the storage writes, or document the exception in the PR body's non-persistence claim."
+  },
+  {
+    "source": "acceptance-a",
+    "severity": "note",
+    "category": "analytics",
+    "title": "Exiting the demo via 'Exit demo' (UserClickedLogout) is recorded as a demo_reset event",
+    "location": "client/src/demo/demo_update.gleam (UserClickedLogout arm)",
+    "evidence": "    UserClickedLogout -> {\n      demo_analytics.capture_event(demo_analytics.demo_reset)\n      #(\n        Model(\n          ..model,\n          demo_mode: False,\n          demo_store: None,\n          auth: NotAsked,\n          route: routes.Landing,",
+    "detail": "Analytics deliverable: 'capturing entry, key surfaces, downloads, CTA clicks'. Demo exit fires demo_reset (no exit event exists in demo_analytics.gleam), conflating two distinct funnel actions and inflating the reset count used to judge demo engagement.",
+    "recommended_fix": "Add a demo_exit event constant and fire it from the UserClickedLogout arm instead of demo_reset (or drop the event there entirely)."
+  }
+]

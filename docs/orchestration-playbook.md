@@ -395,6 +395,13 @@ busy_timeout=5000`). (4) **atomic-append fallback** — single lines, one
    gameplay/canon-surface code (new command kinds, serialization,
    LOG_VERSION, payload contracts, routing/packet semantics) keeps
    `pr_review=1`. See 'Perkins (automated PR review)'.
+   **Enforced from 2026-08-23 (never merge unreviewed):** the job MUST be
+   registered at dispatch; the minion MUST run bmad-build **step 04** (spawn
+   the review-layer subagents) before reporting `done`; and the Orchestrator
+   MUST run `bin/check-pr-ready <job-id>` (job in-review + PR open/mergeable +
+   CI green + an APPROVED verdict with no open CHANGES_REQUESTED) before
+   close-out/merge. `pr_review=1` jobs post the verdict as the `perkins-review`
+   bot, not your own account.
 8. **Handoff (Silas).** End the briefing with a **Dispatch parameters**
    block (repo, repo_root, slug, base, model?, github_issue?). Gru hands
    the path to Silas (`herdr pane run <silas-pane> "dispatch: <path>"`);

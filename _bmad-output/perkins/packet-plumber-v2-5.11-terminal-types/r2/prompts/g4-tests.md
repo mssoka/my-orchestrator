@@ -1,0 +1,3140 @@
+You are reviewing a code diff. You have read-only access to the repository and may verify the diff's claims against the actual codebase using your available tools. The repository checkout at the reviewed state is at:
+/Users/moses/.herdr/worktrees/packet-plumber/perkins-v2-5.11-terminal-types-r2
+(all verification reads happen there; treat it as the source of truth).
+
+Chunk orientation: This chunk contains the re-blessed golden .t1 tick-hash dump: juice (whole file). Part of the canonical PR diff (big-diff chunking).
+
+NOTE — round context: this is round 2 of review on the SAME PR after it was rebased onto the post-#67 base (procedural land/ocean/park background maps merged into the base). Consequences you should treat as EXPECTED, not findings: every re-blessed golden .png now renders the #67 background tiles; the .t1/.log.bin re-bless is the documented deliberate catalog-fold re-bless (the 5.11 catalog change alters the catalog_hash field at fixed offsets in otherwise-identical dumps — cause-documented in the PR body); node_health goldens changed because the demo spawns the new terminal types. Audit the re-bless CAUSE documentation and consistency, not its existence.
+
+--- PROJECT CONVENTIONS ---
+---
+project_name: 'Packet Plumber'
+user_name: 'Moses'
+date: '2026-08-08'
+sections_completed: ['technology_stack', 'engine_rules', 'design_locks', 'performance_rules', 'organization_rules', 'testing_rules', 'platform_rules', 'anti_patterns']
+status: 'complete'
+optimized_for_llm: true
+forge: '_bmad-output/planning-artifacts/forge-packet-plumber-2026-08-05/forged-idea.md'
+brief: '_bmad-output/planning-artifacts/briefs/brief-Packet-Plumber-2026-08-05/brief.md'
+architecture: '_bmad-output/planning-artifacts/architecture/odin-architecture-v1.md'
+supersedes: 'the Godot 4.7.1 pin (pre-pivot revision of this file); the engine pivot to Odin + Raylib was decided by the user on 2026-08-08'
+---
+
+# Project Context for AI Agents
+
+_This file contains critical rules and patterns that AI agents must follow when implementing game code in this project. Focus on unobvious details that agents might otherwise miss. The forge governs locked design decisions; the game brief is the design source of truth; the Odin architecture governs technical structure; this file governs how code gets written._
+
+**Project:** Packet Plumber — a top-down routing puzzle where you are a network engineer keeping the internet alive: draw pipes between nodes, route colored packets by type, predict and survive fair crises, and upgrade infrastructure as the internet evolves through eras. Mini Motorways **light-daytime** visual style (art-direction amendment A1); **desktop-first launch** (Steam PC/Mac; mobile follows when the Odin+raylib toolchain matures — FORGE #6 amended by user ruling, lavish 2026-08-08). At this stage the project is in the **Odin pivot**: the Godot prototype (PR #11/#12) proved the fun and is preserved as the `prototype-fun-gate` tag (removed from main on the first Odin code PR — ruled 2026-08-08); the Odin build (packages at the repo root: `core/`, `app/`, `harness/`) is the real codebase, per `_bmad-output/planning-artifacts/architecture/odin-architecture-v1.md`.
+
+**Citation tags:** `[FORGE #n]` = a sealed decision from the forge (`_bmad-output/planning-artifacts/forge-packet-plumber-2026-08-05/forged-idea.md`); `[BRIEF]` = sealed at the game-brief level; `[ODN-n]` = an architectural decision in the Odin architecture; `[LOOK]` = look-book v1 visual canon.
+
+## Technology Stack & Versions
+
+- **Language:** Odin **`dev-2026-08`** (pin exact; `.odin-version` + CI enforce; recheck at phase boundaries). Verified against upstream releases 2026-08-08.
+- **Renderer/platform lib:** **raylib 6.0** via Odin's shipped `vendor:raylib` bindings (6.0-binding fixes landed in Odin dev-2026-07a). No third-party package manager.
+- **Harness raylib build:** the golden-image harness builds raylib from source with the **software renderer (`rlsw`) + memory platform** (`tools/build_raylib_sw.sh`) so pixel goldens are bit-identical on every machine with no GPU/display. The game binary uses the stock `vendor:raylib` GPU build.
+- **Viewport & framing:** 1280×720 landscape **design grid**; resizable window reveals more map (camera-fit calculation in the render layer — the GL5.2 `aspect=expand` doctrine re-implemented). Landscape-only doctrine unchanged [RULING — user, 2026-08-05].
+- **Typing:** Odin is statically typed by construction; use explicit integer widths (`i32/u32/u64`) on all sim state.
+- **Tests:** `odin test` (`core:testing`, `@(test)`) for the pure core; the golden-image harness (`harness/`, ODN-17) for scripted scenarios + visual regression. Everything testable headless, is.
+- **Reference build:** `game/` is the frozen Godot prototype — behavioral reference only; never ported line-by-line, never extended.
+
+## Critical Implementation Rules
+
+### Stack-Specific Rules (Odin + raylib — the pivot trap set)
+
+- **The core is pure.** `core/` imports only whitelisted `core:*` packages — never `vendor:*`, never `core:os`, never `core:time` (ODN-1). The sim steps only via `core.step(state, tick, commands)`; nothing in core reads a clock, a file, or a device. CI compile-checks this.
+- **Integer-only sim paths.** All state-affecting math is integer or explicit fixed-point (ODN-10). Floats exist only in the view (interpolation, pulses) and never flow back into state. Catalog sim values are integers; cosmetic floats are labeled.
+- **Never iterate a `map` in core.** Odin map order is unspecified — core iterates arrays/slices/`#soa` only (insertion-ordered, stable). Maps are lookup-only. Equal-candidate tie-breaks draw from `state.rng` (ODN-9/10).
+- **RNG is owned, never global.** Sim randomness comes only from the `Rng` held in `Run_State` (owned splitmix64→PCG32 XSH-RR, test vectors pinned — ODN-9). Cosmetic randomness (SFX variants, jitter) comes only from the app-owned second stream (ODN-15). `core:math/rand` is not used for sim — its internals may drift between Odin releases.
+- **Arena discipline (ODN-18).** Three arenas: run (per-run state), snapshot (ping-pong per tick), frame (reset per frame). Core code never calls `new`/`make` without an explicit allocator argument. Dev builds run the tracking allocator; leaks are CI failures.
+- **No globals / singletons.** Everything hangs off `App` → `Run_State`, passed by pointer (ODN-13). Per-run reset = create a fresh run context in a fresh arena; never "clean up and reuse."
+- **Events, not callbacks.** Cross-layer communication is the per-tick `Event` tagged-union buffer on `Run_State`, drained by the app after each step (ODN-14). No function-pointer webs, no global bus.
+- **Errors are values.** Fallible procs return `(T, Error)` with typed error enums; a dropped error return is a CI lint failure (§7.1 of the architecture). Never catch-and-ignore.
+- **Save/log is binary, little-endian, versioned** (ODN-11) — no JSON for state (the JSON-int-to-float trap class is deleted at the root). JSON is for catalogs only, loaded once, fail-fast validated, embedded via `#load()` in release.
+- **Compile-time debug gates.** Debug tools behind `-define:PP_DEBUG=true` (real conditional compilation); release builds contain no cheat/debug code.
+- **Raylib idioms:** immediate-mode drawing only inside `BeginDrawing/EndDrawing`; the static map caches into a `RenderTexture` (redraw on pan/zoom); packets are per-frame draw calls from snapshot arrays — there are no per-entity view objects to pool or free. The harness renders to texture / memory framebuffer, never to screen.
+
+### Game-Rules-as-Code (locked design — enforce in every implementation)
+
+- **Core mechanic is Draw + React, not construct.** PRIMARY: draw pipes between nodes, snapping to nodes (no pixel precision — Mini Metro / Mini Motorways model). SECONDARY: react to PREDICTABLE crises the player saw coming. NOT a Factorio-style construction sim (no material selection, production chains, zoning) `[FORGE #2]`.
+- **Terminals connect via routers only — never terminal-to-terminal** (art-direction amendment A6 / look-book D11). Houses are leaves; routers are the interconnect. The Command_Bus rejects terminal↔terminal draws.
+- **Crises are FAIR and PREDICTABLE, never random.** A crisis is the consequence of a topology flaw the player should have designed around — warning signs first (🟡 congested → 🔴 critical). Random/unfair chaos was explicitly rejected `[FORGE #3]`. The V2 AI disaster system (out of prototype scope) is a stress-test auditor, not a random bully.
+- **Differentiator 1 — packet types + QoS class queues.** Not all packets are equal: gaming wants low latency and can't drop, banking must never drop, streaming wants volume and can buffer, email is low priority. The player allocates each pipe's bandwidth across 3 class queues (Express/Standard/Best-effort); every route is a TRADE-OFF `[FORGE #4]`. All traffic starts on Standard; QoS is player-engineered, never auto.
+- **Differentiator 2 — era progression + infrastructure lifecycle.** The internet evolves (ARPANET → email → web → streaming → …); old infrastructure obsoletes and must be upgraded or it suffocates `[FORGE #4]`.
+- **Visual style is the look-book light canvas:** warm-cream map, literal buildings (6 terminal types), round capacity-scaled router pucks, smooth bezier pipes (glowing cores on fiber/backbone), blue/grey packets with distinct shapes, procedural land/ocean/parks map, warm colors reserved for danger `[LOOK]`. Color is never the sole encoder (shape + icon + pulse).
+- **Cross-platform same-game doctrine:** one game, input-agnostic `[FORGE #6]` — amended 2026-08-08 to desktop-first sequencing: ship Steam PC/Mac first, mobile follows at toolchain maturity; the intent-layer input model keeps all inputs additive.
+- **Brand satire, never real brand names.** YouTune / Amazoom / Goggle / Glitch (Netflix and Discord are kept) `[FORGE rejections]`.
+- **Name is Packet Plumber** `[FORGE #8]`.
+
+### Performance Rules
+
+- **Target: 60 fps sustained** on desktop; optional unlocked-framerate toggle (off by default on battery devices) `[GDD § Performance]`.
+- Fixed 20 Hz logic tick + render interpolation (ODN-2); no per-frame work that the tick model can own. SOA hot loops; zero per-frame heap churn (frame arena).
+
+### Code Organization Rules
+
+- Odin packages live at the repo root (the Odin-native convention, ruled 2026-08-08). **Layout:** `core/` (pure sim), `app/` (game executable: `render/`, `ui/`), `harness/` (golden runner), `demos/`, `data/` (JSON catalogs), `goldens/`, `tools/` (see the architecture §16.2). One directory = one Odin package.
+- Naming (Odin stdlib style): types/constants `Ada_Case` · procs/vars `snake_case` · files `snake_case.odin` · privates `_prefixed` where needed.
+- **Numbers single-source:** balance numbers live in `data/*.json`, never restated in code (ODN-5).
+- Keep all catalog data integer-only for sim values; absent fields use explicit load-time defaults (no sentinel values).
+
+### Testing Rules
+
+- **The golden harness is the verification foundation** (ODN-17): built before feature stories; `harness run` must be green before any PR; `harness save` re-blesses goldens only deliberately and is reviewed like code.
+- **Pin every design invariant as a regression test at the lowest layer** (`@(test)` in `core/`): determinism/replay equality, fair-crisis contracts, QoS drop precedence + no-starvation, snap precision, no-soft-lock. Acceptance criteria become durable tests, not PR prose.
+- Two golden tiers (architecture §10.2): T1 state-hash goldens (every platform, no GPU) + T2 pixel goldens (software renderer, zero-tolerance). On mismatch the harness emits an agent-readable diff bundle (diff PNG + `diff.json` + replay demo) — read it before theorizing.
+
+### Platform & Build Rules
+
+- **Targets:** Steam PC/Mac first (Windows, macOS builds via `odin build -target:...`; native CI runners per OS × amd64/arm64). **Desktop-first launch (ruled 2026-08-08)** — mobile (Android/iOS) is deferred until the Odin+raylib toolchain matures; do not claim mobile support until a maturity spike lands it. Web/wasm is a possible stopgap, not a launch platform. No console `[BRIEF]`.
+- Keep `.odin-version`, the CI matrix, and this file's Technology Stack in sync. Version bumps are deliberate, reviewed events (the PRNG/replay contracts depend on toolchain stability).
+- No purchased assets before the playtest gate; placeholder art = colored rects + emoji + system shapes drawn with raylib primitives (the prototype is reference, not shippable).
+- **Audio/music:** Suno-generated, owned outright by Moses — paid-tier generations only (commercial rights; Content-ID-free for streamer monetization). Soundtrack is a candidate parallel DistroKid release (owned IP).
+- Env files are read-only in worktrees and NEVER committed; any API key (future server features) comes from env only.
+
+### Critical Don't-Miss Rules (anti-patterns)
+
+- **Never use real brand names** — trademark risk; use the satire set `[FORGE rejections]`.
+- **Never make a crisis random or unfair** — the player must always be able to say "I should have seen this coming" `[FORGE #3]`.
+- **Never build a Factorio-style construction layer** — draw + react is the mechanic `[FORGE #2]`.
+- **Never soft-lock the player** — there is always a way to reroute or upgrade out of a crisis.
+- **Never let the view touch the sim** — presentation reads immutable snapshots only; input reaches the core only as validated Commands (ODN-1/12).
+- **Never sample real time in a test** — the harness drives a virtual clock; demos are deterministic by construction.
+- **Never catch-and-ignore** — every error path either recovers (logged) or surfaces.
+- **Never re-litigate a locked forge decision.** If a task conflicts with a `[FORGE #n]` lock, STOP and surface it. For everything else, when in doubt, prefer the more restrictive reading.
+
+---
+
+## Usage Guidelines
+
+**For AI Agents:** Read this file before implementing any game code; read the forge and brief for design intent, and the Odin architecture for structure. Follow ALL rules exactly. This is a living document — when the prototype reveals new traps or the architecture pins new structure, update it.
+
+**For Humans:** Source of truth for locked design = the forge; for the design narrative = the game brief; for technical structure = the Odin architecture; for code conduct = this file. Keep this lean and focused on agent needs.
+
+Last Updated: 2026-08-08 (Odin pivot — engine pin redone from Godot 4.7.1 to Odin dev-2026-08 + raylib 6.0)
+
+--- DIFF ---
+diff --git a/goldens/juice.t1 b/goldens/juice.t1
+index b886067..2b628a2 100644
+--- a/goldens/juice.t1
++++ b/goldens/juice.t1
+@@ -3,1405 +3,1405 @@ t1 1
+ demo juice
+ seed 7
+ logic_hz 20
+-catalog_hash 66c4324a06058860
++catalog_hash 250679b1940fb87b
+ ticks 1400
+-1 41b50ae1d09a7229
+-2 3e435902bc369763
+-3 6b1d57b4462b3e33
+-4 a10eec92d94556ba
+-5 accbe82da2b5277d
+-6 aee90d4739d79822
+-7 0dbe3367e4315982
+-8 2200bf631503f377
+-9 e5003544a0dba114
+-10 dc4d381d255abc82
+-11 a3afcbea29c07d66
+-12 9ef10863043bd196
+-13 6b3365bab4496d5c
+-14 5d0d643a59fa7fa7
+-15 45ea3a5a74086e84
+-16 0ab36a27ad66f7e5
+-17 9461753c96149909
+-18 3f7dc0bed597e055
+-19 267d5b116f97b4a5
+-20 56c1faa613af6dcd
+-21 0089d1f2564bcccc
+-22 5bc24da3d3e0d510
+-23 a2bfd7328c27cdca
+-24 52ef43d0a444459d
+-25 05fa0eb3f0d5593b
+-26 10c9ca339285e241
+-27 56235be0d0f79e30
+-28 67dcef0d401622c8
+-29 677b6968994e831e
+-30 b03f34a4521d1ed0
+-31 0aa0025e39f39275
+-32 7c412755778357a4
+-33 11968662b8ad9cc3
+-34 8d51ed284455b75f
+-35 6fa160eda207f93a
+-36 7f29f88ad29430d8
+-37 601a0d08d555a40e
+-38 5891f7749665035a
+-39 51fae35c31c0a59e
+-40 ee3b512f892eb0d3
+-41 70890be732299dd2
+-42 54e3832de79722f1
+-43 431b75ea025ab39a
+-44 9992347fc01f29f0
+-45 7930aa43fe0c30a5
+-46 48896cdbad5520be
+-47 310573312904b399
+-48 3affb62c79e476d0
+-49 f16e108eafd4d8da
+-50 261cedc6c5dfed5b
+-51 ec17f43bbeea4030
+-52 3941d09f4dcb00aa
+-53 f3728bbbe201e0d5
+-54 d6175ad1f0671cd7
+-55 f7721ef31bf134b8
+-56 a75de0dc123c68c5
+-57 3637ec2d0eecce12
+-58 1785981d0098ebad
+-59 ca1666dbe52fc526
+-60 a490825844dc3f16
+-61 91113ff0c026d2c1
+-62 fe3733adc514cb56
+-63 40fa6cca5d468654
+-64 5d107e1a0cd62aaf
+-65 ba6a462a7cd2f7d8
+-66 3c44fc606d285aab
+-67 a3844447242b25d7
+-68 1a5004efe2737c0e
+-69 ab595ab120032608
+-70 207aede10f35e4fe
+-71 ce0f465cdb58219e
+-72 9e2e61e09ddef02c
+-73 4ce247102bac6258
+-74 10f2181d36502292
+-75 3c49797887a4ec8a
+-76 75ce789923e11637
+-77 fb7fb430d2d32e5b
+-78 49db0df34ec519e9
+-79 1911e86948d3967b
+-80 83ff9b616c2ab6a0
+-81 9b3a1021264659cd
+-82 241e28d43fcd9049
+-83 28b7023883433ce1
+-84 e40e1aaccc4cf8ac
+-85 96ea45a99e98715e
+-86 2fe9eefb2a9b9963
+-87 9cb17ad25b64b947
+-88 2ef157785d745d1e
+-89 17534e31e78c865c
+-90 f09390aa459e9635
+-91 7f5bf9167d167219
+-92 aaf8a67aafeb0e2c
+-93 a3c51c1478edf491
+-94 765ba78eb7b786e4
+-95 3d9e4256f3470014
+-96 79962d259c996ec6
+-97 36e2a2a4e49e0e2a
+-98 80dcb9881a08c584
+-99 e38684dfe62f3786
+-100 43a8e4b088e5e384
+-101 f47205de94407639
+-102 7c0c0473ce8d176c
+-103 e89619a8499c2946
+-104 149c10be974e1046
+-105 534ef4e285910218
+-106 91013013f7cdbbf5
+-107 eb319a251660c4b6
+-108 3895d6d50db0dc02
+-109 9faeed87785cc1dd
+-110 67483ecb20653f25
+-111 20fe418fa2f99fa0
+-112 57c8f7c45c5a8645
+-113 2a1d6a2d7f89ab79
+-114 0b92a2ac3094cbb2
+-115 acf2007cbf571ac7
+-116 b238eddecef1faac
+-117 e37d805380bd19b6
+-118 a12050969bd0fe95
+-119 25401beb169f45b0
+-120 b23c12db61f0795a
+-121 36659edfb8de69da
+-122 bdf8e0ad7d59c217
+-123 5fc925a3e1ee8273
+-124 b1588b628ec17fe5
+-125 ee5949ba5d4c9372
+-126 a1ced89dd6708b32
+-127 111950432b77048b
+-128 956bb70ab14f16d8
+-129 8eae7e9987a5e35e
+-130 0ed671d2214548d1
+-131 ca01c64da5233c90
+-132 b9aa4b96a8add6bc
+-133 b9be987d41c913ff
+-134 0061b736c5346446
+-135 4aa308f33e3e6320
+-136 8b2bbbafc94750a3
+-137 6899fbf25402212d
+-138 bf42be50f8e6c5b3
+-139 2321f7d17fdd4b50
+-140 c7fe792caba7e4ef
+-141 4b4e1681b35a982b
+-142 e14c1de4c97096cd
+-143 4ac47b82fc3a04d3
+-144 ed096203b0b136a9
+-145 5e62398dd70741aa
+-146 2e94ea6155f0754d
+-147 0231830b061f7772
+-148 fb2f2eddcb439297
+-149 d4a35683526cd595
+-150 b5ccbceed241a140
+-151 ea7945cde3e28656
+-152 8ada060e80647e6b
+-153 1e8fa5f921cdc882
+-154 6a994c72226a9510
+-155 dd3253ba8aa12b27
+-156 196a78c33674d6b0
+-157 ebc753108f03d5fd
+-158 9046086935399cec
+-159 cf3f2722c7aaca28
+-160 b5d4c2a2e513ed43
+-161 4cbebfa0e348abf7
+-162 47519717580310a1
+-163 73b70f3269eadcb5
+-164 10497fcc6d959fc1
+-165 10e03dcf2ef71d80
+-166 8fb79de65fde019d
+-167 d6cd7ab742b25510
+-168 1509e9187b7eeb8f
+-169 9c2663bccadbe828
+-170 ad21dbb9949eb727
+-171 bad7d17d7f92beac
+-172 2a77231e014a3328
+-173 0a8f44a3132fc5d0
+-174 3a2c1883d4475dd7
+-175 fbc9e01e35f5aa7b
+-176 c566441c7713d555
+-177 9a6100d212330348
+-178 3bb9482d9347eff1
+-179 c17adedc2705a3ee
+-180 a2733ab905422c41
+-181 12d3f19a5ff70332
+-182 9aed94bd80f3b474
+-183 4076e520db0d95c7
+-184 150a1e5da33dcd08
+-185 c1238162fa124220
+-186 63ba4b6d307d82e7
+-187 c8353e13b63bf802
+-188 a3172ec74f070562
+-189 040dc478ef90b2c3
+-190 d3d77eab24cac040
+-191 090443a383db6847
+-192 940c27dd31515289
+-193 2cb84b9b210b8f8a
+-194 fca776764651392f
+-195 acab646db82b7355
+-196 e8faf0de43b975c3
+-197 31ff6c93425a8d5e
+-198 2f39e7a39c0914cb
+-199 568dd2b4ef166f54
+-200 a868af64ea117a9a
+-201 e09918a7bdbebcd6
+-202 370f31ec23687068
+-203 0b67d060914bbcb8
+-204 04f1ee1205ea31b7
+-205 3331e4f8bcdfd78a
+-206 f3ad0b53b9242cbc
+-207 c18d10d5d89feef0
+-208 5218bffb0b44bd61
+-209 adbf721ee1decb6c
+-210 0d01c142c718c0a0
+-211 9b086ff2bf356e4f
+-212 2f5bfb3cbb68cd8f
+-213 4a1e8c845664855d
+-214 7cbaea5fd92f4029
+-215 139519ac78203bed
+-216 30e518594210a484
+-217 d0158e0635d52595
+-218 f0422f0b80222ae4
+-219 4a1f880f19bb3076
+-220 a6d9719ee18bdce0
+-221 1c454290ac869f2a
+-222 cbd299133fe53448
+-223 17d190efe6a28eaa
+-224 886491381db53e81
+-225 a6d8c0fa46948ec2
+-226 2562cb8f05727323
+-227 22999bda6557e2d5
+-228 769dc7de2d9d0f60
+-229 50172eeda9fdf77c
+-230 c0abe4dc5ce5d6e8
+-231 bccb87c174ff3449
+-232 5ec7938ca52eb27c
+-233 89870aa04ad595ab
+-234 f052b8dcef8756d3
+-235 d5200d98fb2414a2
+-236 5d78d66322939ade
+-237 e491dec90d1d0104
+-238 a701d73ea143da96
+-239 c8006c1cdb680077
+-240 dc6c0eeb28f49b54
+-241 04a1939a5e852ba8
+-242 6f5e14fe46c4e3f5
+-243 10ae9662bcd1e823
+-244 88550c6441ecc26b
+-245 d4f4e70922649365
+-246 bed5084729057fbd
+-247 1a59e612bfa80d61
+-248 e1ffc422d2f5a6e3
+-249 4fd97ad648820f1d
+-250 c7fd6a279c23743e
+-251 ff88b25412f079fe
+-252 55bcc60d30a8233b
+-253 148522cb1c78394b
+-254 e211a53df3605e3e
+-255 6f12e40674164c8d
+-256 a5f3d88925ce1b8a
+-257 211ffc8e77f3d14c
+-258 c5a3cd4751e88334
+-259 d6bc6e90fb86f4a9
+-260 11ad38fae48a984e
+-261 6f0a7316ecc88081
+-262 b94856963973a8d2
+-263 5d1bf21128313c27
+-264 a40519fca26cfacb
+-265 df90f22feff44f4a
+-266 edd0af4f0eb97018
+-267 f4455a734ae82a09
+-268 8d82aeb95dcfc1c6
+-269 8989a9343e943ec4
+-270 02261adcfe11d497
+-271 03532729e04fe8dc
+-272 cb57d8b001f7b2af
+-273 ba44de08b3cec0a0
+-274 7848fd9341948398
+-275 aae4e01fe23f2482
+-276 f32ce746e7f887a5
+-277 8326035647f32d52
+-278 f02745cda3346f49
+-279 17da5ba1bd1e92cb
+-280 c92d48595e0234b8
+-281 4f94f8b8a2f4d1f3
+-282 4d939e1d41718046
+-283 b7c203cfc84bba0a
+-284 4b62dbb036795e4a
+-285 2b57c1110ab26974
+-286 b11242b026d228e1
+-287 e2fd9de39887c142
+-288 379c96e76eadddfa
+-289 addc10aa66e84c21
+-290 595d3705285c09da
+-291 b5a22e592b4884b4
+-292 5b3daa74098b40fc
+-293 6654cba0ab9c61ac
+-294 04e89b99d749e16d
+-295 7cf7ef9aa9e1fae3
+-296 4a0f0358503896f9
+-297 e4b071cf7073fa7e
+-298 47ce81667fcdada0
+-299 8fec3d83fa6ed0ad
+-300 cfc7bcc1092644b4
+-301 032457ae3d3ea745
+-302 7509be2903fe33c8
+-303 6d9e70ed6adbdb06
+-304 96eee414f57fb103
+-305 f7f45ad56bff504c
+-306 05ce5d6cfefe59d9
+-307 856fe72463cb1caa
+-308 9d2d161946b1c952
+-309 5ef4231293023761
+-310 060b8ed3e8097ea4
+-311 eb9e94409d78d8a9
+-312 60008dabe5241836
+-313 3b0f421ce449b694
+-314 31fef5170a8f25e6
+-315 7775d2ba53736904
+-316 a3809340c8a56326
+-317 db24c25caeb5f193
+-318 76cfc391fb69348a
+-319 62a80715319667ad
+-320 3e468cd8450173bc
+-321 20ee99dcfc16f4ab
+-322 ef1e1f339c9c2cd6
+-323 f2e61d757b7437d7
+-324 aa9556b0ff27983a
+-325 be944c51d438b0ed
+-326 4606e1b0a194f69c
+-327 e8ddd7a1094214b0
+-328 439a93cff50c89c3
+-329 17c5937b076d6b3e
+-330 29a4a832181501e7
+-331 4a696a5310c8b9ab
+-332 1321ee46311b49bb
+-333 7e4e9aa6b2b71939
+-334 c7885e68a385ab0e
+-335 7d81032fff952409
+-336 39c690c0595ae36a
+-337 8110b2f7ffdfe515
+-338 e5e823f74258acfd
+-339 686656b5622bea9f
+-340 f862a4d3faac882c
+-341 bc1b8f8174809571
+-342 7898890398aa57d9
+-343 87bdf33b03039807
+-344 5938c731b9b516af
+-345 71c4a4d149a40c66
+-346 839fbfbdc7af7cf8
+-347 8229912f72d82a45
+-348 49f3e2f79fa563b4
+-349 8f8772169bcdbe2a
+-350 2998a0b86a35e85c
+-351 ae6c340cad024342
+-352 880aba1c28f6ebdc
+-353 b4160b9260c459b3
+-354 142f85919f676100
+-355 f40a41432e660a95
+-356 43c666a4de862399
+-357 a6999be36b97d3d8
+-358 a2a11bf47bc32611
+-359 06364561ccbb6196
+-360 ec4ab0f7659f92fe
+-361 6d1e23cbe6b04997
+-362 077498326eff26f3
+-363 73cc66d45724d253
+-364 c63861c971587a6d
+-365 18f0eb12c63da782
+-366 6fc5439bb8ef5009
+-367 da539682759069d7
+-368 ce7cdc2a0b4e21bc
+-369 2d5bff297a093bfc
+-370 70a0f235a1749b15
+-371 07cc7216df51e87a
+-372 ee89ffa68127d011
+-373 cfac0aa6a7be5f12
+-374 73b754243d5d944b
+-375 da2195c9b1166cc0
+-376 a61f3a3fd0856aa0
+-377 79ef964ad28b3ad4
+-378 c0dbbaacde26117b
+-379 27fb9a1726c00336
+-380 050e2d4fd0261f29
+-381 87c31faf2075da88
+-382 5b90bf6e9ee5121a
+-383 7c5b403a6bd78639
+-384 8968bdf551532962
+-385 4f506b2ef13cf7bc
+-386 fdd62ba5945452f4
+-387 2d9a5b18a2a717ce
+-388 8f2300f08318da52
+-389 afc6a6ddeeb9b2cf
+-390 42f9588c1111f550
+-391 607de108dddef953
+-392 5730e2aec1b96319
+-393 06e10b2eeffdb630
+-394 d86b77e239286f44
+-395 241c71c27eca7983
+-396 6d1cca4fbb99fdf1
+-397 6452e1f9f875db07
+-398 7b58f8761058d526
+-399 94a2ce02dd24652e
+-400 f9fb1a31f4a4a81e
+-401 fcafd621007f00e7
+-402 909117a416c46661
+-403 bcc377d206a6b198
+-404 61e08d17c78dce95
+-405 956495f464edce4c
+-406 7d0223ba282042c2
+-407 0f61b336c070ff3e
+-408 0b3aeef54aeb73d1
+-409 a14a873527f084ff
+-410 a65413e8ad5b7d0d
+-411 94a72927b5be001b
+-412 23c92ecb93fe5d72
+-413 be77ccb2be07c2e1
+-414 f0e7580b0bb0087b
+-415 d11a0e852ed4e683
+-416 456e3f142b7afd4b
+-417 d5b741cb1d66ed28
+-418 ac8c114a2c486d9f
+-419 00e819589d8d37fb
+-420 a489e80298c10ff7
+-421 5f7da7199aeca476
+-422 686a276f9a224dcb
+-423 3ffe2dbff954e73a
+-424 817e8abf5c755f48
+-425 d7cb71683c30b06f
+-426 cdad1a035b18f47e
+-427 5a23300fbfc020b0
+-428 783157bb0cbac96a
+-429 c8923d97cb1d9392
+-430 4e11cfade9070c14
+-431 42881639d883a7cb
+-432 42ba878f00e765e7
+-433 38a4dfda22ed4651
+-434 98a654de0f14621f
+-435 3e7882f0945af9e7
+-436 6f27526fcad8de1b
+-437 89fdf432a51c9d76
+-438 786ca0e67189a1f7
+-439 47ea94cd4846034e
+-440 5a7f8f66c3e9c28a
+-441 79325eaef0dfe36b
+-442 e2b66ba36bdf96e2
+-443 7aebb163218c970b
+-444 142b6bf75984b387
+-445 ba8564285aa7c2c3
+-446 1a8d7d741b0742e3
+-447 1df0505e4fce9fdf
+-448 9c6499f906bc9275
+-449 1b89ecc0bf31c338
+-450 1fd04b9ae2d450ca
+-451 32b0bf8d6818917a
+-452 243f338dc0449dbe
+-453 b497f7476fca5b9d
+-454 63221ddf13d8d735
+-455 32b1a159d46eac14
+-456 464c3ecaf7c3171e
+-457 7a4a50f3ceb4d14d
+-458 1c8992887c7f8b92
+-459 a8e89d395c555b67
+-460 c259ae5469c2dd50
+-461 d85f8e03efa18058
+-462 c96fb78b3e5e5d2f
+-463 5e2472b3b007d38d
+-464 b6dc32c00c79da29
+-465 399cdd002ad3bcf3
+-466 ac7629c950e33902
+-467 5a2f1a273cd5ee50
+-468 05e206dea56aad56
+-469 0401c9efa5bc004b
+-470 e80463afa7f1a27d
+-471 2d7cd061706033a8
+-472 5273431a407d9e07
+-473 22515440ed416ea6
+-474 521b1ff76b2a6dfb
+-475 abba63c6e1c50ede
+-476 752aa1f189cc8b0d
+-477 691c198d43c283cf
+-478 1228155501402fed
+-479 3aae25df75edc688
+-480 edc5b028e73ecb6b
+-481 94bea1d0c86a2f6e
+-482 ba1e794e150cb62e
+-483 c5d2a983dfb85a9c
+-484 31144dcf283ec64c
+-485 a08ee457318f52b7
+-486 62dc85fd5881e5d0
+-487 a44407504562b6ea
+-488 e138d16891976679
+-489 d33cea9ea1ba10a9
+-490 941ba4acdf76a4c6
+-491 905951bc29cbf8c2
+-492 b0d94e2df027b0f2
+-493 e477472bd22e5c0b
+-494 024e1e9cd350b548
+-495 af02fd2021f8e343
+-496 18ff17999edaca29
+-497 4ea94870bea077db
+-498 c197b167420579d8
+-499 cf1e796b97e1c6ab
+-500 5c7efa22e293d580
+-501 3a59e3bcf5bb5bfd
+-502 5a59f93b8a340ff7
+-503 199008112527c025
+-504 460375230e44a9ac
+-505 ebd45e739966c271
+-506 d97a33382a490110
+-507 ac77aee94a597900
+-508 3f246473e60b850e
+-509 cd31c02010ee2c29
+-510 bf9448ab95880512
+-511 eb2279464f46617e
+-512 29af23f1ea905133
+-513 fc21ee27976d0952
+-514 9706e580028483f1
+-515 5e89c867d202558c
+-516 0c3b9dc2dcc700b0
+-517 fc37059454405fac
+-518 f916556cddb2251c
+-519 b0b066dda5f798da
+-520 36afee8df4acce31
+-521 2ab22368b09552da
+-522 8d129a27fa0bb7cb
+-523 47120a388dd22ed5
+-524 f8f4fe7837fdb106
+-525 6c10d976e38e353f
+-526 d3a3d5782103e87b
+-527 7f1c6429ecad84f9
+-528 74b3a925098411c7
+-529 edf53a55119b6938
+-530 57a275544b0260b7
+-531 ac50bce48d850072
+-532 aecd6c37e2028a5c
+-533 c605f75ecfaa458b
+-534 471583352086576f
+-535 f1a2e402dded42b0
+-536 3dbff6c6f60b3333
+-537 e123a39472e5f5be
+-538 a9909a135b914874
+-539 eee65dc3e7c4cfa3
+-540 7036b351f3a41de0
+-541 df94bf0044a8a0e0
+-542 50def1f71d90c802
+-543 c69766668448c6cd
+-544 add9c4f867875e0c
+-545 3d7d5f2e51cb2353
+-546 a33a2a7e970693e1
+-547 47248895c86ff8e0
+-548 a81c79637448aee5
+-549 b6734156f84c6a7a
+-550 0e53b52353bf36d2
+-551 c19f29873201859a
+-552 7e8439fd65d23391
+-553 38b269741ef5e08f
+-554 d17df82cde4f68b1
+-555 f6a8ac08d9f5501d
+-556 cacff6afd40eef47
+-557 ae601f1fe0f0fda6
+-558 1b71878667757165
+-559 83d7e1fc54e525c7
+-560 880a8ecf58297d15
+-561 50e34c820defe295
+-562 8a36eefc197d5259
+-563 d4a4e63f619953d4
+-564 c17142f98264cb1b
+-565 bc195959c1750b88
+-566 dac27fdad77d2754
+-567 9d9a79d7a372c107
+-568 1b5f6267fedc82f7
+-569 b705e68e99bd42ba
+-570 d5f24a3648ba26d6
+-571 52ed2169f620b4b6
+-572 1805c82245fbd331
+-573 586a1e6c9643a08e
+-574 936e6b94afa5a8b3
+-575 4235b2c5fe4e1eb0
+-576 c84410f63588b783
+-577 3ec5b350a80be3a9
+-578 edd85dc0258ad260
+-579 d8a22f5d234b4ff2
+-580 c7e0400e086e47a9
+-581 30e261415e57d775
+-582 dd38df7ea110a3cd
+-583 0569b7c05882eda7
+-584 c08c717986ae5744
+-585 d7bd7032f2c19084
+-586 48fac1fdb92a9874
+-587 8bc4de89c948116a
+-588 b3ae15e9805ae603
+-589 3a6172f21d8b3472
+-590 3d3cf3608f66bf79
+-591 607c9cb44de8b51f
+-592 69186d84c209a55a
+-593 a1accbf84180c8c9
+-594 000c365a5dc75e99
+-595 9937f419ae24c7e2
+-596 134c9ca3d7e6e84a
+-597 492e9a302ef7162b
+-598 f73aa9fed72fc977
+-599 a104c0717dd2fbe5
+-600 4d2ed114459d064e
+-601 04356957cb36bea5
+-602 c555e72b1adc882e
+-603 e01592fdaabdd91e
+-604 d184a2909ff51d68
+-605 d50249f025325bc5
+-606 b1c1b73b0639371f
+-607 928cd824eb40d415
+-608 0d54a861ff8f62d1
+-609 e481b10daed86046
+-610 2fd822b8ca2e09e3
+-611 3b46bb828e62d0d9
+-612 50da90dd135a0dd9
+-613 bb7577ee4f5b0841
+-614 5a36af288a9394e4
+-615 9562035ff547a6de
+-616 44ce365898576f5c
+-617 48fe0209d75c39eb
+-618 4bcc32c0382dc18f
+-619 3f497b6775a6c8f8
+-620 44a0d6b8b5ce2422
+-621 f6ceed8fa5cdca5d
+-622 a78bd09cd56aa5ad
+-623 6ef3a96898fbc029
+-624 196559e3505f8f8c
+-625 2d9295aceba8267a
+-626 dedcce2583e34904
+-627 69e36effd602224a
+-628 f5f04cc051ce892f
+-629 451669258d240562
+-630 bde830a36c0fd882
+-631 a78f86f8af725774
+-632 25b17c3b71492375
+-633 9a66c4f7e2c2ebe8
+-634 6b9f1f6727618613
+-635 530ea432ea8e3e79
+-636 1bd0e11a8597629f
+-637 adf0c7a2ad1aeee1
+-638 b26c37177dd7a7c7
+-639 dce5ae7aa70c9be2
+-640 59029c08747424d4
+-641 3f823adffb787b84
+-642 ef4b836e8533e928
+-643 d2f77f96ffee56d0
+-644 61beb39aa4692c07
+-645 dc661a8fdd64d5b5
+-646 71f31a4f3ca20ba4
+-647 b10f6f7bba3d7c13
+-648 711e0c9100a92789
+-649 fc0275a434ec9dc1
+-650 7c37e46d8566f4b8
+-651 234ad2378f18cc7f
+-652 61c3c279dad3a978
+-653 cbec72c67a789f6c
+-654 bb379e83d02ac580
+-655 f51cbc3a6433abdc
+-656 dfbc9ab95bd6f593
+-657 502f457914ca0f1b
+-658 c2c13f478bd85203
+-659 af681eb5ea9a215a
+-660 2253d78885918009
+-661 ffefc53b3fb61564
+-662 dc214add3282581f
+-663 a01fb1d8f53f1606
+-664 e11ae79daab400d2
+-665 f8e036d38cb9576c
+-666 2145b77078de2571
+-667 34647d7b7c3b846e
+-668 91e1571980f01712
+-669 9b5739ecaa8de1a0
+-670 284ca23a60e41913
+-671 5658e3a3d88b9b55
+-672 e8ab83b01d118013
+-673 49765e9f20a9e9e3
+-674 4148ccb018fd9880
+-675 0b12483360d9c866
+-676 cafc752647b8814f
+-677 f51f62bec85d4427
+-678 0c660b682a8c3229
+-679 610eea5cb67f6180
+-680 abc912ee33f01315
+-681 4a40ddc655140443
+-682 3fb716da07911305
+-683 5d183c4fbee92535
+-684 42fe18d831a53a6b
+-685 28de9fb285eab563
+-686 7505c66b2fc370c9
+-687 3024a80e80a72e54
+-688 ab2884af1381ff9d
+-689 2541c994fddadf42
+-690 1fa2a810a8d8482f
+-691 1bbb98cccbdc1ea4
+-692 ce75185bef7bfaf7
+-693 4a3f6215f6a71ac0
+-694 200fa6a94d1f37c8
+-695 40f4b8fb406f0368
+-696 3ac0348fa94d9555
+-697 cbc1cc1aa705543a
+-698 8482bb6b8e430665
+-699 7574be2998056742
+-700 914402fbc30c23b8
+-701 eff3d6663aaef4a6
+-702 bb3381393cc4a620
+-703 df237060cfb1759a
+-704 ff29e2a781aa6be0
+-705 def439c510b14abf
+-706 1938d54e7d309ac2
+-707 5d01d6f7177417c4
+-708 cf6510d517492026
+-709 2afd5738f1e0098b
+-710 e7ab2f12f12bfcca
+-711 7c9d096722324042
+-712 cd0e336eac1b0e85
+-713 ad9c57d1974d171c
+-714 dd0180d594e16b7f
+-715 32f2493b9708b47b
+-716 b7f7e92bd71f4710
+-717 9390b01c1ae2312c
+-718 9b74dc32cea6f58b
+-719 a5d1e223bbfb1b6b
+-720 bd7b9c789e10c971
+-721 bceecb8c0435ed09
+-722 12c9c76312423653
+-723 7161a12e81cbfbad
+-724 6a66b0144e890b42
+-725 c6c379f18258b4f3
+-726 1a6ba1fa59506bb9
+-727 d54028cfb22cf991
+-728 68fcb1d172f63593
+-729 15ecfe93f59e5a13
+-730 4f6fb46394f54fff
+-731 6b99c8877ee71456
+-732 975d5f5f3879b05e
+-733 8f25811157e0d358
+-734 ebb99657ee1e6e06
+-735 7cf1ab20ba2872d8
+-736 89cd1f3eaf65b804
+-737 b9a5b9d702f1cce7
+-738 4f89771f68dbcf82
+-739 13a53a1b36d037ba
+-740 ddb4bf0fed32d76c
+-741 69a443022a9f8452
+-742 41c251c8f3293270
+-743 6ed3cf584226296a
+-744 d381fc8be78b77dc
+-745 ca9b136363681d98
+-746 a10f5c1eb7579f08
+-747 54f88d67ecd50519
+-748 b2ec521a02058a47
+-749 69fda88dcd39b0e9
+-750 c57799fd0b7c7bfa
+-751 bdcbf0e1c0f98cad
+-752 4f8bf637b183101e
+-753 0697ca1b7c315485
+-754 578c1d1c182330aa
+-755 39aa5bf6128292a0
+-756 6768c50fddaa2e6d
+-757 c10af0605d2c457b
+-758 f2baf987e614d6b3
+-759 b66dcbbbb1adc374
+-760 c1f95498de4bb4ad
+-761 c9c07f6117e556ee
+-762 6d995f891470506c
+-763 3accb6f5fd15ac5f
+-764 72c32ff363cd2001
+-765 4b7842d58c1ce69c
+-766 63bee4101b7dc846
+-767 930710b39424f65d
+-768 d6ff233ceb532561
+-769 4de435aa44f2ffd7
+-770 c01006bb95f5f94a
+-771 d22115f58ca21b83
+-772 eb1447fc2af59685
+-773 866f7dd70da24d97
+-774 8f4d89ba8a213c7e
+-775 4eef013aae3578a7
+-776 77194087c054b86f
+-777 0138b22d1a68b974
+-778 e506a335c359a51c
+-779 e9761cece862135c
+-780 864086c234dca53d
+-781 99a790831349293d
+-782 8aeb1ae466c7558a
+-783 b1b407cc303f3ab5
+-784 b8365d1b264c5c6c
+-785 8a2a371a92faddf6
+-786 91328ed990bb5acb
+-787 662af3cc8fd09823
+-788 71bd341ba0b2cea3
+-789 d2c99d1c0199288c
+-790 a84433db8f86ea4f
+-791 e00bf3a78af0242d
+-792 6fdc814ff2035a76
+-793 6e29dd157aa3e33a
+-794 ccaf0e0802dab918
+-795 303018a5878a7ec0
+-796 930d76e0c6e80716
+-797 7ad977a9238c90a7
+-798 4dc2bed500f44dfb
+-799 f8aee344df3f581a
+-800 09ff4485ee1d2eb7
+-801 581ed2092850e954
+-802 3e2790cc44b8865d
+-803 56c9d27cf65ada80
+-804 eaaa75a6bbc26700
+-805 3aed7e61e651f67b
+-806 77ac8b05a3319548
+-807 15e0e7f250c8af58
+-808 86590f39db7d4eb6
+-809 d9eb0ae45dc73147
+-810 91fb4819dc8f7bff
+-811 2b5627be9e93d3be
+-812 db2482e08f90e7eb
+-813 c0c15c5894fe41ba
+-814 d2b27c1b95c9115c
+-815 d215726b62c63289
+-816 987ace184bc39bf0
+-817 071f39ed12280a33
+-818 f9d3160ad5bf64eb
+-819 77f08024069d0c51
+-820 1c2cfb1f58d4ec3b
+-821 9dc09aec9397ad08
+-822 3a08dee42cd6e128
+-823 5ffc0f26d29d7454
+-824 cc64b579459e76d3
+-825 15537e4915477495
+-826 60ca1536c7617045
+-827 41164fd420f15b2a
+-828 74b3e8c20add1cf7
+-829 2bfc09d52704c619
+-830 ebff1690ac760621
+-831 9af88c9dfac84385
+-832 a756f874e223bb14
+-833 2a99aad45cc3b69e
+-834 f99681d97d9f16c0
+-835 61c6481b369ab3c7
+-836 37b5914869dbac4f
+-837 ba16219cb0058cfa
+-838 793910f7ffd32ec0
+-839 168806a4fabbbfc4
+-840 0b7a8c51255da772
+-841 7d2622f92febc4dd
+-842 17bda3e0d4293278
+-843 6093450f46fe716e
+-844 b971db93ff2b8815
+-845 cabd0634d90b7c73
+-846 597e4efd0813f0e6
+-847 57a4dec550e0ff3f
+-848 08bb2fc110911df0
+-849 6d5648366880ba10
+-850 996eea3de969e902
+-851 3e21d62f6b0800d9
+-852 ebe466328cc99a3d
+-853 05c03391bd8ebbdb
+-854 c1a39e352237c801
+-855 61b97c98dbd0fcb8
+-856 e8b4d70044f9be73
+-857 e4670ca01d89dc57
+-858 83ab0ee543fa68aa
+-859 99b60dcaa367bf56
+-860 7c54b4fa41259875
+-861 9150a82d7890e75e
+-862 a78e934a6d00f283
+-863 a1403f9e2888c2e7
+-864 69c5914d1a5b1ad1
+-865 a493950c8aa2ae8c
+-866 f0256ef806df9832
+-867 71f8e3312027e055
+-868 d7f7fdced4e53818
+-869 b55997bf4c4068c4
+-870 58e793a507531746
+-871 76c600be520a98ed
+-872 e6e49b76710cb8fd
+-873 b8fa1c0159999241
+-874 57153c749cedb4d1
+-875 94dc294bfe95b82b
+-876 4745285586b15c4e
+-877 23f7e91cd9489ec4
+-878 ac4749d52010b45d
+-879 8a9d3c491d28a7f5
+-880 f0e5232ad3a4ebe1
+-881 22e1f7639db4ab66
+-882 6f716c38b203e5e9
+-883 ea8bd1972dc08ce0
+-884 552beff5f0896f86
+-885 f6ad009c8f8342b7
+-886 48e124d8567be025
+-887 b938822a28653c7c
+-888 079f33ada6fe66bf
+-889 f23c0a6f630ba158
+-890 f72db45a70313b6d
+-891 a4025a0578ab370f
+-892 1e194e25028b103d
+-893 e81aea45a2d02a97
+-894 937facd65343e901
+-895 520df61c42727067
+-896 c6862ae96a582889
+-897 30a2d88ddf23da39
+-898 71ffc1c506080d7e
+-899 44bebfa680b687fd
+-900 cc2eeb7c09d9dc2f
+-901 6772c5c3ad5cae60
+-902 faf8cb005189e3b4
+-903 b3e232cca1a4bc0a
+-904 395aa0afcc29787f
+-905 8c292a8f8e173b01
+-906 4d1f9a2ebb34dacb
+-907 fc952b5de0904d16
+-908 3f7ac3cf50041f1c
+-909 41c0b124a0ab5812
+-910 37f2af2de575be3a
+-911 6a2dc01d5fc444e5
+-912 310fbb0a7be0064c
+-913 a3b377e8952ac8f8
+-914 5256494976327230
+-915 ae338dd7273f6a58
+-916 1653affd08d4eb5f
+-917 7dfd86cf52673295
+-918 725e9ae142faccb0
+-919 65c78228cb5bcb28
+-920 b4830750cb72e67e
+-921 ac96aa8d9ac86d78
+-922 0a77f2117550fee2
+-923 73a29850c0949dda
+-924 f7177dd007e24235
+-925 cb346029b56fccb7
+-926 186525cc9337cb57
+-927 37999442521797ab
+-928 ca4340c126512553
+-929 962d954aeb5524c8
+-930 19888bfb5a24487e
+-931 108ba830290c241a
+-932 8dc5b42354fabf66
+-933 0df5aa57535777b8
+-934 807671db7f85fa23
+-935 0c846bacab0019ee
+-936 2f9d2a49156f4158
+-937 294f8d9922b9dad7
+-938 ca8addb123fe592a
+-939 bcc610f6d73a1807
+-940 036b6aab74c6a64c
+-941 a2a0bc3b6be0e939
+-942 b2579ffd1ba6e548
+-943 a0e8c7d89591b86e
+-944 392e2482d38dd101
+-945 ab061edf79827c8c
+-946 94c47035e96fad01
+-947 86451e1a1717d2d9
+-948 30c11646093fb852
+-949 fe3fb8a05c5f320e
+-950 f3b27a2aa7310eac
+-951 2087858e312bd513
+-952 ea71047c423ceaed
+-953 8aba092eddc8f04d
+-954 087680f394aeb398
+-955 8d6c7f1085e9f5f2
+-956 6b1b68923a40d46c
+-957 1c5b077cc5fce4c5
+-958 45402669d64bb0b3
+-959 502d0d3406263321
+-960 0f307d0058d4c58b
+-961 d8034b7e23e4c110
+-962 e266356cb946ccdf
+-963 63d46e8019d01445
+-964 47cfaf5e037c73c7
+-965 90de84bb0a235862
+-966 16d6bca908373ab7
+-967 fbb4bdef781affec
+-968 d583156bdb00aa69
+-969 4e93c8e9728d57b7
+-970 5ad80e8f7598b889
+-971 59189aa052decf90
+-972 fd5678debbd524cb
+-973 3c5e1ebdb2da1c3c
+-974 f0615d95beb02e72
+-975 b6773a8398ccf6cb
+-976 59be070904e06fdc
+-977 b36a8b46e78da090
+-978 12a280b79720be54
+-979 476004a539976cc0
+-980 7c6a5fea84da5ef7
+-981 5d4fd2885b6e84b9
+-982 911455baab613b13
+-983 75f45d91e218fb79
+-984 3565a1cc4e4f6af4
+-985 cdfad45f9652ca36
+-986 cc4680bc28146662
+-987 2552afd76e12918e
+-988 c561adeb8df14435
+-989 492a0f3100651230
+-990 e80435a09495fbf4
+-991 3532ef5645805021
+-992 b8c8f2577631c7d7
+-993 43cfe6725242e75f
+-994 881022ae11bb993e
+-995 99c42fdae876148c
+-996 334b452ae0224250
+-997 485fd97a755894fa
+-998 684d9ded890de482
+-999 c4b148da01498c4d
+-1000 746d489a996dede8
+-1001 261c79ba48ae0812
+-1002 f66547f9cb88c945
+-1003 4167720dc4eebe88
+-1004 9f9c5450ad734af5
+-1005 fa69676a96c1d9cc
+-1006 9d8f51dfec3b4677
+-1007 d8cbd2880cbd3e12
+-1008 116e57bd60232f6f
+-1009 82b0b22415b9c406
+-1010 8147cba04ca7166f
+-1011 fed519f3e66c47bf
+-1012 3e41d7bbb0514cdc
+-1013 43c56c1be15ea884
+-1014 c2b772f75a6ca09f
+-1015 8b3e7b37dd535328
+-1016 c7c235a3ad1b7480
+-1017 ddfc6c5efce376c3
+-1018 dcfd2a72af2144c6
+-1019 ce475180ac3f7caf
+-1020 d1924e7b6920402f
+-1021 cea7387a5638907f
+-1022 2523e61a7ecf7649
+-1023 eb218fb3ceac90e3
+-1024 f8dea2811291bd84
+-1025 c7f9bd057692dd6e
+-1026 453ab201b571351c
+-1027 556e92c530d11c24
+-1028 72d218a03cb31517
+-1029 d4e17b94db947a8b
+-1030 08c537b8e9746320
+-1031 1aa9464ed3948b51
+-1032 c9371fe1a7ed415b
+-1033 f4c0f7f9dc5690ad
+-1034 c2a4c45c518f891e
+-1035 2abcc5e2fdbbf36c
+-1036 ba264413ae2d6245
+-1037 c77ab5d2451c32ad
+-1038 20333278db8173d9
+-1039 0efc36d0e17a21bb
+-1040 4ac1cb02e68f612f
+-1041 6f0f771bce10894b
+-1042 d2fd568df5a3c852
+-1043 e9beb9d5f5e684c9
+-1044 da9bca8ee1b5f187
+-1045 a84f080f47d66a50
+-1046 f3fe03808ff65c2a
+-1047 91a9868162b44586
+-1048 b90fc9959dae1913
+-1049 aafc60acc8b03816
+-1050 8b37301288ae4b9c
+-1051 13d4e60be465ddae
+-1052 0b426a7f9ec131c8
+-1053 49a03e8358692f15
+-1054 08c801db5408da0c
+-1055 e7add13985ba8714
+-1056 09dadd73f6a0362a
+-1057 305c5050063191d2
+-1058 5fe25e4f11e9555b
+-1059 1deda4fd7b0b3a69
+-1060 8a7e2c06ceb9670e
+-1061 53802cc76e93dd06
+-1062 cfa83762c71e75e2
+-1063 32402ba905ece422
+-1064 e6c6d42d37454cc1
+-1065 ba3f4a61d04828e2
+-1066 29c9addb89c41d0e
+-1067 e1883ae47ce80974
+-1068 2e517f14508fd988
+-1069 3851991c48f1a8e5
+-1070 5d3584b17a297976
+-1071 4c1ec224d4d65625
+-1072 be6d29d10733327f
+-1073 7d1600d358901bcc
+-1074 ad26a81d7358bd31
+-1075 a6fde32f4830a739
+-1076 891e5f3dc40d567a
+-1077 2c47a5f23209826a
+-1078 ef126fdb4d5ea7bb
+-1079 b33feba61a9ba314
+-1080 556b0226e9f1178e
+-1081 13195c7898c91f3b
+-1082 1b46464e54daa654
+-1083 50c096a7563ce12b
+-1084 7bae33775a7fb31d
+-1085 f0b82add97d08259
+-1086 1402c4f89da846d7
+-1087 e7b71c0662ab6e30
+-1088 c5b36cd75a60776a
+-1089 00e089ab140ea737
+-1090 cd31cd9e2f5dec1a
+-1091 60e5edf90f50f335
+-1092 994f3b453b043d1b
+-1093 36455f505489d20a
+-1094 0c55d784dca3a79f
+-1095 b1734c8512e52c23
+-1096 5e4a8a28179255ed
+-1097 bf86ce336b74861b
+-1098 5fae601c0bc52861
+-1099 e38c7e750aa5251d
+-1100 c271f5d6122d1fc3
+-1101 ac13c2dceb8c2c89
+-1102 6fd57591e6fb6936
+-1103 6eacd752b474549c
+-1104 c827788b7001e8b7
+-1105 fab0fca96731e571
+-1106 a085384e1363ab60
+-1107 40db2064d5d6d2ba
+-1108 0522d09118cf1191
+-1109 aeb2f7309569110a
+-1110 66dd1dbdb6fde026
+-1111 bf292d7ef0ae893d
+-1112 33d55df746cfc096
+-1113 81c27142b965cd32
+-1114 405a2cbe0678c367
+-1115 06d1bf33a3b6cf39
+-1116 bf90a4427e3d91eb
+-1117 bb223b1fbb1fdefd
+-1118 592e35c11745dcf3
+-1119 9c1f957251e03f7b
+-1120 458330bd8e162e25
+-1121 22822cfc9b40dae0
+-1122 2bf1bb42d9830472
+-1123 a07655ccf35b3d86
+-1124 bca62ee79b96c326
+-1125 050a3c1709ee257f
+-1126 0648b07785d2d55c
+-1127 0360eecf7e990b15
+-1128 ac9ec0a969947dc1
+-1129 1657734b3ef83e04
+-1130 ac65926627351e26
+-1131 c9d06368e153ae93
+-1132 98cf40bbc9afcda7
+-1133 304090cf21e6a2d7
+-1134 a2911406157c21c9
+-1135 ab9fa3b2c9b9be40
+-1136 f202c0b3548f4b19
+-1137 d05f9416bc002d07
+-1138 7a2c4eb90a9fcbe8
+-1139 8e94dea6df138b6a
+-1140 ff68f7a4f70faea8
+-1141 d742673dc9c59dce
+-1142 81f2b579f66c57e7
+-1143 56801ea555de0a99
+-1144 ef799b54cf573569
+-1145 b914738d3b055ba9
+-1146 11a4e0149126f3f7
+-1147 d1f5b882bb614b3a
+-1148 948aba778ca3e296
+-1149 c96ee97e14bd19d4
+-1150 98b3c4712791b1aa
+-1151 992aa70d871ac203
+-1152 e88b515256adeca7
+-1153 3de76d127fc1f8aa
+-1154 72cfbba270b144ee
+-1155 7d898f00a0e95f37
+-1156 47bff15673588e9a
+-1157 06ea9fa31fb2b64c
+-1158 81373fdcddd60cbd
+-1159 85452808c8d88518
+-1160 cd0b82dc26aeafc9
+-1161 a303a95cfa19f4d2
+-1162 5a7779d927e9ebb9
+-1163 b3378fa0ba4ac239
+-1164 0eb979fe4e9ba3be
+-1165 7ee3fd94931e47de
+-1166 79b55dfd5e6c4a29
+-1167 1d47f7110df0d0be
+-1168 914e469ed333bbef
+-1169 7ac478d5c5f1dd9c
+-1170 557e9cc5fb752807
+-1171 6ddb10648e688df5
+-1172 cff1b6227e3429b7
+-1173 82de6ed86e990ed8
+-1174 b0f6466f8b8ebb54
+-1175 b00ab9542643040d
+-1176 9b13434540bec49f
+-1177 48fff8b57e6fd992
+-1178 0a57fe8035d4aee5
+-1179 f508b9433a6fd697
+-1180 aa8e64f3bfb208a0
+-1181 f6cb64ed7527c458
+-1182 09fa54bd9d84a730
+-1183 acf33c1e7bee3415
+-1184 69991c862b08f160
+-1185 299d5ca328a22dcd
+-1186 9269f706c9c93585
+-1187 8ae8a3f4e6ee0391
+-1188 e85ede020eeb02c2
+-1189 b520eef5186d487b
+-1190 d14d0640bd615fb9
+-1191 a70d91135db90dba
+-1192 20a619d503675bd3
+-1193 5730ecea7cb2d147
+-1194 7b85d6166f369615
+-1195 c7386616d0429f32
+-1196 eef93fbc08e816c9
+-1197 0f1330e6c5292b44
+-1198 979b654bb31059f9
+-1199 b0931c972c021e88
+-1200 ed16b028c5b734c2
+-1201 8a57f4293cc7915f
+-1202 0895104277d91245
+-1203 9e60b0c3964989b1
+-1204 193dedc72ccd013c
+-1205 130d3b747c943d0b
+-1206 33d5f152f2efff47
+-1207 efb62fce97ccb2bd
+-1208 39ec4758d994ae44
+-1209 05f389409756d8c5
+-1210 077d3c3ee6e0d491
+-1211 1f2e14a5d69fa18f
+-1212 6b8acc403c17ac0c
+-1213 24ed648a9bdf876c
+-1214 4168e6a8cd64a8fa
+-1215 2db541062eba22fa
+-1216 5bd3dd0899eefae8
+-1217 5ffb55f1196a0e2b
+-1218 ec7e41f6b73248c3
+-1219 c0c69b444dd6dc9f
+-1220 b5006298150827b2
+-1221 fbaef606459b5bf2
+-1222 60a9b128d50aa46c
+-1223 5d22e6424b44016b
+-1224 48404bc83c351a4e
+-1225 9c6332c723e0fdcc
+-1226 0a50e52c350cdbe2
+-1227 501b34dd8c0076de
+-1228 f9ab6f9787992247
+-1229 1c8f5c3dc98a243c
+-1230 a8d294fdc2d27001
+-1231 ac8265accece68b8
+-1232 f06c31f84d65daa8
+-1233 163c2a2e79a25cdf
+-1234 4084930c642f1966
+-1235 0353ea33cdae546c
+-1236 723d098abde3f989
+-1237 88fd4a88ef1e8c06
+-1238 b0f66151f7535037
+-1239 f6afbc933f8060fd
+-1240 6bd65a43df3f06ee
+-1241 c91f190625e0d92e
+-1242 75f25415630148bb
+-1243 f51be47dad338ac5
+-1244 b02088aa18c03baa
+-1245 369bd2ac614cce11
+-1246 60e4c3d8e56e9f0c
+-1247 ddbd85b6b96428f6
+-1248 f6854640c277d28e
+-1249 58f0ed828b0713aa
+-1250 abed5aa927ab4e99
+-1251 f3ced4a34a78b668
+-1252 22cac8acc0b2a838
+-1253 2d5f9367ca34c81b
+-1254 db1894bb7591b578
+-1255 f89657be2cc4a1bf
+-1256 2ac3d27f9de20925
+-1257 f4405d6d2f3bffb3
+-1258 06dd98f9abd5a9cc
+-1259 ed0636fd28f31941
+-1260 58cddccecf08ca5a
+-1261 4fd455be396e5d81
+-1262 d721b85ae4706a7c
+-1263 d7435b899c3597ed
+-1264 dbb7d18fe131098a
+-1265 46b41e3079c43bba
+-1266 cc595a0fcfbd6e76
+-1267 5fe66cd081954681
+-1268 10d02d32c92a91a0
+-1269 8f5a81be70113e11
+-1270 83ab4f34209922c0
+-1271 b7c562fe655c1361
+-1272 5c0cd928631a0c41
+-1273 3efef01e401cd9f7
+-1274 56c141fe8503bdc9
+-1275 c3861bbcc470f7ac
+-1276 fb9b3f1b9d13d0b9
+-1277 90984b42194a7af4
+-1278 3f088edb38011e65
+-1279 0c097a41ae963cf1
+-1280 3f8a522e441fc447
+-1281 bb60f5a503435660
+-1282 d7198140ee81aa38
+-1283 af791369517ff286
+-1284 c777cc510946dbb7
+-1285 b52a7ed897333aa0
+-1286 63cb55265cce8542
+-1287 6f73f8f8d6211e7c
+-1288 0a2179bc1bae8d29
+-1289 0c0b2d064167ae87
+-1290 f6058add77cbc368
+-1291 c011fa6b4da4ccdf
+-1292 297fe0e08677f818
+-1293 b234c1db9f3a5a8f
+-1294 cf8927bb9675b289
+-1295 368994d2c6b499f2
+-1296 b0dceb9481039cdf
+-1297 586b0157b5a98434
+-1298 2286e4866b7ab24d
+-1299 bb0acbc4638c9d52
+-1300 1bca278781ded3ce
+-1301 4048795659b71440
+-1302 57013b3236e3a224
+-1303 d81b36efefa68633
+-1304 10ab917f1ba61e04
+-1305 77cb93323d91e3d4
+-1306 92dc53c240be3912
+-1307 195090d4bd0d5842
+-1308 6dbc3ac6c7f2e713
+-1309 caf3301e60e401fd
+-1310 3688138caba870ff
+-1311 bbd97488b5b33671
+-1312 063e9c49c1a3e06c
+-1313 e4888f7e512ce405
+-1314 79201de8cfafa804
+-1315 bdbc5379d18b10ca
+-1316 fc0f474393d402b8
+-1317 792f7c64d7150f80
+-1318 1376d775a4932a03
+-1319 a8c2309b7dac6dc9
+-1320 4b7ab53b0ea3a550
+-1321 c14fd24072a300d3
+-1322 488721f8783dcf77
+-1323 dffa75b815e7c9c3
+-1324 dc32eb376709524b
+-1325 506e13e46d646c31
+-1326 7024abf580e04b7b
+-1327 e70dac7f129caeef
+-1328 bef9810a067f60c7
+-1329 3491bf24956ea516
+-1330 04a46418fb1e4ce4
+-1331 9b9c77a5cf73e5d7
+-1332 d6ccaf173bbd3ad5
+-1333 3f5113ed33242f4a
+-1334 223c16657be5414e
+-1335 8369e8a02c9c8d2c
+-1336 8f1e75ca26d49964
+-1337 eeaaecfe694867de
+-1338 1c0ff56e747934d1
+-1339 63db6505c0c4f25a
+-1340 c2f62291510ccaaf
+-1341 c3c5c6aa9d19dc4f
+-1342 2ab529b034156a9a
+-1343 57c9b6e22cab3a43
+-1344 8ae1e7b2c4a2bdcb
+-1345 d0eaace2bd873313
+-1346 6cba970a4c81b32b
+-1347 c56ccf7402b7cc25
+-1348 e7f7ec4b04d48fb0
+-1349 b9ef8de70b7afacf
+-1350 65d6f12bb3dd6b70
+-1351 e2656c17e90a4bee
+-1352 16d2cea4638d4215
+-1353 db0e88073e0bff2c
+-1354 7a2fd83f828490c4
+-1355 1e20eb5a70ead423
+-1356 b0631196286da8a3
+-1357 2e444c81de6b3322
+-1358 bf54e4be9950ced5
+-1359 0575ec49c1944be1
+-1360 2e60246fd3f6d6de
+-1361 8d73724d527b29cb
+-1362 a9b5a369b957609a
+-1363 87a4d6501e728d0e
+-1364 0c11eecd9225ebc8
+-1365 4d1551ae37ec0f6d
+-1366 0c49aabf20f62727
+-1367 52b0ecdd60c52c0a
+-1368 6f439c6829f6d4f8
+-1369 74d4bea13c910e72
+-1370 61fb7166d914d108
+-1371 6b09910657e2bbf2
+-1372 15c9db885def0c48
+-1373 a5dd7a0343b33ede
+-1374 7e71749661947fc1
+-1375 a09dfaaac36c8e89
+-1376 d748ca6bcce0d931
+-1377 543f9b3303aa713f
+-1378 c438c2e2b773157e
+-1379 951372047c9636c1
+-1380 db9d87e367fa34a5
+-1381 7e807f2956a158bc
+-1382 5b1c7e39f1f12563
+-1383 aabccacdd20dbeba
+-1384 d77094821ba3bab7
+-1385 9b1dd5a47db1d31b
+-1386 6364d15ebd8c6e7d
+-1387 40a30661f9df37a2
+-1388 3da9f161a70044fd
+-1389 3f094fa3b0036192
+-1390 3a1de270396c9cec
+-1391 9ba130b58e5c3959
+-1392 2f47fc78e8f13c47
+-1393 0f9af92d657ff579
+-1394 68301dcb68131fea
+-1395 578ca1062b209ef4
+-1396 247d5bc2a63a86a7
+-1397 55964da484cb5b05
+-1398 bae555b41bdd4428
+-1399 94737970a6ddaa3e
+-1400 c16a075410bd6c9d
++1 617d6f518548819f
++2 b88036633d94ec7d
++3 0fda5d01404eb231
++4 bb8ae3b30100450c
++5 2a1307b21d882543
++6 d6a3fe8aa8997f0c
++7 0ed66a9804bfbd28
++8 43516eee37e46acd
++9 9217bf3e47858026
++10 e9519341a6b3aa8c
++11 de4c3826a14ce3f8
++12 c7ce6583b4352ea0
++13 6ed1b5c3a4a1f772
++14 28559db80ed0e94d
++15 b28c14174fab4da2
++16 2b3adf03012a5843
++17 a0500a191ed75543
++18 f8219cee300a36ef
++19 a6276c4bb4756e53
++20 0621ad59b55baecb
++21 1476648a391de6da
++22 df6a46ecc18874b6
++23 28de74a376b1dbd8
++24 4ac0a7c4b26f8c83
++25 4349c7b520874b01
++26 4c404293a1ee73eb
++27 8a0b96927c46bc26
++28 9f894a257ee520fe
++29 d4adfd502c673e68
++30 08684886e660f57a
++31 0912880683c262ff
++32 b006ae08659370b6
++33 de09f39ea74d32cd
++34 99d06a6a65fb7f39
++35 52ff9bc2a14f5030
++36 2f71f575cece930e
++37 63641d5758a914ac
++38 85941b6ec1bf2880
++39 732760cface77e0c
++40 00de974478a04fbd
++41 1769e4ea87762a18
++42 b15466e902cc172f
++43 1cc2ce21a2bd53dc
++44 26383e7a09f55492
++45 ad2b0a8cf2eba51f
++46 09028cdebaf1c1e0
++47 c1b5a2ccddfa85d7
++48 59be75a07575f332
++49 a35a0cad1b803b98
++50 2dad8f202a297325
++51 c0f9faea47c79532
++52 97a2aa1898a789e4
++53 a6ea053001d677ef
++54 6a3b6e1514e97c29
++55 ef05bacc89329852
++56 59ff1c4d2edb9dc3
++57 dc5d128261834fc4
++58 c4ebb77a1e885873
++59 a22978cf1e2d31a0
++60 cd6c8d195d0f3820
++61 0c79f884596df917
++62 d3f90c6d8986e1e8
++63 d1a7f0a26002bef6
++64 d0a978f9c18aa34d
++65 676c8d320957c022
++66 ffdabed34e49e449
++67 5264ce249a81106d
++68 fa26a4ada1abe2fc
++69 0ba98d69d6f4a25a
++70 bed8d1c98a28aed8
++71 e3f761638702c4cc
++72 29d6167632039ece
++73 d736f9f45ae9c25a
++74 978e400ea84bdd44
++75 b2c43b2efbf48c9c
++76 968576003e583081
++77 3e5ca9ad3f112411
++78 e4761ef02422f5ff
++79 4cd615465e5279fd
++80 2b8046a76d815cb2
++81 fb4f9e941e74031b
++82 20c08cbe495ff00b
++83 af8bb54b40a6e65f
++84 fd98614e70af7d26
++85 a65d156786583928
++86 a27b87e2136bf029
++87 3c6d4c31fd2e27d9
++88 a26fd241d10be7c0
++89 874cfba63140bab6
++90 fe43bca881b6aacf
++91 7511f0878b64ebe7
++92 5f15b33415e06986
++93 6b64f8d4d87535ff
++94 476c6b1288091ffa
++95 d8ba30c99df16532
++96 81a73c07beb75f94
++97 7afbb153b01cb2c8
++98 7c1e21df7fc10742
++99 901674bbf4975cb4
++100 6b3f29804ef5bad2
++101 4199b04ae6753153
++102 c6c62edf32f59536
++103 73a76b3e4fd3d1d0
++104 a4c99737688e54d0
++105 0f47b5bf65c88526
++106 5112c418e7db30eb
++107 bee2a3d20e3a4ab8
++108 0953ce0c3163cf00
++109 ed706c147afbea9f
++110 52edbeb3385788f3
++111 8798fa98cc126082
++112 f1621d6b1465e1cb
++113 ac88fb1838f3842f
++114 589920ffd6b46228
++115 4294e24445312aed
++116 4abf0921e37c75ee
++117 03dfca3778a80dc8
++118 b8150dc31453f1ff
++119 78e0aa12ea8e3336
++120 248e6b38e5ab3944
++121 e4179235d0b77770
++122 b3082901c2b12eb1
++123 3741e86c5bf9ecdd
++124 9604ae74381834cf
++125 9c9e332be0d49c30
++126 d434a46f67ad519c
++127 6f90e36dc8aad359
++128 3cbe4e7e5d5d520a
++129 18130beca5c59d2c
++130 41df561ea4eefcbf
++131 284abe7054b4aaf6
++132 2da665df28c19216
++133 615980e268051021
++134 ff0e548a83b8713c
++135 d084742e9ac2044e
++136 1601a9336632eda5
++137 aae3c69906402e57
++138 b0811dc0d5f52c99
++139 bc457cc1523ac502
++140 6fe45b532e768a5d
++141 b2cb89cd4bc235f1
++142 51ba3ec3930ce1d7
++143 44ab182bb694b815
++144 91d8007f80ebe5d7
++145 04e3b66fa1c57d38
++146 d71fe3a5543da8d7
++147 fe530a72143a2650
++148 82c5611f6174c9a9
++149 414f760f21c907d7
++150 19c6f237024d4196
++151 bca10b2f03273e8c
++152 4124d2a251ee4a7d
++153 6ef433e9d5ec98dc
++154 e16be9108c0095f6
++155 8996f7eaa5eb8b0d
++156 d1967ecfc381c092
++157 b79ba339e33d785b
++158 58e4bdc4d3252f5a
++159 42c746141a425c8a
++160 bde45429e46d67b5
++161 4f0434c5e886522d
++162 da1b02d83474f14b
++163 7d552c8cf55f8d7f
++164 6e37f1cd7067cfff
++165 fc7676195553da9a
++166 e5b63523015cbc2b
++167 a21c65854d973d26
++168 913f55c37c458a31
++169 7c08832c77e9154e
++170 ecadb58e8bd919e5
++171 e901d792b93027b2
++172 3c6e5630915ebed6
++173 48e790db614f3e4e
++174 49a7f2585bc7325d
++175 e3560f20befe0ba5
++176 c776e9b3584b86eb
++177 421f76367b385ab6
++178 97cb867f98e68b0b
++179 9b95653d390d4000
++180 1dc5973ddb0b11cb
++181 ca7d9ac12b0919ec
++182 c2b804c712ffeb46
++183 8ec0acedfe9dad7d
++184 db239f838e182b12
++185 520bf1579cfc0b86
++186 197fbe02a32cb085
++187 9be7a6c45ab0bb08
++188 38b331d14cc4b714
++189 e9ec1e6f5f87c57d
++190 4de12094289a3f8e
++191 be1f34f617e22095
++192 42db96957590504b
++193 c1407bdd0a7b30d8
++194 c10162624ad2f4a5
++195 4ffed3f9196abdeb
++196 41c80512282798e1
++197 d2225e5e767ff5fc
++198 3f0cf0779927e405
++199 ccb866ebe7854bae
++200 88d84f40bb246cac
++201 aefe1c3c727dc4d0
++202 562e75d9fc69053e
++203 82b226a736d3b4ea
++204 0b4fce7754511a95
++205 382abfdb0df75798
++206 7813b05b5c766fc6
++207 d41068d842f29ff2
++208 2939253d2aeccffb
++209 fc56088247873d36
++210 c57d6895e46f9092
++211 73cd6fb0a5fbfa69
++212 ffd437d85e4f521d
++213 41afebe047c3c67b
++214 11a7707fe907836f
++215 9ec428cd0932ac6b
++216 41645168e32aac2a
++217 44a8c7679c54e513
++218 fa38d93efe47a8e2
++219 e3999ee31f371fb4
++220 6e22ade2dfd75aee
++221 721010f1c88b1648
++222 7f13c8beabe0fa6e
++223 1eb8aa286893eab0
++224 3ec864a199195443
++225 31418f4526604850
++226 e1f7f9da34774a45
++227 74deffff0c32272b
++228 64999c82d795d202
++229 0e39203b34898d96
++230 f5a74bd1ee23b7a6
++231 c2f345346a636813
++232 b2fe7cc79147600a
++233 2c4f17974af60cb9
++234 f4dc87b15e441305
++235 56dee5b4755ddc30
++236 1d39bf00c8df1398
++237 926d183edbc8ec46
++238 b5c9b5ce437badf8
++239 de77887896323d45
++240 80021cc044fe51be
++241 58645918e26b2802
++242 7f42ef356017c3f7
++243 901b4fb40521227d
++244 1006e31c87391f61
++245 2797fc3a13e7de97
++246 ab0e90a794cb415f
++247 187a91a1db49e4f3
++248 f345fb466dd5bdc9
++249 d5ac749d5f04770f
++250 14db982ded8bbba8
++251 ef58445fa65f2c14
++252 69bab0d433848709
++253 635053bc6d7a263d
++254 8428b72bead39c9c
++255 1633159da9eb71a3
++256 4620edb86ee776c4
++257 73c0fbbc786e1e5a
++258 3347e90f478a9b6e
++259 cb37d541f3dd0f1b
++260 f2a186681659c490
++261 33d9137c8c1c2533
++262 e9c6cabf88456970
++263 78a319b1681758a5
++264 bb95db828eca671d
++265 555184b696410ac0
++266 cad0507609cfbf6a
++267 d7b40e4a87076887
++268 d2f26cfcf67336e4
++269 353a653bcf42f2b2
++270 9d8ef2990eb06645
++271 666e9b0f60e2cf6e
++272 c5fb2afdd449200d
++273 a7ced2989697c412
++274 0ce0d3d1264ed0b6
++275 1c3e117558226ec0
++276 dca0a9720aabfc5f
++277 d66a9046b12a2ea4
++278 45201aab030591a3
++279 7e4270ba4f84b229
++280 36178005ca06068e
++281 9301e35879b215f9
++282 57000bb62f0de308
++283 a3b22e8bf742f424
++284 49fdb743d5cb0d34
++285 6892d923943ec84e
++286 a863ed70708d3def
++287 ef9117e6139278d0
++288 53c173bc4f8e6130
++289 72ac0f8e38b1f1cb
++290 390ec8bcfad57d30
++291 eb3e35e4e7ec21a2
++292 ac7038d73daa57ba
++293 fcaea085fc000f7e
++294 984d5fc26387763b
++295 22024745a5069445
++296 3f0ebceef344b1e7
++297 0627bfc3368d8724
++298 3f9b6171445be422
++299 25791bdd9dd80317
++300 2a2b08cfd8f0b7ae
++301 abecea38abda47ff
++302 7af484645357c896
++303 1161e2630550c274
++304 74d661ba43fb88c9
++305 c569478790f4d512
++306 f63a1d77d1239b33
++307 52ce82407ae940e4
++308 6fc7dc14bd5ad028
++309 d929792a530cf46f
++310 3a334269b70c817a
++311 2a43f0c2cd5412b3
++312 5d605f484792dd0c
++313 a152bcc357dea032
++314 a1d1210dfc05d1cc
++315 44ec7e3a35a919ca
++316 2185409150e53170
++317 95c991a0b4e1ac89
++318 45a14dd885aa7abc
++319 8de1229ced638543
++320 ffb38def80ca9c32
++321 ac739c4b44935281
++322 113ae86b33d2e044
++323 a0cc118867240461
++324 910cd882e1048bd8
++325 87f9155f2371a0b7
++326 24930dc62037c8c2
++327 45a220241e09d15a
++328 0806a5bdb2c6ae01
++329 da4bec4ccb449db8
++330 b39692205832fa19
++331 85d089189cb9eaa1
++332 8db61abbc4c6ee95
++333 c9ecf2987e26cceb
++334 3427bf1fce005910
++335 56ee5561ebcbf2d3
++336 8feb041297a43ff8
++337 3787edd6c607d9df
++338 8f1a0c5f482404f3
++339 0d68e74f2d7486dd
++340 c10fb2fcb9b2b8fe
++341 9f8e0bb2266fffff
++342 7f564671e07e444f
++343 fe7e135df50c1719
++344 cebf1b7a66dc76ed
++345 9f7c194795ba988c
++346 af1a9d5dd4b6b81a
++347 adbbe2f53927378f
++348 c2bb3f56a7410586
++349 5cec2b5882e729c0
++350 1e030291a5665b6a
++351 211514441f10a104
++352 3fa9e18c2787397e
++353 ff94936d748c1c05
++354 e52b108b1f1e7292
++355 2cd81f8ee857242f
++356 ee729c1374e06dc3
++357 bd6786e67092c596
++358 b3965a9f0f462e03
++359 3620184708bed000
++360 24ac9ac36e536b44
++361 8fd3f521d35a7189
++362 493526b4db491b7d
++363 9bede8711bf74691
++364 14543671e6932a8f
++365 650a3c33984c0ef8
++366 c81db743024d411b
++367 5dfb46ad10a73b6d
++368 7bcdaf1c1340f9c6
++369 90380631f14a4b02
++370 907403d746fcceff
++371 29806ab7492fff5c
++372 d0ba60f618fa69f7
++373 2c72d0c215e50b04
++374 b5039fc441195db5
++375 37d43d897b0c1c5a
++376 64eda92653409ede
++377 b2ade272d5b493c2
++378 fc463aa88f4fecb1
++379 6ec25cd2364fefac
++380 37d6b88ddb7dc3a7
++381 10e904385561b2c2
++382 f89501fe3a48aeac
++383 60bed22fe5f5a8f3
++384 6ceee192322a84cc
++385 a8ac954c78d0976e
++386 f4abfd768143baee
++387 e4854ddb15ef4e34
++388 eefa9dfd68e2aa64
++389 1e2f8b02b4c5b479
++390 94e2a0d3641a1382
++391 cd3df3d7a67a8add
++392 a93b20cd5953c2f3
++393 8e207ea86d3aa32a
++394 8408d78f49cfdc56
++395 019ebd0e6e7a89a1
++396 fc99a8623c97f547
++397 fe27f2fa8f2a5a29
++398 435c9b4213263b1c
++399 be3e0342afb70530
++400 c1986749b36ebdc0
++401 d19e864e083088a5
++402 1100d6a8d2236e0b
++403 c8665b0770c9366e
++404 450de7da709e18df
++405 5a73f47a3ce2c9f2
++406 a2d40d4e5fb86484
++407 bd7d184c784d59f0
++408 1a4069359a794f9b
++409 a698647d6a76d775
++410 66dba45aaaa6359b
++411 a72240ffb94ff539
++412 68f06d444bbe5190
++413 b1d7881ac0013a77
++414 51d344e396c37411
++415 1e6925526a6b5b91
++416 2e75db072682cac5
++417 461805df97cdbe1e
++418 21b523babf8e1329
++419 d09bec30db1fdacd
++420 f13bca9b33319721
++421 29d4dc26f67cb418
++422 95b3f49aab894181
++423 cc64de03332a47d0
++424 eafe6a887851045a
++425 0dca442a3cffcc19
++426 9f88b2d230996dd8
++427 c15ad9abec3ebf06
++428 fed343d69a3c2328
++429 52d54b9ebfd31fbc
++430 d94d42dc4e974c9a
++431 45e7962fce591a51
++432 a6d54928d9214b61
++433 d5efb5d0a9a7725b
++434 8371d9a970685725
++435 d711b08bc6ba0d8d
++436 3a34131652f9b825
++437 9186edb24d36b360
++438 fe9725718945506d
++439 ee7ddc090b0e5e8c
++440 a1317a2b60f9b638
++441 ae4d065aca27dc2d
++442 4276222a0400430c
++443 9015868bbea9619d
++444 0a79bfa056e6630d
++445 3850201f240baf19
++446 7237b55272ea0671
++447 d1e1704434c700c9
++448 f3db98affd901d57
++449 cd2a1b14c875016e
++450 e114518a2e7b3d5c
++451 7fa91b8b1539f9d4
++452 eb7f84c5242a2d28
++453 06facdc83616a20b
++454 acdfe89c178402b7
++455 3b152c0f35750342
++456 8964071d762ed44c
++457 ecc8f0b7ca9766c3
++458 5adb0fec386b7350
++459 315f90c4520a752d
++460 90f976060424d69e
++461 9d88d2397b644daa
++462 8bc38b6d7d1201b5
++463 55599f84d89c325f
++464 3b053784f32b6977
++465 6f857f4d5f679fb1
++466 5591600167047764
++467 b2e944e892244c9e
++468 f905323ca104d884
++469 31db5ab65b3267d1
++470 f2250a04986fc687
++471 f5b051a95efa14ca
++472 277b0c188b075825
++473 2b62b2ae81dc5010
++474 a28060cf8370968d
++475 d3899c4b6236056c
++476 af3056492061ddbf
++477 a31ce4a4e6ee30d9
++478 c261573eabb1a507
++479 dfa1b847dcdba22e
++480 82b89119346dfced
++481 cd428609744043e4
++482 d5eee47061d92d08
++483 46a9a09dff3bd8ae
++484 04cd736d8d9f8862
++485 4d43933efa9cfc35
++486 adfc7d74d0a76662
++487 b19b08b6d8df9028
++488 524a3d689cde8d87
++489 6167d66e22cf5543
++490 9a455da2aa4f8b34
++491 958193e23c7f88a8
++492 49776fc243f64fe4
++493 43faaf727d71cba5
++494 20e2bdf0a98852ce
++495 439d57208cd3a6e9
++496 2ceabceaaf06edc3
++497 8692590e37f34491
++498 08e5d5472791ee2a
++499 08fe725eaa2965ed
++500 e553e15d1b93bc6e
++501 bae431e132763e1f
++502 f5796f554ce52569
++503 4d033b008f1d1a8b
++504 32c306f5347ec10e
++505 29d43d5adc2e635f
++506 2a61522db4db2cf2
++507 1d1d55054905667a
++508 ab3a0d63776bd9e0
++509 0a0aee1e46f11997
++510 f12e3ad0641cfcdc
++511 d0f6bab6c45beedc
++512 7940d6f94579350d
++513 7a1133c1fb64614c
++514 fb2ad1d4b199576b
++515 82440402afaae40a
++516 d46aa6fdc7ba8eda
++517 bb595589d740d316
++518 f29426d7a718ea46
++519 384249dbf75ae224
++520 96ec582ba1381df3
++521 d0aeef102f875ff4
++522 721b031ee9850939
++523 b889301601e6675b
++524 418d76f7f008102c
++525 7856b0985559ed2d
++526 a90997abc40513bd
++527 a6715bd0784bd97b
++528 ad1c80160a0bd971
++529 80395426a537951e
++530 d7555828f454e621
++531 f2d1149fe149e71c
++532 6fd982cd8aad0276
++533 7da9030361eb9789
++534 cf9c82febda1fa99
++535 48b352d274dab176
++536 193c057f158693a9
++537 c1a9d7403d01a9b0
++538 75d8b6ba1604eb4e
++539 c9c89965e28e5405
++540 a30a992812a194fe
++541 cf4de03f56202382
++542 08503b96f47147e8
++543 25f166c6c986cd0b
++544 99f506a6fdb074ea
++545 75c0098c9d7e784d
++546 bb3c3b2aeb5cb833
++547 0fa79710e5ca209a
++548 78d393d92099ffc3
++549 cc7017cf44a24300
++550 13cb31eed97e66e4
++551 1d4358d485342ea4
++552 561c3606f59034ab
++553 3e053f88177fe025
++554 b66b6f3831fcc74f
++555 474ffbf017eef19f
++556 94c9db7931fc8b35
++557 4ca6e5d5d093fa24
++558 855d73158cc795b3
++559 e48a3f058865d249
++560 b99d72c3fcb45f3b
++561 509048cee17e9eab
++562 6cbb276252492bcb
++563 00018a591d22f4ba
++564 bc2f124e8764f709
++565 3d3d1c0e3ed011ca
++566 1ccae835eace2baa
++567 a0cc54e78d0cb885
++568 044125c45a6d5165
++569 5d946cede41bdca0
++570 fc409b980e75d1e0
++571 d071eb6f806626b0
++572 1c16ee5b5f13fa6f
++573 7e4ca572c25484f4
++574 4de7fe2fe684341d
++575 86572abc369b2066
++576 346172ab111566dd
++577 54f504b68393b4f3
++578 ed63a29f4f910fd6
++579 9bf73f2cba6d5e98
++580 b8e0d13346fbab53
++581 6f5cc7ee125ce2db
++582 9e423f9b9b6abbf3
++583 8bec46c875f1a465
++584 bb6733f95e786306
++585 68ac2e4b27915c7e
++586 10fab2e49500aeaa
++587 4986fdefd6ae099c
++588 86d5077ca6b0f5f1
++589 c5a6979238b1d044
++590 e383bc9eb3cc13e7
++591 c6cbb9f9db16bc6d
++592 9722573a33dbb430
++593 dc6f7540a19fa64b
++594 aabe816400b98b2f
++595 3cd08e601d11b2d0
++596 777c28a5b4250cf8
++597 b76ef9e584dee8f9
++598 7c1cec827603a4b1
++599 bff7b86ee3148b97
++600 c392a43e9c6bc68c
++601 6e6c8dba7694271b
++602 e18d3f7067564044
++603 4b2c2e694ff6d078
++604 57c0cd6ce08998fa
++605 9b5e3e725c41785b
++606 c189b646048f2119
++607 95d83d042859016b
++608 50a1115307a06203
++609 80fcb3ff3f8014f8
++610 3ef615e61708f885
++611 825cfa75925ed98b
++612 f96770e02b2ab7b7
++613 e0f837d77e439d7b
++614 917d7b7eef02e276
++615 7696de55af2e9f30
++616 09f502b16533ae66
++617 0ebc1161f389baf1
++618 a4e899bfe2538415
++619 803211c4e1687832
++620 197b31a279bfac58
++621 f9d9082ccd93b087
++622 dc346ca1fa26b1bb
++623 0437524dc39b344b
++624 c7d1f894360d1956
++625 589f9716d1243bd0
++626 8b6ccb9459981a9e
++627 e944cfb759969330
++628 e7bd29b4276de2fd
++629 32bcdd67f4c1ec98
++630 0edba5e2775bc5fc
++631 11868c1cb041c2f6
++632 9826dc98753ca5d3
++633 0f45243fb1a178ae
++634 c71704f0d609e62d
++635 16f4eb2ec246c0b7
++636 6d2cf5237cdb26cd
++637 531defd67b335bd7
++638 68c70aced968773d
++639 2a518b54e7d1ff04
++640 2e92453ea32a408e
++641 5c1a4a3092794d06
++642 e0ce75303b0bf92a
++643 cf195e4b9dc8288a
++644 9f9422e06886e09d
++645 6861ebef464ba1c7
++646 0d84a4086a26cc3a
++647 b29412818986466d
++648 afa00fb423f6c6bb
++649 fa3ba3ee7d372067
++650 0b6462371486f526
++651 364319ff40fd9db1
++652 132d8da75aa9d016
++653 b6e515ca3ad9d89e
++654 55d98c1201b4680a
++655 add4f1c72435311a
++656 c2bb363181b8095d
++657 0573bfe373f50cb5
++658 93b7c0515ae1c6e9
++659 4d1e5262fc8eb088
++660 125dea922051f8b3
++661 2bd03b3302d04556
++662 a5a9985f255d6009
++663 9c8e11a5938d023c
++664 2d8d6fc025e3bb7c
++665 0929b227e62e10de
++666 2abe9fed3650f293
++667 02fa0717d633dedc
++668 acb511606afee784
++669 25ffcae38e08b4fa
++670 39f547e407cd9a41
++671 15c1f9cc0fadf77f
++672 d61d79e9d7bdb229
++673 be0225a31d69fd3d
++674 b067746c417cb622
++675 02f1014eae774848
++676 88408e9364b08555
++677 d3755d881273ea09
++678 1da8032ede27b55f
++679 0771aa9ca9eb36fa
++680 bf1f5bf391906f87
++681 049307b30b1284d5
++682 56ed16f0876e53a7
++683 13c120b14c23a877
++684 022d18989eb6fe6d
++685 b6219e0b005c2991
++686 f3abe74ffcb024f7
++687 c8c09c91932f00da
++688 c09183995f00cfe7
++689 b9111cb367379ee8
++690 7516763a61def435
++691 edde906cceed6bde
++692 bce4bfd55ac80e25
++693 58deaeee83a779a6
++694 4b4f2ee6e310b79a
++695 24cdb9c4df3a6046
++696 c13ffe1f1ee07cef
++697 a9451d6039c1ec14
++698 526be12c959e8973
++699 cee68018e37872f0
++700 40b75de81bff919a
++701 4e977d7c31ff7018
++702 9d1219d233acea1e
++703 2b6b985f4125f3a0
++704 ea718087baf13ab6
++705 2029cdfafd3bd721
++706 cf988d8beb1763b0
++707 9963873add6223c6
++708 dbac3bab0cb1378c
++709 8ffb4d14bbeea4a5
++710 d93681916b287270
++711 7260c8abf0943828
++712 184a64d7acdfeeaf
++713 bae02bcaedace18a
++714 4ee1fcb534985e69
++715 24cf35f36308af19
++716 655b4c43633f50ea
++717 2e7bf2d68d64b26e
++718 bbf3e45efd9d6065
++719 01514ede6b4aa4a5
++720 0f4ff36e2c6eb2b3
++721 eb82c2d20ad743db
++722 96078965423dc321
++723 60772ff8e19e40c7
++724 0637985efb1dc768
++725 6c88fde59fcf69c9
++726 1d439100980632ab
++727 b1d587d9dac1ab8b
++728 00c0cbc6e07a7809
++729 da9f9c4f681d20e9
++730 995cbf09e64d93c9
++731 38a0ef704b03bf20
++732 55989b96d4a913c4
++733 18522ea848849efe
++734 f98186e59ec61e04
++735 b7948bb3d3599b6a
++736 d7895e9e5a94c70e
++737 c9bfc11d9b51ea65
++738 d9049e05a495eec8
++739 b33fe35293353e78
++740 ffcfd5b9cef93d4a
++741 1a014d1557b31100
++742 daa588274005f78e
++743 5ff5e8fe0c20c8b0
++744 58c7d0fb80e1ab36
++745 59bc3aaf40c1834a
++746 55933809574fe886
++747 acd5fd89be80577b
++748 6c2a1bf860131a19
++749 839366b91843f887
++750 7083402810313fc0
++751 8d64acbf58b55e2f
++752 f54e0ecf70094c40
++753 9c6b84e0f15e8633
++754 e36dd72ffe00d050
++755 786594ba14c48ab6
++756 e85d283a602cc9af
++757 1bcb6a189b4781f5
++758 330822b6fb3021fd
++759 56d505686ecd279a
++760 93038415344967f3
++761 171d1fc302db35ac
++762 4b72258444d6b8f6
++763 d16e1af3e187b309
++764 2156f625f25f0a8f
++765 cdc5dbb06fc937ce
++766 10e6ee2e5cf50334
++767 765355784327920b
++768 4ba4cd78c05cabb3
++769 b91ec76cfaef5bdd
++770 2398af13595c5f2c
++771 77c876084374a3b5
++772 6b6bbf23957c773f
++773 4412f623b472b1a5
++774 6634f1196f6df0b4
++775 3fa24ae42a1c41e5
++776 9dbc88119673c6d9
++777 a619ba9604354c52
++778 f77b60aef510ad6e
++779 917ebe1cf24fced6
++780 e1250b89aa07a7fb
++781 8d4539b0eb9c5cbb
++782 8022d058e0c85060
++783 8dd2744602c4917f
++784 96a2ca58e3972d76
++785 122aa5081cb210b8
++786 d7b7b05f5038df9d
++787 ca17dbb23fd3e9c1
++788 35cb7820da949339
++789 0821a813e4257296
++790 af78f384fccbb8b9
++791 82f317bfb1e2d487
++792 658ef4809b981c64
++793 7767444d5da5e26c
++794 89a0d4b3ec8ed2e6
++795 4716f5ae7f06fb52
++796 c0e499641bece75c
++797 729170426766b841
++798 47b626b02e4d93b1
++799 1bf0bb7134ed5104
++800 98fa9ba6176cad1d
++801 f3b4a4c61061d6ae
++802 32e1ab24b2a5239f
++803 80c2b791f2457146
++804 af8326d609d27d16
++805 5129771dc7ba0b09
++806 cf60e364c7eca3ca
++807 72592ff9db65cd6a
++808 af29dd6c8dc6c870
++809 db74abbe5798e185
++810 885840a9cf1955b1
++811 c0edf429bb3d28b4
++812 522c31755e22d929
++813 28c2d70df71f7bb4
++814 2a77c2051c997e7e
++815 c58714cb745b91f3
++816 00e58616fcfb3da2
++817 d1c1e909937be305
++818 79b5fc52d12954d9
++819 e38bd777289dd02f
++820 f9e9f39364377b51
++821 5ab28566c7558ea6
++822 a7d231a8dfc9ddf2
++823 fad0ddde6cfd179e
++824 678b5361c4247b8d
++825 bea4c9601866a033
++826 9124b373f241c883
++827 d3daa3ec13c45a2c
++828 40d77c7917cbc2c5
++829 7ec0d4bb26f7fc37
++830 3c2a5aa12d4be3a7
++831 43a670eb61814c07
++832 40a12603184cf5c2
++833 e8206412eb4f2520
++834 5885d1bb83ceb22a
++835 38ba7e1daae0e245
++836 d1a8c4e015d592ad
++837 d2b9a0ee7d9b87f0
++838 78fec217a49af43e
++839 022e05f953ce6e0a
++840 fbf28cfe9aa6ae28
++841 a2e28b1bcabc7b73
++842 4813665bed7b8196
++843 a06140766a6cd36c
++844 528f993dd962b997
++845 21eb0e85b2a3de05
++846 4714a7d7257515ac
++847 e6e28ebd71d061c5
++848 950af335188bb276
++849 a8c381336c11518a
++850 25c7fbc39f0d51a0
++851 dd80039532c77c33
++852 7536b6917fd9be4b
++853 0ef8bfc4bdac9999
++854 4f08ebacbd6a28d7
++855 28987a52c0b9cee6
++856 fd3a7d079c0cd849
++857 eca14dfeafb32a85
++858 3ed4774359596174
++859 8560e2af67806dec
++860 f202fbf2526a20c7
++861 4c0ee7a4d3c00ea4
++862 f299eda366840609
++863 8af5c115fe9aeb31
++864 d1e49d6a7f4084d7
++865 150aaea96c6e63f6
++866 ce15ab6d6fa8fd74
++867 1703a3dab8ab1407
++868 82f1d4540f21d932
++869 bcdfcdb6fd0d96a2
++870 8aefd9564fcbc6b4
++871 600167e4ad9fe4bf
++872 644bf727f1f34b37
++873 72cb55c2587af613
++874 1869c61716a06dd7
++875 8a56cc2789d4b27d
++876 150ac6d396e35bc8
++877 10758ea2b79c062a
++878 3449a8a6c9cbb31f
++879 12758705a07d8b7b
++880 5996b9770b30ceff
++881 0da1434310c4097c
++882 e114d23c0553e1e7
++883 2652d7c3ece3c372
++884 b05ebae001811ec0
++885 3984369097e23bbd
++886 556302006a4aa073
++887 4f2a969f283376ae
++888 1de28990523d2159
++889 a1ca1de146d8d612
++890 887583167cff250b
++891 b0cd9eecf2bf6929
++892 7299726d5a9489b3
++893 5aad48a6580494e9
++894 839cf3963403b487
++895 fb5a2314ff308df1
++896 18d59791a0a47e07
++897 7bdfae6582d30b0f
++898 01c1933984953778
++899 7b24a99e8c9f25c7
++900 dbee15c986737fcd
++901 7d51df255baf2716
++902 0921cecf9553f36a
++903 dbbd0f779f5894dc
++904 13c510a257380591
++905 b9c79823850e97c3
++906 4a6b090befb9707d
++907 ef76bbebdbe2569c
++908 7d7e65da823fb19a
++909 6dc45445a0ffe628
++910 e7fea8e241581748
++911 e8dccf347f537943
++912 921ce720400d33ea
++913 966b00965d721212
++914 92e0151064e4c002
++915 0ecbccb5a5ac8ffe
++916 65f6cc7c77deac61
++917 6b5361db521e9edb
++918 1bb972a21525e6ee
++919 0184569813649bc6
++920 913c67272ad131d8
++921 c424f4dbef7d6852
++922 b311d07bfe3c9e0c
++923 6280f9803b51ed68
++924 77a2197deeb3b367
++925 976824ed4d60288d
++926 9a0b4eebdf5cdf75
++927 bc0a8243475ac935
++928 0ddda2d5388a9081
++929 7828cdf4cf2f16ae
++930 a84c9d319a51b84c
++931 bf78aa0e40eebc6c
++932 447a2f367939d068
++933 c3a8236e784d6156
++934 0e5b906db0a0b51d
++935 018b8b1dd75ff194
++936 9afc78e05d7e86ca
++937 ba40303bcd26a621
++938 5472e4c869625b3c
++939 6d1ef0f98ba5fdc9
++940 d04cea50392020f2
++941 5a1c0279760f76ff
++942 b6e08a2be431dbb2
++943 7662f00c6bcb2c4c
++944 59d43e03562af223
++945 f412c85d7b6a258e
++946 33190d70f0f38deb
++947 70341536113a30d7
++948 df5e7a8fa6be99c8
++949 d7dc1be5030ae198
++950 5b3d509a8ef527be
++951 8067e243227e10b9
++952 ce0077e013415fbb
++953 3cd688723df935bf
++954 feb3ff6bb63ac6ba
++955 8453b5f9206ffc74
++956 06033350ea68b9d2
++957 f1ca89352e9158db
++958 1fb88a8d3b888d7d
++959 9db03d5f1df9ad17
++960 98e01c66e2b9abd9
++961 84c37d547bb880fa
++962 342a3d2bd5cec6bd
++963 921ca41c6d17e53b
++964 3b1ff6382f304eb1
++965 f176ab2c6e394cf0
++966 75492a61f8276dd5
++967 3ae26a5c034cf4de
++968 42463d1a85ba7193
++969 50c3854268ffa51d
++970 6f63791877899273
++971 24ec3114dcfc5a0a
++972 46583fe345aeb529
++973 e1519c765fe699d2
++974 735ed07264431034
++975 54697ae328ee93fd
++976 60ee379dd9abf6de
++977 201b2501c59deffa
++978 7eee5d5b04d3b542
++979 e93246dbb0183546
++980 5c357a1ccf75fd85
++981 37ec0632aa111b47
++982 62ef57aa3840474d
++983 f5e70f1ca07dde07
++984 56e427d381630936
++985 4d956677323b283c
++986 fbf7a1c6833bcc40
++987 4b96e524a09121ec
++988 2b4bf0628b2e1cb7
++989 db43b0e284cf0a22
++990 02d7cf6c4d9b72b6
++991 ece29d0f4e718653
++992 4934db52dd52c84d
++993 414e9223fe858c59
++994 0d0ec128493b899c
++995 6c2709441ff9b7ee
++996 d90a09606088704e
++997 dc0c4f6f22b11b24
++998 ffe324dfe33c58b4
++999 5c61223dfd37064b
++1000 1065c2403b481246
++1001 8948d926f2d1d578
++1002 b277a40427dd927b
++1003 b3983993d419927a
++1004 4789e6931cc307db
++1005 12601d7be559cf16
++1006 fb4e4fb731fd9375
++1007 9501285373948fe8
++1008 79664a9408fcc279
++1009 10c2c564228e4b30
++1010 d3f56e76544adf1d
++1011 bcbce5be4b4b889d
++1012 9a5cf14ee9ee1662
++1013 8557e0070be61e96
++1014 d90cad8f3e77504d
++1015 b344d3db5ed475e6
++1016 2abc0be9367a05da
++1017 3de115bbd069ade9
++1018 cbca51f8e01878c8
++1019 a51fed4672b26a8d
++1020 713d6e1a84b76eed
++1021 a793bd3b84e9a779
++1022 4851aec312e9b937
++1023 d6438079b58d4aa5
++1024 dc7a033869772ad2
++1025 9d14dec3a63047e0
++1026 aa418c8c87aecfb2
++1027 410e769595792b6e
++1028 ebb81b5ca0679949
++1029 14fd2342b7d4c759
++1030 5c691c9b1e223bc6
++1031 d4f43ba1190a144b
++1032 b177d8eb0d9c9471
++1033 3b85841c640248bf
++1034 ff4f3278f1d26010
++1035 27b4637cabdcce06
++1036 b282412799aff1cf
++1037 9f0b21c417c11cff
++1038 b451d079f5bc6eab
++1039 e8f5e566a4747aa9
++1040 6919fb5c9bfefec1
++1041 b3aed869fc049e2d
++1042 10545e503e48849c
++1043 a8f05a8fd5dba05b
++1044 cad9b337c36caea9
++1045 2dedd93b9b83d282
++1046 feb28e6deadd4144
++1047 a26b6c7dee262924
++1048 f7d8bc2d7c649fa9
++1049 d29d5af9a7b44c14
++1050 c7f9d5832b0cca6a
++1051 c548b9879b8d9e68
++1052 5078e7b44822de4e
++1053 cd1fd4dd16694ff7
++1054 1324763151af1a4e
++1055 f9a9b9a63b1e9946
++1056 bdad9d2bb98d7678
++1057 3aca9a47e071d724
++1058 2519806cdbe55bc9
++1059 072312cec0fb2bf7
++1060 2d245d752406cfc4
++1061 5c18305db24a22c4
++1062 a91227debb8de304
++1063 9a4ee1a315afa9c8
++1064 16bb3c94bfa29a63
++1065 2ecce82bcb8764c4
++1066 d7a2d28763f2d244
++1067 c5b0c5448e2406be
++1068 e9b8e5ac1eff0a92
++1069 731d95615e47d5f7
++1070 2410d38174bb2c94
++1071 5cbb53c9bb2983f3
++1072 53c91f0a6e6580d1
++1073 d41b017ad3bafb1e
++1074 c29cfbb91d7fbedf
++1075 7bbf89bbc71b0bf7
++1076 c649edc6c41a9f40
++1077 e9e66379c95c3a6c
++1078 f5b98b5ec67abf3d
++1079 0a9f4e8337252fd6
++1080 f73d1fdab78d4acc
++1081 8c346f1df64e9109
++1082 f12c6e827f1bb582
++1083 72829f364c92d279
++1084 afc12e4e692b4cbf
++1085 081a0fc0765081df
++1086 7973f50cee07e315
++1087 cf814d6eb18c1446
++1088 6696193928c5c1d8
++1089 d4228aabe1b6c6dd
++1090 531c3727132f26e0
++1091 da407ac15c9e3ecf
++1092 82ed0cad87767451
++1093 29d48f7a65e11e14
++1094 32f84d1986001de9
++1095 87788d32175808d9
++1096 2e763a50f71dccd3
++1097 30a7e7e636afb0d5
++1098 dc61e66d36a7024b
++1099 36e5e36e5f4395a3
++1100 b21034deba8b2e39
++1101 ac80cc2c6d4f0ccf
++1102 737f3604610036dc
++1103 0f155803542b2d42
++1104 5fc512746e7f0aa1
++1105 9c414c2d1e5b9d4b
++1106 455a59c0bfd71cea
++1107 ac79ab3ccb571f74
++1108 9f2bb6fd61b42457
++1109 3b1ba500042ad374
++1110 15bf95cf83ff0f74
++1111 dfe7067dfb6a4823
++1112 cbe3c9bfac5dae94
++1113 38f676c6a56ad20c
++1114 f229e663ca2128e9
++1115 de2fb360885c96db
++1116 70b85ce454c8a5c1
++1117 7406e59e28808cf7
++1118 41801b2c9865377d
++1119 5acfe9f05d588245
++1120 1c671efe09a425f3
++1121 e4e4763c75ca5c72
++1122 d76bedbb100045a4
++1123 4603c066c6e6ef54
++1124 791a2ed383da9428
++1125 ca40a09b905f81e9
++1126 4c58e1e3f89e27b6
++1127 42e0311cdcc293b3
++1128 e0949b6b9106b6af
++1129 37d70069e813792a
++1130 b35eaa5743faaf9c
++1131 e1d99838f78c3cb1
++1132 404be7a130d1c6a5
++1133 c3b1891609512775
++1134 4379425d8ed063a3
++1135 6beb743e64f73fda
++1136 60c58d162478280b
++1137 963987e52413bd65
++1138 b756677cb3c9aaae
++1139 e103afbc5c07944c
++1140 6ed1c80a830751ca
++1141 9efea24694da2688
++1142 d0e5ca4ed48d97ad
++1143 f5d2cf2f7dead9fb
++1144 43e786ab2d645407
++1145 be26aff36336d187
++1146 b670dad2324445a9
++1147 b4bf93067944a4f8
++1148 42f8924fb707a57c
++1149 d4a25ae0b9f462d6
++1150 d53b79260f6fae2c
++1151 5284ebb9040b5615
++1152 01c333303a486a71
++1153 a5bb185997834134
++1154 89d4c0dd870930dc
++1155 69e49a68c2120fa1
++1156 9c9552d4abbc41f0
++1157 794f366953c24922
++1158 2859d14a76b5ba93
++1159 af0999c42271949a
++1160 1ccac3a394a7e29b
++1161 d2140adf110d72e0
++1162 270372f9329e37b3
++1163 59db075243da2283
++1164 c453c57c124e7c40
++1165 182a137404ebed5c
++1166 24a8042e5026b7d7
++1167 2a918847b82483f4
++1168 8d91d6922a2f697d
++1169 fc17370907437c5a
++1170 b44d4c41c57b0001
++1171 f7bc4acee585a3d7
++1172 a3063ba619061f19
++1173 54da223ecda36bbe
++1174 3d6e19a8064c6fe2
++1175 ee7d905ef02fee23
++1176 06d24cf88dfeee21
++1177 8ce41248be8aab88
++1178 868d98518e8c325b
++1179 f205fb927edc5765
++1180 5fe052fa7678c93e
++1181 ebfe492e6ac71a02
++1182 f63974f7c3804dae
++1183 9e744fe5435b3fe7
++1184 84aa6b56e8fad112
++1185 8a5c8300455e4fc3
++1186 17e4509bd98941df
++1187 3feadcf8fc5e877f
++1188 12bfe969339e0ab8
++1189 13a909af31043bc1
++1190 b277fbcb2bce074b
++1191 cef09bf56d3c1a14
++1192 b3d0ba0e31953c65
++1193 a405e714c654f761
++1194 879c17db7225f18b
++1195 d1a9521f83a5b518
++1196 f768b9c4b645addf
++1197 de494951cd8046ae
++1198 bd320c80d444f827
++1199 7a8dfea21701f81a
++1200 d8b88e9873b82dfc
++1201 d1731a02ccab050d
++1202 2d91df5a627d928f
++1203 43a200e959da1b07
++1204 5828e15bb0196b12
++1205 472a090c2ec43b8d
++1206 2c3b7a5f1ce845c5
++1207 221f68a10f7b84ff
++1208 4e6f3579d7491062
++1209 da7f405a552134fb
++1210 17762bbd5b3e6adb
++1211 db9be0f66c412f69
++1212 c427c316535e5ae6
++1213 0ea96aeee6737f1a
++1214 c5164a1ac641c2b4
++1215 c0cd78aa54101e34
++1216 8bc9dfc61a23df5e
++1217 03efcbd2e256bbf1
++1218 3ad007c4466fc1f5
++1219 925c45f25dec32c9
++1220 473c3036600d4120
++1221 8c0d1e7f2632c84c
++1222 c1071388aeaa06d2
++1223 3541b7b665d30489
++1224 91561c0bbf661c48
++1225 119fcfcd6b70119a
++1226 da0bed160c34db14
++1227 f02002a482faa638
++1228 c53c55d1c5f09681
++1229 39931ac3b29aeaaa
++1230 8e4871f6a34fce47
++1231 84baf180603e390a
++1232 ef68acfc9e90d2b6
++1233 a8c0b2521854fe89
++1234 87ec16cdf8e00c08
++1235 c505651032fac9fa
++1236 c29b085dc018304b
++1237 0daab5d2c515faa0
++1238 4f8685b1e9cad531
++1239 68e32c96c6e39943
++1240 468b8a2bf652f790
++1241 49acdb30f028c82c
++1242 bd20518b05968689
++1243 b8a477b51e499c87
++1244 8d9805ce360d5ba8
++1245 d0ef5061f000585f
++1246 99d4d48c680fd832
++1247 f2bf69ec4e060db0
++1248 37ac311e1333d784
++1249 b85680716285db14
++1250 33784fedb3cf24ab
++1251 3a0419c93f41584a
++1252 be51226860ffc14a
++1253 7fda83cd0e86f4f9
++1254 2eb04c0acc790ede
++1255 2eab4ac2cc6be0c1
++1256 982517a118cd768b
++1257 72829cee4231d2e1
++1258 e51464f458a44fea
++1259 6785b275ef641e4f
++1260 04bf56ad4c9e86cc
++1261 ae7fa14c7b9f397b
++1262 9d11f80e5d03a10a
++1263 46baa5120635593b
++1264 78c8419ca5aa1df0
++1265 2b4db395257817d8
++1266 3c87a963d8e6dbe4
++1267 622e14ccb13dfc2b
++1268 1bbbd864a35b746a
++1269 a39b06526e9b4e57
++1270 db22e947793dc6e2
++1271 157ecde72045ce4b
++1272 49889d57594e0737
++1273 b5bfc74b537e5219
++1274 a42a34fd0f2feeeb
++1275 3a60323d1a5832e6
++1276 6e8ff9124f4ed4ff
++1277 e9b69318ca0d1bc2
++1278 86a3f4f615e2333b
++1279 18608093c8a32367
++1280 e341f8e6dc696049
++1281 4026937d220c4242
++1282 527387dde9e51086
++1283 17b6b7a975133560
++1284 84bcbd27c84b73bd
++1285 02888eba0dde56ca
++1286 e281086ae04a83b4
++1287 ceb583b1f8a7d30a
++1288 834e11308f116d77
++1289 31a2719adf10ef6d
++1290 4b894c13ae78e8ea
++1291 4ff56a22a53d6e35
++1292 666a43d8f69d3bd2
++1293 c1c41f3fa0b67c0d
++1294 11f100262c15e567
++1295 da7dd41e652fdc00
++1296 1d14d81949c46369
++1297 2b80c2678aaeff26
++1298 3d1ba2fc7052ef1f
++1299 363ecacfbb289c4c
++1300 ca948ac09d183710
++1301 c8a461ed831530c6
++1302 d4cd6789f7a40386
++1303 0949eb621d28d495
++1304 470fa3c1c5ec9d56
++1305 549676581a487e0a
++1306 d8e780dabe76ff8c
++1307 ee4dd7ea16772c58
++1308 246a2acd3527b429
++1309 a129ebf972c074c3
++1310 a09ac706b5190b21
++1311 95e9016269ba2d0b
++1312 60a6bf140bdb44aa
++1313 7bf22be12abad7e7
++1314 21b1ede2193b570a
++1315 390c59e009bc1c28
++1316 f852ef8522bb3ce6
++1317 7f601e9ac4e9bf9e
++1318 16ebb69e217ace4d
++1319 8a064b7ed9e1cd77
++1320 4abf4f2712852582
++1321 6af56b864c306059
++1322 b803b68a25b04dd5
++1323 e8d749db777eb8ed
++1324 62ac81ddd6de17b9
++1325 96fb1f06aa368283
++1326 b8e215debbe16d59
++1327 9734670037c28e1d
++1328 959fec830679a305
++1329 beca6f6b5d072d34
++1330 ad6f14f9bd561626
++1331 a4cd1280591c33a5
++1332 b4017eb470d72d2f
++1333 1be97cb487d735e0
++1334 1b9e513fed0c0a9c
++1335 04d1a28955fdf99e
++1336 74b82de25e703326
++1337 df9e1e9b5e3254a8
++1338 b10090f061621193
++1339 43fc1a646186eb34
++1340 918b8fa9fe9093bd
++1341 092ea41ab8b77d59
++1342 f31968d26642025c
++1343 04119fb76c92380d
++1344 8a7e6f69c91c037d
++1345 4d0c90d20b1c7c2d
++1346 51e464d4d398750d
++1347 7dc0412d903383b3
++1348 62e8343694ac99e2
++1349 776a08bf252e748d
++1350 5d0d460fb12f7b16
++1351 f45434f72f8a1564
++1352 cef50d06a03b2b83
++1353 9ad29f8d40ccf5d2
++1354 d9a4f58df32f6e1a
++1355 eb542c5c5a3aa4d1
++1356 e9bdee64205bccd9
++1357 ba9e2cfcd74c1818
++1358 08c2467c2bdde493
++1359 6fce2d2d7bbfb107
++1360 313cd0af60249460
++1361 1ed49bc502626259
++1362 3f33a3a4c09a5d34
++1363 aca7954874f190fc
++1364 263f5ca3c7344da6
++1365 38a04b6435bd1a5b
++1366 13a964ce7d151d51
++1367 734ebc9fd9498320
++1368 6a6f3977a5ddf4f6
++1369 af97d472b68e0888
++1370 d7b63cb72914c576
++1371 ca077ecd7213c1c8
++1372 eb24f7d5881b0e76
++1373 3bd83515db20bde0
++1374 c71a9f31ae215a53
++1375 ee9579675b627de7
++1376 8e83a13d9596136b
++1377 8c0d076ff35a652d
++1378 f67d1338bc1f809c
++1379 b7738ac375b0ae9f
++1380 263e4f20e861033f
++1381 54616c997373f07e
++1382 ebb2c34b93d0864d
++1383 f262715f33c7ee10
++1384 a2e61b39884ef319
++1385 6d062b224bac0d81
++1386 5d3705ef48fa2e23
++1387 2e1d4f623ba0fad4
++1388 c2c40973ade3bc67
++1389 e7be48edcd63611c
++1390 71e3d77681ebdee6
++1391 1dc4aea90ff024e7
++1392 7ed04fb17e6dcb11
++1393 1911c5b196d5799f
++1394 e40117956b5c7170
++1395 512656b1427adbe6
++1396 11e1e0a032834af1
++1397 f6f23927c973b0cf
++1398 d7e3811d662c1366
++1399 84b140fd81487654
++1400 4efa1537912403d3
+
+--- SPEC / CONTEXT ---
+The original job briefing (the spec for this work):
+
+# Briefing — packet-plumber-v2-5.11-terminal-types (story 5.11 — diverse terminal types)
+
+- **Job id:** `packet-plumber-v2-5.11-terminal-types`
+- **Repo:** packet-plumber · **Base:** `v2` @ post-#65 merge head (HELD — Silas
+  resolves the exact sha at release; see the hold note below) ·
+  **Slug:** `v2-5.11-terminal-types`
+- **HOLD (Silas):** do NOT dispatch on receipt. Release trigger = the
+  `packet-plumber-terminal-assets-5.11` (#65) merge close-out — this job CONSUMES
+  its approved sprite sheet + manifest. If #65's Perkins loop drags, the 5.12
+  queue-swap stays your call. Record the hold on the row.
+- **Model policy:** `deepseek/deepseek-v4-flash` (execution role). Any
+  mega-minion you spawn launches with the same model — name it explicitly at
+  every spawn.
+- **Skills policy:** `gds-dev-story` (story execution) — the story card below IS
+  the spec; `project-context.md` for code conduct. Your own adversarial pass
+  uses `gds-code-review` layers (blind hunter + edge-case hunter).
+- **Perkins:** `pr_review: 1` (catalog + director + growth — canon surface).
+  **Loop ruling (user, 2026-08-17):** rounds run UNTIL APPROVED.
+- **Memory:** read `/Users/moses/code/docs/minion-field-notes.md` at start;
+  badge-out your field-notes shard per standing orders. On in-review, run
+  `ledger pr packet-plumber-v2-5.11-terminal-types <url>` yourself.
+- **Story card:** `_bmad-output/planning-artifacts/sprints/stories-v2.md` §Story
+  5.11 (relative to `/Users/moses/code/packet-plumber`). Read it + the design
+  spec `_bmad-output/implementation-artifacts/spec-traffic-model.md` BEFORE
+  designing.
+- **Assets in place:** #65 ships the lavish-APPROVED sprites (small-biz +
+  campus) in the sheet + manifest, with the palcheck gate. Your job wires them
+  into the GAME. The shapes are canon — do not re-render or restyle them.
+- **CI:** billing-blocked GH Actions — the LOCAL suite is ground truth;
+  `tools/ci-local.sh` (10 gates) must pass.
+
+## Mission — implement story 5.11 (homes trickle, campuses flood)
+
+**The goal:** the terminal roster gains class analogues — **residential /
+small-biz / campus** — each with a different, bounded demand profile (volume,
+throughput; per-terminal cap = `cap_fraction_permille × throughput ÷
+packet_bandwidth`, uniform per 5.9); a campus emits far more than a home. The
+terminal spectrum reads at a glance (distinct shapes — the #65 sprites).
+
+**Hard requirements (all pinned by the card):**
+
+1. **The CODE touch points the card names** (a new terminal role is a CODE
+   change — Perkins r1 W7): the `Terminal_Role` enum gains its variants
+   (`core/catalog.odin:22`) + `role_from_name` (`core/catalog.odin:1011`) + the
+   `collect_terminals` role selector (`core/flow.odin`) + the growth type-pick
+   (`core/growth.odin`). Name each in the PR.
+2. **The catalog roster.** `node_types.json` gains the new types: per-type
+   throughput/volume/cap fields (data-driven; playtest-tunable), era gating, and
+   the shape mapping to the #65 sprites. Era-gated type pick for growth.
+3. **Bounded, distinct demand.** Each type emits its own bounded profile
+   (campus >> home in volume AND cap); the 5.9 accumulator applies uniformly.
+   The director's typed source/sink selectors resolve against the new types.
+4. **Growth validity.** Every spawn of a new type satisfies `[E31]` validity +
+   the 5.6 placement separation; growth stays fully seed-derived
+   (derive-don't-record, no log entries).
+5. **Readable without color `[E9.1]`.** Distinct shape/icon per type — the
+   sprites do this; assert it in a golden: **a T2 frame with ALL THREE types
+   visible** (the card's named golden).
+6. **Replay + goldens.** Replay byte-identical `[E10]`; catalog fold → the
+   slice's deliberate T1/T2 re-bless (cause-documented, `cat.hash` proof).
+
+**Acceptance:**
+
+1. Card's Given/When/Then verified — the launchable reads true: homes trickle,
+   campuses flood, the roster reads as a spectrum.
+2. Full local suite green (`tools/ci-local.sh` 10/10); determinism pinned; the
+   all-three-types T2 golden added.
+3. PR body: the touch-point list (enum/selector/growth), the per-type profile
+   table (throughput/volume/cap + the math), the era gating, the re-bless cause
+   chain, citations `[ODN-5]` `[ODN-7]` `[E10]` `[E31]` `[E9.1]`.
+4. Story card status line updated in the same PR (the established pattern).
+
+**Scope guard:** the 5.11 wiring ONLY. No group bias (5.12), no QoS/balance
+changes beyond the per-type profile data, no new sprites (the #65 set is canon),
+no UI beyond what the roster needs. If a sprite gap appears (a type the sheet
+doesn't cover), FLAG it — never re-render canon on your own judgment.
+
+## Dispatch parameters
+
+```
+repo: packet-plumber
+repo_root: /Users/moses/code/packet-plumber
+slug: v2-5.11-terminal-types
+base: v2
+model: deepseek/deepseek-v4-flash
+pr_review: 1
+```
+
+The PR body (the implementing minion's claims — audit them):
+
+## Story 5.11 — Diverse terminal types (schools, offices, homes)
+
+The terminal roster gains its class analogues — **residential / small-biz / campus** — each with a different, bounded demand profile. A campus emits far more than a home; the roster reads as a spectrum. Slice 5B (E3.1/E2.1), systems: catalogs `[ODN-5]`, director `[ODN-7]`, growth (5.1 type pick).
+
+### The code touch points (the card's named list — a new terminal role is a CODE change)
+
+1. **`Terminal_Role` enum** (`core/catalog.odin:22`) — gains `Small_Biz` + `Campus`, **appended after the original pair** so the serialized role bytes (0/1/2) stay stable (the enum VALUE is a T1-visible byte, ODN-11).
+2. **`role_from_name`** (`core/catalog.odin`) — resolves `"small_biz"` / `"campus"` at catalog load.
+3. **`collect_terminals` role selector** (`core/flow.odin`) — role-generic by construction; the same scan now resolves the new roles (commented + pinned by `test_terminal_class_profiles`'s selector assertions).
+4. **The growth type-pick** (`core/growth.odin`) — `growth_terminal_roster` consumes the new types via the existing era-gated, TERMINAL-only, demand_weight-weighted draw (routers remain player-placed; every spawn E31-valid + 5.6-separated).
+5. **The #65 sprite wiring** (`app/render/sprites.odin`, `app/render/view.odin`) — role → sprite index + footprint: residential → house, small_biz → the small_biz sprite, campus → the campus sprite; the pre-sprite fallback also draws distinct primitive shapes (E9.1 even without the sheet).
+
+### The catalog roster (`data/node_types.json` `[ODN-5]` — appended at the END so existing type indices stay stable)
+
+Per-type profile = `throughput_units` (the cap input) + `demand_weight` (the volume attractor); the per-terminal cap is computed **uniformly** by the 5.9 accumulator: `cap = cap_fraction_permille × throughput ÷ packet_bandwidth` (500 permille, bandwidth 30).
+
+| type | era | throughput | accrue (milli/tick) | cap (pkts/tick) | burst ceiling | demand_weight |
+|---|---|---|---|---|---|---|
+| residential | 1 | 5 u/s | 83 | 0.083 | 1 (none) | 1 |
+| small_biz | 2 | 20 u/s | 333 | 0.333 (4× a home) | 1 (none) | 2 |
+| content_host | 3 | 80 u/s | 1333 | 1.333 | 2 | 1 |
+| **campus** | 3 | 150 u/s | 2500 | **2.5 (30× a home)** | 3 | 4 |
+
+Era gating: small_biz unlocks at era 2, campus at era 3 — `growth_terminal_roster` spawns the era-unlocked subset (era 3 = the full spectrum), pinned by `test_growth_era_gating`.
+
+### Bounded, distinct demand (`data/demand.json` — era 3 entries, `[ODN-7]`)
+
+- `email` from **small_biz** → residential, volume 1 (offices email; bounded by their 0.333 cap)
+- `streaming` from **campus** → residential, volume 1 (campuses flood; bounded by their 2.5 cap — the ×10 surge lands on campuses too, the honest aggregation event)
+- Entries whose role has **no live terminal spawn nothing and draw no rng** — every pre-5.11 fixture is untouched by construction (verified: all 32 existing `.log.bin` files differ from HEAD **only** in the 8-byte catalog_hash header field).
+- `test_terminal_class_profiles` pins the spectrum: campus fully served (≈window), campus > 10× home in volume, every terminal inside `cap×W + burst`, credit ≤ MAX, and the typed selectors never pick outside their role.
+
+### Readable without color `[E9.1]` — the all-three-types T2 golden
+
+New `demos/terminal_types.dem` (era 3, growth on, fixture + one small_biz + one campus): captures at 5000 ms and 30000 ms show the three classes as **distinct sprites** (house / office / campus — the #65 canon set, never re-rendered). Growth-born small_biz/campus join organically, each spawn E31-valid + min-separated (`test_growth_e31_validity` extended: 20 windows, both new types present + valid).
+
+### The deliberate re-bless (the slice's cause chain — 4.3 discipline)
+
+The catalog fold (`node_types.json` + `demand.json` change the folded bytes):
+
+- **Fold:** `66c4324a06058860 → 250679b1940fb87b`.
+- **Fold-only proof (boot):** the new tick-1 state dump under the new code, with the OLD hash spliced at the fold position (bytes 33..40), FNV-hashes to the OLD golden tick-1 **exactly** (`6c24e9cec592aece`); the un-spliced dump hashes to the blessed tick-1 (`ab1fb0d04a90026c`). The era-0/no-demand shift is the fold alone.
+- **Logs:** all **32 existing `.log.bin`** byte-verified — they differ from HEAD ONLY in the 8-byte catalog_hash header field (bytes 17-24). (The new `terminal_types.log.bin` joins the set.)
+- **T2 partition:** pixels moved **only** in `node_health` (10000 ms / 20000 ms) — the era-3 growth now spawns the new terminal classes + the era-3 demand sources from them (behavioral, cause-documented); the 50 ms frame (pre-growth) and **every other demo's frames are byte-identical** (the fold does not shift pixels).
+- **W9 re-pin** (`test_w9_surge_lands_under_caps`): the 5.9 surge-lands pin now counts the **streaming-capable crowd** (content_hosts + campuses, the 5.11 roster's honest evolution) with **per-type** burst ceilings + envelopes (the crowd floor 8, MIN_LAND, credit/rate bounds all re-verified from the sim). Input-parity manifests re-saved (the same fold).
+
+### Verification
+
+- `tools/ci-local.sh --mac`: **10/10 gates green** (lint, 193 core tests, app build, golden harness ×33 demos + replay gate, palcheck, W1 drift-rejection 233/233 mutations, preview cross-check, PP_DEBUG builds, stats replay-identity, input parity 24/24).
+- Story card status line updated in `stories-v2.md` (the established pattern).
+
+### Decisions & rationale
+
+- **Role/type index stability:** both the enum and the `node_types.json` array **append** the new entries. An earlier mid-list JSON insert shifted `content_host`/`router_basic`'s serialized type indices (T1-visible bytes) — caught by the fold-only proof and fixed; the final fold is pure.
+- **Profiles:** small_biz 20 u/s (4× a home, cap 0.333 — a middle rung with no burst, same latency discipline as homes), campus 150 u/s (the spec's cited example: cap 2.5 pkts/tick, ceiling 3 — the flood site).
+- **Era picks:** small_biz at era 2 (the office class arrives mid-progression), campus at era 3 (the streaming era). Eras 1/2 demand is deliberately UNCHANGED (dormant in the MVP — the era-FSM story owns their re-tune).
+- **`dc` sprite left unwired** — no catalog type maps to it; a future data-center role is its own story (flagged, never re-rendered canon).
+- **No 5.12 scope:** no group bias, no QoS/balance changes beyond the per-type profile data, no new sprites.
+
+--- YOUR LENS ---
+Test coverage analysis via traceability.
+
+For each behaviour change in the diff, trace to a test (new in the diff, or existing). Classify as FULL / PARTIAL / NONE coverage. Emit one finding per gap with severity:
+- blocker: P0 gap (critical path, happy + core error) OR P1 coverage <80%
+- warning: P1 gap at 80–89% OR P2 gap
+- note: P3 gap
+
+Blind-spot heuristics to check:
+- New/modified API endpoints without matching coverage
+- Auth/authz paths missing negative tests
+- Happy-path-only coverage where error handling is implied
+- New DB operations without integration coverage
+- New state transitions without boundary tests
+
+Test level mix (unit/integration/E2E): flag mismatches as findings.
+
+Finally, emit ONE additional finding representing the advisory gate:
+- title: "Advisory test gate: PASS" | "...CONCERNS" | "...FAIL"
+- category: "coverage-gate"
+- severity: PASS → note, CONCERNS → warning, FAIL → blocker
+- detail: rationale with coverage percentages
+- recommended_fix: what would raise the gate
+
+Gate thresholds:
+- PASS: P0 100%, P1 ≥90%, overall ≥80%
+- CONCERNS: P0 100%, P1 80–89%, overall ≥80%
+- FAIL: P0 <100%, or P1 <80%, or overall <80%
+
+--- OUTPUT ---
+Return ONE valid JSON array. Each element must match this schema exactly:
+{
+  "source": "<one of: blind | edge | acceptance | security | architecture | codebase | tests — use the value assigned to you>",
+  "severity": "blocker" | "warning" | "note",
+  "category": "<short tag, e.g. auth, boundary, coupling, coverage-gap>",
+  "title": "<one-line summary>",
+  "location": "<file:line | file:hunk | N/A>",
+  "evidence": "<the exact lines you READ from the file/diff that prove the claim, pasted verbatim. Use N/A ONLY for findings that have no possible code reference (e.g. a missing-spec concern). Do not paraphrase. Do not reconstruct from memory. If you cannot quote the lines, you have not done the work to file the finding.>",
+  "detail": "<why this is a problem, <=40 words>",
+  "recommended_fix": "<the change to apply, <=40 words>"
+}
+
+Output contract:
+- Write ONLY the JSON array (no prose, no markdown fencing, no preamble) to the file named in the FILE-OUTPUT line below using your file-writing tool, then stop.
+- Also return ONLY the JSON array as your final answer. Empty array [] is valid and expected when you find nothing.
+- Do not invent findings to fill a quota.
+
+ACCURACY MANDATE — this is the most important instruction in this prompt:
+
+NO claim you make will be taken at face value. Every finding you emit will be independently re-verified against the actual codebase before it reaches the report. Findings that fail verification are DISCARDED SILENTLY — they will not appear in the report, you will not be asked to defend them, you get no second chance.
+
+Therefore:
+- Open the file. Read the relevant lines. Do not guess from filenames, do not assume from similar-looking code, do not generalise from one example to another.
+- The evidence field must contain the EXACT lines you read. If you cannot paste them, you have not verified the issue and the finding does not belong in your output. A finding without locatable evidence is a hallucination — drop it before it leaves your output.
+- Hedging language ("might", "could", "possibly", "potentially") is a signal that you have not actually verified the issue. Either verify it and report it crisply, or do not report it.
+- Prefer fewer, well-grounded findings over many speculative ones. The user values accuracy over volume — an empty array is a fine and honest answer when nothing is wrong.
+
+FILE-OUTPUT: write ONLY your JSON array to the file
+/Users/moses/code/_bmad-output/perkins/packet-plumber-v2-5.11-terminal-types/r2/lens-out/tests-g4.json
+using your file-writing tool, then stop. (Your source value is: tests)

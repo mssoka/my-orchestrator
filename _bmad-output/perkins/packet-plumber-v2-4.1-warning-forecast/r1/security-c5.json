@@ -1,0 +1,22 @@
+[
+  {
+    "source": "security",
+    "severity": "warning",
+    "category": "input-validation",
+    "title": "Warnings lead ticks cast i32->u64 before the >0 fail-fast: a negative value wraps to ~2^64 and defeats the 'leads > 0' rule",
+    "location": "core/catalog.odin:532-534 (check at 541-543)",
+    "evidence": "b.warnings.node_strained_lead_ticks = u64(jint(wobj, \"node_strained_lead_ticks\", 0))\n\t\t\tb.warnings.node_critical_lead_ticks = u64(jint(wobj, \"node_critical_lead_ticks\", 0))\n\t\t\tb.warnings.pipe_pressure_lead_ticks = u64(jint(wobj, \"pipe_pressure_lead_ticks\", 0))\n\t\t}\n\t\tif b.warnings.node_amber_pct < 0 || ... \n\t\tif b.warnings.node_strained_lead_ticks == 0 || b.warnings.node_critical_lead_ticks == 0 ||\n\t\t\tb.warnings.pipe_pressure_lead_ticks == 0 {\n\t\t\treturn {\"balance.json\", \"warnings\", \"lead times must be > 0 (the FORGE #3 reaction-window surface)\"}\n\t\t}\n\nContrast, the set-piece parse the same file guards (core/catalog.odin:463-466):\n\t\t\t\t\t// tick fields are validated as i32 BEFORE the u64 casts — a\n\t\t\t\t\t// negative JSON value must reject, never wrap to ~2^64 (the\n\t\t\t\t\t// surge would silently never fire).\n\t\t\t\t\tif mult < 1 || st < 0 || dt < 1 || fl < 0 {",
+    "detail": "jint returns i32; u64(-5) wraps to 18446744073709551611 and passes the ==0 check, so the spec's 'Fail-fast validation: ... leads > 0' is bypassable. In warnings.odin:236-240 the wrapped lead makes window_start collapse to 0, so forecast rows appear from tick 0 and the UI reads a ~2^64 lead — the 30s telegraph inverts.",
+    "recommended_fix": "Validate each lead as i32 (reject < 0 or > i32 max) BEFORE the u64 cast, mirroring the set-piece guard (mult/st/dt/fl), or use jint_strict plus an explicit >0 check."
+  },
+  {
+    "source": "security",
+    "severity": "note",
+    "category": "input-validation",
+    "title": "Partial warnings block: missing node_amber_pct/pipe_amber_pct default to 0, pass the ladder check, and make every healthy node/pipe permanently Amber",
+    "location": "core/catalog.odin:528-539; core/warnings.odin:71-73",
+    "evidence": "if wobj, okw := obj[\"warnings\"].(json.Object); okw {\n\t\t\tb.warnings.node_amber_pct = jint(wobj, \"node_amber_pct\", 0)\n\t\t\tb.warnings.node_red_pct = jint(wobj, \"node_red_pct\", 0)\n\t\t\tb.warnings.pipe_amber_pct = jint(wobj, \"pipe_amber_pct\", 0)\n\t\t\tb.warnings.pipe_red_pct = jint(wobj, \"pipe_red_pct\", 0)\n...\n\t\tif b.warnings.node_amber_pct < 0 || b.warnings.node_red_pct <= b.warnings.node_amber_pct ||\n\t\t\tb.warnings.node_red_pct > 100 || b.warnings.pipe_amber_pct < 0 ||\n\t\t\tb.warnings.pipe_red_pct <= b.warnings.pipe_amber_pct || b.warnings.pipe_red_pct > 100 {\n\t\t\treturn {\"balance.json\", \"warnings\", \"strain ladder must satisfy 0 <= amber < red <= 100 (node + pipe)\"}\n\t\t}\n\ncore/warnings.odin:71-73:\nstrain_level :: proc(pct: i64, amber, red: i32) -> Strain_Level {\n\tif pct >= i64(red) do return .Red\n\tif pct >= i64(amber) do return .Amber",
+    "detail": "With node_amber_pct omitted (default 0) and node_red_pct 90, the ladder check passes (0 < 90 <= 100); strain_level(0, 0, 90) returns .Amber for a 0% healthy node, so every alive node/pipe raises Warning_Raised at tick 1 — a degenerate ladder slips the fail-fast.",
+    "recommended_fix": "Require explicit presence of all seven warnings fields (or amber >= 1) so a missing-field default of 0 cannot satisfy the ladder invariant."
+  }
+]
