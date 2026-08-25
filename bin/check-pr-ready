@@ -149,12 +149,24 @@ def main():
             fails.append(f"reviews lookup: {err}")
         else:
             rs = reviews.get("reviews") or []
-            approved = any(r.get("state") == "APPROVED" for r in rs)
-            perkins_approved = any(r.get("state") == "APPROVED" and "perkins" in (r.get("author", {}).get("login", "")).lower()
-                                  for r in rs)
-            changes_req = any(r.get("state") == "CHANGES_REQUESTED" for r in rs)
+            # Per-reviewer LATEST VERDICT (GitHub merge-gating semantics): a
+            # reviewer's newer review supersedes their older one — a stale
+            # CHANGES_REQUESTED from a superseded round must not block a newer
+            # APPROVED (and a stale APPROVED must not mask a newer CR).
+            # COMMENTED/PENDING carry no verdict: they neither set nor clear a
+            # stance; the reviewer's newest APPROVED/CHANGES_REQUESTED rules.
+            latest_verdict = {}
+            for r in sorted(rs, key=lambda r: r.get("submittedAt") or ""):
+                if r.get("state") in ("APPROVED", "CHANGES_REQUESTED"):
+                    who = (r.get("author") or {}).get("login") or "?"
+                    latest_verdict[who] = r.get("state")
+            approved = any(s == "APPROVED" for s in latest_verdict.values())
+            perkins_approved = any(s == "APPROVED" and "perkins" in w.lower()
+                                   for w, s in latest_verdict.items())
+            changes_req = any(s == "CHANGES_REQUESTED" for s in latest_verdict.values())
             if changes_req:
-                fails.append("an outstanding CHANGES_REQUESTED review exists")
+                stale = [w for w, s in latest_verdict.items() if s == "CHANGES_REQUESTED"]
+                fails.append(f"an outstanding CHANGES_REQUESTED review exists (latest verdict by: {', '.join(stale)})")
             if args.require_perkins:
                 if not perkins_approved:
                     fails.append("no perkins-review[bot] APPROVED verdict on record (--require-perkins)")
