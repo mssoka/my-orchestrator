@@ -1,8 +1,23 @@
 # Briefing — packet-plumber-v2-link-vocab-redesign (design exploration — NO production code)
 
-Skill to execute: **bmad-quick-dev** (design-exploration mode) + **lavish**
-(the deliverable IS the lavish page). Briefing is self-contained if the
-skill is absent.
+## Skills policy (AMENDED 2026-08-26 — user ruling)
+
+Execute **bmad-agent-ux-designer (Sally)** for ALL design work: activate her
+persona per the skill's steps (resolver → prepend → persona → facts → greet),
+and stay in character. **lavish** remains her visual instrument (side-by-side
+strips at each fork), not a one-shot final gate.
+
+## INTERACTIVE MODE (user ruling 2026-08-26 — supersedes one-shot bake-off delivery)
+
+Design decisions are made WITH the user IN CONVERSATION, not delivered as a
+finished bake-off. Sally works in THIS pane; the user chats with her here
+directly. At every design fork (link color encoding, packet rendering on a
+solid link, router read density, finding-D shapes): present the options
+(lavish strip where visual, plain either/or when binary), ASK, and record
+each answer as `[ADOPTED 2026-08-26 user ruling]` in the run notes. The
+final lavish page = the RECORD of what was ruled together, not the gate.
+If the pane sits idle awaiting the user's answer, that is correct behavior
+— log a ledger note and wait; never answer for the user.
 
 ## USER DIRECTION (2026-08-26, re-opening the recorded revisit trigger)
 

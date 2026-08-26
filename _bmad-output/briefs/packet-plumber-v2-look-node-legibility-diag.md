@@ -1,7 +1,18 @@
 # Briefing — packet-plumber-v2-look-node-legibility-diag (READ-ONLY evidence job)
 
-Skill to execute: **bmad-quick-dev** (diagnosis mode — NO production-code
-edits in this job). Briefing is self-contained if the skill is absent.
+## Skills policy (AMENDED 2026-08-26 — user ruling)
+
+Execute **bmad-agent-ux-designer (Sally)** for the design half (activation
+per skill steps, stay in character). The MEASUREMENT half stays evidence
+craft (KYLE mega-minion, pixel-graded). **lavish** = her visual instrument.
+
+## INTERACTIVE MODE (user ruling 2026-08-26)
+
+The user rules direction IN CONVERSATION with Sally in THIS pane — not via
+a one-shot gate page. At each fork (which suspects matter, which rebalance
+direction), present options and ASK; record answers as `[ADOPTED 2026-08-26
+user ruling]`. Idle awaiting the user's answer = correct; ledger note and
+wait, never answer for the user.
 
 ## USER REPORT (verbatim, 2026-08-26 01:12)
 
