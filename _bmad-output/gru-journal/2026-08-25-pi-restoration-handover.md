@@ -195,3 +195,13 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   close-out, pr_review=1): implements D1-D8 + R1 + D-2. Belt after crisis-
   duck: migration heist + link-vocab implementation (both serialize on the
   shared surface).
+
+## Look-language consolidation + crisis r1 cycle (Silas, ~16:xxZ)
+
+- ONE Sally rules the full look language (user ruling): link-vocab session
+  consolidated into node-legibility w85:p11 (HANDOFF.md preserved; fork
+  ladders merged; :4387 lavish server survived the pane close).
+- crisis-duck Perkins r1 returned findings; B1 fix landed @0c86e83; r2
+  fix-audit dispatched (w85:p1H, B1 mutation re-verify mandated). Remote CI
+  billing-blocked (3rd time today) — standing ruling: local suite = ground
+  truth, noted in brief + rows.
