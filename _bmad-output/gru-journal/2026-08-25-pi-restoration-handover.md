@@ -141,3 +141,16 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   all 3 zoom tiers + KYLE pixel measurements + 2-3 proposals via lavish).
   Fix heist follows, serialized behind crisis-duck + user ruling at the
   lavish gate. [dublin] log-spam dedup noted for the fix row.
+
+## Link vocabulary pivot (user, ~02:xx — the 08-23 revisit trigger fired)
+
+- Direction: links SINGLE solid color, no lanes; queue state as ingress/
+  egress READ at routers. Archaeology: this re-opens the 08-23 egress-qos
+  steelman WITHDRAWAL — recorded trigger was "re-open re-framed at make QoS
+  changes feelable (no queue migration)". Today = exactly that re-frame:
+  RENDER-side, sim untouched (ODN-3 per-(bundle,lane) queues stand).
+- Dispatched link-vocab-redesign (read-only exploration, lavish bake-off;
+  folds era-gated finding D shape-vocab into the same gate). Hypothesis on
+  the row: lane stripes are ALSO the node-legibility culprit — three
+  lavish pages (node-legibility, link-vocab, crisis-duck verdict) converge
+  at ONE user gate. Implementation serializes behind crisis-duck.
