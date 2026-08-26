@@ -168,3 +168,30 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
 - Sequencing wired: link-vocab implementation blocked_by architecture
   ratification; design exploration continues (may share the gate session);
   crisis-duck + node-legibility orthogonal.
+
+## Latency/egress architecture RATIFIED (user, ~12:3xZ — "looks good", all leans)
+
+- R1 FULL DUPLEX direction split (each direction gets bundle_cap; fixes the
+  shared-bidirectional-queue divergence the investigation found). R2 config
+  stays PER-PIPE (FORGE #4 letter amendment). R3 NO propagation term. R4 E9
+  bound-6 re-keyed per-(port,lane), semantics unchanged.
+- Process note: the minion ran the Fast path (draft-then-ratify) rather than
+  coaching the user through the forks live — the deviation lived in Gru's
+  briefing; the interactive gap was closed by ruling the four rows directly
+  in chat. Future architecture briefings on load-bearing calls: name the
+  Coaching-vs-Fast choice explicitly per the skill doctrine.
+- Relay verified in the arch minion session; spine finalization + lavish
+  ratification page in flight; link-vocab implementation releases at the
+  arch row's completion per the wiring.
+
+## Post-ratification wiring (Gru calls, ~12:4xZ)
+
+- Spine docs PR: GO with explicit lavish exemption (content ratified
+  in-session; re-review = bureaucracy). pr_review=0 docs job.
+- D-2 bandwidth_demand loaded-but-unwired: NAMED STORY on the migration
+  heist per ratified D3 (streaming 8->16 ticks disclosure; T1 re-bless) —
+  never silent drift.
+- New row arch-egress-migration (paneless, blocked_by crisis-duck merge
+  close-out, pr_review=1): implements D1-D8 + R1 + D-2. Belt after crisis-
+  duck: migration heist + link-vocab implementation (both serialize on the
+  shared surface).
