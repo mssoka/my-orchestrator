@@ -128,3 +128,16 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   issue #101 fold carried. Viscomm wave: A+B shipped, C in flight, D
   era-gated. The first fully hands-off release through the graph since the
   pi restoration — brief staged, ruling relayed, graph did the rest.
+
+## Node legibility intake (user, 01:12 local — first play on merged v2)
+
+- Report: "barely see the nodes even when zoomed in". Play was main checkout
+  v2 @0b2aeb9 (rebuilt 00:44 right after Gru's v2 switch; 28-min session).
+  Diff archaeology: viscomm merges did NOT touch node drawing — standing
+  look imbalance; prime suspect the 9bf9797 puck shrink (1.05 base) + pipe
+  saturation dominance. SECOND complaint on this axis (08-23 buildings →
+  grew; now nodes/pucks).
+- Dispatched READ-ONLY evidence job look-node-legibility-diag (captures at
+  all 3 zoom tiers + KYLE pixel measurements + 2-3 proposals via lavish).
+  Fix heist follows, serialized behind crisis-duck + user ruling at the
+  lavish gate. [dublin] log-spam dedup noted for the fix row.
