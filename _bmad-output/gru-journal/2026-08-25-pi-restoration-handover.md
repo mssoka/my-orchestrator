@@ -222,3 +222,10 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
 - Human queue: PR #103 (spine docs) merge; then the migration PR -> Perkins
   -> merge -> LOOK releases on its close-out. Two heist PRs + docs = the
   whole runway.
+
+## PR #103 merged (19:59:57Z, 7ad48f9) — the spine is v2 law
+
+- Ratified architecture committed to mainline; dir collision resolved clean
+  (asides byte-identical, dropped). v2 head 7ad48f9; migration worktree
+  unaffected (merges on top). Human queue now: just the migration PR when
+  Perkins blesses it; LOOK releases on its close-out.
