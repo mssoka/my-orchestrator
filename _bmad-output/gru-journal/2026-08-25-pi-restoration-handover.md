@@ -154,3 +154,17 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   the row: lane stripes are ALSO the node-legibility culprit — three
   lavish pages (node-legibility, link-vocab, crisis-duck verdict) converge
   at ONE user gate. Implementation serializes behind crisis-duck.
+
+## Latency/egress architecture intake (user, ~02:xx — the escalation path fired)
+
+- User: architect the packet-latency model (bmad skills) BEFORE deploying
+  the link redesign. Sim truth verified: latency is SLA accounting only;
+  delay = link-queue residency + travel ticks; no propagation model.
+- Dispatched arch-latency-egress-queue-model (full bmad-architecture; fills
+  a dated 08-26 spine — the 08-23 one was an empty template; memlog is the
+  source of record). Heart: latency decomposition (egress queue residency
+  + serialization at rate + propagation + hop) and the FEELABLE steelman
+  (the 08-23 withdrawal bar). LAVISH gate before any PR.
+- Sequencing wired: link-vocab implementation blocked_by architecture
+  ratification; design exploration continues (may share the gate session);
+  crisis-duck + node-legibility orthogonal.
