@@ -205,3 +205,20 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   fix-audit dispatched (w85:p1H, B1 mutation re-verify mandated). Remote CI
   billing-blocked (3rd time today) — standing ruling: local suite = ground
   truth, noted in brief + rows.
+
+## The belt assembles (evening 2026-08-26)
+
+- Design session concluded (pause-and-spec): LOOK-SPEC.md = 6 design locks
+  (toward-space ladder, auto-breath camera, scale covenant, laneless tier-hue
+  links, building ladder, quiet-board candidate); open forks parked for a
+  future Sally session (link finish 1b, queue encoder, board production,
+  packet shapes, HUD).
+- arch-egress-migration LIVE (w85:p1S @79e8939): S1-S5 story ladder (port
+  re-key -> full-duplex -> D-2 demand -> drop/crisis re-key -> latency
+  ledger), mutation leg per story, D6 save/replay proof. Single dispatch
+  confirmed after a crossed-message scare.
+- look-zoom-language wired paneless behind it: L1-L4 design locks only,
+  LINK_FINISH :: .A_SOLID switch for the open fork (byte-cheap reversal).
+- Human queue: PR #103 (spine docs) merge; then the migration PR -> Perkins
+  -> merge -> LOOK releases on its close-out. Two heist PRs + docs = the
+  whole runway.
