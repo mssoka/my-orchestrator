@@ -229,3 +229,12 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   (asides byte-identical, dropped). v2 head 7ad48f9; migration worktree
   unaffected (merges on top). Human queue now: just the migration PR when
   Perkins blesses it; LOOK releases on its close-out.
+
+## THE MIGRATION SHIPPED (09:36:56Z, 088cf00) + LOOK released
+
+- PR #104 merged: store-and-forward egress QoS is SIM LAW (S1-S5 + D-2
+  disclosed; zero golden churn in the delta — D6 held end to end).
+- Release executed on the close-out trigger: look-zoom-language LIVE
+  (w85:p2J, glm-5.3 max, L1-L4 design locks, LINK_FINISH switch, Sally's
+  LOOK-SPEC as law). The belt ran: spine authored -> ratified -> merged ->
+  implemented -> merged -> look released. Two days, one arc.
