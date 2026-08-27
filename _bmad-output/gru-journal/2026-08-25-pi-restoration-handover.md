@@ -238,3 +238,16 @@ Reverted to pi/herdr. Everything below is the live state at handover (~16:55Z).
   (w85:p2J, glm-5.3 max, L1-L4 design locks, LINK_FINISH switch, Sally's
   LOOK-SPEC as law). The belt ran: spine authored -> ratified -> merged ->
   implemented -> merged -> look released. Two days, one arc.
+
+## THE PIVOT ARC COMPLETE (2026-08-27 17:27:41Z, merge 03dd6f8)
+
+- PR #105 merged: the look design locks shipped. Full arc, user-ruled at
+  every gate: spine (#103) -> migration (#104) -> look (#105), all
+  Perkins-APPROVED, LOG_VERSION 6 intact end to end, zero unintended drift.
+- Board EMPTY. Parked (user-gated future sessions): link finish fork 1b
+  (LINK_FINISH switch carries it), queue encoder, quiet-board production
+  ruling, packet shapes, HUD pass.
+- Era notes: ops + vision unified on glm-5.3-flash (native multimodal,
+  doctrine amended); KYLE 4.6v demoted to fallback; first flash-tier
+  Perkins round exercised inline vision. Root-is-the-repo layout held
+  through the whole arc.
