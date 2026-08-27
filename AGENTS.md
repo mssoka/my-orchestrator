@@ -1181,8 +1181,10 @@ the user at the Gru session in `/Users/moses/code`.
   ruling: no vision skill/minion detour needed on it), vision is INLINE —
   no spawn. Otherwise (glm-5.3 / deepseek
   are blind) ANY agent (Gru, Silas, minions, Bob) spawns a KYLE
-  mega-minion on `zai-coding-cn/glm-4.6v` (standing vision model,
-  probe-verified; one-line flip to glm-5v-turbo when ZAI trial access
+  mega-minion on `zai-coding-cn/glm-5.3-flash` (the OPS pin — mega-minions
+  are ops tier and flash is natively multimodal, 2026-08-27 ruling;
+  fallback glm-4.6v when flash is down;
+  one-line flip to glm-5v-turbo when ZAI trial access
   lands — 1311 subscription-gated as of 08-21). KYLE gets CODEBASE
   ACCESS: spawn in the summoning repo/worktree cwd with tools
   (read/grep/bash); the prompt carries summon-reason + pointers. Two

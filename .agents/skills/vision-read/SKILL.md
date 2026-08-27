@@ -1,6 +1,6 @@
 ---
 name: vision-read
-description: Read an image with the KYLE vision model (zai-coding-cn/glm-4.6v — headless pi with an @file attachment, no mega-minion needed) for quick-reads, or spawn a KYLE visual-verification mega-minion for evidence-grade checks. Use when you need to know what an image shows (screenshots of panes, UI states, game screens, diagrams) and the current model has no vision, or for any image the user asks you to look at.
+description: Read an image with the KYLE vision model (zai-coding-cn/glm-5.3-flash — the ops tier's native multimodal, headless pi with an @file attachment, no mega-minion needed) for quick-reads, or spawn a KYLE visual-verification mega-minion for evidence-grade checks. Use when you need to know what an image shows (screenshots of panes, UI states, game screens, diagrams) and the current model has no vision, or for any image the user asks you to look at.
 ---
 
 # vision-read — KYLE vision (quick-read + visual-verification)
@@ -39,7 +39,8 @@ Otherwise (glm-5.3 / deepseek are blind) route through this skill.
 ## Mode 1 — quick-read (headless tool)
 
 ```bash
-# default (zai-coding-cn/glm-4.6v — KYLE, standing)
+# default (zai-coding-cn/glm-5.3-flash — KYLE, standing since the 2026-08-27
+# native-multimodal ruling; 4.6v demoted to fallback)
 /Users/moses/code/bin/vision-read "/absolute/path/to/image.png" "optional prompt"
 
 # explicit model for one call
@@ -54,7 +55,7 @@ VISION_MODEL=zai-coding-cn/glm-5v-turbo /Users/moses/code/bin/vision-read "/path
 
 ### Swapping the model
 
-Resolution order (first match wins): **`VISION_MODEL` env var → `--model` flag → `--fast` → default glm-4.6v**. To make a model the permanent default, edit the `MODEL="..."` default line in `bin/vision-read` (or export `VISION_MODEL` in the shell profile). **One-line flip target: `zai-coding-cn/glm-5v-turbo`** when ZAI trial access lands (1311 subscription-gated as of 2026-08-21; it declares image input too). **Any swap target must declare image input** — add `"input": ["text", "image"]` to its entry in the models registry (`~/.pi/agent/models.json` overrides / `models-store.json` catalog) or pi bounces the attachment (see Troubleshooting).
+Resolution order (first match wins): **`VISION_MODEL` env var → `--model` flag → `--fast` → default glm-5.3-flash**. To make a model the permanent default, edit the `MODEL="..."` default line in `bin/vision-read` (or export `VISION_MODEL` in the shell profile). **Fallback when flash is down: `--model zai-coding-cn/glm-4.6v`** (the pre-08-27 standing pin). **Any swap target must declare image input** — add `"input": ["text", "image"]` to its entry in the models registry (`~/.pi/agent/models.json` overrides / `models-store.json` catalog) or pi bounces the attachment (see Troubleshooting).
 
 The wrapper runs (env-cleared, so no PI_* overrides):
 
@@ -75,7 +76,8 @@ Spawn KYLE as a full mega-minion when the visual claim needs evidence:
 
 - **Spawn cwd = the summoning repo/worktree** (codebase access: read/grep/
   bash on the real render code, goldens, tests). Never a bare cwd.
-- **Model pinned: `zai-coding-cn/glm-4.6v`** (probe first — see below).
+- **Model pinned: `zai-coding-cn/glm-5.3-flash`** (the ops pin — probe first;
+  fallback `--model zai-coding-cn/glm-4.6v` if flash is down).
 - **Prompt carries summon-reason + pointers**: what to verify, which files
   render the artifact, where goldens/tests live, what evidence to produce
   (pixel scans, hashes, diff output) — never "look at this and tell me".
@@ -112,10 +114,11 @@ both are down, report "vision unavailable".)
 
 ## Model + patience (doctrine 2026-08-21)
 
-- **Default: `zai-coding-cn/glm-4.6v`** — KYLE, the standing vision model
-  (probe-verified; input `["text","image"]` declared). The 08-18
-  local-lmstudio doctrine (qwen3.8-27b@4bit) is RETIRED — qwen is gone
-  from this skill and the tool's default path.
+- **Default: `zai-coding-cn/glm-5.3-flash`** — KYLE, the standing vision model
+  since the 2026-08-27 ruling (ops tier + native multimodal; fast, 1M
+  context, and registered with `input: ["text","image"]`). The
+  evidence-grade bar is the METHOD (pixel scans, hashes, geometry — never
+  vibes), not the model.
 - **`--fast`: `lmstudio/google/gemma-4-e2b`** — LOCAL last resort (~15s/
   image but coarse and MISREADS verbatim text: missed overlays,
   hallucinated percentages). Never default.
