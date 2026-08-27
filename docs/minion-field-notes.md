@@ -33,7 +33,12 @@ findings that keep recurring. One line per entry, dated, with the job id.
   artifacts via `npx -y marked --gfm -o <out.html> <file>.md` (file write,
   no pipe) + byte/tail verify; READ the poll's dom_snapshot — it is the
   only self-check of what the user actually saw (caught a Mermaid render
-  failure the author's eyes missed).
+  failure the author's eyes missed). 2026-08-27 addendum
+  (dream-2026-08-27; dublin-map-beautify): the HTML at
+  `.lavish/<name>.html` must reference images as `<dir>/img/...` — a
+  bare `img/...` path surfaces as 8 fatal artifact-asset-unavailable
+  failures IN THE POLL OUTPUT (not user feedback); read poll failures
+  before interpreting user silence, repair + re-poll.
 - 2026-07-31 (RightTenantry crew — form-funnel-w0, refcheck-rc1-1,
   refcheck-rc2-1): Squirrel triple-trap: `run_squirrel.sh` sources .env and
   points at STAGING (clobbers your override — run `gleam run -m squirrel`
@@ -148,7 +153,12 @@ findings that keep recurring. One line per entry, dated, with the job id.
   dedupe targets before submitting; after ANY multi-edit, re-grep every
   hunk to confirm it landed — a silent whole-batch rejection leaves the
   tree looking edited while nothing applied (5.9 debugged phantom
-  behavior for a round before noticing).
+  behavior for a round before noticing). 2026-08-27 addendum
+  (dream-2026-08-27; arch-latency-egress-queue-model): literal two-char
+  `\n` sequences in target text (mermaid labels) must be `\\n` ESCAPED in
+  edit oldText — a raw `\n` silently becomes a newline, the match fails,
+  and the whole multi-edit call atomically no-ops (same failure shape as
+  the tab-depth class).
 - 2026-08-03 (dream-2026-08-03; RightTenantry crew — refcheck-rc1-2,
   form-save-resume-f3, refcheck-privacy-draft): assert Lustre's SERIALIZED
   render, never view-source assumptions — attributes render SORTED BY NAME
@@ -551,6 +561,43 @@ findings that keep recurring. One line per entry, dated, with the job id.
   wrapped lines), use minimal ASCII-only anchors, and use a scripted
   replace for punctuation-heavy regions.
 
+- 2026-08-25 (packet-plumber-v2-viscomm-crisis-duck + tie-deconflict;
+  dream-2026-08-27): the masked-rc trap bit THREE times in one job —
+  `odin build ... | head` and `2>/dev/null` both hide build failures and
+  re-run a STALE bin/harness (once "confirming" a mutation leg that
+  hadn't compiled, once "passing" palcheck). The captured rc must bind
+  the BUILD's rc, not the pipe's; REBUILD before trusting any binary
+  run; a deliberate-fail probe is the cheap proof that the harness
+  actually executes the new test before trusting a green run.
+- 2026-08-24/25 (packet-plumber-v2-dublin-map-beautify + gauge-telegraph;
+  dream-2026-08-27, 2 shards consolidated): Odin proc literals do NOT
+  capture enclosing scope/locals (palcheck render/count closures ×2;
+  seg-grid builder ×1) — write file-level helper procs with EXPLICIT
+  params (pass struct pointers), never inline `proc` values over
+  loop/config locals.
+- 2026-08-24..26 (packet-plumber v2 crew — node-legibility,
+  dublin-spawn-director, arch-egress-migration, tie-deconflict;
+  dream-2026-08-27): Odin fmt/syntax micro-traps, the silent ones are
+  the killers — literal `{`/`}` in format strings need `{{`/`}}` (a
+  stray single `}` renders literally, breaking emitted JSON silently);
+  NO `%-3d` left-justify flags (renders value×100 garbage silently —
+  plain `%d` only); `geom += str` is illegal (use an appendf helper
+  with `fmt.aprintf`); NO `var x T` (use `x: T`); `for p in [4][2]i32{...}`
+  array LITERALS need a named var first (for-in over array literals is
+  still a syntax error); `import` keyword mandatory per import line;
+  NO `#error` directive — the compile-time assert idiom is `when <bad>
+  { BROKEN :: 1 / 0 }` (constant division by zero, proven by a
+  mutation leg); `odin test app` runs ONLY the app package's tests —
+  render pins live under `odin test app/render`.
+- 2026-08-26 (packet-plumber-v2-arch-egress-migration; dream-2026-08-27,
+  2 incidents on record): EVERY new step()-touched dynamic array must be
+  added to spawn_fx.odin's shadow_clone clone list AND its flow_init
+  mirror (capacity-1) — the shadow silently aliases the LIVE run's
+  pointers and the abort surfaces FAR AWAY at run_destroy
+  (malloc_error_break backtrace finds it; the tx-ring comment in the
+  same proc is the prior incident). Grep the clone list whenever a
+  step()-touched dynamic array is added.
+
 ## Conventions that saved time
 
 - 2026-07-31/08-01 (finlit-game-brief, refcheck-v1-epics,
@@ -728,6 +775,17 @@ findings that keep recurring. One line per entry, dated, with the job id.
   consecutive pristine runs closed it); fix-chains migrate surfaces
   (a rename fixed in one artifact survived in two others for 2 rounds
   — grep ALL surfaces, not the reported one).
+  2026-08-27 addendum (dream-2026-08-27; crisis-duck, tie-deconflict,
+  dublin-spawn-director, arch-egress-migration): compact craft list —
+  grep every NEW expect for `|| true` (a vacuous pin wearing a
+  seatbelt, shipped AGAIN 08-26); capture the "before" value BEFORE
+  mutating the fixture (never re-derive it inside the assertion after);
+  `pop()` removes the LAST row — removing a SPECIFIC fixture row needs
+  swap-remove; a clamp/max util needs an ASYMMETRIC fixture (60/30 —
+  saturated both-directions fixtures cannot discriminate max from
+  sum); pin the DRAW PATH / call site, not the pure predicate (a
+  pure-proc pin is bypassable where it's called); pin the EXCLUSION
+  (eligibility), not the derived ratio.
 - 2026-08-17 (dream-2026-08-17; PP merge train #55–#62 — ×5 jobs):
   merge-train hygiene on a multi-PR base — send the rebase relay
   BEFORE the rework push lands so the fix-audit reviews ONE clean head
@@ -755,6 +813,24 @@ findings that keep recurring. One line per entry, dated, with the job id.
   key-toggle capture). When the user asks mid-flight "should this be
   a skill instead", a reasoned keep-as-dispatched recommendation can
   itself be the ruling (diet clarify halt).
+
+- 2026-08-24..26 (dream-2026-08-27; crisis-duck, dublin-map-beautify,
+  arch-latency-egress-queue-model): verification must bind to an
+  INDEPENDENT anchor — three self-confirmation flavors: stale
+  captions (enumerate crisis state AT THE CAPTURE TICK, never from demo
+  comments — golden predictions came from 4.2-era captions), a verify
+  that compares the same buggy output to itself (the bake's --verify
+  PASSED on broken output; polygonize returned nothing for a round),
+  and documented-but-unconsumed knobs (bandwidth_demand loaded but
+  UNWIRED — never cite a catalog knob in a formula without grepping
+  consumers; "documented in the loader comment" ≠ consumed). Anchor to
+  capture-time state dumps, second derivations, consumer greps.
+- 2026-08-24/26 (dream-2026-08-27; dublin-map-beautify,
+  look-node-legibility-diag — both exactly 7-round mock loops): the
+  user iterates on MOCKS fast (~10min rounds) — keep the mock tool
+  PARAMETERIZED per direction, regenerate strips in ONE command, and
+  KYLE-verify each round before replying; rulings land from the lavish
+  gallery. One-command regeneration is what makes the loop cheap.
 
 ## Recurring review findings
 
@@ -867,6 +943,37 @@ findings that keep recurring. One line per entry, dated, with the job id.
   dead-retries field; font r1 B2 wrong body), a stale body is a note
   (noc-readability-2 N6': r1 text on the live PR — one `gh pr edit`);
   re-audit your own PR body against the final head before each round.
+
+- 2026-08-26 (packet-plumber-v2-arch-egress-migration; dream-2026-08-27;
+  generalizes the estate-r3 B1 slot-renumber class): index-keyed derived
+  state must RESET on regeneration — a same-count bundle renumber
+  (demolish+draw in one batch) silently inherits the dead pair's history
+  unless derived-ring layouts reset on Topology.gen (hunter-probed at
+  120 phantom ticks). Incremental maintenance on renumberable indexes
+  inherits dead entries' state.
+- 2026-08-25 (packet-plumber-v2-viscomm tie-deconflict + gauge-telegraph;
+  dream-2026-08-27, 2 jobs): palette pins must check ALL variant
+  surfaces — CVD mode tables can silently reintroduce a base-palette
+  collision you just fixed (route_tie remapped to pale amber
+  RGB-IDENTICAL to state_congested's remap — always diff the mode tables
+  too), and UI often draws the darkened `state_*_text` VARIANTS, not the
+  raw state colors (a pixel pin against the raw color reads 0 px and
+  looks like a geometry bug). Sibling: tools/derive_a11y_palettes.py
+  cannot parse palette.json inline `//` comments — run it on a
+  comment-stripped copy.
+- 2026-08-25/26 (packet-plumber-v2 crisis-duck + tie-deconflict;
+  dream-2026-08-27): render-surface realities defeat pixel gates — rlsw
+  renders DrawTriangle FILLS opaque (an alpha-only "recede" on a
+  hand-built triangle surface is a no-op); street-oriented quads are
+  BACKFACE-CULLED for some windings (a fill-changing mutation stays
+  pixel-inert because THE FILL NEVER RENDERS there — probe with
+  distinct-color dumps before trusting any block-surface gate); when a
+  highlight OWNS the surface, pin the NEIGHBOR surface (crisis outline
+  overdraws the whole band — non-recede pinned one layer out); and
+  palcheck sections may do full LIVE-RENDER analysis checks (ClearBackground
+  + draw + LoadImageFromScreen) without touching goldens — the
+  golden-capture path never invoking assists does NOT apply to analysis
+  renders.
 
 ## glm-5.2 bare-label routing bug (2026-08-04, 2 independent sightings)
 

@@ -196,6 +196,16 @@ the user at the Gru session in `/Users/moses/code`.
   pre-change is the proof either verdict ships cheap (a shared
   path-walk that "should be equivalent" drifted 1px; only the
   fully-green flags-off harness run caught it).
+  2026-08-27 addendum (dream-2026-08-27; the look lane): a SECOND user
+  complaint on the same visual axis is SYSTEMIC, not a one-off —
+  dispatch a READ-ONLY evidence job first (captures at zoom tiers +
+  KYLE pixel measurements + lavish proposals; main checkout, NO
+  branch/worktree = parallel-safe vs in-flight render jobs; node-
+  legibility 08-26), then the interactive ruling session, then the
+  implementation heist briefed FROM the durable spec artifacts
+  (LOOK-SPEC + design-log as spec inputs, parked forks fenced out;
+  look-zoom-language 08-27). Evidence-job routing + the lavish-gate
+  fix-job trigger ride the row.
 - **Cross-job impact = flag, never act across the boundary
   (2026-08-07/08, 2 sightings).** A minion that spots ANOTHER job's
   file/decision being wrong flags it in its PR, out of scope
@@ -208,7 +218,10 @@ the user at the Gru session in `/Users/moses/code`.
 - **RT main-checkout worktree bootstrap: `cp -r` cycles on the
   self-referencing `_bmad` symlink — `rsync --exclude='_bmad'` is the
   standard copy (2026-08-13, ×2 same evening; recurs on every RT
-  dispatch from the main checkout).
+  dispatch from the main checkout). 2026-08-27 addendum
+  (dream-2026-08-27; righttenantry-dublin-rents-q2-2026): also restore
+  the `server/.env -> ../.env` symlink (main checkout has it, copies
+  don't) — without it `make run` panics 'DATABASE_URL not set'.
 - **Lens-tab layout doctrine (user ruling 2026-08-23): MAX 6 panes per
   tab as 3 rows × 2 cols, built AT CREATION.** Never a split ladder —
   Gru fumbled one (6 panes at 1/1/2/3/58/7 rows, user-flagged) and
@@ -430,6 +443,24 @@ the user at the Gru session in `/Users/moses/code`.
   clears; probe-verified CONCURRENCY bursts (both providers OK) subside
   as lens waves complete — no hold. The probe distinguishes burst from
   wall every time.
+  2026-08-27 addendum (dream-2026-08-27; glm-only window — k3 403
+  weekly cap + flash 402 balance, glm-5.3 carries reasoning AND ops):
+  (a) a 1308 rolling window freed ~1min AFTER capping (cluster-stop
+  08-26 07:35Z, 2 panes) — double-probe, never wait the stated reset;
+  (b) a probe-DOWN hold legitimately PARKS an owed continue (~6.4h,
+  crisis-duck r1 00:41Z→07:04Z) — recovery resumes on the probe flip,
+  not the clock; (c) a burst at wave-spawn leaves lens panes "done"
+  with ZERO JSONs on disk (spawn_wave prompt-seen=0 ×5) — wave-state
+  ground truth is lens JSONs ON DISK, never pane status; (d)
+  CONNECTION-class waves (distinct from 1302/1308) kill round MAINS
+  mid-lens-wait or MID-VERDICT-POST (crisis-duck r2 15:48Z, tie r2
+  08-25) — one continue + re-drive the vanished chunk panes; the
+  6/7-degraded-lens disclosure doctrine extends to this class
+  (coverage re-proven by direct verification); (e) pi auto-retry now
+  self-recovers SOME transients (crisis-duck B1-fix 13:28Z + the
+  14:15Z triple-classified cache/connection/settle batch, zero
+  continues spent) — classify by transcript BEFORE spending a
+  continue; a continue on a self-recovering pane is waste.
 - **Model dispatch & correction ops (2026-08-09).** Only a
   `provider/model` path naming an AUTHED provider works: bare
   `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
@@ -651,6 +682,11 @@ the user at the Gru session in `/Users/moses/code`.
   until resolved, NEVER closes/removes — the 08-17 id-proximity/label
   burns made auto-clean a non-starter); execution stays with Silas.
   Detection-only is the sanctioned shape for ANY cleanup sensor.
+  2026-08-27 addendum (dream-2026-08-27): the W3 spawn-turn stall has
+  an OVERNIGHT flavor — egress-r2's stall (21:41Z) needed the cheap
+  one-continue nudge but nobody was awake: ~11h dead time until a
+  cache-miss fresh-turn wake (08:59Z). Check stalled-round rows at the
+  wake-up/startup sweep; do not wait for the next alert window.
 - **Serialize-hold for pane capacity: pre-create the round row to dedup the
   sensor (2026-08-07).** When the valve is near capacity, hold the next
   Perkins round behind an in-flight one: pre-create its ledger row (status
@@ -703,6 +739,15 @@ the user at the Gru session in `/Users/moses/code`.
   Info), and the fix-now job's briefing is SCOPE-GUARDED against the
   batch items so it cannot eat them (M-1 shipped r1 APPROVED + merged
   as #627 same day). Generalizes to any audit/heist output.
+  2026-08-27 addendum (dream-2026-08-27): two FOLD shapes complete the
+  family — (a) prior-round advisories become ONE batch issue,
+  EXECUTION-FOLDED onto the lane's next PR and closed when it ships
+  (#101 → folded into #102, closed at its merge 08-26); (b) stranded
+  uncommitted orchestrator artifacts fold onto the in-flight PR as a
+  SEPARATE VERBATIM chore commit, preserve-first, never reworded
+  (crisis-duck chore 8c482ec, 8 artifacts, 08-25); redundant
+  fully-merged branches are USER-gated for deletion, never
+  Silas-deleted.
   2026-08-22/23 addendum (dream-2026-08-23 — moot at scale, ×5):
   confirmation/delta rounds around an APPROVED substance are DISPOSABLE
   — sweep without re-dispatch and record the safe-merge qualifier each
@@ -793,6 +838,14 @@ the user at the Gru session in `/Users/moses/code`.
   (f) A head move mid-round (rebase or fold push) = SWEEP the stale
   round + dispatch FRESH at the new head carrying prior findings (×4
   08-22/23) — a round never re-targets; cost is one worktree add.
+  2026-08-27 addendum (dream-2026-08-27): the r2 fix-audit acceptance
+  standard hardens — r2 rounds RE-RUN r1's mutation legs RED-then-GREEN
+  INDEPENDENTLY as the proof (gauge r1 08-25: gauge_read := raw →
+  palcheck §6 FAILS ×2, restored green, porcelain empty; crisis-duck
+  r2 3/3 RED; egress r2: B1-B4 each re-run RED), and the verification
+  pass now also REJECTS lens findings — vacuous-coverage claims
+  disproven by mutation + reads-during-the-round's-own-mutation-window
+  timing artifacts (egress r2: 3 rejected, disclosed).
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
@@ -805,6 +858,35 @@ the user at the Gru session in `/Users/moses/code`.
   inconsistency. **Root cause inferred, not confirmed** — audit target:
   grep dispatch history / Perkins round setups for `--branch` where
   `--detach` was correct.
+- **MEGA-DIFF protocol: `gh pr diff` caps ~20k lines (406) — local
+  canonical diff + two-class verification (2026-08-27,
+  dream-2026-08-27).** #96 (84,831L, API-capped 08-24) and egress r1
+  (54,356L, 406 08-26) both exceeded it. Protocol: generate the
+  canonical diff locally (`git diff <merge-base>..<head>`), DISCLOSE the
+  substitution in brief + verdict; full 7-lens waves on CODE chunks,
+  mechanical bulk-verification on goldens/docs (T1 re-bless inventory
+  cross-check + D6 replay proof); r2 then runs fix-delta-weighted
+  (r1 verified the bulk → spot-check). Proven: egress r1/r2 — 14 lens
+  runs 0 failed, 51k bulk lines mechanically verified. Diffs >3000L
+  chunk into multiple waves (crisis-duck 3142L/3270L, 2 waves each).
+- **bash-3.2 collapses lens wave-spawns (2026-08-27, dream-2026-08-27).**
+  macOS bash 3.2 breaks the wave script's (assoc) arrays — all lenses
+  land in ONE pane (tie r2 08-25; agent self-recovered by relaunching 7
+  rooted lenses). Carry the wave note in round briefings (gauge r1,
+  crisis-duck r1 did) / avoid arrays in wave scripts.
+- **Interactive design sessions: idle-await is the contract, alerts are
+  halts not stalls (2026-08-27, dream-2026-08-27; user-ruled session
+  shape 08-26).** Design minions (Sally persona + interactive mode)
+  present forks IN-PANE and idle-await user rulings ([ADOPTED] recorded
+  per fork); direct-to-pane user answers are legit. Watcher alerts on
+  these rows = interactive halts or their settle echoes — pre-classify,
+  never continue-nudge; escalate only when the user is demonstrably
+  absent. A "PROCESS RESET (user, in-pane)" can restart the fork ladder
+  (earlier rulings revisitable, not void). The pause-and-spec close
+  (LOOK-SPEC.md design locks + design-log.md rulings in the USER's
+  words + parked forks, preserved under implementation-artifacts/) is
+  the durable output — it becomes the next heist's spec input with
+  parked forks explicitly fenced out.
 
 ### Ledger
 
@@ -862,6 +944,17 @@ the user at the Gru session in `/Users/moses/code`.
   the merge. Use `git merge-base --is-ancestor <commit> <branch>` AFTER
   `pull --ff-only` (or `git fetch origin <base>:<base>` when the tree is
   held). Commit-containment is immune to both traps.
+- **Folding untracked artifacts into a PR leaves redundant originals —
+  expect a base-sync collision at the NEXT merge (2026-08-27,
+  dream-2026-08-27).** The sanctioned preserve-first fold structurally
+  duplicates: the PR now tracks copies while the main checkout keeps
+  the untracked originals → the next `pull --ff-only` collides (#102
+  close-out 08-26: ff blocked by modified deferred-work.md + 9
+  untracked originals; #103 same day: arch-dir collision). Resolution:
+  stash + aside + ff + VERIFY aside copies byte-identical to shipped
+  before dropping them. NEVER assume stash-newer-is-superset — the
+  stashed deferred-work.md proved STALE vs the fix-minion's tracked
+  lines (wrong once, same day); diff-check --theirs resolutions.
 - **Minions can SELF-CREATE ledger rows — wrong-id phantoms +
   missing-fields flavors (2026-08-14, ×2).** `refcheck-followup-607`
   (repo prefix dropped) ran 19h as a DUPLICATE of the canonical
@@ -977,6 +1070,20 @@ the user at the Gru session in `/Users/moses/code`.
   logged+notified as TOOL-BROKEN; watchman startup FATALs on
   unresolvable binaries. Any out-of-shell automation (launchd/cron)
   that shells out must bake absolute paths in at install time.
+  2026-08-27 addendum (dream-2026-08-27): (a) herdr status/wait reads
+  lie in BOTH directions now — agent-wait false-NEGATIVE at boot
+  (registration race, restoration: both boots) AND false-DONE while
+  alive-idle (w85:p1 08-25 01:30Z): process + session file is ground
+  truth; a pending escalation delivery doubles as the functional
+  probe. (b) Watchman tab-label resolution was CASE-SENSITIVE — config
+  `Gru` vs live `gru` = every-30min tab-missing false alarms until
+  e5838c1 (exact match first, unique case-insensitive second,
+  ambiguity still warns); ANY label resolution follows that ladder.
+  (c) Human keystrokes landing in a live agent pane are an incident
+  class — a stray /dedi opened the skill-navigator mid-lavish-poll,
+  aborting a 3500s poll (q/escape insufficient, it ate a continue;
+  C-c cleared it, one continue resumed; 08-26 12:54Z). Classification:
+  external input, not provider.
 
 ### Extensions
 
@@ -1049,6 +1156,21 @@ the user at the Gru session in `/Users/moses/code`.
   The sweep fallback executed cold on 08-13 (rc4-4 #609 r1 dispatched
   proactively at 13:50Z: head stable + no round row) — PROVEN; keep
   sweeping at every completion/settle, never trust the sensor alone.
+  2026-08-27 addendum (dream-2026-08-27; PP v2 window 08-24..27): four
+  fresh facets. (a) USER-AUTHORED PRs are sensor-BLIND — they carry no
+  job row → no pr_review=1 (#97 merged 08-24 with the user's own
+  COMMENTED self-review, #98 caught 08-25): on catching one, register
+  the row pr_review=1 + dispatch Perkins; spec = the PR body; the
+  user's informal review is NEVER the verdict. (b) PRE-ADD round rows
+  AT DISPATCH with parent=/sha= keywords in the note (gauge r1 08-25,
+  egress r1/r2 08-26) — `ledger add` chokes on sha= (not a column), so
+  write it via `ledger note` after add; the keywords kill the stale
+  round-pending echo class. (c) When one pr_review=0 gap fires, sweep
+  the SIBLING rows of the same dispatch batch (gauge-telegraph 08-25:
+  SQL-fixed itself AND crisis-duck, same latent gap, minutes from
+  blinding both). (d) Typo'd round-row ids (tie-deconflect-perkins-r2
+  vs parent -deconflict) silently break id-based dedup — treat the
+  parent=/sha= NOTE fields as the durable dedup keys, not the row id.
 - **Vision = KYLE, the vision mega-minion (user ruling 2026-08-21;
   SUPERSEDES the 08-18 local-lmstudio doctrine — qwen3.8-27b@4bit via
   bin/vision-read is RETIRED; the 08-18 no-silent-auto-delegation lesson
@@ -1082,6 +1204,14 @@ the user at the Gru session in `/Users/moses/code`.
   the session modelId, read findings from DISK (long turns hit 500s /
   timeouts — nudge "write NOW compactly, do not re-read"; findings
   land on disk even when the final message errors).
+  2026-08-27 addendum (dream-2026-08-27): vision ranks colors
+  PERCEPTUALLY — node-legibility-diag called the dark-ring variant
+  "wrong" where WCAG said best contrast, and both were true
+  (contrast-vs-board ≠ separation-from-the-dark-puck-rim are DIFFERENT
+  axes; dublin-map-beautify same shape: KYLE narrowed the look,
+  byte/pixel gates decided). Craft: emit geometry.json anchors FROM the
+  renderer, PIL-measure against them, let KYLE corroborate — the
+  measurement decides, the vision screen ranks.
 
 ## Orchestration upgrades (user-approved 2026-08-18)
 
@@ -1133,6 +1263,12 @@ the user at the Gru session in `/Users/moses/code`.
   gates keyed on USER actions (Blender launch). Ops fact: create
   same-repo worktrees STRICTLY SEQUENTIALLY during a mass release (a
   parallel pair hit an index.lock race once — retried clean).
+  2026-08-27 addendum (dream-2026-08-27; hands-off releases at scale,
+  ×2 — crisis-duck 08-26 00:36Z first post-restoration, look-zoom
+  08-27 09:38Z, zero misfires): stage the briefing BEFORE release;
+  paneless held rows need a briefing-column backfill check (caught
+  empty once); when a release authorization crosses an in-flight
+  close-out escalation, verify SINGLE dispatch (one row/pane/worktree).
 - **Sensor-doctrine sync (P2, standing rule):** ANY doctrine amendment
   task must grep the sensor/watcher configs (`.pi/extensions/*.ts`) for
   the retired doctrine being amended — the cap-3 echo class lived in
