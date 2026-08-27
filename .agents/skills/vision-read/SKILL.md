@@ -17,9 +17,12 @@ model. Two modes:
   visual claim is evidence-grade (golden diffs, render captures, layout or
   geometry truth) — a blind quick-read is not enough.
 
-When the active reasoning model is k3 (sees images natively), vision is
-INLINE — no spawn, read the image directly. Otherwise (glm-5.3 / deepseek
-are blind) route through this skill.
+When the active reasoning model is k3, or the session model is
+`zai-coding-cn/glm-5.3-flash` (natively multimodal, verified 2026-08-27
+through pi with a registered `input: ["text","image"]` entry — the first
+GLM-5-series flash with native vision, user ruling), vision is INLINE — no
+spawn, read the image directly with the read tool / @file attachment.
+Otherwise (glm-5.3 / deepseek are blind) route through this skill.
 
 ## When to use
 

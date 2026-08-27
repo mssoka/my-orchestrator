@@ -1175,7 +1175,11 @@ the user at the Gru session in `/Users/moses/code`.
   SUPERSEDES the 08-18 local-lmstudio doctrine — qwen3.8-27b@4bit via
   bin/vision-read is RETIRED; the 08-18 no-silent-auto-delegation lesson
   stands).** When the active reasoning model is k3 (sees images
-  natively), vision is INLINE — no spawn. Otherwise (glm-5.3 / deepseek
+  natively), or the session model is `zai-coding-cn/glm-5.3-flash`
+  (natively multimodal — first GLM-5-series flash with vision, verified
+  through pi 2026-08-27 with registered `input: ["text","image"]`; user
+  ruling: no vision skill/minion detour needed on it), vision is INLINE —
+  no spawn. Otherwise (glm-5.3 / deepseek
   are blind) ANY agent (Gru, Silas, minions, Bob) spawns a KYLE
   mega-minion on `zai-coding-cn/glm-4.6v` (standing vision model,
   probe-verified; one-line flip to glm-5v-turbo when ZAI trial access
