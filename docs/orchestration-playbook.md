@@ -85,7 +85,9 @@ His extension (`.pi/extensions/silas.ts`) injects his standing orders +
 startup checklist; nefario-watch is gated to `PI_SILAS=1`, so ALL sensors
 alert Silas — Gru's context stays clean.
 
-**Model:** Silas runs on **`deepseek/deepseek-v4-flash`** — set
+**Model:** Silas runs on **`zai-coding-cn/glm-5.3-flash`** (user ruling
+2026-08-27: new ZAI flash tier; deepseek flash retired from ops after the
+402 wall) — set
 AUTOMATICALLY by `.pi/extensions/silas.ts` at launch (`session_start` ->
 `pi.setModel`), no manual `/model`; notifies if missing or unkeyed. The
 COO's work is execution-grade; the reasoning tier (Gru/Perkins/Bob) is
@@ -251,7 +253,9 @@ fallback → HOLD:** reasoning dispatches probe `kimi-coding/k3` →
 a mid-work round PARKS (resume via probe flip + continue).
 **`deepseek/deepseek-v4-pro` is BANNED from the reasoning tier** (cost)
 — zero duties, not even mechanical fix-audits;
-**`deepseek/deepseek-v4-flash` is ops/coding ONLY**. Reasoning roles:
+**flash tiers (`deepseek-v4-flash`, `zai-coding-cn/glm-5.3-flash`) are
+ops/coding ONLY** — glm-5.3-flash joined the watchman's
+FORBIDDEN_REASONING list 2026-08-27. Reasoning roles:
 **Gru** (persona, relays, escalations, briefing authorship), **Perkins**
 (code review — the last line of defense), **Bob** (dream: consolidation +
 lesson curation). Low-volume, judgment-heavy roles. Belt rows stay
@@ -306,10 +310,12 @@ self-reported ids. models.json entries MUST declare `"input": ["text",
 auto-delegation stays REMOVED (08-18). NO vision deferral: models with
 NO native vision MUST route through Kyle — never guess or hallucinate.
 
-**Execution — `deepseek/deepseek-v4-flash`:** **Silas** (COO: ops,
+**Execution — `zai-coding-cn/glm-5.3-flash`** (ops tier since
+2026-08-27; interim deepseek-v4-flash while ZAI errors): **Silas** (COO:
+ops,
 relay, coordination, dispatches), **ALL minions** (implementation), and
 **mega-minions** (well-specified sub-tasks). The fleet workhorse: fast,
-reliable, always-live.
+reliable, ZAI-always-live.
 **The 402 CLASS (2026-08-19):** a deepseek **402 Insufficient Balance**
 is an ACCOUNT wall (billing — a user top-up fixes it; waiting does not).
 Per errored pane: `/model <ops fallback>` + continue, once; the fleet
