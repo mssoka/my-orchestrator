@@ -206,6 +206,17 @@ the user at the Gru session in `/Users/moses/code`.
   (LOOK-SPEC + design-log as spec inputs, parked forks fenced out;
   look-zoom-language 08-27). Evidence-job routing + the lavish-gate
   fix-job trigger ride the row.
+  2026-08-29 addendum (dream-2026-08-29; the #106/#107 ruling
+  cadence): the reversal can land AFTER Perkins APPROVED — a USER
+  RULING supersedes the verdict (the verdict blessed the spec; the
+  user rules the spec): #106 r1 APPROVED the width bump, the user
+  ruled pure-pulse-same-sizes → merge HELD, the loop re-armed on
+  ruling-defined acceptance (moot-by-ruling; the 33-PNG width
+  inventory went throwaway without complaint). Cadence record: 4
+  user rulings across 2 PRs in one day (08-28: era-1 default /
+  local-goldens canon / saves disposable / glow-only pulse), ALL
+  amend-and-relay, ZERO re-dispatches — the healthy path at full
+  speed.
 - **Cross-job impact = flag, never act across the boundary
   (2026-08-07/08, 2 sightings).** A minion that spots ANOTHER job's
   file/decision being wrong flags it in its PR, out of scope
@@ -222,12 +233,54 @@ the user at the Gru session in `/Users/moses/code`.
   (dream-2026-08-27; righttenantry-dublin-rents-q2-2026): also restore
   the `server/.env -> ../.env` symlink (main checkout has it, copies
   don't) — without it `make run` panics 'DATABASE_URL not set'.
+- **Live-tree dedup under open sessions: SWAP-NOW, REMOVE-LATER
+  (2026-08-28/29, skills dedup sweep, 3 repos).** Procedure: capture
+  the only-in-repo list to a ledger note FIRST, verify zero live
+  panes, then rm (finlit: stale Jul-28 snapshot, 71 entries; UE:
+  byte-clean subset, 6 real-dirs-vs-symlinks); sessions resolve via
+  ~/.pi/agent/skills symlinks to canonical (spot-checked). When a
+  LIVE main-checkout session holds the path: swap NOW — move the
+  stale dir aside (`.agents/skills.stale-aug5`) + symlink to
+  canonical in its place (Sally's live session resolved through the
+  link, zero breakage) — and rm BOTH the aside AND the symlink at
+  the lane's close (the symlink points at the orchestrator root's
+  working tree). A deferred trigger keyed on a NEVER-CLOSING pane is
+  a broken trigger — the swap dissolves it (the stale content is
+  already inert; only disk noise waits). The deferred LAST-close
+  trigger itself fired correctly (written on both live rows; swept
+  at the 08-29 cull).
+- **Ground pending-claims and ambiguous acks against live
+  pane/lavish state before reporting or acting (2026-08-27/28, ×4).**
+  Gru told the user two 'pending' prompts were awaiting them — both
+  were ALREADY ANSWERED (stale-board ×2 one night; lavish rulings
+  land without a pane signal). Silas grounded two bare user 'go'
+  relays in Gru's session before acting (08-28 09:55Z + 14:2xZ —
+  Sally already held the pill question): a bare 'go' =
+  continue-acknowledgment, NEVER a new dispatch; queue one confirm.
+  'Pending' is a claim about pane/lavish state — verify the state
+  first.
+- **Falsify-the-premise briefings + the cross-job evidence relay
+  (2026-08-28, ×2 jobs).** A hypothesis-led briefing names the
+  falsification mandate ('verify-not-assume'); a DISCONFIRMED lead
+  hypothesis with the real chain is a first-class deliverable, not a
+  failure — box-crash r1 disproved the briefed 2→4-grow on evidence
+  (box_grow idempotent post-enable) and proved the real chain
+  (shadow_clone value-copy aliased the LIVE allocator in the slice
+  headers → destroy freed live buffers → topology.gen re-predict
+  double-freed). A sibling job's landed verdict relays INTO a live
+  research lane as primary evidence mid-flight (the crash root cause
+  → lang-safety's falsify test case, via the steering queue —
+  deferred-not-lost, verified in the buffer, no duplicate).
 - **Lens-tab layout doctrine (user ruling 2026-08-23): MAX 6 panes per
   tab as 3 rows × 2 cols, built AT CREATION.** Never a split ladder —
   Gru fumbled one (6 panes at 1/1/2/3/58/7 rows, user-flagged) and
   Silas evened it post-hoc: resize semantics are empirical (up = top
   edge up = grow; down = bottom edge down = grow; top/bottom panes
-  clamp → shrink/no-op), ~10 small resizes + layout reads → all even
+  clamp → shrink/no-op; `herdr pane resize --amount` is a FLOAT
+  fraction (0-1): integer amounts clamp the split to extremes
+  (0.1/0.6 ratios observed; 0.27 moved the boundary cleanly) —
+  verify with `herdr pane layout` after each call), ~10 small
+  resizes + layout reads → all even
   at 12 rows; surgery on a LIVE round is safe if no pane is closed or
   moved. Playbook + lens-skill-template amendments ride the next docs
   pass.
@@ -421,7 +474,13 @@ the user at the Gru session in `/Users/moses/code`.
   Probe false-reads go BOTH directions (k3 false-negative with empty
   error 08-19 08:10Z; glm false-DOWN 08-20 16:13Z — a chatty "OK —
   I'm here" reply vs the strict `^OK$` match) — re-probe once before
-  acting on any surprising read. Cap-reset times remain estimates:
+  acting on any surprising read. 08-27 consequence surface: the
+  night-watchman's model GATE ate a chatty-OK glm false-DOWN and
+  REFUSED to relaunch a dead Gru (Gru came up by other means; glm
+  re-probed UP) — the strict-match false-read now blocks RECOVERY
+  automation, not just dispatches; a DOWN verdict built on a
+  chatty/nonempty reply is a re-probe-first trigger inside any
+  automated gate. Cap-reset times remain estimates:
   glm's 1308 rolling window freed ~11h EARLY vs the stated 20:43Z
   reset (08-20) — never schedule a resume off the provider's stated
   time; only the probe decides. 2026-08-22/23 addendum (dream-2026-08-23;
@@ -687,6 +746,19 @@ the user at the Gru session in `/Users/moses/code`.
   one-continue nudge but nobody was awake: ~11h dead time until a
   cache-miss fresh-turn wake (08:59Z). Check stalled-round rows at the
   wake-up/startup sweep; do not wait for the next alert window.
+  2026-08-29 addendum (dream-2026-08-29; ×3 leaks in one day, 08-28):
+  the sweep checklist fails in practice even where doctrine exists —
+  a MOOT-swept round leaked all 7 of its lens panes (#106 r2
+  moot-swept on the user's eyeball-gate merge: row + worktree
+  closed, live lenses missed; found cwd-exact at the #107 r5
+  close-out), and two MERGE close-outs leaked their round MAIN panes
+  (p3V #106-r1, p5E #107-r5 — found at the user-ordered pane cull).
+  The enumeration, for BOTH merge close-outs AND moot sweeps: row +
+  worktree + branch + MAIN pane + EVERY lens pane, cwd-exact
+  verified — the lens wave outlives the main, and the main outlives
+  a sloppy sweep. A cull SPARES bare-shell no-agent panes — those
+  are USER TERMINALS (w8D/w8E 08-27, p63 ~/Downloads 08-28):
+  classify and leave, never sweep on Gru's flag alone.
 - **Serialize-hold for pane capacity: pre-create the round row to dedup the
   sensor (2026-08-07).** When the valve is near capacity, hold the next
   Perkins round behind an in-flight one: pre-create its ledger row (status
@@ -846,6 +918,29 @@ the user at the Gru session in `/Users/moses/code`.
   pass now also REJECTS lens findings — vacuous-coverage claims
   disproven by mutation + reads-during-the-round's-own-mutation-window
   timing artifacts (egress r2: 3 rejected, disclosed).
+  2026-08-29 addendum (dream-2026-08-29; the flash-tier era —
+  glm-5.3-flash runs every round since 08-27): (g) CONNECTION-CLASS
+  main deaths are an EXPECTED ~1×/round on flash long-context lens
+  waves — 6 deaths in <24h on 08-28 (#106 r1/r2, #107 r1/r3/r4/r5),
+  EVERY one salvaged: ONE continue + the durable lens JSONs; a death
+  BEFORE the wave still salvages — the wave restarts from the saved
+  canonical diff.patch/diff-code.patch (#107 r5, zero lens work
+  lost). Budget for it; never alarm, never re-dispatch. (h) The
+  BLIND lens is the truncation canary on flash (it reads the whole
+  diff = most context, so it output-caps FIRST): 7 rounds / 4 jobs /
+  2 days — retry ONCE on a fresh pane (recovers ~half: congestion r1,
+  #107 r4/r5), else close 6/7 DEGRADED-DISCLOSED with the diff
+  covered by the remaining lenses (look-zoom r1, #107 r1/r3,
+  box-crash r1) — never force the degraded guard, never fake 7/7.
+  (i) A blocker CARRIED 2+ rounds = a pipeline/process defect until
+  proven otherwise, not luck — escalate with the carried-blocker
+  pattern-flag to Gru and re-target the round at the MECHANISM:
+  review BYTES vs the merged tree (blob forensics, convention
+  census), never claims (#107 B2 carried r3→r4: the claimed
+  'one-machine settle' was the minion machine agreeing with itself —
+  census 116/117 swapped, ZERO warm bytes absorbed; the r5 briefing
+  led 'bytes not claims' → B2 closed: 86/117 byte-identical to #106
+  warm, 0.00% swap-signature).
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
@@ -869,6 +964,15 @@ the user at the Gru session in `/Users/moses/code`.
   (r1 verified the bulk → spot-check). Proven: egress r1/r2 — 14 lens
   runs 0 failed, 51k bulk lines mechanically verified. Diffs >3000L
   chunk into multiple waves (crisis-duck 3142L/3270L, 2 waves each).
+  2026-08-29 addendum (dream-2026-08-29; #107 r4/r5): the fix-delta
+  can be MEGA TOO — a re-bless-heavy rework push keeps the delta at
+  ~88k lines (r4 88825L, r5 88689L, overwhelmingly the one-machine
+  corpus re-settle). The 'r2 spot-checks the bulk' default yields
+  then: the two-class protocol applies to the fix-delta itself (full
+  lens on the code chunk — r4: 651L; mechanical on the bulk), and
+  for byte-claim blockers the mechanical leg is BLOB FORENSICS
+  (convention census + byte-diff vs merged-tree warm bytes), not
+  spot-check.
 - **bash-3.2 collapses lens wave-spawns (2026-08-27, dream-2026-08-27).**
   macOS bash 3.2 breaks the wave script's (assoc) arrays — all lenses
   land in ONE pane (tie r2 08-25; agent self-recovered by relaunching 7
@@ -887,6 +991,21 @@ the user at the Gru session in `/Users/moses/code`.
   words + parked forks, preserved under implementation-artifacts/) is
   the durable output — it becomes the next heist's spec input with
   parked forks explicitly fenced out.
+  2026-08-29 addendum (dream-2026-08-29; quinn + shape-vocab +
+  lang-safety): (a) THE CLOSE SHAPE — a user-ordered pane cull
+  retires 'pane stays open amendment-ready' (both lanes culled 08-29
+  01:48Z): the DURABLE RECORD is the amendment surface; future
+  amendments = a NEW session launched from the record. (b) A live
+  main-checkout session HOLDS the checkout — a parallel read-only
+  job that must build at 2+ commits goes DETACHED (the 08-27
+  regression audit: main HELD by quinn → detached at the AFTER sha +
+  a minion-owned scratch worktree at the BEFORE sha; a HEAD move
+  under a live design pane = the catastrophic class). (c) A dead pi
+  on an idle-awaiting pane is INVISIBLE (its alerts are
+  pre-classified noise — quinn lay 47min post-opening-turn in the
+  herdr outage): salvage the composed content from the session jsonl
+  to a brief file BEFORE relaunch, relaunch same pane, chained
+  handover verified, the session re-presents.
 
 ### Ledger
 
@@ -1083,7 +1202,14 @@ the user at the Gru session in `/Users/moses/code`.
   class — a stray /dedi opened the skill-navigator mid-lavish-poll,
   aborting a 3500s poll (q/escape insufficient, it ate a continue;
   C-c cleared it, one continue resumed; 08-26 12:54Z). Classification:
-  external input, not provider.
+  external input, not provider. 2026-08-29 addendum
+  (dream-2026-08-29): the class is also SELF-INFLICTED — the
+  operator's own chain did it: Silas' launch chain carried a stray
+  placeholder `pane run w85:p3R 'placeholder...'` and typed literal
+  junk into the LIVE A1 minion pane (08-28 00:25Z; corrected in
+  place with an explicit disregard note). Never leave placeholder
+  pane-run commands in a && dispatch chain — one bad target types
+  into a live agent.
 
 ### Extensions
 
@@ -1271,7 +1397,13 @@ the user at the Gru session in `/Users/moses/code`.
   glm's 1308 window freed ~11h EARLY vs the stated reset, so the probe
   (never the provider's stated time) gates the resume. NEW milestone
   type: the fun-test gate (user-held — merge ≠ done; the gate is the
-  user's play session; the PP v2 belt is parked on it). 2026-08-22/23
+  user's play session; the PP v2 belt is parked on it). FIRST FIRE
+  08-28: the gate caught the 3rd-spawn SIGABRT (shadow_clone
+  aliasing — a CI-INVISIBLE class: zero golden demos run box-on; the
+  playtest was the only box-on × telegraph-lead surface) — .ips in
+  hand → URGENT dispatch → PR #108 → r1 APPROVED → merged in ~3.5h.
+  A user-play gate is the named coverage surface for CI-blind
+  feature lanes. 2026-08-22/23
   addendum (dream-2026-08-23 — the 16-PR wave ran end-to-end on it): a
   whole multi-job WAVE encodes as paneless blocked_by rows + named
   release triggers (7 wave rows held behind #76; released on cue at

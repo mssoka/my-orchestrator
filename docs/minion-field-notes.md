@@ -38,7 +38,12 @@ findings that keep recurring. One line per entry, dated, with the job id.
   `.lavish/<name>.html` must reference images as `<dir>/img/...` — a
   bare `img/...` path surfaces as 8 fatal artifact-asset-unavailable
   failures IN THE POLL OUTPUT (not user feedback); read poll failures
-  before interpreting user silence, repair + re-poll.
+  before interpreting user silence, repair + re-poll. 2026-08-29
+  addendum (dream-2026-08-29; viscomm-regression-audit): decision
+  menus = per-row RADIO forms + one Queue button each — a clean
+  per-row ruling arrived as a single tagged keep-leave prompt (R1
+  restore-via-A1); a Send-&-End session delivers the final feedback
+  once on the next poll (no extra polling rounds after it).
 - 2026-07-31 (RightTenantry crew — form-funnel-w0, refcheck-rc1-1,
   refcheck-rc2-1): Squirrel triple-trap: `run_squirrel.sh` sources .env and
   points at STAGING (clobbers your override — run `gleam run -m squirrel`
@@ -350,6 +355,29 @@ findings that keep recurring. One line per entry, dated, with the job id.
   ms arg needs the suffix (`overlay-check surge 3000ms`, not `3000`)
   and overlay captures must set the same view flags as the app
   (`view_set_rail(true)`) or the capture misrepresents it (×2).
+  2026-08-29 addendum (dream-2026-08-29; mechanics-the-box + its
+  r3/r4/r5 rounds — the trap RECURRED 08-28 despite this entry): the
+  SILENT flavor — NEVER bless T2 goldens with `odin run harness`
+  directly: the direct build links stock vendor:raylib whose
+  readback is R/B-SWAPPED (BGRA); the frames RENDER, the T2 compare
+  is self-consistent, the suite goes GREEN, and only a blob-level
+  census exposes every frame swapped. Symptoms: palcheck raster
+  legs fail with 0 px of EVERY canon hex; 'stale' goldens that
+  re-bless to byte-identical wrong frames; a black frame where the
+  reference is warm. T1/fold-check stay valid (sim hashes are
+  render-independent) — exactly why the T1-only sweep misses it.
+  Bless + verify T2 ONLY via tools/harness.sh (rlsw shadow,
+  warm-correct RGBA). Cross-machine blessing SPLITS a corpus (two
+  machines, swapped conventions: census 116/117 vs 1 warm) — after
+  ANY cross-machine merge, re-bless the ENTIRE corpus from ONE
+  machine and run the full T2 loop TWICE; a 'one-machine settle'
+  claim is verified against the MERGED TREE's warm bytes (a minion
+  machine agreeing with itself absorbs zero). T2/palcheck are
+  ENVIRONMENT-BOUND on a given machine: before chasing a raster
+  regression, re-bless the BASE in a scratch worktree — if base
+  reproduces the fail (03dd6f8 re-blessed = the 61-fail exactly),
+  it's the render environment, not the diff; disclose and let the
+  human/CI rule the golden source of truth.
 - 2026-08-11 (dream-2026-08-11; packet-plumber-v2-1.3-packet-flow +
   -1.1-walking-skeleton — 2 stories): the PP-v2 determinism spine — the
   replay gate re-creates run-setup (fixture) but NOT flow demand by
@@ -597,6 +625,59 @@ findings that keep recurring. One line per entry, dated, with the job id.
   (malloc_error_break backtrace finds it; the tx-ring comment in the
   same proc is the prior incident). Grep the clone list whenever a
   step()-touched dynamic array is added.
+  2026-08-29 addendum (dream-2026-08-29; box-crash-third-spawn +
+  lang-safety-research — the class RECURRED on the #107 Box arrays):
+  the rule grows a PIN-LINE half — every new Run_State dynamic array
+  adds a clone line AND a pin line in
+  test_spawn_fx_shadow_clone_box_owns_every_array: the box-ON
+  fixture + raw_data pointer pins make a missed field CI-visible
+  (box-OFF fixtures hide it — nil headers delete harmlessly; skip
+  only raw_data==nil in the pin, len==0 hides allocated backings).
+  Odin dynamic arrays carry their ALLOCATOR in the header — a missed
+  clone field alias-frees the LIVE buffers silently (the 3rd-spawn
+  SIGABRT: destroy freed them, topology.gen re-predict freed them
+  AGAIN). Forensics that work: grep the repro surface for by-value
+  dynamic-array/struct copies feeding a destroy (`clone := src^` +
+  `run_destroy(&shadow)` was the whole bug); `odin test` beats
+  libmalloc for localizing (bad free @ file:line call sites) — but
+  its bad frees are REPORTED not fatal and temp_allocator frees are
+  leak-invisible, so a mutation gate pins OWNERSHIP directly
+  (pointer compares), never allocator abort/leak behavior; a macOS
+  .ips loses the stack above _heap_free — a -debug build + lldb
+  `breakpoint set -n malloc_error_break` recovers the full Odin
+  stack in one run; core:mem Tracking_Allocator's bad_free_callback
+  (file:line) catches the class DETERMINISTICALLY. READ-ONLY repro
+  recipe: rsync the repo to /tmp (exclude _bmad) + an env-gated
+  frame-script driver in app/main.odin copying the PP_NOC_E2E
+  pattern (append Device_Events after polls, before dispatch_frame)
+  — drove real drag-connects, caught the crash RED, proved the fix
+  GREEN (8 connects).
+- 2026-08-28 (packet-plumber-v2-mechanics-the-box +
+  -look-zoom-language — 2 jobs): Odin/harness semantic traps. (a) a
+  `case:` in a `#partial switch` swallows EVERYTHING after it — a
+  case inserted below the default silently never runs (a demolish
+  refund priced zero and tests mostly passed): keep special cases
+  ABOVE the default; grep `case:` adjacency in review. (b) never
+  price a charge/refund from POST-apply topology —
+  pipe_slot/node_slot SKIP DEAD entities and fall back to slot 0
+  (tombstone-then-price refunds the wrong tier/span or nothing):
+  validate snapshots the pre-edit facts into a small struct, price
+  from the snapshot; a refund test demolishing id 0 MASKS the bug
+  (slot 0 = the accidental right answer) — always demolish a
+  NON-ZERO id. (c) the demo-directive zero-value trap: a numeric
+  Demo field with '1.0 = default' semantics still zero-inits (zoom 0
+  → scale = fit*0 → the map grid loop drew ~forever, a 2.5h silent
+  'suite run') — normalize absent-directive numerics AT PARSE TAIL +
+  belt the run site; a hung `harness run` with an EMPTY log = sample
+  the process, look for an unbounded render loop. (d) needle/patch
+  craft: `replace1`'s 4th arg is a COUNT not an occurrence index;
+  retuning a fixture value silently no-ops old needles (verify each
+  row still fails-for-the-right-reason); loader messages carry
+  EM-DASHES (a hyphen want-substring fails contains() — copy
+  want-strings from the loader source); field alignment differs per
+  helper (a copied-alignment needle matches a DIFFERENT helper's
+  block — a patch that 'applies' but greps empty no-oped; verify by
+  grepping the INSERTED comment).
 
 ## Conventions that saved time
 
@@ -786,6 +867,22 @@ findings that keep recurring. One line per entry, dated, with the job id.
   sum); pin the DRAW PATH / call site, not the pure predicate (a
   pure-proc pin is bypassable where it's called); pin the EXCLUSION
   (eligibility), not the derived ratio.
+  2026-08-29 addendum (dream-2026-08-29; look-zoom-language,
+  mechanics-the-box, box-crash-third-spawn — ×3 jobs): the lineage
+  keeps mutating — (i) FIXTURE-ZERO-DATA vacuity: Views reading
+  sprite bboxes must hand-set them (zero bboxes → every router
+  endpoint's drawn size 0 → the covenant cap zeroes → the whole
+  sweep passes crushed at cap 0); (ii) HELPER-LEVEL vacuity: a
+  fail-fast reject helper omitting ONE catalog source dies in an
+  EARLIER file and the 'wrong file' branch returns without checking
+  — every row green forever; audit by mutating ONE expectation to
+  nonsense (green suite = dead table), and fixing the helper exposes
+  the stale expectations (~40 — want = the loader MESSAGE substring,
+  copied from loader source, never the key name); (iii)
+  allocator-behavior-dependent mutation gates are
+  vacuous-by-construction (`odin test` bad frees are
+  reported-not-fatal, temp_allocator frees leak-invisible) — pin
+  ownership via pointer compares.
 - 2026-08-17 (dream-2026-08-17; PP merge train #55–#62 — ×5 jobs):
   merge-train hygiene on a multi-PR base — send the rebase relay
   BEFORE the rework push lands so the fix-audit reviews ONE clean head
@@ -831,6 +928,32 @@ findings that keep recurring. One line per entry, dated, with the job id.
   PARAMETERIZED per direction, regenerate strips in ONE command, and
   KYLE-verify each round before replying; rulings land from the lavish
   gallery. One-command regeneration is what makes the loop cheap.
+- 2026-08-27/28 (packet-plumber-v2-viscomm-regression-audit,
+  -congestion-read-a1, -look-zoom-language — 3 jobs): PP
+  visual-evidence craft. (a) 'did effect X die' audits resolve
+  MECHANICALLY: `harness motion-strip` + a fixed-pixel time-series
+  (link centerline color per frame) proves static-vs-animated + the
+  phase in one strip; per-era worktree goldens are FREE before/after
+  evidence (each worktree's goldens/ = its own era's blessed render
+  — compare those first). (b) a user's 'it used to pulse' memory can
+  be PERCEPTION of static code (the 4.1 halo never pulsed — the read
+  came from level-flicker + ribbon mass): trace the MECHANISM and
+  the CANVAS separately or audit the wrong thing. (c) stride the
+  evidence harness FIRST (bin/harness_before from HEAD + view-only
+  extension), THEN mutate — before-strips → change → re-bless →
+  after-strips made every claim checkable in ONE worktree. (d) a
+  band-measure palcheck leg returning exactly your scan half-window
+  count (2·half+1) is measuring ALONG the feature, not across it —
+  assert a predicted pixel count from the draw's own math (dump the
+  column) before trusting the leg. (e) trimmed-blit hides
+  under-sprite decoration (DrawTexturePro blits the content bbox
+  tight): the read is a HALO (radius > 0.5× footprint), and
+  predicted blend scans need the TRUE underlay color — probe with
+  the correct fit offset (OX=(win−world×fit)/2; seed-7 land tint
+  (239,228,186), not canvas). (f) palcheck render-only fixtures:
+  `crisis.pipe_congestion` is len 0 until warnings_update runs —
+  resize() + explicitly zero grown slots to .None; E26 rejects
+  terminal→terminal pipes in fixtures (mirror §7: terminal→router).
 
 ## Recurring review findings
 
@@ -974,6 +1097,19 @@ findings that keep recurring. One line per entry, dated, with the job id.
   + draw + LoadImageFromScreen) without touching goldens — the
   golden-capture path never invoking assists does NOT apply to analysis
   renders.
+
+- 2026-08-28 (dream-2026-08-29; mechanics-the-box r3/r4 +
+  box-crash-third-spawn — ×3): FLAG-ON coverage ships at ZERO unless
+  explicitly gated — ruling wiring (era-1 start + 6.2 gate) had ZERO
+  coverage (r3 B4); the debug-override leg shipped RED (the era row
+  asserted ==1 under PP_DEBUG where =3 is the sanctioned override —
+  gate the assertion on !PP_DEBUG, both builds 52/52); and a
+  flag-gated feature had ZERO exercising demos (the 3rd-spawn
+  SIGABRT: box-on × telegraph-lead existed only in the user's
+  playtest). A ruling that changes shipped defaults needs its wiring
+  covered in EVERY configuration the gates build (default AND debug
+  override); a feature flag needs ≥1 flag-ON demo/gate (the
+  env-gated frame-script driver pattern covers it headless).
 
 ## glm-5.2 bare-label routing bug (2026-08-04, 2 independent sightings)
 
