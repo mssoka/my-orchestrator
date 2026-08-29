@@ -36,6 +36,10 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
   a plausibly-backfilled file (e.g. a journal whose dates span across the
   marker) carries undreamed material at its tail. (08-03→08-07 gru-journal
   backfill; the 08-17 dream recovered the 5.2 20h arc only by tail-reading.)
+  **Content-dating (user-approved 2026-08-29, U1 APPROVED):** inputs are
+  dated by CONTENT — the entry's own date headers — never by file mtimes
+  (mtimes drift with restores/edits). The marker gates which FILES enter
+  the pass; within a file, read and shard by content dates.
 - Field-note shards: `/Users/moses/code/_bmad-output/field-notes/*.md`
 - Gru journal: `/Users/moses/code/_bmad-output/gru-journal/*.md`
 - Silas journal: `/Users/moses/code/_bmad-output/silas-journal/*.md`

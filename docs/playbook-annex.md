@@ -49,6 +49,11 @@ reader per source, proposals with reasoning):
    (last ~40 lines), not skipped — the marker/mtime filter silently
    drops late-written material (the 08-03→08-07 gru-journal backfill;
    the 08-17 dream recovered the 5.2 20h arc only by tail-reading).
+   **Content-dating (user-approved 2026-08-29, U1 APPROVED):** dream
+   inputs are dated by CONTENT — the entry's own date headers — never
+   by file mtimes (mtimes drift with restores/edits; the 08-28 tree
+   restore normalized ~200 files). The marker gates which FILES enter
+   the pass; within a file, read and shard by content dates.
    Each sheep writes findings to its OWN shard in the dream dir —
    shard-by-writer, same as the live memory.
 3. **Bob consolidates:** reads the sheep findings, hunts patterns —
