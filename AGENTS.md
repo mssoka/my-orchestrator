@@ -1219,6 +1219,16 @@ the user at the Gru session in `/Users/moses/code`.
   renderer, PIL-measure against them, let KYLE corroborate — the
   measurement decides, the vision screen ranks.
 
+### Video lane (standing rules, user-ruled 2026-08-29/30)
+
+- **ALL video work routes through the higgsfield bridge** — standing
+  rule per the 08-29 youtube-scope line (Subo a Sion creative work is
+  the current instance). No ad-hoc video pipelines outside the bridge.
+- **`youtube-channel` is under management** — adopted 2026-08-30 per
+  user ruling, recorded in `managed-repos.txt` (the studio repo for
+  YouTube channel creative work). Intake/dispatch/ledger/Perkins/
+  dreams apply to it like any managed repo.
+
 ## Orchestration upgrades (user-approved 2026-08-18)
 
 - **Quota probe (P1):** `bin/quota-probe [model]` — env-cleared pi probe of

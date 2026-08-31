@@ -95,7 +95,12 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
    found, proposals auto vs user-ack, watch items) + the report path.
    Self-report: `/Users/moses/code/bin/ledger set dream-<yyyy-mm-dd> working`
    at start, `/Users/moses/code/bin/ledger set dream-<yyyy-mm-dd> in-review
-   "report at <path>"` at the end. On blocked: `herdr notification show "dream-<yyyy-mm-dd>" --body "<one-liner>"`.
+   "report at <path>"` at the end. On blocked: `herdr notification show
+   "dream-<yyyy-mm-dd>" --body "<one-liner>"` — a CHECKLIST GATE (mirror
+   of the playbook's self-notify gate): tick it in the final message by
+   PASTING the verbatim tool result (must show `shown:true`; a claim
+   without the paste = compliance gap; `shown:false` → retry once,
+   then escalate).
 
 **Never:** edit the live memory store, write the `last-dream` marker
 (Silas writes it at close-out), open PRs, or touch any repo.
