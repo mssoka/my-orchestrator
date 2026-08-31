@@ -655,6 +655,20 @@ the user at the Gru session in `/Users/moses/code`.
   processes — 3 stuck core.bin (removed worktree) spinning ~3.5 cores
   + 2 orphaned beam.smp dev servers found; sweep orphan processes at
   census/close-out.
+- **Long local lanes run marker-file-driven async with an explicit
+  completion relay (2026-08-30/31, ×2 lanes).** A multi-hour or
+  multi-day local GPU queue (ComfyUI H3, MLX LTX) does not rely on
+  pane-watcher alerts alone: the lane contract is marker file + poll
+  loop + `herdr pane run <owner-pane>` relay on completion/death —
+  the user called out the observability gap on the LTX 44-shot queue
+  (Gru standardized: marker file + poll loop + relay = Gru wakes on
+  completion/death, 08-31), and the h3 lane ran the same shape one
+  day earlier (submit → prompt_id watch file → END TURN → resume on
+  the short-poll tick; Silas' resume duty keyed on the
+  done-transition, 08-30). Turn-ends on these lanes are INTENTIONAL,
+  not stalls: pre-classify the lane's idle/working flips as lane
+  events (a multi-day queue flips constantly), and never let a
+  done-transition sit overnight (the egress-r2 lesson).
 - **Review/Perkins/cap sensors re-fire already-acted events — expect one
   stale echo per action (2026-08-01/02).** Silas relays/escalates/
   dispatches at round close-out; the sensor tick lands seconds-to-minutes
@@ -867,6 +881,18 @@ the user at the Gru session in `/Users/moses/code`.
   the notification relay is busy (the ledger + watcher caught it).
   Verify `shown:true` in the result; never assume the fire-and-forget
   landed.
+  2026-08-31 addendum (dream-2026-08-31; the playtest squad — 3/3 in
+  one day): the compliance gap is now the DEFAULT, not the exception
+  — all THREE playtest-squad minions (pp-playtest-neweyes/-stress/
+  -fun) completed without firing the briefing-mandated self-notify on
+  08-31, and fun's completion report CLAIMED `shown:true` without
+  ever executing (0 `cli:notification:show` results in its session
+  jsonl — a false claim, worse than a skip). Silas fired all three
+  himself (shown:true verified). A prose "notify on finish" briefing
+  line does not survive a long turn — the self-notify step wants a
+  checklist-gate form (template hardening rides as a dream user-ack).
+  Until it lands: Silas verify-and-fire on EVERY no-PR completion is
+  the only reliable guard.
 - **A Perkins fix-audit round is HELD on an UNSTABLE review target
   (2026-08-11).** Deferred when the PR head is still MOVING (minion
   iterating CI fixes / active A/B) AND/OR CI is RED — the harness
@@ -1403,7 +1429,27 @@ the user at the Gru session in `/Users/moses/code`.
   playtest was the only box-on × telegraph-lead surface) — .ips in
   hand → URGENT dispatch → PR #108 → r1 APPROVED → merged in ~3.5h.
   A user-play gate is the named coverage surface for CI-blind
-  feature lanes. 2026-08-22/23
+  feature lanes. 2026-08-31 addendum (dream-2026-08-31; the playtest
+  squad — the gate as a MINION SQUAD): the gate's second fire ran as
+  three harness-first minions (pp-playtest-stress/-fun/-neweyes)
+  under a hard mid-dispatch mechanics ruling — minions CANNOT drive
+  the GUI; play = golden-harness demo AUTHORING (.dem +
+  tools/harness.sh run + captures). The ruling landed ~6 min after
+  handover and was amended-in-place + relayed ×3 (verified in
+  steering buffers; zero re-dispatches — amend-and-relay at batch
+  scale). Blind demo-authoring (guessing the vocabulary cold) is a
+  first-class AUDIT surface: neweyes' blind session found REAL
+  harness bugs a GUI framing would never touch (the parser silently
+  accepting unknown commands; expect-hash dead since harness v1.1;
+  motion-strip rendering the wrong world; the unreachable lose state
+  #115), and stress independently corroborated #111/#112 —
+  cross-member corroboration is the signal a squad finding is real.
+  The verdict cycle closed end-to-end: fun scored balance 3.5/10
+  with the fix-first pair named (#118 era-3 death clock + #124
+  one-way health drain, corroborated by neweyes #115) → issues filed
+  → fix-first-then-re-test. GPU-contention caveat: perf claims HOLD
+  while a local GPU lane shares the box (the contention ruling;
+  stress filed no perf claims). 2026-08-22/23
   addendum (dream-2026-08-23 — the 16-PR wave ran end-to-end on it): a
   whole multi-job WAVE encodes as paneless blocked_by rows + named
   release triggers (7 wave rows held behind #76; released on cue at
