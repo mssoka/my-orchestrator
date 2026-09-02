@@ -531,8 +531,16 @@ older briefings use that name; this is the same section.)
   lavish review BEFORE the PR opens** — build, serve via `lavish`,
   foreground-poll for in-page annotations, apply, then open the PR (see
   'HTML artifact review (lavish)'). Code keeps the regular PR pattern.
-- When blocked or finished: `herdr notification show "<job-id>" --body
-  "<one-line status>"`.
+- **Self-notify = a CHECKLIST GATE (numbered, ticked, PASTED — not
+  prose).** When blocked or finished, your final message MUST carry
+  this completion step ticked, with the verbatim tool result pasted:
+  1. [x] `herdr notification show "<job-id>" --body "<one-line
+     status>"` → `<paste the result — must show shown:true>`
+  The pasted `shown:true` IS the proof of delivery. A claimed
+  `shown:true` without the pasted result = compliance gap (×3 seen
+  2026-08-31; one minion claimed shown:true without executing the
+  command). If the result shows `shown:false` (relay busy), retry
+  once, then escalate — never claim success on a `false`.
 - **Self-report every status transition** to the ledger as it happens:
   `bin/ledger set <job-id> <status> "<one-line note>"` (e.g.
   `clarifying` when you halt, `working` once answers arrive,
