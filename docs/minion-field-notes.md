@@ -499,6 +499,34 @@ findings that keep recurring. One line per entry, dated, with the job id.
   SEPARATE verb from `harness save <demo>` — a catalog_hash fold
   re-bless that skips it fails gate 10 on 'catalog drift' (enumerate
   the save verbs before any re-bless).
+- 2026-09-01 (dream-2026-09-02; pp-funfix-118-124 + pp-playtest-fun
+  — the fun-test loop): PP demo-authoring + evidence craft.
+  (a) PRs ALWAYS `gh pr create --base v2` — the repo default is main
+  = permanently DIRTY vs the wrong lane (#125, recovered via `gh pr
+  edit --base v2`; no rebase when the branch descends from
+  origin/v2); never assume the remote HEAD default. (b) Unblessed
+  demos FAIL `harness run` (no-manifest T1) — `harness save` in a
+  sandbox copy (`rsync -a --exclude .git --exclude _bmad`, ~300 MB,
+  carries the gitignored rlsw shadow) blesses AND still writes the
+  `--stats-out` stream even for failing runs; save-then-run is the
+  only path that also replay-verifies your evidence. (c) replay_error
+  latches with NO reason named (#123) — bisect: router ports FIRST
+  (4/router; spine links count — a 3-router spine for 13 nodes needs
+  14 ports), then spans (`span_between` = integer-Euclidean isqrt
+  half-up; ACTIVE tiers 14 standard / 16 mid / 18 wide), and NEVER
+  `sed`-renumber spawn ids (dangling draw endpoints — rewrite the
+  whole demo). (d) The v3 stats CSV has NO lifecycle events (breach
+  latches, grace chips, Run_Won invisible — a win with 1801/1801
+  SLA-flagged ticks LOOKS like a breach that should have drained):
+  ground truth = blessed HUD capture PNGs read inline (glm-5.3-flash
+  native vision), never stats math alone.
+- 2026-09-01 (dream-2026-09-02; gru-journal video lane + the pi
+  lens-turn sibling): a tool/bridge CALL timeout ≠ job failure —
+  long server-side jobs (Cycles renders, generations, batch runs)
+  finish anyway; CHECK THE OUTPUT ARTIFACT before retrying or
+  declaring failure (bridge-timeout Cycles renders landed
+  server-side; pi lens turns that hit 500s still wrote findings to
+  disk).
 - 2026-08-20 (dream-2026-08-21; packet-plumber-ue-bootstrap + -slice-1 —
   the UE repo cluster): ue-mcp bridge ops — `ue-mcp init` is pty-only:
   deploy via the package's `dist/deploy-cli.js` then REBUILD (a stale
@@ -817,7 +845,8 @@ findings that keep recurring. One line per entry, dated, with the job id.
 - 2026-08-13 (dream-2026-08-13; 3.4-sla, 4.2-surge, 4.1-warning ×2 — ×4
   sightings, both repos): reported success LIES — verify by OBSERVABLE
   effect, not return values: a narrow pipe draw is silently REJECTED
-  (max_span 10) → zero events (spawn narrow-tier nodes ≤10 tiles apart);
+  (max_span 10 — narrow since DISABLED; active tiers 14/16/18, see
+  the 2026-09-01 entry) → zero events (spawn narrow-tier nodes ≤10 tiles apart);
   adding pipes to a full router silently rejects (Router_Ports_Full →
   replay_error latched — swap or size the fixture); Odin
   `strings.replace` returns replaced=true while the doc holds the old

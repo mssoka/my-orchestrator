@@ -233,6 +233,23 @@ the user at the Gru session in `/Users/moses/code`.
   (dream-2026-08-27; righttenantry-dublin-rents-q2-2026): also restore
   the `server/.env -> ../.env` symlink (main checkout has it, copies
   don't) — without it `make run` panics 'DATABASE_URL not set'.
+  2026-09-02 addendum (dream-2026-09-02; pp-funfix-118-124): the
+  class is cross-repo — a PP `git worktree add` worktree misses
+  `_bmad` ENTIRELY (fully gitignored, nothing to copy): `ln -s
+  <repo_root>/_bmad _bmad` from the worktree before any bmad-build
+  step; render_skill.py lives at the ORCHESTRATOR root's
+  `/Users/moses/code/_bmad/scripts/` (the PP main checkout's
+  `_bmad/scripts/` does NOT carry it).
+- **PP PRs always `--base v2` — the briefing names the base
+  (2026-09-01, pp-funfix-118-124 / PR #125).** `gh pr create`
+  silently targets the repo's DEFAULT branch: on the v2-lane repo
+  that opened #125 vs `main` = permanently DIRTY against the wrong
+  lane. Recovery when the true base hasn't moved: retarget (`gh pr
+  edit --base v2`) — NO rebase needed when the branch descends
+  cleanly from origin/v2 (#125: OPEN+MERGEABLE in one edit).
+  Standing rule (Silas, same night): packet-plumber PRs always carry
+  `--base v2`; dispatch briefings NAME the base so the rule stops
+  being tribal knowledge.
 - **Live-tree dedup under open sessions: SWAP-NOW, REMOVE-LATER
   (2026-08-28/29, skills dedup sweep, 3 repos).** Procedure: capture
   the only-in-repo list to a ledger note FIRST, verify zero live
@@ -543,6 +560,12 @@ the user at the Gru session in `/Users/moses/code`.
   mega-minions explicitly in every briefing; template model lines rot
   (the dream template's "unset" meant retired-kimi at the 08-13
   dispatch — override required).
+  2026-09-02 addendum (dream-2026-09-02; packet-plumber-funfix-118-124
+  dispatch 08-31): HAND-AUTHORED briefing model lines rot too — the
+  funfix brief named deepseek ops four days after the 08-27
+  retirement; the dispatch-time correction layer (Silas overrides +
+  flags in the dispatch note) caught it, no wrong-model launch.
+  Verify the model line at dispatch even on same-day briefs.
   2026-08-19 supersede (user ruling, wire-aesthetics r1 / PR #70):
   defaultProvider is now deepseek/deepseek-v4-flash — an UNSET or
   bare-`pi` Perkins ROUND launch now runs the WHOLE round on flash
@@ -893,6 +916,12 @@ the user at the Gru session in `/Users/moses/code`.
   checklist-gate form (template hardening rides as a dream user-ack).
   Until it lands: Silas verify-and-fire on EVERY no-PR completion is
   the only reliable guard.
+  2026-09-02 addendum (dream-2026-09-02; pp-funtest-r2 +
+  orchestrator-docs-p4-p5): the checklist-gate form field-proven x2
+  the very next window — both completions self-notified with the
+  PASTED `shown:true` (2/2 vs 0/3 the day before); the gate itself
+  rides PR #16 (the P5 hardening, in-review). Verify-and-fire stays
+  until the trend holds past PR #16's merge.
 - **A Perkins fix-audit round is HELD on an UNSTABLE review target
   (2026-08-11).** Deferred when the PR head is still MOVING (minion
   iterating CI fixes / active A/B) AND/OR CI is RED — the harness
@@ -966,7 +995,17 @@ the user at the Gru session in `/Users/moses/code`.
   'one-machine settle' was the minion machine agreeing with itself —
   census 116/117 swapped, ZERO warm bytes absorbed; the r5 briefing
   led 'bytes not claims' → B2 closed: 86/117 byte-identical to #106
-  warm, 0.00% swap-signature).
+  warm, 0.00% swap-signature). (j) The blind-lens single retry can
+  fail on a PROVIDER ERROR, not just a second truncation — same
+  close: 6/7 DEGRADED-DISCLOSED (pp-funfix-118-124 r1 09-01), and
+  'line-by-line hunk verification' is a named, disclosed
+  compensation for the missing blind lens (stronger than 'covered
+  by the remaining lenses'). Mutation checks now reach DOC surfaces:
+  the era3_surge_survivable header's 'pre-fix this mesh died' claim
+  was FALSE by mutation (cold mesh never breaches) and the tuning
+  table's measured-effect citation was disproven (4-lens convergence
+  + mutation) — bytes-not-claims extends to demo headers + tuning
+  tables.
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
@@ -1120,6 +1159,19 @@ the user at the Gru session in `/Users/moses/code`.
   self-created at `working` with pane/tab/worktree/model/pr EMPTY
   (Silas filled post-hoc). Verify-and-fill on every round row stays
   the guard.
+  2026-09-02 addendum (dream-2026-09-02; pp-funfix-118-124 — the
+  CANONICAL-FLIP flavor): the minion looked up the SHORT id, found
+  nothing, and self-created `pp-funfix-118-124` (its note claimed
+  'dispatch add was missing' — FALSE; Silas' row existed as
+  `packet-plumber-funfix-118-124`), then ran the ENTIRE live
+  lifecycle on it (pr -> in-review -> merged) while the dispatch row
+  sat stale at working + pane pointer, feeding a post-merge watcher
+  echo. Reconciled per this doctrine (canonical = the minion's row).
+  New sub-facts: a self-created row also defaults `base: main` on a
+  v2-lane repo, and the durable fix is dispatch-side — the handover
+  must PIN the row id verbatim ('your ledger row is <id> —
+  self-report THAT id'), so the minion's first `ledger show/set`
+  lands on the canonical row.
   2026-08-19/21 addendum (two NEW flavors): (a) WRONG-ROW events — the
   r5 round's self-report (`ledger set <id> working`) landed on the r4
   ROW (a sibling DONE row flipped done→working, restored; round ids
@@ -1300,6 +1352,12 @@ the user at the Gru session in `/Users/moses/code`.
   (`#pullrequestreview-` / `-1`) — the recovered-as-note verdict written
   at close-out carries the real id; never read the URL off the
   self-close event (×2: qos-panel 5.8, readability-assist).
+  2026-09-02 addendum (dream-2026-09-02; pp-funfix-118-124-perkins-r1):
+  the EMPTY flavor — a close-out note wrote 'r1 posted as formal
+  review: .' with the URL missing entirely (the done note read
+  'review: posted-on-PR-125'). A placeholder is record-loss: FETCH
+  the review id at close-out and write the full URL, or the
+  permanent ledger loses the anchor.
 
 - **`pr_review` is a LEDGER KEY, not a note string (2026-08-12, ~11h of sensor blindness).** The Perkins sensor's gate is `job.pr_review === 1` read from the COLUMN. Writing "pr_review 1" into the `ledger add` note leaves the column at its 0 default and the review-sensor silently skips the job — 5 jobs blind (~11h: 3.3/3.4/4.1/rc1-1/rc4-3/rc4-4/4.2, every Perkins round in that window was a manual/held dispatch; only 3.2 fired because its row was SQL-fixed at 12:16Z). ALWAYS pass `pr_review=<n>` as an add-key when the briefing mandates it. VERIFY the column after add (`sqlite3 ... SELECT pr_review`), don't trust the note. Sensor-down fallback: at every minion completion/settle, sweep in-review pr_review=1 jobs — no round row carrying the current head sha + head stable → dispatch manually, never wait on the sensor.
   2026-08-13 addendum (dream-2026-08-13): manual/held dispatch is what
@@ -1449,7 +1507,15 @@ the user at the Gru session in `/Users/moses/code`.
   one-way health drain, corroborated by neweyes #115) → issues filed
   → fix-first-then-re-test. GPU-contention caveat: perf claims HOLD
   while a local GPU lane shares the box (the contention ruling;
-  stress filed no perf claims). 2026-08-22/23
+  stress filed no perf claims). 2026-09-02 addendum
+  (dream-2026-09-02; pp-funtest-r2): the loop's first FULL cycle
+  closed — fix PR #125 r1-APPROVED + merged (e50e9a8) -> the held
+  re-test row released on cue at the merge -> GATE YES on both
+  metrics (era-3 winnable-with-good-play 5/7 runs; health
+  recoverable 46%->100%->win) vs the 3.5/10 baseline; 3 new issues
+  #126-#128 + r2 comments on #119/#121/#122. The shape that worked:
+  the GATE METRIC is defined up-front in the held row's note,
+  release = the fix PR's merge. 2026-08-22/23
   addendum (dream-2026-08-23 — the 16-PR wave ran end-to-end on it): a
   whole multi-job WAVE encodes as paneless blocked_by rows + named
   release triggers (7 wave rows held behind #76; released on cue at
