@@ -1,0 +1,52 @@
+[
+  {
+    "source": "codebase",
+    "severity": "blocker",
+    "category": "broken-existing-test",
+    "title": "Nil Input.state segfaults the existing input suite: draw_drag_on_a_node_never_pans (verified failing)",
+    "location": "app/input/camera_input_test.odin:56-58",
+    "evidence": "cam_test_ctx wires ictx.topo/ictx.cat/ictx.log but never ictx.state:\n\tictx.topo = &st.topology\n\tictx.cat = cat\n\tictx.log = log\nwhile box_apply_edit dereferences state unguarded (core/box.odin:152-153):\nbox_apply_edit :: proc(state: ^Run_State, cmd: Command, cat: ^Catalogs) -> (Edit_Result, Edit_Error) {\n\tif !state.box_enabled {\nActual run of `odin test app/input` in this worktree: \"Finished 13 tests in 2.553ms. 1 test failed. - input.draw_drag_on_a_node_never_pans \tSignal caught: Segmentation_Fault\"",
+    "detail": "commit_draw now routes through box_apply_edit, which derefs state.box_enabled with no nil check; the camera fixture's Input leaves state nil, so the first draw gesture crashes the test. CI leg ci.yml:77 (odin test app/input) is red.",
+    "recommended_fix": "Wire ictx.state = &st in cam_test_ctx (mirroring exec_test.odin:73) and nil-guard the delegate: `if state == nil || !state.box_enabled` in box_apply_edit, so unwired Input stays legacy-safe."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "resource-leak",
+    "title": "stats_destroy does not free the new rec.box.pieces array — per-tick leak on box-on stats runs",
+    "location": "core/stats.odin:378-383",
+    "evidence": "stats_compute allocates per tick (core/stats.odin:195):\n\t\trec.box.pieces = make([dynamic]Stats_Box_Piece_Row, 0, 4, allocator)\nbut the destructor was not extended:\nstats_destroy :: proc(rec: ^Stats_Record) {\n\tdelete(rec.classes)\n\tdelete(rec.pipes)\n\tdelete(rec.ports)\n\tdelete(rec.drops)\n\trec^ = {}\n}",
+    "detail": "stats_destroy is the per-record teardown (harness/run.odin:485, app/main.odin:594); on box-on runs every stepped tick leaks one heap array, breaking the record's own run_init/destroy discipline.",
+    "recommended_fix": "Add `delete(rec.box.pieces)` to stats_destroy before the `rec^ = {}` reset."
+  },
+  {
+    "source": "codebase",
+    "severity": "warning",
+    "category": "feedback-gap",
+    "title": "Box refusal on placement is silent — the place path never feeds last_reject (commit_draw does)",
+    "location": "app/input/exec.odin:156-158",
+    "evidence": "Place_Release path has no else branch:\n\t\t\t\tcmd := pp.Cmd_Place_Router{type_idx = u16(inp.placing), pos = tile}\n\t\t\t\tif _, err := pp.box_apply_edit(inp.state, pp.Command{1, cmd}, inp.cat); err == .None {\n\t\t\t\t\tappend(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})\n\t\t\t\t}\nwhile commit_draw got the feedback branch (exec.odin:341-344):\n\t\t} else {\n\t\t\t// the Box's \"no\" must TEACH (the record: tutorial by\n\t\t\t// consequence) — surface the refusal on the toast channel.\n\t\t\tinp.last_reject = err\n\t\t\tinp.reject_tick = inp.tick",
+    "detail": "Tray selection (exec.odin:114) doesn't gate on held pieces, so .Box_Piece_Exhausted fires at runtime with no toast — reject_label's authored \"none of those in the box - teardown refunds pieces\" (main.odin:2198) is unreachable from placement, contradicting tutorial-by-consequence.",
+    "recommended_fix": "Mirror commit_draw's else on the placement path: set inp.last_reject/inp.reject_tick when box_apply_edit refuses a placement."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "duplication",
+    "title": "Router short-name mapping duplicated verbatim: draw_box_hud re-implements draw_tray's",
+    "location": "app/main.odin:2424",
+    "evidence": "draw_box_hud (new, main.odin:2424):\n\t\tif short == \"router_basic\" { short = \"basic\" } else if short == \"router_mid\" { short = \"mid\" } else if short == \"router_high\" { short = \"high\" }\ndraw_tray (shipped, main.odin:2479):\n\t\tif short == \"router_basic\" { short = \"basic\" } else if short == \"router_mid\" { short = \"mid\" } else if short == \"router_high\" { short = \"high\" }\ndraw_box_hud also re-calls `row, ok := pp.era_row(&app.cat, app.state.era)` inside both per-type/per-spool loops (main.odin:2417, 2429).",
+    "detail": "Identical id-shortening logic now lives twice in one file; a new router tier id would need both sites updated, and the era_row lookup repeats per loop iteration.",
+    "recommended_fix": "Extract a shared router_short_name helper (or hoist the mapping beside draw_tray's) and hoist the era_row call above the loops."
+  },
+  {
+    "source": "codebase",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Dead slot lookup in box_charge's Demolish_Node case — result discarded, refund rides the snapshot",
+    "location": "core/box.odin:296-297",
+    "evidence": "\tcase Cmd_Demolish_Node:\n\t\tslot, _ := node_slot(t, c.node)\n\t\t\tstate.box.pieces[snap.dn_type] += snap.dn_pieces\n\t\tfor s in 0..<len(state.box.spools) {\n\t\t\tstate.box.spools[s] += snap.dn_spools[s]\n\t\t}",
+    "detail": "slot is never used; the refund comes entirely from the validate-time snapshot (the node is dead post-apply, so node_slot would return slot 0/!ok anyway). The odd over-indented line suggests an abandoned edit.",
+    "recommended_fix": "Delete the `slot, _ := node_slot(t, c.node)` line and fix the indentation of the pieces line."
+  }
+]

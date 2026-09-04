@@ -1,0 +1,10 @@
+# field notes — packet-plumber-v2-viscomm-crisis-duck
+
+- The masked-rc trap bit THREE times in one job: `odin build ... | head` and `2>/dev/null` both hide build failures and re-run a STALE bin/harness (once "confirming" a mutation leg that hadn't compiled, once "passing" palcheck); after ANY suppressed-output command, echo $??-style rc capture must bind odin's rc, not the pipe's — and rebuild before trusting any binary run.
+- An "involved" visual element can be pixel-UNTESTABLE by design: the crisis bottleneck outline overdraws the named bundle's whole band (+ riders), so the zone's non-recede was pinned one layer out (the type-chip glyph above the sprite + at-node doorstep riders, both clear of the outline's end-caps) — when the highlight owns the surface, pin the neighbor surface.
+- Empirical golden-set prediction vs reality: the briefing predicted surge/estate_surge crisis re-blesses, but a temp capture-time crisis dump showed NO active crisis at any of their captures on the current head (stale 4.2-era captions post the 08-24 re-pin) — and dublin@90s unexpectedly carries a Pool_Exhaustion crisis (which the design correctly recedes nothing for); enumerate crisis state AT THE CAPTURE TICK, never from demo comments.
+
+# Perkins r1 addendum (2026-08-26)
+
+- rlsw renders DrawTriangle FILLS opaque too (not just lines) — an alpha-only "recede" on a hand-built triangle surface is a goldens-path no-op; use the RGB mix (crisis_recede) and pin with a live-render leg. Worse: dublin_node_block_draw's street-oriented quads are BACKFACE-CULLED for some windings (pre-existing; deferred) — a mutation that changes only the fill can stay pixel-inert because THE FILL NEVER RENDERS there; probe with distinct-color dumps before trusting any block-surface gate.
+- Test-fixture pin craft: (a) `pop()` removes the LAST row — resolving a specific crisis in a fixture needs swap-remove; (b) never re-derive the "before" value inside an assertion AFTER mutating the fixture — capture it before; (c) an `|| true` inside an expect is a vacuous pin wearing a seatbelt (shipped one AGAIN, caught again — grep every new expect for it).

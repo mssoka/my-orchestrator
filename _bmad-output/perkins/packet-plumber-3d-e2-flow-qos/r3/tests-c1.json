@@ -1,0 +1,72 @@
+[
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "P2 gap: QoS allocation → strand-thickness visual feedback is unpinned (alloc-rebuild detection unasserted; a constant thickness passes the only strand test)",
+    "location": "scripts/flow_view.gd:51-52 + scripts/pipe_arc.gd:85-89 vs tests/test_view_interaction.gd:206-214",
+    "evidence": "flow_view.gd:51-52: `elif meta.get(\"alloc\", []) != p.alloc:` / `_rebuild_view(id, p)`. pipe_arc.gd:85-89: `func _strand_thickness(lane: int) -> float:` ... `var share := float(_shares[lane]) / 100.0` / `return share if share > 0.0 else HAIRLINE_FRAC`. The only strand assertions (test_view_interaction.gd:210-214): `var s0 := arc.strand_point(0, 0.5)` ... `check(s0.distance_to(s1) > 0.05 and s1.distance_to(s2) > 0.05 and s0.distance_to(s2) > 0.05, \"strands: the three lane points occupy distinct ring positions\")` — a mutation returning constant thickness for every lane still satisfies these distance checks (angles differ), and the alloc-change rebuild branch has no assertion on resulting shares/thickness anywhere in tests/.",
+    "detail": "E2.3's visible feedback loop ('strands visibly re-thicken', hairline for unallocated lanes) can silently regress; only ring distinctness is pinned, not share→thickness.",
+    "recommended_fix": "In test_view_interaction, apply a set_lanes change and assert the arc's shares/_strand_thickness deltas (e.g. lane 0 hairline 0.3 vs lane 1 full 1.0) and that the view rebuilt."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "P3 gap: dot-pool density cap (MAX_DOTS_PER_PIPE=48) and post-drain slot hiding have no test",
+    "location": "scripts/flow_view.gd:10,133-134,167-168",
+    "evidence": "flow_view.gd:10: `const MAX_DOTS_PER_PIPE := 48 # beyond this the density speaks; lowest ids win`; 133-134: `if used >= MAX_DOTS_PER_PIPE:` / `capped = true # density speaks; hide the rest — never ghost`; 167-168: `for i in range(used, pool.size()):` / `pool[i].visible = false`. No test file references MAX_DOTS_PER_PIPE or floods >48 in-flight packets (grep across tests/ returns nothing); _dot_material_rebind checks only pool[0].",
+    "detail": "The 'never ghost' density guard and stale-slot hiding are visual-only behaviors a regression would silently break (ghost dots after drain, unbounded pool).",
+    "recommended_fix": "Flood one bundle past 48 in-flight and assert pool.size() == 48; after drain assert all pool[i].visible == false."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "P3 gap: reverse-direction (endpoint b) dot rendering branch 't = 1.0 - t' untested on the view side",
+    "location": "scripts/flow_view.gd:141-143",
+    "evidence": "flow_view.gd:141-143: `var t := float(int(pkt.progress_milli)) / length` / `if endpoint == 1:` / `t = 1.0 - t # b -> a traversal renders reversed`. Sim-side inflight_b is covered (test_sim_flow._duplex_capacity spawns 1→2 and 2→1), but no view test spawns a b→a packet and asserts dot position; _dot_material_rebind stages only 0→9 (endpoint 0).",
+    "detail": "Half of all bidirectional traffic renders through this one-line reversal; a sign flip would make b→a dots swim upstream visually, undetected by the suite.",
+    "recommended_fix": "Extend _dot_material_rebind (or a new leg): spawn 9→0, sync, assert the dot sits at strand_point(lane, 1 - progress/length)."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "P3 gap: QosPanel.open unknown-pipe error path (auto-close) is untested",
+    "location": "scripts/qos_panel.gd:113-118",
+    "evidence": "qos_panel.gd:113-118: `func open(pipe_id: int, sim: SimCore) -> void:` / `_pipe_id = pipe_id` / `var p: Dictionary = sim.pipes.get(pipe_id)` / `if p == null:` / `close_panel()` / `return`. _panel_logic in test_view_interaction.gd only opens a real pipe; no test calls open() with an unknown id (grep 'open(-1'/'open(99' in tests/ returns nothing).",
+    "detail": "Explicit error handling implied by the guard is happy-path-only covered; a regression (e.g. stale visible panel, wrong _pipe_id) would pass the suite.",
+    "recommended_fix": "Add one leg: panel.open(999, sim) then assert not panel.visible and panel._pipe_id == -1."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "P3 gap: editor one-shot capture path (_editor_preview_shot / _editor_vp3d fallback) has no automated coverage",
+    "location": "scripts/main.gd:99,133-135",
+    "evidence": "main.gd:99: `func _editor_preview_shot() -> void:`; 133-135: `func _editor_vp3d() -> Viewport:` / `if not Engine.has_singleton(\"EditorInterface\"):` / `return null`. test_editor_preview.gd pins structure textually (`src.begins_with(\"@tool\")`, `src.contains(\"@export_tool_button(\\\"Regenerate Preview\\\"\")`) and regenerate behavior, but never exercises the --editor-preview-shot coroutine or the no-editor-singleton fallback.",
+    "detail": "Editor-only capture affordance; the fallback and quit-path can break silently. Mitigated: captures/08-editor-preview.png exists as a run artifact.",
+    "recommended_fix": "Acceptable as evidence-artifact-only; optionally smoke-call _editor_vp3d() headless and assert it returns null outside the editor."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "P3 gap: same-priority overflow tie-break ('oldest of its class' FIFO) is documented but not directly pinned",
+    "location": "scripts/sim/sim_core.gd:455-463",
+    "evidence": "sim_core.gd:455-463: `## first, then packet id (oldest of its class). Tuple compare — a packed` / `func _is_lower_rank(a: int, b: int) -> bool:` / `var pa := int(SimBalance.CLASSES[packets[a].cls].drop_priority)` / `var pb := int(SimBalance.CLASSES[packets[b].cls].drop_priority)` / `if pa != pb:` / `return pa < pb` / `return a < b`. Both directed legs in test_sim_qos._drop_precedence are cross-class ('queue full of streaming, an email arrives', 'queue full of email, a streaming packet arrives'); the equal-priority id branch is exercised only statistically, where a `a > b` mutation would not flip any assertion.",
+    "detail": "The documented FIFO fairness tie-break within a class can silently invert (newest drops instead of oldest) without failing any directed check.",
+    "recommended_fix": "Add a directed leg: QUEUE_DEPTH streaming queued + streaming newcomer, assert the victim is the lowest queued id and the newcomer joins."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: PASS",
+    "location": "N/A",
+    "evidence": "Verified by running `godot --headless -s res://tests/run_tests.gd`: `SUITE RESULT: PASS (0 failure(s))` — 185 checks across 12 files, each matching its pinned EXPECTED_CHECKS (5+14+25+26+5+27+5 sim/view/replay checks etc.). Trace of 32 diff behaviors: P0 = the five epic A1 contracts, all FULL (replay byte-identity incl. seed-divergence and command-timing mutation legs in test_sim_replay; drop precedence directed both directions; lane reservation + gap-filling; SLA detect/attribute/sticky incl. threshold-bites mutation; view purity incl. a negative control) = 100%. P1 = 18/18 FULL (ECMP, min-cost, pooled + duplex capacity, every command-validation branch, set_lanes, serialization order, deactivation re-enqueue, exact lane-speed ratios, no_route isolation, select grammar via real InputEvents, occlusion guard, panel logic incl. validation-passing payload, request_connect binding, node_index identity, HUD chip, dot material rebind) = 100%. P2 = 2 FULL + 2 PARTIAL = 50%. P3 = 0/5. Overall = (25 full + 2 half) / 32 ≈ 81%.",
+    "detail": "P0 100%, P1 100% (≥90%), overall ~81% (≥80%) — all PASS thresholds met. Gaps concentrate in P2/P3 visual-feedback and error-path edges; every critical-path behavior carries happy + core-error + mutation legs.",
+    "recommended_fix": "To lift overall toward 90%: pin the QoS alloc→strand-thickness visual mapping and the FlowView alloc-rebuild (raises P2 to 100%), plus cheap legs for the dot cap/hide, panel.open invalid-id, and the same-priority tie-break."
+  }
+]

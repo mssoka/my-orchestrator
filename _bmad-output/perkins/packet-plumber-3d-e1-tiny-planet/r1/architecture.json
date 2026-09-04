@@ -1,0 +1,82 @@
+[
+  {
+    "source": "architecture",
+    "severity": "warning",
+    "category": "dead-code",
+    "title": "Node-separation decay loop is dead code; effective separation (0.0625 rad) contradicts the documented hitbox-disjoint contract",
+    "location": "scripts/world_seed.gd:145-149",
+    "evidence": "const MIN_NODE_SEPARATION_RAD := 0.25 # keeps node hitboxes (r 0.95) from overlapping\nconst MAXF_SEPARATION_FLOOR := 0.25 # fallback keeps at least 25% of the separation\n...\n\t\tvar sep := MAXF_SEPARATION_FLOOR * (1.0 - float(attempt) / 80.0) * MIN_NODE_SEPARATION_RAD\n\t\tif sep < MIN_NODE_SEPARATION_RAD * 0.25:\n\t\t\tsep = MIN_NODE_SEPARATION_RAD * 0.25",
+    "detail": "0.25*(1-a/80)*0.25 <= 0.0625 for every attempt, so the floor clamp pins sep to a constant 0.0625: the 80-attempt decay machinery never engages, and 0.0625 rad (0.5 units at R=8) is below the ~0.24 rad needed to keep r=0.95 hitboxes disjoint as the comment/spec claim.",
+    "recommended_fix": "Use sep = MIN_NODE_SEPARATION_RAD * (1.0 - 0.75*attempt/80.0) so it decays 0.25 -> 0.0625, and fix the misleading comment/constant name (MAXF_SEPARATION_FLOOR reads like a typo)."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Geodesic's 'pure static math' module takes/returns scene-tree Node3D in snap_candidate",
+    "location": "scripts/geodesic.gd:102-112",
+    "evidence": "## Pure great-circle math on a sphere (E1.1 surface-math core).\n...\nstatic func snap_candidate(point: Vector3, candidates: Array, snap_arc: float) -> Node3D:\n\tvar best: Node3D = null\n\tvar best_arc := snap_arc\n\tfor n in candidates:\n\t\tif n == null or not (n is Node3D):\n\t\t\tcontinue\n\t\tvar arc := arc_angle(point, (n as Node3D).global_position)",
+    "detail": "The module's stated contract (and the spec code map: 'pure static math') is violated: snap_candidate is scene-aware, coupling the math layer to Node3D and forcing the headless snap test to stage real nodes in the tree.",
+    "recommended_fix": "Accept Array of Vector3 positions (or a position Callable) and return the winning index; let the caller map index -> node. Keeps Geodesic tree-free."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "coupling",
+    "title": "Scripts self-resolve sibling scene paths instead of composition-root injection",
+    "location": "scripts/connect_controller.gd:19-21",
+    "evidence": "@onready var rig: OrbitCamera = get_node(\"../OrbitRig\")\n@onready var nodes_container: Node3D = get_node(\"../Nodes\")\n@onready var pipes_container: Node3D = get_node(\"../Pipes\")\n--- input_router.gd:21: @onready var camera: Camera3D = get_node(\"../OrbitRig/Camera3D\")\n--- capture_runner.gd:18-19: _controller = get_node(\"../ConnectController\") / _rig = get_node(\"../OrbitRig\")",
+    "detail": "main.gd is documented as the composition root wiring signals, yet dependencies are hard-coded via relative paths in three scripts (inconsistently: router reaches ../OrbitRig/Camera3D directly while the controller uses rig.camera). Renaming/reparenting nodes in main.tscn breaks scripts at runtime.",
+    "recommended_fix": "Have main.gd inject dependencies (setup(rig, nodes, pipes) or exported NodePaths) so the scene layout lives in one place; route both camera accesses through the OrbitCamera abstraction."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Dev-only capture harness is instantiated inside the shipped main scene",
+    "location": "scenes/main.tscn:56-57",
+    "evidence": "[node name=\"CaptureRunner\" type=\"Node\" parent=\".\"]\nscript = ExtResource(\"7\")\n--- capture_runner.gd: \"## Capture harness (A4): INERT during normal play — activates only when the game is launched with `-- --capture`.\"",
+    "detail": "Proof-of-look tooling (reads sibling nodes, commits pipes, quits the tree) ships in the game scene tree. Flag-gated and inert in play, but it mixes dev/proof concerns into the production composition and every scene load pays its _ready.",
+    "recommended_fix": "Move capture sequencing to a separate overlay scene or a --script harness that instantiates main.tscn, keeping the shipped scene free of tooling nodes."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "premature-optimization",
+    "title": "draw_move's 1e-4 rebuild guard is a no-op at real zooms — preview rebuilds on every motion event anyway",
+    "location": "scripts/connect_controller.gd:66-71",
+    "evidence": "\t# Rebuild the preview mesh only when the arc end actually moved — motion\n\t# events arrive per-frame and a full SurfaceTool rebuild per event churns.\n\tif end.distance_to(_last_preview_end) > 1e-4:\n\t\t_last_preview_end = end\n\t\t_show_preview(_source.global_position, end)\n\t\t_preview.visible = true",
+    "detail": "At the globe stop (distance 22, fov 50, 900px tall) one pixel of pointer motion projects to ~0.023 world units — 200x the 1e-4 threshold — so the full SurfaceTool rebuild still fires on essentially every motion event. The guard adds state (_last_preview_end) and complexity without the claimed benefit.",
+    "recommended_fix": "Either quantize the projection (e.g. snap end to the geodesic sample grid or ~1px-equivalent arc step) so the guard actually dedupes, or drop the guard and the _last_preview_end state."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "dead-code",
+    "title": "Geodesic.ray_sphere ships in production but is only exercised by tests",
+    "location": "scripts/geodesic.gd:81",
+    "evidence": "static func ray_sphere(origin: Vector3, dir: Vector3, center: Vector3, radius: float) -> Vector3:\n--- only callers: ./tests/test_geodesic.gd:79-83 (production ray-casts use physics: connect_controller.gd _project_pointer / input_router.gd _pick)",
+    "detail": "A second, analytic ray/projection path exists solely to be tested while gameplay uses physics ray-casts. Dead production surface that E2+ readers must reason about, and the two projection paths can silently diverge.",
+    "recommended_fix": "Either use the analytic ray_sphere for the pointer projection (cheap, collider-free) or delete it and its test until needed."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "duplication",
+    "title": "Orthonormal-basis idiom and elevated_path computation duplicated across modules",
+    "location": "scripts/node_site.gd:39-42",
+    "evidence": "node_site.gd: var helper := Vector3.UP if absf(n.dot(Vector3.UP)) < 0.99 else Vector3.RIGHT / var t1 := n.cross(helper).normalized() / var t2 := t1.cross(n).normalized()\n--- pipe_arc.gd:117-119: same three lines verbatim (dir variant)\n--- pipe_arc.gd:46 and :105: identical `Geodesic.elevated_path(_a, _b, WorldSeed.PLANET_RADIUS, BASE_ELEVATION_FRAC * WorldSeed.PLANET_RADIUS * _radius_scale, SEGMENTS)` computed once for the mesh and again for the trestles",
+    "detail": "The same basis-from-normal construction is copy-pasted in two files, and build() recomputes the identical 49-point path twice per rebuild. Small now, but the idiom will spread (E3 props, E2 packet paths) and the copies can drift.",
+    "recommended_fix": "Extract Geodesic.basis_from_normal(n) (or a small BasisUtil) and have build() compute the path once, passing it to _rebuild_mesh and _rebuild_trestles."
+  },
+  {
+    "source": "architecture",
+    "severity": "note",
+    "category": "coupling",
+    "title": "Pipe-bundle registry keys bundles by node display names",
+    "location": "scripts/connect_controller.gd:138-141",
+    "evidence": "func _pair_key(a: NodeSite, b: NodeSite) -> String:\n\tvar an := str(a.name)\n\tvar bn := str(b.name)\n\treturn an + \"|\" + bn if an < bn else bn + \"|\" + an",
+    "detail": "Bundle identity depends on tree node-name strings staying unique forever. E3 growth adds/removes nodes dynamically; a renamed, recycled, or duplicated name silently merges or orphans bundles — name uniqueness is an implicit invariant nothing enforces.",
+    "recommended_fix": "Key by instance identity (get_instance_id() pair or NodeSite references via a stable id field assigned at staging) instead of display names."
+  }
+]

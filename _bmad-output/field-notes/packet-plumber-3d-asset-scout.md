@@ -1,0 +1,5 @@
+# field notes — packet-plumber-3d-asset-scout (2026-09-04)
+
+- Poly Pizza (CC0-rich) has NO usable API without a key, but search pages embed full JSON in `window.__SERVER_APP_STATE__` (title/author/license/previewUrl) and the GLBs sit at `static.poly.pizza/<preview-uuid>.glb` — search-page JSON + curl = a complete free scouting API; tri counts via HTTP-range fetch of just the GLB JSON chunk (sum accessors).
+- "Imports lie" quantified: authoring scales ranged 0.08x–25x across sources (power plant 1.33 m, farm house 25.3 m) — normalize by MEASURED world bbox (glTF accessor min/max × node-transform walk; ~80 lines of python, no Blender needed for GLB→GLB) and carry the factor in a `PP3D_NormalizedScale` root node; Sketchfab-sourced items go through the blender MCP `download_sketchfab_model` which accepts `target_size` and self-scales (still verify by measurement).
+- Sketchfab thumbnails-as-files: `GET https://api.sketchfab.com/v3/models/<uid>` (public, no auth) → `thumbnails.images[].url` (NOT `.urls`); the blender MCP preview tool returns inline images only, unusable for HTML surfaces.

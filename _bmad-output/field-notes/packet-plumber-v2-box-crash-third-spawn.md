@@ -1,0 +1,5 @@
+# field notes — packet-plumber-v2-box-crash-third-spawn (2026-08-28)
+
+- `shadow_clone` (app/render/spawn_fx.odin) hand-copies Run_State's dynamic arrays; EVERY new Run_State dynamic array must add a clone line AND a pin line in test_spawn_fx_shadow_clone_box_owns_every_array — the box-ON fixture + raw_data pointer pins are what make a missed field CI-visible (box-OFF fixtures hide it: nil headers delete harmlessly; skip only raw_data==nil in the pin, len==0 hides allocated backings).
+- Reducing a "pointer being freed was not allocated" SIGABRT with lost app frames: grep the repro surface for by-value dynamic-array/struct copies feeding a destroy — `clone := src^` + `run_destroy(&shadow)` was the whole bug; Odin's test allocator prints `bad free @ file:line` call sites, so `odin test` beats libmalloc for localizing invalid frees.
+- `odin test` bad frees are REPORTED not fatal, and temp_allocator frees are no-ops the leak report cannot see — a mutation gate must pin ownership directly (pointer compares), never depend on allocator abort/leak behavior.

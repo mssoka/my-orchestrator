@@ -1,0 +1,72 @@
+[
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Terminal gauge snap (the r1 game-over-freeze fix) has zero coverage — deleting it passes every gate",
+    "location": "app/main.odin:617",
+    "evidence": "app/main.odin:611-618:\n            app.accum = min(app.accum, tick_seconds) // bounded catch-up debt\n            if app.state.terminal {\n                app.mode = .Game_Over // the core went terminal -> game over\n                // v2-viscomm-gauge-telegraph: a terminal run SNAPS the gauges to\n                // raw (unfed reads raw). The lose screen's empty meter IS the loss\n                // mechanic's surface — a mid-ease fill + chunk ghost frozen at the\n                // death tick would draw the pre-death level forever while the pct\n                // number reads the terminal truth (the r1 review's freeze finding).\n                rnd.gauge_reset(&app.view.gauges)\n            }\n— app/gauge_wiring_test.odin:9-18 pins only two seams: \"(a) start_run zeroes the gauge-ease state — the retry path (R/Enter) must never carry a previous run's mid-ease level\" and \"(b) feed_drop_sites (the per-tick presentation-feed seam) feeds the gauge targets from live sim truth\". `grep -rn gauge_reset app/*_test.odin app/render/*_test.odin` → 0 hits; the reset at main.odin:988 (start_run) is pinned by wiring test (a), the reset at main.odin:617 (terminal) by nothing.",
+    "detail": "This r1 review fix ships unpinned: it lives inline in main's fixed-timestep loop, unreachable by the pullback-style wiring tests. Deleting the call returns the frozen mid-ease lose-screen fill with every gate green.",
+    "recommended_fix": "Extract the terminal transition (mode set + gauge_reset) into a seam proc like start_run/feed_drop_sites and pin it with the same pullback_test_app fixture: arm a mid-ease state, drive the proc, expect gauges unseeded."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "SLA eased display numbers lack the draw-path mutation leg — bypassing gauge_read in draw_sla_gauges fails no test",
+    "location": "app/main.odin:2279",
+    "evidence": "app/main.odin:2277-2289 (inside draw_sla_gauges):\n            loss_pct := rnd.sla_loss_pct(acc)\n            if c < len(app.view.gauges.sla_loss) {\n                loss_pct = rnd.gauge_read(&app.view, &app.view.gauges.sla_loss[c], loss_pct, app.tick)\n            }\n...\n            avg_ms := rnd.sla_avg_ms(acc)\n            if c < len(app.view.gauges.sla_ms) {\n                avg_ms = rnd.gauge_read(&app.view, &app.view.gauges.sla_ms[c], avg_ms, app.tick)\n            }\n— palcheck section 6 pins only the two BARS: \"(a) UNFED ... (b) MID-EASE ... (c) CHUNK FLASH ... (d) REDUCED MOTION\" on draw_health_meter plus section 6(e) on draw_pool_gauge; no leg renders draw_sla_gauges. The PR body claims \"Deferred (deferred-work.md): ... SLA text draw-path pixel pin\" but _bmad-output/implementation-artifacts/deferred-work.md (8 lines) contains only \"- source_spec: `_bmad-output/implementation-artifacts/spec-3-2-lane-qos.md`\" and \"- source_spec: `_bmad-output/implementation-artifacts/spec-routing-bandwidth-cost.md`\" — no gauge entries exist.",
+    "detail": "The briefing's non-negotiable standard (\"deleting/bypassing the easing MUST fail a test\") holds for health and pool bars but not the SLA readouts: deleting either gauge_read call keeps unit, wiring, golden, and palcheck gates green — the strobe silently returns.",
+    "recommended_fix": "Pin the SLA draw seam: move the eased-readout formatting into app/render (harness-importable) and palcheck it, or export the display-number derivation and pin it from the existing app-package test; record the deferral in deferred-work.md as claimed."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Pool-bar chunk-ghost draw block unpinned — health twin has palcheck 6(c) legs, pool has none",
+    "location": "app/render/visibility.odin:110",
+    "evidence": "app/render/visibility.odin:108-118:\n    // the chunk cue (a pool drained by an event flashes the lost region once,\n    // then the fill eases down through it — same craft as the health bar)\n    if fl := gauge_flash_read(v, &v.gauges.pool, tick); fl > 0 {\n        raw_pct := pct\n        lo_pct := min(v.gauges.pool.start, raw_pct)\n        hi_pct := max(v.gauges.pool.start, raw_pct)\n...\n— palcheck section 6(e) runs only UNFED + MID-EASE legs (its comment: \"render the REAL draw_pool_gauge at a clear anchor + scan the fill extent\"); `sed -n '806,840p' harness/palcheck.odin | grep -c 'ghost\\|flash'` → 0. The chunk-ghost draw leg exists only for health (section 6c).",
+    "detail": "Deleting the pool ghost block (visibility.odin:110-120) fails no test: gauge_flash_read is unit-tested generically, and palcheck 6(e) never renders a chunk state. One of the two flash cues is mutation-survivable at the draw level.",
+    "recommended_fix": "Add a 6(e) chunk leg mirroring 6(c): gauge_reset, seed 100, chunk to 20 via gauge_target, render at age 1 — scan the ghost band blends over the track, then pure track after len(CHUNK_FLASH) ticks."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "CHUNK_SLA_MS per-unit threshold wiring never exercised by any test",
+    "location": "app/render/gauge.odin:282",
+    "evidence": "app/render/gauge.odin:282:\n            gauge_target(v, &v.gauges.sla_ms[c], sla_avg_ms(acc), tick, CHUNK_SLA_MS)\n— `grep -rn CHUNK_SLA_MS app/ harness/ --include='*.odin' | grep -v '^app/render/gauge.odin'` → 0 hits: no test anywhere references CHUNK_SLA_MS. Every gauge_target call in gauge_test.odin (lines 84-296) passes CHUNK_PCT; gauge_tick tests (gauge_sla_slots_seed_lazily, gauge_tick_feeds_all_gauges) feed only small SLA deltas, never a ≥25ms chunk crossing.",
+    "detail": "The r1 per-unit-threshold fix (CHUNK_PCT vs CHUNK_SLA_MS — itself a review finding) ships unregression-pinned: swapping CHUNK_SLA_MS to CHUNK_PCT in gauge_tick, or reintroducing the unit confusion, fails nothing.",
+    "recommended_fix": "Add a gauge_tick test: seed sla_ms at 10ms, jump total_latency_ms so avg ≥ 35ms, assert the tween re-anchored (start moved from display, t0 = jump tick) while sla_loss stays on its pct threshold."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Loop→feed_drop_sites call site unpinned and the claimed deferred-work.md entries are absent",
+    "location": "app/main.odin:580",
+    "evidence": "app/main.odin:580 (inside main's fixed-timestep step loop):\n                feed_drop_sites(&app)\n— app/gauge_wiring_test.odin:70 drives the seam proc directly (`feed_drop_sites(&app)`), not the loop's call of it. The PR body claims \"Deferred (deferred-work.md): the loop→feed_drop_sites call-site pin (the pre-existing debug_surface_smoke.sh class — needs a headless app-drive harness)\" but deferred-work.md contains no such entry (its 8 lines hold only the lane-qos and routing-bandwidth items). tools/debug_surface_smoke.sh runs `./bin/harness-debug-sw overlay-pixels qos_contention 12000ms` — a harness overlay path, not the app loop.",
+    "detail": "Deleting main.odin:580 disables the entire gauge feed (and drop marks) with every gate green — the seam is pinned one level down, but the engagement call is not, and the deferral is not durably recorded where claimed.",
+    "recommended_fix": "Record both gauge deferrals in _bmad-output/implementation-artifacts/deferred-work.md now; land the headless app-drive harness story that can pin the loop call site (same class as debug_surface_smoke)."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "pool_fill_pct boundary clamps (packets > cap, cap ≤ 0) untested",
+    "location": "app/render/gauge.odin:241",
+    "evidence": "app/render/gauge.odin:241-244:\npool_fill_pct :: proc(flow: ^pp.Flow_State, cat: ^pp.Catalogs) -> i32 {\n    cap := u32(max(1, cat.balance.pool_max_packets))\n    return i32(min(u32(len(flow.packets)) * 100 / cap, 100))\n}\n— all existing coverage is sub-cap: gauge_test.odin:283 + gauge_wiring_test.odin:58 set `cat.balance.pool_max_packets = 200` with 2 packets; palcheck.odin:820 sets 100 with 55 packets. No test drives packets > cap (clamp-at-100) or pool_max_packets ≤ 0 (the max(1,·) guard). The old draw code carried the comment \"clamp: a bad cap must not draw off-frame (edge-hunter r1)\" — that guard moved into this proc without a boundary pin.",
+    "detail": "The shared derivation now owns the off-frame guard, but its two boundary behaviors (overflow clamp, degenerate cap) have no regression test — a future refactor of the clamp or guard fails nothing.",
+    "recommended_fix": "Extend gauge_tick_feeds_all_gauges (or a small unit test): 150 packets / cap 100 → target exactly 100; cap 0 → no divide-by-zero, pct bounded 0..100."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: CONCERNS",
+    "location": "N/A",
+    "evidence": "Pinned: app/render/gauge_test.odin (11 tests) + app/gauge_wiring_test.odin (2 tests) + palcheck section 6 (health legs a-d + pool legs e unfed/mid-ease) — gauge_wiring_test.odin:4 self-describes the class: \"pins (the r1 verification-gap findings — the repo's #1 blocker genus: 'a wiring regression that never draws would pass every compile gate and every golden')\". Unpinned (verified above): terminal snap (app/main.odin:617, 0 test refs), SLA draw seam (app/main.odin:2279/2289, no palcheck leg), pool ghost (visibility.odin:110, no 6e leg), CHUNK_SLA_MS wiring (gauge.odin:282, 0 test refs), pool_fill_pct boundaries (gauge.odin:241).",
+    "detail": "P0 (golden byte-identity/unfed contract) 100% — unit + draw-level + goldens. P1 ≈80%: the three named surfaces' draw legs and both reset paths, with SLA draw and terminal snap unpinned. Overall ≈83% (20/24 behavior rows full/half-credit).",
+    "recommended_fix": "Raise P1 to ≥90%: extract+pin the terminal transition, add the SLA eased-readout draw-path leg, and a pool-ghost palcheck leg; record the two deferrals in deferred-work.md as the PR body claims."
+  }
+]

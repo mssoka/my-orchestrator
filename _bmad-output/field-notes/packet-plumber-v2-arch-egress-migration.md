@@ -1,0 +1,6 @@
+# packet-plumber-v2-arch-egress-migration — field notes (2026-08-26)
+
+- shadow_clone is a per-story trap, not a one-off: EVERY new step()-touched dynamic array must be added to spawn_fx.odin's clone list AND its flow_init mirror (capacity-1) — the shadow silently aliases the LIVE run's pointers and the abort surfaces far away at run_destroy (malloc_error_break backtrace finds it; the tx-ring comment in the same proc is the prior incident).
+- Diffing against a MOVING remote tip fakes deletions: the spine landed on v2 via #103 after the branch point, so "this branch deletes the spine" was a merge-base artifact — always diff at the merge-base before believing a hunter blocker about missing files.
+- Same-count bundle renumber (demolish+draw in one batch) silently inherits the dead pair's history unless derived-ring layouts reset on Topology.gen — the B1 slot-renumbering class generalizes to every ring keyed by a regenerated index (hunter-probed at 120 phantom ticks).
+- r1 fold addendum: test step_once helpers hardcode tick 1 — past that tick the backward-tick guard silently no-ops (use step_n); Odin for-in over array literals is still a syntax error; a clamp-at-100 util read needs an ASYMMETRIC fixture (60/30) — a saturated both-directions fixture cannot discriminate max from sum.

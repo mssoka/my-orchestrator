@@ -1,0 +1,92 @@
+[
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "E2.3 pipe-select gesture (Mode.SELECT) has zero test coverage",
+    "location": "scripts/input_router.gd:88-105",
+    "evidence": "signal pipe_selected(pipe_id: int)\nconst CLICK_SLOP_PX := 6.0 # press-release movement still counted as a click\nenum Mode { NONE, DRAW, ORBIT, SELECT }\n\t_picked_pipe = flow_view.pick_pipe(screen_pos, camera)\n\t_mode = Mode.SELECT if _picked_pipe >= 0 else Mode.ORBIT\n\tif was == Mode.SELECT and _picked_pipe >= 0 \\\n\t\t\tand screen_pos.distance_to(_press_pos) <= CLICK_SLOP_PX:\n\t\tpipe_selected.emit(_picked_pipe)\n\tif was != Mode.NONE and was != Mode.SELECT:\n\t\tgesture_ended.emit(screen_pos)\n--- grep -rn 'pick_pipe\\|pipe_selected\\|Mode.SELECT\\|SELECT' tests/ -> 0 matches. test_input.gd (unchanged, E1) pins classify() DRAW/ORBIT only; test_gesture.gd (updated for E2) still drives only the DRAW commit/cancel paths.",
+    "detail": "New input-grammar branch (SELECT) plus two behavior changes to _end — SELECT suppresses gesture_ended and emits pipe_selected only within click slop; dragged select silently becomes orbit. None is pinned headless.",
+    "recommended_fix": "Extend test_gesture.gd: build a pipe, press on its arc, assert router._mode==SELECT; release within 6px asserts pipe_selected fires and gesture_ended does not; drag beyond slop asserts orbit took over."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "FlowView.pick_pipe geometric picking and occlusion guard untested",
+    "location": "scripts/flow_view.gd:56-88",
+    "evidence": "func pick_pipe(screen_pos: Vector2, camera: Camera3D) -> int:\n\tif sim == null or sim.pipes.is_empty():\n\t\treturn -1\n\t# Occlusion guard: a far-side pipe near the ray's EXIT point must never\n\t# win a click aimed at the visible hemisphere — reject samples beyond\n\t# the planet's near-surface hit.\n\tvar entry := Geodesic.ray_sphere(from, dir, Vector3.ZERO, WorldSeed.PLANET_RADIUS)\n\tvar max_t := INF\n\tif entry != Vector3.INF:\n\t\tmax_t = (entry - from).length()\n--- grep -rn 'pick_pipe' tests/ -> 0 matches. Only the underlying primitive Geodesic.ray_sphere has tests (test_geodesic.gd:78-84); the composition (zoom-scaled threshold, nearest-sample, far-side rejection) has none.",
+    "detail": "pick_pipe decides which pipe the click selects — the sole entry to the QoS panel. Its occlusion guard and clampf(0.25,1.5) threshold are load-bearing geometry with no regression pin; a far-side-pipe regression would ship silently.",
+    "recommended_fix": "Add a headless test: stage the scene, connect two pipes (one front, one antipodal), unproject known arc points through the real camera, assert pick_pipe returns the front pipe id and -1 for empty sky/crosshair positions."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "QosPanel ladder/fallback/apply logic exercised as noise but never asserted",
+    "location": "scripts/qos_panel.gd:143-171",
+    "evidence": "func _on_rung(count: int) -> void:\n\t_alloc = SimBalance.LADDER[count].duplicate()\n\t# classes on newly-inactive lanes fall back to the highest active lane\n\tfor cls in _cls_lane:\n\t\tif _alloc[int(_cls_lane[cls])] <= 0:\n\t\t\tvar lane := SimBalance.LANE_STANDARD\n\t\t\tif _alloc[lane] <= 0:\n\t\t\t\tlane = 0\n\t\t\t_cls_lane[cls] = lane\n...\nfunc _on_apply() -> void:\n\tif _pipe_id < 0:\n\t\treturn\n\tapply_requested.emit(_pipe_id, _alloc.duplicate(), _cls_lane.duplicate())\n--- grep -rn '_on_rung\\|_on_apply\\|apply_requested\\|LADDER' tests/ -> 0 matches. test_view_purity.gd only calls it as unasserted noise: 'qos.open(2, main.sim)' / 'qos._on_class_cycle(\"email\")' — no check() reads panel state; the sim-level LADDER is covered via sim tests only.",
+    "detail": "The panel's only real logic — rung fallback when a class's lane goes inactive (including the Standard-also-inactive edge) and the apply-guard — has zero assertions. Its output feeds set_lanes commands; a fallback bug corrupts player QoS input silently.",
+    "recommended_fix": "Add a panel unit test: open on a fresh sim pipe, _on_rung(1) then _on_rung(2)/_on_rung(3), assert _alloc/_cls_lane fallbacks and shares label; call _on_apply with _pipe_id=-1 asserting apply_requested stays unemitted."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "boundary",
+    "title": "Command-bus invalid-command no-ops mostly untested (add_pipe entirely)",
+    "location": "scripts/sim/sim_core.gd:112-159",
+    "evidence": "func _cmd_add_pipe(cmd: Dictionary) -> void:\n\tif not (cmd.has(\"a\") and cmd.has(\"b\")):\n\t\treturn\n\tvar a := int(cmd.a)\n\tvar b := int(cmd.b)\n\tif a < 0 or b < 0 or a >= node_kind.size() or b >= node_kind.size() or a == b:\n\t\treturn\n...\n\tvar alloc: Array = cmd.alloc\n\tif alloc.size() != 3:\n\t\treturn\n\tvar p = pipes.get(int(cmd.pipe))\n\tif p == null:\n\t\treturn\n--- Only two of the validation branches are pinned, in test_sim_qos.gd: 'check(p.alloc[0] == before[0] and p.alloc[1] == before[1], \"invalid ladder (sum > 100) is rejected as a no-op\")' and 'check(int(p.cls_lane.email) == 2, \"class cannot be assigned to an inactive lane (rejected)\")'. No test exercises out-of-range a/b, a==b, missing keys, alloc.size()!=3, lane outside 0-2, negative shares, or unknown pipe id.",
+    "detail": "apply_command is the only mutation API and promises deterministic no-ops on invalid input; add_pipe validation and most set_lanes branches (size, range, unknown pipe) have no negative tests — the classic happy-path-only blind spot.",
+    "recommended_fix": "Extend test_sim_qos._set_lanes_command-style cases: add_pipe with a==b/out-of-range/missing keys asserts pipes.size() unchanged and command_log still records each attempt; set_lanes with alloc.size()!=3, lane 3, [-10,110,0], unknown pipe."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "no_route drop path and unreachable-demand SLA isolation never pinned",
+    "location": "scripts/sim/sim_core.gd:211-272",
+    "evidence": "# Demand only spawns when the destination is REACHABLE (unreachable demand\n# is not congestion — it must never poison the SLA counters).\n...\n\t\t\tif dst < 0 or not _reachable(n, dst):\n\t\t\t\tcontinue\n...\n\tvar pipe_id := _pick_next_pipe(pkt.src, pkt.dst, pkt.cls, id, node)\n\tif pipe_id < 0:\n\t\t_drop(id, node, \"no_route\")\n\t\treturn\n--- grep -rn 'no_route\\|_reachable' tests/ -> 0 matches (only the word 'reachable' in a test_sim_replay comment: '16 pipes, 13 reachable houses'). test_sim_sla._loss_breach_attributable pins only reason=='queue_overflow': 'if int(d.pipe) < 0 or int(d.node) < 0 or str(d.reason) != \"queue_overflow\":'.",
+    "detail": "The documented invariant — isolated houses must not poison loss SLAs — and the no_route drop reason have zero tests. A regression in _reachable silently flips gentle networks into loss breaches (or masks real no_route drops).",
+    "recommended_fix": "Add a sim test: sim with two disconnected pipe islands, drive 300 ticks, assert dropped_total==0, both loss latches false; stage one _spawn_packet across islands and assert drops[0].reason=='no_route' with pipe<0."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "Visual flow surfaces (packet dots, egress pulses) have no automated coverage",
+    "location": "scripts/flow_view.gd:121-171",
+    "evidence": "const MAX_DOTS_PER_PIPE := 48 # beyond this the density speaks; lowest ids win\n...\nfunc _sync_dots(id: int, p: Dictionary) -> void:\n...\n\t\t\tvar t := float(int(pkt.progress_milli)) / length\n\t\t\tif endpoint == 1:\n\t\t\t\tt = 1.0 - t # b -> a traversal renders reversed\n--- node_site.gd:29-33: 'const PULSE_COOLDOWN := 0.22 # seconds between egress pulses' / 'func pulse_egress() -> void:' / 'if _pulse_cd > 0.0:' / 'return'. grep -rn 'pulse_egress\\|node_admissions\\|_sync_dots\\|MAX_DOTS' tests/ -> 0 matches.",
+    "detail": "A2's visible-evidence contract (packets streaming, egress beats) is verified only via captures 06/07, not the headless suite. Dot lane placement, endpoint reversal, 48-dot cap, and pulse cooldown are unpinned.",
+    "recommended_fix": "Acceptable as capture-verified per epic A2. Optionally add a light headless pin: flood a pipe, run flow_view.sync, assert visible dot count matches inflight (capped at 48) and pulse cooldown suppresses repeat tweens."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "HUD breach chip (set_breaches/_breach_lines) untested",
+    "location": "scripts/hud.gd:56-64",
+    "evidence": "func set_breaches(lines: String) -> void:\n\tif lines.is_empty():\n\t\t_breach_panel.visible = false\n\t\treturn\n\tif _breach.text != lines:\n\t\t_breach.text = lines\n\t_breach_panel.visible = true\n--- main.gd:179: 'func _breach_lines() -> String:' with the comment '# Independent ifs: a latency latch must never hide a co-occurring loss breach'. grep -rn 'set_breaches\\|_breach_lines' tests/ -> 0 matches.",
+    "detail": "The only visible SLA surface (quiet-when-healthy canon) has no test: hide-on-empty, show-on-breach, and independent latency+loss line composition are unpinned. Display-only, sim latches fully covered.",
+    "recommended_fix": "Add a scene-level check: drive the live sim into a breach, await a frame, assert Hud._breach_panel.visible and _breach_lines() lists both latching classes; assert hidden on a gentle network."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "PipeArc share-driven strand geometry API (strand_point/sample_at/hairline) untested",
+    "location": "scripts/pipe_arc.gd:59-94",
+    "evidence": "const HAIRLINE_FRAC := 0.3 # an unallocated lane renders as a hairline strand\n...\nfunc sample_at(t: float) -> Vector3:\n...\nfunc strand_point(lane: int, t: float) -> Vector3:\n...\nfunc _strand_thickness(lane: int) -> float:\n\t# share 100% -> 1.0; share 0% -> a hairline strand\n\tvar share := float(_shares[lane]) / 100.0\n\treturn share if share > 0.0 else HAIRLINE_FRAC\n--- grep -rn 'strand_point\\|sample_at\\|get_path_samples\\|HAIRLINE\\|shares' tests/ -> 0 matches. Existing pins are E1-era: test_world checks arc endpoints and '_radius_scale > 1.0' only.",
+    "detail": "New public geometry feeding dot placement and pick math — sample_at interpolation, strand_point lane offset, hairline fallback — has no direct tests; E1 tests cover only endpoints and radius scale. Visual-correctness risk, not logic.",
+    "recommended_fix": "Add pure-geometry checks: build an arc with [50,30,20], assert strand_point(l,t) offsets lie on the strand ring per _lane_angle, share 0 renders HAIRLINE_FRAC, sample_at(0)/sample_at(1) hit endpoints."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: CONCERNS",
+    "location": "tests/run_tests.gd:20-31",
+    "evidence": "\"**Test contracts:** replay byte-identity on a fixed seed (determinism contract); contention drops by drop precedence (lowest first); a dedicated lane reservation holds its class's capacity; SLA breach is detectable and attributable; view-layer changes never shift sim state.\" (spec-epic-e2.md)\n--- All five P0 contracts have dedicated passing suites: test_sim_replay.gd, test_sim_qos.gd (_drop_precedence/_reservation_holds), test_sim_sla.gd, test_view_purity.gd. Gaps found: select gesture NONE, pick_pipe NONE, panel logic PARTIAL, command validation PARTIAL (2/~8 branches), no_route/reachability NONE.",
+    "detail": "P0 = 100% (5/5 epic contracts). P1 ≈ 85% (11/13 groups: 9 full, 2 partial, select path 0). Overall ≈ 65% automation-only, ≈ 80% counting A2 captures as designed evidence for visual P3 surfaces.",
+    "recommended_fix": "Add headless tests for the select gesture chain (router→pick_pipe→panel open/apply) and command-bus negative branches; that lifts P1 ≥90% and overall ≥80% strictly — gate PASS."
+  }
+]

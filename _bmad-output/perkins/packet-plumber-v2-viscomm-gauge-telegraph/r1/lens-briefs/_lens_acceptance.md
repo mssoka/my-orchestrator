@@ -1,0 +1,8 @@
+Audit the diff against the spec and context docs above. Identify:
+- Violations of specific acceptance criteria
+- Deviations from spec intent
+- Missing implementation of specified behavior
+- Contradictions between spec constraints and actual code
+- Scope drift — changes not asked for by the spec
+
+For each finding, reference the violated AC or constraint in `detail` (quote the exact phrase from the spec when possible).

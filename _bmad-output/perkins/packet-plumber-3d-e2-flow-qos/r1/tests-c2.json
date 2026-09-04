@@ -1,0 +1,62 @@
+[
+  {
+    "source": "tests",
+    "severity": "blocker",
+    "category": "coverage-gap",
+    "title": "Pipe-select input grammar (SELECT mode, pick_pipe, pipe_selected signal) has zero test coverage",
+    "location": "scripts/input_router.gd:92-101",
+    "evidence": "scripts/input_router.gd:\n\t_picked_pipe = flow_view.pick_pipe(screen_pos, camera)\n\t_mode = Mode.SELECT if _picked_pipe >= 0 else Mode.ORBIT\n...\n\tif was == Mode.SELECT and _picked_pipe >= 0 \\\n\t\t\tand screen_pos.distance_to(_press_pos) <= CLICK_SLOP_PX:\n\t\tpipe_selected.emit(_picked_pipe)\n\ntests/test_input.gd (the ONLY input coverage, never reaches the pipe branch — grep for pick_pipe|SELECT|pipe_selected|_picked_pipe across tests/ returns nothing):\n\tcheck(InputRouter.classify(site) == InputRouter.Mode.DRAW, \"press on a node = DRAW\")\n\tcheck(InputRouter.classify(body) == InputRouter.Mode.ORBIT, \"press on the planet body = ORBIT\")\n\tcheck(InputRouter.classify(null) == InputRouter.Mode.ORBIT, \"press on the sky = ORBIT\")",
+    "detail": "The E2.3 story's pipe-select verb (the only player path to QoS; a documented README control) is untested at every level: pick geometry, occlusion guard, click slop, drag-to-orbit fallback, signal wiring, panel open. Even the capture runner bypasses it (calls main._on_pipe_selected directly).",
+    "recommended_fix": "Add a test_gesture leg: draw a pipe, unproject a path-sample midpoint, press+release cleanly, assert router Mode.SELECT and panel visible; press+drag past slop asserts it becomes orbit."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "QoS panel command-construction logic (_on_rung lane fallback, _on_apply emission) untested",
+    "location": "scripts/qos_panel.gd:143-170",
+    "evidence": "scripts/qos_panel.gd:\nfunc _on_rung(count: int) -> void:\n\t_alloc = SimBalance.LADDER[count].duplicate()\n\t# classes on newly-inactive lanes fall back to the highest active lane\n\tfor cls in _cls_lane:\n\t\tif _alloc[int(_cls_lane[cls])] <= 0:\n...\nfunc _on_apply() -> void:\n\tif _pipe_id < 0:\n\t\treturn\n\tapply_requested.emit(_pipe_id, _alloc.duplicate(), _cls_lane.duplicate())\n\ntests/test_view_purity.gd (the only panel exercise — un-asserted view noise):\n\t\t\tqos.open(2, main.sim)\n\t\t\tqos._on_class_cycle(\"email\")\n\t\t\tqos._on_class_cycle(\"email\")\n\t\t\tqos._on_class_cycle(\"streaming\")\n\t\t\tqos.close_panel()",
+    "detail": "P2 gap: no test presses a rung or Apply. If the fallback emits a class onto an inactive lane, SimCore silently rejects the whole set_lanes as a no-op — the player's Apply would appear broken with no failing test.",
+    "recommended_fix": "Headless panel test: open on a real pipe, click rungs, assert _alloc/_cls_lane fallback mapping and that apply_requested emits a valid command that SimCore actually applies (alloc changes)."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "error-path",
+    "title": "Command-bus invalid-command guards claimed as deterministic no-ops but only 2 of ~6 branches tested",
+    "location": "scripts/sim/sim_core.gd:117-144",
+    "evidence": "scripts/sim/sim_core.gd:\n## ... Invalid commands are recorded and\n## ignored (deterministic no-ops) — the panel never sends one.\n...\n\tif a < 0 or b < 0 or a >= node_kind.size() or b >= node_kind.size() or a == b:\n\t\treturn\n...\n\tvar p = pipes.get(int(cmd.pipe))\n\tif p == null:\n\t\treturn\n\ntests only cover two guards (tests/test_sim_qos.gd):\n\tcheck(p.alloc[0] == before[0] and p.alloc[1] == before[1], \"invalid ladder (sum > 100) is rejected as a no-op\")\n\tcheck(int(p.cls_lane.email) == 2, \"class cannot be assigned to an inactive lane (rejected)\")",
+    "detail": "P3 error-path blind spot: add_pipe with out-of-range/self node ids, set_lanes on an unknown pipe id, wrong alloc size, and missing keys are happy-path-only; every test add_pipe uses valid indices.",
+    "recommended_fix": "Extend test_sim_qos._set_lanes_command with no-op legs: add_pipe a==b / a>=N leaves pipes empty; set_lanes on unknown pipe id and alloc.size()!=2/3 leave state + hash behavior pinned."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "coverage-gap",
+    "title": "HUD breach-chip rendering (_breach_lines independent-if logic) untested",
+    "location": "scripts/main.gd:183-187",
+    "evidence": "scripts/main.gd:\n\t\t# Independent ifs: a latency latch must never hide a co-occurring loss\n\t\t# breach (sticky latches would silence it forever).\n\t\tif bool(s.lat_breach):\n\t\t\tparts.append(\"%s latency SLA breached\" % cls)\n\t\tif bool(s.loss_breach):\n\t\t\tparts.append(\"%s loss SLA breached\" % cls)\n\ngrep for hud|set_breaches|_breach_lines across tests/ returns nothing (only scripts/main.gd:26,71 hits).",
+    "detail": "P3: the both-latches HUD fix from the review fold has no test; a regression re-elsing the ifs (or hiding the chip) would pass the suite. Sim-side latches are pinned; only the rendering line is bare.",
+    "recommended_fix": "Unit-pin _breach_lines on a sim with both latches forced true (assert both class names present) and Hud.set_breaches('') hides the chip."
+  },
+  {
+    "source": "tests",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Loss-latch stickiness (no-chatter) unpinned while the latency twin is pinned",
+    "location": "tests/test_sim_sla.gd:39-72",
+    "evidence": "tests/test_sim_sla.gd (latency has an explicit stickiness leg):\n\tvar latched_at := int(s.lat_tick)\n\tdrive(sim, 600)\n\tcheck(int(sim.sla[\"email\"].lat_tick) == latched_at and bool(sim.sla[\"email\"].lat_breach),\n\t\t\"SLA: breach latch is sticky-Enter (no chatter)\")\n(loss is asserted set once, never re-checked after further ticks):\n\tcheck(bool(sim.sla[\"email\"].loss_breach), \"SLA: email loss breach detected (>30%)\")\n\tcheck(bool(sim.sla[\"streaming\"].loss_breach), \"SLA: streaming loss breach detected (>10%)\")",
+    "detail": "P3: the sticky-Enter doctrine ('ratios dilute, latches must not chatter') applies to both latches; only loss-breach-set is tested, not loss_tick stability across continued overload.",
+    "recommended_fix": "In _loss_breach_attributable, capture loss_tick, drive 600 more saturated ticks, assert loss_tick unchanged and loss_breach still true for both classes."
+  },
+  {
+    "source": "tests",
+    "severity": "warning",
+    "category": "coverage-gate",
+    "title": "Advisory test gate: CONCERNS",
+    "location": "N/A",
+    "evidence": "N/A",
+    "detail": "P0 100% (all five canon contracts FULL with mutation legs: replay identity+seed/timing legs, drop precedence directed+statistical, reservation, SLA detect+attribute, view purity). P1 ≈83% (14/18 areas FULL; pipe-select verb 0%, panel apply logic partial, loss stickiness partial) — 80–89% band. Overall ≈89% ≥80%.",
+    "recommended_fix": "Add the pipe-select gesture leg (raises P1 ~5pts), panel rung/apply emission pins, and loss-latch stickiness leg to reach P1 ≥90% for PASS."
+  }
+]

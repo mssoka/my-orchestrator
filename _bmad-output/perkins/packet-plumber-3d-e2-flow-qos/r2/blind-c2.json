@@ -1,0 +1,82 @@
+[
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "test-integrity",
+    "title": "Determinism capture and replay test apply the shared command stream at different ticks",
+    "location": "tools/determinism_log.gd:30 / tests/test_sim_replay.gd:22",
+    "evidence": "tests/test_sim_base.gd: \"## tests/test_sim_replay.gd and tools/determinism_log.gd so the committed\n## capture and its sibling test can never drift apart.\" | tests/test_sim_replay.gd: \"\t\tif t == 120:\" | tools/determinism_log.gd: \"\t\tif t == ticks / 3:\" (REPLAY_TICKS=900, so commands land at tick 300) | captures/05-replay-determinism.txt: \"traffic carried: 10 packets delivered across the run\" | tests/test_sim_replay.gd: \"check(carried >= 12, \\\"replay scenario carries real traffic (%d delivered — pin is not vacuous)\\\" % carried)\" and \"check(a.dump_state() != b.dump_state(), \\\"same command at a different tick diverges (timing is state)\\\")\"",
+    "detail": "The shared definition covers only the command list; application ticks differ (120 vs 300) and the diff itself declares timing is state — the committed capture and the sibling test are different runs, as their divergent delivered counts (10 vs ≥12) prove.",
+    "recommended_fix": "Hoist the apply tick into test_sim_base (e.g. REPLAY_CMD_TICK := 120) and use that one constant in both test_sim_replay.gd and tools/determinism_log.gd."
+  },
+  {
+    "source": "blind",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "Diff ships E2 tests/docs/captures but none of the sim implementation its own spec declares",
+    "location": "_bmad-output/implementation-artifacts/spec-e2-flow-qos.md:hunk (Code Map)",
+    "evidence": "spec Code Map: \"+- `scripts/sim/sim_balance.gd` -- NEW: all tunables as const data (tiers, classes, lanes, ladder, speeds, queue depths, SLA thresholds, colors)\" / \"+- `scripts/sim/sim_core.gd` -- NEW: RefCounted deterministic sim: state, owned RNG, Dijkstra+ECMP routing, per-tick step (spawn → serialize/admit → traverse → arrive → SLA), command bus, fnv1a-32 state hash + canonical dump\" / \"+- `scripts/capture_runner.gd` + `captures/` -- EDIT: packets-flowing, QoS-panel, determinism log, editor-preview shots\" — while tests in this diff call undefined symbols: \"+func make_sim(seed_value := SEED) -> SimCore:\" and \"+\tvar sim = scene.get(\\\"sim\\\")\"",
+    "detail": "Every script the Code Map marks NEW/EDIT (sim_core, sim_balance, flow_view, qos_panel, main, input_router, pipe_arc, node_site, connect_controller, capture_runner) is absent from this diff; the tests cannot compile or pass against it alone.",
+    "recommended_fix": "Land the scripts/ implementation in the same change, or record the chunk dependency explicitly; this diff alone cannot pass its own runner."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "doc-consistency",
+    "title": "Spec change-log entry predates the spec's own creation date",
+    "location": "_bmad-output/implementation-artifacts/spec-e2-flow-qos.md:4",
+    "evidence": "frontmatter: \"+created: '2026-09-05'\" vs change log: \"+- 2026-09-04 (step-04 review, patch class): hash wording fixed — the code's\n+  state hash is FNV-1a 32-bit\"; deferred-work.md header: \"## From packet-plumber-3d-e2-flow-qos step-04 review (2026-09-04)\"",
+    "detail": "The spec claims creation on 2026-09-05 yet records a change made 2026-09-04 — the log predates the document. Provenance dates contradict each other within one file.",
+    "recommended_fix": "Correct the created date (the GDD and deferred-work both date this work 2026-09-04) or redate the change-log entry."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "test-integrity",
+    "title": "'byte-identical' preview pin actually performs approximate float comparison",
+    "location": "tests/test_editor_preview.gd:hunk",
+    "evidence": "\tcheck(_same(boot_positions, regen_positions), \"regenerate reproduces the boot world byte-identically\") — while _same implements: \"+\tfor i in pa.size():\n+\t\tif not pa[i].is_equal_approx(pb[i]):\n+\t\t\treturn false\" and _staging captures only \"+\treturn {\"planet_children\": planet.get_child_count(), \"site_count\": sites.size(), \"positions\": pos}\"",
+    "detail": "is_equal_approx tolerates float drift and the snapshot omits everything but positions and child counts — the assertion is materially weaker than its 'byte-identical' message claims.",
+    "recommended_fix": "Compare exact component equality (==), or reword the message to 'identical staging (approximate float compare)'."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "known-defect",
+    "title": "Unbounded per-stream RNG salt counters shipped; stream coupling deferred to E3",
+    "location": "_bmad-output/implementation-artifacts/deferred-work.md:3",
+    "evidence": "\"- [defer] Demand-stream salt bands drift into each other over very long runs\n  (destination salt 7_000_000 + counter*31337 grows unboundedly; after ~1M\n  spawns/house it can cross other draw bands → statistical (NOT determinism)\n  coupling between seeded streams).\"",
+    "detail": "Long-run statistical independence of the 'owned' seed-derived streams is knowingly broken at high spawn counts; only replay byte-identity is protected. Documented, but the guard is cheap.",
+    "recommended_fix": "Apply the note's own guard now (bound the counter, e.g. counter % 8192) instead of waiting for E3 demand retuning."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "vacuous-pin",
+    "title": "Deactivation 'still flows' check is polluted by natural demand",
+    "location": "tests/test_sim_qos.gd:hunk (_lane_deactivation_never_strands)",
+    "evidence": "\t# And they still FLOW: after enough ticks everything delivers (no silent loss).\n+\tdrive(sim, 1800)\n+\tvar accounted := int(sim.sla[\"email\"].delivered) + int(sim.sla[\"email\"].dropped)\n+\tcheck(accounted >= SimBalance.QUEUE_DEPTH, \"deactivation: every packet accounted (delivered+dropped = %d >= %d)\" % [accounted, SimBalance.QUEUE_DEPTH]) — staged endpoints 1 and 2 are houses per test_sim_base's map \"[router, h, h, h, h, h, h, h, h, router, h]\"; the same file's other test notes: \"+\t# Router endpoints (0, 9) — routers never spawn natural demand, so the\n+\t# observed in-flight order is purely the staged packets.\"",
+    "detail": "During 1800 ticks natural house 1↔2 email inflates sla delivered, so 'accounted >= QUEUE_DEPTH' can pass even if the staged packets are silently lost — the safety net cannot attribute delivery.",
+    "recommended_fix": "Stage on router endpoints (0,9) as _serialization_order_direct does, or tally only the staged packet ids."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "vacuous-pin",
+    "title": "Delivered-count pins in test_sim_flow count natural demand despite the OD-filter claim",
+    "location": "tests/test_sim_flow.gd:hunk",
+    "evidence": "header: \"+## origin-destination pair so natural demand cannot pollute the pins.\" — but the pins count sim-wide: \"+\tcheck(int(r1.sim.sla[\"email\"].delivered) > 30, \"ECMP diamond delivers (%d; the flood saturates by design)\" % r1.sim.sla[\"email\"].delivered)\" and \"+\tcheck(int(sim.sla[\"email\"].delivered) > 25, \"min-cost scenario delivers (%d; flood saturates by design)\" % sim.sla[\"email\"].delivered)\"",
+    "detail": "The OD filter applies to in-flight observation only; sla delivered counts are sim-wide, so natural house-to-house email inflates these non-vacuity thresholds — exactly what the header claims cannot happen.",
+    "recommended_fix": "Derive delivered counts from staged packet ids, or stage on routers; scope the header's pollution claim to in-flight observations."
+  },
+  {
+    "source": "blind",
+    "severity": "note",
+    "category": "vacuous-pin",
+    "title": "Serialization wave-2 ordering check passes vacuously once wave-1 email delivers",
+    "location": "tests/test_sim_qos.gd:hunk (_serialization_order_direct)",
+    "evidence": "+\tcheck(int(inflight2[inflight2.size() - 1]) == be_id and inflight2.find(be_id) > inflight2.find(email_id),\n+\t\t\"serialization: Best-effort admits after the higher lanes (tail = %d)\" % int(inflight2[inflight2.size() - 1])) — after \"drive(sim, 3)\" a second time, wave-1 packets may no longer be in flight",
+    "detail": "find(email_id) returns -1 when the wave-1 email has already delivered; then any non-negative index for be_id satisfies the comparison — the Best-effort-ordering property is unproven on that path.",
+    "recommended_fix": "Precondition on inflight2.find(email_id) >= 0, or assert ordering via recorded admission order instead of in-flight positions."
+  }
+]

@@ -1,0 +1,5 @@
+# pp-playtest-fun — field notes (shard)
+
+- 2026-09-01 (r2): Unblessed strategy demos FAIL `harness run` (no-manifest T1) — but `harness save` in a sandbox copy blesses AND still writes the `--stats-out` stream even for failing runs; save-then-run is the only path that also replay-verifies your evidence. Sandbox copy = `rsync -a --exclude .git --exclude _bmad` (~300 MB, carries the gitignored rlsw shadow).
+- 2026-09-01 (r2): The 4-port router cap IS the topology floor — a 3-router spine for 13 nodes needs 14 ports and every short draw fails validation as a replay_error latch (ODN-11) with no message naming the cause; count endpoints before authoring minimal meshes. Span metric is integer-Euclidean-rounded (isqrt + half-up), max 14 standard / 18 wide.
+- 2026-09-01 (r2): The v3 stats CSV has NO lifecycle events — breach latches, grace chips, Run_Won are invisible in it (G-row meter + C-row flags only). Ground truth for "did the breach latch / did the grace re-arm" = blessed HUD capture PNGs read directly (glm-5.3-flash native vision); stats math alone misleads (a win with 1801/1801 SLA-flagged window ticks looks like a breach that should have drained).

@@ -1,0 +1,5 @@
+# packet-plumber-v2-viscomm-regression-audit — field notes
+
+- 2026-08-27: "did effect X die" audits on PP resolve mechanically with `harness motion-strip` + a fixed-pixel time-series (link centerline color per frame) — a static-vs-animated effect and its phase are provable in one strip; golden PNGs in per-era worktrees are free BEFORE/AFTER evidence (each worktree's `goldens/` is its own era's blessed render — compare those before building anything).
+- 2026-08-27: a "pulsating" user memory may be a PERCEPTION of static code — the 4.1 congestion halo never pulsed; the read came from level-flicker (amber↔red re-tint) + ribbon mass. Trace the MECHANISM and the CANVAS separately or you audit the wrong thing (severed-code hunt found nothing; the salience collapse was the L1 width ruling).
+- 2026-08-27: lavish input playbook per-row radio forms + one Queue button each collected a clean per-row ruling (R1 restore-via-A1 arrived as a single tagged keep-leave prompt); a Send-&-End session delivers the final feedback once on the next poll — no extra polling rounds needed after it.

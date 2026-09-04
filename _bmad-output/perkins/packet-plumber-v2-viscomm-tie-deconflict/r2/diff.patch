@@ -1,0 +1,652 @@
+diff --git a/_pr_body_viscomm_tie.md b/_pr_body_viscomm_tie.md
+new file mode 100644
+index 0000000..6eeda89
+--- /dev/null
++++ b/_pr_body_viscomm_tie.md
+@@ -0,0 +1,91 @@
++## What
++
++Finding A of the vis-comm audit (2026-08-25): the equal-cost tie mark and the
++congestion-warning telegraph are gestalt twins. `route_tie` {242,181,68,235}
++was RGB-identical to `state_congested` {242,181,68,255} (alpha 20/255 apart),
++and both drew solid node-centered rings — two UNRELATED meanings ("routing
++info, nothing is wrong" vs "this node is strained — act") sharing hue AND
++shape. A player who learns "amber ring = congestion" misreads the tie mark as
++a warning, or worse, learns to ignore amber rings outright.
++
++This PR de-conflicts on BOTH levers (never color alone, both directions).
++
++## Hue: info violet `#965EE8` = {150, 94, 232, 235}
++
++- **Hue 264°** — a clear family exit, not a nudge: **225°** from
++  `state_congested` (39°, warm-danger family).
++- **Pipe-tier safety**: >= **62°** from every tier (copper 28°, gold 51°,
++  steel-cyan 202°) — well past the 15° canon minimum, so the ring can never
++  read as a pipe tier. (Deep teal was rejected: only ~25° from the
++  steel-cyan tier.)
++- **Canvas contrast**: on the warm-cream `#EDE2C8` paper the violet reads at
++  rec.601 luminance ~126 vs the canvas ~226 — a dark-on-light pop in the
++  cool register the board otherwise reserves for nothing node-shaped, so it
++  reads "annotation/overlay", not "danger" (warm) or "infrastructure"
++  (copper/gold). Violet is the classic informational/selected-state family.
++
++Applied in the three canonical places, one value each: `data/palette.json`,
++`palette_load`'s inline fallback, and `fallback_palette` (ODN-5: palette is
++data; the fallbacks mirror it).
++
++## Shape: dashed ring
++
++`draw_tie_mark` now draws **6 dashes of 30°** (3-on / 3-off around the pinned
++36-segment `SPAWN_RING_TABLE` fan — the `draw_ring_annulus` quad precedent:
++two CCW triangles per segment, alpha-safe in rlsw, no transcendentals in the
++draw path). The warning telegraph stays a SOLID ring. Even a fully colorblind
++read cannot confuse dashed-info with solid-warning. Caption
++("equal cost - split by hash", ASCII) unchanged. The modulated predicate is a
++pure proc (`tie_dash_on`) so the test pins draw behavior, not just constants.
++
++## a11y mode tables (derived, not hand-waved)
++
++The old mode tables remapped `route_tie` to pale amber `[242,213,120]` —
++**RGB-identical to `state_congested`'s deutan/protan remap** — i.e. the CVD
++modes reintroduced the exact collision this PR removes. The base violet
++clears every oracle pair under all three Machado-2009 severity-1.0
++simulations, so the remap is retired:
++
++| mode | worst pair (route-marks, vs `route_glow` teal) | threshold |
++|---|---|---|
++| deutan | 109.8 | 48 |
++| protan | 148.5 | 48 |
++| tritan | 136.2 | 48 |
++| deutan/protan, tie vs congested remap | **241.2 / 275.7** | 48 |
++
++`tools/derive_a11y_palettes.py`'s amber anchor for `route_tie` is removed
++(partial tables: absent tokens keep base values); the three `route_tie` lines
++are deleted from `data/palette.json` "modes". `tools/harness.sh palcheck`
++green on the shipped tables. (Side note: the derive script chokes on the
++`//` comments now present in palette.json — I ran it on a comment-stripped
++copy; pre-existing, out of scope.)
++
++## Mutation leg (vacuous-pin doctrine)
++
++`app/render/palette_polish_test.odin` gains two tests:
++`route_tie_is_hue_distinct_from_warning_and_pipe_tiers` (exact bytes on both
++load + fallback paths, warm-family exit classifier, >= 15° from every pipe
++tier via `hue_degrees`) and `route_tie_mark_is_a_dashed_ring_not_a_solid_warning_shape`
++(duty cycle must be exactly 1/2, run-boundary spot checks, dash count >= 4).
++
++**Proven by mutation, both levers:**
++1. Hue revert (`route_tie` back to `{242,181,68,235}` in palette.json):
++   `odin test app/render` FAILS — byte pin, warm-family check, and two
++   tier-separation asserts (copper 11.5°, fiber 11.6° < 15) all fire.
++2. Shape revert (`tie_dash_on` -> `return true`, i.e. solid ring):
++   FAILS — "dash duty cycle must be 1/2 (on=36 of 36)".
++
++## Verify (all green, from the worktree root)
++
++| command | result |
++|---|---|
++| `odin test core` | 261 tests OK |
++| `odin test app` | 46 tests OK |
++| `odin test app/render` | 83 tests OK |
++| `tools/lint.sh` | all gates green |
++| `tools/harness.sh palcheck` | all green |
++| `tools/harness.sh run` | **49/49 demos green, ZERO golden diffs** (golden-safety premise held: the harness never invokes the assist draws) |
++
++Out of scope (noted in the audit findings file): `sel_halo` and
++`lane_express` also sit in the amber family but draw on pipes/bands, not
++node rings.
+diff --git a/app/render/assist.odin b/app/render/assist.odin
+index a11acda..682ad5d 100644
+--- a/app/render/assist.odin
++++ b/app/render/assist.odin
+@@ -466,9 +466,56 @@ draw_glow_edge :: proc(v: ^View, topo: ^pp.Topology, bundles: ^pp.Bundles, u, w:
+ 	rl.DrawCircleV(b, halo * 0.5, col)
+ }
+ 
+-// draw_tie_mark — the T2 equal-cost cue at a split node: a warm ring around
+-// the node + the rule caption ("equal cost - split by hash" — ASCII, gate 6;
+-// a split never looks random: both branches glow and the node names the rule).
++// TIE_DASH_SEG / TIE_DASH_COUNT — the shape-distinctness pins for the tie
++// mark (viscomm audit finding A, 2026-08-25): the equal-cost cue must read
++// as INFORMATION, not warning. The node-health telegraph is a SOLID amber
++// ring; the tie mark is a DASHED info-violet ring (TIE_DASH_SEG table
++// segments on, TIE_DASH_SEG off, around the SPAWN_RING_TABLE fan — the
++// annulus-quad precedent, no transcendentals). The count is DERIVED from the
++// fan size, never hard-coded; the `when` below keeps the derivation honest
++// at compile time (r1 N3: the old "6 dashes"/"30 deg" comments could rot
++// silently if SPAWN_RING_SEGS changed).
++TIE_DASH_SEG :: 3 // consecutive table segments per dash
++TIE_DASH_COUNT :: SPAWN_RING_SEGS / (2 * TIE_DASH_SEG) // dashes around the fan (derived)
++
++when SPAWN_RING_SEGS % (2 * TIE_DASH_SEG) != 0 {
++	// compile-time trip (r1 N3): a mis-aligned dash pattern cannot build —
++	// constant division by zero is a compile error when this branch is live.
++	TIE_DASH_TILING_BROKEN :: 1 / 0
++}
++
++// tie_dash_on — is table segment `i` part of a dash? Pure, so the render
++// test can pin the pattern itself (deleting the dash modulation — reverting
++// to a solid warning-shaped ring — fails the pin, not just playtesting).
++tie_dash_on :: proc(i: int) -> bool {
++	return (i / TIE_DASH_SEG) % 2 == 0
++}
++
++// tie_dash_segments — the per-segment DRAW ENUMERATION: exactly the table
++// segments draw_tie_mark draws (its quad loop consumes this array — the r1
++// blocker fix: the drawn set and the pinned set are the same bytes, and the
++// harness pixel-scans the ring itself). The FIXED length is load-bearing:
++// a solid-ring revert (the tie_dash_on guard deleted here) overruns the
++// array and fails the render tests instead of passing them.
++tie_dash_segments :: proc() -> [TIE_DASH_COUNT * TIE_DASH_SEG]int {
++	segs: [TIE_DASH_COUNT * TIE_DASH_SEG]int
++	n := 0
++	for i in 0 ..< SPAWN_RING_SEGS {
++		if !tie_dash_on(i) {
++			continue
++		}
++		segs[n] = i
++		n += 1
++	}
++	return segs
++}
++
++// draw_tie_mark — the T2 equal-cost cue at a split node: a DASHED info-violet
++// ring around the node + the rule caption ("equal cost - split by hash" —
++// ASCII, gate 6; a split never looks random: both branches glow and the node
++// names the rule). Shape + hue both de-conflicted from the SOLID amber
++// congestion-warning telegraph (never color alone — ring + caption here,
++// ring + glyph + pulse there).
+ draw_tie_mark :: proc(v: ^View, topo: ^pp.Topology, node_id: u32) {
+ 	p := v.palette
+ 	slot, ok := pp.node_slot(topo, node_id)
+@@ -480,9 +527,19 @@ draw_tie_mark :: proc(v: ^View, topo: ^pp.Topology, node_id: u32) {
+ 	col := p.route_tie
+ 	r := s * 0.62
+ 	th := 2.5 * v.scale
+-	for k in 0..<i32(th) {
+-		rl.DrawCircleLinesV(c, r - f32(k) * v.scale, col)
++	r_in, r_out := r - th * 0.5, r + th * 0.5
++	// degenerate guard (the draw_ring_annulus precedent — r1 N7: a zero/negative
++	// radius or fully transparent ring must early-return like its sibling).
++	if r_out <= 0 || r_in < 0 || col.a == 0 {
++		return
+ 	}
++	// the dashed ring: the draw path CONSUMES the pinned enumeration —
++	// tie_dash_segments() is the single source of the drawn set (the r1
++	// blocker fix: a solid-ring revert must come through the enumeration,
++	// where it fails the fixed length; the harness pixel-scans the ring to
++	// pin this end-to-end).
++	segs := tie_dash_segments()
++	draw_ring_segments(v, c, r_in, r_out, col, segs[:])
+ 	caption := "equal cost - split by hash"
+ 	fs := i32(max(11, s * 0.30))
+ 	cw := i32(len(caption)) * fs / 2
+diff --git a/app/render/palette.odin b/app/render/palette.odin
+index caf0217..bfa182d 100644
+--- a/app/render/palette.odin
++++ b/app/render/palette.odin
+@@ -165,7 +165,7 @@ Palette :: struct {
+ 	// Job B (readability package): the route-glow + tie-cue colors (R2a/R3/T2,
+ 	// canon 2026-08-13). Cosmetic only, like the rest of the palette.
+ 	route_glow: rl.Color, // the winning-path halo (translucent green)
+-	route_tie:  rl.Color, // the equal-cost split-node mark (warm amber)
++	route_tie:  rl.Color, // the equal-cost split-node mark (info violet - NOT the amber warning family)
+ 	// 7.3: the colorblind mode tables (data/palette.json "modes" — derived by
+ 	// tools/derive_a11y_palettes.py; palcheck re-verifies pairwise separation
+ 	// under each deficiency's simulation). Plain fixed-size data. `mode` is
+@@ -267,7 +267,7 @@ palette_load :: proc(source: []byte = DEFAULT_PALETTE_JSON) -> Palette {
+ 		p.lane_speeds = {1000, 850, 700}
+ 	}
+ 	p.route_glow = jcol(obj, "route_glow", {86, 180, 110, 110})
+-	p.route_tie = jcol(obj, "route_tie", {242, 181, 68, 235})
++	p.route_tie = jcol(obj, "route_tie", {186, 94, 232, 235})
+ 	// 7.3: the colorblind mode tables ("modes": {deutan/protan/tritan}).
+ 	// Tolerant parse like the rest: a malformed table leaves that token
+ 	// unset (the mode then keeps the base value — fail-visible in palcheck,
+@@ -330,7 +330,7 @@ fallback_palette :: proc() -> Palette {
+ 	p.state_critical = {232, 69, 69, 255}
+ 	p.lane_speeds = {1000, 850, 700}
+ 	p.route_glow = {86, 180, 110, 110}
+-	p.route_tie = {242, 181, 68, 235}
++	p.route_tie = {186, 94, 232, 235}
+ 	return p
+ }
+ 
+diff --git a/app/render/palette_polish_test.odin b/app/render/palette_polish_test.odin
+index a9aa9db..040276d 100644
+--- a/app/render/palette_polish_test.odin
++++ b/app/render/palette_polish_test.odin
+@@ -131,6 +131,98 @@ hue_degrees :: proc(c: rl.Color) -> f32 {
+ 	return h
+ }
+ 
++// --- v2-viscomm-tie (2026-08-25): the tie/warning de-conflict pins ------------
++// Finding A of the vis-comm audit: route_tie was RGB-identical to
++// state_congested modulo alpha (242,181,68) — two unrelated meanings sharing
++// hue AND shape (both solid node rings). These pins hold BOTH levers of the
++// fix so a revert to the amber solid ring fails CI, not playtesting:
++// (a) HUE — route_tie is the info-violet family, far from the amber warning
++//     AND >= 15 deg from every pipe tier AND every router tier ring (r1 W2:
++//     router tiers are node-centered rings on routers too — exactly where
++//     ECMP split nodes sit; the old 3-pipe array missed the 14.0deg collision
++//     with router_tier_high) + >= 90 deg from state_congested (r1 N8: the
++//     numeric pin, not just the channel-ordering classifier);
++// (b) SHAPE — the tie mark is a DASHED ring: the pattern AND the draw-path
++//     enumeration (tie_dash_segments — what draw_tie_mark consumes), never
++//     the warning telegraph's solid ring (the harness pixel-scans the ring
++//     itself: palcheck section 5).
++@(test)
++route_tie_is_hue_distinct_from_warning_and_pipe_tiers :: proc(t: ^testing.T) {
++	p := palette_load()
++	// the exact shipped bytes (load path + fallback — the data-token pin)
++	// r2: hue 280 (#BA5EE8) — shifted off 264 to clear the 15 deg node-signal
++	// canon vs router_tier_high (250.3 deg).
++	expect_color(t, p.route_tie, {186, 94, 232, 235})
++	f := fallback_palette()
++	expect_color(t, f.route_tie, {186, 94, 232, 235})
++	// hue-family exit: the warning telegraph is warm (red-max, blue-min);
++	// the tie mark must NOT be in that family (integer channel ordering).
++	testing.expect(t, p.state_congested.r > p.state_congested.g && p.state_congested.g > p.state_congested.b,
++		"sanity: state_congested must stay in the warm family")
++	testing.expect(t, !(p.route_tie.r > p.route_tie.g && p.route_tie.g > p.route_tie.b),
++		"route_tie must NOT share the warm warning family")
++	// >= 15 deg from every node-signal ring: pipe tiers AND router tiers (the
++	// ring must never read as a tier — r1 W2 folded the router tiers in).
++	tie_h := hue_degrees(p.route_tie)
++	tiers := [6]rl.Color{p.pipe_copper, p.pipe_steel, p.pipe_fiber,
++		p.router_tier_basic, p.router_tier_mid, p.router_tier_high}
++	for tier, i in tiers {
++		d := abs(tie_h - hue_degrees(tier))
++		d = min(d, 360 - d)
++		testing.expectf(t, d >= 15, "route_tie vs node-signal ring %s hue delta %.1f deg < 15", fmt_tok(i), d)
++	}
++	// r1 N8: the NUMERIC separation pin vs the warning head — circular hue
++	// distance >= 90 deg (a classifier alone let a magenta congested pass).
++	dc := abs(tie_h - hue_degrees(p.state_congested))
++	dc = min(dc, 360 - dc)
++	testing.expectf(t, dc >= 90, "route_tie vs state_congested hue delta %.1f deg < 90", dc)
++}
++
++@(test)
++route_tie_mark_is_a_dashed_ring_not_a_solid_warning_shape :: proc(t: ^testing.T) {
++	// the shape leg — BOTH layers (r1 blocker: the predicate-only pin was
++	// vacuous against the draw path; the enumeration + harness pixel-scan
++	// close it). Deleting the dash modulation — reverting draw_tie_mark to a
++	// solid DrawCircleLinesV-style ring like the warning telegraph — must
++	// fail here or the pin is vacuous.
++	testing.expect(t, TIE_DASH_SEG >= 2, "a dash needs >= 2 consecutive segments to read as a dash")
++	testing.expect(t, TIE_DASH_COUNT >= 4, "fewer than 4 dashes reads as a broken ring, not a dashed one")
++	on := 0
++	for i in 0 ..< SPAWN_RING_SEGS {
++		if tie_dash_on(i) {
++			on += 1
++		}
++	}
++	// exactly half the fan is dash: any always-true revert (solid ring)
++	// or pattern break changes this count.
++	testing.expectf(t, on == SPAWN_RING_SEGS / 2,
++		"dash duty cycle must be 1/2 (on=%d of %d)", on, SPAWN_RING_SEGS)
++	// the pattern alternates in TIE_DASH_SEG-wide runs (run 0 on, run 1 off,
++	// run 2 on, ...) — spot-check the run boundaries.
++	testing.expect(t, tie_dash_on(0), "run 0 must be on")
++	testing.expect(t, !tie_dash_on(TIE_DASH_SEG), "run 1 must be off")
++	testing.expect(t, tie_dash_on(2 * TIE_DASH_SEG), "run 2 must be on")
++	// the DRAW-PATH enumeration pin (r1 blocker fix): draw_tie_mark's quad
++	// loop consumes tie_dash_segments(), so the DRAWN set == this array —
++	// assert set equality against the pattern, both directions. The fixed
++	// array length means a deleted tie_dash_on guard inside the enumeration
++	// PANICS the bounds check here (a solid revert cannot sneak through).
++	segs := tie_dash_segments()
++	testing.expectf(t, len(segs) == SPAWN_RING_SEGS / 2,
++		"the draw enumeration must carry half the fan (got %d of %d)", len(segs), SPAWN_RING_SEGS)
++	k := 0
++	for i in 0 ..< SPAWN_RING_SEGS {
++		if tie_dash_on(i) {
++			// ascending scan: the enumeration must hold exactly i, in order —
++			// a missing, extra, or out-of-place segment fails at its position.
++			testing.expectf(t, k < len(segs) && segs[k] == i,
++				"draw enumeration diverges from the dash pattern at segment %d", i)
++			k += 1
++		}
++	}
++	testing.expect(t, k == len(segs), "the enumeration covers every on-segment exactly (no extras, no gaps)")
++}
++
+ // --- helpers -----------------------------------------------------------------
+ 
+ expect_color :: proc(t: ^testing.T, got, want: rl.Color) {
+@@ -142,6 +234,9 @@ fmt_tok :: proc(i: int) -> string {
+ 	switch i {
+ 	case 0:  return "copper"
+ 	case 1:  return "steel"
+-	case:    return "fiber"
++	case 2:  return "fiber"
++	case 3:  return "router_tier_basic"
++	case 4:  return "router_tier_mid"
++	case:    return "router_tier_high"
+ 	}
+ }
+diff --git a/app/render/spawn_fx.odin b/app/render/spawn_fx.odin
+index bbfdba2..5a2e62d 100644
+--- a/app/render/spawn_fx.odin
++++ b/app/render/spawn_fx.odin
+@@ -376,6 +376,31 @@ spawn_fx_draw_telegraph :: proc(v: ^View, tick: u64) {
+ 	draw_ring_annulus(v, c, outer, outer + SPAWN_RING_W_TILES * s * 0.55, ink)
+ }
+ 
++// draw_ring_segments — the shared annulus quad fan for exactly the given
++// SPAWN_RING_TABLE segments (the geometry single-source — r1 N2/N6 fold:
++// the spawn rings, the solid telegraph rings, and the tie mark's dashed
++// ring all emit from here, so the winding/culling lesson lives in ONE
++// copy). Two triangles per segment; CCW winding in screen space (rlgl
++// culls BACK faces with front = CCW — the CW order culled BOTH the rlsw
++// capture AND the GPU app; the sprite quads render because their winding
++// is CCW). tri 1: p1o, p1i, p2o — tri 2: p2o, p1i, p2i. Deterministic: no
++// transcendentals, fixed 36-segment geometry at every scale (the
++// health-ring stroke precedent).
++draw_ring_segments :: proc(v: ^View, c: rl.Vector2, r_in, r_out: f32, col: rl.Color, segs: []int) {
++	table := SPAWN_RING_TABLE // local copy — a constant can't be indexed by a runtime index
++	for i in segs {
++		j := (i + 1) % SPAWN_RING_SEGS
++		a1 := table[i]
++		a2 := table[j]
++		p1o := rl.Vector2{c.x + a1[0] * r_out, c.y + a1[1] * r_out}
++		p2o := rl.Vector2{c.x + a2[0] * r_out, c.y + a2[1] * r_out}
++		p1i := rl.Vector2{c.x + a1[0] * r_in, c.y + a1[1] * r_in}
++		p2i := rl.Vector2{c.x + a2[0] * r_in, c.y + a2[1] * r_in}
++		rl.DrawTriangle(p1o, p1i, p2o, col)
++		rl.DrawTriangle(p2o, p1i, p2i, col)
++	}
++}
++
+ // draw_ring_annulus — a filled ring segment between inner/outer radii at
+ // screen pos `c`, built from the pinned SPAWN_RING_TABLE (two triangles per
+ // segment — a quad fan; RL_TRIANGLES fills alpha-blend in the rlsw software
+@@ -385,22 +410,11 @@ draw_ring_annulus :: proc(v: ^View, c: rl.Vector2, r_in, r_out: f32, col: rl.Col
+ 	if r_out <= 0 || r_in < 0 || col.a == 0 {
+ 		return
+ 	}
++	all: [SPAWN_RING_SEGS]int // the identity enumeration — every segment
+ 	for i in 0 ..< SPAWN_RING_SEGS {
+-		j := (i + 1) % SPAWN_RING_SEGS
+-		table := SPAWN_RING_TABLE // local copy — a constant can't be indexed by a runtime index
+-		a1 := table[i]
+-		a2 := table[j]
+-		p1o := rl.Vector2{c.x + a1[0] * r_out, c.y + a1[1] * r_out}
+-		p2o := rl.Vector2{c.x + a2[0] * r_out, c.y + a2[1] * r_out}
+-		p1i := rl.Vector2{c.x + a1[0] * r_in, c.y + a1[1] * r_in}
+-		p2i := rl.Vector2{c.x + a2[0] * r_in, c.y + a2[1] * r_in}
+-		// CCW winding in screen space (rlgl culls BACK faces with front = CCW
+-		// — the CW order culled BOTH the rlsw capture AND the GPU app; the
+-		// sprite quads render because their winding is CCW). tri 1: p1o,
+-		// p1i, p2o — tri 2: p2o, p1i, p2i
+-		rl.DrawTriangle(p1o, p1i, p2o, col)
+-		rl.DrawTriangle(p2o, p1i, p2i, col)
++		all[i] = i
+ 	}
++	draw_ring_segments(v, c, r_in, r_out, col, all[:])
+ }
+ 
+ // spawn_fx_reveal_transform — the (scale, fade) for a node id at `tick`
+diff --git a/data/palette.json b/data/palette.json
+index 1d771e7..7303c7a 100644
+--- a/data/palette.json
++++ b/data/palette.json
+@@ -1,5 +1,5 @@
+ {
+-  "_comment": "Palette catalog (look-book v1, art-direction v1.2 — the light-canvas canon). ALL values cosmetic (RGBA quads 0-255); the core never reads this file. The render layer loads it so art tuning is data (ODN-5). 7.4/canon D9: water/coast/park are the procedural-map tokens (story 7.4 — the look-book §2 palette oracle; the palcheck gate scans the blessed juice golden for them). 7.3: 'modes' = the colorblind remap tables (deutan/protan/tritan — simulator-derived by tools/derive_a11y_palettes.py, Machado 2009 severity-1.0; palcheck re-verifies pairwise separation under simulation). Partial tables: absent tokens keep base values; 'packet_classes' remaps catalog class colors at DRAW time (the catalog itself is never edited — cat.hash is golden-poison). v2-network-pop (2026-08-22, user ruling: networking must pop): the LEFOU system-tone mute is REVERSED IN THE NETWORK LAYER ONLY — pipe tiers back to a vivid family (narrow = saturated copper-orange #F06E00, standard = cyan #0096F0, wide/fiber = the direction's warm-gold #FFD700; pairwise hue separation >= 15 deg), packets stay at catalog maxima (the look-book shades, draw-time), node accents up (router LED token). The CALM BOARD tokens (canvas/water/coast/park/grid) are untouched — the Brush 70/30 done right: quiet paper board (the 70), saturated warm-gold-dominant network (the 30 by band area). a11y mode tables untouched (they override the signal set under CVD). v2-node-clarity (2026-08-22): the terminal-class hue families + router tier markers (Q2a/Q2b) — ADDITIONS ONLY, every pre-existing token keeps its bytes (the parallel POP job owns the network tokens; the final wave reconciles). The family tokens' ALPHA byte is the wash strength: draw_building alpha-blends the anchor over the sprite footprint, so the baked sprite recolors into its family while the silhouette + detail survive (E9.1: shape + chip + wash). The tier tokens are both the puck wash anchor and the ring color (drawn at full alpha).",
++  "_comment": "Palette catalog (look-book v1, art-direction v1.2 — the light-canvas canon). ALL values cosmetic (RGBA quads 0-255); the core never reads this file. The render layer loads it so art tuning is data (ODN-5). 7.4/canon D9: water/coast/park are the procedural-map tokens (story 7.4 — the look-book §2 palette oracle; the palcheck gate scans the blessed juice golden for them). 7.3: 'modes' = the colorblind remap tables (deutan/protan/tritan — simulator-derived by tools/derive_a11y_palettes.py, Machado 2009 severity-1.0; palcheck re-verifies pairwise separation under simulation). Partial tables: absent tokens keep base values; 'packet_classes' remaps catalog class colors at DRAW time (the catalog itself is never edited — cat.hash is golden-poison). v2-network-pop (2026-08-22, user ruling: networking must pop): the LEFOU system-tone mute is REVERSED IN THE NETWORK LAYER ONLY — pipe tiers back to a vivid family (narrow = saturated copper-orange #F06E00, standard = cyan #0096F0, wide/fiber = the direction's warm-gold #FFD700; pairwise hue separation >= 15 deg), packets stay at catalog maxima (the look-book shades, draw-time), node accents up (router LED token). The CALM BOARD tokens (canvas/water/coast/park/grid) are untouched — the Brush 70/30 done right: quiet paper board (the 70), saturated warm-gold-dominant network (the 30 by band area). a11y mode tables untouched (they override the signal set under CVD). v2-node-clarity (2026-08-22): the terminal-class hue families + router tier markers (Q2a/Q2b) — ADDITIONS ONLY, every pre-existing token keeps its bytes (the parallel POP job owns the network tokens; the final wave reconciles). The family tokens' ALPHA byte is the wash strength: draw_building alpha-blends the anchor over the sprite footprint, so the baked sprite recolors into its family while the silhouette + detail survive (E9.1: shape + chip + wash). The tier tokens are both the puck wash anchor and the ring color (drawn at full alpha). v2-viscomm-tie (2026-08-25): route_tie EXITS the amber warning family — info violet #BA5EE8 (r2 hue shift: was #965EE8 @264deg, only 14deg from router_tier_high — below the 15deg node-signal canon; now 280deg, 29.7deg from router_tier_high, circular distance 119deg from state_congested, >=15deg from every pipe AND router tier) + a DASHED ring (draw_tie_mark) so the informational split cue can never read as the SOLID-ring congestion telegraph. The mode tables no longer remap route_tie: the base violet separates under all three CVD simulations (r2 re-derivation: worst route_tie pair 102.8 vs threshold 48; tie-vs-congested pair 105.0/202.1/236.5 deutan/protan/tritan — the pair is now IN both oracles), and the old pale-amber remap was RGB-identical to state_congested's deutan/protan remap.",
+   "canvas":        [237, 226, 200, 255],
+   "grid":          [194, 182, 148, 255],
+   "water":         [179, 205, 224, 255],
+@@ -42,7 +42,7 @@
+   "lane_speeds":   [1000, 850, 700],
+   "sel_halo":      [232, 181, 68, 90],
+   "route_glow":    [86, 180, 110, 110],
+-  "route_tie":     [242, 181, 68, 235],
++  "route_tie":     [186, 94, 232, 235],
+   "modes": {
+     "deutan": {
+       "state_healthy":   [0, 118, 132, 255],
+@@ -57,7 +57,6 @@
+       "pipe_steel":      [122, 132, 146, 255],
+       "pipe_fiber":      [36, 60, 132, 255],
+       "route_glow":      [0, 118, 132, 110],
+-      "route_tie":       [242, 213, 120, 235],
+       "water":           [96, 138, 172, 255],
+       "park":            [196, 204, 132, 255],
+       "coast":           [216, 198, 150, 255],
+@@ -77,7 +76,6 @@
+       "pipe_steel":      [122, 132, 146, 255],
+       "pipe_fiber":      [36, 60, 132, 255],
+       "route_glow":      [0, 118, 132, 110],
+-      "route_tie":       [242, 213, 120, 235],
+       "water":           [96, 138, 172, 255],
+       "park":            [196, 204, 132, 255],
+       "coast":           [216, 198, 150, 255],
+@@ -97,7 +95,6 @@
+       "pipe_steel":      [122, 132, 146, 255],
+       "pipe_fiber":      [52, 44, 150, 255],
+       "route_glow":      [16, 138, 74, 110],
+-      "route_tie":       [240, 204, 96, 235],
+       "water":           [52, 92, 156, 255],
+       "park":            [196, 212, 128, 255],
+       "coast":           [204, 186, 138, 255],
+diff --git a/harness/palcheck.odin b/harness/palcheck.odin
+index b8e3efc..64a20eb 100644
+--- a/harness/palcheck.odin
++++ b/harness/palcheck.odin
+@@ -104,6 +104,11 @@ a11y_separation_check :: proc(cat: ^pp.Catalogs, base: ^rnd.Palette, mode: rnd.P
+ 	append(&pairs, [2]rl.Color{p.pipe_copper, p.pipe_fiber})
+ 	append(&pairs, [2]rl.Color{p.pipe_steel, p.pipe_fiber})
+ 	append(&pairs, [2]rl.Color{p.route_glow, p.route_tie})
++	// v2-viscomm-tie r1 W3/W5: the EXACT pair this token exists to separate.
++	// The old tables passed every gate while the old pale-amber route_tie
++	// remap was RGB-identical to state_congested's deutan/protan remap
++	// (simulated distance 0.0 — re-verified by recomputation at review time).
++	append(&pairs, [2]rl.Color{p.route_tie, p.state_congested})
+ 	append(&pairs, [2]rl.Color{p.water, p.park})
+ 	append(&pairs, [2]rl.Color{p.water, p.land})
+ 	append(&pairs, [2]rl.Color{p.park, p.land})
+@@ -514,6 +519,14 @@ run_palcheck :: proc(cat: ^pp.Catalogs) -> int {
+ 			}
+ 			eff: rnd.Palette
+ 			rnd.palette_apply_mode(&base, &eff, mode)
++			// r1 N9/W4: route_tie bytes are UNTOUCHED by every mode table — the
++			// base info-violet survives all three simulations, so the tables
++			// deliberately never remap it. A reintroduced route_tie remap (the
++			// old pale-amber one was RGB-identical to the congested remap)
++			// fails here.
++			check(eff.route_tie == base.route_tie,
++				fmt.aprintf("a11y %s route_tie unremapped (base violet survives)", rnd.palette_mode_name(mode)),
++				int(eff.route_tie.g) + int(eff.route_tie.b))
+ 			// the banner border + the telegraph ring draw the state colors pure
+ 			// (the outline pre-composites toward canvas — the ring does not)
+ 			n_crit := count_near(frame, eff.state_critical, 30) // real-ladder re-bless re-pin: the frames pre-composite the critical hex
+@@ -540,6 +553,100 @@ run_palcheck :: proc(cat: ^pp.Catalogs) -> int {
+ 		}
+ 	}
+ 
++	// --- 5. the tie-mark draw-path pin (v2-viscomm-tie r1 blocker) ----------
++	// The r1 blocker: the dashed-shape pins covered the pure predicate but
++	// NOTHING covered the actual draw loop — deleting the modulation inside
++	// draw_tie_mark (a solid warning-shaped ring) passed 83/83 tests. This
++	// check renders the REAL draw path (draw_route_glow -> draw_tie_mark, its
++	// only caller) on the rlsw renderer and pixel-scans the ring at every
++	// table segment's mid-angle: the DRAWN set must equal tie_dash_on's set
++	// exactly (half the fan). A solid-ring revert — guard deleted, enumeration
++	// bypassed, any form — renders the full fan and fails here. This is a live
++	// analysis frame like section 2, NOT a golden capture: the T2 goldens never
++	// invoke draw_route_glow (the assist doctrine — goldens cannot shift).
++	{
++		state: pp.Run_State
++		pp.run_init(&state, 7, cat.hash, cat.balance.logic_hz)
++		res, _ := pp.node_type_index(cat, "residential")
++		host, _ := pp.node_type_index(cat, "content_host")
++		rtm, _ := pp.node_type_index(cat, "router_mid")
++		narrow, _ := pp.pipe_tier_index(cat, "narrow")
++		n0 := pp.topology_spawn_node(&state.topology, res, {4, 15}, cat)   // the split
++		n1 := pp.topology_spawn_node(&state.topology, rtm, {12, 11}, cat)  // path A hop
++		n2 := pp.topology_spawn_node(&state.topology, rtm, {12, 19}, cat)  // path B hop
++		n3 := pp.topology_spawn_node(&state.topology, host, {20, 15}, cat) // the dst
++		pp.topology_apply_edit(&state.topology, pp.Command{kind = pp.Cmd_Draw_Pipe{a = n0, b = n1, tier = narrow}}, cat)
++		pp.topology_apply_edit(&state.topology, pp.Command{kind = pp.Cmd_Draw_Pipe{a = n1, b = n3, tier = narrow}}, cat)
++		pp.topology_apply_edit(&state.topology, pp.Command{kind = pp.Cmd_Draw_Pipe{a = n0, b = n2, tier = narrow}}, cat)
++		// one live packet AT the split, dst the host: the candidate (n2-n3)
++		// completes the equal-cost diamond, so the what-if DAG splits at n0.
++		append(&state.flow.packets, pp.Packet{src = n0, dst = n3, at_node = n0, class = 0})
++		scratch: rnd.Preview_Scratch
++		rnd.preview_scratch_make(&scratch)
++		prev: rnd.Route_Preview
++		pok := rnd.preview_compute(&scratch, &state.topology, &state.flow, cat, pp.Cmd_Draw_Pipe{a = n2, b = n3, tier = narrow}, &prev)
++		check(pok && len(prev.split_nodes) == 1 && prev.split_nodes[0] == n0,
++			"tie preview arms the split node (ECMP diamond)", len(prev.split_nodes))
++		// zoom onto the split node + render the REAL glow path on paper canvas
++		view.scale = 3.0
++		view.off_x = f32(view.win_w) / 2 - f32(4) * view.tile_px * view.scale
++		view.off_y = f32(view.win_h) / 2 - f32(15) * view.tile_px * view.scale
++		rl.BeginDrawing()
++		rl.ClearBackground(rl.Color{237, 226, 200, 255})
++		rnd.draw_route_glow(&view, &state.topology, &state.bundles, &prev, false, {0, 0})
++		rl.EndDrawing()
++		img := rl.LoadImageFromScreen()
++		normalize(&img)
++		px := rl.LoadImageColors(img)
++		// ring geometry mirrors draw_tie_mark: r = s * 0.62, band 2.5 * scale
++		slot, _ := pp.node_slot(&state.topology, n0)
++		c := rnd.node_screen(&view, state.topology.node_pos[slot])
++		s := view.tile_px * view.scale
++		r := s * 0.62
++		tie := view.palette.route_tie
++		drawn := 0
++		mismatch := 0
++		for i in 0 ..< rnd.SPAWN_RING_SEGS {
++			j := (i + 1) % rnd.SPAWN_RING_SEGS
++			table := rnd.SPAWN_RING_TABLE // local copy — a constant can't be indexed by a runtime index
++			// the mid-angle unit vector of table segment i (boundary vectors summed)
++			dx := table[i][0] + table[j][0]
++			dy := table[i][1] + table[j][1]
++			l := math.sqrt_f32(dx * dx + dy * dy)
++			dx /= l
++			dy /= l
++			// sample 3 radii through the band's centerline (AA insurance)
++			near_tie := false
++			radii := [3]f32{r - 1.5, r, r + 1.5}
++			for rr in radii {
++				xi := int(c.x + dx * rr)
++				yi := int(c.y + dy * rr)
++				if xi < 0 || yi < 0 || xi >= int(img.width) || yi >= int(img.height) {
++					continue
++				}
++				p := px[yi * int(img.width) + xi]
++				if abs(i32(p.r) - i32(tie.r)) <= 60 && abs(i32(p.g) - i32(tie.g)) <= 60 && abs(i32(p.b) - i32(tie.b)) <= 60 {
++					near_tie = true
++					break
++				}
++			}
++			if near_tie {
++				drawn += 1
++			}
++			if near_tie != (rnd.tie_dash_on(i)) {
++				mismatch += 1
++			}
++		}
++		check(mismatch == 0 && drawn == rnd.SPAWN_RING_SEGS / 2,
++			fmt.aprintf("tie ring drawn set == tie_dash_on (drawn %d of %d, mismatches %d — a solid-ring revert renders the full fan)", drawn, rnd.SPAWN_RING_SEGS, mismatch),
++			drawn)
++		rl.UnloadImageColors(px)
++		rl.UnloadImage(img)
++		rnd.preview_release(&prev)
++		rnd.preview_scratch_destroy(&scratch)
++		pp.run_destroy(&state)
++	}
++
+ 	if fails > 0 {
+ 		fmt.printfln("palcheck: %d check(s) FAILED", fails)
+ 		return 1
+diff --git a/tools/derive_a11y_palettes.py b/tools/derive_a11y_palettes.py
+index cc5eaa7..3979ec1 100644
+--- a/tools/derive_a11y_palettes.py
++++ b/tools/derive_a11y_palettes.py
+@@ -94,8 +94,46 @@ def mix(a, b, t):  # linear mix in 8-bit space
+ 
+ # ---------------------------------------------------------------- the canon
+ 
+-PAL = json.load(open("data/palette.json"))
+-PKT = json.load(open("data/packet_types.json"))
++def strip_jsonc_comments(text):
++    """Remove `//` line comments OUTSIDE string literals. data/palette.json
++    carries inline comments (the font overhaul added them); the derivation
++    must run on the SHIPPED bytes, not a private stripped copy (r1 W1:
++    the a11y numbers were unreproducible from the repo). In-string `//` is
++    preserved; the newline is kept so parse-error line numbers stay true."""
++    out = []
++    in_str = False
++    esc = False
++    i = 0
++    while i < len(text):
++        ch = text[i]
++        if in_str:
++            out.append(ch)
++            if esc:
++                esc = False
++            elif ch == "\\":
++                esc = True
++            elif ch == '"':
++                in_str = False
++            i += 1
++            continue
++        if ch == '"':
++            in_str = True
++            out.append(ch)
++            i += 1
++            continue
++        if ch == "/" and i + 1 < len(text) and text[i + 1] == "/":
++            while i < len(text) and text[i] != "\n":
++                i += 1
++            continue
++        out.append(ch)
++        i += 1
++    return "".join(out)
++
++def load_jsonc(path):
++    return json.loads(strip_jsonc_comments(open(path).read()))
++
++PAL = load_jsonc("data/palette.json")
++PKT = load_jsonc("data/packet_types.json")
+ 
+ def tok(name):
+     v = PAL[name]
+@@ -127,6 +165,12 @@ def eff(name):
+     for a, b in itertools.combinations(pipes, 2):
+         P.append(("pipe-tiers", a, b, T_SIGNAL))
+     P.append(("route-marks", eff("route_glow"), eff("route_tie"), T_SIGNAL))
++    # v2-viscomm-tie r1 W3/W5: the EXACT pair this token exists to separate —
++    # tie (info violet) vs the congestion warning — under every simulation.
++    # The old tables passed every gate while the old pale-amber route_tie
++    # remap was RGB-identical to state_congested's deutan/protan remap
++    # (simulated distance 0.0).
++    P.append(("tie-vs-congested", eff("route_tie"), eff("state_congested"), T_SIGNAL))
+     cls = [tuple(classes.get(cid, CLASS_BASE[cid])[:3]) for cid in CLASS_BASE]
+     for a, b in itertools.combinations(cls, 2):
+         P.append(("packet-classes", a, b, T_SIGNAL))
+@@ -182,10 +226,16 @@ def derive(mode):
+     if mode == "tritan":
+         remap["pipe_fiber"] = (52, 44, 150)
+ 
+-    # -- route marks: glow = healthy family, tie = express family (linked to
+-    #    the triad anchors by construction — verified by the oracle)
++    # -- route marks: glow = healthy family (linked to the triad anchors by
++    #    construction — verified by the oracle). v2-viscomm-tie (2026-08-25):
++    #    route_tie is NO LONGER remapped — the base info-violet (r2: 186,94,232
++    #    @ hue 280) survives all three simulations far past threshold (worst
++    #    route_tie pair 102.8 vs T_SIGNAL 48) AND the tie-vs-congested pair
++    #    clears every mode (105.0+ — it is IN pair_list below), so the partial
++    #    table keeps the base bytes. The old pale-amber remap made tie
++    #    RGB-identical to state_congested under deutan/protan — the exact
++    #    collision this token's redesign removed.
+     remap["route_glow"] = (teal[0], teal[1], teal[2], PAL["route_glow"][3])
+-    remap["route_tie"]  = (pale[0], pale[1], pale[2], PAL["route_tie"][3])
+ 
+     # -- map tokens: deutan/protan turn water/park into near-twins (blue vs
+     #    green both drop toward beige). Separate by L + warmth: water darker

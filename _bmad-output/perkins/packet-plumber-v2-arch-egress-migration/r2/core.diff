@@ -1,0 +1,2884 @@
+diff --git a/core/bundles.odin b/core/bundles.odin
+index 9e04148..00f97bc 100644
+--- a/core/bundles.odin
++++ b/core/bundles.odin
+@@ -65,15 +65,17 @@ Bundles :: struct {
+ 	bundle_count:[dynamic]u32, // live member count (the render-width proxy)
+ 	bundle_tier: [dynamic]u16, // highest tier index among members (render color)
+ 	n:           u32,          // live bundle count
+-	// v2-network-units: the per-bundle TRANSMITTED-WORK window (the honest
+-	// utilization counter, ifHCOutOctets-style). Flat ring of
+-	// UTIL_WINDOW_TICKS slots per bundle: tx_slot_tick[bi*W+s] = the tick that
+-	// last wrote slot s (0 = never), tx_served[bi*W+s] = the bandwidth-units
+-	// the bundle served that tick (flow_step records it). DERIVED state — the
+-	// same status as lane_caps/drop_sites: rebuilt identically on replay,
+-	// NEVER serialized (the T1 hash is byte-identical; LOG_VERSION is
+-	// untouched — the job's isomorphism rule). Reset on every rebuild
+-	// (bundle slots renumber — a stale ring would misattribute history).
++	// v2-network-units + v2-arch-egress S2 (AD-5): the per-(bundle, DIRECTION)
++	// TRANSMITTED-WORK window (the honest utilization counter, ifHCOutOctets-
++	// style — full duplex: each direction transmits at its own rate). Flat ring
++	// of UTIL_WINDOW_TICKS slots per (bundle, direction):
++	// tx_slot_tick[(bi*PORT_DIR_COUNT+dir)*W+s] = the tick that last wrote slot
++	// s (0 = never), tx_served[...] = the bandwidth-units that PORT served that
++	// tick (flow_step records it). DERIVED state — the same status as
++	// lane_caps/drop_sites: rebuilt identically on replay, NEVER serialized
++	// (the T1 hash is byte-identical for runs that do not contend; LOG_VERSION
++	// is untouched). Reset on every rebuild (bundle slots renumber — a stale
++	// ring would misattribute history).
+ 	tx_slot_tick: [dynamic]u64, // per-slot last-write tick (0 = never written)
+ 	tx_served:    [dynamic]u32, // per-slot served bandwidth-units that tick
+ }
+@@ -167,11 +169,12 @@ bundles_rebuild :: proc(b: ^Bundles, t: ^Topology, cat: ^Catalogs, era: u8, allo
+ 		}
+ 	}
+ 
+-	// v2-network-units: reset the tx window ring (a rebuild can drop/reshape
+-	// bundles — bundle slots renumber, so history must not carry across).
+-	// resize PRESERVES old elements; the explicit zero pass is the reset
+-	// (deterministic: replay hits the same rebuilds from the same commands).
+-	nw := int(b.n) * UTIL_WINDOW_TICKS
++	// v2-network-units + v2-arch-egress S2: reset the tx window ring per
++	// (bundle, direction) — a rebuild can drop/reshape bundles (bundle slots
++	// renumber, so history must not carry across). resize PRESERVES old
++	// elements; the explicit zero pass is the reset (deterministic: replay
++	// hits the same rebuilds from the same commands).
++	nw := int(b.n) * PORT_DIR_COUNT * UTIL_WINDOW_TICKS
+ 	if len(b.tx_slot_tick) != nw {
+ 		resize(&b.tx_slot_tick, nw)
+ 	}
+@@ -184,22 +187,23 @@ bundles_rebuild :: proc(b: ^Bundles, t: ^Topology, cat: ^Catalogs, era: u8, allo
+ 	}
+ }
+ 
+-// bundle_tx_record — record one tick's served bandwidth-units for a bundle
+-// into its window slot (the honest transmitted-work counter). Called from
+-// flow_step's serve pass once per bundle per tick (served == 0 skips — the
++// bundle_tx_record — record one tick's served bandwidth-units for a
++// (bundle, direction) PORT into its window slot (the honest transmitted-work
++// counter; S2 full duplex — each direction records independently). Called
++// from flow_step's serve pass once per port per tick (served == 0 skips — the
+ // slot keeps its last value; the tick key makes staleness exact). NOTE (N9):
+ // a same-tick re-step accumulates duplicate served into one slot — production
+ // never re-steps (the step contract; the same accepted class as the event
+ // buffer), and the stats stream's live==replay byte-compare would catch any
+ // divergence.
+-bundle_tx_record :: proc(b: ^Bundles, tick: u64, bi: u32, served: u32) {
++bundle_tx_record :: proc(b: ^Bundles, tick: u64, bi: u32, dir: u8, served: u32) {
+ 	if served == 0 {
+ 		return
+ 	}
+ 	if int(bi) >= int(b.n) {
+ 		return // defensive — a vanished bundle never records
+ 	}
+-	s := int(bi) * UTIL_WINDOW_TICKS + int(tick % UTIL_WINDOW_TICKS)
++	s := (int(bi) * PORT_DIR_COUNT + int(dir)) * UTIL_WINDOW_TICKS + int(tick % UTIL_WINDOW_TICKS)
+ 	if s >= len(b.tx_slot_tick) {
+ 		return // defensive — sized at rebuild
+ 	}
+@@ -210,9 +214,11 @@ bundle_tx_record :: proc(b: ^Bundles, tick: u64, bi: u32, served: u32) {
+ 	b.tx_served[s] += served
+ }
+ 
+-// bundle_tx_window — the bundle's served-units over the last W ticks (the
+-// utilization numerator). Pure read over the ring (stats_compute's call).
+-bundle_tx_window :: proc(b: ^Bundles, tick: u64, bi: u32) -> u64 {
++// bundle_tx_window — the (bundle, direction) port's served-units over the
++// last W ticks (the utilization numerator; AD-5/AV-4: utilization is a
++// (bundle, direction) property — the denominator is ALWAYS the
++// per-direction cap). Pure read over the ring (stats_compute's call).
++bundle_tx_window :: proc(b: ^Bundles, tick: u64, bi: u32, dir: u8) -> u64 {
+ 	if int(bi) >= int(b.n) {
+ 		return 0
+ 	}
+@@ -221,7 +227,7 @@ bundle_tx_window :: proc(b: ^Bundles, tick: u64, bi: u32) -> u64 {
+ 		lo = tick - UTIL_WINDOW_TICKS // (tick-W, tick] — W ticks inclusive
+ 	}
+ 	sum: u64 = 0
+-	base := int(bi) * UTIL_WINDOW_TICKS
++	base := (int(bi) * PORT_DIR_COUNT + int(dir)) * UTIL_WINDOW_TICKS
+ 	for s in 0..<UTIL_WINDOW_TICKS {
+ 		st := b.tx_slot_tick[base + s]
+ 		if st > lo && st <= tick {
+diff --git a/core/bundles_test.odin b/core/bundles_test.odin
+index ccea5d1..558f852 100644
+--- a/core/bundles_test.odin
++++ b/core/bundles_test.odin
+@@ -338,25 +338,25 @@ test_bundle_tx_window_expiry_and_reuse :: proc(t: ^testing.T) {
+ 
+ 	// fill ticks 1..W with 1 unit each — the full window reads W.
+ 	for tick in u64(1)..=u64(UTIL_WINDOW_TICKS) {
+-		bundle_tx_record(&s.bundles, tick, bs, 1)
++		bundle_tx_record(&s.bundles, tick, bs, PORT_DIR_LO_TO_HI, 1)
+ 	}
+-	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs) == u64(UTIL_WINDOW_TICKS),
+-		"a full window sums W (got %d)", bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs))
++	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs, PORT_DIR_LO_TO_HI) == u64(UTIL_WINDOW_TICKS),
++		"a full window sums W (got %d)", bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs, PORT_DIR_LO_TO_HI))
+ 
+ 	// tick W+1: the tick-1 entry EXPIRES (window = (1, W+1]) — still W total
+ 	// with the new entry; the boundary is exact, not W+1.
+-	bundle_tx_record(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs, 1)
+-	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs) == u64(UTIL_WINDOW_TICKS),
+-		"window expiry at W: tick-1 must drop out exactly (got %d)", bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs))
++	bundle_tx_record(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs, PORT_DIR_LO_TO_HI, 1)
++	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs, PORT_DIR_LO_TO_HI) == u64(UTIL_WINDOW_TICKS),
++		"window expiry at W: tick-1 must drop out exactly (got %d)", bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs, PORT_DIR_LO_TO_HI))
+ 
+ 	// SLOT REUSE at W: writing tick W+1 (the same slot that held tick 1) must
+ 	// OVERWRITE via the stale check, never accumulate — the previous
+ 	// assertion's 240 already proves it (an accumulate would read 241); this
+ 	// block pins the documented same-tick duplicate class (N9: production
+ 	// never re-steps — a same-tick re-step accumulates into one slot).
+-	bundle_tx_record(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs, 1) // duplicate tick W+1
+-	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs) == u64(UTIL_WINDOW_TICKS) + 1,
+-		"same-tick duplicates accumulate (the documented N9 class; got %d)", bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs))
++	bundle_tx_record(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs, PORT_DIR_LO_TO_HI, 1) // duplicate tick W+1
++	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs, PORT_DIR_LO_TO_HI) == u64(UTIL_WINDOW_TICKS) + 1,
++		"same-tick duplicates accumulate (the documented N9 class; got %d)", bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS) + 1, bs, PORT_DIR_LO_TO_HI))
+ }
+ 
+ @(test)
+@@ -374,9 +374,9 @@ test_bundle_tx_ring_rebuild_reset :: proc(t: ^testing.T) {
+ 
+ 	// populate the ring
+ 	for tick in u64(1)..=u64(UTIL_WINDOW_TICKS) {
+-		bundle_tx_record(&s.bundles, tick, bs, 1)
++		bundle_tx_record(&s.bundles, tick, bs, PORT_DIR_LO_TO_HI, 1)
+ 	}
+-	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs) == u64(UTIL_WINDOW_TICKS), "ring populated")
++	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs, PORT_DIR_LO_TO_HI) == u64(UTIL_WINDOW_TICKS), "ring populated")
+ 
+ 	// a topology change rebuilds the view — bundle slots can renumber, so the
+ 	// ring MUST reset (a stale ring would misattribute history).
+@@ -384,9 +384,9 @@ test_bundle_tx_ring_rebuild_reset :: proc(t: ^testing.T) {
+ 	step_once(&s, cat)
+ 	bs2, ok2 := bundles_slot_for_pair(&s.bundles, min(res, rt), max(res, rt))
+ 	testing.expectf(t, ok2, "bundle survives the rebuild")
+-	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs2) == 0,
+-		"rebuild resets the window (got %d)", bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs2))
+-	testing.expectf(t, s.bundles.tx_slot_tick[int(bs2)*UTIL_WINDOW_TICKS] == 0,
++	testing.expectf(t, bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs2, PORT_DIR_LO_TO_HI) == 0,
++		"rebuild resets the window (got %d)", bundle_tx_window(&s.bundles, u64(UTIL_WINDOW_TICKS), bs2, PORT_DIR_LO_TO_HI))
++	testing.expectf(t, s.bundles.tx_slot_tick[(int(bs2)*PORT_DIR_COUNT+int(PORT_DIR_LO_TO_HI))*UTIL_WINDOW_TICKS] == 0,
+ 		"rebuild zeroes the slot ticks (stale ticks must not survive)")
+ }
+ 
+@@ -399,11 +399,11 @@ test_bundle_tx_ring_bounds_and_no_write :: proc(t: ^testing.T) {
+ 	defer run_destroy(&s)
+ 
+ 	// served == 0 never writes — the slot keeps its prior value.
+-	bundle_tx_record(&s.bundles, 1, bs, 5)
+-	bundle_tx_record(&s.bundles, 2, bs, 0)
+-	testing.expectf(t, bundle_tx_window(&s.bundles, 2, bs) == 5, "served==0 is a no-write (got %d)", bundle_tx_window(&s.bundles, 2, bs))
++	bundle_tx_record(&s.bundles, 1, bs, PORT_DIR_LO_TO_HI, 5)
++	bundle_tx_record(&s.bundles, 2, bs, PORT_DIR_LO_TO_HI, 0)
++	testing.expectf(t, bundle_tx_window(&s.bundles, 2, bs, PORT_DIR_LO_TO_HI) == 5, "served==0 is a no-write (got %d)", bundle_tx_window(&s.bundles, 2, bs, PORT_DIR_LO_TO_HI))
+ 
+ 	// defensive bounds: an out-of-range bundle slot records nothing and reads 0.
+-	bundle_tx_record(&s.bundles, 3, 9999, 7)
+-	testing.expectf(t, bundle_tx_window(&s.bundles, 3, 9999) == 0, "out-of-range window reads 0")
++	bundle_tx_record(&s.bundles, 3, 9999, PORT_DIR_LO_TO_HI, 7)
++	testing.expectf(t, bundle_tx_window(&s.bundles, 3, 9999, PORT_DIR_LO_TO_HI) == 0, "out-of-range window reads 0")
+ }
+diff --git a/core/catalog.odin b/core/catalog.odin
+index 7eb0696..e1db517 100644
+--- a/core/catalog.odin
++++ b/core/catalog.odin
+@@ -626,6 +626,14 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 			if lt <= 0 || lp < 0 || lp > 100 || bw < 1 {
+ 				return {"packet_types.json", pt.id, "latency_tol_ms/max_loss_pct/bandwidth_demand invalid"}
+ 			}
++			// v2-arch-egress S3 (D-2 wired; review r1): the demand feeds
++			// packet_demand_units' u32 multiply (demand x packet_bandwidth) —
++			// bound it at load so the product can never wrap (an authoring-time
++			// silent wrap would corrupt the AD-3(c) serialization term; 4096 x
++			// 800 = 3.3M << 2^32, and no real frame is 4096 jumbo-frames wide).
++			if bw > 4096 {
++				return {"packet_types.json", pt.id, "bandwidth_demand must be 1..4096 (the u32 demand-total bound)"}
++			}
+ 			if lane < 0 || lane > 2 {
+ 				return {"packet_types.json", pt.id, "default_lane must be 0..2 (Express/Standard/Best-effort)"}
+ 			}
+@@ -853,8 +861,12 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 			return {"balance.json", "snap_radius", "must be > 0"}
+ 		}
+ 		b.packet_bandwidth = jint(obj, "packet_bandwidth", 30)
+-		if b.packet_bandwidth <= 0 {
+-			return {"balance.json", "packet_bandwidth", "must be > 0 (the per-edge packet service demand — the pace knob)"}
++		// Perkins r1 W2 (the other multiplicand): packet_demand_units'
++		// u32 multiply is demand x packet_bandwidth — BOTH factors are bounded
++		// (demand 1..4096 above; 4096 x 4096 = 16.7M << 2^32) so the product
++		// can never wrap at the catalog seam.
++		if b.packet_bandwidth <= 0 || b.packet_bandwidth > 4096 {
++			return {"balance.json", "packet_bandwidth", "must be 1..4096 (the per-edge packet service demand - the u32 demand-total bound's other factor)"}
+ 		}
+ 		// 2026-08-21 pace-tuning: the terminal-spawn cadence knobs (moved from
+ 		// the growth core consts — the 5.6 placement-block precedent). Fail-fast
+diff --git a/core/catalog_test.odin b/core/catalog_test.odin
+index f4fbf5b..e1a4e02 100644
+--- a/core/catalog_test.odin
++++ b/core/catalog_test.odin
+@@ -354,6 +354,10 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		{"latency decimal", replace1(PKT_VALID, `"latency_tol_ms": 500`, `"latency_tol_ms": 2.5`, 1), "sim fields must be integers"},
+ 		{"loss over 100", replace1(PKT_VALID, `"max_loss_pct": 30`, `"max_loss_pct": 101`, 1), "latency_tol_ms/max_loss_pct/bandwidth_demand invalid"},
+ 		{"bandwidth zero", replace1(PKT_VALID, `"bandwidth_demand": 1`, `"bandwidth_demand": 0`, 1), "latency_tol_ms/max_loss_pct/bandwidth_demand invalid"},
++		// v2-arch-egress S3 review fold + Perkins r1 W3: the > 4096 rejection
++		// branch had NO test (the < 1 branch above did) — the demand feeds
++		// packet_demand_units' u32 multiply, so the bound must bite.
++		{"bandwidth demand over bound", replace1(PKT_VALID, `"bandwidth_demand": 1`, `"bandwidth_demand": 4097`, 1), "bandwidth_demand must be 1..4096 (the u32 demand-total bound)"},
+ 		// r1 warning #3: 256 wraps to 0 through the u8 cast — must reject pre-cast
+ 		{"lane 3", replace1(PKT_VALID, `"default_lane": 1`, `"default_lane": 3`, 1), "default_lane must be 0..2"},
+ 		{"lane 256 wraps", replace1(PKT_VALID, `"default_lane": 1`, `"default_lane": 256`, 1), "default_lane must be 0..2"},
+@@ -512,6 +516,21 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		check_reject_bal(t, r.doc, r.rule)
+ 	}
+ 
++	// --- Perkins r1 W2/W3: packet_bandwidth joins the demand-total bound ----------
++	// The u32 multiply in packet_demand_units is demand x packet_bandwidth —
++	// BOTH factors bounded (demand 1..4096 in packet_types.json; this one
++	// 1..4096 here). The old load only checked > 0.
++	pace_rows := []struct {
++		label, doc, rule: string
++	}{
++		{"packet_bandwidth zero", replace1(BAL_VALID, `"packet_bandwidth": 30`, `"packet_bandwidth": 0`, 1), "must be 1..4096 (the per-edge packet service demand"},
++		{"packet_bandwidth negative", replace1(BAL_VALID, `"packet_bandwidth": 30`, `"packet_bandwidth": -5`, 1), "must be 1..4096 (the per-edge packet service demand"},
++		{"packet_bandwidth over bound", replace1(BAL_VALID, `"packet_bandwidth": 30`, `"packet_bandwidth": 4097`, 1), "must be 1..4096 (the per-edge packet service demand"},
++	}
++	for r in pace_rows {
++		check_reject_bal(t, r.doc, r.rule)
++	}
++
+ 	// --- 6.2 balance.json `advance` block negative rows ---------------------
+ 	advance_rows := []struct {
+ 		label, doc, rule: string
+diff --git a/core/crisis.odin b/core/crisis.odin
+index d6a50c5..05bef25 100644
+--- a/core/crisis.odin
++++ b/core/crisis.odin
+@@ -78,12 +78,14 @@ CRISIS_RESOLVE_MARGIN :: u32(2)
+ // Cooldown_Entry — a recently-resolved root cause (the re-fire gate, arch
+ // §6.4). Engine memory, never serialized; pruned once stale. Keyed on the
+ // STABLE canonical node pair (Perkins r1 B1 — the bundle slot is compaction-
+-// prone; the pair survives renumbering).
++// prone; the pair survives renumbering) + the DIRECTION bit (S4/F1: an A→B
++// resolution must not suppress a distinct B→A re-fire inside the window).
+ Cooldown_Entry :: struct {
+ 	archetype:   u16,
+ 	kind:        Root_Cause_Kind,
+ 	lo:          u32,
+ 	hi:          u32,
++	dir:         u8, // the resolved port's direction (F1)
+ 	resolve_tick: u64,
+ }
+ 
+@@ -91,6 +93,10 @@ Cooldown_Entry :: struct {
+ // the full root-cause payload (archetype, cause kind, class, bundle, pipe).
+ // Both tags share the payload shape (the resolved event carries the ending
+ // crisis's refs — the render + the cooldown bookkeeping consume them).
++// v2-arch-egress S4 (AV-2): the payload gains the shed/saturated PORT's
++// direction — root_cause names (router, port): the pair identity serializes
++// on the row (target = the bundle slot), the direction resolves the port at
++// the read site (stable, replay-proof — the spine's amendment).
+ event_emit_crisis :: proc(state: ^Run_State, tick: u64, tag: u8, ac: Active_Crisis) {
+ 	append(&state.events, Event{
+ 		tick = tick,
+@@ -100,14 +106,15 @@ event_emit_crisis :: proc(state: ^Run_State, tick: u64, tag: u8, ac: Active_Cris
+ 		archetype = u8(ac.archetype),
+ 		cause = u8(ac.kind),
+ 		pipe = ac.pipe,
++		direction = ac.dir,
+ 	})
+ }
+ 
+-// bundle_class_queue — the number of on-edge packets of `class` queued on
+-// bundle `bi` (the surge class's own backlog on the bottleneck — any lane;
+-// the class rides its per-pipe lane, so the backlog is the bundle-wide load).
+-// Array-order walk (deterministic, ODN-10).
+-bundle_class_queue :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, class: u16) -> u32 {
++// port_class_queue — the number of on-edge packets of `class` queued on the
++// (bundle, direction) PORT (the surge class's own backlog on the bottleneck
++// port — any lane; the class rides its per-pipe lane). Array-order walk
++// (deterministic, ODN-10). The S4 crisis measure (AD-4).
++port_class_queue :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, dir: u8, class: u16) -> u32 {
+ 	n: u32 = 0
+ 	for i in 0..<len(state.flow.packets) {
+ 		p := &state.flow.packets[i]
+@@ -115,63 +122,65 @@ bundle_class_queue :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, class: u1
+ 		if p.class != class { continue }
+ 		b, ok := bundle_of_pipe(state, p.edge)
+ 		if !ok || b != bi { continue }
++		if port_dir_of_packet(state, p) != dir { continue }
+ 		n += 1
+ 	}
+ 	return n
+ }
+ 
+-// bundle_lane_at — is any (bundle, lane) queue at or above `at`? The lane
+-// threshold variant of bundle_lane_at_bound (the resolve margin needs the
+-// at-or-above form). bundle_lane_count counts ALL classes in a lane — the
+-// ladder's own measure.
+-bundle_lane_at :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, at: u32) -> bool {
++// port_lane_at — is any (port, lane) queue at or above `at`? The lane
++// threshold variant of port_lane_at_bound (the resolve margin needs the
++// at-or-above form). port_lane_count counts ALL classes in a lane — the
++// ladder's own measure (the S4 resolve-pass read).
++port_lane_at :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, dir: u8, at: u32) -> bool {
+ 	for lane in u8(0)..<LANE_COUNT {
+-		if bundle_lane_count(state, cat, bi, lane) >= at {
++		if port_lane_count(state, cat, bi, dir, lane) >= at {
+ 			return true
+ 		}
+ 	}
+ 	return false
+ }
+ 
+-// bundle_lane_at_bound — any (bundle, lane) queue at the E9 bound (the state
+-// the drop precedence sheds from). bundle_lane_count counts ALL classes in a lane
+-// — the ladder's own measure.
+-bundle_lane_at_bound :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32) -> bool {
++// port_lane_at_bound — any (port, lane) queue at the E9 bound (the state the
++// drop precedence sheds from — the S4 trigger measure, per direction).
++port_lane_at_bound :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, dir: u8) -> bool {
+ 	for lane in u8(0)..<LANE_COUNT {
+-		if bundle_lane_count(state, cat, bi, lane) >= u32(cat.balance.lane_queue_packets) {
++		if port_lane_count(state, cat, bi, dir, lane) >= u32(cat.balance.lane_queue_packets) {
+ 			return true
+ 		}
+ 	}
+ 	return false
+ }
+ 
+-// class_in_bundle_lane — is at least one on-edge packet of `class` queued on
+-// bundle `bi` in `lane`? (The lane each packet rides resolves per-pipe via
+-// qos_lane_of — the player's categorization.) Array-order walk (deterministic).
+-class_in_bundle_lane :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, lane: u8, class: u16) -> bool {
++// class_in_port_lane — is at least one on-edge packet of `class` queued on
++// the (bundle, direction) port in `lane`? (The lane each packet rides
++// resolves per-pipe via qos_lane_of — the player's categorization.)
++// Array-order walk (deterministic).
++class_in_port_lane :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, dir: u8, lane: u8, class: u16) -> bool {
+ 	for i in 0..<len(state.flow.packets) {
+ 		p := &state.flow.packets[i]
+ 		if p.delivered || !p.on_edge { continue }
+ 		if p.class != class { continue }
+ 		b, ok := bundle_of_pipe(state, p.edge)
+ 		if !ok || b != bi { continue }
++		if port_dir_of_packet(state, p) != dir { continue }
+ 		if bundle_lane_of(state, cat, p) == lane { return true }
+ 	}
+ 	return false
+ }
+ 
+-// crisis_bundle_saturated — the per-bundle saturation predicate (the (a)
+-// trigger measure): the surge class has packets queued on the bundle AND THE
+-// CLASS'S OWN LANE is at the E9 bound. The class-lane precision matters (the
+-// frozen letter: "a bundle whose lane queue is at the E9 bound"): a lane held
+-// at bound by ANOTHER class alone (e.g. email's Best-effort lane) while the
+-// surge rides a healthy lane is NOT the surge's flaw — the bundle-wide any-
+-// lane measure would misattribute it.
+-crisis_bundle_saturated :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, class: u16) -> bool {
++// crisis_port_saturated — the per-PORT saturation predicate (the (a) trigger
++// measure, S4/AD-4): the surge class has packets queued on the port AND THE
++// CLASS'S OWN LANE on that port is at the E9 bound. The class-lane precision
++// matters (the frozen letter: "a bundle whose lane queue is at the E9 bound"
++// — re-keyed to the port): a lane held at bound by ANOTHER class alone (e.g.
++// email's Best-effort lane) while the surge rides a healthy lane is NOT the
++// surge's flaw.
++crisis_port_saturated :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, dir: u8, class: u16) -> bool {
+ 	bound := u32(cat.balance.lane_queue_packets)
+ 	for lane in u8(0)..<LANE_COUNT {
+-		if bundle_lane_count(state, cat, bi, lane) < bound { continue }
+-		if class_in_bundle_lane(state, cat, bi, lane, class) { return true }
++		if port_lane_count(state, cat, bi, dir, lane) < bound { continue }
++		if class_in_port_lane(state, cat, bi, dir, lane, class) { return true }
+ 	}
+ 	return false
+ }
+@@ -193,11 +202,14 @@ first_member_pipe :: proc(state: ^Run_State, bi: u32) -> u32 {
+ // `bundle` this tick? Reads the per-tick DROP_SITE scratch (W6 — the events
+ // buffer is the serialized record, never an engine input). `bundle` filters
+ // the shed site: E9 drops carry the shed bundle; E22 pool drops carry
+-// NO_BUNDLE (match any bundle).
+-drop_of_class_this_tick :: proc(state: ^Run_State, class: u16, reason: Drop_Reason, bundle: u32) -> bool {
++// NO_BUNDLE (match any bundle). S4: a non-NO_BUNDLE bundle with dir_ok=false
++// matches ANY direction (the pair-wide question); dir_ok=true demands the
++// site's port direction (the per-port resolve question).
++drop_of_class_this_tick :: proc(state: ^Run_State, class: u16, reason: Drop_Reason, bundle: u32, dir: u8 = 0, dir_ok: bool = false) -> bool {
+ 	for ds in state.flow.drop_sites {
+ 		if ds.class != class || ds.reason != reason { continue }
+ 		if bundle != NO_BUNDLE && ds.bundle != bundle { continue }
++		if dir_ok && ds.dir != dir { continue }
+ 		return true
+ 	}
+ 	return false
+@@ -214,40 +226,45 @@ drop_of_reason_this_tick :: proc(state: ^Run_State, reason: Drop_Reason) -> bool
+ 	return false
+ }
+ 
+-// crisis_find_saturated_bundle — pass 1 of the root-cause scan (slot order,
+-// deterministic): the first bundle where the surge class's own queue sits on
+-// a bound lane (the (a) settled saturation — the queue at the E9 bound with
+-// the class backlog). Returns (bundle, pipe, ok).
+-crisis_find_saturated_bundle :: proc(state: ^Run_State, cat: ^Catalogs, class: u16) -> (u32, u32, bool) {
++// crisis_find_saturated_port — pass 1 of the root-cause scan (deterministic:
++// bundle slot asc, direction asc — the pinned enumeration): the first
++// (bundle, direction) PORT where the surge class's own queue sits on a bound
++// lane (the (a) settled saturation — the queue at the E9 bound with the class
++// backlog). Returns (bundle, dir, pipe, ok).
++crisis_find_saturated_port :: proc(state: ^Run_State, cat: ^Catalogs, class: u16) -> (u32, u8, u32, bool) {
+ 	for bi in u32(0)..<state.bundles.n {
+-		if crisis_bundle_saturated(state, cat, bi, class) {
+-			return bi, first_member_pipe(state, bi), true
++		for dir in u8(0)..<PORT_DIR_COUNT {
++			if crisis_port_saturated(state, cat, bi, dir, class) {
++				return bi, dir, first_member_pipe(state, bi), true
++			}
+ 		}
+ 	}
+-	return NO_BUNDLE, 0, false
++	return NO_BUNDLE, 0, 0, false
+ }
+ 
+-// crisis_find_bound_lane_bundle — pass 2 of the root-cause scan: the (b)
++// crisis_find_bound_lane_port — pass 2 of the root-cause scan: the (b)
+ // drop-fallback element. The frozen contract names "the first any-lane-at-
+ // bound bundle — a drop implies a bound lane"; the SETTLED scan cannot see
+ // the admission-time bound (the queue dips below it by up to the service
+ // rate on every post-service eval), so the faithful implementation is the
+-// drop's OWN site — the lane that WAS at bound when the ladder shed (the
++// drop's OWN site — the port that WAS at bound when the ladder shed (the
+ // per-tick drop-site scratch; first shed of the tick, deterministic). Falls
+-// back to the first any-lane-at-bound bundle when the class's own drops
+-// carry no site (defensive — E9 sites always carry their bundle).
+-crisis_find_bound_lane_bundle :: proc(state: ^Run_State, cat: ^Catalogs, class: u16) -> (u32, u32, bool) {
++// back to the first any-lane-at-bound PORT when the class's own drops carry
++// no site (defensive — E9 sites always carry their bundle).
++crisis_find_bound_lane_port :: proc(state: ^Run_State, cat: ^Catalogs, class: u16) -> (u32, u8, u32, bool) {
+ 	for ds in state.flow.drop_sites {
+ 		if ds.class != class || ds.reason != Drop_Reason.Queue_Overflow { continue }
+ 		if ds.bundle == NO_BUNDLE { continue }
+-		return ds.bundle, first_member_pipe(state, ds.bundle), true
++		return ds.bundle, ds.dir, first_member_pipe(state, ds.bundle), true
+ 	}
+ 	for bi in u32(0)..<state.bundles.n {
+-		if bundle_lane_at_bound(state, cat, bi) {
+-			return bi, first_member_pipe(state, bi), true
++		for dir in u8(0)..<PORT_DIR_COUNT {
++			if port_lane_at_bound(state, cat, bi, dir) {
++				return bi, dir, first_member_pipe(state, bi), true
++			}
+ 		}
+ 	}
+-	return NO_BUNDLE, 0, false
++	return NO_BUNDLE, 0, 0, false
+ }
+ 
+ // crisis_active_for — is there an active crisis for this (archetype, set-piece)
+@@ -263,15 +280,17 @@ crisis_active_for :: proc(state: ^Run_State, archetype, set_piece: u16) -> bool
+ 
+ // crisis_cooldown_blocked — a same-cause re-trigger blocked by the archetype's
+ // cooldown? (tick - resolve_tick) < cooldown gates re-fire (arch §6.4). Keyed
+-// on the STABLE canonical pair (B1).
+-crisis_cooldown_blocked :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs, archetype: u16, kind: Root_Cause_Kind, lo, hi: u32) -> bool {
++// on the STABLE canonical pair (B1) + the DIRECTION bit (S4/F1 — the spine's
++// rubric fix: an A→B resolution must not suppress a distinct B→A re-fire
++// inside the window; the pair alone would).
++crisis_cooldown_blocked :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs, archetype: u16, kind: Root_Cause_Kind, lo, hi: u32, dir: u8) -> bool {
+ 	cd := u64(0)
+ 	if int(archetype) < len(cat.crises) {
+ 		cd = cat.crises[archetype].cooldown_ticks
+ 	}
+ 	if cd == 0 { return false }
+ 	for c in state.crisis.cooldowns {
+-		if c.archetype == archetype && c.kind == kind && c.lo == lo && c.hi == hi {
++		if c.archetype == archetype && c.kind == kind && c.lo == lo && c.hi == hi && c.dir == dir {
+ 			if tick - c.resolve_tick < cd {
+ 				return true
+ 			}
+@@ -281,8 +300,11 @@ crisis_cooldown_blocked :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs, ar
+ }
+ 
+ // crisis_trigger — append an active crisis + emit the Triggered event. The
+-// pair + member pipe are resolved from the CURRENT slot (stable identity, B1).
+-crisis_trigger :: proc(state: ^Run_State, tick: u64, ai, si: u16, kind: Root_Cause_Kind, bundle: u32, class: u16, multiplier: i32) {
++// pair + member pipe are resolved from the CURRENT slot (stable identity, B1);
++// `dir` names the saturated PORT (S4 — root_cause names (router, port); the
++// field is DERIVED engine memory, never serialized: replay re-derives it
++// identically from the same trigger state).
++crisis_trigger :: proc(state: ^Run_State, tick: u64, ai, si: u16, kind: Root_Cause_Kind, bundle: u32, dir: u8, class: u16, multiplier: i32) {
+ 	lo, hi := u32(0), u32(0)
+ 	if kind == .Saturated_Bundle && int(bundle) < len(state.bundles.bundle_lo) {
+ 		lo = state.bundles.bundle_lo[bundle]
+@@ -293,6 +315,7 @@ crisis_trigger :: proc(state: ^Run_State, tick: u64, ai, si: u16, kind: Root_Cau
+ 		set_piece = si,
+ 		kind = kind,
+ 		bundle = bundle,
++		dir = dir,
+ 		bundle_lo = lo,
+ 		bundle_hi = hi,
+ 		pipe = first_member_pipe(state, bundle),
+@@ -313,6 +336,7 @@ crisis_resolve_row :: proc(state: ^Run_State, tick: u64, cr: ^Crisis_State, idx:
+ 		kind = ac.kind,
+ 		lo = ac.bundle_lo,
+ 		hi = ac.bundle_hi,
++		dir = ac.dir,
+ 		resolve_tick = tick,
+ 	})
+ 	for j := idx; j < len(cr.active)-1; j += 1 {
+@@ -380,22 +404,24 @@ crisis_evaluate :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 			// would otherwise block a resolve forever). The MVP data pins 6.
+ 			margin := CRISIS_RESOLVE_MARGIN
+ 			if bound > 0 && bound <= margin { margin = bound - 1 }
+-			// RELIEVED (hysteresis, Perkins r2 W-qos): the class backlog fell
+-			// below (bound - margin) AND no lane of the bundle sits at or
+-			// above (bound - margin) (the lane threshold gets the SAME margin
+-			// as the backlog — the settled queue dips ±1-2 around the bound on
+-			// the service/completion phase, and a sharp bound-only threshold
+-			// lets a marginal lane's dip trigger a spurious resolve + same-tick
+-			// re-trigger chatter, contradicting one-trigger-per-activation;
+-			// a lane held at capacity by ANOTHER class likewise still means no
+-			// spare capacity) AND the ladder stopped shedding the class on it
+-			// this tick (the admission evidence — all three must clear, or the
+-			// flaw persists).
++			// RELIEVED (hysteresis, Perkins r2 W-qos; S4/AD-4 re-keyed to the
++			// PORT): the class backlog on THIS PORT fell below (bound - margin)
++			// AND no lane of THIS PORT sits at or above (bound - margin) (the
++			// lane threshold gets the SAME margin as the backlog — the settled
++			// queue dips ±1-2 around the bound on the service/completion phase,
++			// and a sharp bound-only threshold lets a marginal lane's dip
++			// trigger a spurious resolve + same-tick re-trigger chatter,
++			// contradicting one-trigger-per-activation; a lane held at capacity
++			// by ANOTHER class likewise still means no spare capacity) AND the
++			// ladder stopped shedding the class on THIS PORT this tick (the
++			// admission evidence — all three must clear, or the flaw persists).
++			// The measures + the CRISIS_RESOLVE_MARGIN hysteresis survive
++			// VERBATIM — only the key moved (bundle → port).
+ 			relieved := bound > margin &&
+-				bundle_class_queue(state, cat, b, ac.class) + margin < bound &&
+-				!bundle_lane_at(state, cat, b, bound - margin)
++				port_class_queue(state, cat, b, ac.dir, ac.class) + margin < bound &&
++				!port_lane_at(state, cat, b, ac.dir, bound - margin)
+ 			cleared = relieved &&
+-				!drop_of_class_this_tick(state, ac.class, .Queue_Overflow, b)
++				!drop_of_class_this_tick(state, ac.class, .Queue_Overflow, b, ac.dir, true)
+ 		case .Pool_Exhaustion:
+ 			// the pool's shedding stopped AND the pool is meaningfully below
+ 			// its cap (the same hysteresis the E9 path gets from
+@@ -440,31 +466,31 @@ crisis_evaluate :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 		// DIFFERENT cause) survives; the (b) drop-fallback stays gated on the
+ 		// settled scan MISSING (the frozen fallback order).
+ 		triggered := false
+-		if b, _, ok := crisis_find_saturated_bundle(state, cat, sp.class); ok {
++		if b, dir, _, ok := crisis_find_saturated_port(state, cat, sp.class); ok {
+ 			lo := u32(0)
+ 			hi := u32(0)
+ 			if int(b) < len(state.bundles.bundle_lo) {
+ 				lo = state.bundles.bundle_lo[b]
+ 				hi = state.bundles.bundle_hi[b]
+ 			}
+-			if !crisis_cooldown_blocked(state, tick, cat, ai, .Saturated_Bundle, lo, hi) {
+-				crisis_trigger(state, tick, ai, u16(si), .Saturated_Bundle, b, sp.class, sp.multiplier)
++			if !crisis_cooldown_blocked(state, tick, cat, ai, .Saturated_Bundle, lo, hi, dir) {
++				crisis_trigger(state, tick, ai, u16(si), .Saturated_Bundle, b, dir, sp.class, sp.multiplier)
+ 				triggered = true
+ 			}
+ 		} else if drop_of_class_this_tick(state, sp.class, .Queue_Overflow, NO_BUNDLE) {
+ 			// (b) a surge-class Queue_Overflow drop this tick — the element
+-			// from the drop's own site (the admission-time bound lane; the
++			// from the drop's own site (the admission-time bound PORT; the
+ 			// settled scan misses it when service >= 1 packet/tick dips the
+-			// eval queue below the bound — see crisis_find_bound_lane_bundle).
+-			if b, _, ok := crisis_find_bound_lane_bundle(state, cat, sp.class); ok {
++			// eval queue below the bound — see crisis_find_bound_lane_port).
++			if b, dir, _, ok := crisis_find_bound_lane_port(state, cat, sp.class); ok {
+ 				lo := u32(0)
+ 				hi := u32(0)
+ 				if int(b) < len(state.bundles.bundle_lo) {
+ 					lo = state.bundles.bundle_lo[b]
+ 					hi = state.bundles.bundle_hi[b]
+ 				}
+-				if !crisis_cooldown_blocked(state, tick, cat, ai, .Saturated_Bundle, lo, hi) {
+-					crisis_trigger(state, tick, ai, u16(si), .Saturated_Bundle, b, sp.class, sp.multiplier)
++				if !crisis_cooldown_blocked(state, tick, cat, ai, .Saturated_Bundle, lo, hi, dir) {
++					crisis_trigger(state, tick, ai, u16(si), .Saturated_Bundle, b, dir, sp.class, sp.multiplier)
+ 					triggered = true
+ 				}
+ 			}
+@@ -483,8 +509,8 @@ crisis_evaluate :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 		// whole network is the flaw).
+ 		if !triggered && drop_of_reason_this_tick(state, .Pool_Exhaustion) &&
+ 			len(state.flow.packets) + int(min(CRISIS_RESOLVE_MARGIN, u32(max(1, cat.balance.pool_max_packets)) - 1)) >= int(cat.balance.pool_max_packets) {
+-			if crisis_cooldown_blocked(state, tick, cat, ai, .Pool_Exhaustion, 0, 0) { continue }
+-			crisis_trigger(state, tick, ai, u16(si), .Pool_Exhaustion, NO_BUNDLE, sp.class, sp.multiplier)
++			if crisis_cooldown_blocked(state, tick, cat, ai, .Pool_Exhaustion, 0, 0, PORT_DIR_LO_TO_HI) { continue }
++			crisis_trigger(state, tick, ai, u16(si), .Pool_Exhaustion, NO_BUNDLE, PORT_DIR_LO_TO_HI, sp.class, sp.multiplier)
+ 		}
+ 	}
+ }
+diff --git a/core/crisis_test.odin b/core/crisis_test.odin
+index 8c05202..5c53a40 100644
+--- a/core/crisis_test.odin
++++ b/core/crisis_test.odin
+@@ -502,8 +502,10 @@ test_crisis_era_zero_noop :: proc(t: ^testing.T) {
+ // --- (i) Perkins r1 B2-1: the SETTLED-scan (a) branch, executed distinctly ----
+ 
+ // test_crisis_settled_scan_names_slot_order_bundle — pin the (a) trigger path
+-// (crisis_find_saturated_bundle's slot-order scan) as the ELEMENT SELECTOR,
+-// distinct from the (b) drop-site fallback. Construction (mult2 catalog, pool
++// (the settled-scan's port_class_queue slot-order sweep over (bundle asc,
++// dir asc) — the old crisis_find_saturated_bundle's scan, re-keyed to the
++// port in S4) as the ELEMENT SELECTOR, distinct from the (b) drop-site
++// fallback. Construction (mult2 catalog, pool
+ // raised): the DOWNSTREAM res0->router leg (bundle 0, slot 0) is class-
+ // saturated with email paying every shed on its Best-effort lane (streaming
+ // never sheds THERE), while the UPSTREAM host->router leg (bundle 1, 1 wide —
+@@ -584,7 +586,7 @@ test_crisis_settled_scan_names_slot_order_bundle :: proc(t: ^testing.T) {
+ 		if tick == 1200 {
+ 			// the trigger tick's settled state: the (a) slot-order scan — frozen
+ 			// after this tick's step
+-			scan_a_bundle, _, scan_a_ok = crisis_find_saturated_bundle(&s, cat, 1)
++			scan_a_bundle, _, _, scan_a_ok = crisis_find_saturated_port(&s, cat, 1)
+ 		}
+ 		for e in s.events[before:] {
+ 			if e.tag == EVENT_TAG_CRISIS_TRIGGERED || e.tag == EVENT_TAG_CRISIS_RESOLVED {
+@@ -615,7 +617,13 @@ test_crisis_settled_scan_names_slot_order_bundle :: proc(t: ^testing.T) {
+ 	// backlog at the raised arrival). The (a)-vs-(b) attribution distinction
+ 	// (scan result != the drop's own site) is what this pins —
+ 	// non-vacuously: the (b) drop-fallback would have named bundle 1.
+-	testing.expect_value(t, first_stream_drop_bundle, u32(0)) // the real-ladder re-pin: the first shed lands on the bottleneck itself
++	// D-2 (v2-arch-egress S3) re-pin (measured): the doubled streaming
++	// serialization (1600 units) fills the decayed sink legs (bundle 2) to
++	// the E9 bound before the shared bottleneck's own lane pins — the first
++	// class-1 shed lands on bundle 2, while bundle 0's streaming lane still
++	// pins at the bound by the trigger tick (the (a) scan's precondition —
++	// asserted above — is unchanged).
++	testing.expect_value(t, first_stream_drop_bundle, u32(2))
+ }
+ 
+ // --- (j) Perkins r1 B2-2: the backward-tick latch ----------------------------
+@@ -652,13 +660,22 @@ test_crisis_event_payload_byte_layout :: proc(t: ^testing.T) {
+ 	// this is the 4.2 extension (the whole section count + per-event
+ 	// tick/tag bytes are covered there).
+ 	w := writer_make(context.temp_allocator)
+-	w_event_payload(&w, Event{tag = EVENT_TAG_PACKET_DROPPED, class = 0x1234, reason = u8(Drop_Reason.Queue_Overflow), target = 0xDEADBEEF})
+-	w_event_payload(&w, Event{tag = EVENT_TAG_PACKET_DROPPED, class = 7, reason = u8(Drop_Reason.Pool_Exhaustion), target = NO_BUNDLE})
+-	w_event_payload(&w, Event{tag = EVENT_TAG_CRISIS_TRIGGERED, archetype = 0, cause = u8(Root_Cause_Kind.Saturated_Bundle), class = 1, target = 3, pipe = 9})
+-	w_event_payload(&w, Event{tag = EVENT_TAG_CRISIS_RESOLVED, archetype = 0, cause = u8(Root_Cause_Kind.Pool_Exhaustion), class = 1, target = NO_BUNDLE, pipe = 0})
++	w_event_payload(&w, Event{tag = EVENT_TAG_PACKET_DROPPED, class = 0x1234, reason = u8(Drop_Reason.Queue_Overflow), target = 0xDEADBEEF, direction = 1})
++	w_event_payload(&w, Event{tag = EVENT_TAG_PACKET_DROPPED, class = 7, reason = u8(Drop_Reason.Pool_Exhaustion), target = NO_BUNDLE, direction = 0})
++	w_event_payload(&w, Event{tag = EVENT_TAG_CRISIS_TRIGGERED, archetype = 0, cause = u8(Root_Cause_Kind.Saturated_Bundle), class = 1, target = 3, pipe = 9, direction = 1})
++	w_event_payload(&w, Event{tag = EVENT_TAG_CRISIS_RESOLVED, archetype = 0, cause = u8(Root_Cause_Kind.Pool_Exhaustion), class = 1, target = NO_BUNDLE, pipe = 0, direction = 0})
+ 	want := w.buf[:]
+-	testing.expectf(t, len(want) == 2*(2+1+4)+2*(1+1+2+4+4),
+-		"4.2 payload sizes: got %d, want %d", len(want), 2*(2+1+4)+2*(1+1+2+4+4))
++	// v2-arch-egress S4 (AV-2): each payload gains the trailing DIRECTION u8
++	// — drop 2+1+4+1 = 8 bytes, crisis 1+1+2+4+4+1 = 13 (the 4.2 fold's shape:
++	// events regenerate, the action log is commands — the S4 re-bless covers).
++	testing.expectf(t, len(want) == 2*(2+1+4+1)+2*(1+1+2+4+4+1),
++		"4.2+S4 payload sizes: got %d, want %d", len(want), 2*(2+1+4+1)+2*(1+1+2+4+4+1))
++	// the direction byte's POSITION: trailing on the drop payload (offset
++	// 2+1+4 = 7 within the first event)
++	testing.expectf(t, want[7] == 1, "drop direction byte: got %d, want 1", want[7])
++	testing.expectf(t, want[8+7] == 0, "pool-drop direction byte: got %d, want 0 (E22 sites are map-wide)", want[8+7])
++	// trailing on the crisis payload (offset 8+8+1+1+2+4+4 = 28 overall)
++	testing.expectf(t, want[28] == 1, "crisis direction byte: got %d, want 1", want[28])
+ 
+ 	// the crises section: one active row, exact bytes (absent-when-empty for
+ 	// zero rows is pinned by the golden T1s — a zero-crisis run has no bytes).
+@@ -797,7 +814,7 @@ test_crisis_slot_renumber_keeps_crisis_attached :: proc(t: ^testing.T) {
+ 	testing.expectf(t, ok && b == 1, "pair P must resolve to slot 1 after the renumber, got %d ok=%v", b, ok)
+ 	// the streaming still saturates the re-resolved slot (the island was
+ 	// decoupled — the flow untouched): the class backlog at the bound
+-	testing.expectf(t, crisis_bundle_saturated(&s, cat, 1, 1),
++	testing.expectf(t, crisis_port_saturated(&s, cat, 1, ac.dir, 1),
+ 		"the re-resolved slot must still be saturated (backlog at the bound)")
+ }
+ 
+@@ -995,7 +1012,7 @@ test_crisis_drop_fallback_attribution :: proc(t: ^testing.T) {
+ 			if e.tag == EVENT_TAG_CRISIS_TRIGGERED {
+ 				last_trigger_tick = e.tick
+ 				last_target = e.target
+-				_, _, scan_ok := crisis_find_saturated_bundle(&s, cat, 1)
++				_, _, _, scan_ok := crisis_find_saturated_port(&s, cat, 1)
+ 				if !scan_ok {
+ 					any_b_trigger = true
+ 				}
+diff --git a/core/demand_test.odin b/core/demand_test.odin
+index 3128ab9..3376c99 100644
+--- a/core/demand_test.odin
++++ b/core/demand_test.odin
+@@ -996,8 +996,23 @@ test_w11_aggregation_congests_shared_link :: proc(t: ^testing.T) {
+ 	sla_draw(&s, cat, b6, rb, "wide", 1) // pipe 11
+ 	sla_draw(&s, cat, host, rb, "wide", 1)   // pipe 12 — the host drop
+ 	sla_draw(&s, cat, ra, rb, "standard", 1) // pipe 13 — the shared uplink
++	// v2-arch-egress S4 re-stage: the per-(port,lane) bound (R4) doubles the
++	// pair's buffer and the S2 full-duplex split doubles its drain — the
++	// default host credit (0.05 streaming/tick) no longer pins the uplink's
++	// port queue inside any reasonable window (measured: 1 drop at 2400).
++	// Raise the host's throughput to 200 (the crisis/health fixture
++	// precedent): credit 0.125/tick vs the decayed 50 u/s service — the
++	// streaming port pins at bound 6 and the aggregation choke is REAL again.
++	hi_idx, _ := node_type_index(cat, "content_host")
++	cat.node_types[hi_idx].throughput_units = 200
+ 
+-	W :: u64(600)
++	// v2-arch-egress S4 re-stage (measured): the per-(port,lane) bound (R4)
++	// doubles the pair's buffer (6 -> 12 per lane) — the pooled bound shed the
++	// uplink's mixed-direction backlog within 600 ticks, but the split ports
++	// absorb that regime; the streaming port's own queue pins at bound 6 by
++	// ~tick 1000 (3 drops at 1200, 5 at 1800 — measured). W 600 -> 1200 keeps
++	// the aggregation-choke premise alive under the directional bound.
++	W :: u64(1200)
+ 	drops: u64 = 0
+ 	by_bundle := make(map[u32]u64, 16) // drop targets (resolved to bundles after the run)
+ 	defer delete(by_bundle)
+diff --git a/core/egress_test.odin b/core/egress_test.odin
+new file mode 100644
+index 0000000..1fddba4
+--- /dev/null
++++ b/core/egress_test.odin
+@@ -0,0 +1,769 @@
++package core
++
++// egress_test.odin — v2-arch-egress S1 pins (the ratified spine 2026-08-26,
++// AD-2): the egress-port identity — (router, egress-port, lane) where
++// egress-port = the directional bundle — over the DERIVED packet membership
++// encoding. Pinned here at the lowest layer so they survive review rounds,
++// refactors, and Perkins:
++//
++//   [AD-2 canonical] the retained departure node (at_node) resolves the
++//   port's direction AND its router; the heading-based derivation coincides
++//   by construction — pinned for every on-edge packet in the fixture.
++//   [AD-2 derived] the directional read twins (port_lane_count /
++//   newest_in_port_lane / port_lane_ready) count ONLY their direction's
++//   packets — a bidirectional fixture splits cleanly.
++//   [S1 invisibility] the undirected bundle_* view equals Σ over directions
++//   for every lane — the legacy reads stayed exactly today's numbers through
++//   the whole ladder (T1 byte-identity held at S1: zero re-bless; S2/S4
++//   shifted runs re-blessed per the disclosed inventory).
++//   [port_lane_caps] a port's caps = the member-summed caps, identical for
++//   both directions (R2/AD-5: per-pipe weights, full-duplex members).
++//
++// The mutation leg (S1: port derivation bypass): deleting the direction
++// filter in port_lane_count (or neutering port_dir_of_packet's at_node
++// derivation) makes the directional-count + split pins below FAIL — the
++// pins bite at the derivation, not the walk (verified RED-then-GREEN at
++// authoring; re-prove by reverting the filter).
++
++import "core:strings"
++import "core:testing"
++
++// egress_setup — the fixture for the port pins: the 1.2 fixture nodes
++// (res@{8,15}=0, rt@{20,15}=1, host@{32,15}=2) with BOTH fixture pipes drawn
++// (res—rt and rt—host), stepped once so the routing + bundle views are
++// rebuilt (rule 1). Bundle 0 = pair (res=0, rt=1) lo=0 hi=1; bundle 1 = pair
++// (rt=1, host=2) lo=1 hi=2.
++egress_setup :: proc(cat: ^Catalogs) -> (Run_State, u32, u32, u32) {
++	s: Run_State
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&s, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	draw(&s, 1, res, rt, std)
++	draw(&s, 1, rt, host, std)
++	step_n(&s, 1, cat)
++	return s, res, rt, host
++}
++
++// on_edge_packet — append a synthetic on-edge packet riding `pipe_id` from
++// `from_node` toward `to_node` (the derived encoding exactly as flow_step's
++// forward pass writes it: at_node = the retained departure node).
++on_edge_packet :: proc(s: ^Run_State, class: u16, pipe_id, from_node, to_node: u32, id: u64) {
++	s.flow.next_packet_id += 1
++	append(&s.flow.packets, Packet{
++		id = id,
++		class = class,
++		src = from_node,
++		dst = to_node,
++		on_edge = true,
++		at_node = from_node,
++		edge = pipe_id,
++		heading = to_node,
++		spawn_tick = 0,
++	})
++}
++
++@(test)
++test_port_dir_canonical_and_coincidence :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, host := egress_setup(cat)
++	defer run_destroy(&s)
++
++	// both directions on bundle 0 (res—rt): res→rt departs lo (dir 0),
++	// rt→res departs hi (dir 1); plus rt→host on bundle 1 (lo=rt → dir 0)
++	on_edge_packet(&s, 0, 0, res, rt, 101) // bundle 0 dir 0 (res is lo)
++	on_edge_packet(&s, 0, 0, rt, res, 102) // bundle 0 dir 1 (rt is hi)
++	on_edge_packet(&s, 0, 1, rt, host, 103) // bundle 1 dir 0 (rt is lo of pair 1..2)
++
++	// [AD-2 canonical] the at_node derivation names the direction, and the
++	// heading derivation COINCIDES by construction for every on-edge packet
++	// (the render's other-endpoint rule — pinned here so the coincidence can
++	// never silently break).
++	for i in 0..<len(s.flow.packets) {
++		p := &s.flow.packets[i]
++		if p.delivered || !p.on_edge { continue }
++		b, ok := bundle_of_pipe(&s, p.edge)
++		testing.expectf(t, ok, "packet %d: live pipe must resolve a bundle", p.id)
++		dir := port_dir_of_packet(&s, p)
++		// heading-derived: heading == the pair's hi endpoint iff dir 0
++		heading_dir := PORT_DIR_HI_TO_LO
++		if p.heading == s.bundles.bundle_hi[b] && p.heading != s.bundles.bundle_lo[b] {
++			heading_dir = PORT_DIR_LO_TO_HI
++		}
++		if p.heading == s.bundles.bundle_lo[b] && p.heading != s.bundles.bundle_hi[b] {
++			heading_dir = PORT_DIR_HI_TO_LO
++		}
++		testing.expectf(t, dir == heading_dir,
++			"packet %d: at_node dir %d != heading dir %d (the canonical/coincidence pin)",
++			p.id, dir, heading_dir)
++		// the port's router IS the retained departure node (canonical)
++		testing.expectf(t, egress_router_of_port(&s, b, dir) == p.at_node,
++			"packet %d: router-of-port %d != at_node %d", p.id, egress_router_of_port(&s, b, dir), p.at_node)
++	}
++
++	// spot pins on the fixture ids: bundle 0 pair (0,1) — res(0)→rt(1) is dir 0
++	testing.expect_value(t, port_dir_of_packet(&s, &s.flow.packets[0]), PORT_DIR_LO_TO_HI)
++	testing.expect_value(t, port_dir_of_packet(&s, &s.flow.packets[1]), PORT_DIR_HI_TO_LO)
++	testing.expect_value(t, egress_router_of_port(&s, 0, PORT_DIR_LO_TO_HI), res)
++	testing.expect_value(t, egress_router_of_port(&s, 0, PORT_DIR_HI_TO_LO), rt)
++}
++
++@(test)
++test_port_lane_count_directional_split :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++
++	// three Standard-lane riders on bundle 0: two res→rt (dir 0), one rt→res
++	// (dir 1) — email defaults to Standard, no overrides on the fixture
++	on_edge_packet(&s, 0, 0, res, rt, 201)
++	on_edge_packet(&s, 0, 0, res, rt, 202)
++	on_edge_packet(&s, 0, 0, rt, res, 203)
++
++	b, ok := bundle_of_pipe(&s, 0)
++	testing.expectf(t, ok, "pipe 0 must resolve bundle 0")
++	testing.expect_value(t, port_lane_count(&s, cat, b, PORT_DIR_LO_TO_HI, LANE_STANDARD), u32(2))
++	testing.expect_value(t, port_lane_count(&s, cat, b, PORT_DIR_HI_TO_LO, LANE_STANDARD), u32(1))
++	// the other lanes are empty in both directions
++	testing.expect_value(t, port_lane_count(&s, cat, b, PORT_DIR_LO_TO_HI, LANE_EXPRESS), u32(0))
++	testing.expect_value(t, port_lane_count(&s, cat, b, PORT_DIR_HI_TO_LO, LANE_BEST_EFFORT), u32(0))
++
++	// newest_in_port_lane: the LAST array-order rider of the direction
++	testing.expectf(t, newest_in_port_lane(&s, cat, b, PORT_DIR_LO_TO_HI, LANE_STANDARD) == 1,
++		"newest dir-0 Standard must be index 1 (packet 202)")
++	testing.expectf(t, newest_in_port_lane(&s, cat, b, PORT_DIR_HI_TO_LO, LANE_STANDARD) == 2,
++		"newest dir-1 Standard must be index 2 (packet 203)")
++	// the exclude contract: a pending shed hides from the directional count
++	// exactly as it does from the undirected one
++	excluded := []int{1}
++	testing.expect_value(t, port_lane_count(&s, cat, b, PORT_DIR_LO_TO_HI, LANE_STANDARD, excluded), u32(1))
++	testing.expectf(t, newest_in_port_lane(&s, cat, b, PORT_DIR_LO_TO_HI, LANE_STANDARD, excluded) == 0,
++		"with index 1 excluded, the newest dir-0 Standard is index 0")
++
++	// port_lane_ready: Standard ready in BOTH directions independently
++	r0 := port_lane_ready(&s, cat, b, PORT_DIR_LO_TO_HI)
++	r1 := port_lane_ready(&s, cat, b, PORT_DIR_HI_TO_LO)
++	testing.expectf(t, r0[LANE_STANDARD] && !r0[LANE_EXPRESS] && !r0[LANE_BEST_EFFORT],
++		"dir-0 readiness must be Standard only")
++	testing.expectf(t, r1[LANE_STANDARD] && !r1[LANE_EXPRESS] && !r1[LANE_BEST_EFFORT],
++		"dir-1 readiness must be Standard only")
++}
++
++@(test)
++test_undirected_view_equals_sum_of_ports :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, host := egress_setup(cat)
++	defer run_destroy(&s)
++
++	// mixed bidirectional load on BOTH bundles: email (Standard) + a
++	// streaming rider (also Standard default) across directions
++	on_edge_packet(&s, 0, 0, res, rt, 301)
++	on_edge_packet(&s, 0, 0, rt, res, 302)
++	on_edge_packet(&s, 0, 1, rt, host, 303) // email rt→host on bundle 1 dir 0 (rt=1 is lo of pair 1..2)
++	on_edge_packet(&s, 1, 1, host, rt, 304) // streaming host→rt on bundle 1 dir 1 (host=2 is hi) — Standard default too
++	on_edge_packet(&s, 0, 1, rt, host, 305) // a second email rt→host rider
++
++	// [S1 invisibility] for every bundle and lane, the undirected view every
++	// mechanic still reads == Σ over the two port queues — the re-key cannot
++	// move a number until a story consumes the directional twins
++	for bi in u32(0)..<s.bundles.n {
++		for lane in u8(0)..<LANE_COUNT {
++			undirected := bundle_lane_count(&s, cat, bi, lane)
++			sum := port_lane_count(&s, cat, bi, PORT_DIR_LO_TO_HI, lane) +
++				port_lane_count(&s, cat, bi, PORT_DIR_HI_TO_LO, lane)
++			testing.expectf(t, undirected == sum,
++				"bundle %d lane %d: undirected %d != Σ ports %d (the S1 invisibility pin)",
++				bi, lane, undirected, sum)
++		}
++	}
++	// the fixture totals: bundle 0 has 2 riders (1/direction), bundle 1 has 3
++	testing.expect_value(t, bundle_lane_count(&s, cat, 0, LANE_STANDARD), u32(2))
++	testing.expect_value(t, bundle_lane_count(&s, cat, 1, LANE_STANDARD), u32(3))
++}
++
++@(test)
++test_port_lane_caps_full_duplex_members :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++
++	// [R2/AD-5] a port's caps = the member-summed bundle caps, IDENTICAL for
++	// both directions (per-pipe weights; full-duplex members). The fixture's
++	// single standard member gives Standard 100, the others 0 (unconfigured
++	// 100% Standard — E5/08-19 ruling), summed identically per direction.
++	for bi in u32(0)..<s.bundles.n {
++		caps := port_lane_caps(&s, bi)
++		testing.expect_value(t, caps, bundle_lane_caps(&s, bi))
++		again := port_lane_caps(&s, bi)
++		testing.expect_value(t, again, caps) // stable read — two reads agree (Perkins r1 N6: the old line compared a call to itself)
++	}
++	testing.expect_value(t, port_lane_caps(&s, 0), [3]u32{0, 100, 0})
++	testing.expectf(t, s.bundles.bundle_cap[0] == 100, "bundle 0 (one standard member) caps at 100")
++}
++
++// --- v2-arch-egress S2: full duplex (AD-5, ruling R1) -------------------------
++
++@(test)
++test_full_duplex_direction_independence :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++
++	// 12 Standard riders on bundle 0 (the res—rt standard pipe, cap 100):
++	// 6 forward (res→rt, dir 0) + 6 reverse (rt→res, dir 1). FULL DUPLEX
++	// (AD-5): each direction drains its own 6×800 = 4800 units at its OWN
++	// 100/tick budget — both directions delivered by tick ~48. Under the
++	// pooled 2.1 doctrine (one shared 100/tick budget for the PAIR) the 12
++	// packets need 9600/100 = 96 ticks — the cross-direction contention the
++	// ruling retires (the mutation leg: hoisting `remaining` out of the
++	// direction loop collapses the split and this pin goes RED).
++	for k in 0..<6 {
++		on_edge_packet(&s, 0, 0, res, rt, u64(400 + k))
++	}
++	for k in 0..<6 {
++		on_edge_packet(&s, 0, 0, rt, res, u64(500 + k))
++	}
++	step_n(&s, 50, cat)
++
++	arrived := count_arrived(&s)
++	testing.expectf(t, arrived == 12,
++		"full duplex: both directions must drain their own budgets by tick 50 (got %d/12 arrived — the shared-budget collapse)", arrived)
++
++	// per-direction windows: each direction served its own ~4800 units (the
++	// window covers (tick-W, tick] with W=240 — everything). Exact: every
++	// rider delivered, so Σ served per direction == 4800 exactly.
++	b, ok := bundle_of_pipe(&s, 0)
++	testing.expectf(t, ok, "pipe 0 resolves bundle 0")
++	testing.expect_value(t, bundle_tx_window(&s.bundles, s.tick, b, PORT_DIR_LO_TO_HI), u64(4800))
++	testing.expect_value(t, bundle_tx_window(&s.bundles, s.tick, b, PORT_DIR_HI_TO_LO), u64(4800))
++}
++
++@(test)
++test_single_direction_serve_unchanged :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++
++	// a lone direction's transit is IDENTICAL to the pre-S2 serve (the same
++	// budget, the same FIFO, the same WRR windows — S2 byte-identity for
++	// unidirectional runs is structural, not lucky): 3 email riders drain in
++	// ceil(3×800/100) = 24 serve ticks; the idle direction records NOTHING.
++	for k in 0..<3 {
++		on_edge_packet(&s, 0, 0, res, rt, u64(600 + k))
++	}
++	step_n(&s, 25, cat)
++	testing.expectf(t, count_arrived(&s) == 3, "3 lone riders drain in 24 ticks (got %d arrived)", count_arrived(&s))
++	b, _ := bundle_of_pipe(&s, 0)
++	testing.expect_value(t, bundle_tx_window(&s.bundles, s.tick, b, PORT_DIR_LO_TO_HI), u64(2400))
++	testing.expect_value(t, bundle_tx_window(&s.bundles, s.tick, b, PORT_DIR_HI_TO_LO), u64(0))
++}
++
++@(test)
++test_tx_ring_records_per_direction :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, bs := tx_ring_setup(cat)
++	defer run_destroy(&s)
++
++	// the two directions' ring slots are INDEPENDENT: same tick, different
++	// served — neither clobbers the other (the flat-ring re-key doubled the
++	// layout; a base-math slip would alias them).
++	bundle_tx_record(&s.bundles, 7, bs, PORT_DIR_LO_TO_HI, 40)
++	bundle_tx_record(&s.bundles, 7, bs, PORT_DIR_HI_TO_LO, 15)
++	testing.expect_value(t, bundle_tx_window(&s.bundles, 7, bs, PORT_DIR_LO_TO_HI), u64(40))
++	testing.expect_value(t, bundle_tx_window(&s.bundles, 7, bs, PORT_DIR_HI_TO_LO), u64(15))
++}
++
++// --- v2-arch-egress S3: the D-2 named story (bandwidth_demand WIRED) ---------
++
++@(test)
++test_demand_wiring_streaming_transit_16_ticks :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s: Run_State
++	run_init(&s, 7, cat.hash, TEST_LOGIC_HZ)
++	defer run_destroy(&s)
++	res, rt, _ := test_seed_fixture(&s, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	draw(&s, 1, res, rt, std)
++	// email (demand 1) + streaming (demand 2), spawned at tick 1 from res to
++	// rt — the era-0 standard pipe serves 100 u/t per direction.
++	flow_seed_demand(&s.flow, 1, res, rt, 0)
++	flow_seed_demand(&s.flow, 1, res, rt, 1)
++	step_n(&s, 20, cat)
++
++	email_tick, streaming_tick := u64(0), u64(0)
++	n := 0
++	for e in s.events {
++		if e.tag == EVENT_TAG_PACKET_ARRIVED {
++			n += 1
++		}
++	}
++	// recover each delivery tick by class from the SLA accumulators is not
++	// possible (totals only) — re-derive from the packets' own history is
++	// gone too (culled); instead re-run the two classes in ISOLATION so the
++	// single arrival event's tick is unambiguous.
++	s2: Run_State
++	run_init(&s2, 7, cat.hash, TEST_LOGIC_HZ)
++	defer run_destroy(&s2)
++	test_seed_fixture(&s2, cat)
++	append(&s2.action_log, Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = res, b = rt, tier = std}})
++	flow_seed_demand(&s2.flow, 1, res, rt, 0) // email only
++	for tick in u64(1)..=12 {
++		batch := make([dynamic]Command, 0, 2, context.temp_allocator)
++		for cmd in s2.action_log {
++			if cmd.apply_tick == tick { append(&batch, cmd) }
++		}
++		before2 := len(s2.events)
++		step(&s2, tick, batch[:], cat)
++		for e in s2.events[before2:] {
++			if e.tag == EVENT_TAG_PACKET_ARRIVED { email_tick = tick }
++		}
++		free_all(context.temp_allocator)
++	}
++	s3: Run_State
++	run_init(&s3, 7, cat.hash, TEST_LOGIC_HZ)
++	defer run_destroy(&s3)
++	test_seed_fixture(&s3, cat)
++	append(&s3.action_log, Command{apply_tick = 1, kind = Cmd_Draw_Pipe{a = res, b = rt, tier = std}})
++	flow_seed_demand(&s3.flow, 1, res, rt, 1) // streaming only
++	for tick in u64(1)..=22 {
++		batch := make([dynamic]Command, 0, 2, context.temp_allocator)
++		for cmd in s3.action_log {
++			if cmd.apply_tick == tick { append(&batch, cmd) }
++		}
++		before3 := len(s3.events)
++		step(&s3, tick, batch[:], cat)
++		for e in s3.events[before3:] {
++			if e.tag == EVENT_TAG_PACKET_ARRIVED { streaming_tick = tick }
++		}
++		free_all(context.temp_allocator)
++	}
++
++	// [D-2 the disclosure pin] email: demand 1 → ceil(800/100) = 8 transit
++	// ticks (spawn tick 1, join tick 1, serve 2..9, arrive 9 — the pre-wire
++	// transit UNCHANGED); streaming: demand 2 → ceil(1600/100) = 16 transit
++	// ticks (serve 2..17, arrive 17) — the 8→16 shift the briefing discloses.
++	testing.expectf(t, email_tick == 9, "email must arrive at tick 9 (8 transit ticks; got %d)", email_tick)
++	testing.expectf(t, streaming_tick == 17, "streaming must arrive at tick 17 (16 transit ticks — D-2 wired; got %d — the demand-unwired mutation reads 9)", streaming_tick)
++	// in the COMBINED run the two share one 100 u/t FIFO: the email clears at
++	// tick 9, the streaming rider then drains 10..25 — at tick 20 exactly ONE
++	// has arrived (the mixed-lane FIFO pin below carries the full drain).
++	testing.expect_value(t, u64(n), u64(1))
++}
++
++@(test)
++test_demand_wiring_progress_frac_per_class :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++
++	// mid-edge fraction is demand-aware: streaming at progress 800 of its
++	// 1600 total reads the SAME half-way frac as email at 400 of 800.
++	on_edge_packet(&s, 0, 0, res, rt, 701)
++	s.flow.packets[0].progress_units = 400 // email: 400/800
++	on_edge_packet(&s, 1, 0, res, rt, 702)
++	s.flow.packets[1].progress_units = 800 // streaming: 800/1600
++	testing.expect_value(t, packet_progress_frac(&s.flow.packets[0], cat), u32(128))
++	testing.expect_value(t, packet_progress_frac(&s.flow.packets[1], cat), u32(128))
++	// the demand helper itself: email 1×800, streaming 2×800
++	testing.expect_value(t, packet_demand_units(cat, 0), u32(800))
++	testing.expect_value(t, packet_demand_units(cat, 1), u32(1600))
++	// transit_ticks (the AD-3(c) formula): 8 / 16 / 1 (mid) / 1 (wide)
++	testing.expect_value(t, transit_ticks(packet_demand_units(cat, 0), 100), u32(8))
++	testing.expect_value(t, transit_ticks(packet_demand_units(cat, 1), 100), u32(16))
++	testing.expect_value(t, transit_ticks(packet_demand_units(cat, 1), 4000), u32(1))
++	testing.expect_value(t, transit_ticks(packet_demand_units(cat, 1), 10000), u32(1))
++}
++
++@(test)
++test_demand_wiring_mixed_lane_fifo :: proc(t: ^testing.T) {
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s: Run_State
++	run_init(&s, 7, cat.hash, TEST_LOGIC_HZ)
++	defer run_destroy(&s)
++	res, rt, _ := test_seed_fixture(&s, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	draw(&s, 1, res, rt, std)
++	flow_seed_demand(&s.flow, 1, res, rt, 0) // email first (FIFO head)
++	flow_seed_demand(&s.flow, 1, res, rt, 1) // streaming behind it
++	step_n(&s, 9, cat)
++	// at tick 9 the email (800 units served 2..9) has ARRIVED while the
++	// streaming rider (queued behind the same 100 u/t budget, 0 served until
++	// the email cleared) is still on-edge — the FIFO discipline is unchanged
++	// by D-2, only each packet's own total moved.
++	testing.expectf(t, count_arrived(&s) == 1, "email arrives first at tick 9 (got %d arrived)", count_arrived(&s))
++	on_edge := 0
++	for p in s.flow.packets {
++		if p.on_edge { on_edge += 1 }
++	}
++	testing.expectf(t, on_edge == 1, "streaming still on-edge at tick 9 (got %d)", on_edge)
++	step_n(&s, 20, cat) // ticks 10..29: streaming serves 1600 more than the 0 it had
++	testing.expectf(t, count_arrived(&s) == 2, "streaming drains by tick 25 (got %d arrived)", count_arrived(&s))
++}
++
++// --- v2-arch-egress S4: the drop/crisis re-key (AD-4/R4/AV-2/F1) --------------
++
++@(test)
++test_e9_bound_is_per_port :: proc(t: ^testing.T) {
++	// R4: the E9 lane bound is per (port, lane) — a direction's queue fills to
++	// its OWN bound 6 regardless of the reverse direction's load. The pair may
++	// hold 12 queued (the F4 balance note: 6 -> 12 per lane per pair) with
++	// NEITHER port shedding the other's arrivals. The pooled-bound mutation
++	// (counting both directions) fails both halves.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++	b, ok := bundle_of_pipe(&s, 0)
++	testing.expectf(t, ok, "pipe 0 resolves bundle 0")
++
++	// dir 0 (res→rt) pinned AT the bound: 6 queued
++	for k in 0..<6 {
++		on_edge_packet(&s, 0, 0, res, rt, u64(800 + k))
++	}
++	// dir 1 (rt→res) at 5 — one under its own bound; the PAIR total is 11
++	// (far past the old pooled bound of 6)
++	for k in 0..<5 {
++		on_edge_packet(&s, 0, 0, rt, res, u64(900 + k))
++	}
++
++	// (i) an at-node packet at rt with dst res forwards into (b, dir 1,
++	// Standard): 5 < 6 -> ADMITS (no drop). Pooled counting (11 >= 6) would
++	// shed it — the R4 divergence.
++	before := len(s.events)
++	s.flow.next_packet_id += 1
++	append(&s.flow.packets, Packet{id = 950, class = 0, src = rt, dst = res, on_edge = false, at_node = rt, spawn_tick = s.tick})
++	step_n(&s, 1, cat)
++	dropped := false
++	for e in s.events[before:] {
++		if e.tag == EVENT_TAG_PACKET_DROPPED && e.reason == u8(Drop_Reason.Queue_Overflow) {
++			dropped = true
++			// AV-2: an E9 drop event carries the shed port's direction
++			testing.expectf(t, e.direction == PORT_DIR_HI_TO_LO, "E9 drop direction must be dir 1, got %d", e.direction)
++		}
++	}
++	testing.expectf(t, !dropped, "a port whose lane is under ITS bound must admit (5 < 6; the pair holding 11 is irrelevant — R4)")
++	// and it joined the queue
++	joined := false
++	for p in s.flow.packets {
++		if p.id == 950 && p.on_edge { joined = true }
++	}
++	testing.expectf(t, joined, "the arrival must be on-edge (admitted)")
++
++	// (ii) the pinned port DOES shed: an at-node packet at res with dst rt
++	// forwards into (b, dir 0, Standard): 6 >= 6 -> the arrival's lane is the
++	// lowest non-empty -> the ARRIVAL drops, with the port's direction byte.
++	before = len(s.events)
++	s.flow.next_packet_id += 1
++	append(&s.flow.packets, Packet{id = 951, class = 0, src = res, dst = rt, on_edge = false, at_node = res, spawn_tick = s.tick})
++	step_n(&s, 1, cat)
++	shed := false
++	for e in s.events[before:] {
++		if e.tag == EVENT_TAG_PACKET_DROPPED && e.reason == u8(Drop_Reason.Queue_Overflow) {
++			shed = true
++			testing.expectf(t, e.direction == PORT_DIR_LO_TO_HI, "E9 drop direction must be dir 0, got %d", e.direction)
++			testing.expectf(t, e.target == b, "AV-1: the drop target stays the BUNDLE id (got %d)", e.target)
++		}
++	}
++	testing.expectf(t, shed, "a port whose lane is AT its bound must shed the arrival (R4)")
++}
++
++@(test)
++test_crisis_cooldown_keyed_by_direction :: proc(t: ^testing.T) {
++	// F1 (the spine's rubric fix): the cooldown re-fire key carries the
++	// direction bit — an A→B resolution must NOT suppress a distinct B→A
++	// re-fire inside the window (the pair alone would).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	crisis_catalog_mult2(cat, 100) // cooldown 100 ticks
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++	append(&s.crisis.cooldowns, Cooldown_Entry{
++		archetype = 0, kind = .Saturated_Bundle,
++		lo = min(res, rt), hi = max(res, rt), dir = PORT_DIR_LO_TO_HI,
++		resolve_tick = 50,
++	})
++	// same pair, same direction: blocked inside the window
++	testing.expectf(t, crisis_cooldown_blocked(&s, 100, cat, 0, .Saturated_Bundle, min(res, rt), max(res, rt), PORT_DIR_LO_TO_HI),
++		"same-port re-fire inside the cooldown must be blocked")
++	// same pair, OPPOSITE direction: NOT blocked (the distinct B→A re-fire)
++	testing.expectf(t, !crisis_cooldown_blocked(&s, 100, cat, 0, .Saturated_Bundle, min(res, rt), max(res, rt), PORT_DIR_HI_TO_LO),
++		"the OPPOSITE port's re-fire must NOT be suppressed (F1)")
++	// and outside the window neither blocks
++	testing.expectf(t, !crisis_cooldown_blocked(&s, 200, cat, 0, .Saturated_Bundle, min(res, rt), max(res, rt), PORT_DIR_LO_TO_HI),
++		"past the window the same-port re-fire is free")
++}
++
++// --- v2-arch-egress S5: the latency ledger + the reads (D3/F2 + AV-5 + AD-7) --
++
++@(test)
++test_residency_ledger_terms :: proc(t: ^testing.T) {
++	// F2 (the AD-3 measurement boundary): per-hop delay is EXACTLY
++	// (a) join tick + (b) residency + (c) serialization — Σ over a delivery
++	// equals delivery_tick − spawn_tick. Pinned through the ledger:
++	//   uncontended: (b) = 0 — the lone rider is in service every tick past
++	//   join (the head-of-line is never "waiting");
++	//   contended: the second rider's (b) counts the ticks the scheduler
++	//   spent on the head — exactly its extra delay.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++	b, _ := bundle_of_pipe(&s, 0)
++
++	// uncontended: ONE email rider, delivered ~8 ticks after its spawn (the
++	// fixture already ran tick 1 — seed the NEXT tick)
++	flow_seed_demand(&s.flow, 2, res, rt, 0)
++	step_n(&s, 10, cat)
++	testing.expectf(t, count_arrived(&s) == 1, "the lone rider delivers")
++	testing.expect_value(t, port_residency_ticks(&s.flow, s.tick, b, PORT_DIR_LO_TO_HI, LANE_STANDARD, 0), u64(0))
++
++	// contended: two riders, 1 tick apart — the second waits out the first's
++	// serialization tail. F2 (the AD-3(a) first-hop boundary, verbatim): the
++	// second rider spawns at tick 3 and forwards DURING tick 3 — the join
++	// coincides with the spawn tick, (a) = 0 elapsed. The head joined at 2
++	// and serializes 3..10; the second waits (b) = 7 ticks (4..10 — the
++	// scheduler reaches it at 11), then serializes (c) = 8 ticks (11..18) and
++	// delivers during 18: (a)+(b)+(c) = 0+7+8 = 15 = delivery(18) −
++	// spawn(3) EXACTLY — the F2 identity. The ledger pins (b) = 7.
++	s2: Run_State
++	run_init(&s2, 7, cat.hash, TEST_LOGIC_HZ)
++	defer run_destroy(&s2)
++	res2, rt2, _ := test_seed_fixture(&s2, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	draw(&s2, 1, res2, rt2, std)
++	flow_seed_demand(&s2.flow, 2, res2, rt2, 0)
++	flow_seed_demand(&s2.flow, 3, res2, rt2, 0)
++	step_n(&s2, 20, cat)
++	testing.expectf(t, count_arrived(&s2) == 2, "both riders deliver")
++	waited := port_residency_ticks(&s2.flow, s2.tick, b2_of(&s2), PORT_DIR_LO_TO_HI, LANE_STANDARD, 0)
++	testing.expectf(t, waited == 7, "the second rider's residency (b) must be exactly 7 (the head's serialization tail), got %d", waited)
++}
++
++// b2_of — bundle 0 of the second fixture (avoid capture confusion).
++b2_of :: proc(s: ^Run_State) -> u32 {
++	b, ok := bundle_of_pipe(s, 0)
++	if !ok { return 0 }
++	return b
++}
++
++@(test)
++test_router_buffering_and_port_reads :: proc(t: ^testing.T) {
++	// AD-7 reads: router_buffering_packets sums the ROUTER's own ports (the
++	// at-rest aggregate — AV-6: Σ per-port, never the pair's); at-node stuck
++	// packets (the 4.1 telegraph) are NOT folded in.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++
++	// 3 queued on res's port (dir 0), 1 on rt's port (dir 1)
++	on_edge_packet(&s, 0, 0, res, rt, 601)
++	on_edge_packet(&s, 0, 0, res, rt, 602)
++	on_edge_packet(&s, 0, 0, res, rt, 603)
++	on_edge_packet(&s, 0, 0, rt, res, 604)
++	testing.expect_value(t, router_buffering_packets(&s, cat, res), u32(3))
++	testing.expect_value(t, router_buffering_packets(&s, cat, rt), u32(1))
++	// an at-node UNADMITTED packet (stuck — waiting) is NOT buffering (AV-6)
++	s.flow.next_packet_id += 1
++	append(&s.flow.packets, Packet{id = 605, class = 0, src = res, dst = 999, on_edge = false, at_node = res})
++	testing.expect_value(t, router_buffering_packets(&s, cat, res), u32(3))
++	// port_util_pct: the per-direction denominator (a saturated port reads
++	// 100, never 200 for the pair — AV-4); pre-traffic reads 0
++	testing.expect_value(t, port_util_pct(&s, s.tick, 0, PORT_DIR_LO_TO_HI), u32(0))
++}
++
++@(test)
++test_stats_port_rows_shape :: proc(t: ^testing.T) {
++	// F3: the stats record carries per-(router, port) rows — the NOC QUEUES
++	// source. Router/peer map the port's direction (dir 0 = lo→hi: router lo,
++	// peer hi); depths are directional; the CSV stream carries Q rows (v3).
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++	on_edge_packet(&s, 0, 0, res, rt, 701)
++	step_n(&s, 1, cat)
++
++	rec := stats_compute(&s, cat, u64(0xDEADBEEF), context.temp_allocator)
++	defer stats_destroy(&rec)
++	testing.expectf(t, len(rec.ports) == 4, "two bundles x two directions = 4 port rows (got %d)", len(rec.ports))
++	if len(rec.ports) >= 4 {
++		p0 := rec.ports[0] // bundle 0, dir 0 — router lo(res), peer hi(rt)
++		testing.expect_value(t, p0.router, res)
++		testing.expect_value(t, p0.peer, rt)
++		testing.expect_value(t, p0.dir, PORT_DIR_LO_TO_HI)
++		p1 := rec.ports[1] // bundle 0, dir 1 — router rt, peer res
++		testing.expect_value(t, p1.router, rt)
++		testing.expect_value(t, p1.peer, res)
++		testing.expect_value(t, p1.dir, PORT_DIR_HI_TO_LO)
++		// the queued rider is dir 0's Standard lane only
++		testing.expect_value(t, rec.ports[0].q[LANE_STANDARD], u32(1))
++		testing.expect_value(t, rec.ports[1].q[LANE_STANDARD], u32(0))
++	}
++	// the CSV carries the Q rows
++	sb := strings.builder_make(context.temp_allocator)
++	stats_write_header(&sb)
++	stats_write_csv(&sb, &rec)
++	txt := strings.to_string(sb)
++	defer delete(txt)
++	has_q := false
++	for line in strings.split(txt, "\n", context.temp_allocator) {
++		if len(line) > 1 && line[0] == 'Q' && line[1] == ',' { has_q = true }
++	}
++	testing.expectf(t, has_q, "the CSV stream must carry Q port rows")
++}
++
++// --- Perkins r1 B3/B4: the AV-4/AV-7 rollup pins + the ledger regression ------
++
++@(test)
++test_util_max_never_sum_both_directions :: proc(t: ^testing.T) {
++	// AV-4 (Perkins r1 B3, mutation-proven vacuous before): utilization is a
++	// (bundle, DIRECTION) property — the pipe row carries MAX over
++	// directions, never the sum. Both directions loaded ASYMMETRICALLY in
++	// window (60% / 30% of a 240-tick x 100-unit window): max reads 60; the
++	// sum-mutant would read 90 (both unclamped — the discriminator). Then
++	// BOTH directions saturated: the pair reads 100, never a 200.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s, res, rt, _ := egress_setup(cat)
++	defer run_destroy(&s)
++	b, _ := bundle_of_pipe(&s, 0)
++	testing.expectf(t, s.bundles.bundle_cap[b] == 100, "fixture: bundle 0 caps at 100 u/t")
++
++	// window (0, 240]: dir0 60% = 14400 units, dir1 30% = 7200 units —
++	// recorded straight into the tx ring (the pure accumulator the serve
++	// pass writes; the read walks it identically).
++	bundle_tx_record(&s.bundles, 1, b, PORT_DIR_LO_TO_HI, 14400)
++	bundle_tx_record(&s.bundles, 1, b, PORT_DIR_HI_TO_LO, 7200)
++	testing.expect_value(t, port_util_pct(&s, 240, b, PORT_DIR_LO_TO_HI), u32(60))
++	testing.expect_value(t, port_util_pct(&s, 240, b, PORT_DIR_HI_TO_LO), u32(30))
++	rec := stats_compute(&s, cat, u64(0xDEADBEEF), context.temp_allocator)
++	defer stats_destroy(&rec)
++	found := false
++	for &row in rec.pipes {
++		if row.pipe == 0 {
++			found = true
++			testing.expectf(t, row.util_pct == 60, "the pipe row reads MAX over directions (60, never the 90 sum) — got %d", row.util_pct)
++		}
++	}
++	testing.expectf(t, found, "pipe 0 has a stats row")
++
++	// phase 2 (window (240, 480]): BOTH directions at full saturation — the
++	// per-direction reads are 100 each and the pair row reads 100, NEVER a
++	// pair-200 (AV-4's named case). stats_compute reads the window at
++	// state.tick, so the sim advances to 480 first (no traffic in this
++	// fixture — the steps only age the rings).
++	step_n(&s, 479, cat) // s.tick 1 -> 480
++	testing.expect_value(t, s.tick, u64(480))
++	bundle_tx_record(&s.bundles, 480, b, PORT_DIR_LO_TO_HI, 24000)
++	bundle_tx_record(&s.bundles, 480, b, PORT_DIR_HI_TO_LO, 24000)
++	testing.expect_value(t, port_util_pct(&s, 480, b, PORT_DIR_LO_TO_HI), u32(100))
++	testing.expect_value(t, port_util_pct(&s, 480, b, PORT_DIR_HI_TO_LO), u32(100))
++	rec2 := stats_compute(&s, cat, u64(0xDEADBEEF), context.temp_allocator)
++	defer stats_destroy(&rec2)
++	for &row in rec2.pipes {
++		if row.pipe == 0 {
++			testing.expectf(t, row.util_pct == 100, "a both-directions-saturated pair reads 100, never 200 — got %d", row.util_pct)
++		}
++	}
++}
++
++@(test)
++test_residency_ledger_resets_on_renumber :: proc(t: ^testing.T) {
++	// Perkins r1 B4 (the layout-gen reset, mutation-proven vacuous before):
++	// a topology edit that keeps the bundle COUNT but renumbers the slots
++	// (the demolish+draw-in-one-batch class) must reset the ledger — the new
++	// pair's key must not inherit the dead pair's history. Mirrors the tx
++	// ring's test_bundle_tx_ring_rebuild_reset.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 7, cat.hash, TEST_LOGIC_HZ)
++	res, rt, _ := test_seed_fixture(&s, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	draw(&s, 1, res, rt, std)
++	// the two-rider contention fixture: the second rider accrues (b) = 7
++	// packet-ticks on bundle 0's dir-0 Standard lane (the F2 pin's own
++	// choreography — the ledger holds the history AFTER delivery).
++	flow_seed_demand(&s.flow, 2, res, rt, 0)
++	flow_seed_demand(&s.flow, 3, res, rt, 0)
++	step_n(&s, 20, cat)
++	b := b2_of(&s)
++	waited := port_residency_ticks(&s.flow, s.tick, b, PORT_DIR_LO_TO_HI, LANE_STANDARD, 0)
++	testing.expectf(t, waited == 7, "control: the history is in-window before the edit (got %d)", waited)
++
++	// a topology edit bumps Topology.gen; the next record pass must RESET
++	// the ledger even though the bundle count (and thus the key count) is
++	// unchanged — dropping the layout_gen guard leaks the dead history into
++	// the same-index key of whatever pair owns the slot next.
++	topology_apply_edit(&s.topology, Command{1, Cmd_Draw_Pipe{rt, res, std}}, cat) // parallel pipe, same pair — count unchanged, gen bumped
++	step_n(&s, 1, cat) // tick 22: the record pass runs with the new gen
++	b2, ok := bundles_slot_for_pair(&s.bundles, min(res, rt), max(res, rt))
++	testing.expectf(t, ok, "the bundle survives the edit")
++	testing.expect_value(t, b2, b) // same slot — the leak's exact shape
++	testing.expectf(t, port_residency_ticks(&s.flow, s.tick, b2, PORT_DIR_LO_TO_HI, LANE_STANDARD, 0) == 0,
++		"the renumber resets the ledger (got %d phantom packet-ticks)", port_residency_ticks(&s.flow, s.tick, b2, PORT_DIR_LO_TO_HI, LANE_STANDARD, 0))
++	key := ((b2 * PORT_DIR_COUNT + u32(PORT_DIR_LO_TO_HI)) * LANE_COUNT + u32(LANE_STANDARD)) * s.flow.residency.classes + 0
++	base := int(key) * RESIDENCY_WINDOW_TICKS
++	for sl in 0..<RESIDENCY_WINDOW_TICKS {
++		testing.expectf(t, s.flow.residency.slot_tick[base + sl] == 0,
++			"slot %d kept a stale write tick (%d) — the reset must zero the slots", sl, s.flow.residency.slot_tick[base + sl])
++	}
++}
++
++@(test)
++test_residency_idle_window_reads_zero :: proc(t: ^testing.T) {
++	// Perkins r1 B4 (the read-time staleness fold, mutation-proven vacuous
++	// before): a key that goes IDLE keeps its last slots written, but only
++	// slots written inside (tick - W, tick] count — an idle port reads 0,
++	// never a frozen forever-stale figure. Mirrors the tx ring's
++	// test_bundle_tx_window_expiry_and_reuse.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 7, cat.hash, TEST_LOGIC_HZ)
++	res, rt, _ := test_seed_fixture(&s, cat)
++	std, _ := pipe_tier_index(cat, "standard")
++	draw(&s, 1, res, rt, std)
++	flow_seed_demand(&s.flow, 2, res, rt, 0)
++	flow_seed_demand(&s.flow, 3, res, rt, 0)
++	step_n(&s, 20, cat)
++	b := b2_of(&s)
++	testing.expectf(t, port_residency_ticks(&s.flow, s.tick, b, PORT_DIR_LO_TO_HI, LANE_STANDARD, 0) == 7,
++		"control: the history reads in-window (got %d)", port_residency_ticks(&s.flow, s.tick, b, PORT_DIR_LO_TO_HI, LANE_STANDARD, 0))
++
++	// the read is pure over the ring: advancing the READ tick past the last
++	// write + W expires every slot of the key — 0, never the frozen 7.
++	idle := s.tick + u64(RESIDENCY_WINDOW_TICKS) + 1
++	testing.expectf(t, port_residency_ticks(&s.flow, idle, b, PORT_DIR_LO_TO_HI, LANE_STANDARD, 0) == 0,
++		"an idle key reads 0 past its window (got %d — a frozen stale sum)", port_residency_ticks(&s.flow, idle, b, PORT_DIR_LO_TO_HI, LANE_STANDARD, 0))
++}
+diff --git a/core/flow.odin b/core/flow.odin
+index db5e7a4..97d5a43 100644
+--- a/core/flow.odin
++++ b/core/flow.odin
+@@ -59,16 +59,19 @@ Spawn_Req :: struct {
+ }
+ 
+ // Drop_Site — one packet-drop site for the CURRENT tick (4.2, W6). The flow
+-// records where the ladders shed (class + reason + bundle) into a per-tick
+-// scratch that the crisis engine reads as sim input — the ODN-14 event buffer
+-// is the serialized RECORD, never an engine input (the app never drains it;
+-// a future drain must not change sim behavior). DERIVED per tick (cleared at
+-// the top of flow_step, appended at each shed) — never serialized; the events
+-// remain the replay-proof record.
++// records where the ladders shed (class + reason + bundle + direction) into a
++// per-tick scratch that the crisis engine reads as sim input — the ODN-14
++// event buffer is the serialized RECORD, never an engine input (the app never
++// drains it; a future drain must not change sim behavior). DERIVED per tick
++// (cleared at the top of flow_step, appended at each shed) — never serialized;
++// the events remain the replay-proof record. v2-arch-egress S4 (AV-2): the
++// 1-bit DIRECTION of the shed port rides here too (derived; E9 sites carry
++// the port's direction, E22 pool sites carry 0 — meaningless map-wide).
+ Drop_Site :: struct {
+ 	class:  u16,
+ 	reason: Drop_Reason,
+ 	bundle: u32, // E9: the shed bundle; E22: NO_BUNDLE (map-wide)
++	dir:    u8,  // E9: the shed port's direction (PORT_DIR_*); E22: 0
+ }
+ 
+ Flow_State :: struct {
+@@ -112,8 +115,43 @@ Flow_State :: struct {
+ 	// engine's input (W6). Cleared at the top of flow_step, appended at each
+ 	// shed; NEVER serialized (the Packet_Dropped events are the record).
+ 	drop_sites:     [dynamic]Drop_Site,
++	// v2-arch-egress S5 (F2): the ids SERVICED this tick (the serve pass's
++	// per-lane unions fold here; the residency record excludes them — the
++	// (c) term is never (b)). PER-TICK scratch, cleared at the top of
++	// flow_step like drop_sites; never serialized.
++	serviced_this_tick: [dynamic]u64,
++	// v2-arch-egress S5 (AV-5): the per-(port, lane, class) rolling RESIDENCY
++	// accumulators — the latency ledger's queue-wait term (AD-3(b)/AD-7: the
++	// where-does-delay-live attribution). DERIVED scratch in the serve pass
++	// (the tx-ring precedent): REBUILT identically on replay, NEVER serialized
++	// (the T1 hash is byte-identical; LOG_VERSION untouched). Reset whenever
++	// the key layout shifts (bundles renumber / class rows grow).
++	residency:      Residency_State,
+ }
+ 
++// Residency_State — the rolling packet-tick ledger, keyed
++// ((bundle × PORT_DIR_COUNT + dir) × LANE_COUNT + lane) × classes + class,
++// one flat ring of RESIDENCY_WINDOW_TICKS slots per key (the health-ring
++// pattern: slot holds the KEY's per-tick delta; win holds the rolling sum —
++// the read is O(1)). Reported for in-flight + rolling-recent traffic
++// (per-DELIVERED-packet attribution is OUT OF SCOPE by the spine: per-hop
++// routing carries no route history — nothing compliant could produce it).
++Residency_State :: struct {
++	keys:     u32,             // the key count at last layout (0 = empty)
++	classes:  u32,             // the class-count bound at last layout
++	layout_gen: u32,           // the Topology.gen the layout was built for (a SAME-COUNT bundle renumber must reset — the B1 slot-renumbering class; review-swarm finding, pinned by test)
++	slot_tick: [dynamic]u64,   // per SLOT: the tick that last wrote it (0 = never)
++	ticks:    [dynamic]u32,    // per SLOT: the packet-ticks waited that tick
++	// (Perkins r1 W1: the per-key rolling `win` sum is GONE — it was never
++	// read; the read walks the raw slots and folds staleness itself. One
++	// bookkeeping, one authority — ODN-18.)
++}
++
++// RESIDENCY_WINDOW_TICKS — the rolling-recent window for the residency
++// ledger (the tx-ring window: 12 s @ 20 Hz — recent-enough to reflect the
++// current regime, long enough to smooth the WRR windows).
++RESIDENCY_WINDOW_TICKS :: UTIL_WINDOW_TICKS
++
+ flow_init :: proc(f: ^Flow_State, allocator := context.allocator) {
+ 	f^ = {}
+ 	f.packets = make([dynamic]Packet, 0, 16, allocator)
+@@ -123,6 +161,12 @@ flow_init :: proc(f: ^Flow_State, allocator := context.allocator) {
+ 	f.sla = make([dynamic]Sla_Accumulator, 0, 4, allocator)
+ 	f.sla_breach = make([dynamic][2]bool, 0, 4, allocator)
+ 	f.drop_sites = make([dynamic]Drop_Site, 0, 8, allocator) // 4.2
++	// S5: the ledger arrays are made here (capacity 1) so run_destroy's
++	// deletes are always over live allocations (the layout pass resizes on
++	// first use; the mirror-fixture rule).
++	f.residency.slot_tick = make([dynamic]u64, 0, 1, allocator)
++	f.residency.ticks = make([dynamic]u32, 0, 1, allocator)
++	f.serviced_this_tick = make([dynamic]u64, 0, 16, allocator) // S5/F2
+ }
+ 
+ flow_destroy :: proc(f: ^Flow_State) {
+@@ -133,6 +177,9 @@ flow_destroy :: proc(f: ^Flow_State) {
+ 	delete(f.sla)
+ 	delete(f.sla_breach)
+ 	delete(f.drop_sites) // 4.2
++	delete(f.residency.slot_tick) // S5
++	delete(f.residency.ticks)
++	delete(f.serviced_this_tick) // S5/F2
+ }
+ 
+ // flow_seed_demand — append a trivial legacy demand entry (run setup; the
+@@ -175,20 +222,26 @@ flow_spawn :: proc(f: ^Flow_State, class: u16, src, dst: u32, tick: u64) {
+ // run genuinely contends.
+ 
+ // event_emit_drop — append a Packet_Dropped event with its payload (3.3,
+-// ODN-14): the dropped class + the Drop_Reason + (4.2) the shed bundle. The serializer writes the
+-// payload tag-conditionally, so pre-3.3 event streams stay byte-identical.
++// ODN-14): the dropped class + the Drop_Reason + (4.2) the shed bundle +
++// (S4/AV-2) the shed port's direction. The serializer writes the payload
++// tag-conditionally, so pre-3.3 event streams stay byte-identical.
++// v2-arch-egress S4 (AV-1/AV-2): `target` STAYS the bundle id (the port never
++// re-keys target — the ratified spine's blocker fix); the DIRECTION rides the
++// existing tag-conditional Event.direction payload slot (the SLA-crossing
++// precedent — no new field; events are regenerated and the action log is
++// commands, so LOG_VERSION stays 6 and old logs replay unchanged).
+ // 3.4: every emitted drop is an SLA loss — sla_count_drop rides here so the
+ // accounting cannot drift from the event stream (the dropped half of the
+ // pinned invariant; the 2.3 silent severance cull — which emits NO event —
+ // counts explicitly at its cull site).
+-event_emit_drop :: proc(state: ^Run_State, tick: u64, class: u16, reason: Drop_Reason, bundle: u32) {
++event_emit_drop :: proc(state: ^Run_State, tick: u64, class: u16, reason: Drop_Reason, bundle: u32, dir: u8) {
+ 	sla_count_drop(&state.flow, class)
+-	append(&state.events, Event{tick = tick, tag = EVENT_TAG_PACKET_DROPPED, class = class, reason = u8(reason), target = bundle})
++	append(&state.events, Event{tick = tick, tag = EVENT_TAG_PACKET_DROPPED, class = class, reason = u8(reason), target = bundle, direction = dir})
+ 	// 4.2 (W6): the per-tick drop-site scratch — the crisis engine's sim input.
+ 	// The event above is the serialized record; this is the engine's read (the
+ 	// app never drains the event buffer, and a future drain must never change
+ 	// sim behavior).
+-	append(&state.flow.drop_sites, Drop_Site{class = class, reason = reason, bundle = bundle})
++	append(&state.flow.drop_sites, Drop_Site{class = class, reason = reason, bundle = bundle, dir = dir})
+ }
+ 
+ // --- 3.4: per-class SLA accounting + breach evaluation ------------------------
+@@ -395,6 +448,135 @@ bundle_lane_ready :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32) -> (ready:
+ 	return
+ }
+ 
++// --- v2-arch-egress S1: the egress-port identity (AD-2, ratified spine ----
++// 2026-08-26). The logical queue key is (router, egress-port, lane) where
++// egress-port = the DIRECTIONAL bundle (node pair + direction) — the
++// store-and-forward model's port (AD-1). PHYSICAL ENCODING STAYS DERIVED
++// (D2): an on-edge packet's (edge, heading) resolves its port; the packet's
++// RETAINED DEPARTURE NODE (at_node at forward time) IS the port's router —
++// pinned CANONICAL by the spine's adversarial gate; the render's
++// other-endpoint(edge, heading) derivation coincides by construction
++// (pinned by test). Direction encoding: 0 = lo→hi (departing the canonical
++// pair's MIN endpoint), 1 = hi→lo.
++//
++// S1 shipped the identity + the directional read twins; the ladder has
++// since completed — the serve pass (S2), the serialization term (S3), the
++// E9 admission bound + drop ladder (S4) and the crisis/warnings/stats
++// reads all key by the PORT now (the S1 invisibility contract held: zero
++// re-bless at S1, pinned byte-identity). The undirected bundle_* twins
++// above are the spine-authorized LEGACY view — bundle_lane_count stays
++// live (the stats P-rows' per-lane columns); the orphaned ones retire with
++// the link-vocab render heists (their surface, not this job's).
++
++PORT_DIR_COUNT    :: 2
++PORT_DIR_LO_TO_HI :: u8(0) // departure endpoint == bundle_lo
++PORT_DIR_HI_TO_LO :: u8(1) // departure endpoint == bundle_hi
++
++// port_dir_of_packet — the egress direction an ON-EDGE packet rides: derived
++// from its retained departure node (at_node — set when the packet forwarded
++// on, never cleared while on-edge): departing the pair's lo endpoint = 0,
++// else 1. CANONICAL per AD-2: at_node names the router whose port the packet
++// queues at; the heading-based derivation (heading == the pair's hi endpoint)
++// coincides by construction (pinned in egress_test.odin).
++port_dir_of_packet :: proc(state: ^Run_State, p: ^Packet) -> u8 {
++	b, ok := bundle_of_pipe(state, p.edge)
++	if !ok || int(b) >= len(state.bundles.bundle_lo) {
++		return PORT_DIR_LO_TO_HI // defensive — unresolvable membership (never live)
++	}
++	if p.at_node == state.bundles.bundle_lo[b] {
++		return PORT_DIR_LO_TO_HI
++	}
++	return PORT_DIR_HI_TO_LO
++}
++
++// port_dir_of_router — the direction of the port a router OWNS on a bundle:
++// the router sitting at the pair's lo endpoint departs dir 0, the hi endpoint
++// dir 1. The admission-side twin of port_dir_of_packet (which reads the
++// on-edge packet's retained departure node — the same resolution at forward
++// time).
++port_dir_of_router :: proc(state: ^Run_State, bi: u32, node: u32) -> u8 {
++	if int(bi) >= len(state.bundles.bundle_lo) {
++		return PORT_DIR_LO_TO_HI // defensive — never live
++	}
++	if node == state.bundles.bundle_lo[bi] {
++		return PORT_DIR_LO_TO_HI
++	}
++	return PORT_DIR_HI_TO_LO
++}
++
++// egress_router_of_port — the router node id that OWNS a port: the departure
++// endpoint of its direction (lo for dir 0, hi for dir 1). The buffering +
++// scheduling unit of AD-1.
++egress_router_of_port :: proc(state: ^Run_State, bi: u32, dir: u8) -> u32 {
++	if int(bi) >= len(state.bundles.bundle_lo) {
++		return 0 // defensive — never live (bundles_rebuild sizes the arrays)
++	}
++	if dir == PORT_DIR_HI_TO_LO {
++		return state.bundles.bundle_hi[bi]
++	}
++	return state.bundles.bundle_lo[bi]
++}
++
++// port_lane_count — the queue depth of a (bundle, direction, lane) port
++// queue: on-edge packets of the bundle riding `dir`, resolved to the lane.
++// Directional twin of bundle_lane_count (same exclude contract — a pending
++// shed is not part of the queue the next arrival sees). Array-order walk
++// (deterministic, ODN-10).
++port_lane_count :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, dir: u8, lane: u8, exclude: []int = nil) -> u32 {
++	n: u32 = 0
++	for i in 0..<len(state.flow.packets) {
++		p := &state.flow.packets[i]
++		if p.delivered || !p.on_edge { continue }
++		if lane_drop_pending(exclude, i) { continue }
++		b, ok := bundle_of_pipe(state, p.edge)
++		if !ok || b != bi { continue }
++		if port_dir_of_packet(state, p) != dir { continue }
++		if bundle_lane_of(state, cat, p) == lane { n += 1 }
++	}
++	return n
++}
++
++// newest_in_port_lane — the index of the NEWEST (last array-order) packet in
++// a port queue's lane, or -1 — the E9 shed target once S4 re-keys the ladder.
++// Same contract as newest_in_bundle_lane, directionally scoped.
++newest_in_port_lane :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, dir: u8, lane: u8, exclude: []int = nil) -> int {
++	for i := len(state.flow.packets) - 1; i >= 0; i -= 1 {
++		p := &state.flow.packets[i]
++		if p.delivered || !p.on_edge { continue }
++		if lane_drop_pending(exclude, i) { continue }
++		b, ok := bundle_of_pipe(state, p.edge)
++		if !ok || b != bi { continue }
++		if port_dir_of_packet(state, p) != dir { continue }
++		if bundle_lane_of(state, cat, p) == lane { return i }
++	}
++	return -1
++}
++
++// port_lane_ready — which lanes of a PORT have queued packets this tick (the
++// E7 floor + gap-fill read once S2 splits the serve pass). Directional twin
++// of bundle_lane_ready; early-out when all three.
++port_lane_ready :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, dir: u8) -> (ready: [LANE_COUNT]bool) {
++	for i in 0..<len(state.flow.packets) {
++		p := &state.flow.packets[i]
++		if p.delivered || !p.on_edge { continue }
++		b, ok := bundle_of_pipe(state, p.edge)
++		if !ok || b != bi { continue }
++		if port_dir_of_packet(state, p) != dir { continue }
++		ready[bundle_lane_of(state, cat, p)] = true
++		if ready[0] && ready[1] && ready[2] { break }
++	}
++	return
++}
++
++// port_lane_caps — a port's per-lane WFQ caps: Σ member pipe lane_caps
++// (exactly bundle_lane_caps — the R2 ruling: weights stay per-pipe, a port's
++// caps = summed member caps). IDENTICAL for both directions of a pair (the
++// members are full-duplex fibers; each direction serves at the member rates
++// — AD-5). Named twin for the port vocabulary; bundle_lane_caps IS the value.
++port_lane_caps :: proc(state: ^Run_State, bi: u32) -> [3]u32 {
++	return bundle_lane_caps(state, bi)
++}
++
+ // flow_remove_at — splice a packet out of the in-flight array, preserving
+ // order (the drop path — no new Packet field, no `delivered` misuse). The
+ // caller must pass indices collected against the CURRENT array and apply them
+@@ -406,18 +588,35 @@ flow_remove_at :: proc(f: ^Flow_State, idx: int) {
+ 	pop(&f.packets)
+ }
+ 
++// packet_demand_units — the TOTAL bandwidth units a packet of `class` needs
++// to cross one edge (D-2 WIRED — the spine's named story): bandwidth_demand ×
++// packet_bandwidth. The catalog field was loaded-but-unwired at the 2026-08-23
++// real-ladder rebalance; this is its landing in the AD-3(c) serialization
++// term — a DELIBERATE balance change (the disclosure): streaming's demand ×2
++// takes 8→16 transit ticks at the 100 u/s standard tier (ceil(1600/100)),
++// email unchanged at 8 (ceil(800/100)). Defensive: an out-of-catalog class
++// reads the uniform 1× (never zero — the serve math divides by it).
++packet_demand_units :: proc(cat: ^Catalogs, class: u16) -> u32 {
++	demand := i32(1)
++	if int(class) < len(cat.packet_types) && cat.packet_types[class].bandwidth_demand > 0 {
++		demand = cat.packet_types[class].bandwidth_demand
++	}
++	return u32(demand) * u32(cat.balance.packet_bandwidth)
++}
++
+ // serve_bundle_lane — serve up to `avail` bandwidth-units to one lane queue
+-// of a bundle (FIFO in array order): each queued packet consumes
+-// min(need, avail); a packet whose need is met arrives at its heading
+-// (delivered at dst → score + Packet_Arrived — the 1.3 arrival semantics).
+-// `skip` holds the packet ids that forwarded THIS tick — they joined the
+-// queue but do NOT consume bandwidth until next tick (the one-hop-per-tick
+-// convention). Returns the units actually consumed (a packet with a small
+-// residual need consumes less than the budget — the residual flows to the
+-// next window).
+-serve_bundle_lane :: proc(state: ^Run_State, cat: ^Catalogs, tick: u64, bi: u32, lane: u8, avail_in: u32, skip: []u64) -> u32 {
++// of a (bundle, DIRECTION) port (FIFO in array order): each queued packet
++// consumes min(need, avail); a packet whose need is met arrives at its
++// heading (delivered at dst → score + Packet_Arrived — the 1.3 arrival
++// semantics). v2-arch-egress S2 (AD-5): the queue is DIRECTIONAL — only
++// packets whose port direction is `dir` are members (port_dir_of_packet, the
++// at_node-canonical derivation). `skip` holds the packet ids that forwarded
++// THIS tick — they joined the queue but do NOT consume bandwidth until next
++// tick (the one-hop-per-tick convention — AD-3(a), the join convention).
++// Returns the units actually consumed (a packet with a small residual need
++// consumes less than the budget — the residual flows to the next window).
++serve_bundle_lane :: proc(state: ^Run_State, cat: ^Catalogs, tick: u64, bi: u32, dir: u8, lane: u8, avail_in: u32, skip: []u64) -> u32 {
+ 	f := &state.flow
+-	bandwidth := u32(cat.balance.packet_bandwidth)
+ 	served: u32 = 0
+ 	avail := avail_in
+ 	for i in 0..<len(f.packets) {
+@@ -436,14 +635,21 @@ serve_bundle_lane :: proc(state: ^Run_State, cat: ^Catalogs, tick: u64, bi: u32,
+ 		}
+ 		b, ok := bundle_of_pipe(state, p.edge)
+ 		if !ok || b != bi { continue }
++		if port_dir_of_packet(state, p) != dir { continue }
+ 		if bundle_lane_of(state, cat, p) != lane { continue }
+-		need := bandwidth - p.progress_units // progress < bandwidth for a live on-edge packet
++		total := packet_demand_units(cat, p.class) // D-2: the class's own demand (streaming jumbo ×2)
++		need := total - p.progress_units // progress < total for a live on-edge packet
+ 		if need == 0 { continue } // defensive — arrived packets are flagged, never served
+ 		give := min(need, avail)
+ 		p.progress_units += give
+ 		avail -= give
+ 		served += give
+-		if p.progress_units >= bandwidth {
++		// S5/F2: the id was SERVICED this tick (the serialization term (c) —
++		// the residency ledger (b) counts only packets the scheduler has not
++		// reached); folded straight into the per-tick scratch (cleared at the
++		// top of flow_step, like drop_sites).
++		append(&f.serviced_this_tick, p.id)
++		if p.progress_units >= total {
+ 			// arrived at the far endpoint (the Packet_Arrived event emits from
+ 			// the CULL pass — array order, so the same-tick event stream keeps
+ 			// spawn order exactly like the 2.x single-pass model, F6)
+@@ -508,7 +714,7 @@ flow_try_spawn :: proc(state: ^Run_State, cat: ^Catalogs, class: u16, src, dst:
+ 		if shed_idx >= 0 && shed_lane > arrive_lane {
+ 			// the target is STRICTLY lower priority than the arrival — a
+ 			// lower-priority resident pays (the ladder's letter: BE drops first)
+-			event_emit_drop(state, tick, f.packets[shed_idx].class, .Pool_Exhaustion, NO_BUNDLE)
++			event_emit_drop(state, tick, f.packets[shed_idx].class, .Pool_Exhaustion, NO_BUNDLE, PORT_DIR_LO_TO_HI)
+ 			flow_remove_at(f, shed_idx)
+ 		} else {
+ 			// the arrival is the lowest-priority candidate present (its lane is
+@@ -518,7 +724,7 @@ flow_try_spawn :: proc(state: ^Run_State, cat: ^Catalogs, class: u16, src, dst:
+ 			// WAS a demand attempt (3.4): demand_seen counts it; the drop event
+ 			// (below) counts dropped. The invariant demand_seen == delivered +
+ 			// dropped + live holds — the arrival contributes 1 to both sides.
+-			event_emit_drop(state, tick, class, .Pool_Exhaustion, NO_BUNDLE)
++			event_emit_drop(state, tick, class, .Pool_Exhaustion, NO_BUNDLE, PORT_DIR_LO_TO_HI)
+ 			sla_count_demand(&state.flow, class)
+ 			return false
+ 		}
+@@ -594,6 +800,143 @@ collect_terminals :: proc(t: ^Topology, cat: ^Catalogs, role: Terminal_Role,
+ 	return
+ }
+ 
++// --- v2-arch-egress S5: the residency ledger (AV-5) + the reads contract -----
++
++// residency_layout — (re)size the ledger for the current bundle/class layout.
++// Called at the top of the record pass; a layout shift (bundles renumber on
++// topology edits, class rows grow on first demand) RESETS the ledger (the
++// tx-ring convention — a stale ring would misattribute history). Pure resize
++// + zero: deterministic on replay (never serialized).
++residency_layout :: proc(f: ^Flow_State, n_bundles: u32, classes: u32, topo_gen: u32) {
++	keys := n_bundles * PORT_DIR_COUNT * LANE_COUNT * classes
++	if f.residency.keys == keys && f.residency.classes == classes && f.residency.layout_gen == topo_gen {
++		return
++	}
++	f.residency.keys = keys
++	f.residency.classes = classes
++	f.residency.layout_gen = topo_gen
++	n := int(keys) * RESIDENCY_WINDOW_TICKS
++	resize(&f.residency.slot_tick, n)
++	resize(&f.residency.ticks, n)
++	for i in 0..<n {
++		f.residency.slot_tick[i] = 0
++		f.residency.ticks[i] = 0
++	}
++}
++
++// residency_record_tick — the serve-pass tail: ONE on-edge tick per waiting
++// packet, folded into its (port, lane, class) key. Residency (b) begins the
++// tick AFTER the join (F2: the join tick itself is the processing term (a),
++// never wait time) — `forwarded` (this tick's joiners) and `serviced` (this
++// tick's serialization term (c)) are excluded. Called at the END of flow_step
++// over the CULL survivors. The per-slot staleness + rolling-sum update is the
++// health-ring pattern. NOTE (the N9 class, the tx ring's accepted hazard): a
++// same-tick re-step DOUBLE-COUNTS the waiting packets into one slot —
++// production never re-steps (the step contract; the harness drains per step
++// and the app never re-steps), and the stats stream's live==replay
++// byte-compare catches any divergence. Cost: O(waiting x (joiners+serviced))
++// linear scans per tick — the step's densest walk, bounded by the pool cap
++// (512) at current scale; fine until profiling says otherwise.
++residency_record_tick :: proc(f: ^Flow_State, state: ^Run_State, cat: ^Catalogs, tick: u64, forwarded: []u64, serviced: []u64) {
++	classes := u32(max(1, len(f.sla)))
++	if state.bundles.n == 0 {
++		return
++	}
++	residency_layout(f, state.bundles.n, classes, state.topology.gen)
++	r := &f.residency
++	W := u64(RESIDENCY_WINDOW_TICKS)
++	for i in 0..<len(f.packets) {
++		p := &f.packets[i]
++		if p.delivered || !p.on_edge { continue }
++		joined := false
++		for s in forwarded {
++			if s == p.id { joined = true; break }
++		}
++		if joined { continue } // the join tick is processing (a), not residency (b)
++		in_service := false
++		for s in serviced {
++			if s == p.id { in_service = true; break }
++		}
++		if in_service { continue } // being serialized this tick — term (c), not (b)
++		b, ok := bundle_of_pipe(state, p.edge)
++		if !ok { continue }
++		dir := port_dir_of_packet(state, p)
++		lane := bundle_lane_of(state, cat, p)
++		class := u32(p.class)
++		if class >= classes { class = classes - 1 } // defensive — a beyond-sla class clamps
++		key := ((u32(b) * PORT_DIR_COUNT + u32(dir)) * LANE_COUNT + u32(lane)) * classes + class
++		slot := int(key) * RESIDENCY_WINDOW_TICKS + int(tick % W)
++		if r.slot_tick[slot] != tick {
++			// stale slot: reset (slot reuse OVERWRITES, never accumulates)
++			r.ticks[slot] = 0
++			r.slot_tick[slot] = tick
++		}
++		r.ticks[slot] += 1
++	}
++}
++
++// port_residency_ticks — the (port, lane, class) key's rolling packet-ticks
++// over the last RESIDENCY_WINDOW_TICKS (the queue-wait attribution term —
++// AD-7's latency read: observed on-edge ticks vs the uncontended baseline
++// ceil(demand/line_rate) is the analytical split of ONE serve mechanism,
++// the spine's I1 convention). The read folds STALENESS itself (the tx-ring
++// pattern, bundle_tx_window: a key that goes idle keeps its last slots in
++// `win`, but only slots written inside (tick-W, tick] count — an idle port
++// reads 0, never a frozen forever-stale figure). O(W) per read; reads are
++// panel/NOC-frequency, never per-packet.
++port_residency_ticks :: proc(f: ^Flow_State, tick: u64, bi: u32, dir: u8, lane: u8, class: u16) -> u64 {
++	r := &f.residency
++	if r.classes == 0 || int(class) >= int(r.classes) {
++		return 0
++	}
++	key := ((bi * PORT_DIR_COUNT + u32(dir)) * LANE_COUNT + u32(lane)) * r.classes + u32(class)
++	if int(key) >= int(r.keys) {
++		return 0 // defensive — a pre-layout read
++	}
++	W := u64(RESIDENCY_WINDOW_TICKS)
++	lo := u64(0)
++	if tick > W {
++		lo = tick - W // (tick-W, tick] — W ticks inclusive
++	}
++	sum: u64 = 0
++	base := int(key) * RESIDENCY_WINDOW_TICKS
++	for s in 0..<RESIDENCY_WINDOW_TICKS {
++		if r.slot_tick[base + s] > lo && r.slot_tick[base + s] <= tick {
++			sum += u64(r.ticks[base + s])
++		}
++	}
++	return sum
++}
++
++// router_buffering_packets — a router's BUFFERING read (AD-7/AV-6): the sum
++// of its ports' queue depths (all lanes — the at-rest aggregate; per-port on
++// focus). At-node unadmitted stuck packets are a SEPARATE read (the 4.1
++// telegraph — never folded into buffering). Pure walk over the router's
++// incident bundles' ports (the router owns the port DEPARTING it).
++router_buffering_packets :: proc(state: ^Run_State, cat: ^Catalogs, router: u32) -> u32 {
++	n: u32 = 0
++	for bi in u32(0)..<state.bundles.n {
++		for dir in u8(0)..<PORT_DIR_COUNT {
++			if egress_router_of_port(state, bi, dir) != router { continue }
++			for lane in u8(0)..<LANE_COUNT {
++				n += port_lane_count(state, cat, bi, dir, lane)
++			}
++		}
++	}
++	return n
++}
++
++// port_util_pct — a PORT's honest utilization (AD-7/AV-4): the direction's
++// transmitted work over the window ÷ (the PER-DIRECTION cap × window) — the
++// denominator is ALWAYS the per-direction cap (never Σ, never the pair's).
++port_util_pct :: proc(state: ^Run_State, tick: u64, bi: u32, dir: u8) -> u32 {
++	if int(bi) >= int(state.bundles.n) || state.bundles.bundle_cap[bi] == 0 {
++		return 0
++	}
++	w := bundle_tx_window(&state.bundles, tick, bi, dir)
++	return util_pct_window(w, UTIL_WINDOW_TICKS, state.bundles.bundle_cap[bi])
++}
++
+ // --- 5.9: the per-terminal spawn accumulator (endpoints never self-congest) --
+ // Integer milli-packet fixed-point (ODN-10): a source spawn costs
+ // SPAWN_CREDIT_COST milli; a terminal is pickable only while its credit is at
+@@ -703,6 +1046,9 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 	// run, appended by event_emit_drop. The crisis engine reads ONLY this
+ 	// tick's sites (no stale entries, no event-buffer dependency).
+ 	clear(&f.drop_sites)
++	// S5/F2: the serviced-id scratch likewise per-tick (the serve pass folds
++	// its per-lane unions in; the residency record reads it at the end).
++	clear(&f.serviced_this_tick)
+ 
+ 	// 0. QoS lane allocation (3.2, ODN-3): rebuild the DERIVED per-pipe lane
+ 	// caps when the topology changed (same rule-1 gen trigger as the routing /
+@@ -877,28 +1223,32 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 		}
+ 		pick := ecmp_pick(p.src, p.dst, u8(p.class), p.id, count) // 3.1: per-class ECMP hash (flow affinity by class)
+ 		hop := state.routing.hops[int(offset) + int(pick)]
+-		// 3.3 E9 — the contention drop precedence at admission. When the target
+-		// (bundle, lane) queue is at its bound (lane_queue_packets), the pipe
+-		// sheds the NEWEST packet of the LOWEST-priority non-empty lane (full
+-		// ladder BE → Standard → Express); the arriving packet itself drops
+-		// when it IS the shed target (its lane is the lowest non-empty — the
+-		// queue keeps its bound). A lower-priority shed pays for the arrival.
++		// 3.3 E9 — the contention drop precedence at admission.
++		// v2-arch-egress S4 (AD-4/R4): the bound + the shed ladder are re-keyed
++		// to the (bundle, DIRECTION, lane) PORT queue — bound 6 per port lane
++		// (semantics unchanged: the ladder BE → S → E, newest-of-lowest shed,
++		// the arrival itself drops when it IS the shed target; the bound IS
++		// the arrival-exceeds-drain drop). The arrival's port resolves from
++		// its DEPARTURE node (at_node — the canonical router derivation, the
++		// same resolution the on-edge packets carry). Drop events carry the
++		// port's direction (AV-2) with target = the bundle id (AV-1).
+ 		admit := true
+ 		if b, okb := bundle_of_pipe(state, hop.pipe); okb {
++			dir := port_dir_of_router(state, b, p.at_node)
+ 			lane := qos_lane_of(&state.topology, cat, hop.pipe, p.class)
+-			if bundle_lane_count(state, cat, b, lane, drops[:]) >= u32(cat.balance.lane_queue_packets) {
++			if port_lane_count(state, cat, b, dir, lane, drops[:]) >= u32(cat.balance.lane_queue_packets) {
+ 				shed_idx := -1
+-				for l := LANE_BEST_EFFORT; ; l -= 1 { // BE → S → E
+-					if bundle_lane_count(state, cat, b, l, drops[:]) > 0 {
+-						shed_idx = newest_in_bundle_lane(state, cat, b, l, drops[:])
++				for l := LANE_BEST_EFFORT; ; l -= 1 { // BE → S → E — the PORT's lanes
++					if port_lane_count(state, cat, b, dir, l, drops[:]) > 0 {
++						shed_idx = newest_in_port_lane(state, cat, b, dir, l, drops[:])
+ 						if l != lane {
+ 							// a lower-priority queued packet pays for the arrival
+-							event_emit_drop(state, tick, state.flow.packets[shed_idx].class, .Queue_Overflow, b)
++							event_emit_drop(state, tick, state.flow.packets[shed_idx].class, .Queue_Overflow, b, dir)
+ 							append(&drops, shed_idx)
+ 						} else {
+ 							// the arriving packet is the shed target — it drops,
+ 							// never joining the queue
+-							event_emit_drop(state, tick, p.class, .Queue_Overflow, b)
++							event_emit_drop(state, tick, p.class, .Queue_Overflow, b, dir)
+ 							append(&drops, i)
+ 							admit = false
+ 						}
+@@ -953,45 +1303,53 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 		p.waiting_ticks = 0 // 4.1: a severed drop-back re-tries fresh next tick
+ 	}
+ 
+-	// 4. SERVE — 3.3 node serialization (ODN-3): per bundle, serve the on-edge
+-	// lane queues in cyclic WRR windows. One window = one Express → Standard →
+-	// Best walk; each ready lane is entitled to its WFQ budget (Σ member
+-	// lane_caps), floored to a 1-unit quantum when its budget is zero (E7 — ≥1
+-	// slot per non-empty lane per window, no starvation under continuous
+-	// Express); empty lanes are skipped so their entitlement flows to the next
+-	// ready lane in the walk (work-conserving gap-fill — the pipe is never
+-	// idle while a packet waits). Windows repeat until the bundle's capacity is
+-	// consumed or nothing is ready — a lone packet in ANY lane therefore gets
+-	// the FULL capacity (existing light-demo transits unchanged). Within a
+-	// lane the queue is FIFO in array order (deterministic; join-order nuance
+-	// documented in the spec).
++	// 4. SERVE — 3.3 node serialization (ODN-3) + v2-arch-egress S2 (AD-5,
++	// ruling R1: FULL DUPLEX). Each direction of a bundle is its own port
++	// queue with its OWN bundle_cap serve budget (a 1 Gbps link is 1 Gbps
++	// each way — a reverse-direction stream no longer competes for the
++	// forward budget; same-direction estate contention survives). Per port,
++	// serve the on-edge lane queues in cyclic WRR windows: one window = one
++	// Express → Standard → Best walk; each ready lane is entitled to its WFQ
++	// budget (Σ member lane_caps — identical per direction, R2), floored to a
++	// 1-unit quantum when its budget is zero (E7 — ≥1 slot per non-empty lane
++	// per window, no starvation under continuous Express); empty lanes are
++	// skipped so their entitlement flows to the next ready lane in the walk
++	// (work-conserving gap-fill — the port is never idle while a packet
++	// waits). Windows repeat until the port's capacity is consumed or nothing
++	// is ready — a lone packet in ANY lane therefore gets the FULL capacity.
++	// Within a lane the queue is FIFO in array order (deterministic). The
++	// enumeration order (bundle slot asc, heading asc) is PINNED — AV-3's
++	// belt: non-load-bearing under independent budgets, pinned anyway. The tx
++	// utilization ring records per (bundle, direction).
+ 	for bi in u32(0)..<state.bundles.n {
+-		remaining := state.bundles.bundle_cap[bi]
+-		if remaining == 0 {
+-			continue
+-		}
+-		caps := bundle_lane_caps(state, bi)
+-		bundle_served: u32 = 0 // v2-network-units: this tick's transmission work (the honest tx counter)
+-		for {
+-			ready := bundle_lane_ready(state, cat, bi)
+-			budget := qos_serialize(caps, ready, remaining)
+-			window_served: u32 = 0
+-			for lane in 0..<LANE_COUNT {
+-				if budget[lane] == 0 {
+-					continue
+-				}
+-				window_served += serve_bundle_lane(state, cat, tick, bi, u8(lane), budget[lane], forwarded[:])
+-			}
+-			bundle_served += window_served
+-			if window_served == 0 {
+-				break // nothing ready / nothing served — drained or degenerate
+-			}
+-			remaining -= window_served
++		caps := bundle_lane_caps(state, bi) // the port's lane caps (identical per direction, R2)
++		for dir in u8(0)..<PORT_DIR_COUNT {
++			remaining := state.bundles.bundle_cap[bi] // FULL budget per direction (full duplex)
+ 			if remaining == 0 {
+-				break
++				continue
+ 			}
++			dir_served: u32 = 0 // this tick's transmission work for THIS port (the honest tx counter)
++			for {
++				ready := port_lane_ready(state, cat, bi, dir)
++				budget := qos_serialize(caps, ready, remaining)
++				window_served: u32 = 0
++				for lane in 0..<LANE_COUNT {
++					if budget[lane] == 0 {
++						continue
++					}
++					window_served += serve_bundle_lane(state, cat, tick, bi, dir, u8(lane), budget[lane], forwarded[:])
++				}
++				dir_served += window_served
++				if window_served == 0 {
++					break // nothing ready / nothing served — drained or degenerate
++				}
++				remaining -= window_served
++				if remaining == 0 {
++					break
++				}
++			}
++			bundle_tx_record(&state.bundles, tick, bi, dir, dir_served)
+ 		}
+-		bundle_tx_record(&state.bundles, tick, bi, bundle_served)
+ 	}
+ 
+ 	// 5. CULL delivered packets + packets stranded at a tombstoned node (2.3),
+@@ -1039,6 +1397,15 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 	}
+ 	delete(survivors)
+ 
++	// 5.5 v2-arch-egress S5 (AV-5): the residency ledger's per-tick record —
++	// the cull survivors still on-edge are the settled queue; this tick's
++	// joiners (their tick was the processing term (a)) AND this tick's
++	// serviced packets (the serialization term (c) — the head-of-line is in
++	// service, never waiting) are excluded: what remains is exactly (b), the
++	// ticks the scheduler has not reached the packet (F2: a+b+c sums to
++	// delivery−spawn EXACTLY). DERIVED scratch — never serialized.
++	residency_record_tick(f, state, cat, tick, forwarded[:], f.serviced_this_tick[:])
++
+ 	// 6. SLA breach evaluation (3.4, ODN-3 §5.2/ODN-14) — AFTER the cull, so
+ 	// the accumulators are final for the tick. Per class with completed
+ 	// demand: loss % and avg latency vs the catalog tolerances; transitions
+@@ -1050,13 +1417,17 @@ flow_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 
+ // packet_progress_frac — the cosmetic along-edge fraction in Q8 (0..256) for
+ // the render: 0 at the departure node, 256 at `heading`. Pure function of the
+-// packet's edge state + the catalog bandwidth (the view reads this; ODN-1).
+-// At-node packets return 0 (the render places them at `at_node`).
+-packet_progress_frac :: proc(p: ^Packet, bandwidth: u32) -> u32 {
+-	if !p.on_edge || bandwidth == 0 {
++// packet's edge state + its class's D-2 demand total (the view reads this;
++// ODN-1). At-node packets return 0 (the render places them at `at_node`).
++packet_progress_frac :: proc(p: ^Packet, cat: ^Catalogs) -> u32 {
++	if !p.on_edge {
+ 		return 0
+ 	}
+-	frac := (u64(p.progress_units) * 256 + u64(bandwidth)/2) / u64(bandwidth) // rounded
++	total := u64(packet_demand_units(cat, p.class))
++	if total == 0 {
++		return 0 // defensive — packet_demand_units never returns 0 for real catalogs
++	}
++	frac := (u64(p.progress_units) * 256 + total/2) / total // rounded
+ 	if frac > 256 {
+ 		frac = 256
+ 	}
+diff --git a/core/health_test.odin b/core/health_test.odin
+index 6ee8d13..91a3512 100644
+--- a/core/health_test.odin
++++ b/core/health_test.odin
+@@ -213,9 +213,11 @@ test_health_windowed_breach_recovers :: proc(t: ^testing.T) {
+ 	health_narrow_fixture(&s, cat)
+ 	s.health_enabled = true
+ 	// phase 1: saturate — the narrow path fills the E9 lane bound within a
+-	// few ticks (2 streaming/tick vs 0.083/tick service), sheds accrue, and
+-	// the windowed loss breaches at ~tick 5 (Grace_Started).
+-	step_n(&s, 60, cat)
++	// few ticks, sheds accrue, and the windowed latch breaches. D-2
++	// (v2-arch-egress S3) re-pin: the doubled streaming serialization (1600
++	// units) pushes the first delivery — and with it the windowed LATENCY
++	// breach — to t=85 (was ~53; measured).
++	step_n(&s, 90, cat)
+ 	stream := u16(1)
+ 	testing.expectf(t, s.health.breach[stream], "streaming must breach under saturation")
+ 	testing.expectf(t, health_count_tag(s.events[:], EVENT_TAG_GRACE_STARTED) == 1,
+@@ -408,23 +410,23 @@ test_health_grace_refill_gradual :: proc(t: ^testing.T) {
+ 	s.era = 3
+ 	health_narrow_fixture(&s, cat)
+ 	s.health_enabled = true
+-	// burn the grace fully: breach ~7 + expiry ~407 (Grace_Expired). The fix
+-	// lands LATE in the grace (300 — the countdown keeps burning through the
+-	// stuck window: the exit at ~479 lands just AFTER the expiry — the grace
+-	// is SPENT and the meter drains 428..479 (the mid-drain survival band).
+-	// 2026-08-21 pace re-pin: at the 4x pace the post-fix exit lands ~179
+-	// ticks after the fix (vs ~192 before), and the expiry at ~428 — a fix
+-	// at 241 would exit at ~420, 8 ticks BEFORE the expiry (the grace freezes
+-	// at 8, the meter never drains — measured); 300 clears the expiry.
+-	step_n(&s, 299, cat)
+-	health_apply_fix(&s, cat, 300)
+-	step_n(&s, 150, cat) // tick 450: past the expiry (~432) — the meter drains
++	// burn the grace fully: breach ~28 + expiry ~427 (Grace_Expired). D-2
++	// (v2-arch-egress S3) re-pin (measured, F-swept 220..300): the doubled
++	// serialization holds the pre-fix losses in the 200-tick window longer —
++	// the post-fix exit lands at ~fix+186, the expiry is pinned at 427, and
++	// the drain death at ~477 (the old fix at 300 now exits PAST the death —
++	// measured TERMINAL at 476). The fix at 275 centers the exit (~461) in
++	// the survival band (427, 477): the grace burns fully, the meter drains
++	// ~30 ticks mid-flight, and the run survives.
++	step_n(&s, 274, cat)
++	health_apply_fix(&s, cat, 275)
++	step_n(&s, 175, cat) // tick 450: past the expiry (427), pre-exit (461) — the meter mid-drain
+ 	_ = s
+ 	testing.expectf(t, health_count_tag(s.events[:], EVENT_TAG_GRACE_EXPIRED) == 1, "the grace must expire under sustained breach")
+ 	testing.expectf(t, s.health.grace[1].grace_left == 0, "a spent grace reads 0, got %d", s.health.grace[1].grace_left)
+ 	testing.expectf(t, s.health.meter_pct < 100, "the meter must be draining, got %d", s.health.meter_pct)
+-	// scan per tick for the first refill value: the exit ~479, the 50-tick
+-	// streak gate (the refill starts ~529), then the gradual refill — the
++	// scan per tick for the first refill value: the exit ~461, the 50-tick
++	// streak gate (the refill starts ~511), then the gradual refill — the
+ 	// first refilled value must be exactly grace_refill_per_tick (5), never
+ 	// a jump to the full 400. (The scan starts at 450 — past the expiry, so
+ 	// grace_left reads 0 through the burning tail and the first >0 is the
+@@ -484,13 +486,14 @@ test_health_drain_max_not_sum_e16 :: proc(t: ^testing.T) {
+ 	// max-not-sum assertion window — step to 230.
+ 	// real-ladder re-pin (measured): the email's latency breach enters at
+ 	// ~216 (the deep queue behind the raised host's streaming), the streaming
+-	// at ~39. The two-class overlap band needs the email's grace to expire
+-	// BEFORE the streaming-driven death (~239 + 100/2 = 289): email grace 60
+-	// -> post-grace ~276, band [276, 289] — step to 280 and assert the drain
+-	// ticks 280..284.
+-	cat.packet_types[0].health_grace_ticks = 60
++	// at ~36. D-2 (v2-arch-egress S3) re-pin (measured): the streaming grace
++	// (200) expires at ~236 and its severity-2 drain starts THEN — death at
++	// ~286. The two-class overlap band needs the email post-grace before the
++	// death: email grace 30 -> post-grace ~246, band [246, 286] — step to 250
++	// and assert the drain ticks 251..255.
++	cat.packet_types[0].health_grace_ticks = 30
+ 	cat.packet_types[1].health_grace_ticks = 200
+-	step_n(&s, 280, cat)
++	step_n(&s, 250, cat)
+ 	testing.expectf(t, !s.replay_error, "no draw may be rejected (the fixture must be fully wired)")
+ 	testing.expectf(t, s.health.breach[0] && s.health.breach[1], "both classes must be breached")
+ 	testing.expectf(t, s.health.grace[0].grace_left == 0 && s.health.grace[1].grace_left == 0,
+@@ -727,24 +730,25 @@ test_health_no_soft_lock_property :: proc(t: ^testing.T) {
+ 
+ 	// (b) recoverable-until-empty: saturate, fix LATE in the grace (the exit
+ 	// needs a full window slide, so the fix must land within ~250 ticks of the
+-	// breach to beat the drain; 2026-08-21 pace re-pin: the breach at ~28, the
+-	// expiry at ~428, and the post-fix exit at ~fix+179 — the fix moves from
+-	// 241 (the exit at ~420 would beat the expiry and the meter never drains,
+-	// measured) to 300 (the exit at ~479 — the escape exists while the meter
+-	// is above 0) and the meter must climb back.
++	// breach to beat the drain). D-2 (v2-arch-egress S3) re-pin (measured,
++	// F-swept): the breach at ~28, the expiry pinned at ~427, the post-fix
++	// exit at ~fix+186, and the drain death at ~477 — the fix at 275 exits at
++	// ~461, AFTER the expiry (the meter demonstrably drains mid-flight) and
++	// BEFORE the death (the escape exists while the meter is above 0; the old
++	// fix at 300 now exits past the death — TERMINAL at 476, measured).
+ 	s2: Run_State
+ 	defer run_destroy(&s2)
+ 	run_init(&s2, 42, cat.hash, TEST_LOGIC_HZ)
+ 	s2.era = 3
+ 	health_narrow_fixture(&s2, cat)
+ 	s2.health_enabled = true
+-	step_n(&s2, 299, cat) // in grace (breach ~28, expiry ~428) — the meter still 100
+-	health_apply_fix(&s2, cat, 300)
+-	step_n(&s2, 150, cat) // tick 450: the expiry fired (~432), the meter is DRAINING (~64)
++	step_n(&s2, 274, cat) // in grace (breach ~28, expiry ~427) — the meter still 100
++	health_apply_fix(&s2, cat, 275)
++	step_n(&s2, 175, cat) // tick 450: the expiry fired (427), the meter is DRAINING (~78)
+ 	testing.expectf(t, !s2.terminal, "a mid-grace fix must not lose the run")
+ 	testing.expectf(t, s2.health.meter_pct > 0 && s2.health.meter_pct < 100,
+ 		"the meter must be mid-drain (recoverable), got %d", s2.health.meter_pct)
+-	step_n(&s2, 400, cat) // the exit ~479, then recharge to full
++	step_n(&s2, 400, cat) // the exit ~461, then recharge to full
+ 	testing.expectf(t, s2.health.meter_pct == 100,
+ 		"the meter must fully recover to 100, got %d", s2.health.meter_pct)
+ 
+diff --git a/core/qos_test.odin b/core/qos_test.odin
+index 6b27e27..1b42f92 100644
+--- a/core/qos_test.odin
++++ b/core/qos_test.odin
+@@ -517,9 +517,10 @@ test_qos_serialize_budgets :: proc(t: ^testing.T) {
+ @(test)
+ test_qos_lone_packet_full_capacity :: proc(t: ^testing.T) {
+ 	// the golden-stability keystone: a lone packet in ANY lane crosses a
+-	// standard pipe (cap 15, bandwidth 120) in 8 on-edge ticks at the
+-	// 2026-08-21 pace (the transit scales 4x with packet_bandwidth — the
+-	// work-conserving full-capacity property is what's pinned, not the 2).
++	// standard pipe (cap 100, bandwidth 800) at the FULL capacity — the
++	// work-conserving property is what's pinned. D-2 (v2-arch-egress S3): the
++	// transit is the CLASS's own demand — email/bulk 8 on-edge ticks
++	// (ceil(800/100)), streaming 16 (ceil(1600/100) — the jumbo disclosure).
+ 	// Measured per lane via the player's overrides.
+ 	classes := [3]u16{0, 1, 2}
+ 	for cls in classes {
+@@ -535,12 +536,13 @@ test_qos_lone_packet_full_capacity :: proc(t: ^testing.T) {
+ 		run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
+ 		res, rt, _ := lane_pipe_setup(&s, cat)
+ 		queue_packet(&s, cls, res, rt, false, 0, 0)
+-		// tick 1: join the queue (no consumption that tick). Ticks 2-9: the
+-		// lone packet gets the FULL capacity (15/tick via the cyclic windows).
+-		step_n(&s, 8, cat)
+-		testing.expectf(t, s.score == 0, "lane %d: not delivered after 8 ticks (transit is 8 on-edge ticks at the 4x pace)", lane)
++		// tick 1: join the queue (no consumption that tick). Ticks 2..T+1:
++		// the lone packet gets the FULL capacity via the cyclic windows.
++		transit := transit_ticks(packet_demand_units(cat, cls), 100)
++		step_n(&s, u64(transit), cat)
++		testing.expectf(t, s.score == 0, "lane %d: not delivered after %d ticks (the class's own transit)", lane, transit)
+ 		step_n(&s, 1, cat)
+-		testing.expectf(t, s.score == 1, "lane %d: lone packet crosses in 8 on-edge ticks — full capacity (work-conserving)", lane)
++		testing.expectf(t, s.score == 1, "lane %d: lone packet crosses in %d on-edge ticks — full capacity (work-conserving)", lane, transit)
+ 	}
+ }
+ 
+diff --git a/core/serialize.odin b/core/serialize.odin
+index 331a796..6d0babc 100644
+--- a/core/serialize.odin
++++ b/core/serialize.odin
+@@ -459,11 +459,17 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event, cat: ^Catalogs,
+ // drop payloads were class+reason only, so pre-4.2 event streams are NOT
+ // byte-identical; the 4.2 re-bless covers the fold) and the tags 8/9 crisis
+ // payloads (genuinely append-only).
++// v2-arch-egress S4 (AV-2): the drop + crisis payloads gain the trailing
++// DIRECTION byte — the port resolution rides the existing tag-conditional
++// Event.direction slot (the SLA-crossing precedent; no new struct field, and
++// events are REGENERATED while the action log is commands — LOG_VERSION stays
++// 6 and old logs replay unchanged). The S4 re-bless covers the byte shift.
+ w_event_payload :: proc(w: ^Writer, e: Event) {
+ 	if e.tag == EVENT_TAG_PACKET_DROPPED {
+ 		w_u16(w, e.class)
+ 		w_u8(w, e.reason)
+ 		w_u32(w, e.target) // E9: the shed bundle; E22: NO_BUNDLE
++		w_u8(w, e.direction) // S4/AV-2: the shed port's direction (0 for E22 pool sites)
+ 	}
+ 	if e.tag == EVENT_TAG_SLA_THRESHOLD_CROSSED {
+ 		w_u16(w, e.class)
+@@ -480,6 +486,7 @@ w_event_payload :: proc(w: ^Writer, e: Event) {
+ 		w_u16(w, e.class)
+ 		w_u32(w, e.target)
+ 		w_u32(w, e.pipe)
++		w_u8(w, e.direction) // S4/AV-2: the named port's direction (root_cause = (router, port))
+ 	}
+ 	if e.tag == EVENT_TAG_GRACE_STARTED || e.tag == EVENT_TAG_GRACE_EXPIRED {
+ 		w_u16(w, e.class)
+diff --git a/core/sla_test.odin b/core/sla_test.odin
+index 9d56dd3..c6dc3d5 100644
+--- a/core/sla_test.odin
++++ b/core/sla_test.odin
+@@ -128,8 +128,8 @@ test_sla_delivery_accounting :: proc(t: ^testing.T) {
+ 	sla_spawn(&s, 1, 0, res, host) // email, lone -> 850 ms (delivers at 18)
+ 	sla_spawn(&s, 21, 0, res, host) // email, lone -> 850 ms (delivers at 38)
+ 	sla_spawn(&s, 41, 0, res, host) // email, lone -> 850 ms (delivers at 58)
+-	sla_spawn(&s, 61, 1, res, host) // streaming, lone -> 850 ms (delivers at 78)
+-	record_run(&s, 90, cat)
++	sla_spawn(&s, 61, 1, res, host) // streaming, lone -> 1650 ms (D-2: 2x16+1=33 ticks; delivers at 94)
++	record_run(&s, 95, cat)
+ 
+ 	testing.expect_value(t, s.flow.sla[0].delivered, u64(3))
+ 	testing.expect_value(t, s.flow.sla[0].dropped, u64(0))
+@@ -138,7 +138,9 @@ test_sla_delivery_accounting :: proc(t: ^testing.T) {
+ 	testing.expect_value(t, s.flow.sla[1].delivered, u64(1))
+ 	testing.expect_value(t, s.flow.sla[1].dropped, u64(0))
+ 	testing.expect_value(t, s.flow.sla[1].demand_seen, u64(1))
+-	testing.expect_value(t, s.flow.sla[1].total_latency_ms, u64(850))
++	// D-2 (v2-arch-egress S3): streaming's demand 2 doubles the per-edge
++	// serialization (16 vs 8) — 2 hops + 1 join = 33 ticks = 1650 ms exact.
++	testing.expect_value(t, s.flow.sla[1].total_latency_ms, u64(1650))
+ 	sla_check_invariant(t, &s)
+ }
+ 
+@@ -223,17 +225,22 @@ test_sla_zero_demand_neutral_e24 :: proc(t: ^testing.T) {
+ @(test)
+ test_sla_breach_latency_enter_exit :: proc(t: ^testing.T) {
+ 	// Long path res(0)->j1(3)->j2(4)->j3(5) on standard pipes (8-tile hops —
+-	// within span): at the 2026-08-21 pace a lone packet spawned at S delivers
+-	// at S+26 -> 1300 ms (3 edges × 8 on-edge ticks + 2 forward ticks; the 4x
+-	// packet_bandwidth quadruples the old 400 ms). Streaming tol 1200 ->
+-	// enters breach on its first delivery (tick 27); email tol 2000 -> never
+-	// breaches on the same path (attribution — email transits 1300 ms alone
+-	// at tk+9, clear of the sibling streaming packet's shared-edge queues).
+-	// Recovery: short-path (res->rt->host, 850 ms = 2 edges × 8 + 1) deliveries
+-	// drag the CUMULATIVE average (the sla_evaluate seam — no window/margin
+-	// here; the health layer's windowed latch is a separate derived read)
+-	// under the 1200 ms tolerance -> (4×1300 + 2×850)/6 = 1150 <= 1200 -> Exit
+-	// on the 2nd short delivery (tick 185). No other crossings.
++	// within span). D-2 (v2-arch-egress S3) re-stage: streaming's demand 2
++	// doubles the per-edge serialization — a lone streaming long-path packet
++	// delivers at S+50 -> 2500 ms (3 edges × 16 + 2 forward ticks); email tol
++	// 2000 never breaches on the same path (26 ticks -> 1300 ms, spawned
++	// 17 ticks behind the streaming rider so its edge-1 service window
++	// (spawn+1..spawn+16) has cleared). Streaming tol 1200 -> Enter on its
++	// first delivery (tick 51). The email follower rides 33 ticks behind
++	// (clear of the jumbo's 16-tick edge windows on ALL THREE edges — a
++	// 17-tick gap queues behind it on e2/e3 and inflates the email to
++	// 2050 ms; 33 keeps the email's own 26-tick transit = 1300 ms).
++	// Recovery: ONE-HOP shorts (res->rt, 16 ticks
++	// -> 800 ms — the 2-hop 1650 ms can no longer out-run the tolerance, the
++	// honest D-2 regime shift) drag the CUMULATIVE average (the sla_evaluate
++	// seam — no window/margin here; the health layer's windowed latch is a
++	// separate derived read) to (4×2500 + 13×800)/17 = 1200.0 EXACTLY <= 1200
++	// -> Exit on the 13th short delivery (tick 471). No other crossings.
+ 	cat_storage: Catalogs
+ 	cat := test_catalog(&cat_storage)
+ 	defer catalogs_destroy(cat)
+@@ -252,24 +259,22 @@ test_sla_breach_latency_enter_exit :: proc(t: ^testing.T) {
+ 	sla_draw(&s, cat, j1, j2, "standard", 1)   // long path edge 2
+ 	sla_draw(&s, cat, j2, j3, "standard", 1)   // long path edge 3
+ 	// phase 1 — the breach: 4 streaming + 4 email long-path spawns, spaced
+-	// 36 ticks apart (each streaming packet transits alone: 35 ticks, no
+-	// shared-edge queueing at the 4x pace); the email follows 9 ticks behind
+-	// (clear of the streaming packet's first-edge service window, so it
+-	// transits alone: 32 ticks = 1600 ms < email's 2000 ms tolerance).
++	// 60 ticks apart (each streaming packet transits alone: 50 ticks; the
++	// email follows 33 ticks behind — clear of every jumbo edge window — and
++	// delivers at tk+59 -> 1300 ms < 2000).
+ 	for k in 0..<4 {
+-		tk := u64(1 + 36 * k)
+-		sla_spawn(&s, tk, 1, res, j3)     // streaming -> 1750 ms each (delivers tk+35)
+-		sla_spawn(&s, tk + 9, 0, res, j3) // email -> 1600 ms, never breaches
++		tk := u64(1 + 60 * k)
++		sla_spawn(&s, tk, 1, res, j3)      // streaming -> 2500 ms each (delivers tk+50)
++		sla_spawn(&s, tk + 33, 0, res, j3) // email -> 1300 ms, never breaches (delivers tk+59)
+ 	}
+-	// phase 2 — recovery: short-path streaming spawns spaced 17+ ticks apart
+-	// (each transits alone: 850 ms = 16 on-edge ticks + 1). The 200-tick
+-	// window average drops under the exit band (tol 1200 − margin 160 =
+-	// 1040) at the 8th short delivery (window: 2 longs + 8 shorts =
+-	// (2×1750 + 8×850)/10 = 1030 < 1040) -> the Exit fires there.
++	// phase 2 — recovery: ONE-HOP streaming shorts (res->rt, its own bundle —
++	// no shared edges with the long path) spaced 17 ticks apart, each
++	// transiting alone: 800 ms = 16 on-edge ticks. Cumulative average hits
++	// exactly 1200 at the 13th short delivery -> Exit there.
+ 	for k in 0..<20 {
+-		sla_spawn(&s, 151 + 17 * u64(k), 1, res, host)
++		sla_spawn(&s, 251 + 17 * u64(k), 1, res, rt)
+ 	}
+-	_, evs := sla_record_run(&s, 520, cat, t)
++	_, evs := sla_record_run(&s, 600, cat, t)
+ 	defer delete(evs)
+ 
+ 	testing.expect(t, !s.replay_error, "replay_error latched (a logged command failed)")
+@@ -283,11 +288,11 @@ test_sla_breach_latency_enter_exit :: proc(t: ^testing.T) {
+ 	}
+ 	testing.expect_value(t, len(cross_evs), 2)
+ 	if len(cross_evs) == 2 {
+-		testing.expect_value(t, cross_evs[0].tick, u64(27)) // the first streaming long-path delivery (spawn 1 + 26)
++		testing.expect_value(t, cross_evs[0].tick, u64(51)) // the first streaming long-path delivery (spawn 1 + 50)
+ 		testing.expect_value(t, cross_evs[0].class, u16(1))
+ 		testing.expect_value(t, cross_evs[0].metric, u8(Sla_Metric.Latency))
+ 		testing.expect_value(t, cross_evs[0].direction, u8(Sla_Direction.Enter))
+-		testing.expect_value(t, cross_evs[1].tick, u64(185)) // the 2nd short delivery (151+17+17) — cumulative avg 1150 <= 1200
++		testing.expect_value(t, cross_evs[1].tick, u64(471)) // the 13th short delivery (251+17×12+16) — cumulative avg exactly 1200
+ 		testing.expect_value(t, cross_evs[1].class, u16(1))
+ 		testing.expect_value(t, cross_evs[1].metric, u8(Sla_Metric.Latency))
+ 		testing.expect_value(t, cross_evs[1].direction, u8(Sla_Direction.Exit))
+@@ -295,7 +300,7 @@ test_sla_breach_latency_enter_exit :: proc(t: ^testing.T) {
+ 	// attribution: email (class 0) crossed nothing, but was delivered.
+ 	testing.expect_value(t, s.flow.sla[0].delivered, u64(4))
+ 	testing.expect_value(t, s.flow.sla[1].delivered, u64(24)) // 4 long + 20 short
+-	testing.expect_value(t, s.flow.sla[1].total_latency_ms, u64(4 * 1300 + 20 * 850))
++	testing.expect_value(t, s.flow.sla[1].total_latency_ms, u64(4 * 2500 + 20 * 800))
+ 	sla_check_invariant(t, &s)
+ }
+ 
+diff --git a/core/stats.odin b/core/stats.odin
+index a233316..2e50f22 100644
+--- a/core/stats.odin
++++ b/core/stats.odin
+@@ -81,6 +81,22 @@ Stats_Pipe_Row :: struct {
+ 	q: [3]u32,
+ }
+ 
++// Stats_Port_Row — v2-arch-egress S5 (AD-4/F3/AD-7): one per live
++// (bundle, direction) PORT — the NOC QUEUE DEPTH section's re-keyed row
++// source (the router's buffering view, per (router, port)). Queue depths are
++// per (port, lane) against the E9 bound (AV-7: never summed to a pair total
++// on this surface); util_pct is the PER-DIRECTION honest utilization (AV-4:
++// the denominator is the direction's own cap). Rows in (bundle asc,
++// dir asc) order — deterministic.
++Stats_Port_Row :: struct {
++	router:  u32,  // the port's owning router (node id, E11-stable — the departure endpoint)
++	peer:    u32,  // the far endpoint the port faces (node id)
++	bundle:  u32,  // the bundle slot (derived — display only)
++	dir:     u8,   // PORT_DIR_LO_TO_HI / PORT_DIR_HI_TO_LO
++	q:       [3]u32, // per-lane depth (packets) vs the E9 bound
++	util_pct: u32,  // the port's windowed utilization (per-direction denominator)
++}
++
+ // Stats_Drop_Row — one per (live member pipe, class, reason) for THIS tick's
+ // E9 bundle drops (drop_sites — the per-tick scratch the crisis engine reads,
+ // appended during flow_step, cleared at the top of the next). A shed bundle's
+@@ -108,6 +124,7 @@ Stats_Record :: struct {
+ 	meter:    u32, // health.meter_pct (raw — the health module pins the disabled state at 100)
+ 	classes:  [dynamic]Stats_Class_Row,
+ 	pipes:    [dynamic]Stats_Pipe_Row,
++	ports:    [dynamic]Stats_Port_Row, // S5: the (router, port) NOC QUEUES rows (F3)
+ 	drops:    [dynamic]Stats_Drop_Row,
+ }
+ 
+@@ -128,6 +145,7 @@ stats_compute :: proc(state: ^Run_State, cat: ^Catalogs, sim_hash: u64,
+ 	rec.meter = state.health.meter_pct
+ 	rec.classes = make([dynamic]Stats_Class_Row, 0, 8, allocator)
+ 	rec.pipes = make([dynamic]Stats_Pipe_Row, 0, 8, allocator)
++	rec.ports = make([dynamic]Stats_Port_Row, 0, 8, allocator)
+ 	rec.drops = make([dynamic]Stats_Drop_Row, 0, 4, allocator)
+ 
+ 	// --- per-class rows (class-id order; one per flow.sla row) --------------
+@@ -194,17 +212,25 @@ stats_compute :: proc(state: ^Run_State, cat: ^Catalogs, sim_hash: u64,
+ 		}
+ 		row.dropped = dropped
+ 		row.offered = row.carried + u64(dropped) * bw
+-		// v2-network-units — HONEST utilization: the bundle's transmitted
+-		// work over the window ÷ (line rate × window) (ifHCOutOctets/ifSpeed
+-		// pattern). The backlog (q/carried) is its OWN signal — a lone queued
+-		// packet reads 0%, not the old 800%-clamped-100.
+-		served_window: u64 = 0
++		// v2-network-units + v2-arch-egress S2 — HONEST utilization per AD-5/AV-4:
++		// utilization is a (bundle, DIRECTION) property — the denominator is
++		// ALWAYS the per-direction cap. The pipe row carries the link-level
++		// number = MAX over directions (never Σ — a bidirectional pair serving
++		// 100% each way reads 100, not 200); tx_octets is a COUNTER (both
++		// directions' frames crossed the fibers — Σ is the honest octet count).
++		// The backlog (q/carried) is its OWN signal — a lone queued packet reads
++		// 0%, not the old 800%-clamped-100.
++		w_lo := u64(0)
++		w_hi := u64(0)
+ 		if bs != NO_BUNDLE && int(bs) < int(state.bundles.n) {
+-			served_window = bundle_tx_window(&state.bundles, state.tick, bs)
++			w_lo = bundle_tx_window(&state.bundles, state.tick, bs, PORT_DIR_LO_TO_HI)
++			w_hi = bundle_tx_window(&state.bundles, state.tick, bs, PORT_DIR_HI_TO_LO)
+ 		}
+-		row.tx_octets = served_to_octets(served_window, u32(bw))
++		row.tx_octets = served_to_octets(w_lo + w_hi, u32(bw))
+ 		if row.cap_units > 0 {
+-			row.util_pct = util_pct_window(served_window, UTIL_WINDOW_TICKS, row.cap_units)
++			u_lo := util_pct_window(w_lo, UTIL_WINDOW_TICKS, row.cap_units)
++			u_hi := util_pct_window(w_hi, UTIL_WINDOW_TICKS, row.cap_units)
++			row.util_pct = max(u_lo, u_hi)
+ 		}
+ 		// lane columns: this pipe's dial + the flow's derived per-pipe caps
+ 		if int(ps) < len(state.topology.pipe_weights) {
+@@ -216,6 +242,32 @@ stats_compute :: proc(state: ^Run_State, cat: ^Catalogs, sim_hash: u64,
+ 		append(&rec.pipes, row)
+ 	}
+ 
++	// --- per-port rows (live bundles x directions; the NOC QUEUES source) --
++	// S5/F3: the NOC QUEUE DEPTH section builds per (router, port) — the
++	// router-buffering view of AD-7. Per-lane depth against the E9 bound
++	// (AV-7: any rollup is max-lane, never sum); util is the per-direction
++	// honest metric (AV-4). (bundle asc, dir asc) — the pinned enumeration.
++	for bi in u32(0)..<state.bundles.n {
++		for dir in u8(0)..<PORT_DIR_COUNT {
++			row: Stats_Port_Row
++			row.bundle = bi
++			row.dir = dir
++			row.router = egress_router_of_port(state, bi, dir)
++			// the peer is the endpoint the port FACES: the hi endpoint for
++			// dir 0 (lo→hi departs lo), the lo endpoint for dir 1
++			if dir == PORT_DIR_HI_TO_LO && int(bi) < len(state.bundles.bundle_lo) {
++				row.peer = state.bundles.bundle_lo[bi]
++			} else if int(bi) < len(state.bundles.bundle_hi) {
++				row.peer = state.bundles.bundle_hi[bi]
++			}
++			for lane in 0..<LANE_COUNT {
++				row.q[lane] = port_lane_count(state, cat, bi, dir, u8(lane))
++			}
++			row.util_pct = port_util_pct(state, state.tick, bi, dir)
++			append(&rec.ports, row)
++		}
++	}
++
+ 	// --- per-tick E9 drop rows (aggregated per member pipe, class, reason) --
+ 	// drop_sites append order (deterministic); a shed bundle replicates to
+ 	// every live member (the pooled link shed them). E22 (NO_BUNDLE) sites are
+@@ -264,6 +316,7 @@ stats_compute :: proc(state: ^Run_State, cat: ^Catalogs, sim_hash: u64,
+ stats_destroy :: proc(rec: ^Stats_Record) {
+ 	delete(rec.classes)
+ 	delete(rec.pipes)
++	delete(rec.ports)
+ 	delete(rec.drops)
+ 	rec^ = {}
+ }
+@@ -291,10 +344,11 @@ stats_emit :: proc(state: ^Run_State, cat: ^Catalogs, sim_hash: u64,
+ // stats_write_header — the stream preamble: the row-schema legend as `#`
+ // comment lines. Written once at the start of every stream (deterministic).
+ stats_write_header :: proc(sb: ^strings.Builder) {
+-	write_str(sb, "# pp stats stream v2 - deterministic per-tick stats (story 5.7; same seed + commands -> identical bytes; v2 = the v2-network-units P-row: honest windowed util + the appended tx_octets column)\n")
++	write_str(sb, "# pp stats stream v3 - deterministic per-tick stats (story 5.7; same seed + commands -> identical bytes; v2 = the v2-network-units P-row: honest windowed util + the appended tx_octets column; v3 = v2-arch-egress S5: the Q port rows per (router, port) — the NOC QUEUES re-key)\n")
+ 	write_str(sb, "# G <tick>,<gen>,<sim_hash_hex>,<score>,<meter_pct>\n")
+ 	write_str(sb, "# C <tick>,<class>,<demand>,<delivered>,<dropped>,<loss_pct>,<avg_latency_ms>,<sla_lat>,<sla_loss>\n")
+ 	write_str(sb, "# P <tick>,<pipe>,<tier>,<cap_units>,<offered>,<carried>,<dropped>,<util_pct>,<wE>,<wS>,<wB>,<cE>,<cS>,<cB>,<qE>,<qS>,<qB>,<tx_octets>  (util = HONEST windowed % — served work / (rate x window); tx_octets = window transmitted octets)\n")
++	write_str(sb, "# Q <tick>,<router>,<peer>,<dir>,<qE>,<qS>,<qB>,<util_pct>   (v2-arch-egress S5: the (router, port) queue rows — per-lane depth vs the E9 bound; util = the PORT's own windowed % (the per-direction denominator, AV-4))\n")
+ 	write_str(sb, "# D <tick>,<pipe>,<class>,<reason>,<count>   (E9 bundle drops; reason 0=Queue_Overflow)\n")
+ }
+ 
+@@ -314,6 +368,10 @@ stats_write_csv :: proc(sb: ^strings.Builder, rec: ^Stats_Record) {
+ 			rec.tick, p.pipe, p.tier, p.cap_units, p.offered, p.carried, p.dropped, p.util_pct,
+ 			p.w[0], p.w[1], p.w[2], p.c[0], p.c[1], p.c[2], p.q[0], p.q[1], p.q[2], p.tx_octets)
+ 	}
++	for q in rec.ports {
++		fmt.sbprintf(sb, "Q,%d,%d,%d,%d,%d,%d,%d,%d\n",
++			rec.tick, q.router, q.peer, q.dir, q.q[0], q.q[1], q.q[2], q.util_pct)
++	}
+ 	for d in rec.drops {
+ 		fmt.sbprintf(sb, "D,%d,%d,%d,%d,%d\n",
+ 			rec.tick, d.pipe, d.class, d.reason, d.count)
+diff --git a/core/stats_test.odin b/core/stats_test.odin
+index 220d76d..7e4eeb0 100644
+--- a/core/stats_test.odin
++++ b/core/stats_test.odin
+@@ -159,8 +159,20 @@ test_stats_derivation_congested :: proc(t: ^testing.T) {
+ 			// served units → 9% (1125×100/(240×50) = 9.4). The OLD formula read
+ 			// any backlog as 800%-clamped-100 — the queue-occupancy bug the NOC
+ 			// exposed.
++			// v2-arch-egress S2 re-pin (full duplex): the pooled budget served
++			// 1125 units total (tx_octets 2109); the direction split gives each
++			// direction its own 50 u/t budget — the forward port serves 1150
++			// units and the REVERSE port (previously starved by the pooled
++			// FIFO) now transmits its own 250 — Σ = 1400 units → 2625 octets.
++			// util stays 9: the MAX-over-directions form (AV-4) — the forward
++			// port alone reads 1150×100/(240×50) = 9; the reverse reads 2.
++			// D-2 (v2-arch-egress S3) re-pin: streaming's doubled demand stretches
++			// the forward port's serializations — the reverse port (250 units at
++			// S2) has not yet served by tick 24, so the window is the forward
++			// 1150 units alone -> 2156 octets; util stays 9 (the per-direction
++			// denominator form — the forward port reads 1150×100/(240×50) = 9).
+ 			testing.expect_value(t, p.util_pct, u32(9))
+-			testing.expect_value(t, p.tx_octets, u64(2109)) // 1125 × 1500/800 (1.875 B/unit)
++			testing.expect_value(t, p.tx_octets, u64(2156)) // 1150 × 1500/800 (1.875 B/unit)
+ 			testing.expect(t, p.offered >= p.carried, "offered (carried + drops) >= carried")
+ 			// the 3 lanes sum to the budget allocation
+ 			total_caps := u64(p.c[0]) + u64(p.c[1]) + u64(p.c[2])
+diff --git a/core/types.odin b/core/types.odin
+index ea90419..a7f6a63 100644
+--- a/core/types.odin
++++ b/core/types.odin
+@@ -272,6 +272,7 @@ Active_Crisis :: struct {
+ 	set_piece:     u16, // era set-piece index (which activation this crisis belongs to)
+ 	kind:          Root_Cause_Kind,
+ 	bundle:        u32, // Saturated_Bundle: the CURRENT bundle slot (re-resolved per tick from the stable pair)
++	dir:           u8,  // v2-arch-egress S4: the saturated PORT's direction (DERIVED engine memory, never serialized — root_cause names (router, port); replay re-derives it identically from the trigger state)
+ 	bundle_lo:     u32, // Saturated_Bundle: canonical min-endpoint node id of the named pair (STABLE identity, never serialized)
+ 	bundle_hi:     u32, // Saturated_Bundle: canonical max-endpoint node id of the named pair (STABLE identity, never serialized)
+ 	pipe:          u32, // Saturated_Bundle: the first live member pipe id at trigger (E11-stable — display/render ref)
+@@ -421,7 +422,7 @@ Event :: struct {
+ 	class:     u16, // Packet_Dropped / Sla_Threshold_Crossed / crisis payload: the class
+ 	reason:    u8,  // Packet_Dropped payload: Drop_Reason; Era_Advance_Blocked (6.2): Advance_Block_Reason
+ 	metric:    u8,  // Sla_Threshold_Crossed payload: Sla_Metric
+-	direction: u8,  // Sla_Threshold_Crossed payload: Sla_Direction
++	direction: u8,  // Sla_Threshold_Crossed: Sla_Direction; Packet_Dropped + crisis tags (S4/AV-2): the port's direction — tag-conditional dual use
+ 	sign:      u8,  // Warning_Raised / Warning_Cleared payload: Warning_Sign
+ 	target:    u32, // Warning_Raised / Warning_Cleared: node/pipe id; Packet_Dropped (4.2): the shed bundle; crisis: the bundle slot
+ 	archetype: u8,  // Crisis_Triggered / Crisis_Resolved payload: crises.json archetype index
+diff --git a/core/units.odin b/core/units.odin
+index 89ad7d8..ce3d443 100644
+--- a/core/units.odin
++++ b/core/units.odin
+@@ -62,17 +62,20 @@ FRAME_BYTES :: 1500
+ // = 200 — a sibling window in the same catalog section).
+ UTIL_WINDOW_TICKS :: 240
+ 
+-// transit_ticks — the serialization formula (the game's own): a frame takes
+-// ceil(packet_bandwidth / capacity) ticks to cross a link of the given
+-// capacity. The unit model's "frame_bits ÷ rate" in game ticks. A
+-// ZERO-capacity link has NO line rate (transit 0) — the honest defensive
+-// semantics (Perkins r1 N1: the old cap->1 sentinel mapped a dead link to
+-// ~800 Mbps, inverted).
+-transit_ticks :: proc(packet_bandwidth, capacity: u32) -> u32 {
++// transit_ticks — the AD-3(c) serialization term in ticks: how many ticks a
++// packet of `demand_units` total bandwidth needs to cross a line of
++// `capacity` units/tick — ceil(demand_units / capacity). The unit model's
++// "frame_bits ÷ rate" in game ticks (D-2 wired: the demand is the CLASS's
++// total, packet_demand_units(cat, class), not the uniform catalog base;
++// email 800 @ 100 u/s = 8, streaming 1600 @ 100 = 16, any class @ mid/wide
++// = 1). Integer, tick-quantized (ODN-2). A ZERO-capacity link has NO line
++// rate (transit 0) — the honest defensive semantics (Perkins r1 N1: the old
++// cap->1 sentinel mapped a dead link to ~800 Mbps, inverted).
++transit_ticks :: proc(demand_units, capacity: u32) -> u32 {
+ 	if capacity == 0 {
+ 		return 0 // no capacity -> no serialization delay -> no rate
+ 	}
+-	return (packet_bandwidth + capacity - 1) / capacity
++	return (demand_units + capacity - 1) / capacity
+ }
+ 
+ // line_rate_bps — a link's line rate in REAL bits/s, LINEAR in capacity —
+diff --git a/core/warnings.odin b/core/warnings.odin
+index fa184ab..9b73b9a 100644
+--- a/core/warnings.odin
++++ b/core/warnings.odin
+@@ -162,29 +162,37 @@ warning_evaluate :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 
+ 	// --- 2. accumulate the measured congestion (scratch; freed at return)
+ 	// Node loads: per node SLOT — the stuck-packet backlog (waiting_ticks >= 1)
+-	// is the honest node signal (see the header contract). Pipe congestion: per
+-	// BUNDLE slot, the FULLEST lane's queue depth vs its E9 bound
+-	// (lane_queue_packets x packet_bandwidth) — "congestion climbing toward
+-	// saturation" (GDD M5): a lone packet on a pipe is 1/6 of a lane bound
+-	// (17 % — healthy, no busy-flicker); a lane at its bound (6 packets) is
+-	// 100 % — the E9 drop precedence is dropping. The congestion levels replicate to
+-	// every member pipe of the bundle (the bundle is the capacity unit, 2.1).
++	// is the honest node signal (see the header contract). Pipe congestion
++	// (v2-arch-egress S4/F3, AD-4): per (bundle, DIRECTION) PORT, the FULLEST
++	// lane's queue depth vs the E9 bound (lane_queue_packets x
++	// packet_bandwidth — the re-keyed bound the ladder sheds from) —
++	// "congestion climbing toward saturation" (GDD M5) — a COUNT ratio (the
++	// x packet_bandwidth factors cancel exactly; deliberately demand-blind:
++	// the bound is 6 PACKETS per port lane, whatever their jumbo sizes): a
++	// lone packet on a pipe is 1/6 of a lane bound (17 % — healthy, no
++	// busy-flicker); a lane at its bound (6 packets) is 100 %. A member pipe
++	// carries BOTH
++	// directions — its level is the WORSE (max) port's, replicated to every
++	// member pipe of the bundle as today (the bundle is the capacity unit,
++	// 2.1; the max-never-sum rollup is the AV-7 convention).
+ 	nload := make([dynamic]i64, len(t.node_alive), len(t.node_alive), context.temp_allocator)
+ 	defer delete(nload)
+-	press := make([dynamic]i64, int(state.bundles.n), int(state.bundles.n), context.temp_allocator)
++	press := make([dynamic]i64, int(state.bundles.n) * PORT_DIR_COUNT, int(state.bundles.n) * PORT_DIR_COUNT, context.temp_allocator)
+ 	defer delete(press)
+ 	lane_bound_units := i64(cat.balance.lane_queue_packets) * i64(cat.balance.packet_bandwidth)
+ 	for bs in 0..<int(state.bundles.n) {
+ 		if lane_bound_units <= 0 { break }
+-		fullest := i64(0)
+-		for lane in u8(0)..<LANE_COUNT {
+-			depth := i64(bundle_lane_count(state, cat, u32(bs), lane))
+-			units := depth * i64(cat.balance.packet_bandwidth)
+-			if units > fullest {
+-				fullest = units
++		for dir in u8(0)..<PORT_DIR_COUNT {
++			fullest := i64(0)
++			for lane in u8(0)..<LANE_COUNT {
++				depth := i64(port_lane_count(state, cat, u32(bs), dir, lane))
++				units := depth * i64(cat.balance.packet_bandwidth)
++				if units > fullest {
++					fullest = units
++				}
+ 			}
++			press[bs * PORT_DIR_COUNT + int(dir)] = fullest
+ 		}
+-		press[bs] = fullest
+ 	}
+ 
+ 	// Node loads: count the STUCK packets (waiting_ticks >= 1 — they failed a
+@@ -225,7 +233,11 @@ warning_evaluate :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 		bs := state.bundles.pipe_bundle[ps]
+ 		new := Congestion_Level.None
+ 		if bs != NO_BUNDLE && lane_bound_units > 0 {
+-			new = congestion_level(press[bs] * 100 / lane_bound_units, w.pipe_amber_pct, w.pipe_red_pct)
++			// the pipe's level = the WORSE port's pressure (both directions
++			// ride the same fibers; max, never sum — the AV-7 rollup rule)
++			worst := max(press[int(bs) * PORT_DIR_COUNT + int(PORT_DIR_LO_TO_HI)],
++			             press[int(bs) * PORT_DIR_COUNT + int(PORT_DIR_HI_TO_LO)])
++			new = congestion_level(worst * 100 / lane_bound_units, w.pipe_amber_pct, w.pipe_red_pct)
+ 		}
+ 		cr.pipe_congestion[ps] = pipe_congestion_transition(state, tick, cr.pipe_congestion[ps], new, t.pipe_id[ps])
+ 	}
+diff --git a/core/warnings_test.odin b/core/warnings_test.odin
+index 6361c0a..af923c7 100644
+--- a/core/warnings_test.odin
++++ b/core/warnings_test.odin
+@@ -612,3 +612,50 @@ test_warning_evaluate_idempotent_and_pure :: proc(t: ^testing.T) {
+ 	testing.expect_value(t, s.topology.gen, gen_before)
+ 	testing.expectf(t, len(s.flow.packets) == packets_before, "warning_evaluate must not touch the flow")
+ }
++
++// --- (c2) Perkins r1 B2: the AV-7 max-never-sum rollup, pinned ------------------
++
++@(test)
++test_pipe_congestion_max_never_sum :: proc(t: ^testing.T) {
++	// AV-7: a member pipe carries the WORSE direction's pressure (max over
++	// the two ports, never the sum — the fibers are shared but the ports are
++	// independent queues). Mutation-proven vacuous before this pin: the old
++	// fixture loaded ONE direction (max == sum there). This fixture loads
++	// BOTH, asymmetrically: the forward port's fullest lane holds 5 of the
++	// 6-packet bound (83% — amber), the reverse port's holds 1 (17% — none).
++	// The pipe reads AMBER. The sum-mutant (lo+hi = 6/6 = 100%) would raise
++	// Pipe_Critical — the exact discriminator.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 13, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&s, cat)
++	sla_draw(&s, cat, res, rt, "standard", 1)
++	sla_draw(&s, cat, rt, host, "standard", 1)
++	// FIVE riders forward onto pipe 0's bundle departing res (dir lo->hi,
++	// Standard lane): 5/6 of the E9 bound — amber, not red.
++	for k in u64(1)..=5 {
++		sla_spawn(&s, 1, 0, res, host)
++	}
++	// ONE rider the OTHER way (departing rt, dir hi->lo): 1/6 — no level.
++	sla_spawn(&s, 1, 0, rt, res)
++	hashes, evs := warn_record_run(&s, 20, cat)
++	defer delete(hashes)
++	defer delete(evs)
++
++	// the hand-verified stream (the lane-bound fixture's own drain cadence —
++	// 8 ticks per packet): depth 5 at @1 (83% amber), 4 at @9 (67% healthy).
++	warn_assert_stream(t, evs[:], []Event{
++		{tick = 1, tag = EVENT_TAG_WARNING_RAISED, sign = u8(Warning_Sign.Pipe_Congested), target = 0},
++		{tick = 9, tag = EVENT_TAG_WARNING_CLEARED, sign = u8(Warning_Sign.Pipe_Congested), target = 0},
++	})
++	// the AV-7 belt, explicit: Pipe_Critical NEVER fires — the sum-mutant's
++	// signature (5+1 = 6/6 = 100% red at tick 1).
++	for e in evs {
++		testing.expectf(t, e.sign != u8(Warning_Sign.Pipe_Critical),
++			"Pipe_Critical fired (tick %d) — the rollup summed the two ports (AV-7: max, never sum)", e.tick)
++	}
++}
+diff --git a/harness/palcheck.odin b/harness/palcheck.odin
+index 414911f..9814223 100644
+--- a/harness/palcheck.odin
++++ b/harness/palcheck.odin
+@@ -396,7 +396,11 @@ run_palcheck :: proc(cat: ^pp.Catalogs) -> int {
+ 	// marking). v2-blender-sculpt: measured 881 px near-tol on the re-blessed
+ 	// frame -> floor 500 (~57%).
+ 	check(count_near(calm, HOST_WALL, 6) > 500, "host wall band (B1 canary)", count_near(calm, HOST_WALL, 6))
+-	check(count_exact(calm, LED_GREEN) > 5, "puck LEDs", count_exact(calm, LED_GREEN))
++	// D-2 (v2-arch-egress S3) re-pin: the doubled streaming serialization
++	// shifts one puck's 30s congestion level (a calm LED pair reads 5 px on
++	// the re-blessed frame, was 6) — floor 4 keeps the canary (a broken LED
++	// render reads 0) without coupling to a single pixel of AA.
++	check(count_exact(calm, LED_GREEN) > 4, "puck LEDs", count_exact(calm, LED_GREEN))
+ 	check(count_near(calm, rl.Color{86, 98, 116, 255}, 12) > 200, "puck hardware tone", count_near(calm, rl.Color{86, 98, 116, 255}, 12))
+ 
+ 	// 1e. the 5.11 class-analogue sprites (the #65 canon set — Perkins r1 W1):
+@@ -921,7 +925,7 @@ run_palcheck :: proc(cat: ^pp.Catalogs) -> int {
+ 		// the 08-19 hand-append trap is about rows the engine then
+ 		// re-resolves mid-run — this fixture renders immediately).
+ 		psa, _ := pp.pipe_slot(&state.topology, pa.id)
+-		pp.crisis_trigger(&state, 1000, 0, 0, .Saturated_Bundle, state.bundles.pipe_bundle[psa], 0, 10)
++		pp.crisis_trigger(&state, 1000, 0, 0, .Saturated_Bundle, state.bundles.pipe_bundle[psa], pp.PORT_DIR_LO_TO_HI, 0, 10)
+ 		// camera: both pipes on screen, bands wide enough for clean sampling
+ 		view.scale = 2.0
+ 		view.lane_detail = false
+diff --git a/tools/lint.sh b/tools/lint.sh
+index 09e0c4d..3f92c5c 100755
+--- a/tools/lint.sh
++++ b/tools/lint.sh
+@@ -100,5 +100,17 @@ if ! python3 tools/test_sprite_foldin.py; then
+ 	FAIL=1
+ fi
+ 
++echo "-- gate 8: no link-queue vocabulary on render paths (spine F5, AD-1)"
++# v2-arch-egress (the ratified spine's Enforcement row, rubric F5): links are
++# dumb bit-pipes — they paint UTILIZATION, never queue state (AD-1: "No unit
++# may derive a 'link queue' concept for any purpose"). Queue/buffering state
++# lives at ROUTER PORTS (AD-2/AD-7: router_buffering, port rows). The gate
++# fails on link_queue-family identifiers or link-scoped queue-state fields in
++# the render/link-vocab surfaces (the LB-gate precedent — a vocabulary drift
++# the render heists could silently introduce). Perkins r1 N9: harness/ joins
++# the scan — it owns render-adjacent overlay code (the NOC/e2e seams).
++HITS=$(grep -rnE 'link_(queue|depth|backlog|buffer|load|congest)' app/ harness/ --include='*.odin' || true)
++if [ -n "$HITS" ]; then echo "$HITS"; echo "FAIL: link-queue vocabulary on a render path (spine F5/AD-1)"; FAIL=1; fi
++
+ if [ "$FAIL" -ne 0 ]; then exit 1; fi
+ echo "lint: all gates green"

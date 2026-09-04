@@ -1,0 +1,42 @@
+[
+  {
+    "source": "edge",
+    "severity": "warning",
+    "category": "coverage-gap",
+    "title": "New 2^40 wrap-bound rejection row is vacuous: check_reject_balance never reaches balance.json, and the wrap-bound validator branch is dead code",
+    "location": "core/catalog_test.odin:887",
+    "evidence": "core/catalog_test.odin:887: {\"box interval over the wrap bound\", replace1(BAL_VALID, `\"dot_interval_ticks\": 2400`, `\"dot_interval_ticks\": 1099511627776`, 1), \"must be <= 2^40 (the HUD permille math's wrap bound)\"}. || core/catalog_test.odin:1003-1010 (check_reject_balance sets node_types/pipe_tiers/balance/packet_types/demand/eras — never crises) then: `if cerr.file != \"balance.json\" { testing.expectf(t, cerr.file != \"\", \"expected a balance.json rejection (rule %q), got %q %q\", want_rule, cerr.file, cerr.rule); return }`. || core/catalog.odin:1153: `di, okdi := jint_strict(bobj, \"dot_interval_ticks\", -1)`; core/catalog.odin:1813: `jint_strict :: proc(o: json.Object, key: string, def: i32) -> (i32, bool)` whose value proc does `if i < i64(min(i32)) || i > i64(max(i32)) { return 0, false }` -> rule \"clock keys must be integers (no decimals)\"; the wrap-bound branch `if u64(di) > u64(1) << 40 { return {\"balance.json\", \"box\", \"dot_interval_ticks must be <= 2^40 (the HUD permille math's wrap bound)\"} }` can therefore never fire. || Execution probe of this exact doc: with a valid crises source the load rejects rule=\"clock keys must be integers (no decimals)\"; with the helper's actual sources the load rejects file=\"crises.json\", rule=\"invalid JSON\" (crises parses before balance in catalogs_load), so the expectf(cerr.file != \"\") passes without the rule substring ever being checked.",
+    "detail": "Verified by execution: the row passes only via the unset-crises fallthrough (rejection from crises.json, rule never compared); and since jint_strict caps at i32, di==2^40 is rejected earlier with a different rule, so deleting the >2^40 branch keeps the test green.",
+    "recommended_fix": "Add crises = transmute([]u8)string(CRISES_VALID) to check_reject_balance, and either pin the reachable i32 rejection or parse dot_interval_ticks as i64 so the 2^40 branch is reachable and the mutation leg can turn the row red."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "boundary",
+    "title": "Palcheck section-8 routed legs index pipe_congestion[ps8] without the testing_lvl_ok guard every sibling leg uses — out-of-bounds panic instead of the premise FAIL",
+    "location": "harness/palcheck.odin:1566",
+    "evidence": "harness/palcheck.odin:1447-1451: `testing_lvl_ok := ok_ps && found_bi` / `if testing_lvl_ok && int(ps8) >= len(state.crisis.pipe_congestion) { ... resize(&state.crisis.pipe_congestion, int(ps8) + 1) ... }`. Legs (a)/(b)/(c)/(f)/(g) guard: 1522 `if testing_lvl_ok {` then `state.crisis.pipe_congestion[ps8] = .Amber`. Leg (d) does NOT: 1565-1566 `view.route_wires = true` / `state.crisis.pipe_congestion[ps8] = .Amber`; 1574 `state.crisis.pipe_congestion[ps8] = .None`. The fixture never runs warnings_update, and core/warnings.odin:52 sizes it `make([dynamic]Congestion_Level, 0, 8, allocator)` — len 0.",
+    "detail": "If the premise fails (ok_ps false — e.g. a catalog id rename makes the discarded-error index lookups fail, so the draw errors and pipe_slot returns false), the resize is skipped, len stays 0, and line 1566 indexes an empty dynamic array: panic, not the intended premise FAIL the check at 1464 recorded.",
+    "recommended_fix": "Wrap legs (d)/(e) in the same `if testing_lvl_ok { ... }` guard as (a)/(b)/(c)/(f)/(g)."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "unvalidated-input",
+    "title": "harness save accepts --skip-raster with no guard: blesses T1 manifests/logs while silently skipping every PNG write, leaving stale goldens against fresh manifests",
+    "location": "harness/main.odin:422",
+    "evidence": "harness/main.odin:412-417: `if verb != \"run\" && verb != \"save\" { usage() }` — the shared flag block below serves both verbs; 422-430: `if rest[i] == \"--skip-raster\" { ... skip_raster = true; i += 1; continue }` (no verb check). 489-494: `rc: Render_Ctx` / `if skip_raster { fmt.println(...) } else { render_setup(&rc, &cat) }` — rc stays zero, ready=false. harness/run.odin:489: `if rc.ready {` gates every capture, whose save branch is `if save { write_golden(name, cap_ms, img) }`, while the manifest bless/replay legs outside it run unconditionally.",
+    "detail": "save --skip-raster re-blesses manifests + action logs but writes zero PNGs; the repo is left with new manifests over stale pixels, surfacing only as raster failures on a later full local run. No usage() rejection guards the combination.",
+    "recommended_fix": "Reject the flag for the save verb (usage()) or print a loud partial-bless warning when save runs with skip_raster."
+  },
+  {
+    "source": "edge",
+    "severity": "note",
+    "category": "semantics",
+    "title": "econ dots_post_crisis counts dots from first crisis ACTIVATION (including while active), not 'after the last crisis resolved' — the Q7 gate is weaker than its comment/fail message",
+    "location": "harness/econ.odin:94",
+    "evidence": "harness/econ.odin:47: `dots_post_crisis: i32, // dots AFTER the last crisis resolved (the no-death-spiral recovery)`. 94: `if stats.saw_crisis_active do stats.dots_post_crisis += 1` (inside the EVENT_TAG_BOX_DOT branch). 98: `if len(s.crisis.active) > 0 do stats.saw_crisis_active = true` — latched on first activation, never cleared on resolution; the fail message (387-389) reads \"no dot landed after the crisis — the death spiral the floor must absorb\".",
+    "detail": "A dot landing while the crisis is still active increments dots_post_crisis, so a never-resolving crisis with in-crisis dots passes the `crises >= 1 && dots_post_crisis == 0` gate — the measured recovery property is narrower than documented.",
+    "recommended_fix": "Either track resolution (clear saw_crisis_active / count only when active is empty) or reword the comment and fail message to claim the activation-onward property the code actually measures."
+  }
+]

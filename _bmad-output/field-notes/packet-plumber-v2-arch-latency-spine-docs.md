@@ -1,0 +1,3 @@
+- BSD diff has no -R for recursive dir compare — use lowercase -r (cost one round-trip on the verbatim check).
+- Commit message discipline: paste the EXACT ratified message; first commit attempt drifted to a shorthand form, caught by re-reading the ruling — amend before push, never after.
+- Verbatim-copy jobs: cp -R then `diff -r` against source is cheap insurance that the PR carries exactly what was ratified.

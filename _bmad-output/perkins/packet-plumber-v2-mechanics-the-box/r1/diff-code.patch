@@ -1,0 +1,2731 @@
+diff --git a/.gitignore b/.gitignore
+index c4d58bf..9b9f242 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -32,7 +32,10 @@ core.bin
+ app-win.exe
+ 
+ # Framework tooling — bootstrapped to worktrees from repo-root (Dispatch step 4)
++# (bare `_bmad` covers the worktree bootstrap SYMLINK — `_bmad/` only matches
++# the real directory in the main checkout)
+ _bmad/
++_bmad
+ 
+ # Local tooling copies + spent review scratch (not source)
+ .agents/
+diff --git a/app/input/exec.odin b/app/input/exec.odin
+index 397654a..a920d5b 100644
+--- a/app/input/exec.odin
++++ b/app/input/exec.odin
+@@ -154,7 +154,7 @@ apply_intent :: proc(inp: ^Input, intent: Intent) {
+ 			if !moved {
+ 				tile := tile_from_world(inp.cat, inp.drag.wx, inp.drag.wy)
+ 				cmd := pp.Cmd_Place_Router{type_idx = u16(inp.placing), pos = tile}
+-				if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++				if _, err := pp.box_apply_edit(inp.state, pp.Command{1, cmd}, inp.cat); err == .None {
+ 					append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
+ 				}
+ 			}
+@@ -328,7 +328,7 @@ drag_retarget :: proc(inp: ^Input, wx, wy: f32) {
+ commit_draw :: proc(inp: ^Input) {
+ 	if inp.drag_to != 0 && inp.drag.valid == .None {
+ 		cmd := pp.Cmd_Draw_Pipe{a = inp.drag.from_node, b = inp.drag_to, tier = inp.tier}
+-		if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++		if _, err := pp.box_apply_edit(inp.state, pp.Command{1, cmd}, inp.cat); err == .None {
+ 			append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
+ 			// v2-sound: the live fast-path twin of step's PIPE_DRAWN emission —
+ 			// the SAME event at the SAME apply_tick (inp.tick + 1), so live and
+@@ -338,6 +338,11 @@ commit_draw :: proc(inp: ^Input) {
+ 				append(inp.sim_events, pp.Event{tick = inp.tick + 1, tag = pp.EVENT_TAG_PIPE_DRAWN})
+ 			}
+ 			if inp.on_draw_commit != nil { inp.on_draw_commit(inp.user, inp) }
++		} else {
++			// the Box's "no" must TEACH (the record: tutorial by
++			// consequence) — surface the refusal on the toast channel.
++			inp.last_reject = err
++			inp.reject_tick = inp.tick
+ 		}
+ 	}
+ 	inp.drag.active = false
+@@ -549,7 +554,7 @@ pipe_popover_anchor :: proc(inp: ^Input, ps: u32) -> rl.Vector2 {
+ // selection; success clears it.
+ demolish_pipe :: proc(inp: ^Input, pipe: u32) {
+ 	cmd := pp.Cmd_Demolish_Pipe{pipe = pipe}
+-	if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++	if _, err := pp.box_apply_edit(inp.state, pp.Command{1, cmd}, inp.cat); err == .None {
+ 		append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
+ 		inp.sel_pipe = -1
+ 		inp.sel_node = -1
+@@ -564,7 +569,7 @@ demolish_pipe :: proc(inp: ^Input, pipe: u32) {
+ // it). Clears BOTH selections (the batch may have killed the selected pipe).
+ demolish_node :: proc(inp: ^Input, node: u32) {
+ 	cmd := pp.Cmd_Demolish_Node{node = node}
+-	if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++	if _, err := pp.box_apply_edit(inp.state, pp.Command{1, cmd}, inp.cat); err == .None {
+ 		append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
+ 		inp.sel_pipe = -1
+ 		inp.sel_node = -1
+@@ -607,7 +612,7 @@ qos_apply_auto :: proc(inp: ^Input, pipe: u32) {
+ 		return // nothing to write — the split already matches the ladder
+ 	}
+ 	cmd := pp.Cmd_Set_Weights{pipe = pipe, weights = w}
+-	if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++	if _, err := pp.box_apply_edit(inp.state, pp.Command{1, cmd}, inp.cat); err == .None {
+ 		append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
+ 	} else {
+ 		inp.last_reject = err
+@@ -637,7 +642,7 @@ set_lane_class :: proc(inp: ^Input, class: u16, lane: u8) {
+ 	// [Auto]/[Revert]. A silent clobber of player work would be a UX bug.
+ 	was_auto := !qos_mode_manual(inp, ps)
+ 	cmd := pp.Cmd_Set_Lane{pipe = pipe, class = class, lane = lane}
+-	if _, err := pp.topology_apply_edit(inp.topo, pp.Command{1, cmd}, inp.cat); err == .None {
++	if _, err := pp.box_apply_edit(inp.state, pp.Command{1, cmd}, inp.cat); err == .None {
+ 		append(inp.log, pp.Command{apply_tick = inp.tick + 1, kind = cmd})
+ 		if was_auto {
+ 			qos_apply_auto(inp, pipe)
+diff --git a/app/input/exec_test.odin b/app/input/exec_test.odin
+index b07b1fc..fb066f8 100644
+--- a/app/input/exec_test.odin
++++ b/app/input/exec_test.odin
+@@ -70,6 +70,7 @@ test_commit_draw_emits_pipe_drawn_event :: proc(t: ^testing.T) {
+ 	ictx: Input
+ 	ictx.topo = &st.topology
+ 	ictx.cat = cat
++	ictx.state = &st // the Box: box_apply_edit needs the owning run (box-off here — legacy free-build)
+ 	ictx.log = &log
+ 	ictx.sim_events = &events
+ 	ictx.tick = 7 // arbitrary — the event must carry apply_tick = tick + 1 = 8
+@@ -115,6 +116,7 @@ test_commit_draw_invalid_emits_nothing :: proc(t: ^testing.T) {
+ 	ictx: Input
+ 	ictx.topo = &st.topology
+ 	ictx.cat = cat
++	ictx.state = &st // the Box: box_apply_edit needs the owning run (box-off here — legacy free-build)
+ 	ictx.log = &log
+ 	ictx.sim_events = &events
+ 	ictx.tick = 7
+@@ -153,6 +155,7 @@ test_commit_draw_nil_sim_events :: proc(t: ^testing.T) {
+ 	ictx: Input
+ 	ictx.topo = &st.topology
+ 	ictx.cat = cat
++	ictx.state = &st // the Box: box_apply_edit needs the owning run (box-off here — legacy free-build)
+ 	ictx.log = &log
+ 	// sim_events deliberately nil (the parity drive's shape)
+ 	ictx.tick = 3
+@@ -223,3 +226,47 @@ test_settings_nav_reaches_noc_row :: proc(t: ^testing.T) {
+ 	testing.expectf(t, len(rec.rows) == 1 && rec.rows[0] == i32(rnd.SETTINGS_ROW_NOC),
+ 		"the adjust hook fires on the NOC row (got %v)", rec.rows)
+ }
++
++// box-on refusal feedback (v2-mechanics-the-box): a material refusal on the
++// fast-path commit surfaces on the reject-toast channel — the economy
++// teaches by consequence, never silently.
++test_commit_draw_box_refusal_sets_last_reject :: proc(t: ^testing.T) {
++	cat: pp.Catalogs
++	wire_test_cat(&cat)
++	defer pp.catalogs_destroy(&cat)
++	// a minimal era row so box_enable has a kit to grant (the fail-loud
++	// era_row guard requires a row for the run's era)
++	er := pp.Era_Row{era = 1, id = "t1"}
++	er.box_pieces = make([dynamic]u32, len(cat.node_types))
++	er.box_spools = make([dynamic]u32, pp.BOX_SPOOL_COUNT)
++	append(&cat.eras, er)
++	st: pp.Run_State
++	pp.run_init(&st, 42, cat.hash, TEST_LOGIC_HZ)
++	defer pp.run_destroy(&st)
++	wire_test_topo(&st.topology, &cat)
++	st.era = 1
++	st.box_enabled = true
++	pp.box_enable(&st, &cat)
++	st.box.spools[pp.BOX_SPOOL_STANDARD] = 2 // too short for any draw
++
++	log: [dynamic]pp.Command
++	defer delete(log)
++	events: [dynamic]pp.Event
++	defer delete(events)
++
++	ictx: Input
++	ictx.topo = &st.topology
++	ictx.cat = &cat
++	ictx.state = &st
++	ictx.log = &log
++	ictx.sim_events = &events
++	ictx.tick = 7
++	ictx.drag = {active = true, from_node = 0, wx = 8 * f32(cat.balance.tile_px), wy = 15 * f32(cat.balance.tile_px), valid = .None, placing = -1}
++	ictx.drag_to = 1
++	ictx.tier = 0
++
++	commit_draw(&ictx)
++	testing.expect(t, ictx.last_reject == .Box_Spool_Exhausted, "a spool-short draw must surface on the reject-toast channel")
++	testing.expect(t, len(log) == 0, "a refused draw logs nothing")
++	testing.expect(t, len(st.topology.pipe_alive) == 0, "a refused draw applies nothing")
++}
+diff --git a/app/input/input.odin b/app/input/input.odin
+index bf3ff9e..fb3e90b 100644
+--- a/app/input/input.odin
++++ b/app/input/input.odin
+@@ -30,6 +30,7 @@ Input :: struct {
+ 	// refs (the app wires once; the harness wires per run)
+ 	topo: ^pp.Topology,
+ 	cat:  ^pp.Catalogs,
++	state: ^pp.Run_State, // the Box (v2-mechanics-the-box): the fast-path routes through box_apply_edit, which needs the owning Run_State (stock + the enabled flag)
+ 	view: ^rnd.View,
+ 	log:  ^[dynamic]pp.Command, // the action log (commands land here — the replay artifact, ODN-11)
+ 	sim_events: ^[dynamic]pp.Event, // the app's event buffer (v2-sound: the fast-path wire-placed cue lands here — the audio consumer's feed, ODN-14)
+diff --git a/app/main.odin b/app/main.odin
+index 09657af..5e4931c 100644
+--- a/app/main.odin
++++ b/app/main.odin
+@@ -482,6 +482,7 @@ main :: proc() {
+ 	// canonical on App and are mirrored into the ctx around dispatch.
+ 	app.input.topo = &app.state.topology
+ 	app.input.cat = &app.cat
++	app.input.state = &app.state // the Box (v2-mechanics-the-box): box_apply_edit needs the owning run
+ 	app.input.view = &app.view
+ 	app.input.log = &app.state.action_log
+ 	// v2-sound: the fast-path event buffer (commit_draw's PIPE_DRAWN cue —
+@@ -909,6 +910,12 @@ start_run :: proc(app: ^App, seed: u64) {
+ 	app.state.health_enabled = app.health_on // 4.3: the Network Health meter (run setup)
+ 	app.state.surge_win_pct = app.surge_win_pct // 4.3: the surge-uptime win threshold (run setup)
+ 	app.state.growth_enabled = true // 5.1: the map grows (run setup — terminals appear outward from the player-placed router mesh; era 3 unlocks content_host spawns + the wide-tier connect radius)
++	// The Box (v2-mechanics-the-box, user-authorized from the mechanics-quinn
++	// record): the build layer's material economy is LIVE in the game — era
++	// caps + the refill clock ride the catalogs; box_enable grants the start
++	// era's kit + schedules the first dot.
++	app.state.box_enabled = true
++	pp.box_enable(&app.state, &app.cat)
+ 	app.tick = 0
+ 	app.accum = 0
+ 	app.input.drag = {}
+@@ -1613,6 +1620,14 @@ draw_hud :: proc(app: ^App) {
+ 		score := fmt.tprintf("delivered %d", app.state.score)
+ 		draw_text(app, score, 12, 56, rnd.hud(&app.view, 17), p.ink_soft_text)
+ 	}
++	// The Box (v2-mechanics-the-box): the MINIMAL glanceable economy line —
++	// typed-piece counters + the next-dot progress, ONE line under the score
++	// (FORGE #2: a glance, never arithmetic; the tray chips carry the same
++	// counts at the point of choice). Color never sole encoder — text only,
++	// ink_soft (LOOK calm: scarcity must not read as anxiety).
++	if app.state.box_enabled {
++		draw_box_hud(app, 76)
++	}
+ 	// 4.1: the forecast weather report (top-right) + the congestion legend. The
+ 	// panel draws zero pixels when the forecast is empty; the legend explains
+ 	// the telegraph (ring + glyph + pulse — never color alone) AND consumes
+@@ -2180,6 +2195,8 @@ reject_label :: proc(e: pp.Edit_Error) -> string {
+ 	case .Invalid_Lane: return "that's not a lane"
+ 	case .Invalid_Weights: return "that weight set is invalid - lanes 0..1000, never all zero, never-drop lanes keep bandwidth"
+ 	case .Not_An_Upgrade: return "modernize only upgrades - demolish and redraw to go down a tier" // 6.3
++	case .Box_Piece_Exhausted: return "none of those in the box - teardown refunds pieces" // box (ruling 4)
++	case .Box_Spool_Exhausted: return "not enough line in the spool - demolish returns tiles" // box (ruling 6)
+ 	}
+ 	return "can't do that"
+ }
+@@ -2383,6 +2400,42 @@ draw_text_h :: proc(app: ^App, txt: string, x, y: i32, size: i32, col: rl.Color)
+ 	rnd.draw_text_font(app.view.font_header, txt, x, y, size, col)
+ }
+ 
++// draw_box_hud — the Box's glanceable economy line (v2-mechanics-the-box;
++// FORGE #2: a glance, never arithmetic). One text row: the typed-piece
++// counters (only types the era ceiling actually grants), the spool tiles
++// against their era cap, and the next-dot progress. Text-only, ink_soft —
++// LOOK calm: the scarcity readout must never make a healthy grid feel
++// anxious. y = the row's top offset (under the score line).
++draw_box_hud :: proc(app: ^App, y: i32) {
++	p := app.palette
++	txt := "box"
++	first := true
++	for nt, i in app.cat.node_types {
++		if nt.kind != .Junction {
++			continue
++		}
++		row, ok := pp.era_row(&app.cat, app.state.era)
++		if !ok || i >= len(row.box_pieces) || row.box_pieces[i] == 0 {
++			continue // the era grants none — the chip is not a glance item
++		}
++		if !first do txt = fmt.tprintf("%s  ", txt)
++		first = false
++		short := nt.id
++		if short == "router_basic" { short = "basic" } else if short == "router_mid" { short = "mid" } else if short == "router_high" { short = "high" }
++		txt = fmt.tprintf("%s %s x%d", txt, short, app.state.box.pieces[i])
++	}
++	for s in 0..<pp.BOX_SPOOL_COUNT {
++		row, ok := pp.era_row(&app.cat, app.state.era)
++		if !ok || s >= len(row.box_spools) || row.box_spools[s] == 0 {
++			continue
++		}
++		txt = fmt.tprintf("%s  %s %d/%d", txt, pp.spool_name(u8(s)), app.state.box.spools[s], row.box_spools[s])
++	}
++	prog := pp.box_dot_progress_permille(&app.state)
++	txt = fmt.tprintf("%s  dot %d%%", txt, prog / 10)
++	draw_text(app, txt, 12, y, rnd.hud(&app.view, 15), p.ink_soft_text)
++}
++
+ // draw_tray — the 3.5 hardware tray: link chips (tier select) + router chips
+ // (placement arm). No inventory counts in v2 (the economy is a later story) —
+ // chips are mode selectors. The rect math is the render package's (single
+@@ -2416,6 +2469,7 @@ draw_tray :: proc(app: ^App) {
+ 		r := rnd.tray_chip_rect(&app.view, i)
+ 		tidx := rts[k]
+ 		nt := app.cat.node_types[tidx]
++		held := !app.state.box_enabled || app.state.box.pieces[tidx] > 0
+ 		bg := rl.Color{238, 230, 210, 255}
+ 		if i32(tidx) == app.input.placing { bg = rl.Color{210, 226, 196, 255} }
+ 		rl.DrawRectangleRec(r, bg)
+@@ -2423,7 +2477,20 @@ draw_tray :: proc(app: ^App) {
+ 		rl.DrawCircle(i32(r.x + rnd.hud_f(&app.view, 15)), i32(r.y + r.height/2), rnd.hud_f(&app.view, 6), p.router_body)
+ 		short := nt.id
+ 		if short == "router_basic" { short = "basic" } else if short == "router_mid" { short = "mid" } else if short == "router_high" { short = "high" }
+-		draw_text(app, short, i32(r.x) + rnd.hud(&app.view, 26), i32(r.y) + rnd.hud(&app.view, 7), rnd.hud(&app.view, 15), p.ink_soft_text)
++		// The Box (v2-mechanics-the-box): the chip names its count at the
++		// point of choice (FORGE #2 glanceable); an empty tier dims its label
++		// (text + state, never color alone — the count IS the message).
++		// Box-OFF runs keep the shipped bare label (the golden-stability
++		// rule: no incidental pixel shifts on legacy demos).
++		label := short
++		if app.state.box_enabled {
++			label = fmt.tprintf("%s x%d", short, app.state.box.pieces[tidx])
++		}
++		ink := p.ink_soft_text
++		if !held { ink = p.ink_faint }
++		// the label SIZE stays 15 on box-off runs (the shipped look — the
++		// golden-stability rule); the count variant reads fine at 15 too.
++		draw_text(app, label, i32(r.x) + rnd.hud(&app.view, 26), i32(r.y) + rnd.hud(&app.view, 7), rnd.hud(&app.view, 15), ink)
+ 		i += 1
+ 	}
+ }
+diff --git a/app/pullback_test.odin b/app/pullback_test.odin
+index 7b4eb6a..2ea9fd6 100644
+--- a/app/pullback_test.odin
++++ b/app/pullback_test.odin
+@@ -34,6 +34,15 @@ pullback_test_app :: proc(app: ^App) {
+ 		pp.Node_Type{id = "router_basic", display = "rt", kind = .Junction, port_capacity = 4},
+ 	)
+ 	append(&app.cat.pipe_tiers, pp.Pipe_Tier{id = "test", display = "test", max_span = 20, cost_per_tile = 1}) // the W8 pipe-select leg needs a valid draw
++	// the Box (v2-mechanics-the-box): start_run enables the box — the test
++	// app's minimal catalog needs the era row APP_ERA grants a kit from
++	// (box_enable fails loud on a missing row, by design).
++	for e in 1..=APP_ERA {
++		er := pp.Era_Row{era = u8(e), id = fmt.tprintf("t%d", e)}
++		er.box_pieces = make([dynamic]u32, len(app.cat.node_types))
++		er.box_spools = make([dynamic]u32, pp.BOX_SPOOL_COUNT)
++		append(&app.cat.eras, er)
++	}
+ 	pp.run_init(&app.state, 42, app.cat.hash, 20)
+ 	ti, _ := pp.node_type_index(&app.cat, "residential")
+ 	ri, _ := pp.node_type_index(&app.cat, "router_basic")
+diff --git a/app/qos_panel.odin b/app/qos_panel.odin
+index 3f91a98..063aff2 100644
+--- a/app/qos_panel.odin
++++ b/app/qos_panel.odin
+@@ -211,7 +211,7 @@ qos_nudge :: proc(app: ^App, lane: u8, minus: bool) {
+ 	}
+ 	w[lane] = nv
+ 	cmd := pp.Cmd_Set_Weights{pipe = u32(app.input.sel_pipe), weights = w}
+-	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {
++	if _, err := pp.box_apply_edit(&app.state, pp.Command{1, cmd}, &app.cat); err == .None {
+ 		append(&app.state.action_log, pp.Command{
+ 			apply_tick = app.tick + 1,
+ 			kind = cmd,
+@@ -234,7 +234,7 @@ qos_apply_preset :: proc(app: ^App, preset: u16) {
+ 	}
+ 	w := app.cat.balance.lane_presets[preset].weights
+ 	cmd := pp.Cmd_Set_Weights{pipe = u32(app.input.sel_pipe), weights = w}
+-	if _, err := pp.topology_apply_edit(&app.state.topology, pp.Command{1, cmd}, &app.cat); err == .None {
++	if _, err := pp.box_apply_edit(&app.state, pp.Command{1, cmd}, &app.cat); err == .None {
+ 		append(&app.state.action_log, pp.Command{
+ 			apply_tick = app.tick + 1,
+ 			kind = cmd,
+diff --git a/core/box.odin b/core/box.odin
+new file mode 100644
+index 0000000..ce9cd1e
+--- /dev/null
++++ b/core/box.odin
+@@ -0,0 +1,366 @@
++package core
++
++import "core:fmt"
++
++// box.odin — THE BOX (mechanics-quinn record, rulings 2+3+4+5+6; job
++// packet-plumber-v2-mechanics-the-box). The build layer's material authority:
++// the player holds TYPED PIECES — router pieces by junction node-type
++// (rulings 2+4: the knights-and-bishops grammar) and pipe tiles on two SPOOLS
++// (ruling 6: standard | fiber, drained 1/tile by the matching tier) — against
++// an ERA CEILING (ruling 3: the caps on Era_Row; era advance RAISES the cap
++// and a restore brings stock TO it, never past — no banking). Refill DOTS
++// restore-to-cap on a KNOWN clock spine (ruling 5), accelerated by deliveries
++// since the last dot, clamped [floor, base] — the floor is the no-soft-lock
++// guarantee and is NEVER gated on performance; the base interval is the
++// ceiling (a crisis-stalled run rides the spine, never slower — the Q7
++// death-spiral answer). Teardown refunds EVERYTHING, unclamped (the full-
++// refund ruling; "cannibalize-and-redeploy is always available, never free —
++// the surge runs while you rebuild").
++//
++// Promotion (ruling 4) needs NO new verb: a router "swap" is demolish (the
++// piece returns) + place the higher tier (a piece is spent) — lifetime cost
++// equals place-big-first by construction. The pipe modernize (Cmd_Set_Pipe_
++// Tier) resplices spools: the new tier's tiles drain the matching spool, the
++// old tier's tiles refund theirs. Only tiers you HOLD are placeable
++// (.Box_Piece_Exhausted) — the single biggest behavioral change vs shipped
++// free tiering, ruled in with eyes open.
++//
++// Determinism (the spine): every proc here is a pure function of serialized
++// state + catalogs + the command stream. The Box gates the SAME validate-
++// then-apply path the replay uses (box_apply_edit wraps topology_apply_edit),
++// so live edits and replay drain/refund identically (E10). state.box_enabled
++// is run setup (like health_enabled/growth_enabled — never serialized); the
++// box section serializes absent-when-disabled, so box-off runs write zero
++// bytes and every legacy golden stays byte-identical modulo the catalog fold.
++
++// box_make / box_destroy — the Box lifetime (mirrors era_gate_make; the
++// arrays stay len-0 until box_enable grows them — a disabled box owns
++// nothing, the zero-value discipline).
++box_make :: proc(b: ^Box_State, allocator := context.allocator) {
++	b^ = {}
++}
++
++box_destroy :: proc(b: ^Box_State) {
++	delete(b.pieces)
++	delete(b.spools)
++}
++
++// box_enable — run setup for a box-on run (the app's start_run / the harness
++// Run_Config; NEVER called mid-run — the Box is setup, like the fixture).
++// Grows the stock arrays, schedules the first dot on the spine, and restores
++// stock to the START era's caps (era 1 is felt-not-counted: the player opens
++// the run holding the full era kit — ruling 7's fat caps).
++box_enable :: proc(state: ^Run_State, cat: ^Catalogs) {
++	// fail loud (never a silent zero-kit run — an era_row miss here would
++	// read as a permanent empty box: dots firing into a box that restores
++	// nothing). A caller passing an era outside the table is a setup bug.
++	if _, ok := era_row(cat, state.era); !ok {
++		panic("box_enable: the run's era has no catalog row — the Box cannot grant a kit")
++	}
++	state.box_enabled = true
++	box_grow(&state.box, cat)
++	box_restore_to_cap(state, cat)
++	state.box.dot_interval = cat.balance.box.dot_interval_ticks
++	state.box.next_dot_tick = state.tick + cat.balance.box.dot_interval_ticks
++	state.box.delivered_baseline = box_total_delivered(state)
++}
++
++// box_grow — size the stock arrays to the catalog (idempotent).
++box_grow :: proc(b: ^Box_State, cat: ^Catalogs) {
++	if len(b.pieces) < len(cat.node_types) {
++		old := len(b.pieces)
++		resize(&b.pieces, len(cat.node_types))
++		for i in old..<len(b.pieces) {
++			b.pieces[i] = 0
++		}
++	}
++	if len(b.spools) < BOX_SPOOL_COUNT {
++		old := len(b.spools)
++		resize(&b.spools, BOX_SPOOL_COUNT)
++		for i in old..<len(b.spools) {
++			b.spools[i] = 0
++		}
++	}
++}
++
++// box_restore_to_cap — the refill (rulings 2+3+5): bring every type UP to its
++// current-era cap, never past it (no banking — a refund overshoot above cap
++// is left alone, never destroyed; refills from below clamp exactly at cap).
++box_restore_to_cap :: proc(state: ^Run_State, cat: ^Catalogs) {
++	row, ok := era_row(cat, state.era)
++	if !ok {
++		return
++	}
++	box_grow(&state.box, cat)
++	for t in 0..<len(state.box.pieces) {
++		cap: u32 = 0
++		if t < len(row.box_pieces) {
++			cap = row.box_pieces[t]
++		}
++		if state.box.pieces[t] < cap {
++			state.box.pieces[t] = cap
++		}
++	}
++	for s in 0..<len(state.box.spools) {
++		cap: u32 = 0
++		if s < len(row.box_spools) {
++			cap = row.box_spools[s]
++		}
++		if state.box.spools[s] < cap {
++			state.box.spools[s] = cap
++		}
++	}
++}
++
++// box_on_era_advance — the crazyhouse rule (ruling 3): "era = new-bigger-set
++// moment". Called from era_step's fire path AFTER the era flip, so the caps
++// read are the NEW era's. The clock spine is untouched (tempo is era-
++// independent; the restore is the advance's own material event).
++box_on_era_advance :: proc(state: ^Run_State, cat: ^Catalogs) {
++	if !state.box_enabled {
++		return
++	}
++	box_restore_to_cap(state, cat)
++}
++
++// Box_Charge_Snapshot — the PRE-APPLY material data box_charge prices from.
++// The charge runs AFTER topology_apply_edit has mutated the topology, so any
++// pre-edit fact (the resplice's OLD tier; a junction demolish's incident-pipe
++// set) must be captured in box_validate and carried through — reading it
++// post-apply silently zeroes the resplice swap and the batch refund.
++Box_Charge_Snapshot :: struct {
++	old_tier:   u16, // Set_Pipe_Tier: the pipe's tier BEFORE the tier-up
++	dp_tier:    u16, // Demolish_Pipe: the pipe's tier BEFORE the tombstone (pipe_slot skips dead pipes — the charge must not re-look-up)
++	dp_span:    i32, // Demolish_Pipe: the pipe's cached span (same post-apply hazard)
++	dn_type:    u16, // Demolish_Node: the junction's node-type (post-apply the node is dead — node_slot skips it)
++	dn_pieces:  u32, // Demolish_Node: the junction's piece (0 = not a node demolish)
++	dn_spools:  [BOX_SPOOL_COUNT]u32, // Demolish_Node: incident tiles per spool
++}
++
++// box_apply_edit — the ONE entry point for player edits on a run (replay +
++// the app fast-path): material legality (the Box) wrapped around the
++// topology's validate-then-apply, then the charge/refund. Order is fixed:
++// box_validate (material) -> topology_apply_edit (topology legality + apply)
++// -> box_charge (drain/refund). A command that is not priceable (unknown
++// tier/node id) passes the Box untouched so the TOPOLOGY authority reports
++// its own canonical error — the Box never shadows a malformed command with a
++// material one. Disabled = pure delegate (byte-identical legacy behavior).
++//
++// Cmd_Era_Advance is not a topology edit and spends no material — it latches
++// exactly as step's replay loop always has (the fire, and the advance-time
++// restore, live in era_step).
++box_apply_edit :: proc(state: ^Run_State, cmd: Command, cat: ^Catalogs) -> (Edit_Result, Edit_Error) {
++	if !state.box_enabled {
++		#partial switch c in cmd.kind {
++		case Cmd_Era_Advance:
++			if e := era_advance_validate(state, c, cat); e != .None {
++				return {}, e
++			}
++			era_advance_latch(state, c)
++			return {}, .None
++		case:
++			return topology_apply_edit(&state.topology, cmd, cat)
++		}
++	}
++	snap: Box_Charge_Snapshot
++	if e := box_validate(state, cmd, cat, &snap); e != .None {
++		return {}, e
++	}
++	#partial switch c in cmd.kind {
++	case Cmd_Era_Advance:
++		if e := era_advance_validate(state, c, cat); e != .None {
++			return {}, e
++		}
++		era_advance_latch(state, c)
++		return {}, .None
++	case:
++		res, err := topology_apply_edit(&state.topology, cmd, cat)
++		if err != .None {
++			return res, err
++		}
++		box_charge(state, cmd, cat, &snap)
++		return res, .None
++	}
++}
++
++// box_validate — the material leg (rulings 4+6): can the player AFFORD this?
++// Every check here is paired with the identical pricing in box_charge below —
++// keep the two in lockstep (the pair is the invariant the tests pin: a
++// validated command never underflows a counter in charge).
++box_validate :: proc(state: ^Run_State, cmd: Command, cat: ^Catalogs, snap: ^Box_Charge_Snapshot) -> Edit_Error {
++	t := &state.topology
++	#partial switch c in cmd.kind {
++	case Cmd_Draw_Pipe:
++		if u32(c.tier) >= u32(len(cat.pipe_tiers)) {
++			return .None // unpriceable — validate_draw reports .Unknown_Tier
++		}
++		sa, oka := node_slot(t, c.a)
++		sb, okb := node_slot(t, c.b)
++		if !oka || !okb {
++			return .None // unpriceable — validate_draw reports .Missing_Node
++		}
++		span := span_between(t.node_pos[sa], t.node_pos[sb])
++		if u64(state.box.spools[cat.pipe_tiers[c.tier].spool]) < u64(span) {
++			return .Box_Spool_Exhausted
++		}
++	case Cmd_Place_Router:
++		if u32(c.type_idx) >= u32(len(cat.node_types)) {
++			return .None // unpriceable — validate_place reports .Unknown_Node_Type
++		}
++		if cat.node_types[c.type_idx].kind != .Junction {
++			return .None // unpriceable — validate_place reports .Not_A_Junction
++		}
++		if state.box.pieces[c.type_idx] < 1 {
++			return .Box_Piece_Exhausted
++		}
++	case Cmd_Set_Pipe_Tier:
++		if u32(c.tier) >= u32(len(cat.pipe_tiers)) {
++			return .None // unpriceable — validate_set_pipe_tier reports .Unknown_Tier
++		}
++		slot, ok := pipe_slot(t, c.pipe)
++		if !ok {
++			return .None // unpriceable — the topology reports .Missing_Pipe
++		}
++		// the resplice: the NEW tier's tiles drain the new spool (the old
++		// tier's tiles refund unconditionally — a refund can never fail).
++		// SAME-SPOOL resplices (mid->wide, both fiber) are NET-ZERO — drain
++		// and refund the identical span — so they price at zero and must
++		// never refuse on a short spool (a pointless refusal would be a
++		// false "no" — the FORGE #2 tripwire's cousin).
++		if cat.pipe_tiers[c.tier].spool != cat.pipe_tiers[t.pipe_tier[slot]].spool {
++			if u64(state.box.spools[cat.pipe_tiers[c.tier].spool]) < u64(t.pipe_span[slot]) {
++				return .Box_Spool_Exhausted
++			}
++		}
++		snap.old_tier = t.pipe_tier[slot] // PRE-apply tier (charge reads post-apply)
++	case Cmd_Demolish_Pipe:
++		slot, ok := pipe_slot(t, c.pipe)
++		if !ok {
++			return .None // unpriceable — the topology reports .Missing_Pipe
++		}
++		// teardown is always affordable (a refund can never fail) — the
++		// snapshot exists so the CHARGE prices the RIGHT pipe post-tombstone
++		// (pipe_slot skips dead pipes; a post-apply re-look-up would fall
++		// back to slot 0 and refund the wrong tier/span — the node-demolish
++		// hazard's pipe-side twin).
++		snap.dp_tier = t.pipe_tier[slot]
++		snap.dp_span = t.pipe_span[slot]
++	case Cmd_Demolish_Node:
++		slot, ok := node_slot(t, c.node)
++		if !ok {
++			return .None // unpriceable — the topology reports .Missing_Node
++		}
++		// the atomic batch: snapshot the refund (the piece + every incident
++		// LIVE pipe's tiles) BEFORE the apply tombstones them.
++		snap.dn_pieces = 1
++		snap.dn_type = t.node_type[slot]
++		for pi in 0..<len(t.pipe_alive) {
++			if !t.pipe_alive[pi] {
++				continue
++			}
++			_, is_end := pipe_other(t, u32(pi), c.node)
++			if is_end {
++				snap.dn_spools[cat.pipe_tiers[t.pipe_tier[pi]].spool] += u32(t.pipe_span[pi])
++			}
++		}
++	case:
++	}
++	return .None
++}
++
++// box_charge — the material movement for an APPLIED command (box_validate
++// passed + topology_apply_edit succeeded). Draws/placements drain; teardown
++// refunds FULLY (ruling 2) and is NEVER clamped — a refund may push stock
++// above the era cap (the next dot's restore-to-cap simply no-ops while stock
++// rides high). The junction-demolish batch refunds the router piece + every
++// incident pipe's tiles in slot order (the same scan apply_demolish_node
++// uses, so replay charges identically).
++box_charge :: proc(state: ^Run_State, cmd: Command, cat: ^Catalogs, snap: ^Box_Charge_Snapshot) {
++	t := &state.topology
++	#partial switch c in cmd.kind {
++	case Cmd_Draw_Pipe:
++		sa := node_slot_raw(t, c.a)
++		sb := node_slot_raw(t, c.b)
++		span := span_between(t.node_pos[sa], t.node_pos[sb])
++		state.box.spools[cat.pipe_tiers[c.tier].spool] -= u32(span)
++	case Cmd_Place_Router:
++		state.box.pieces[c.type_idx] -= 1
++	case Cmd_Set_Pipe_Tier:
++		slot, _ := pipe_slot(t, c.pipe)
++		span := t.pipe_span[slot]
++		state.box.spools[cat.pipe_tiers[c.tier].spool] -= u32(span)
++		state.box.spools[cat.pipe_tiers[snap.old_tier].spool] += u32(span)
++	case Cmd_Demolish_Pipe:
++		state.box.spools[cat.pipe_tiers[snap.dp_tier].spool] += u32(snap.dp_span)
++	case Cmd_Demolish_Node:
++		slot, _ := node_slot(t, c.node)
++			state.box.pieces[snap.dn_type] += snap.dn_pieces
++		for s in 0..<len(state.box.spools) {
++			state.box.spools[s] += snap.dn_spools[s]
++		}
++	case:
++	}
++}
++
++// box_step — the refill clock (ruling 5). Called from core.step AFTER
++// era_step (a same-tick advance+dot: the advance restores to the NEW caps
++// first; the dot then no-ops or tops up — one deterministic order). Fires at
++// most one dot per step (ticks are contiguous; a dot reschedules the next at
++// its fire tick). The interval the NEXT dot rides is decided HERE from the
++// deliveries since the LAST dot — the known worst case: the player can always
++// read when the dot lands (the schedule never moves mid-interval), and a
++// zero-delivery interval rides the BASE spine (a crisis can slow the EARNED
++// acceleration, never the guarantee — the floor is absolute, the base is the
++// ceiling).
++box_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
++	if !state.box_enabled {
++		return
++	}
++	if tick < state.box.next_dot_tick {
++		return
++	}
++	box_restore_to_cap(state, cat)
++	event_emit(state, tick, EVENT_TAG_BOX_DOT)
++	delivered_now := box_total_delivered(state)
++	d := delivered_now - state.box.delivered_baseline
++	state.box.delivered_baseline = delivered_now
++	bb := cat.balance.box
++	interval := bb.dot_interval_ticks
++	if d > 0 {
++		pull := d * bb.dot_accel_ticks_per_delivery
++		if pull > interval - bb.dot_floor_ticks {
++			pull = interval - bb.dot_floor_ticks
++		}
++		interval -= pull
++	}
++	state.box.dot_interval = interval
++	state.box.next_dot_tick = tick + interval
++}
++
++// box_total_delivered — the delivery counter the acceleration reads: the sum
++// of the flow's cumulative per-class SLA delivered accumulators. Derived
++// (never serialized in the box — the accumulators themselves ride the T1
++// hash; the box pins only the baseline diff anchor).
++box_total_delivered :: proc(state: ^Run_State) -> u64 {
++	total: u64 = 0
++	for i in 0..<len(state.flow.sla) {
++		total += state.flow.sla[i].delivered
++	}
++	return total
++}
++
++// box_dot_progress_permille — the HUD's next-dot progress (0..1000): how far
++// the current dot interval has run. A pure read of serialized state (the
++// schedule never moves mid-interval — the glanceable contract). 0 when the
++// interval is degenerate (never in a loaded catalog: interval >= 1).
++box_dot_progress_permille :: proc(state: ^Run_State) -> u32 {
++	if state.box.dot_interval == 0 || state.tick >= state.box.next_dot_tick {
++		return 0
++	}
++	left := state.box.next_dot_tick - state.tick
++	if left >= state.box.dot_interval {
++		return 0
++	}
++	run := state.box.dot_interval - left
++	return u32(run * 1000 / state.box.dot_interval)
++}
+diff --git a/core/box_test.odin b/core/box_test.odin
+new file mode 100644
+index 0000000..bab6070
+--- /dev/null
++++ b/core/box_test.odin
+@@ -0,0 +1,601 @@
++package core
++
++// box_test.odin — THE BOX's behavior suite (v2-mechanics-the-box; record open
++// question 8: "a mutation-leg-style gate for the economy … so the tutorial-by-
++// consequence is provable, not vibes"). Pins:
++//
++//   1. the material grammar (rulings 4+6): place costs a held piece, draws
++//      drain the matching spool 1/tile, modernize resplices, teardown refunds
++//      FULLY (unclamped), refusals are atomic (nothing applied, nothing logged);
++//   2. the Cap (ruling 3): era advance raises + restores-to-cap, refills never
++//      push past (no banking), refunds may ride above cap until the next dot;
++//   3. the clock (ruling 5): dots restore + reschedule on the spine; delivery
++//      acceleration clamps to [floor, base]; the floor is ABSOLUTE (the
++//      no-soft-lock guarantee — never gated on performance);
++//   4. replay determinism (E10): a box-on run replays byte-identical;
++//   5. THE ECONOMY GATES THAT CAN FAIL: a deterministic greedy-expansive bot
++//      (build big, then cannibalize-and-redeploy — the record's expansive
++//      builder) hears the ceiling's "no" only when the box is genuinely
++//      empty, hears it in EPISODES (never refusal spam), and self-resolves
++//      as the dot lands — and the gate DETECTS its own mutation legs
++//      (delete-the-cap, drop-the-floor).
++//
++// Fixture: test_catalog + a box clock {base 400, floor 100, accel 1} + era
++// caps re-shaped to the canon GRADIENT in miniature (era 1: 8 basic pieces /
++// 48 standard tiles / no fiber; era 2 raises pieces + opens fiber; era 3 adds
++// mid/high + leans fiber — non-decreasing per type, the load contract's
++// shape). Small caps keep the gates fast; the doctrine-level cadence runs in
++// the L5 harness econ-check against the REAL catalogs.
++
++import "core:testing"
++
++BOX_TEST_BASE :: u64(400)
++BOX_TEST_FLOOR :: u64(100)
++BOX_TEST_ACCEL :: u64(1)
++BOX_FIX_PIECES :: u32(8) // era-1 basic pieces at cap
++BOX_FIX_TILES :: u32(48) // era-1 standard tiles at cap
++
++// box_test_catalog — the shared fixture catalog (era caps re-shaped to the
++// canon gradient in miniature).
++box_test_catalog :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalogs {
++	test_catalog(cat, allocator)
++	cat.balance.box = Box_Balance{
++		dot_interval_ticks           = BOX_TEST_BASE,
++		dot_floor_ticks              = BOX_TEST_FLOOR,
++		dot_accel_ticks_per_delivery = BOX_TEST_ACCEL,
++	}
++	// the fixture's hand-built tiers carry no spool (test_catalog predates
++	// the Box) — resolve the tech classes here or every tier prices as
++	// standard and the resplice grammar silently vanishes.
++	wd, ok_wd := pipe_tier_index(cat, "wide")
++	if !ok_wd do panic("box_test_catalog: no wide tier")
++	cat.pipe_tiers[wd].spool = BOX_SPOOL_FIBER
++	rt, ok_rt := node_type_index(cat, "router_basic")
++	rm, ok_rm := node_type_index(cat, "router_mid")
++	rh, ok_rh := node_type_index(cat, "router_high")
++	if !ok_rt || !ok_rm || !ok_rh do panic("box_test_catalog: junction types missing")
++	for era in 0..<len(cat.eras) {
++		cat.eras[era].box_pieces[rt] = 8
++		cat.eras[era].box_pieces[rm] = 0
++		cat.eras[era].box_pieces[rh] = 0
++		cat.eras[era].box_spools[BOX_SPOOL_STANDARD] = BOX_FIX_TILES
++		cat.eras[era].box_spools[BOX_SPOOL_FIBER] = 0
++	}
++	// era 2 raises pieces + opens fiber; era 3 adds the mid/high kit + leans
++	// fiber (non-decreasing per type — ruling 3's load contract, mirrored).
++	cat.eras[1].box_pieces[rt] = 12
++	cat.eras[1].box_spools[BOX_SPOOL_FIBER] = 40
++	cat.eras[2].box_pieces[rt] = 12
++	cat.eras[2].box_pieces[rm] = 4
++	cat.eras[2].box_pieces[rh] = 2
++	cat.eras[2].box_spools[BOX_SPOOL_FIBER] = 200
++	return cat
++}
++
++// box_test_run — a fresh era-`era` run with the static fixture (res ← router
++// → host) and the Box enabled (the starting kit restored at setup).
++box_test_run :: proc(s: ^Run_State, seed: u64, era: u8, cat: ^Catalogs) -> (u32, u32, u32) {
++	run_init(s, seed, cat.hash, TEST_LOGIC_HZ)
++	s.era = era
++	res, rt, host := test_seed_fixture(s, cat)
++	box_enable(s, cat)
++	return res, rt, host
++}
++
++box_rt_idx :: proc(cat: ^Catalogs) -> u16 {
++	i, ok := node_type_index(cat, "router_basic")
++	if !ok do panic("box_test: no router_basic")
++	return i
++}
++box_mid_idx :: proc(cat: ^Catalogs) -> u16 {
++	i, ok := node_type_index(cat, "router_mid")
++	if !ok do panic("box_test: no router_mid")
++	return i
++}
++box_std_idx :: proc(cat: ^Catalogs) -> u16 {
++	i, ok := pipe_tier_index(cat, "standard")
++	if !ok do panic("box_test: no standard tier")
++	return i
++}
++box_wd_idx :: proc(cat: ^Catalogs) -> u16 {
++	i, ok := pipe_tier_index(cat, "wide")
++	if !ok do panic("box_test: no wide tier")
++	return i
++}
++
++// box_apply_cmd — the fast-path apply used throughout (what the app's
++// Command_Bus does): box_apply_edit, and on success log at the next tick.
++box_apply_cmd :: proc(s: ^Run_State, kind: Command_Kind, cat: ^Catalogs) -> Edit_Error {
++	_, err := box_apply_edit(s, Command{apply_tick = s.tick + 1, kind = kind}, cat)
++	return err
++}
++
++// ---------------------------------------------------------------- the flag --
++
++@test
++test_box_disabled_is_legacy_delegate :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 1, cat.hash, TEST_LOGIC_HZ)
++	res, rt, host := test_seed_fixture(&s, &cat)
++	// box-OFF (the zero value): builds are free — the shipped behavior.
++	err := box_apply_cmd(&s, Cmd_Place_Router{type_idx = box_rt_idx(&cat), pos = {20, 19}}, &cat)
++	testing.expect(t, err == .None, "box-off placement must be free")
++	err = box_apply_cmd(&s, Cmd_Draw_Pipe{a = res, b = rt, tier = box_std_idx(&cat)}, &cat)
++	testing.expect(t, err == .None, "box-off draw must be free")
++	testing.expect(t, !s.box_enabled, "box must stay disabled")
++	testing.expect(t, len(s.box.pieces) == 0 && len(s.box.spools) == 0, "a disabled box owns no stock arrays")
++	testing.expect(t, len(s.topology.pipe_alive) == 1, "the draw applied")
++	_ = host
++}
++
++@test
++test_box_enable_grants_the_starting_kit :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	box_test_run(&s, 1, 1, &cat)
++	testing.expect(t, s.box_enabled, "box enabled")
++	testing.expect(t, s.box.pieces[box_rt_idx(&cat)] == BOX_FIX_PIECES, "era-1 basic pieces at cap")
++	testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == BOX_FIX_TILES, "era-1 standard tiles at cap")
++	testing.expect(t, s.box.spools[BOX_SPOOL_FIBER] == 0, "era-1 fiber is empty")
++	testing.expect(t, s.box.next_dot_tick == BOX_TEST_BASE, "the first dot rides the spine from setup")
++}
++
++// ------------------------------------------------------- the material grammar --
++
++@test
++test_box_draw_drains_and_place_costs :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	res, rt, host := box_test_run(&s, 1, 1, &cat)
++	// the canonical 12-tile draw (the fixture's res→router leg).
++	err := box_apply_cmd(&s, Cmd_Draw_Pipe{a = res, b = rt, tier = box_std_idx(&cat)}, &cat)
++	testing.expect(t, err == .None, "an affordable draw applies")
++	testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == BOX_FIX_TILES - 12, "the spool drained exactly the span")
++	testing.expect(t, len(s.topology.pipe_alive) == 1, "the pipe is live")
++	// placement spends a piece of the chosen tier.
++	err = box_apply_cmd(&s, Cmd_Place_Router{type_idx = box_rt_idx(&cat), pos = {20, 19}}, &cat)
++	testing.expect(t, err == .None, "an affordable placement applies")
++	testing.expect(t, s.box.pieces[box_rt_idx(&cat)] == BOX_FIX_PIECES - 1, "the placement spent one basic piece")
++	_ = host
++}
++
++@test
++test_box_refusals_are_atomic :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	res, rt, host := box_test_run(&s, 1, 1, &cat)
++	// drain the standard spool below the draw price, then refuse.
++	s.box.spools[BOX_SPOOL_STANDARD] = 5
++	log_before := len(s.action_log)
++	err := box_apply_cmd(&s, Cmd_Draw_Pipe{a = res, b = rt, tier = box_std_idx(&cat)}, &cat)
++	testing.expect(t, err == .Box_Spool_Exhausted, "a short spool refuses the WHOLE draw (atomic, no partial)")
++	testing.expect(t, len(s.topology.pipe_alive) == 0, "a refused draw applies nothing")
++	testing.expect(t, len(s.action_log) == log_before, "a refused draw logs nothing")
++	// an unheld router tier refuses (.Box_Piece_Exhausted) — era 1 holds no
++	// mid pieces (the fixture's era gradient), so a mid placement refuses.
++	err = box_apply_cmd(&s, Cmd_Place_Router{type_idx = box_mid_idx(&cat), pos = {20, 19}}, &cat)
++	testing.expect(t, err == .Box_Piece_Exhausted, "an unheld tier refuses")
++	testing.expect(t, len(s.action_log) == log_before, "the piece refusal logs nothing")
++	_ = host
++}
++
++@test
++test_box_modernize_resplices_spools :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	res, rt, host := box_test_run(&s, 1, 1, &cat)
++	box_apply_cmd(&s, Cmd_Draw_Pipe{a = res, b = rt, tier = box_std_idx(&cat)}, &cat)
++	s.box.spools[BOX_SPOOL_FIBER] = 50
++	std_before := s.box.spools[BOX_SPOOL_STANDARD]
++	err := box_apply_cmd(&s, Cmd_Set_Pipe_Tier{pipe = 0, tier = box_wd_idx(&cat)}, &cat)
++	testing.expect(t, err == .None, "an affordable modernize applies")
++	testing.expect(t, s.box.spools[BOX_SPOOL_FIBER] == 50 - 12, "the new tier drained the fiber spool")
++	testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == std_before + 12, "the old tiles returned to the standard spool")
++	// a spool-short resplice refuses atomically: force the TARGET spool low.
++	s.box.spools[BOX_SPOOL_STANDARD] = 3
++	err = box_apply_cmd(&s, Cmd_Set_Pipe_Tier{pipe = 0, tier = box_std_idx(&cat)}, &cat)
++	testing.expect(t, err == .Box_Spool_Exhausted, "a spool-short resplice refuses")
++	_ = host
++}
++
++@test
++test_box_teardown_refunds_fully_and_unclamped :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	res, rt, host := box_test_run(&s, 1, 1, &cat)
++	box_apply_cmd(&s, Cmd_Draw_Pipe{a = res, b = rt, tier = box_std_idx(&cat)}, &cat)
++	// refunds are NEVER clamped: force the spool to cap-7, demolish (+12)
++	// → cap+5, strictly ABOVE the era ceiling.
++	s.box.spools[BOX_SPOOL_STANDARD] = BOX_FIX_TILES - 7
++	err := box_apply_cmd(&s, Cmd_Demolish_Pipe{pipe = 0}, &cat)
++	testing.expect(t, err == .None, "demolish applies")
++	testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == BOX_FIX_TILES + 5, "the FULL refund landed ABOVE the cap (never clamped)")
++	// a junction demolish refunds the piece + every incident pipe's tiles.
++	box_apply_cmd(&s, Cmd_Place_Router{type_idx = box_rt_idx(&cat), pos = {20, 19}}, &cat) // pieces 8→7
++	box_apply_cmd(&s, Cmd_Draw_Pipe{a = rt, b = 3, tier = box_std_idx(&cat)}, &cat)        // router→router2 span 4
++	pieces_before := s.box.pieces[box_rt_idx(&cat)]
++	tiles_before := s.box.spools[BOX_SPOOL_STANDARD]
++	err = box_apply_cmd(&s, Cmd_Demolish_Node{node = 3}, &cat)
++	testing.expect(t, err == .None, "the batch demolish applies")
++	testing.expect(t, s.box.pieces[box_rt_idx(&cat)] == pieces_before + 1, "the router piece returned")
++	testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == tiles_before + 4, "the incident pipe's tiles returned")
++	_ = host
++}
++
++// ------------------------------------------------------------------ the Cap --
++
++@test
++test_box_restore_never_passes_cap :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	box_test_run(&s, 1, 1, &cat)
++	// stock above cap (refund overshoot): a restore is a no-op, never a trim.
++	s.box.spools[BOX_SPOOL_STANDARD] = BOX_FIX_TILES + 20
++	box_restore_to_cap(&s, &cat)
++	testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == BOX_FIX_TILES + 20, "a restore never pushes past cap — and never destroys")
++	// stock below cap: the restore clamps exactly at cap (no banking).
++	s.box.spools[BOX_SPOOL_STANDARD] = 8
++	s.box.pieces[box_rt_idx(&cat)] = 0
++	box_restore_to_cap(&s, &cat)
++	testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == BOX_FIX_TILES, "the restore brought the spool TO the cap")
++	testing.expect(t, s.box.pieces[box_rt_idx(&cat)] == BOX_FIX_PIECES, "the restore brought the pieces TO the cap")
++}
++
++@test
++test_box_era_advance_raises_and_restores :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	// the fixture's era 2 raises the caps (12 pieces vs 8).
++	rt := box_rt_idx(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	box_test_run(&s, 1, 1, &cat)
++	// spend down first — the advance must TOP UP, not merely re-cap.
++	s.box.pieces[rt] = 2
++	s.box.spools[BOX_SPOOL_STANDARD] = 6
++	err := box_apply_cmd(&s, Cmd_Era_Advance{to_era = 2}, &cat)
++	testing.expect(t, err == .None, "the advance latches")
++	// step once: era_step fires the advance (gate off — no crisis) + the
++	// box restores to the NEW era's caps.
++	record_run(&s, 1, &cat)
++	testing.expect(t, s.era == 2, "the era flipped")
++	testing.expect(t, s.box.pieces[rt] == 12, "the advance restored pieces to the RAISED cap")
++	testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == BOX_FIX_TILES, "the advance restored spools to the era cap")
++	testing.expect(t, s.box.spools[BOX_SPOOL_FIBER] == 40, "the advance opened the fiber spool (the era-2 mix)")
++}
++
++// ---------------------------------------------------------------- the clock --
++
++@test
++test_box_dot_restores_and_reschedules :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	box_test_run(&s, 1, 1, &cat)
++	// spend, then cross the dot tick.
++	s.box.spools[BOX_SPOOL_STANDARD] = 6
++	s.box.pieces[box_rt_idx(&cat)] = 1
++	dot_seen := false
++	for tick in u64(1)..=BOX_TEST_BASE {
++		before := len(s.events)
++		step(&s, tick, nil, &cat)
++		for e in s.events[before:] {
++			if e.tag == EVENT_TAG_BOX_DOT do dot_seen = true
++		}
++		clear(&s.events)
++	}
++	testing.expect(t, dot_seen, "the dot fired on the spine tick")
++	testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == BOX_FIX_TILES, "the dot restored the spool to cap")
++	testing.expect(t, s.box.pieces[box_rt_idx(&cat)] == BOX_FIX_PIECES, "the dot restored the pieces to cap")
++	testing.expect(t, s.box.next_dot_tick == 2 * BOX_TEST_BASE, "the next dot rides the base interval (zero deliveries in a bare fixture)")
++}
++
++@test
++test_box_acceleration_clamps_to_floor_and_base :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	box_test_run(&s, 1, 1, &cat)
++	// white-box: the acceleration reads the flow's cumulative delivered
++	// accumulators (the same counter real deliveries increment).
++	append(&s.flow.sla, Sla_Accumulator{delivered = 500})
++	// dot 1 fires at tick 400: d = 500 → pull 500 clamped to base-floor=300
++	// → interval 100 (the FLOOR — strong play earns time, bounded).
++	box_step(&s, BOX_TEST_BASE, &cat)
++	testing.expect(t, s.box.next_dot_tick == BOX_TEST_BASE + BOX_TEST_FLOOR, "a strong interval clamps at the floor")
++	testing.expect(t, s.box.dot_interval == BOX_TEST_FLOOR, "the pinned interval is the floor")
++	// dot 2 fires at 500: zero deliveries since the last dot → the BASE spine
++	// (the known worst case — a stalled run rides the spine, never slower).
++	box_step(&s, BOX_TEST_BASE + BOX_TEST_FLOOR, &cat)
++	testing.expect(t, s.box.next_dot_tick == BOX_TEST_BASE + BOX_TEST_FLOOR + BOX_TEST_BASE, "a stalled interval rides the base spine")
++	// mid-strength: partial acceleration is linear and unclamped.
++	s.flow.sla[0].delivered = 550 // +50 since dot 2
++	box_step(&s, BOX_TEST_BASE + BOX_TEST_FLOOR + BOX_TEST_BASE, &cat)
++	testing.expect(t, s.box.next_dot_tick == BOX_TEST_BASE + BOX_TEST_FLOOR + BOX_TEST_BASE + (BOX_TEST_BASE - 50), "partial deliveries pull the dot closer, tick for tick")
++}
++
++@test
++test_box_floor_pin_the_no_soft_lock_guarantee :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	box_test_run(&s, 1, 1, &cat)
++	// The no-soft-lock pin: however strong the play, the interval NEVER dips
++	// below the floor — and the floor never gates on performance (a run with
++	// ZERO deliveries still dots on the base spine — the test above pins it;
++	// this pin walks many flood-cycles and checks the bound every time).
++	append(&s.flow.sla, Sla_Accumulator{delivered = 1 << 30})
++	for i in 0..<12 {
++		fire := s.box.next_dot_tick
++		box_step(&s, fire, &cat)
++		interval := s.box.next_dot_tick - fire
++		testing.expectf(t, interval >= BOX_TEST_FLOOR, "cycle %d: interval %d dipped below the floor %d",
++			i, interval, BOX_TEST_FLOOR)
++		// and the guarantee itself: the dot always affords a rebuild — the
++		// spool AND the pieces are never stranded empty at a dot.
++		testing.expect(t, s.box.spools[BOX_SPOOL_STANDARD] == BOX_FIX_TILES, "every dot restores the spool to cap (the always-available half)")
++		testing.expect(t, s.box.pieces[box_rt_idx(&cat)] == BOX_FIX_PIECES, "every dot restores the pieces to cap (the rebuild half)")
++	}
++}
++
++// ------------------------------------------------- the economy gates (Q8) —
++
++// Box_Greedy_Stats — what the gate bot measures.
++Box_Greedy_Stats :: struct {
++	draws_ok:       i32, // draws that applied
++	refusals:       i32, // Box_Spool_Exhausted attempts
++	episodes:       i32, // CONSECUTIVE refusal bursts (the brush's unit — never attempt-spam)
++	first_no_tick:  u64, // the first refusal (0 = never)
++	first_no_built: u32, // tiles in play when the first "no" landed (generosity)
++	first_no_stock: u32, // spool stock left when the first "no" landed (the empty-box measure)
++	post_dot_draws: i32, // draws that applied after the first dot (self-resolution)
++	in_refusal:     bool, // episode tracker (internal)
++	dot_seen:       bool, // (internal) a BOX_DOT crossed during the run
++}
++
++// econ_run_greedy — a deterministic GREEDY-EXPANSIVE bot on the 3-node
++// fixture (res 0 ← rt 1 → host 2). EXPANSION: 3 new routers at 14-tile
++// spacing (the longest legal standard spans — the big-swing instinct), then
++// 2 segments per pair (the chain + 1 parallel; routers are 4-port-capped),
++// drawn every 2 ticks. SUSTAIN: cannibalize-and-redeploy — demolish the
++// oldest segment, redraw it on its pair (the record's "always available"
++// teardown loop). The stats expose the brush's shape.
++econ_run_greedy :: proc(s: ^Run_State, cat: ^Catalogs, ticks: u64, stats: ^Box_Greedy_Stats) {
++	BOX_SEG :: 6 // 3 pairs × 2 segments
++	pairs := [3][2]u32{{1, 3}, {3, 4}, {4, 5}}
++	spots := [3][2]i32{{6, 15}, {6, 29}, {20, 29}} // 14-tile spacing
++	seg_pipe: [BOX_SEG]u32
++	seg_pair: [BOX_SEG]int
++	// the expansion placements (fast-path applies at tick 0; the main loop
++	// owns the tick drive from 1).
++	for k in 0..<3 {
++		if box_apply_cmd(s, Cmd_Place_Router{type_idx = box_rt_idx(cat), pos = spots[k]}, cat) != .None {
++			panic("econ_run_greedy: bot placement refused — the fixture geometry regressed")
++		}
++	}
++	seg_cursor := 0
++	oldest := 0
++	for tick in u64(1)..=ticks {
++		before := len(s.events)
++		step(s, tick, nil, cat)
++		for e in s.events[before:] {
++			if e.tag == EVENT_TAG_BOX_DOT do stats.dot_seen = true
++		}
++		clear(&s.events)
++		if tick % 2 != 0 {
++			continue
++		}
++		a, b: u32
++		if seg_cursor < BOX_SEG {
++			// EXPANSION: the next scripted segment (chain first per pair).
++			a = pairs[seg_cursor / 2][0]
++			b = pairs[seg_cursor / 2][1]
++		} else {
++			// SUSTAIN: demolish the oldest segment, then redraw its pair —
++			// the cannibalize-and-redeploy loop (funded by the refund).
++			dem := oldest % BOX_SEG
++			if box_apply_cmd(s, Cmd_Demolish_Pipe{pipe = seg_pipe[dem]}, cat) != .None {
++				panic("econ_run_greedy: bot demolish refused — the refund contract regressed")
++			}
++			a = pairs[seg_pair[dem] / 2][0]
++			b = pairs[seg_pair[dem] / 2][1]
++		}
++		err := box_apply_cmd(s, Cmd_Draw_Pipe{a = a, b = b, tier = box_std_idx(cat)}, cat)
++		if err == .None {
++			if seg_cursor < BOX_SEG {
++				seg_pipe[seg_cursor] = u32(len(s.topology.pipe_alive) - 1) // the new pipe's id
++				seg_pair[seg_cursor] = seg_cursor
++			} else {
++				dem := oldest % BOX_SEG
++				seg_pipe[dem] = u32(len(s.topology.pipe_alive) - 1)
++			}
++			if seg_cursor < BOX_SEG {
++				seg_cursor += 1
++			} else {
++				oldest += 1
++			}
++			stats.draws_ok += 1
++			if stats.first_no_tick != 0 {
++				stats.post_dot_draws += 1
++			}
++			stats.in_refusal = false
++		} else if err == .Box_Spool_Exhausted {
++			stats.refusals += 1
++			if !stats.in_refusal {
++				stats.episodes += 1
++				stats.in_refusal = true
++			}
++			if stats.first_no_tick == 0 {
++				stats.first_no_tick = tick
++				// tiles in play when the ceiling first spoke: every live
++				// pipe's span (the generosity measure).
++				in_play: u32 = 0
++				for p in 0..<len(s.topology.pipe_alive) {
++					if s.topology.pipe_alive[p] {
++						in_play += u32(s.topology.pipe_span[p])
++					}
++				}
++				stats.first_no_built = in_play
++				stats.first_no_stock = s.box.spools[BOX_SPOOL_STANDARD]
++			}
++		}
++		// .Router_Ports_Full attempts are neither draws nor refusals — the
++		// bot's geometry keeps them impossible (2 segments per 4-port pair).
++	}
++}
++
++@test
++test_econ_gate_brush_and_first_no :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	box_test_run(&s, 7, 1, &cat)
++	stats: Box_Greedy_Stats
++	econ_run_greedy(&s, &cat, 1200, &stats)
++	// THE FIRST "NO" MUST LAND ON A GREEDY-BUT-SAFE PLAYER: only once the
++	// box is genuinely (nearly) empty — the bot had built 4 long segments
++	// (56 in-play tiles vs the 48-tile kit) before the ceiling spoke. An
++	// early "no" would be pressure, not consequence.
++	testing.expectf(t, stats.first_no_tick != 0, "no brush observed — the ceiling never spoke (a dead gate)")
++	// the empty-box contract: built + stock ≈ the full kit (nothing was
++	// withheld) and the box held less than one more segment when it spoke
++	// (the "no" is the kit running out, never arbitrary early rejection).
++	testing.expectf(t, stats.first_no_built+stats.first_no_stock >= BOX_FIX_TILES,
++		"the first 'no' landed with only %d+%d material in play — something starved the player",
++		stats.first_no_built, stats.first_no_stock)
++	testing.expectf(t, stats.first_no_built >= BOX_FIX_TILES-14,
++		"the first 'no' landed after only %d in-play tiles — starvation, not an earned brush",
++		stats.first_no_built)
++	// THE BRUSH IS AN EPISODE, NOT SPAM: refusals arrive in bursts bounded
++	// by the dot windows (≤ 1 per restore window + the sustain crossovers).
++	windows := 1200 / BOX_TEST_BASE + 1
++	testing.expectf(t, stats.episodes <= i32(windows) + 2, "too many refusal episodes (%d in %d windows) — the ceiling is pressuring, not brushing",
++		stats.episodes, windows)
++	// SELF-RESOLVING AS A DOT LANDS: after the first refusal, building
++	// resumed (the dot restored the kit; the redeploy loop re-earned it).
++	testing.expect(t, stats.post_dot_draws > 0, "the brush never self-resolved — the dot did not restore the greedy player")
++	// the dot itself was seen on the spine during the run.
++	testing.expect(t, stats.dot_seen, "no dot fired during the gate run — the clock regressed")
++}
++
++@test
++test_econ_gate_mutation_legs :: proc(t: ^testing.T) {
++	// The gates must be able to FAIL (record Q8): each leg runs the SAME bot
++	// against a fixture with one ruling mechanically deleted and asserts the
++	// gate condition VIOLATES (the mutation leg), then the sibling test's
++	// unmutated run is the GREEN half.
++	// LEG 1 — delete-the-cap: an effectively infinite spool never brushes.
++	{
++		cat: Catalogs
++		box_test_catalog(&cat)
++		cat.eras[0].box_spools[BOX_SPOOL_STANDARD] = 1 << 20 // the cap is gone
++		s: Run_State
++		defer run_destroy(&s)
++		box_test_run(&s, 7, 1, &cat)
++		stats: Box_Greedy_Stats
++		econ_run_greedy(&s, &cat, 1200, &stats)
++		testing.expectf(t, stats.first_no_tick == 0, "delete-the-cap leg: the bot still hit a refusal at tick %d — the gate cannot detect a deleted cap",
++			stats.first_no_tick)
++		catalogs_destroy(&cat)
++	}
++	// LEG 2 — mutate-the-floor away: with floor 0 the acceleration clamp
++	// lets the interval collapse to 0 (the anti-canonical move the pin
++	// exists to catch).
++	{
++		cat: Catalogs
++		box_test_catalog(&cat)
++		cat.balance.box.dot_floor_ticks = 0 // the floor is gone
++		s: Run_State
++		defer run_destroy(&s)
++		box_test_run(&s, 1, 1, &cat)
++		append(&s.flow.sla, Sla_Accumulator{delivered = 1 << 30})
++		fire := s.box.next_dot_tick
++		box_step(&s, fire, &cat)
++		interval := s.box.next_dot_tick - fire
++		testing.expectf(t, interval < BOX_TEST_FLOOR, "mutate-the-floor leg: the interval held at %d with the floor deleted — the floor leg cannot detect deletion",
++			interval)
++		catalogs_destroy(&cat)
++	}
++}
++
++// ---------------------------------------------------------------- determinism --
++
++@test
++test_box_replay_is_byte_identical :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	// the live run: a scripted box arc — draw, place, modernize, demolish,
++	// an era latch — crossing two dot fires (the clock in the hash).
++	s: Run_State
++	defer run_destroy(&s)
++	res, rt, host := box_test_run(&s, 11, 1, &cat)
++	append(&s.action_log, Command{apply_tick = 2, kind = Cmd_Draw_Pipe{a = res, b = rt, tier = box_std_idx(&cat)}})
++	append(&s.action_log, Command{apply_tick = 5, kind = Cmd_Place_Router{type_idx = box_rt_idx(&cat), pos = {20, 19}}})
++	append(&s.action_log, Command{apply_tick = 8, kind = Cmd_Set_Pipe_Tier{pipe = 0, tier = box_wd_idx(&cat)}})
++	append(&s.action_log, Command{apply_tick = 11, kind = Cmd_Demolish_Pipe{pipe = 0}})
++	append(&s.action_log, Command{apply_tick = 14, kind = Cmd_Era_Advance{to_era = 2}})
++	hashes := record_run(&s, 900, &cat)
++	// the replay: a fresh state, the same setup + the cloned log.
++	r: Run_State
++	defer run_destroy(&r)
++	box_test_run(&r, 11, 1, &cat)
++	r.action_log = clone_log(s.action_log)
++	replay_hashes := record_run(&r, 900, &cat)
++	testing.expect(t, len(hashes) == len(replay_hashes), "the sequences must have equal length")
++	for i in 0..<len(hashes) {
++		testing.expectf(t, hashes[i] == replay_hashes[i], "tick %d diverged: %d vs %d", i + 1, hashes[i], replay_hashes[i])
++	}
++	_ = host
++}
++
++// ------------------------------------------------------------------ the HUD --
++
++@test
++test_box_dot_progress_is_a_pure_read :: proc(t: ^testing.T) {
++	cat: Catalogs
++	defer catalogs_destroy(&cat)
++	box_test_catalog(&cat)
++	s: Run_State
++	defer run_destroy(&s)
++	box_test_run(&s, 1, 1, &cat)
++	testing.expect(t, box_dot_progress_permille(&s) == 0, "progress starts at 0")
++	// half the interval: ~500 permille (integer rounding tolerant).
++	s.tick = BOX_TEST_BASE / 2
++	p := box_dot_progress_permille(&s)
++	testing.expectf(t, p >= 490 && p <= 510, "mid-interval progress should read ~500, got %d", p)
++	// past the fire tick: 0 (the next dot's window).
++	s.tick = s.box.next_dot_tick
++	testing.expect(t, box_dot_progress_permille(&s) == 0, "progress at the fire tick reads 0")
++}
+diff --git a/core/catalog.odin b/core/catalog.odin
+index e1db517..45e165d 100644
+--- a/core/catalog.odin
++++ b/core/catalog.odin
+@@ -29,6 +29,31 @@ Terminal_Role :: enum u8 { None, Residential, Content_Host, Small_Biz, Campus }
+ 
+ // --- catalog row types -------------------------------------------------------
+ 
++// The Box spool set (ruling 6 [P2], v2-mechanics-the-box) — FIXED at two
++// spools, the pipe-stock tech classes: standard (the copper/FTTH access
++// spool) and fiber (the mid/wide fiber spool). Closed by canon — a third
++// spool is a record amendment, not a data edit. pipe_tiers entries resolve
++// their `spool` string to this index at load (fail-fast).
++BOX_SPOOL_COUNT :: 2
++BOX_SPOOL_STANDARD :: u8(0)
++BOX_SPOOL_FIBER :: u8(1)
++
++spool_from_name :: proc(name: string) -> (u8, bool) {
++	switch name {
++	case "standard": return BOX_SPOOL_STANDARD, true
++	case "fiber":    return BOX_SPOOL_FIBER, true
++	}
++	return 0, false
++}
++
++spool_name :: proc(s: u8) -> string {
++	switch s {
++	case BOX_SPOOL_STANDARD: return "standard"
++	case BOX_SPOOL_FIBER:    return "fiber"
++	}
++	return "?"
++}
++
+ Node_Type :: struct {
+ 	id:               string,
+ 	display:          string,
+@@ -49,6 +74,12 @@ Pipe_Tier :: struct {
+ 	max_span:       i32,   // the hard span cap, enforced at edit (E3 family)
+ 	cost_per_tile:  i32,   // draw cost factor: cost = span × cost_per_tile
+ 	era_introduced: i32,
++	// The Box (ruling 6 [P2], v2-mechanics-the-box): WHICH SPOOL this tier's
++	// tiles drain — the era-invariant tech class of the pipe (standard = the
++	// copper/FTTH access spool; mid/wide = the fiber spool). Resolved to the
++	// fixed 2-spool set index at load; REQUIRED per tier (a tier without a
++	// spool is unpriceable — fail-fast, never a silent default spool).
++	spool: u8,
+ }
+ 
+ // Packet_Shape — the primary visual distinguisher (never color alone, [UX-DR4]).
+@@ -248,6 +279,7 @@ Balance :: struct {
+ 	// 6.2: the era-advance gate numbers (GDD M4 — the modernization gate's
+ 	// sustain window + the per-class delivery bar; arch §6.6).
+ 	advance: Advance_Balance,
++	box: Box_Balance,
+ 	// 5.6: the placement-separation rules (user ruling 2026-08-14, GDD M3) —
+ 	// router↔router vs router↔terminal are DIFFERENT distances; data-driven
+ 	// playtest tunables (the old blanket 7-tile const moved here — its own
+@@ -371,6 +403,20 @@ Advance_Balance :: struct {
+ 	sla_uptime_pct:         i32, // the per-class delivery bar, 1..100
+ }
+ 
++// Box_Balance — the Box's refill clock (ruling 5 [M4], balance.json `box`;
++// v2-mechanics-the-box). Dots restore stock TO the era caps on a KNOWN spine:
++// dot_interval_ticks is the worst-case schedule (the ceiling — a stalled run
++// rides the spine, never slower); deliveries since the last dot ACCELERATE
++// the next: interval = clamp(base − accel·deliveries, floor, base). The FLOOR
++// is the no-soft-lock guarantee — never gated on performance. Integer ticks
++// (ODN-10); all three required at load (a partial block is an authoring
++// error, never a silent zero-interval).
++Box_Balance :: struct {
++	dot_interval_ticks:           u64, // the spine (worst case + the acceleration ceiling)
++	dot_floor_ticks:              u64, // the max-acceleration bound (the no-soft-lock floor)
++	dot_accel_ticks_per_delivery: u64, // ticks pulled closer per delivered packet
++}
++
+ // Placement_Balance — the 5.6 placement-separation tunables (balance.json
+ // `placement` block; GDD M3 + user ruling 2026-08-14). router_router_sep_tiles
+ // = the min gap between two player-placed junctions (playtest 4);
+@@ -445,6 +491,17 @@ Era_Row :: struct {
+ 	// (fail-fast on unknown ids).
+ 	unlock_node_types: [dynamic]u16,
+ 	unlock_pipe_tiers: [dynamic]u16,
++	// The Box (rulings 2+3+6+7, v2-mechanics-the-box): the era's build-material
++	// CEILING, resolved to dense parallel arrays at load — box_pieces[i] is the
++	// cap on junction node-type i's pieces, box_spools[s] the cap on spool s's
++	// tiles (the fixed 2-spool set). Era advance RAISES the cap (non-decreasing
++	// per type across consecutive rows, fail-fast at load — ruling 3's "era
++	// advance raises the cap" is canon, a decreasing cap would make the
++	// restore-to-cap DESTROY pieces); refills restore stock TO the cap, never
++	// past it (no banking). REQUIRED per era row (a Box-era without a ceiling
++	// is unpriceable — fail-fast, ODN-5).
++	box_pieces: [dynamic]u32,
++	box_spools: [dynamic]u32,
+ }
+ 
+ Catalogs :: struct {
+@@ -567,6 +624,16 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 			t.max_span = jint(eo, "max_span", 0)
+ 			t.cost_per_tile = jint(eo, "cost_per_tile", 0)
+ 			t.era_introduced = jint(eo, "era_introduced", 1)
++			// The Box (ruling 6): the tier's SPOOL — REQUIRED per tier (a tier
++		// without a spool is unpriceable; a typo'd spool id is a content bug).
++			if _, has := eo["spool"]; !has {
++				return {"pipe_tiers.json", t.id, "spool is required (the Box's pipe-stock tech class: standard | fiber)"}
++			}
++			sp, oksp := spool_from_name(jstr(eo, "spool"))
++			if !oksp {
++				return {"pipe_tiers.json", t.id, fmt.tprintf("unknown spool %q (must be standard | fiber)", jstr(eo, "spool"))}
++			}
++			t.spool = sp
+ 			if t.id == "" || t.capacity_units <= 0 || t.max_span <= 0 || t.cost_per_tile < 0 || t.cost < 1 {
+ 				return {"pipe_tiers.json", t.id, "id/capacity/max_span/cost invalid (cost must be >= 1 — zero-cost edges break the per-hop progress guarantee)"}
+ 			}
+@@ -1077,6 +1144,36 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 		if b.advance.sla_uptime_pct < 1 || b.advance.sla_uptime_pct > 100 {
+ 			return {"balance.json", "advance.sla_uptime_pct", "must be 1..100 (the per-class delivery bar — the 95% advance canon)"}
+ 		}
++		// The Box's refill clock (ruling 5 [M4]; balance.json `box`). REQUIRED
++		// content (a missing block is an authoring error — the clock is the
++		// no-soft-lock spine, never a silent zero-interval): all three keys
++		// strict integers >= 1, floor <= base (a floor above the base would
++		// invert the clamp and make acceleration a slowdown).
++		if bobj, okbx := obj["box"].(json.Object); okbx {
++			di, okdi := jint_strict(bobj, "dot_interval_ticks", -1)
++			df, okdf := jint_strict(bobj, "dot_floor_ticks", -1)
++			da, okda := jint_strict(bobj, "dot_accel_ticks_per_delivery", -1)
++			if !okdi || !okdf || !okda {
++				return {"balance.json", "box", "clock keys must be integers (no decimals)"}
++			}
++			if di < 1 || df < 1 || da < 1 {
++				return {"balance.json", "box", "dot_interval_ticks/dot_floor_ticks/dot_accel_ticks_per_delivery must be >= 1 with all keys present"}
++			}
++			if u64(df) > u64(di) {
++				return {"balance.json", "box", "dot_floor_ticks must be <= dot_interval_ticks (the floor bounds acceleration, never a slowdown)"}
++			}
++			// the HUD's permille math (run x 1000) must never wrap (ODN-10):
++			// a 1<<40-tick interval is already ~1.8 years at 20 Hz — far past
++			// any authored era; beyond it the progress read would corrupt.
++			if u64(di) > u64(1) << 40 {
++				return {"balance.json", "box", "dot_interval_ticks must be <= 2^40 (the HUD permille math's wrap bound)"}
++			}
++			b.box.dot_interval_ticks = u64(di)
++			b.box.dot_floor_ticks = u64(df)
++			b.box.dot_accel_ticks_per_delivery = u64(da)
++		} else {
++			return {"balance.json", "box", "missing the box block (the refill clock is required: dot_interval_ticks, dot_floor_ticks, dot_accel_ticks_per_delivery)"}
++		}
+ 		if mp, okm := obj["map"].(json.Object); okm {
+ 			b.map_w_tiles = jint(mp, "w_tiles", 0)
+ 			b.map_h_tiles = jint(mp, "h_tiles", 0)
+@@ -1388,6 +1485,75 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 			if len(er.unlock_node_types) == 0 || len(er.unlock_pipe_tiers) == 0 {
+ 				return {"eras.json", er.id, "infrastructure.node_types/pipe_tiers must be non-empty arrays"}
+ 			}
++			// The Box ceiling (rulings 2+3+6, v2-mechanics-the-box) — REQUIRED per
++			// era row: dense parallel arrays (pieces per junction node-type, spool
++			// stock per the fixed 2-spool set). Ids resolve fail-fast (pieces MUST
++			// be junction kinds — a terminal is never player-placed hardware, so a
++			// piece cap on one is a content bug); counts are strict ints >= 0.
++			// An unlisted type's cap is 0 (the honest "you hold none of these yet").
++			er.box_pieces = make([dynamic]u32, len(cat.node_types), allocator)
++			er.box_spools = make([dynamic]u32, BOX_SPOOL_COUNT, allocator)
++			bobj2, okbx := eo["box"].(json.Object)
++			if !okbx {
++				return {"eras.json", er.id, "the box block is required (pieces + spools — the era's build-material ceiling)"}
++			}
++			if pobj, okp := bobj2["pieces"].(json.Object); okp {
++				for key, pv in pobj {
++					ni, okn := node_type_index(cat, key)
++					if !okn {
++						return {"eras.json", er.id, fmt.tprintf("box.pieces: unknown node type %q", key)}
++					}
++					if cat.node_types[ni].kind != .Junction {
++						return {"eras.json", er.id, fmt.tprintf("box.pieces: %q is not a junction (only routers are box pieces)", key)}
++					}
++					if cat.node_types[ni].era_introduced > era {
++						return {"eras.json", er.id, fmt.tprintf("box.pieces: %q unlocks at era %d — a cap here is dead stock before its era", key, cat.node_types[ni].era_introduced)}
++					}
++					cv, okc := jint_strict_value(pv, key)
++					if !okc {
++						return {"eras.json", er.id, fmt.tprintf("box.pieces.%s: cap must be an integer (no decimals)", key)}
++					}
++					if cv < 0 {
++						return {"eras.json", er.id, fmt.tprintf("box.pieces.%s: cap must be >= 0", key)}
++					}
++					er.box_pieces[ni] = u32(cv)
++				}
++			} else {
++				return {"eras.json", er.id, "box.pieces must be an object of junction-id -> cap"}
++			}
++			if sobj, oks := bobj2["spools"].(json.Object); oks {
++				for key, sv in sobj {
++					si, oksn := spool_from_name(key)
++					if !oksn {
++						return {"eras.json", er.id, fmt.tprintf("box.spools: unknown spool %q (must be standard | fiber)", key)}
++					}
++					cv, okc := jint_strict_value(sv, key)
++					if !okc {
++						return {"eras.json", er.id, fmt.tprintf("box.spools.%s: cap must be an integer (no decimals)", key)}
++					}
++					if cv < 0 {
++						return {"eras.json", er.id, fmt.tprintf("box.spools.%s: cap must be >= 0", key)}
++					}
++					// the mix cross-check: a spool whose EVERY tier unlocks in a
++					// LATER era is dead stock here (the player holds tiles no
++					// draw can spend — the tray shows abundance the box
++					// refuses to price). Era-2 fiber with mid/wide at era 3
++					// was exactly this bug, caught by review.
++					any_live_tier := false
++					for ti in 0..<len(cat.pipe_tiers) {
++						if cat.pipe_tiers[ti].spool == si && cat.pipe_tiers[ti].era_introduced <= era {
++							any_live_tier = true
++							break
++						}
++					}
++					if !any_live_tier && cv > 0 {
++						return {"eras.json", er.id, fmt.tprintf("box.spools.%s: cap %d but no %s-spool tier unlocks by era %d (dead stock — shift the cap to the era that unlocks the tier)", key, cv, key, era)}
++					}
++					er.box_spools[si] = u32(cv)
++				}
++			} else {
++				return {"eras.json", er.id, "box.spools must be an object of spool-id -> cap"}
++			}
+ 			// invariant (a) — the roster + unlock tables exactly equal the
+ 			// era_introduced-derived sets (the per-item era gates can never
+ 			// drift from the era table; a drift in either direction is a
+@@ -1458,6 +1624,23 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 				return {"eras.json", "eras", fmt.tprintf("sparse era table — rows must be dense 1..%d (gap before row %d)", len(cat.eras), i+1)}
+ 			}
+ 		}
++		// The Box (ruling 3): era advance RAISES the cap — every era row's caps
++		// must be non-decreasing per type vs the prior row (a decreasing cap
++		// would make the advance-time restore-to-cap DESTROY pieces — the exact
++		// anti-canonical move). Equal is legal (an era may hold a line while
++		// shifting the mix). Checked here, post-density (the prior row exists).
++		for i in 1..<len(cat.eras) {
++			for t in 0..<len(cat.eras[i].box_pieces) {
++				if cat.eras[i].box_pieces[t] < cat.eras[i-1].box_pieces[t] {
++					return {"eras.json", cat.eras[i].id, fmt.tprintf("box.pieces cap for node type %q DECREASES vs the prior era (ruling 3: era advance raises the cap)", cat.node_types[t].id)}
++				}
++			}
++			for s in 0..<len(cat.eras[i].box_spools) {
++				if cat.eras[i].box_spools[s] < cat.eras[i-1].box_spools[s] {
++					return {"eras.json", cat.eras[i].id, fmt.tprintf("box.spools cap for spool %q DECREASES vs the prior era (ruling 3: era advance raises the cap)", spool_name(u8(s)))}
++				}
++			}
++		}
+ 		// required content: era 1 rosters email (the MVP's first class).
+ 		if len(cat.eras) >= 1 {
+ 			has_email := false
+@@ -1489,6 +1672,8 @@ catalogs_destroy :: proc(cat: ^Catalogs) {
+ 		delete(cat.eras[i].packet_classes)
+ 		delete(cat.eras[i].unlock_node_types)
+ 		delete(cat.eras[i].unlock_pipe_tiers)
++		delete(cat.eras[i].box_pieces)
++		delete(cat.eras[i].box_spools)
+ 	}
+ 	delete(cat.eras) // 6.1
+ 	delete(cat.balance.lane_presets) // 3.2
+@@ -1627,18 +1812,24 @@ jint :: proc(o: json.Object, key: string, def: i32) -> i32 {
+ // 2^32+4 silently becoming 4) and a wrong-typed field must never default.
+ jint_strict :: proc(o: json.Object, key: string, def: i32) -> (i32, bool) {
+ 	if v, ok := o[key]; ok {
+-		#partial switch x in v {
+-		case json.Integer:
+-			i := i64(x)
+-			if i < i64(min(i32)) || i > i64(max(i32)) {
+-				return 0, false // out of range — reject, never wrap
+-			}
+-			return i32(i), true
+-		case json.Float:
++		return jint_strict_value(v, key)
++	}
++	return def, true
++}
++
++// jint_strict_value — the json.Value half of jint_strict (the eras.json box
++// caps iterate the JSON object directly, so they strict-check the VALUE
++// without a key lookup). Same contract: a decimal / out-of-i32 / wrong-typed
++// value rejects, never truncates or defaults.
++jint_strict_value :: proc(v: json.Value, key: string) -> (i32, bool) {
++	#partial switch x in v {
++	case json.Integer:
++		i := i64(x)
++		if i < i64(min(i32)) || i > i64(max(i32)) {
+ 			return 0, false
+-		case:
+-			return 0, false // wrong-typed (string/bool/null) — reject, never default
+ 		}
++		return i32(i), true
++	case:
++		return 0, false // float / string / bool / null — reject, never default
+ 	}
+-	return def, true
+ }
+diff --git a/core/catalog_test.odin b/core/catalog_test.odin
+index e1a4e02..5551369 100644
+--- a/core/catalog_test.odin
++++ b/core/catalog_test.odin
+@@ -34,9 +34,9 @@ NT_VALID :: `{"entries": [
+ ]}`
+ 
+ TIER_VALID :: `{"entries": [
+-  {"id": "narrow", "capacity_units": 10, "cost": 20, "clean_span": 8, "max_span": 10, "cost_per_tile": 5, "era_introduced": 1},
+-  {"id": "standard", "capacity_units": 15, "cost": 10, "clean_span": 10, "max_span": 14, "cost_per_tile": 12, "era_introduced": 1},
+-  {"id": "wide", "capacity_units": 40, "cost": 5, "clean_span": 14, "max_span": 18, "cost_per_tile": 30, "era_introduced": 3}
++  {"id": "narrow", "capacity_units": 10, "cost": 20, "clean_span": 8, "max_span": 10, "cost_per_tile": 5, "era_introduced": 1, "spool": "standard"},
++  {"id": "standard", "capacity_units": 15, "cost": 10, "clean_span": 10, "max_span": 14, "cost_per_tile": 12, "era_introduced": 1, "spool": "standard"},
++  {"id": "wide", "capacity_units": 40, "cost": 5, "clean_span": 14, "max_span": 18, "cost_per_tile": 30, "era_introduced": 3, "spool": "fiber"}
+ ]}`
+ 
+ BAL_VALID :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_bandwidth": 30,
+@@ -81,6 +81,11 @@ BAL_VALID :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_b
+     "grace_refill_per_tick": 5,
+     "grace_refill_streak_ticks": 50
+   },
++  "box": {
++    "dot_interval_ticks": 2400,
++    "dot_floor_ticks": 600,
++    "dot_accel_ticks_per_delivery": 1
++  },
+   "advance": {
+     "milestone_window_ticks": 600,
+     "sla_uptime_pct": 95
+@@ -123,7 +128,7 @@ SP_DEM_VALID :: string(`{"eras": [` + SP_ERA + `]}`)
+ // set — the eras-load exact-equality invariant). The load runs the required-
+ // content guards before the era block, so a doc dropping email/streaming
+ // surfaces the packet_types rejection, not an eras-row one.
+-ERAS_ROW :: `{"era": 1, "id": "foundations", "display_name": "Foundations", "packet_types": ["email"], "demand_era": 1, "legacy_decay_permille": 1000, "infrastructure": {"node_types": ["residential", "router_basic"], "pipe_tiers": ["narrow", "standard"]}}`
++ERAS_ROW :: `{"era": 1, "id": "foundations", "display_name": "Foundations", "packet_types": ["email"], "demand_era": 1, "legacy_decay_permille": 1000, "infrastructure": {"node_types": ["residential", "router_basic"], "pipe_tiers": ["narrow", "standard"]}, "box": {"pieces": {"router_basic": 6}, "spools": {"standard": 240, "fiber": 0}}}`
+ ERAS_VALID :: string(`{"eras": [` + ERAS_ROW + `]}`)
+ 
+ // ERAS_ROW_3_GAP — a VALID era-3 row (roster email+streaming, all era<=3
+@@ -131,7 +136,7 @@ ERAS_VALID :: string(`{"eras": [` + ERAS_ROW + `]}`)
+ // with the era-1 row to form a SPARSE table (rows 1,3 — the gap at 2 is the
+ // r1 W7 rejection class). The gap check must be the FIRST era-table rejection,
+ // so the row itself must pass every other era invariant.
+-ERAS_ROW_3_GAP :: `{"era": 3, "id": "streaming_surge", "display_name": "Streaming Surge", "packet_types": ["email", "streaming"], "demand_era": 1, "legacy_decay_permille": 500, "infrastructure": {"node_types": ["residential", "content_host", "router_basic", "router_mid", "router_high", "small_biz", "campus"], "pipe_tiers": ["narrow", "standard", "wide"]}}`
++ERAS_ROW_3_GAP :: `{"era": 3, "id": "streaming_surge", "display_name": "Streaming Surge", "packet_types": ["email", "streaming"], "demand_era": 1, "legacy_decay_permille": 500, "infrastructure": {"node_types": ["residential", "content_host", "router_basic", "router_mid", "router_high", "small_biz", "campus"], "pipe_tiers": ["narrow", "standard", "wide"]}, "box": {"pieces": {"router_basic": 10, "router_mid": 3, "router_high": 2}, "spools": {"standard": 240, "fiber": 360}}}`
+ 
+ 
+ // CRISES_VALID — the 4.2 archetype table baseline (mirrors data/crises.json).
+@@ -456,6 +461,10 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		{"cost negative", replace1(TIER_VALID, `"cost": 10`, `"cost": -3`, 1), "cost must be >= 1"},
+ 		{"cost missing", replace1(TIER_VALID, `"cost": 10, `, ``, 1), "cost must be >= 1"},
+ 		{"cost decimal", replace1(TIER_VALID, `"cost": 10`, `"cost": 2.5`, 1), "cost must be an integer"},
++		// The Box (ruling 6): the spool is REQUIRED per tier + id-resolved —
++		// an unpriced tier or a typo'd spool id is a content bug.
++		{"spool missing", replace1(TIER_VALID, `, "spool": "standard"`, ``, 1), "spool is required"},
++		{"spool unknown", replace1(TIER_VALID, `"spool": "standard"`, `"spool": "copper"`, 1), "unknown spool"},
+ 	}
+ 	for r in tier_rows {
+ 		check_reject_tier(t, r.doc, r.rule)
+@@ -862,6 +871,19 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		{"pipe congestion lead negative", replace1(BAL_VALID, `"pipe_congestion_lead_ticks": 400`, `"pipe_congestion_lead_ticks": -3`, 1), "lead times"},
+ 		{"node critical lead zero", replace1(BAL_VALID, `"node_critical_lead_ticks": 200`, `"node_critical_lead_ticks": 0`, 1), "lead times"},
+ 		{"pipe congestion lead zero", replace1(BAL_VALID, `"pipe_congestion_lead_ticks": 400`, `"pipe_congestion_lead_ticks": 0`, 1), "lead times"},
++		// The Box's refill clock (ruling 5) — REQUIRED content, strict ints,
++		// floor <= base (the floor bounds ACCELERATION; a floor above the base
++		// would invert the clamp into a slowdown).
++		{"box missing", replace1(BAL_VALID, `  "box": {
++    "dot_interval_ticks": 2400,
++    "dot_floor_ticks": 600,
++    "dot_accel_ticks_per_delivery": 1
++  }, `, ``, 1), "missing the box block"},
++		{"box interval zero", replace1(BAL_VALID, `"dot_interval_ticks": 2400`, `"dot_interval_ticks": 0`, 1), "must be >= 1 with all keys present"},
++		{"box interval decimal", replace1(BAL_VALID, `"dot_interval_ticks": 2400`, `"dot_interval_ticks": 24.5`, 1), "clock keys must be integers"},
++		{"box floor zero", replace1(BAL_VALID, `"dot_floor_ticks": 600`, `"dot_floor_ticks": 0`, 1), "must be >= 1 with all keys present"},
++		{"box floor above base", replace1(BAL_VALID, `"dot_floor_ticks": 600`, `"dot_floor_ticks": 3000`, 1), "dot_floor_ticks must be <= dot_interval_ticks"},
++		{"box accel zero", replace1(BAL_VALID, `"dot_accel_ticks_per_delivery": 1`, `"dot_accel_ticks_per_delivery": 0`, 1), "must be >= 1 with all keys present"},
+ 	}
+ 	for r in bal_rows {
+ 		check_reject_balance(t, r.doc, r.rule)
+@@ -897,8 +919,11 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 	// for the invariant-direction rows: ROW_2_MISS_ROSTER drops email from the
+ 	// roster (email, era_introduced 1 <= 2, must be listed); ROW_2_MISS_NODE
+ 	// drops small_biz from the unlock table (era_introduced 2 <= 2).
+-	ERAS_ROW_2_MISS_ROSTER :: `{"era": 2, "id": "email_web", "display_name": "Email & Web", "packet_types": ["streaming"], "demand_era": 1, "legacy_decay_permille": 500, "infrastructure": {"node_types": ["residential", "router_basic", "small_biz"], "pipe_tiers": ["narrow", "standard"]}}`
+-	ERAS_ROW_2_MISS_NODE :: `{"era": 2, "id": "email_web", "display_name": "Email & Web", "packet_types": ["email"], "demand_era": 1, "legacy_decay_permille": 500, "infrastructure": {"node_types": ["residential", "router_basic"], "pipe_tiers": ["narrow", "standard"]}}`
++	ERAS_ROW_2_MISS_ROSTER :: `{"era": 2, "id": "email_web", "display_name": "Email & Web", "packet_types": ["streaming"], "demand_era": 1, "legacy_decay_permille": 500, "infrastructure": {"node_types": ["residential", "router_basic", "small_biz"], "pipe_tiers": ["narrow", "standard"]}, "box": {"pieces": {"router_basic": 8}, "spools": {"standard": 240, "fiber": 0}}}`
++	ERAS_ROW_2_MISS_NODE :: `{"era": 2, "id": "email_web", "display_name": "Email & Web", "packet_types": ["email"], "demand_era": 1, "legacy_decay_permille": 500, "infrastructure": {"node_types": ["residential", "router_basic"], "pipe_tiers": ["narrow", "standard"]}, "box": {"pieces": {"router_basic": 8}, "spools": {"standard": 240, "fiber": 0}}}`
++	// a fully VALID era-2 row (roster + unlocks + box all correct) — the base
++	// for the box-cap-monotonicity rows (only the box caps are wrong there).
++	ERAS_ROW_2_OK :: `{"era": 2, "id": "email_web", "display_name": "Email & Web", "packet_types": ["email"], "demand_era": 1, "legacy_decay_permille": 500, "infrastructure": {"node_types": ["residential", "router_basic", "small_biz"], "pipe_tiers": ["narrow", "standard"]}, "box": {"pieces": {"router_basic": 8}, "spools": {"standard": 240, "fiber": 0}}}`
+ 	eras_rows := []struct {
+ 		label, doc, rule: string
+ 	}{
+@@ -935,6 +960,19 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		{"streaming listed in era 1", replace1(ERAS_VALID, `"packet_types": ["email"]`, `"packet_types": ["email", "streaming"]`, 1), "listed before its era"},
+ 		{"era-2 roster missing email", `{"eras": [` + ERAS_ROW + `, ` + ERAS_ROW_2_MISS_ROSTER + `]}`, "missing from the era-2 roster"},
+ 		{"era-2 unlock missing small_biz", `{"eras": [` + ERAS_ROW + `, ` + ERAS_ROW_2_MISS_NODE + `]}`, "missing from the era-2 unlock table"},
++		// The Box (v2-mechanics-the-box) — the ceiling is REQUIRED per era row,
++		// strictly typed, id-resolved, and NON-DECREASING per type (ruling 3:
++		// era advance raises the cap — a decrease would make the advance-time
++		// restore DESTROY pieces).
++		{"box missing", replace1(ERAS_VALID, `, "box": {"pieces": {"router_basic": 6}, "spools": {"standard": 240, "fiber": 0}}`, ``, 1), "the box block is required"},
++		{"box piece unknown node type", replace1(ERAS_VALID, `"router_basic": 6`, `"router_ghost": 6`, 1), "unknown node type"},
++		{"box piece on a terminal", replace1(ERAS_VALID, `"router_basic": 6`, `"residential": 6`, 1), "not a junction"},
++		{"box piece decimal cap", replace1(ERAS_VALID, `"router_basic": 6`, `"router_basic": 6.5`, 1), "cap must be an integer"},
++		{"box piece negative cap", replace1(ERAS_VALID, `"router_basic": 6`, `"router_basic": -1`, 1), "cap must be >= 0"},
++		{"box spool unknown id", replace1(ERAS_VALID, `"spools": {"standard": 240, "fiber": 0}`, `"spools": {"copper": 240}`, 1), "unknown spool"},
++		{"box spool decimal cap", replace1(ERAS_VALID, `"standard": 240`, `"standard": 24.5`, 1), "cap must be an integer"},
++		{"box cap decrease era 2", replace1(`{"eras": [` + ERAS_ROW + `, ` + ERAS_ROW_2_OK + `]}`, `"router_basic": 8`, `"router_basic": 5`, 1), "DECREASES vs the prior era"},
++		{"box spool decrease era 2", replace1(`{"eras": [` + ERAS_ROW + `, ` + ERAS_ROW_2_OK + `]}`, `"router_basic": 8}, "spools": {"standard": 240, "fiber": 0}`, `"router_basic": 8}, "spools": {"standard": 100, "fiber": 0}`, 1), "DECREASES vs the prior era"},
+ 	}
+ 	for r in eras_rows {
+ 		check_reject_eras(t, r.doc, r.rule)
+diff --git a/core/determinism_test.odin b/core/determinism_test.odin
+index 1405045..3b41d53 100644
+--- a/core/determinism_test.odin
++++ b/core/determinism_test.odin
+@@ -205,6 +205,19 @@ test_catalog :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalog
+ 		for n in nodes { append(&r.unlock_node_types, n) }
+ 		r.unlock_pipe_tiers = make([dynamic]u16, 0, len(tiers), allocator)
+ 		for t in tiers { append(&r.unlock_pipe_tiers, t) }
++		// The Box (v2-mechanics-the-box): the caps MIRROR here like every
++		// Era_Row field (the 6.3 lesson — a zeroed field silently collapses
++		// behavior). These are box-ON-compatible caps (era-relative, mirroring
++		// the spirit of data/eras.json); the legacy tests run box-OFF (the
++		// Run_State.box_enabled zero value), so they observe nothing — but a
++		// future box-on fixture must never inherit silent zero caps.
++		r.box_pieces = make([dynamic]u32, len(cat.node_types), allocator)
++		r.box_spools = make([dynamic]u32, BOX_SPOOL_COUNT, allocator)
++		if rt, ok := node_type_index(cat, "router_basic"); ok { r.box_pieces[rt] = 8 }
++		if rm, ok := node_type_index(cat, "router_mid"); ok { r.box_pieces[rm] = 3 }
++		if rh, ok := node_type_index(cat, "router_high"); ok { r.box_pieces[rh] = 2 }
++		r.box_spools[BOX_SPOOL_STANDARD] = 320
++		r.box_spools[BOX_SPOOL_FIBER] = 360
+ 		append(&cat.eras, r)
+ 	}
+ 	ei2, _ := class_index(cat, "email")
+diff --git a/core/era.odin b/core/era.odin
+index e7fa742..15a67e8 100644
+--- a/core/era.odin
++++ b/core/era.odin
+@@ -383,5 +383,9 @@ era_step :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 	bundles_rebuild(&state.bundles, &state.topology, cat, state.era)
+ 	state.bundles_gen = state.topology.gen
+ 	flow_lane_caps_rebuild(state, cat)
++	// The Box (v2-mechanics-the-box, ruling 3's crazyhouse rule): the era is
++	// the new-bigger-set moment — the caps are the NEW era's and stock
++	// restores TO them (never past). No-op when the box is disabled.
++	box_on_era_advance(state, cat)
+ 	event_emit_era(state, tick, new_era)
+ }
+diff --git a/core/serialize.odin b/core/serialize.odin
+index 6d0babc..c862613 100644
+--- a/core/serialize.odin
++++ b/core/serialize.odin
+@@ -308,6 +308,49 @@ state_writer :: proc(state: ^Run_State, tick_events: []Event, cat: ^Catalogs,
+ 		}
+ 	}
+ 
++	// The Box (v2-mechanics-the-box) — SERIALIZED when the box is enabled (run
++	// setup); ABSENT-WHEN-DISABLED so every legacy run writes zero bytes here
++	// (the golden-stability rule). Layout: sparse non-zero piece rows (node-
++	// type index u16 + stock u32, index order), sparse non-zero spool rows
++	// (spool index u8 + stock u32, index order), then the clock (next_dot_tick
++	// u64, dot_interval u64, delivered_baseline u64). Deterministic: the rows
++	// walk dense parallel arrays in index order, and replay re-applies the
++	// same command stream through box_apply_edit, so the sections agree
++	// byte-for-byte (E10).
++	if state.box_enabled {
++		nz_pieces := 0
++		for i in 0..<len(state.box.pieces) {
++			if state.box.pieces[i] != 0 {
++				nz_pieces += 1
++			}
++		}
++		w_u32(&w, u32(nz_pieces))
++		for i in 0..<len(state.box.pieces) {
++			if state.box.pieces[i] == 0 {
++				continue
++			}
++			w_u16(&w, u16(i))
++			w_u32(&w, state.box.pieces[i])
++		}
++		nz_spools := 0
++		for s in 0..<len(state.box.spools) {
++			if state.box.spools[s] != 0 {
++				nz_spools += 1
++			}
++		}
++		w_u32(&w, u32(nz_spools))
++		for s in 0..<len(state.box.spools) {
++			if state.box.spools[s] == 0 {
++				continue
++			}
++			w_u8(&w, u8(s))
++			w_u32(&w, state.box.spools[s])
++		}
++		w_u64(&w, state.box.next_dot_tick)
++		w_u64(&w, state.box.dot_interval)
++		w_u64(&w, state.box.delivered_baseline)
++	}
++
+ 	// the Topology — the network commands mutate. Serialized slot-by-slot
+ 	// (alive flags included so tombstones/id-monotonicity ride in the hash,
+ 	// E11), in insertion order (stable, ODN-10). THIS is what makes the drawn
+diff --git a/core/stats.odin b/core/stats.odin
+index 2e50f22..c93b649 100644
+--- a/core/stats.odin
++++ b/core/stats.odin
+@@ -113,6 +113,31 @@ Stats_Drop_Row :: struct {
+ 	count:  u32,
+ }
+ 
++// Stats_Box_Row — the Box's per-tick calibration row (v2-mechanics-the-box;
++// --stats-out evidence for the economy tuning). Present (non-zero enabled)
++// only on box-on runs — absent-when-disabled like the box's T1 section. The
++// spool stocks + caps (the era ceiling) + the clock (next-dot tick, the
++// current interval, the progress permille) — every column a pure read of the
++// serialized box state, so the stream stays byte-identical live vs replay.
++Stats_Box_Row :: struct {
++	enabled:      bool,
++	std_stock:    u32,
++	fiber_stock:  u32,
++	std_cap:      u32,
++	fiber_cap:    u32,
++	next_dot:     u64,
++	interval:     u64,
++	prog_permille: u32,
++	pieces:       [dynamic]Stats_Box_Piece_Row,
++}
++
++// Stats_Box_Piece_Row — one junction type's piece stock + era cap (the J row).
++Stats_Box_Piece_Row :: struct {
++	type_idx: u16,
++	stock:    u32,
++	cap:      u32,
++}
++
+ // Stats_Record — one per STEPPED sim tick. The harness emits one record after
+ // each step (paused 5.3 wall ticks emit none — the state is stable, and the
+ // drop sites are per-step scratch, so a paused record would be a lie).
+@@ -126,6 +151,7 @@ Stats_Record :: struct {
+ 	pipes:    [dynamic]Stats_Pipe_Row,
+ 	ports:    [dynamic]Stats_Port_Row, // S5: the (router, port) NOC QUEUES rows (F3)
+ 	drops:    [dynamic]Stats_Drop_Row,
++	box:      Stats_Box_Row, // the Box (v2-mechanics-the-box): enabled only on box-on runs
+ }
+ 
+ // stats_compute — derive the per-tick record from the EXISTING state (pure;
+@@ -147,6 +173,42 @@ stats_compute :: proc(state: ^Run_State, cat: ^Catalogs, sim_hash: u64,
+ 	rec.pipes = make([dynamic]Stats_Pipe_Row, 0, 8, allocator)
+ 	rec.ports = make([dynamic]Stats_Port_Row, 0, 8, allocator)
+ 	rec.drops = make([dynamic]Stats_Drop_Row, 0, 4, allocator)
++	// the Box row (v2-mechanics-the-box): pure reads of the serialized state
++	// + the era caps — identical on replay (E10).
++	rec.box.enabled = state.box_enabled
++	if state.box_enabled {
++		sp := u32(0)
++		if len(state.box.spools) > 0 {
++			sp = state.box.spools[BOX_SPOOL_STANDARD]
++			rec.box.fiber_stock = state.box.spools[BOX_SPOOL_FIBER]
++		}
++		rec.box.std_stock = sp
++		if row, ok := era_row(cat, state.era); ok {
++			if len(row.box_spools) > 0 {
++				rec.box.std_cap = row.box_spools[BOX_SPOOL_STANDARD]
++				rec.box.fiber_cap = row.box_spools[BOX_SPOOL_FIBER]
++			}
++		}
++		rec.box.next_dot = state.box.next_dot_tick
++		rec.box.interval = state.box.dot_interval
++		rec.box.prog_permille = box_dot_progress_permille(state)
++		rec.box.pieces = make([dynamic]Stats_Box_Piece_Row, 0, 4, allocator)
++		if row, ok := era_row(cat, state.era); ok {
++			for i in 0..<len(state.box.pieces) {
++				if i >= len(cat.node_types) || cat.node_types[i].kind != .Junction {
++					continue
++				}
++				cap := u32(0)
++				if i < len(row.box_pieces) {
++					cap = row.box_pieces[i]
++				}
++				if cap == 0 && state.box.pieces[i] == 0 {
++					continue // an ungranted type is not a calibration row
++				}
++				append(&rec.box.pieces, Stats_Box_Piece_Row{type_idx = u16(i), stock = state.box.pieces[i], cap = cap})
++			}
++		}
++	}
+ 
+ 	// --- per-class rows (class-id order; one per flow.sla row) --------------
+ 	for c in 0..<len(state.flow.sla) {
+@@ -376,6 +438,19 @@ stats_write_csv :: proc(sb: ^strings.Builder, rec: ^Stats_Record) {
+ 		fmt.sbprintf(sb, "D,%d,%d,%d,%d,%d\n",
+ 			rec.tick, d.pipe, d.class, d.reason, d.count)
+ 	}
++	// the Box rows (v2-mechanics-the-box) — box-on runs only (absent-when-
++	// disabled: legacy streams stay byte-identical). B = spools + the clock;
++	// J = one row per junction type the era ceiling grants (the piece half
++	// of the squeeze must be as visible as the tile half).
++	if rec.box.enabled {
++		fmt.sbprintf(sb, "B,%d,%d,%d,%d,%d,%d,%d,%d\n",
++			rec.tick, rec.box.std_stock, rec.box.fiber_stock,
++			rec.box.std_cap, rec.box.fiber_cap,
++			rec.box.next_dot, rec.box.interval, rec.box.prog_permille)
++		for nt, i in rec.box.pieces {
++			fmt.sbprintf(sb, "J,%d,%d,%d,%d\n", rec.tick, nt.type_idx, nt.stock, nt.cap)
++		}
++	}
+ }
+ 
+ // bool_to_u8 — 0/1 for the CSV (integers only).
+diff --git a/core/step.odin b/core/step.odin
+index 9bb4e69..952ea89 100644
+--- a/core/step.odin
++++ b/core/step.odin
+@@ -57,34 +57,29 @@ step :: proc(state: ^Run_State, tick: u64, commands: []Command, cat: ^Catalogs)
+ 
+ 	// apply this tick's commands to the Topology (the same validate-then-apply
+ 	// the edit fast-path uses — one legality path, so replay can't diverge).
+-	// 6.1: Cmd_Era_Advance is NOT a topology edit — it latches the era FSM's
+-	// pending advance (validated here, fired later in era_step at the S6 seam;
+-	// a replayed command that fails validation is the same CRITICAL divergence
+-	// — latch, never silent).
++	// 6.1: Cmd_Era_Advance is NOT a topology edit — box_apply_edit latches it
++	// exactly as this loop always did (validated here, fired later in era_step
++	// at the S6 seam; a replayed command that fails validation is the same
++	// CRITICAL divergence — latch, never silent). The Box (v2-mechanics-the-
++	// box): the entry is box_apply_edit — material validate/charge wrapped
++	// around the same topology authority, so live and replay drain/refund
++	// identically (E10); box-disabled it IS the old path (byte-identical
++	// legacy).
+ 	for cmd in commands {
+-		#partial switch c in cmd.kind {
+-		case Cmd_Era_Advance:
+-			if e := era_advance_validate(state, c, cat); e != .None {
+-				state.replay_error = true
+-			} else {
+-				era_advance_latch(state, c)
+-			}
+-		case:
+-			_, err := topology_apply_edit(&state.topology, cmd, cat)
+-			if err != .None {
++		_, err := box_apply_edit(state, cmd, cat)
++		if err != .None {
+ 				// a replayed command that fails validation is a CRITICAL divergence
+ 				// (the log stores post-validation truth — this should never happen
+ 				// for a honestly-recorded log). Latch + let the gate reject.
+-				state.replay_error = true
+-			} else {
+-				// v2-sound: the wire-placed cue — emitted on EVERY successful pipe
+-				// draw at the apply tick, so replay (this path) and the live
+-				// fast-path (exec.odin commit_draw, same apply_tick) produce
+-				// byte-identical event streams (ODN-14). Zero payload.
+-				#partial switch k in cmd.kind {
+-				case Cmd_Draw_Pipe:
+-					event_emit(state, tick, EVENT_TAG_PIPE_DRAWN)
+-				}
++			state.replay_error = true
++		} else {
++			// v2-sound: the wire-placed cue — emitted on EVERY successful pipe
++			// draw at the apply tick, so replay (this path) and the live
++			// fast-path (exec.odin commit_draw, same apply_tick) produce
++			// byte-identical event streams (ODN-14). Zero payload.
++			#partial switch k in cmd.kind {
++			case Cmd_Draw_Pipe:
++				event_emit(state, tick, EVENT_TAG_PIPE_DRAWN)
+ 			}
+ 		}
+ 	}
+@@ -195,6 +190,14 @@ step :: proc(state: ^Run_State, tick: u64, commands: []Command, cat: ^Catalogs)
+ 	// NEXT tick's flow (the director reads cat.demand.eras[era-1] per tick).
+ 	era_step(state, tick, cat)
+ 
++	// The Box's refill clock (v2-mechanics-the-box, ruling 5) — AFTER era_step
++	// (a same-tick advance+dot restores to the NEW caps first; the dot then
++	// no-ops or tops up — one deterministic order) and BEFORE win_lose_eval
++	// (a dot on the terminal tick is skipped by the barrier — a refill is
++	// never the terminal event). Box-disabled this is a no-op (every legacy
++	// run stays byte-identical).
++	box_step(state, tick, cat)
++
+ 	// the win/lose gate (1.4 stub, §6.5): score >= goal -> Run_Won; tick cap hit
+ 	// with score < goal -> Run_Lost; 4.3 adds the surge-uptime win. Appends
+ 	// exactly one terminal event + latches `terminal`/`outcome`; the barrier
+diff --git a/core/topology.odin b/core/topology.odin
+index 5555f60..4350581 100644
+--- a/core/topology.odin
++++ b/core/topology.odin
+@@ -118,6 +118,13 @@ isqrt :: proc(x: i64) -> i64 {
+ // Rounded Euclidean distance between two grid points (matches round(sqrt(d²)),
+ // computed integer-only). One metric serves span validation, draw cost, and
+ // the snap radius (E4).
++// span_between_nodes — the PUBLIC slot-pair wrapper (the Box's econ-check
++// verb prices candidate reaches from outside the package; the integer math
++// is THE same span_between — one source, two entry points).
++span_between_nodes :: proc(t: ^Topology, a, b: u32) -> i32 {
++	return span_between(t.node_pos[a], t.node_pos[b])
++}
++
+ span_between :: proc(a, b: [2]i32) -> i32 {
+ 	d2 := dist2(a, b)
+ 	r := isqrt(d2)
+diff --git a/core/types.odin b/core/types.odin
+index a7f6a63..3d7fe59 100644
+--- a/core/types.odin
++++ b/core/types.odin
+@@ -33,6 +33,8 @@ Edit_Error :: enum u8 {
+ 	Invalid_Weights,    // 3.2 — weights out of domain OR a zeroing edit on a never-drop lane (E6)
+ 	Invalid_Era_Advance, // 6.1 — an era-advance request that is invalid (to_era out of the era table, or not forward)
+ 	Not_An_Upgrade,     // 6.3 — a tier change that is not STRICTLY upward (same/lower = demolish-and-redraw territory)
++	Box_Piece_Exhausted,  // box (ruling 4) — placing/promoting a router tier the player holds no piece of
++	Box_Spool_Exhausted,  // box (ruling 6) — a draw/resplice whose tiles exceed the matching spool's stock
+ }
+ 
+ // LANE_* — the 3 DiffServ lanes (ODN-3). 0 = Express (highest), 2 = Best-effort.
+@@ -450,6 +452,25 @@ EVENT_TAG_ERA_ADVANCED :: u8(13)   // 6.1: the era FSM advanced the active era (
+ EVENT_TAG_ERA_ADVANCE_BLOCKED :: u8(14) // 6.2: the advance gate blocked the era advance (reason payload = Advance_Block_Reason)
+ EVENT_TAG_PIPE_DRAWN :: u8(15)    // v2-sound: a pipe was drawn (the audio layer's wire-placed cue; zero payload)
+ EVENT_TAG_NODE_SPAWNED :: u8(16)   // v2-sound: the growth director spawned a terminal (the spawn-feel chime; zero payload)
++EVENT_TAG_BOX_DOT :: u8(17)        // box (ruling 5): a refill dot landed — stock restored toward the era caps (zero payload; the HUD pulse + the audio layer's future cue read the box state directly)
++
++// Box_State — the player's material stock (rulings 2+3+5+6, v2-mechanics-the-
++// box): typed router pieces (parallel to node_types — only junction kinds can
++// be non-zero) + spool tiles (parallel to the fixed 2-spool set), the era caps
++// living on Era_Row. next_dot_tick/dot_interval/delivered_baseline are the
++// refill clock's serialized state: the dot restores stock TO the era caps
++// (never past — no banking), scheduled on the balance.box spine, accelerated
++// by deliveries since the last dot (clamped [floor, base]). SERIALIZED
++// absent-when-disabled (the box_enabled gate — box-off runs write zero bytes,
++// the golden-stability rule); pieces/spools serialize SPARSE (non-zero rows
++// only, index order — deterministic).
++Box_State :: struct {
++	pieces:            [dynamic]u32, // router pieces per node_type index (junction kinds only)
++	spools:            [dynamic]u32, // pipe tiles per spool index (BOX_SPOOL_*)
++	next_dot_tick:     u64,          // the tick the next refill dot fires (the known worst-case schedule)
++	dot_interval:      u64,          // the interval the CURRENT dot was scheduled with (the HUD progress denominator)
++	delivered_baseline: u64,         // total deliveries at the last dot (the acceleration diff anchor)
++}
+ 
+ // Outcome — the latched terminal result (1.4 stub). None while the run is in
+ // play; Won/Lost once win_lose_eval appends the terminal event. The terminal-
+@@ -546,6 +567,12 @@ Run_State :: struct {
+ 	// fires on the E14 crisis gate alone), so every legacy demo stays byte-identical.
+ 	advance_gate_enabled: bool,
+ 	era_gate: Era_Gate_State,          // 6.2: the gate's DERIVED measurement (never serialized — rebuilt identically on replay)
++	// The Box (v2-mechanics-the-box): run setup like health_enabled/growth_enabled —
++	// NOT serialized; its observable state is the box section (stock + clock),
++	// which serializes absent-when-disabled. Disabled (the zero value) = every
++	// legacy run stays byte-identical: builds are free, no refusals, no dots.
++	box_enabled: bool,
++	box:       Box_State,             // the material stock + the refill clock (serialized when enabled)
+ 	terminal:     bool,                // 1.4: latched once Run_Won/Run_Lost emitted (the barrier, E17)
+ 	outcome:      Outcome,             // 1.4: which terminal event fired (None while non-terminal)
+ 	action_log:   [dynamic]Command,    // the replay artifact (ODN-11)
+@@ -575,6 +602,7 @@ run_init :: proc(state: ^Run_State, seed: u64, catalog_hash: u64, logic_hz: i32,
+ 	crisis_make(&state.crisis, allocator)
+ 	health_make(&state.health, allocator)
+ 	era_gate_make(&state.era_gate, allocator)
++	box_make(&state.box, allocator)
+ 	rng_seed(&state.rng, seed)
+ }
+ 
+@@ -590,4 +618,5 @@ run_destroy :: proc(state: ^Run_State) {
+ 	crisis_destroy(&state.crisis)
+ 	health_destroy(&state.health)
+ 	era_gate_destroy(&state.era_gate)
++	box_destroy(&state.box)
+ }
+diff --git a/data/balance.json b/data/balance.json
+index fb19bba..ea544e8 100644
+--- a/data/balance.json
++++ b/data/balance.json
+@@ -59,6 +59,12 @@
+     "milestone_window_ticks": 600,
+     "sla_uptime_pct": 95
+   },
++  "box": {
++    "_comment": "The Box's refill clock (mechanics-quinn record, ruling 5 [M4] — v2-mechanics-the-box): dots restore stock TO the era caps on a KNOWN spine — dot_interval_ticks is the worst-case schedule (the player can always read when the next dot lands); deliveries since the last dot ACCELERATE the next one: interval = clamp(dot_interval_ticks - dot_accel_ticks_per_delivery * deliveries, dot_floor_ticks, dot_interval_ticks). The FLOOR is the no-soft-lock guarantee (always available) — it is NEVER gated on performance; the base interval is the ceiling (a crisis-stalled run rides the spine, never slower — the Q7 death-spiral answer). Integer ticks @ logic_hz; L1 staging values tuned against the sim harness (evidence in the PR).",
++    "dot_interval_ticks": 2400,
++    "dot_floor_ticks": 600,
++    "dot_accel_ticks_per_delivery": 1
++  },
+   "lane_presets": [
+     {
+       "id": "balanced",
+diff --git a/data/eras.json b/data/eras.json
+index e7076bd..829a75c 100644
+--- a/data/eras.json
++++ b/data/eras.json
+@@ -1,5 +1,5 @@
+ {
+-  "_comment": "Era catalog (Story 6.1 + 6.3, GDD § M4, ODN-5) — the authoritative per-era row: the ACTIVE packet-type roster, the demand-signature binding, the infrastructure unlock table, and the legacy-decay factor (6.3: legacy_decay_permille — the effective-throughput multiplier a legacy pipe serves at during this era; integer 1..1000, fail-fast validated; 1000 = no decay). Loaded + fail-fast validated exactly like the sibling catalogs: every id cross-ref resolves to its catalog (packet_types / node_types / pipe_tiers), every referenced demand era must exist in demand.json, and the sim numbers are integers only. The era FSM (core/era.odin, S6) advances state.era against this table; the advance command rides the action log (Cmd_Era_Advance), so the unlock switch is replay-deterministic by construction (E10). The roster + unlock tables are enforced to EXACTLY equal the per-item era_introduced-derived sets (the two data sources can never drift), and every demand entry class must be in its era's roster. MVP rows: eras 1-3 (the content demand.json carries; eras 4-6 are full-game content that arrive with their packet/node/tier rosters — E5.4 / story 6.3 territory, out of this slice's scope).",
++  "_comment": "Era catalog (Story 6.1 + 6.3, GDD § M4, ODN-5) — the authoritative per-era row: the ACTIVE packet-type roster, the demand-signature binding, the infrastructure unlock table, and the legacy-decay factor (6.3: legacy_decay_permille — the effective-throughput multiplier a legacy pipe serves at during this era; integer 1..1000, fail-fast validated; 1000 = no decay). The BOX block (mechanics-quinn record, rulings 2+3+6+7 — v2-mechanics-the-box): the era's build-material CEILING — pieces (router stock by junction node-type id) + spools (pipe-tile stock by spool id: standard | fiber). Era advance RAISES the cap (non-decreasing per type, fail-fast enforced) and a refill/restore brings stock TO the cap, never past (no banking); refunds are never clamped (full teardown refund is the ruling). Era 1-2 are fat caps (felt-not-counted, ruling 7); era 3 shifts the mix fiberward and introduces the mid/high router pieces (the promotion grammar's material, ruling 4). Values are L1 staging starts tuned against the sim harness (job packet-plumber-v2-mechanics-the-box) — the PR body carries the tuned numbers + run evidence. Loaded + fail-fast validated exactly like the sibling catalogs: every id cross-ref resolves to its catalog (packet_types / node_types / pipe_tiers), every referenced demand era must exist in demand.json, and the sim numbers are integers only. The era FSM (core/era.odin, S6) advances state.era against this table; the advance command rides the action log (Cmd_Era_Advance), so the unlock switch is replay-deterministic by construction (E10). The roster + unlock tables are enforced to EXACTLY equal the per-item era_introduced-derived sets (the two data sources can never drift), and every demand entry class must be in its era's roster. MVP rows: eras 1-3 (the content demand.json carries; eras 4-6 are full-game content that arrive with their packet/node/tier rosters — E5.4 / story 6.3 territory, out of this slice's scope).",
+   "eras": [
+     {
+       "era": 1,
+@@ -11,6 +11,10 @@
+       "infrastructure": {
+         "node_types": ["residential", "router_basic"],
+         "pipe_tiers": ["standard"]
++      },
++      "box": {
++        "pieces": { "router_basic": 6 },
++        "spools": { "standard": 240, "fiber": 0 }
+       }
+     },
+     {
+@@ -23,6 +27,10 @@
+       "infrastructure": {
+         "node_types": ["residential", "router_basic", "small_biz"],
+         "pipe_tiers": ["standard"]
++      },
++      "box": {
++        "pieces": { "router_basic": 8 },
++        "spools": { "standard": 240, "fiber": 0 }
+       }
+     },
+     {
+@@ -35,6 +43,10 @@
+       "infrastructure": {
+         "node_types": ["residential", "router_basic", "small_biz", "content_host", "campus", "router_mid", "router_high"],
+         "pipe_tiers": ["standard", "mid", "wide"]
++      },
++      "box": {
++        "pieces": { "router_basic": 10, "router_mid": 3, "router_high": 2 },
++        "spools": { "standard": 240, "fiber": 360 }
+       }
+     }
+   ]
+diff --git a/data/pipe_tiers.json b/data/pipe_tiers.json
+index d29d87a..23ea2e2 100644
+--- a/data/pipe_tiers.json
++++ b/data/pipe_tiers.json
+@@ -9,7 +9,8 @@
+       "clean_span": 10,
+       "max_span": 14,
+       "cost_per_tile": 12,
+-      "era_introduced": 1
++      "era_introduced": 1,
++      "spool": "standard"
+     },
+     {
+       "id": "mid",
+@@ -19,7 +20,8 @@
+       "clean_span": 12,
+       "max_span": 16,
+       "cost_per_tile": 20,
+-      "era_introduced": 3
++      "era_introduced": 3,
++      "spool": "fiber"
+     },
+     {
+       "id": "wide",
+@@ -29,7 +31,8 @@
+       "clean_span": 14,
+       "max_span": 18,
+       "cost_per_tile": 30,
+-      "era_introduced": 3
++      "era_introduced": 3,
++      "spool": "fiber"
+     }
+   ]
+ }
+diff --git a/demos/box_spine.dem b/demos/box_spine.dem
+new file mode 100644
+index 0000000..4997d29
+--- /dev/null
++++ b/demos/box_spine.dem
+@@ -0,0 +1,35 @@
++# box_spine.dem — v2-mechanics-the-box: the Box's arc on the REAL catalog
++# (era 1: 6 basic pieces, 240 standard tiles, no fiber; the clock spine at
++# 2400 ticks / 120 s per dot on the base interval). The beats:
++#
++#   400-800ms  — the player builds: the fixture leg + a second router +
++#                parallel segments (the spool visibly drains 240 -> ~180).
++#   116000ms   — PRE-dot capture: the box drained (stock < cap).
++#   120000+    — tick 2400: the DOT fires — stock restores TO cap (never
++#                past), the BOX_DOT event rides the T1 hash.
++#   122000ms   — `advance 2`: the era-2 latch fires (gate off, no crisis) —
++#                the crazyhouse rule: caps RAISE (basic 8) and stock restores
++#                to the new ceiling (the era-2 restore beat, also in the T1).
++#   123000ms   — POST-dot + post-advance capture: the box refilled at the
++#                raised ceiling (glanceable HUD beat).
++#   124500ms   — settled era-2 beat (the network running at the new kit).
++#
++# `box on` (run setup — the r1 B1 rule: carried identically on the replay
++# path) arms the material economy; every draw/place/demolish/advance below
++# is a LOGGED command, replay-byte-identical (E10). The T1 pins the box
++# section (sparse stock + clock) from the first drained tick onward.
++seed 42
++era 1
++box on
++run 126000ms
++at 400ms draw 0 1 standard
++at 500ms draw 1 2 standard
++at 600ms place router_basic 30 8
++at 700ms draw 1 3 standard
++at 800ms draw 1 3 standard
++capture at 116000ms
++capture at 124500ms
++at 122000ms advance 2
++capture at 123000ms
++capture at 125000ms
++expect hash stable
+diff --git a/harness/demo.odin b/harness/demo.odin
+index 57a1208..ee0edd0 100644
+--- a/harness/demo.odin
++++ b/harness/demo.odin
+@@ -185,6 +185,7 @@ Demo :: struct {
+ 	advances:           [dynamic]Advance_Intent,  // 6.1: `at <n>ms advance <era>` (a LOGGED command — the era FSM's input)
+ 	growth_on:          bool,    // 5.1: `growth on` — the director's map growth (run setup, like the fixture)
+ 	advance_gate_on:    bool,    // 6.2: `advance gate on` — the era-advance modernization gate (run setup; disabled = the 6.1 mechanics, byte-identical)
++	box_on:             bool,    // the Box (v2-mechanics-the-box): `box on` — the material economy (run setup; disabled = legacy free-build, byte-identical)
+ 	map_source:         u8,      // v2-dublin-board: `map dublin` / `map procedural` — the named map input (run setup, like the seed; 0 = procedural — the zero value, every legacy demo stays byte-identical)
+ 	zoom:               f32,     // LOOK §1: `zoom <z>` — the pinned camera altitude for this demo's captures (view-only run setup, like a11y; 1.0 = the fit, the zero value — every legacy demo stays byte-identical)
+ 
+@@ -610,6 +611,17 @@ parse_demo :: proc(name: string, text: string) -> (Demo, string) {
+ 				return {}, fmt.tprintf("bad growth (want: growth on): %s", line)
+ 			}
+ 			d.growth_on = true
++		case "box":
++			// box on — the material economy (v2-mechanics-the-box; run setup
++			// like growth: re-created identically on every replay). Requires
++			// era >= 1 (box_enable restores the CURRENT era's kit).
++			if len(fields) < 2 || fields[1] != "on" {
++				return {}, fmt.tprintf("bad box (want: box on): %s", line)
++			}
++			if d.era == 0 {
++				return {}, fmt.tprintf("box on requires an era (set `era <n>` first): %s", line)
++			}
++			d.box_on = true
+ 		case "map":
+ 			// map dublin|procedural — v2-dublin-board: the named map input
+ 			// (run setup, like the seed — re-created identically on every
+diff --git a/harness/econ.odin b/harness/econ.odin
+new file mode 100644
+index 0000000..cf3b644
+--- /dev/null
++++ b/harness/econ.odin
+@@ -0,0 +1,392 @@
++package main
++
++// econ.odin — the `econ-check` harness verb (v2-mechanics-the-box, record
++// open questions 1-4 + 7): the L5 calibration evidence generator. A
++// deterministic GREEDY-EXPANSIVE bot (the record's expansive builder: big
++// swings, then cannibalize-and-redeploy) plays the REAL catalog across four
++// scenarios and reports the economy's observable shape:
++//
++//   era1-calm    — the era-1 kit is fat: the ceiling never speaks (calm).
++//   era2-brush   — the era-2 phase brushes the ceiling gently: a handful of
++//                  refusal EPISODES across the phase, each self-resolving as
++//                  a dot lands (ruling 7's authored brush).
++//   era3-slope   — demand growth outruns restore: refusals arrive regularly
++//                  (the bind is a slope inside the era, not a boundary step).
++//   crisis-stall — a different seed's demand shape stresses the clock: the
++//                  dot interval must stay inside [floor, base] (never slower
++//                  than the known spine, never faster than the floor) and
++//                  teardown+dots keep the player rebuilding (Q7: no death
++//                  spiral — the floor absorbs it).
++//
++// Every number printed here rides the PR body (the tuned numbers + runs as
++// evidence, per the record). Deterministic: fixed seeds, fixed spot tables,
++// the real catalogs — same binary, same table.
++
++import pp "../core"
++import "core:fmt"
++
++// Econ_Stats — what a scenario run measures.
++Econ_Stats :: struct {
++	draws_ok:        i32,
++	places_ok:       i32,
++	refusals:        i32,
++	episodes:        i32,
++	first_no_tick:   u64,
++	dot_count:       i32,
++	interval_min:    u64,
++	interval_max:    u64,
++	min_stock:       u32,
++	deliveries:      u64,
++	dots_in_refusal: i32, // dots that landed during a refusal episode (the self-resolution count)
++	piece_starved:   bool, // a placement was refused .Box_Piece_Exhausted (the era-3 PIECE half of the squeeze)
++	in_refusal:      bool, // episode tracker (internal)
++	other_errs:      i32, // debug: span/port/etc. rejections
++}
++
++
++ECON_SPOTS :: [10][2]i32{{6, 15}, {6, 29}, {20, 29}, {34, 29}, {34, 15}, {34, 3}, {20, 3}, {6, 3}, {16, 9}, {26, 9}}
++
++// econ_run_scenario — the greedy bot on the real catalog. Fixed seed, the
++// static fixture (res ← router → host), box on. Expansion: place the spot
++// chain + 2 segments per pair (the chain + 1 parallel — routers are
++// 4-port-capped); sustain: demolish-oldest + redraw its pair
++// (cannibalize-and-redeploy). An action every 2 ticks.
++econ_run_scenario :: proc(cat: ^pp.Catalogs, era: u8, ticks: u64, seed: u64, stats: ^Econ_Stats, name_dbg: string) {
++	s: pp.Run_State
++	defer pp.run_destroy(&s)
++	pp.run_init(&s, seed, cat.hash, cat.balance.logic_hz)
++	s.era = era
++	seed_fixture(&s, cat)
++	s.box_enabled = true
++	pp.box_enable(&s, cat)
++	s.growth_enabled = true // the map grows: demand reach pressure builds
++	// over the run (the real cadence: one terminal per spawn window)
++	stats.interval_min = 1 << 62
++	stats.interval_max = 0
++	stats.min_stock = 1 << 31
++	rt_idx, _ := pp.node_type_index(cat, "router_basic")
++	std_idx, _ := pp.pipe_tier_index(cat, "standard")
++	placed := 0
++	seg_cursor := 0
++	oldest := 0
++	prev_delivered: u64 = 0
++	spot_ids: [16]u32
++	BOX_SEG :: 18 // the 2 fixture legs + 8 pairs × 2 segments
++	seg_pipe: [BOX_SEG]u32 // the CURRENT pipe id per segment (rebuilt segments get new monotonic ids)
++	seg_tier: [BOX_SEG]u16 // the segment's tier (era-3 expansion draws wide — the fiber evidence)
++	wd_idx, _ := pp.pipe_tier_index(cat, "wide")
++	for tick in u64(1)..=ticks {
++		before := len(s.events)
++		pp.step(&s, tick, nil, cat)
++		for e in s.events[before:] {
++			if e.tag == pp.EVENT_TAG_BOX_DOT {
++				stats.dot_count += 1
++				if s.box.dot_interval < stats.interval_min do stats.interval_min = s.box.dot_interval
++				if s.box.dot_interval > stats.interval_max do stats.interval_max = s.box.dot_interval
++				if stats.in_refusal do stats.dots_in_refusal += 1
++			}
++		}
++		clear(&s.events)
++		if s.box.spools[pp.BOX_SPOOL_STANDARD] < stats.min_stock {
++			stats.min_stock = s.box.spools[pp.BOX_SPOOL_STANDARD]
++		}
++		d := econ_delivered_total(&s)
++		if d > prev_delivered {
++			stats.deliveries += d - prev_delivered
++			prev_delivered = d
++		}
++		if tick % 2 != 0 {
++			continue
++		}
++		// the placement half: keep expanding while spots + pieces remain.
++		spots := ECON_SPOTS
++		if placed >= len(spots) && tick % 200 == 0 {
++			// the piece-wall probe: every spot is used — keep PROBING the
++			// piece stock so the era-3 piece bind is observable (a refused
++			// probe is the box saying no on the router half).
++			_, err := pp.box_apply_edit(&s, pp.Command{1, pp.Cmd_Place_Router{type_idx = rt_idx, pos = ECON_SPOTS[0] + [2]i32{1, 1}}}, cat)
++			if err == .Box_Piece_Exhausted {
++				stats.piece_starved = true
++			}
++		}
++		if placed < len(spots) && s.box.pieces[rt_idx] > 0 {
++			pos := spots[placed]
++			res, err := pp.box_apply_edit(&s, pp.Command{1, pp.Cmd_Place_Router{type_idx = rt_idx, pos = pos}}, cat)
++			if err == .Box_Piece_Exhausted {
++				// the era-3 PIECE bind: the box said no on the router half —
++				// the record's "every draw is material off the board".
++				stats.piece_starved = true
++				placed = len(spots) // out of pieces — stop trying
++			} else if err == .None {
++				spot_ids[placed] = res.id // the ACTUAL node id (growth spawns interleave the monotonic ids)
++				placed += 1
++				stats.places_ok += 1
++			} else {
++				placed += 1 // an invalid spot (geometry) — skip it
++			}
++		}
++		a, b: u32
++		tier := std_idx
++		wire_mode := false
++		max_seg := placed * 2 // pairs = placed (fixture link + spot chain)
++		if seg_cursor < max_seg {
++			// the build order: the fixture legs FIRST (res->router, router->
++			// host — so demand actually FLOWS: a sink path exists and the
++			// acceleration has deliveries to read), then the chain pairs —
++			// by RECORDED id (growth spawns interleave the monotonic ids).
++			// Era-3 expansion draws WIDE when the fiber spool affords it —
++			// the spool-mix shift (rulings 6+7) needs calibration evidence.
++			if seg_cursor == 0 {
++				a = 0
++				b = 1
++			} else if seg_cursor == 1 {
++				a = 1
++				b = 2
++			} else {
++				pair := (seg_cursor - 2) / 2
++				a = u32(1)
++				b = spot_ids[0]
++				if pair > 0 && pair < placed {
++					a = spot_ids[pair - 1]
++					b = spot_ids[pair]
++				}
++			}
++			if era >= 3 && seg_cursor >= 2 && s.box.spools[pp.BOX_SPOOL_FIBER] >= 14 {
++				tier = wd_idx
++			}
++		} else if tw_ok, tw_a, tw_b := econ_pick_wire(&s, cat, spot_ids[:], placed); tw_ok {
++			// WIRE: a spawned terminal lacks a line — net-new tiles (the
++			// demand-reach pressure the era ladder is tuned against).
++			a = tw_a
++			b = tw_b
++			wire_mode = true
++		} else {
++			dem := oldest % max_seg
++			// demolish the OLDEST segment by its TRACKED id (rebuilt segments
++			// get new monotonic ids — a raw build-order id would hit a dead
++			// pipe and silently stall the sustain loop), then redraw its pair.
++			pp.box_apply_edit(&s, pp.Command{1, pp.Cmd_Demolish_Pipe{pipe = seg_pipe[dem]}}, cat)
++			if dem == 0 {
++				a = 0
++				b = 1
++			} else if dem == 1 {
++				a = 1
++				b = 2
++			} else {
++				pair := (dem - 2) / 2
++				a = u32(1)
++				b = spot_ids[0]
++				if pair > 0 && pair < placed {
++					a = spot_ids[pair - 1]
++					b = spot_ids[pair]
++				}
++			}
++			tier = seg_tier[dem]
++		}
++		res, err := pp.box_apply_edit(&s, pp.Command{1, pp.Cmd_Draw_Pipe{a = a, b = b, tier = tier}}, cat)
++		if err == .None {
++			stats.draws_ok += 1
++			stats.in_refusal = false
++			if seg_cursor < BOX_SEG {
++				seg_pipe[seg_cursor] = res.id
++				seg_tier[seg_cursor] = tier
++				seg_cursor += 1
++			} else {
++				seg_pipe[oldest % BOX_SEG] = res.id
++				oldest += 1
++			}
++		} else if err == .Router_Ports_Full {
++			// the pair's geometry is exhausted — consume the segment slot and
++			// move on (the wire/sustain phases carry the run's pressure).
++			if seg_cursor < BOX_SEG {
++				seg_cursor += 1
++			} else {
++				oldest += 1
++			}
++		} else if err == .Box_Spool_Exhausted {
++			stats.refusals += 1
++			if !stats.in_refusal {
++				stats.episodes += 1
++				stats.in_refusal = true
++			}
++			if stats.first_no_tick == 0 {
++				stats.first_no_tick = tick
++			}
++		} else {
++			if stats.other_errs < 6 {
++				ka := slot0_kind(&s.topology, a)
++				kb := slot0_kind(&s.topology, b)
++				fmt.eprintfln("  [%s] uncounted draw error tick %d: %v a=%d(%v) b=%d(%v) wire=%v", name_dbg, tick, err, a, ka, b, kb, wire_mode)
++			}
++			stats.other_errs += 1
++		}
++	}
++}
++
++// econ_pick_wire — find a spawned terminal (id > 2) with NO line yet within
++// `max_span` of a placed router: the demand-reach draw (net-new tiles).
++// Returns ok + (router id, terminal id). Deterministic: lowest terminal id,
++// then lowest router id.
++econ_pick_wire :: proc(s: ^pp.Run_State, cat: ^pp.Catalogs, spot_ids: []u32, placed: int) -> (bool, u32, u32) {
++	max_span := 14 // the standard tier's max span (the bot draws standard only)
++	for ts in 0..<len(s.topology.node_alive) {
++		if ts < 3 || !s.topology.node_alive[ts] {
++			continue
++		}
++		if s.topology.node_kind[ts] != .Terminal {
++			continue
++		}
++		// connected already?
++		wired := false
++		for pi in 0..<len(s.topology.pipe_alive) {
++			if !s.topology.pipe_alive[pi] {
++				continue
++			}
++			if s.topology.pipe_a[pi] == s.topology.node_id[ts] || s.topology.pipe_b[pi] == s.topology.node_id[ts] {
++				wired = true
++			}
++		}
++		if wired {
++			continue
++		}
++		// the nearest junction (any) whose ports aren't full
++		best_d := i32(max_span) + 1
++		best_r: u32 = 0
++		for r in 0..<len(s.topology.node_alive) {
++			if !s.topology.node_alive[r] || s.topology.node_kind[r] != .Junction {
++				continue
++			}
++			is_mine := r == 1
++			for k in 0..<placed {
++				if spot_ids[k] == s.topology.node_id[r] {
++					is_mine = true
++				}
++			}
++			if !is_mine {
++				continue // spawned terminals + unplaced ids are not wire anchors
++			}
++			// free port? (canon #14: live pipes per junction ≤ port_capacity)
++			used := 0
++			for pi in 0..<len(s.topology.pipe_alive) {
++				if !s.topology.pipe_alive[pi] {
++					continue
++				}
++				if s.topology.pipe_a[pi] == s.topology.node_id[r] || s.topology.pipe_b[pi] == s.topology.node_id[r] {
++					used += 1
++				}
++			}
++			if used >= int(cat.node_types[s.topology.node_type[r]].port_capacity) {
++				continue
++			}
++			d := pp.span_between_nodes(&s.topology, u32(r), u32(ts))
++			if d <= i32(max_span) && d < best_d {
++				best_d = d
++				best_r = s.topology.node_id[r]
++			}
++		}
++		if best_r != 0 {
++			return true, best_r, s.topology.node_id[ts]
++		}
++	}
++	return false, 0, 0
++}
++
++slot0_kind :: proc(t: ^pp.Topology, id: u32) -> string {
++	for i in 0..<len(t.node_alive) {
++		if t.node_id[i] == id {
++			ka := "dead"
++			if t.node_alive[i] do ka = "alive"
++			if t.node_kind[i] == .Junction do return fmt.tprintf("J(%s)", ka)
++			return fmt.tprintf("T(%s)", ka)
++		}
++	}
++	return "missing"
++}
++
++econ_delivered_total :: proc(s: ^pp.Run_State) -> u64 {
++	t: u64 = 0
++	for i in 0..<len(s.flow.sla) {
++		t += s.flow.sla[i].delivered
++	}
++	return t
++}
++
++econ_check :: proc(cat: ^pp.Catalogs) -> int {
++	fmt.println("econ-check — v2-mechanics-the-box L5 calibration (deterministic; real catalogs)")
++	fmt.println("scenario      ticks  draws  places  refusals  episodes  first_no  dots  interval[min,max]  min_stock  deliveries  dots-in-refusal  piece-starved")
++	fails := 0
++	base := cat.balance.box.dot_interval_ticks
++	floor := cat.balance.box.dot_floor_ticks
++
++	// era1-calm — fat kit: the ceiling never speaks.
++	{
++		stats: Econ_Stats
++		econ_run_scenario(cat, 1, 6000, 42, &stats, "era1-calm")
++		econ_print_row("era1-calm", 6000, &stats)
++		if stats.episodes != 0 {
++			fmt.printf("  FAIL: era-1 must stay calm (0 episodes, got %d)\n", stats.episodes)
++			fails += 1
++		}
++	}
++	// era2-brush — a gentle brush, self-resolving.
++	{
++		stats: Econ_Stats
++		econ_run_scenario(cat, 2, 12000, 42, &stats, "era2-brush")
++		econ_print_row("era2-brush", 12000, &stats)
++		if stats.episodes < 1 || stats.episodes > 8 {
++			fmt.printf("  FAIL: era-2 must brush gently (1..8 episodes, got %d)\n", stats.episodes)
++			fails += 1
++		}
++		if stats.dots_in_refusal == 0 {
++			fmt.println("  FAIL: era-2 brushes must self-resolve (a dot landed mid-shortage)")
++			fails += 1
++		}
++	}
++	// era3-slope — the bind arrives (demand growth outruns restore).
++	{
++		stats: Econ_Stats
++		econ_run_scenario(cat, 3, 24000, 42, &stats, "era3-slope")
++		econ_print_row("era3-slope", 24000, &stats)
++		// the era-3 bind is TWO-SIDED (the record: "every draw is material
++		// off the board"): tile refusals OR the piece wall — either means
++		// the box out-says the player's growth.
++		if stats.episodes < 1 && !stats.piece_starved {
++			fmt.println("  FAIL: era-3 must bind (the slope never spoke — retune the caps/clock)")
++			fails += 1
++		}
++	}
++	// crisis-stall (Q7) — a different demand shape; the clock must hold.
++	{
++		stats: Econ_Stats
++		econ_run_scenario(cat, 3, 24000, 7, &stats, "crisis-stall")
++		econ_print_row("crisis-stall", 24000, &stats)
++		if stats.interval_min < floor {
++			fmt.println("  FAIL: the interval dipped below the floor — the no-soft-lock guarantee broke")
++			fails += 1
++		}
++		if stats.interval_max > base {
++			fmt.println("  FAIL: the interval exceeded the base spine — the worst case is not known")
++			fails += 1
++		}
++		if stats.min_stock == 0 && stats.dot_count == 0 {
++			fmt.println("  FAIL: an empty box with no dots — the death spiral the floor must absorb")
++			fails += 1
++		}
++	}
++	if fails == 0 {
++		fmt.println("econ-check: all scenario verdicts hold")
++		return 0
++	}
++	fmt.printf("econ-check: %d verdict(s) FAILED — retune the era caps / clock, then re-run\n", fails)
++	return 1
++}
++
++econ_print_row :: proc(name: string, ticks: u64, stats: ^Econ_Stats) {
++	imin := stats.interval_min
++	if stats.dot_count == 0 do imin = 0
++	imax := stats.interval_max
++	fmt.printf("%-12s %6d  %5d  %5d  %8d  %8d  %8d  %4d  [%5d,%5d]     %5d    %10d  %4d  %v\n",
++		name, ticks, stats.draws_ok, stats.places_ok, stats.refusals, stats.episodes,
++		stats.first_no_tick, stats.dot_count, imin, imax,
++		stats.min_stock, stats.deliveries, stats.dots_in_refusal, stats.piece_starved)
++}
+diff --git a/harness/main.odin b/harness/main.odin
+index 86e970e..0d3205c 100644
+--- a/harness/main.odin
++++ b/harness/main.odin
+@@ -22,6 +22,8 @@ package main
+ //   odin run harness -- fold-check <prev-hash> <prev-tick1>
+ //                                               r3 N11: prove a re-bless is the catalog fold
+ //                                               alone (boot's tick-1 splice; re-runnable gate)
++//   odin run harness -- econ-check              v2-mechanics-the-box: the L5 economy calibration
++//                                               scenarios (deterministic greedy bot + clock bounds)
+ 
+ import "core:fmt"
+ import "core:strconv"
+@@ -74,6 +76,21 @@ main :: proc() {
+ 		pp.catalogs_destroy(&cat)
+ 		os.exit(int(code))
+ 	}
++	if verb == "econ-check" {
++		// v2-mechanics-the-box: the L5 calibration evidence generator (the
++		// greedy-bot scenarios + the Q7 clock bounds; deterministic).
++		if len(rest) != 0 {
++			usage()
++		}
++		cat: pp.Catalogs
++		if e := load_catalogs(&cat); e != "" {
++			fmt.eprintfln("econ-check: %s", e)
++			os.exit(2)
++		}
++		code := econ_check(&cat)
++		pp.catalogs_destroy(&cat)
++		os.exit(int(code))
++	}
+ 	if verb == "map-preview" {
+ 		// 7.4 / canon D9: render the draw fixture on an arbitrary seed's
+ 		// procedural map (the lavish-gate candidate tool). Usage:
+diff --git a/harness/parity.odin b/harness/parity.odin
+index 272c71c..9d1494a 100644
+--- a/harness/parity.odin
++++ b/harness/parity.odin
+@@ -197,6 +197,7 @@ drive_parity :: proc(cat: ^pp.Catalogs, frames: [dynamic][]inp.Device_Event, tie
+ 	ictx: inp.Input
+ 	ictx.topo = &state.topology
+ 	ictx.cat = cat
++	ictx.state = &state // the Box (v2-mechanics-the-box): the fast-path's box_apply_edit needs the owning run
+ 	ictx.view = &view
+ 	ictx.log = &state.action_log
+ 	// NOTE: sim_events stays NIL here on purpose — the wire-placed cue is an
+diff --git a/harness/run.odin b/harness/run.odin
+index ad2ed91..d6829b3 100644
+--- a/harness/run.odin
++++ b/harness/run.odin
+@@ -342,6 +342,7 @@ run_demo :: proc(name: string, save: bool, cat: ^pp.Catalogs, rc: ^Render_Ctx, s
+ 		qos_fixture = demo.qos_fixture,
+ 		growth_on = demo.growth_on, // 5.1: run setup — the director's map growth
+ 		advance_gate_on = demo.advance_gate_on, // 6.2: run setup — the era-advance gate (r1 B1: the live/bless path MUST carry the flag or the blessed goldens pin gate-off runs while the replay path — load_demo_replay — runs gate-on and diverges at the fire tick)
++		box_on = demo.box_on, // the Box (v2-mechanics-the-box): run setup — carried on BOTH paths (the r1 B1 rule)
+ 		map_source = demo.map_source, // v2-dublin-board: run setup — the named map input (dublin|procedural)
+ 		session = {goal = demo.win_goal, cap_ms = demo.lose_cap_ms, health_on = demo.health_on, surge_win_pct = demo.surge_win_pct},
+ 	}
+@@ -711,6 +712,7 @@ Demo_Replay :: struct {
+ 	pauses:      [dynamic]Pause_Event, // 5.3: the driver pause schedule (run setup)
+ 	growth_on:   bool, // 5.1: the director's map growth (run setup, like the fixture)
+ 	advance_gate_on: bool, // 6.2: the era-advance gate (run setup, like the fixture)
++	box_on:      bool, // the Box (v2-mechanics-the-box): the material economy (run setup, like the fixture)
+ 	map_source:  u8,  // v2-dublin-board: the named map input (run setup, like the seed — the replay re-creates the board from the same committed asset bytes)
+ 	session:     Session_Cfg,
+ }
+@@ -738,6 +740,12 @@ demo_apply_setup :: proc(state: ^pp.Run_State, cfg: ^Demo_Replay, cat: ^pp.Catal
+ 	apply_session(state, cfg.session, cat.balance.logic_hz)
+ 	state.growth_enabled = cfg.growth_on // 5.1: run setup — re-created identically on every replay
+ 	state.advance_gate_enabled = cfg.advance_gate_on // 6.2: run setup — re-created identically on every replay
++	// The Box (v2-mechanics-the-box): run setup, re-created identically on
++	// every replay — AFTER the era set above (the kit reads the era caps).
++	if cfg.box_on {
++		state.box_enabled = true
++		pp.box_enable(state, cat)
++	}
+ 	// v2-dublin-board: the named map input — run setup, re-created
+ 	// identically on every replay (the fixture precedent). A dublin demo
+ 	// loads the board ONCE (cached) and pins it on the state; the board's
+@@ -806,6 +814,7 @@ load_demo_replay :: proc(demo_name: string) -> Demo_Replay {
+ 	cfg.session.surge_win_pct = demo.surge_win_pct // 4.3
+ 	cfg.growth_on = demo.growth_on // 5.1: run setup — re-created identically on replay
+ 	cfg.advance_gate_on = demo.advance_gate_on // 6.2: run setup — re-created identically on replay
++	cfg.box_on = demo.box_on // the Box: run setup — re-created identically on replay
+ 	cfg.map_source = demo.map_source // v2-dublin-board: run setup — re-created identically on replay (the board re-loads from the same committed asset bytes)
+ 	delete(demo.demolishes) // r1 note: the sibling loaders leaked this too
+ 	delete(demo.emphasis)   // 3.2

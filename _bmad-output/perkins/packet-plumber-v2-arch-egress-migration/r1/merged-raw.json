@@ -1,0 +1,437 @@
+{
+ "findings": [
+  {
+   "source": [
+    "acceptance"
+   ],
+   "severity": "warning",
+   "category": "ui-overflow",
+   "title": "QoS panel per-direction depth row overflows the 300px panel plate onto the map",
+   "location": "app/qos_panel.odin:409-422",
+   "evidence": "app/qos_panel.odin:36: `QOS_PANEL_W :: 300` (plate right edge = QOS_PANEL_X 12 + 300 = 312). The new loop at 409-422: `for dir in 0..<pp.PORT_DIR_COUNT {` / `draw_text(app, dirs[dir], qdx, qd_y + 3, 14, p.ink_soft_text)` / `qdx += 30` / (3 cells) `qdx += 34` / `qdx += 10` \u2014 per direction 30+3x34+10 = 142, two directions = 284, plus the measured label `depth_label := fmt.tprintf(\"queue depth (bound %d):\", bound)` (~140-160px at 14px) + 8 \u2192 row spans ~432-452px from x=22; the \"rev\" block starts at ~322 > 312. draw path is unclipped: app/render/view.odin:1441 `rl.DrawTextEx(f, cstring(raw_data(cbuf)), {f32(x), f32(y)}, f32(size), 1, col)`. The removed single-direction row (~267px) fit inside 300.",
+   "detail": "S5 bounds render edits to \"Minimal mechanical render edits for compile/read correctness ONLY\" \u2014 the re-keyed row no longer fits its panel: the \"rev\" block draws ~130-150px past the plate onto the map, unreadable/overlapping. Goldens never capture the panel open, so the suite cannot see it.",
+   "recommended_fix": "Stack the two direction blocks on separate sub-rows (fwd line, rev line) or shrink the cell pitch so the row stays within QOS_PANEL_W=300; add a render-test pin asserting the row's right edge <= the panel rect.",
+   "_lens_file": "acceptance-app"
+  },
+  {
+   "source": [
+    "architecture"
+   ],
+   "severity": "warning",
+   "category": "layout",
+   "title": "Per-direction queue-depth row overflows the 300px QoS panel by ~130-160px \u2014 renders un-clipped over the map",
+   "location": "app/qos_panel.odin:409",
+   "evidence": "Panel width: `QOS_PANEL_W :: 300` (line 36); plate: `return {f32(rnd.hud(&app.view, QOS_PANEL_X)), ..., f32(rnd.hud(&app.view, QOS_PANEL_W)), ...}` (line 54). Row start: `qdx := QOS_PANEL_X + 10 + i32(rl.MeasureTextEx(app.view.font, cstring(raw_data(label_c)), 14, 1).x) + 8` with label `fmt.tprintf(\"queue depth (bound %d):\", bound)` (21 glyphs @ 14px \u2248 130-160px \u2192 qdx \u2248 170-200). The diff's new loop: `for dir in 0..<pp.PORT_DIR_COUNT { draw_text(app, dirs[dir], qdx, qd_y + 3, 14, p.ink_soft_text); qdx += 30; for lane in 0..<3 { ... qdx += 34 } qdx += 10 }` = 2 \u00d7 142 = 284px of columns \u2192 row ends \u2248 x 440-472 vs the plate edge at 312. Old row was 3 \u00d7 34 = 102px (ended \u2248 272-292 \u2014 inside). Every other row fits by construction: `w := (rnd.hud(&app.view, QOS_PANEL_W) - rnd.hud(&app.view, 16) - rnd.hud(&app.view, 4) * (n - 1)) / n` (line 96). No scissor/clip exists in qos_panel.odin or view.odin (grep: only world-grid clipping).",
+   "detail": "The S5 per-direction readout (this PR's own deliverable) paints its fwd tail + the entire rev group past the plate border, over live gameplay. T2 can't catch it \u2014 the row needs a selected pipe, and S5 logged zero golden drift.",
+   "recommended_fix": "Stack the two direction groups on two sub-rows inside the panel (or compact: drop the fwd/rev captions and halve the column pitch), keeping the row within QOS_PANEL_W like the preset-row math.",
+   "_lens_file": "architecture-app"
+  },
+  {
+   "source": [
+    "architecture"
+   ],
+   "severity": "note",
+   "category": "layout",
+   "title": "NOC QUEUE row label `R%d>%d` outgrew the 52px gutter the old `P%d` label fit \u2014 collides with the E-lane column once node ids hit two digits",
+   "location": "app/render/noc_overlay.odin:775",
+   "evidence": "New label: `draw_mono_c(v, fmt.tprintf(\"R%d>%d\", pr.router, pr.peer), px + 6, ty, NOC_SIZE_BODY, NOC_TXT_DIM)` at `NOC_SIZE_BODY :: 18` (line 344); first lane column starts at a fixed `bx := px + 52 + i32(lane) * 104`. The diff removed the old form `draw_mono_c(v, fmt.tprintf(\"P%d\", p.pipe), px + 6, ty, NOC_SIZE_BODY, NOC_TXT_DIM)` whose worst case (\"P123\", 4 glyphs \u2248 36-43px) fit the gutter. Node ids are append-only E11 slots: any router or peer id \u2265 10 makes the label 5-6 glyphs \u2248 45-65px at mono advance, ending past px+52 into the lane letter.",
+   "detail": "The re-key widened the row's identity label ~2\u00d7 while the lane-grid x-offsets are unchanged \u2014 on growing maps (ids \u2265 10 are routine) the label overlaps the Express lane letter/bar. Same fixed-layout-overflow class as the QoS panel row.",
+   "recommended_fix": "Widen the lane-grid offset for the QUEUE section (e.g. bx := px + 68) or render the pair label at NOC_SIZE_LABEL / compact form (\"10>20\") so the gutter holds 6 glyphs.",
+   "_lens_file": "architecture-app"
+  },
+  {
+   "source": [
+    "architecture"
+   ],
+   "severity": "warning",
+   "category": "dead-state",
+   "title": "Residency ledger maintains a `win` rolling-sum no read ever consumes \u2014 dual bookkeeping, one source of truth",
+   "location": "core/flow.odin:872",
+   "evidence": "record pass: `r.win[key] -= u64(r.ticks[slot])` ... `r.ticks[slot] += 1; r.win[key] += 1`; read (port_residency_ticks) recomputes from the slot ring and never reads win values: `sum: u64 = 0; base := int(key) * RESIDENCY_WINDOW_TICKS; for s in 0..<RESIDENCY_WINDOW_TICKS { if r.slot_tick[base + s] > lo && r.slot_tick[base + s] <= tick { sum += u64(r.ticks[base + s]) } } return sum`. Grep over core/app/harness (incl. tests): `win`'s values are only written, resized, cloned (app/render/spawn_fx.odin:227), and length-checked (`if int(key) >= len(r.win)`), never read.",
+   "detail": "Maintained-never-read state: extra work per record tick, a second (stale-inclusive) sum that can never substitute for the staleness-filtered read, and a misleading comment in port_residency_ticks that reasons about `win`. Same debt class the review swarm removed (`bundle_class_queue`).",
+   "recommended_fix": "Delete the `win` field, its layout zero pass, and the two maintenance lines in residency_record_tick; keep the slot ring as the single source (bundle_tx_window's shape).",
+   "_lens_file": "architecture-core"
+  },
+  {
+   "source": [
+    "architecture"
+   ],
+   "severity": "note",
+   "category": "dead-code",
+   "title": "Undirected helpers `newest_in_bundle_lane` and `bundle_lane_ready` lost their last callers in this diff but remain",
+   "location": "core/flow.odin:425",
+   "evidence": "Definitions remain: `newest_in_bundle_lane :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, lane: u8, exclude: []int = nil) -> int` (line 425) and `bundle_lane_ready :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32) -> (ready: [LANE_COUNT]bool)` (line 439). Repo-wide grep for call sites returns none; their former consumers were re-keyed: `shed_idx = newest_in_port_lane(state, cat, b, dir, l, drops[:])` (flow.odin:1245) and `ready := port_lane_ready(state, cat, bi, dir)` (flow.odin:1333).",
+   "detail": "Dead twins left behind by the S2/S4 re-key. Unlike `bundle_lane_count` (still the sanctioned legacy view for stats P-rows and the S1-invisibility pin), these two have zero readers in production or tests.",
+   "recommended_fix": "Delete both procs (or keep only if the render-heist legacy-view contract names them); note the removal beside the swarm's existing dead-code disclosures.",
+   "_lens_file": "architecture-core"
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "churn",
+   "title": "Unrelated em-dash-to-hyphen edit in a test message rides the egress re-key",
+   "location": "app/render/palette_polish_test.odin:crisis_desat_factor_purity",
+   "evidence": "-\ttesting.expect(t, f_after == table3[5], \"the tick after A resolves: the basis switches to B's own onset \u2014 phase 5, the DIP\")\n+\ttesting.expect(t, f_after == table3[5], \"the tick after A resolves: the basis switches to B's own onset - phase 5, the DIP\")",
+   "detail": "A message-string punctuation change in a test untouched by the egress migration, while the same diff adds em-dash-laden comments elsewhere (lint.sh: 'the LB-gate precedent \u2014 a vocabulary drift') \u2014 no convention explains it.",
+   "recommended_fix": "Revert the message to the original em dash, or state the encoding rule being enforced and apply it consistently across the tree.",
+   "_lens_file": "blind-app"
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "New link-queue vocabulary gate scans only app/ though render-path code lives in harness/ too",
+   "location": "tools/lint.sh:gate 8",
+   "evidence": "+HITS=$(grep -rnE 'link_(queue|depth|backlog|buffer|load|congest)' app/ --include='*.odin' || true)\n+if [ -n \"$HITS\" ]; then echo \"$HITS\"; echo \"FAIL: link-queue vocabulary on a render path (spine F5/AD-1)\"; FAIL=1; fi\n\n--- harness/palcheck.odin hunk in this same diff:\n \t\t// camera: both pipes on screen, bands wide enough for clean sampling\n \t\tview.scale = 2.0\n \t\tview.lane_detail = false",
+   "detail": "The gate's stated purpose is 'no link-queue vocabulary on render paths', but its scope is app/ only \u2014 harness/palcheck.odin, a render path this very diff edits (camera, view, frame sampling), escapes the check.",
+   "recommended_fix": "Extend the grep to the render surfaces that exist outside app/ (harness/ render fixtures, tools/ render checks), or narrow the gate's comment to say app/ render paths only.",
+   "_lens_file": "blind-app"
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "warning",
+   "category": "dead-code",
+   "title": "Residency ledger's win array is maintained every packet-tick but never read; the documented O(1) read does not exist",
+   "location": "core/flow.odin:Residency_State / port_residency_ticks / residency_record_tick",
+   "evidence": "// one flat ring of RESIDENCY_WINDOW_TICKS slots per key (the health-ring\n// pattern: slot holds the KEY's per-tick delta; win holds the rolling sum \u2014\n// the read is O(1)).\n\u2026\n\tsum: u64 = 0\n\tbase := int(key) * RESIDENCY_WINDOW_TICKS\n\tfor s in 0..<RESIDENCY_WINDOW_TICKS {\n\t\tif r.slot_tick[base + s] > lo && r.slot_tick[base + s] <= tick {\n\t\t\tsum += u64(r.ticks[base + s])\n\t\t}\n\t}\n\treturn sum\n\u2026\n\t\tif r.slot_tick[slot] != tick {\n\t\t\t// stale slot: fold the OLD value out of the window sum, reset\n\t\t\tr.win[key] -= u64(r.ticks[slot])",
+   "detail": "win's values are never consumed: port_residency_ticks walks W slots and touches win only via len(r.win). Every waiting packet pays fold-out/add maintenance for state nothing reads; the O(1) comment is false.",
+   "recommended_fix": "Either return the maintained r.win[key] (with staleness folded on write) or delete win and its maintenance writes; correct the read-is-O(1) comment.",
+   "_lens_file": "blind-core"
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "warning",
+   "category": "coverage-gap",
+   "title": "Warnings per-port pressure re-key with max-never-sum rollup ships with no test pin in this diff",
+   "location": "core/warnings.odin:warning_evaluate",
+   "evidence": "\t\t\t// the pipe's level = the WORSE port's pressure (both directions\n\t\t\t// ride the same fibers; max, never sum \u2014 the AV-7 rollup rule)\n\t\t\tworst := max(press[int(bs) * PORT_DIR_COUNT + int(PORT_DIR_LO_TO_HI)],\n\t\t\t             press[int(bs) * PORT_DIR_COUNT + int(PORT_DIR_HI_TO_LO)])\n\t\t\tnew = congestion_level(worst * 100 / lane_bound_units, w.pipe_amber_pct, w.pipe_red_pct)",
+   "detail": "warnings.odin re-keys pressure per (bundle, direction) and rolls up with max, yet no warnings test changes ship in this 17-file diff \u2014 a pooled-count or sum rollup regression would pass every existing (unidirectional) fixture.",
+   "recommended_fix": "Add a bidirectional-fixture pin: load both ports of one bundle unequally and assert the member pipe's level equals the worse port's ratio, never the sum.",
+   "_lens_file": "blind-core"
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "Residency layout_gen renumber-reset has no pinning test while the tx ring's identical hazard got one",
+   "location": "core/flow.odin:Residency_State.layout_gen",
+   "evidence": "\tlayout_gen: u32,           // the Topology.gen the layout was built for (a SAME-COUNT bundle renumber must reset \u2014 the B1 slot-renumbering class; review-swarm finding)",
+   "detail": "The tx ring's rebuild reset is pinned by test_bundle_tx_ring_rebuild_reset; the residency ledger's same-count-renumber reset (layout_gen) has no pin \u2014 a regression to count-only layout matching would misattribute history silently.",
+   "recommended_fix": "Add a renumber-reset pin mirroring the tx-ring test: bump topology gen at unchanged bundle/class counts and assert the residency reads zero afterward.",
+   "_lens_file": "blind-core"
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "vacuous-test",
+   "title": "Self-comparing expect_value in test_port_lane_caps_full_duplex_members asserts nothing",
+   "location": "core/egress_test.odin:test_port_lane_caps_full_duplex_members",
+   "evidence": "\t\ttesting.expect_value(t, port_lane_caps(&s, bi), port_lane_caps(&s, bi)) // stable read",
+   "detail": "A pure function is compared to itself \u2014 always equal, always green. The 'stable read' property is untested by this line; the adjacent literal assertions carry the actual coverage.",
+   "recommended_fix": "Delete the self-compare, or assert two separately-computed results against the [3]u32{0, 100, 0} literal already pinned on the next line.",
+   "_lens_file": "blind-core"
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "boundary",
+   "title": "The 4096 bandwidth_demand bound guards only one operand of the u32 demand multiply",
+   "location": "core/catalog.odin:catalogs_load + core/flow.odin:packet_demand_units",
+   "evidence": "\t\t\t// v2-arch-egress S3 (D-2 wired; review r1): the demand feeds\n\t\t\t// packet_demand_units' u32 multiply (demand x packet_bandwidth) \u2014\n\t\t\t// bound it at load so the product can never wrap (an authoring-time\n\t\t\t// silent wrap would corrupt the AD-3(c) serialization term; 4096 x\n\t\t\t// 800 = 3.3M << 2^32, and no real frame is 4096 jumbo-frames wide).\n\t\t\tif bw > 4096 {\n\u2026\n\treturn u32(demand) * u32(cat.balance.packet_bandwidth)",
+   "detail": "'the product can never wrap' binds only demand (\u22644096); packet_bandwidth \u2014 the other u32 factor \u2014 is not bounded anywhere in this diff, so a balance value above ~1.04M still wraps silently.",
+   "recommended_fix": "Bound the product at balance load: reject packet_bandwidth values for which 4096 \u00d7 packet_bandwidth would exceed u32 (or clamp-validate the product directly).",
+   "_lens_file": "blind-core"
+  },
+  {
+   "source": [
+    "blind"
+   ],
+   "severity": "note",
+   "category": "doc-drift",
+   "title": "S1 comment block claims every mechanic still reads the undirected view \u2014 the same diff re-keys them all",
+   "location": "core/flow.odin:S1 comment block above PORT_DIR_COUNT",
+   "evidence": "// S1 ships the identity + the directional read twins ONLY \u2014 every mechanic\n// (E9 admission, the serve pass, crisis/warnings/stats) still reads the\n// UNDIRECTED bundle_* view above, so the re-key is invisible in the T1 hash\n// until S2 (serve split) and S4 (bound/drop re-key) \u2014 byte-identity pinned\n// by the untouched goldens.",
+   "detail": "This diff itself re-keys E9 admission to port_lane_count, the serve pass to port_lane_ready, crisis/warnings to the port_* twins, and stats gains port rows \u2014 the comment describes an intermediate state that does not exist in the shipped tree.",
+   "recommended_fix": "Reword as history: S1 introduced the twins; S2/S4, landed in the same change, re-keyed the readers. Drop the 'until S2/S4' staging claim.",
+   "_lens_file": "blind-core"
+  },
+  {
+   "source": [
+    "codebase"
+   ],
+   "severity": "warning",
+   "category": "layout",
+   "title": "Per-direction queue-depth readout overflows the 300 px QoS panel plate",
+   "location": "app/qos_panel.odin:404-423",
+   "evidence": "QOS_PANEL_W :: 300\n...\n\t\t\tqdx := QOS_PANEL_X + 10 + i32(rl.MeasureTextEx(app.view.font, cstring(raw_data(label_c)), 14, 1).x) + 8\n\t\t\tfor dir in 0..<pp.PORT_DIR_COUNT {\n\t\t\t\tdraw_text(app, dirs[dir], qdx, qd_y + 3, 14, p.ink_soft_text)\n\t\t\t\tqdx += 30\n\t\t\t\tfor lane in 0..<3 {\n\t\t\t\t\tdepth := pp.port_lane_count(&app.state, &app.cat, bi, u8(dir), u8(lane))\n\t\t\t\t\t...\n\t\t\t\t\tdraw_text(app, depth_str, qdx, qd_y + 3, 14, col)\n\t\t\t\t\tqdx += 34\n\t\t\t\t}\n\t\t\t\tqdx += 10\n\t\t\t}",
+   "detail": "The two direction groups advance 2\u00d7(30+3\u00d734)+10 = 274 px after the ~150 px \"queue depth (bound N):\" label, ending ~454 px \u2014 ~140 px past the plate's right edge (QOS_PANEL_X 12 + QOS_PANEL_W 300 = 312). The pre-change single-direction row ended ~282 px, inside.",
+   "recommended_fix": "Fit the readout inside the plate: stack fwd/rev on two rows, or drop the per-direction label pitch (e.g. 30\u219222, 34\u219226) so 2 groups + label stay under QOS_PANEL_W-20.",
+   "_lens_file": "codebase-app"
+  },
+  {
+   "source": [
+    "codebase"
+   ],
+   "severity": "note",
+   "category": "documentation",
+   "title": "Stale pre-D-2 doc comment left stacked above the new transit_ticks doc",
+   "location": "core/units.odin:65-70",
+   "evidence": "// transit_ticks \u2014 the serialization formula (the game's own): a frame takes\n// ceil(packet_bandwidth / capacity) ticks to cross a link of the given\n// capacity. The unit model's \"frame_bits \u00f7 rate\" in game ticks. A\n// ZERO-capacity link has NO line rate (transit 0) \u2014 the honest defensive\n// semantics (Perkins r1 N1: the old cap->1 sentinel mapped a dead link to\n// ~800 Mbps, inverted).\n// transit_ticks \u2014 the AD-3(c) serialization term in ticks: how many ticks a\n// packet of `demand_units` total bandwidth needs to cross a line of",
+   "detail": "Two stacked doc comments: the first still describes the superseded uniform packet_bandwidth semantics, contradicting the D-2-wired demand_units signature directly below it.",
+   "recommended_fix": "Delete the old comment block (units.odin lines 65-70), keeping the new AD-3(c) doc as the proc's only comment.",
+   "_lens_file": "codebase-core"
+  },
+  {
+   "source": [
+    "codebase"
+   ],
+   "severity": "note",
+   "category": "documentation",
+   "title": "Test comment references deleted proc crisis_find_saturated_bundle",
+   "location": "core/crisis_test.odin:505",
+   "evidence": "// (crisis_find_saturated_bundle's slot-order scan) as the ELEMENT SELECTOR,",
+   "detail": "The S4 rename replaced crisis_find_saturated_bundle with crisis_find_saturated_port; repo-wide grep finds no definition of the old name, only this stale comment mention.",
+   "recommended_fix": "Update the comment to read crisis_find_saturated_port.",
+   "_lens_file": "codebase-core"
+  },
+  {
+   "source": [
+    "codebase"
+   ],
+   "severity": "note",
+   "category": "dead-code",
+   "title": "Undirected twins newest_in_bundle_lane and bundle_lane_ready left with zero callers",
+   "location": "core/flow.odin:425",
+   "evidence": "newest_in_bundle_lane :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32, lane: u8, exclude: []int = nil) -> int {\n...\nbundle_lane_ready :: proc(state: ^Run_State, cat: ^Catalogs, bi: u32) -> (ready: [LANE_COUNT]bool) {",
+   "detail": "After the S2/S4 re-key (port_lane_ready, newest_in_port_lane) these two have no callers anywhere \u2014 unlike siblings bundle_lane_count (stats.odin:204) and bundle_lane_caps (flow.odin:1328). Retained per the spine's legacy-view convention but currently dead.",
+   "recommended_fix": "Either remove both procs in this PR or add a comment marking them the deliberate undirected legacy view so future readers know they are intentionally caller-less.",
+   "_lens_file": "codebase-core"
+  },
+  {
+   "source": [
+    "edge"
+   ],
+   "severity": "warning",
+   "category": "boundary",
+   "title": "QoS panel per-direction queue-depth row overflows the 300-unit panel plate \u2014 the entire rev group draws off-panel with no clip",
+   "location": "app/qos_panel.odin:408-422",
+   "evidence": "app/qos_panel.odin:36: `QOS_PANEL_W :: 300`. :395: `draw_text(app, depth_label, QOS_PANEL_X + 10, qd_y + 3, 14, p.ink_soft_text)`. :408-422: `qdx := QOS_PANEL_X + 10 + i32(rl.MeasureTextEx(app.view.font, cstring(raw_data(label_c)), 14, 1).x) + 8 / for dir in 0..<pp.PORT_DIR_COUNT { / draw_text(app, dirs[dir], qdx, qd_y + 3, 14, p.ink_soft_text) / qdx += 30 / ... qdx += 34 (per cell, x3) ... / qdx += 10 / }`",
+   "detail": "Two direction groups consume 2\u00d7(30+3\u00d734+10)=284 units after the ~140px label from x=22 \u2014 content runs to \u2248450 vs the plate's right edge at X+W=312. The rev label and all three rev cells draw past the plate onto the map; no scissor clip exists (no BeginScissorMode in app/).",
+   "recommended_fix": "Halve the pitch (dir label 20, cell 24-26) and shorten the label, or stack fwd/rev on two rows \u2014 keep the row within QOS_PANEL_W.",
+   "_lens_file": "edge-app"
+  },
+  {
+   "source": [
+    "edge"
+   ],
+   "severity": "note",
+   "category": "boundary",
+   "title": "NOC queue row's fixed 46px label column can't hold R<router>><peer> once node ids reach two digits \u2014 label overlaps the E-lane column",
+   "location": "app/render/noc_overlay.odin:780,783",
+   "evidence": "app/render/noc_overlay.odin:780: `draw_mono_c(v, fmt.tprintf(\"R%d>%d\", pr.router, pr.peer), px + 6, ty, NOC_SIZE_BODY, NOC_TXT_DIM)`. :783: `bx := px + 52 + i32(lane) * 104`. :344: `NOC_SIZE_BODY  :: 18 // body/counters`",
+   "detail": "Node ids are unbounded monotonic (E11); \"R12>29\" is 7 mono glyphs at 18px (\u224868-76px) into a 46px column (px+6..px+52), colliding with the E-lane letter. Two-digit ids are the normal mid-game state; the old \"P%d\" (3-4 glyphs) fit.",
+   "recommended_fix": "Move the lane columns right (bx := px + 64 or 72), or compact the label (drop the peer to a dir arrow: R<router><dir>).",
+   "_lens_file": "edge-app"
+  },
+  {
+   "source": [
+    "edge"
+   ],
+   "severity": "warning",
+   "category": "boundary",
+   "title": "packet_demand_units u32 wrap guard bounds bandwidth_demand only \u2014 packet_bandwidth (the other operand) is validated >0 with no upper bound",
+   "location": "core/flow.odin:601 + core/catalog.odin:631-635,863-866",
+   "evidence": "core/flow.odin:601: `return u32(demand) * u32(cat.balance.packet_bandwidth)`. core/catalog.odin:630-635: `// ... bound it at load so the product can never wrap (an authoring-time // silent wrap would corrupt the AD-3(c) serialization term; 4096 x // 800 = 3.3M << 2^32, and no real frame is 4096 jumbo-frames wide). if bw > 4096 { return {\"packet_types.json\", pt.id, \"bandwidth_demand must be 1..4096 (the u32 demand-total bound)\"} }`. core/catalog.odin:863-866: `b.packet_bandwidth = jint(obj, \"packet_bandwidth\", 30) if b.packet_bandwidth <= 0 { return {\"balance.json\", \"packet_bandwidth\", \"must be > 0 ...\"} }`",
+   "detail": "A catalog passing all validation (demand 4096, packet_bandwidth 1048576 \u2014 only `<= 0` is rejected) wraps the u32 product; at exactly 2^32 it wraps to 0, serve_bundle_lane's need=0 skips the packet forever \u2014 never served, never dropped.",
+   "recommended_fix": "Complete the guard at load: reject packet_bandwidth > 2^32/4096 (1048576), or widen the multiply to u64 in packet_demand_units (and transit_ticks' demand_units+capacity-1 addition).",
+   "_lens_file": "edge-core"
+  },
+  {
+   "source": [
+    "security"
+   ],
+   "severity": "note",
+   "category": "boundary",
+   "title": "Demand-wrap guard bounds only one multiplicand: packet_bandwidth has no upper bound at catalog load",
+   "location": "core/catalog.odin:863-866 (paired with core/flow.odin:601 and core/catalog.odin:629-636)",
+   "evidence": "core/catalog.odin:629-636:\n\t\t\t// v2-arch-egress S3 (D-2 wired; review r1): the demand feeds\n\t\t\t// packet_demand_units' u32 multiply (demand x packet_bandwidth) \u2014\n\t\t\t// bound it at load so the product can never wrap (an authoring-time\n\t\t\t// silent wrap would corrupt the AD-3(c) serialization term; 4096 x\n\t\t\t// 800 = 3.3M << 2^32, and no real frame is 4096 jumbo-frames wide).\n\t\t\tif bw > 4096 {\n\t\t\t\treturn {\"packet_types.json\", pt.id, \"bandwidth_demand must be 1..4096 (the u32 demand-total bound)\"}\n\t\t\t}\n\ncore/catalog.odin:863-866 (the other multiplicand, no upper bound):\n\tb.packet_bandwidth = jint(obj, \"packet_bandwidth\", 30)\n\tif b.packet_bandwidth <= 0 {\n\t\treturn {\"balance.json\", \"packet_bandwidth\", \"must be > 0 (the per-edge packet service demand \u2014 the pace knob)\"}\n\t}\n\ncore/flow.odin:601 (the guarded multiply):\n\treturn u32(demand) * u32(cat.balance.packet_bandwidth)",
+   "detail": "The new bound closes the u32 wrap for the demand factor only. packet_bandwidth >= 2^32/4096 = 1,048,576 still silently wraps the product, corrupting the serialization term the comment claims can never wrap.",
+   "recommended_fix": "Validate the product jointly at load: bound packet_bandwidth (e.g. <= 1,048,575) or fail-fast when max_class_demand x packet_bandwidth would exceed u32 max.",
+   "_lens_file": "security-core"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "QoS panel per-direction depth readout (fwd/rev columns) has no automated coverage \u2014 no unit test, not in any golden capture",
+   "location": "app/qos_panel.odin:409-422",
+   "evidence": "for dir in 0..<pp.PORT_DIR_COUNT {\n\t\t\t\tdraw_text(app, dirs[dir], qdx, qd_y + 3, 14, p.ink_soft_text)\n\t\t\t\tqdx += 30\n\t\t\t\tfor lane in 0..<3 {\n\t\t\t\t\tdepth := pp.port_lane_count(&app.state, &app.cat, bi, u8(dir), u8(lane)) \u2014 app/qos_panel_test.odin covers only nudge geometry: '// qos_panel_test.odin \u2014 the QoS manual-editor scaled-geometry pin (Perkins r3 // blocker 4d: B2's fix \u2014 values derived from the scaled nudge rects \u2014 had no // automated pin)'; grep of harness/*.odin for qos_panel: zero matches (never captured).",
+   "detail": "S5's T2 disclosure says zero golden drift \u2014 panels are off in captures. Reading the wrong direction, or column overflow at UI scales (the r3 precedent class), passes every gate. Core read itself is pinned.",
+   "recommended_fix": "Add a geometry test for the depth row (six columns + two dir labels fit the panel at every UI_SCALE_STEPS), mirroring the nudge-rect pin.",
+   "_lens_file": "tests-app"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "NOC QUEUE row draw re-key (R<router>><peer> label, per-port lanes) untested \u2014 only the noc_queue_rows predicate has a test",
+   "location": "app/render/noc_overlay.odin:771-811",
+   "evidence": "draw_mono_c(v, fmt.tprintf(\"R%d>%d\", pr.router, pr.peer), px + 6, ty, NOC_SIZE_BODY, NOC_TXT_DIM) \u2014 the only ports-based test pins the predicate alone (noc_overlay_test.odin:318-322): append(&sr.ports, pp.Stats_Port_Row{router = 1, peer = 2, q = {0, 0, 0}, util_pct = 69}) ... testing.expect_value(t, noc_queue_rows(&sr, 70), i32(2)); the draw loop and label format have no test, and the overlay-check verb is PP_DEBUG-only (harness/main.odin:257 'the verb stays a PP_DEBUG harness tool').",
+   "detail": "The row re-key is draw-only and outside the gating suite; a regression (wrong router/peer mapping, lane bars reading the wrong port) passes lint, odin test app/render, and T1/T2.",
+   "recommended_fix": "Extract the row-label/mapping into a pure proc (stats.ports row -> label string) and pin it; or add the QUEUE section to a PP_DEBUG overlay-check sidecar and re-bless it.",
+   "_lens_file": "tests-app"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "test-hardening",
+   "title": "Lint gate 8 (link-queue vocabulary) deviates from its cited LB-gate precedent: Ada_Case names bypass, comments false-positive, no negative self-test",
+   "location": "tools/lint.sh:111",
+   "evidence": "HITS=$(grep -rnE 'link_(queue|depth|backlog|buffer|load|congest)' app/ --include='*.odin' || true) \u2014 vs the precedent at lines 35/39: LB_PAT='pick_pipe|lb_mode|lb_weighted|node_lb_weighted|Lb_Mode|load[ _-]?balanc|round[ _-]?robin' and _found=$(sed 's://.*::' \"$_f\" | grep -nE \"$LB_PAT\" ...). Verified empirically: 'Link_Queue_Depth' gets 0 matches from the gate-8 regex (bypass); a comment '// no link_queue concept (spine)' matches (no comment stripping); gates 7/7b carry python self-tests, gate 8 has none.",
+   "detail": "The gate works for snake_case drift (verified: link_queue_depth matches) but a future Link_Queue type or a spine-quoting comment bends it either way; gates 7/7b set the self-test bar this gate skips.",
+   "recommended_fix": "Match the LB-gate shape: strip comments (sed), add Link_ variants (Ada_Case), and add a one-line negative self-test asserting the pattern catches a known-bad string.",
+   "_lens_file": "tests-app"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-gate",
+   "title": "Advisory test gate: PASS",
+   "location": "N/A",
+   "evidence": "N/A",
+   "detail": "In-scope behavior (spine AD-7: this job ships READS, not look) fully covered: predicate re-key (noc_overlay_test:318-322), shadow_clone S5 arrays (spawn_fx_test round-trip hash + dual run_destroy), progress-frac wiring (core pin + S3's 43 T2 re-blesses), palcheck/palette re-pins. P0 100%, P1 100%, overall \u226580%.",
+   "recommended_fix": "Three P3 notes above are pre-heist hardening: the depth-row geometry pin, a NOC row-label pin, and gate-8 self-test \u2014 fold into the link-vocab render heists.",
+   "_lens_file": "tests-app"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "warning",
+   "category": "coverage-gap",
+   "title": "New catalog bound bandwidth_demand 1..4096 has no rejection test (the bw > 4096 branch is never exercised)",
+   "location": "core/catalog.odin:634-636",
+   "evidence": "if bw > 4096 {\n\t\t\t\treturn {\"packet_types.json\", pt.id, \"bandwidth_demand must be 1..4096 (the u32 demand-total bound)\"}\n\t\t\t} \u2014 catalog_test.odin's invalid-rows table covers only the lower bound: {\"bandwidth zero\", replace1(PKT_VALID, `\"bandwidth_demand\": 1`, `\"bandwidth_demand\": 0`, 1), \"latency_tol_ms/max_loss_pct/bandwidth_demand invalid\"}, and contains no row with bandwidth_demand > 4096 (grep for 4096/4097 in catalog_test.odin: no matches).",
+   "detail": "The S3 load-time wrap guard (the u32 demand-total bound) is new validation with NONE coverage of its rejection branch; the repo's own convention pins every catalog bound (cf. the 'lane 256 wraps' rows).",
+   "recommended_fix": "Add a pkt_rows reject row: replace1(PKT_VALID, \"bandwidth_demand\": 1, \"bandwidth_demand\": 4097) expecting 'bandwidth_demand must be 1..4096'.",
+   "_lens_file": "tests-core"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "warning",
+   "category": "coverage-gap",
+   "title": "Warnings port re-key (S4/F3) never tested with bidirectional load \u2014 the max-vs-pooled-sum divergence is unpinned",
+   "location": "core/warnings.odin:238-240",
+   "evidence": "worst := max(press[int(bs) * PORT_DIR_COUNT + int(PORT_DIR_LO_TO_HI)],\n\t\t             press[int(bs) * PORT_DIR_COUNT + int(PORT_DIR_HI_TO_LO)]) \u2014 both covering fixtures are unidirectional: warnings_test.odin:169-171 `for k in u64(1)..=6 { sla_spawn(&s, 1, 0, res, host)` (test_pipe_congestion_lane_bound) and warnings_test.odin:376-377 `for k in u64(1)..=6 { sla_spawn(&s, 1, 0, res, host) // 6 packets, one lane, at the E9 bound` (test_pipe_congestion_multi_member_bundle).",
+   "detail": "All res\u2192host spawns ride dir 0 only; reverting worst to the pooled sum (press_lo + press_hi) passes the suite unchanged. The AV-7/F3 max-never-sum convention is untested at its only divergent point.",
+   "recommended_fix": "Add a test splitting the 6-packet load across both directions (e.g. 5 forward + 5 reverse): assert NO Pipe_Critical (pooled sum would read 10/6 \u2192 red).",
+   "_lens_file": "tests-core"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "warning",
+   "category": "coverage-gap",
+   "title": "Residency ledger layout reset on Topology.gen (same-count renumber) has no regression test",
+   "location": "core/flow.odin:809-811",
+   "evidence": "if f.residency.keys == keys && f.residency.classes == classes && f.residency.layout_gen == topo_gen {\n\t\treturn\n\t} \u2014 grep over core/*_test.odin for residency_layout/layout_gen: zero matches; egress_test.odin's only port_residency_ticks reads are lines 538 and 558, neither steps a topology edit after recording.",
+   "detail": "The review-swarm fix for the same-count renumber leak (120 phantom ticks, PR body) ships with no pin; deleting the layout_gen check fails no test. The tx-ring analog HAS test_bundle_tx_ring_rebuild_reset.",
+   "recommended_fix": "Mirror the tx-ring reset test: record residency, redraw/demolish to renumber bundles at same count, assert port_residency_ticks reads 0 and slot_tick zeroed.",
+   "_lens_file": "tests-core"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "warning",
+   "category": "coverage-gap",
+   "title": "Stats pipe-row AV-4 form (util MAX over directions, tx_octets \u03a3) measured only with the reverse direction unserved \u2014 a sum-util implementation passes",
+   "location": "core/stats_test.odin:170-174",
+   "evidence": "// D-2 (v2-arch-egress S3) re-pin: streaming's doubled demand stretches\n\t\t\t// the forward port's serializations \u2014 the reverse port (250 units at\n\t\t\t// S2) has not yet served by tick 24, so the window is the forward\n\t\t\t// 1150 units alone -> 2156 octets; util stays 9 (the per-direction\n\t\t\t// denominator form \u2014 the forward port reads 1150\u00d7100/(240\u00d750) = 9).\n\t\t\ttesting.expect_value(t, p.util_pct, u32(9)) \u2014 against stats.odin:233 row.util_pct = max(u_lo, u_hi) and stats.odin:229 row.tx_octets = served_to_octets(w_lo + w_hi, u32(bw)).",
+   "detail": "The fixture is bidirectional but at the single read point w_hi=0, so util_pct = u_lo+u_hi and tx_octets = forward-only both pass. The ratified AV-4 max-never-\u03a3 convention is mutation-indistinguishable at its only test.",
+   "recommended_fix": "Step the congested fixture past the reverse port's first serves (or assert at two ticks): pin util = max (never \u03a3 \u2192 \u2264100) and tx_octets = \u03a3 of both windows.",
+   "_lens_file": "tests-core"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "port_util_pct pinned only pre-traffic (0) \u2014 the AV-4 'saturated reads 100, never 200' denominator pin is absent",
+   "location": "core/egress_test.odin:591-593",
+   "evidence": "// port_util_pct: the per-direction denominator (a saturated port reads\n\t// 100, never 200 for the pair \u2014 AV-4); pre-traffic reads 0\n\ttesting.expect_value(t, port_util_pct(&s, s.tick, 0, PORT_DIR_LO_TO_HI), u32(0)) \u2014 the sole port_util_pct assertion in the suite (grep: one match).",
+   "detail": "The comment names the AV-4 pin but the assertion only covers the zero path; util_pct_window's clamp is tested in units_test but not through the per-direction read.",
+   "recommended_fix": "After the full-duplex drain fixture (both directions ~100% for a window), assert port_util_pct == 100 for each direction \u2014 never a pair-summed 200.",
+   "_lens_file": "tests-core"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "note",
+   "category": "coverage-gap",
+   "title": "port_residency_ticks staleness-fold read path (idle key reads 0 after window expiry) untested",
+   "location": "core/flow.odin:906-910",
+   "evidence": "for s in 0..<RESIDENCY_WINDOW_TICKS {\n\t\tif r.slot_tick[base + s] > lo && r.slot_tick[base + s] <= tick {\n\t\t\tsum += u64(r.ticks[base + s])\n\t\t}\n\t} \u2014 egress_test.odin reads at lines 538/558 immediately after recording (ticks \u2264 ~21, window 240); no test reads past expiry, unlike the tx-ring's test_bundle_tx_window_expiry_and_reuse.",
+   "detail": "The hunter-fold fix ('residency staleness folds at READ time \u2014 idle keys read 0', PR body) has no regression pin; a frozen-win regression would fail no test.",
+   "recommended_fix": "Mirror the tx-ring expiry test: accumulate residency, advance > RESIDENCY_WINDOW_TICKS idle ticks, assert the key reads 0 (stale slots excluded at read).",
+   "_lens_file": "tests-core"
+  },
+  {
+   "source": [
+    "tests"
+   ],
+   "severity": "warning",
+   "category": "coverage-gate",
+   "title": "Advisory test gate: CONCERNS",
+   "location": "N/A",
+   "evidence": "N/A",
+   "detail": "P0 100% (S1-S5 mutation legs + re-pins all verified present and biting); P1 \u224885% (AV-4 util form, F3 warnings directional, catalog bound branch unpinned at divergence); overall \u224882%. Reads-contract conventions carry the shortfall.",
+   "recommended_fix": "Add the four warning-level tests (catalog 4097 row, bidirectional warnings split, residency layout-reset mirror, stats \u03a3/MAX at two read points) to lift P1 \u226590% \u2192 PASS.",
+   "_lens_file": "tests-core"
+  }
+ ],
+ "rejected": [
+  {
+   "finding": {
+    "source": "architecture",
+    "severity": "note",
+    "category": "verification-hazard",
+    "title": "Review worktree carries an un-restored PERKINS-MUTATION-S3 \u2014 tree diverges from reviewed sha 1e9c783",
+    "location": "core/flow.odin:597",
+    "evidence": "Working tree (mtime 22:03, after tests-core.json 22:02): `demand := i32(1) // PERKINS-MUTATION-S3: demand unwired (uniform 1x)`. Reviewed sha / diff-core.patch: `demand := i32(1)` followed by `if int(class) < len(cat.packet_types) && cat.packet_types[class].bandwidth_demand > 0 { demand = cat.packet_types[class].bandwidth_demand }`. `git diff` shows exactly this one hunk.",
+    "detail": "A mutation-leg leftover (not a defect of the reviewed diff): any later lens running `odin test core` in this worktree sees the S3 RED (streaming-transit pin fails) and could file false suite-red findings against a green head.",
+    "recommended_fix": "Restore `core/flow.odin` to HEAD blob 998560b (`git checkout -- core/flow.odin`) before dispatching the remaining lenses; no code change to the PR itself.",
+    "_lens_file": "architecture-core"
+   },
+   "reason": "timing artifact - the lens read flow.odin during the round's own S3 mutation window; the final tree is clean (git status empty, suite green, mutation restored)"
+  }
+ ],
+ "failed_layers": []
+}

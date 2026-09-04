@@ -1,0 +1,327 @@
+diff --git a/app/render/spawn_fx.odin b/app/render/spawn_fx.odin
+index 566c9ba..f50532c 100644
+--- a/app/render/spawn_fx.odin
++++ b/app/render/spawn_fx.odin
+@@ -247,6 +247,17 @@ shadow_clone :: proc(src: ^pp.Run_State, allocator := context.allocator) -> pp.R
+ 	c.era_gate.win_dropped = clone_dyn(g.win_dropped, allocator)
+ 	c.era_gate.prev_delivered = clone_dyn(g.prev_delivered, allocator)
+ 	c.era_gate.prev_dropped = clone_dyn(g.prev_dropped, allocator)
++	bx := &src.box
++	c.box.pieces = clone_dyn(bx.pieces, allocator)
++	c.box.spools = clone_dyn(bx.spools, allocator)
++	// ^ THE 2026-08-28 PLAYTEST ABORT (job packet-plumber-v2-box-crash-third-
++	// spawn): the Box (#107) shipped without these two lines — the clone's box
++	// headers aliased the live buffers, the shadow's run_destroy freed them
++	// (predict #1), and the next mid-window connection re-predicted → double
++	// free → libmalloc "pointer being freed was not allocated" SIGABRT. The
++	// box-OFF fixtures above hid it (nil headers delete harmlessly). The gate:
++	// test_spawn_fx_shadow_clone_box_owns_every_array (every owned array
++	// pinned) + test_spawn_fx_predict_box_economy_leg (the playtest leg).
+ 	return clone
+ }
+ 
+@@ -310,6 +321,7 @@ spawn_fx_predict :: proc(v: ^View, state: ^pp.Run_State, cat: ^pp.Catalogs, tick
+ 			}
+ 		}
+ 		pp.step(&shadow, tt, batch[:], cat)
++		delete(batch) // per-tick scratch; temp-allocator frees are no-ops today, but the delete keeps this correct under a tracked allocator (review r1: an earlier comment misclaimed the leak report saw this)
+ 	}
+ 	if shadow.topology.next_node_id > nodes_before {
+ 		// exactly one spawn per window by construction (the growth branch
+diff --git a/app/render/spawn_fx_test.odin b/app/render/spawn_fx_test.odin
+index 45b5393..abb5d97 100644
+--- a/app/render/spawn_fx_test.odin
++++ b/app/render/spawn_fx_test.odin
+@@ -108,6 +108,292 @@ sfx_hash :: proc(s: ^pp.Run_State, cat: ^pp.Catalogs) -> u64 {
+ 	return pp.state_hash(s, {}, cat, context.temp_allocator)
+ }
+ 
++// --- THE BOX SHADOW ALIAS GATE (the 2026-08-28 playtest abort) --------------
++//
++// User playtest SIGABRT (.ips app.bin-2026-08-28-211134/211400, libmalloc
++// "pointer being freed was not allocated" from Odin runtime::_heap_free) on
++// the third spawn-building connection: shadow_clone's hand-maintained array
++// list MISSED the Box arrays (#107) — the clone's box headers aliased the
++// LIVE state's buffers, run_destroy(&shadow) freed them out from under the
++// live sim (predict #1), and the next prediction (each connection bumps
++// topology.gen → re-predict) double-freed the same block → abort. The
++// box-OFF fixtures above hide the class: nil headers delete harmlessly.
++// These two tests make the whole class CI-visible: (1) every owned dynamic
++// array in a clone must be a PRIVATE buffer, with the box ENABLED (the nil
++// trap), and (2) the economy leg — ≥5 spawn windows crossed with
++// place/promote/teardown/resplice + a forced re-predict per connection (the
++// app's live pattern) — which pre-fix aborts exactly like the playtest.
++
++// sfx_no_alias — one field's private-buffer pin (empty headers may be nil on
++// both sides — nothing aliased, delete no-ops; skip them).
++sfx_no_alias :: proc(t: ^testing.T, a, b: [dynamic]$T, ctx, name: string) {
++	if len(a) == 0 {
++		return
++	}
++	testing.expectf(t, raw_data(a) != raw_data(b),
++		"%s: clone.%s aliases the LIVE state's buffer (shadow_clone missed-field class: the shadow's run_destroy frees live memory; the next predict double-frees, the 2026-08-28 playtest SIGABRT)",
++		ctx, name)
++}
++
++@(test)
++test_spawn_fx_shadow_clone_box_owns_every_array :: proc(t: ^testing.T) {
++	cat: pp.Catalogs
++	sfx_load_cat(&cat, context.temp_allocator)
++	defer pp.catalogs_destroy(&cat)
++
++	s: pp.Run_State
++	pp.run_init(&s, 42, cat.hash, cat.balance.logic_hz)
++	defer pp.run_destroy(&s)
++	sfx_fixture(&s, &cat)
++	s.era = 3 // the full kit era: pieces + fiber spools non-empty (the nil trap)
++	pp.box_enable(&s, &cat)
++	for tick in u64(1) ..= 65 {
++		pp.step(&s, tick, {}, &cat)
++	}
++
++	clone := shadow_clone(&s, context.temp_allocator)
++	defer pp.run_destroy(&clone)
++
++	// THE GATE: every step()-touched owned dynamic array is a private buffer.
++	// One line per array run_destroy frees — a NEW Run_State dynamic array
++	// must add (a) its clone line in shadow_clone AND (b) its pin line here.
++	ctx := "box-clone"
++	sfx_no_alias(t, clone.topology.node_alive, s.topology.node_alive, ctx, "topology.node_alive")
++	sfx_no_alias(t, clone.topology.node_id, s.topology.node_id, ctx, "topology.node_id")
++	sfx_no_alias(t, clone.topology.node_kind, s.topology.node_kind, ctx, "topology.node_kind")
++	sfx_no_alias(t, clone.topology.node_role, s.topology.node_role, ctx, "topology.node_role")
++	sfx_no_alias(t, clone.topology.node_type, s.topology.node_type, ctx, "topology.node_type")
++	sfx_no_alias(t, clone.topology.node_pos, s.topology.node_pos, ctx, "topology.node_pos")
++	sfx_no_alias(t, clone.topology.pipe_alive, s.topology.pipe_alive, ctx, "topology.pipe_alive")
++	sfx_no_alias(t, clone.topology.pipe_id, s.topology.pipe_id, ctx, "topology.pipe_id")
++	sfx_no_alias(t, clone.topology.pipe_a, s.topology.pipe_a, ctx, "topology.pipe_a")
++	sfx_no_alias(t, clone.topology.pipe_b, s.topology.pipe_b, ctx, "topology.pipe_b")
++	sfx_no_alias(t, clone.topology.pipe_tier, s.topology.pipe_tier, ctx, "topology.pipe_tier")
++	sfx_no_alias(t, clone.topology.pipe_span, s.topology.pipe_span, ctx, "topology.pipe_span")
++	sfx_no_alias(t, clone.topology.pipe_weights, s.topology.pipe_weights, ctx, "topology.pipe_weights")
++	sfx_no_alias(t, clone.topology.pipe_lane_over, s.topology.pipe_lane_over, ctx, "topology.pipe_lane_over")
++	sfx_no_alias(t, clone.routing.hop_offset, s.routing.hop_offset, ctx, "routing.hop_offset")
++	sfx_no_alias(t, clone.routing.hop_count, s.routing.hop_count, ctx, "routing.hop_count")
++	sfx_no_alias(t, clone.routing.hops, s.routing.hops, ctx, "routing.hops")
++	sfx_no_alias(t, clone.bundles.pipe_bundle, s.bundles.pipe_bundle, ctx, "bundles.pipe_bundle")
++	sfx_no_alias(t, clone.bundles.bundle_lo, s.bundles.bundle_lo, ctx, "bundles.bundle_lo")
++	sfx_no_alias(t, clone.bundles.bundle_hi, s.bundles.bundle_hi, ctx, "bundles.bundle_hi")
++	sfx_no_alias(t, clone.bundles.bundle_cap, s.bundles.bundle_cap, ctx, "bundles.bundle_cap")
++	sfx_no_alias(t, clone.bundles.bundle_count, s.bundles.bundle_count, ctx, "bundles.bundle_count")
++	sfx_no_alias(t, clone.bundles.bundle_tier, s.bundles.bundle_tier, ctx, "bundles.bundle_tier")
++	sfx_no_alias(t, clone.bundles.tx_slot_tick, s.bundles.tx_slot_tick, ctx, "bundles.tx_slot_tick")
++	sfx_no_alias(t, clone.bundles.tx_served, s.bundles.tx_served, ctx, "bundles.tx_served")
++	sfx_no_alias(t, clone.flow.packets, s.flow.packets, ctx, "flow.packets")
++	sfx_no_alias(t, clone.flow.demand, s.flow.demand, ctx, "flow.demand")
++	sfx_no_alias(t, clone.flow.sla, s.flow.sla, ctx, "flow.sla")
++	sfx_no_alias(t, clone.flow.sla_breach, s.flow.sla_breach, ctx, "flow.sla_breach")
++	sfx_no_alias(t, clone.flow.lane_caps, s.flow.lane_caps, ctx, "flow.lane_caps")
++	sfx_no_alias(t, clone.flow.spawn_credit_milli, s.flow.spawn_credit_milli, ctx, "flow.spawn_credit_milli")
++	sfx_no_alias(t, clone.flow.drop_sites, s.flow.drop_sites, ctx, "flow.drop_sites")
++	sfx_no_alias(t, clone.flow.serviced_this_tick, s.flow.serviced_this_tick, ctx, "flow.serviced_this_tick")
++	sfx_no_alias(t, clone.flow.residency.slot_tick, s.flow.residency.slot_tick, ctx, "flow.residency.slot_tick")
++	sfx_no_alias(t, clone.flow.residency.ticks, s.flow.residency.ticks, ctx, "flow.residency.ticks")
++	sfx_no_alias(t, clone.crisis.node_congestion, s.crisis.node_congestion, ctx, "crisis.node_congestion")
++	sfx_no_alias(t, clone.crisis.pipe_congestion, s.crisis.pipe_congestion, ctx, "crisis.pipe_congestion")
++	sfx_no_alias(t, clone.crisis.forecast, s.crisis.forecast, ctx, "crisis.forecast")
++	sfx_no_alias(t, clone.crisis.active, s.crisis.active, ctx, "crisis.active")
++	sfx_no_alias(t, clone.crisis.cooldowns, s.crisis.cooldowns, ctx, "crisis.cooldowns")
++	sfx_no_alias(t, clone.crisis.node_health, s.crisis.node_health, ctx, "crisis.node_health")
++	sfx_no_alias(t, clone.health.breach, s.health.breach, ctx, "health.breach")
++	sfx_no_alias(t, clone.health.grace, s.health.grace, ctx, "health.grace")
++	sfx_no_alias(t, clone.health.prev_delivered, s.health.prev_delivered, ctx, "health.prev_delivered")
++	sfx_no_alias(t, clone.health.prev_dropped, s.health.prev_dropped, ctx, "health.prev_dropped")
++	sfx_no_alias(t, clone.health.prev_latency, s.health.prev_latency, ctx, "health.prev_latency")
++	sfx_no_alias(t, clone.health.win_delivered, s.health.win_delivered, ctx, "health.win_delivered")
++	sfx_no_alias(t, clone.health.win_dropped, s.health.win_dropped, ctx, "health.win_dropped")
++	sfx_no_alias(t, clone.health.win_latency, s.health.win_latency, ctx, "health.win_latency")
++	sfx_no_alias(t, clone.health.ring, s.health.ring, ctx, "health.ring")
++	sfx_no_alias(t, clone.era_gate.ring, s.era_gate.ring, ctx, "era_gate.ring")
++	sfx_no_alias(t, clone.era_gate.win_delivered, s.era_gate.win_delivered, ctx, "era_gate.win_delivered")
++	sfx_no_alias(t, clone.era_gate.win_dropped, s.era_gate.win_dropped, ctx, "era_gate.win_dropped")
++	sfx_no_alias(t, clone.era_gate.prev_delivered, s.era_gate.prev_delivered, ctx, "era_gate.prev_delivered")
++	sfx_no_alias(t, clone.era_gate.prev_dropped, s.era_gate.prev_dropped, ctx, "era_gate.prev_dropped")
++	sfx_no_alias(t, clone.box.pieces, s.box.pieces, ctx, "box.pieces") // THE 2026-08-28 MISS
++	sfx_no_alias(t, clone.box.spools, s.box.spools, ctx, "box.spools") // THE 2026-08-28 MISS
++	// action_log/events are ZEROED in the clone by design (shadow_clone's
++	// contract) — asserted nil here so a future regression to aliasing (or a
++	// copy) of them is caught too.
++	testing.expect(t, raw_data(clone.action_log) == nil || len(clone.action_log) == 0, "clone.action_log must stay zeroed")
++	testing.expect(t, raw_data(clone.events) == nil || len(clone.events) == 0, "clone.events must stay zeroed")
++
++	// box-ON round trip: with the stock cloned, clone+step stays hash-identical
++	// (the box section rides the T1 hash when enabled — a missed box field
++	// drifts the telegraph exactly like the arrays above).
++	piece_ok := len(clone.box.pieces) == len(s.box.pieces)
++	testing.expectf(t, piece_ok, "clone box pieces must mirror the live shape")
++	pp.step(&s, 66, {}, &cat)
++	pp.step(&clone, 66, {}, &cat)
++	testing.expectf(t, sfx_hash(&clone, &cat) == sfx_hash(&s, &cat),
++		"box-ON clone+step must stay hash-identical to the live sim (a missed box field drifts the telegraph)")
++	testing.expect(t, !clone.replay_error, "the shadow must not latch replay_error")
++}
++
++// sfx_count_new_spawns — NODE_SPAWNED events in s.events[from:] (events
++// accumulate until the app drains — core never clears).
++sfx_count_new_spawns :: proc(s: ^pp.Run_State, from: int) -> u32 {
++	n: u32 = 0
++	for e in s.events[from:] {
++		if e.tag == pp.EVENT_TAG_NODE_SPAWNED {
++			n += 1
++		}
++	}
++	return n
++}
++
++// sfx_find_place_spot — the first valid placement spot on a fixed probe ring
++// around the fixture router (deterministic; no rng). Sentinel {-1,-1} when
++// nothing validates — placement_valid refuses the negative grid coordinate,
++// so the caller's apply assert fails loudly (review r1: {0,0} could
++// silently validate).
++sfx_find_place_spot :: proc(s: ^pp.Run_State, cat: ^pp.Catalogs, type_idx: u16) -> [2]i32 {
++	deltas := [][2]i32{{4, 0}, {-4, 0}, {0, 4}, {0, -4}, {5, 5}, {-5, 5}, {5, -5}, {-5, -5}, {6, 0}, {0, 6}, {-6, 0}, {0, -6}, {7, 3}, {-7, -3}, {3, 7}, {-3, -7}, {8, 0}, {0, 8}, {-8, 0}, {0, -8}, {9, 4}, {-9, -4}, {4, 9}, {-4, -9}, {10, 0}, {0, 10}, {-10, 0}, {0, -10}}
++	for d in deltas {
++		pos := [2]i32{12 + d[0], 10 + d[1]}
++		c := pp.Cmd_Place_Router{type_idx = type_idx, pos = pos}
++		if pp.box_check_place(s, c, cat) == .None {
++			return pos
++		}
++	}
++	return {-1, -1}
++}
++
++// sfx_connect_newest — a valid standard-tier draw from the newest spawned
++// terminal to the first junction that prices (the "connect the spawn
++// building" action the user was performing). Returns tier = 0xffff when no
++// pair validates (the caller's apply assert fails loudly).
++sfx_connect_newest :: proc(s: ^pp.Run_State, cat: ^pp.Catalogs) -> pp.Cmd_Draw_Pipe {
++	newest := s.topology.next_node_id - 1
++	for i in 0 ..< len(s.topology.node_alive) {
++		if !s.topology.node_alive[i] || s.topology.node_kind[i] != .Junction {
++			continue
++		}
++		c := pp.Cmd_Draw_Pipe{a = s.topology.node_id[i], b = newest, tier = 0}
++		if pp.box_check_draw(s, c, cat) == .None {
++			return c
++		}
++	}
++	return {a = 0, b = 0, tier = 0xffff}
++}
++
++@(test)
++test_spawn_fx_predict_box_economy_leg :: proc(t: ^testing.T) {
++	// The playtest repro as a gate: FIVE spawn windows, each crossed with a
++	// Box economy edit (place / connect / resplice / teardown / promote) and a
++	// FORCED telegraph re-predict per connection (the app's live pattern —
++	// every edit bumps topology.gen and main.odin re-predicts mid-window).
++	// Pre-fix, predict #1's shadow destroy frees the live Box buffers and
++	// predict #2 double-frees them: this leg ABORTS with the .ips signature.
++	cat: pp.Catalogs
++	sfx_load_cat(&cat, context.temp_allocator)
++	defer pp.catalogs_destroy(&cat)
++	interval := u64(cat.balance.terminal_spawn_interval_ticks)
++
++	s: pp.Run_State
++	pp.run_init(&s, 42, cat.hash, cat.balance.logic_hz)
++	defer pp.run_destroy(&s)
++	sfx_fixture(&s, &cat)
++	s.era = 3 // router_mid/high pieces + fiber spool: the full promote/resplice kit
++	pp.box_enable(&s, &cat)
++
++	v: View
++	v.catalogs = &cat
++
++	mid, _ := pp.node_type_index(&cat, "router_mid")
++	spawns: u32 = 0
++	t_prev := u64(0)
++	for w in u64(1) ..= 5 {
++		base := interval * w
++		lead := base - 5 // inside the 10-tick telegraph lead, like the playtest
++		for tick in t_prev + 1 ..= lead {
++			mark := len(s.events)
++			pp.step(&s, tick, {}, &cat)
++			spawns += sfx_count_new_spawns(&s, mark)
++		}
++		t_prev = lead
++
++		apply :: proc(t: ^testing.T, s: ^pp.Run_State, cat: ^pp.Catalogs, w: u64, kind: pp.Command_Kind) {
++			_, e := pp.box_apply_edit(s, pp.Command{apply_tick = 0, kind = kind}, cat)
++			testing.expectf(t, e == .None, "w%d economy edit refused: %v (the leg requires every edit to apply)", w, e)
++		}
++
++		// w1 PLACE a mid router; w2 CONNECT the newest spawn; w3 RESPLICE it to
++		// mid (fiber drains, standard refunds); w4 TEARDOWN that pipe (full
++		// refund); w5 PROMOTE: demolish the w1 router (piece + incident tiles
++		// refund) — the demolish+place promotion cycle's expensive half.
++		switch w {
++		case 1:
++			pos := sfx_find_place_spot(&s, &cat, mid)
++			apply(t, &s, &cat, w, pp.Cmd_Place_Router{type_idx = mid, pos = pos})
++		case 2:
++			draw := sfx_connect_newest(&s, &cat)
++			apply(t, &s, &cat, w, draw)
++		case 3:
++			pipe := s.topology.pipe_id[len(s.topology.pipe_id) - 1]
++			apply(t, &s, &cat, w, pp.Cmd_Set_Pipe_Tier{pipe = pipe, tier = 1})
++		case 4:
++			pipe := s.topology.pipe_id[len(s.topology.pipe_id) - 1]
++			apply(t, &s, &cat, w, pp.Cmd_Demolish_Pipe{pipe = pipe})
++		case 5:
++			// the highest PLACED junction id (monotonic ids; the fixture's id 1
++			// and 3 are junctions too — place went higher)
++			placed: u32 = 0
++			for i in 0 ..< len(s.topology.node_alive) {
++				if s.topology.node_alive[i] && s.topology.node_kind[i] == .Junction {
++					placed = max(placed, s.topology.node_id[i])
++				}
++			}
++			apply(t, &s, &cat, w, pp.Cmd_Demolish_Node{node = placed})
++		case:
++		}
++
++		// the re-predict the app fires on every mid-window connection
++		spawn_fx_predict(&v, &s, &cat, lead, {}, true)
++		// the leg's own teeth: the re-predict must leave the live Box buffers
++		// OWNED. Pre-fix, predict #1's shadow destroy already freed them — this
++		// pin fails deterministically here (the app's default heap aborts on the
++		// same state: the next predict double-frees — the .ips signature).
++		probe := shadow_clone(&s, context.temp_allocator)
++		sfx_no_alias(t, probe.box.pieces, s.box.pieces, "economy-leg", "box.pieces")
++		sfx_no_alias(t, probe.box.spools, s.box.spools, "economy-leg", "box.spools")
++		pp.run_destroy(&probe)
++		testing.expectf(t, v.spawn_fx.telegraph_valid, "w%d: lead tick %d is inside the telegraph window, a telegraph must be live", w, lead)
++		testing.expectf(t, v.spawn_fx.telegraph.spawn_tick == base, "w%d: telegraph window %d, want %d", w, v.spawn_fx.telegraph.spawn_tick, base)
++
++		// stock sanity after the shadow touched the run: every counter within
++		// [0, era cap] (a corrupted/aliased buffer shows up as heap garbage —
++		// the deterministic alias gate above is the exact pin; this is the net)
++		row, ok := pp.era_row(&cat, s.era)
++		testing.expect(t, ok, "era 3 must have a catalog row")
++		for i in 0 ..< len(s.box.pieces) {
++			cap := u32(0)
++			if i < len(row.box_pieces) {
++				cap = row.box_pieces[i]
++			}
++			testing.expectf(t, s.box.pieces[i] <= cap, "w%d: pieces[%d] = %d over cap %d (aliased/corrupted box stock)", w, i, s.box.pieces[i], cap)
++		}
++		for i in 0 ..< len(s.box.spools) {
++			cap := u32(0)
++			if i < len(row.box_spools) {
++				cap = row.box_spools[i]
++			}
++			testing.expectf(t, s.box.spools[i] <= cap, "w%d: spools[%d] = %d over cap %d (aliased/corrupted box stock)", w, i, s.box.spools[i], cap)
++		}
++	}
++	// finish the run through the last window so the real spawns land
++	for tick in t_prev + 1 ..= interval * 5 {
++		mark := len(s.events)
++		pp.step(&s, tick, {}, &cat)
++		spawns += sfx_count_new_spawns(&s, mark)
++	}
++	testing.expectf(t, spawns >= 5, "the leg must cross >= 5 spawn windows: got %d", spawns)
++	testing.expect(t, !s.replay_error, "the economy leg must stay replay-clean")
++}
++
+ @(test)
+ test_spawn_fx_shadow_clone_round_trips :: proc(t: ^testing.T) {
+ 	cat: pp.Catalogs

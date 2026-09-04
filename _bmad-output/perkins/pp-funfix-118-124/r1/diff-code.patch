@@ -1,0 +1,737 @@
+diff --git a/_bmad-output/implementation-artifacts/spec-packet-plumber-funfix-118-124.md b/_bmad-output/implementation-artifacts/spec-packet-plumber-funfix-118-124.md
+new file mode 100644
+index 0000000..5130626
+--- /dev/null
++++ b/_bmad-output/implementation-artifacts/spec-packet-plumber-funfix-118-124.md
+@@ -0,0 +1,91 @@
++---
++title: 'pp-funfix-118-124 — kill the era-3 death clock, give the meter a way back'
++type: 'feature'
++created: '2026-09-01'
++status: 'in-progress'
++baseline_commit: '61ea014de2726ceabf46c015ebd0e6a4254e837a'
++review_loop_iteration: 0
++context: ['project-context.md']
++---
++
++<frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
++
++## Intent
++
++**Problem:** (#118) era-3's arrival starts an unwinnable death clock — the playtest squad measured every strategy run dead 16.7–28.4 s after the era flip (first meter dip 41.9–42.6 s, dead 46.8–47.5 s), before the marquee surge even opens at 60 s; the drain evidence (first dip → death ≈ 5.0 s at ~1%/tick) pins the killer as the EMAIL grace expiring (breached since era 2 on a grown standard mesh), with streaming's clock right behind it. (#124) the meter heals only when NO class is breach-latched — in observed play it is a one-way drain: any post-grace breach empties it in 2.5–5 s.
++
++**Approach:** Pure balance + one small mechanic, per the issues' "tunables, not a rewrite". #118: extend BOTH classes' `health_grace_ticks` 400 → 900 (45 s — covers the fiber-sprint window; the fiber spool only exists from era 3's box grant, so pre-arrival conversion is impossible — the grace IS the counterplay window). #124: add the issue's streak-gated meter refill — after `meter_refill_streak_ticks` (200) ticks with NO active drain, the meter refills at `meter_refill_per_tick` (1%/tick) even while classes remain breach-latched-in-grace; the existing all-clear recharge is untouched.
++
++## Boundaries & Constraints
++
++**Always:** integer-only sim math (ODN-10); balance numbers single-sourced in data/*.json (ODN-5); breach thresholds, drain rates, drain cap, grace-refill guard, tolerances, win condition (surge 90) all UNCHANGED — a never-converting player still dies (post-grace drain → empty → Run_Lost); new behavior pinned by core tests with measured tick values (never guessed); golden shifts re-blessed only via the sanctioned rlsw pipeline (`harness save` + `harness input-parity save` + replay gate + `tools/ci-local.sh --mac`).
++
++**Ask First:** if the survivable golden cannot be produced with grace 900 + prompt wide conversion (i.e. the arrival is still unsurvivable), HALT — that means the ramp lever (issue option 1) is also needed and the scope grows.
++
++**Never:** no new systems (no repair action, no Box-economy coupling — the issue's smaller proposal wins); no demand-volume or credit-gate changes; no SLA tolerance/exit-margin moves; no serialization/LOG_VERSION changes (the streak scratch is derived, never serialized); no lose-state softening beyond the grace window (post-grace drain stays lethal — #115 must not regress); do not touch #119's era-forecast surface (separate issue).
++
++## I/O & Edge-Case Matrix
++
++| Scenario | Input / State | Expected Output / Behavior | Error Handling |
++|----------|--------------|---------------------------|----------------|
++| Prepared ride (#118) | era-2 mesh, gate fires era 3 @30 s, wide conversion within ~5 s | breach may latch but exits within the 900-tick grace — zero drain ticks; run survives into the surge window | N/A |
++| Ignored arrival | era-3 breach, no conversion | first drain at breach+900 ticks (≈45 s later than today), then the unchanged 2–5 s drain to Run_Lost | E17 unchanged |
++| Streak refill (#124) | classes breach-latched-in-grace, no post-grace drain for 200 ticks | meter +1%/tick (Meter_Changed emits), capped at 100 | N/A |
++| Active drain | any class post-grace breached | refill blocked; streak reset to 0 every drain tick; drain semantics byte-identical to today | E16 unchanged |
++| All-clear | no class breached | existing recharge_pct_per_tick path, unchanged | N/A |
++| Health disabled | `health on` absent | meter inert; new streak never gates anything observable | back-compat |
++| Catalog | missing new balance keys | fail-fast load error (jint -1 sentinel pattern) | loader rejects |
++
++</frozen-after-approval>
++
++## Code Map
++
++- `core/health.odin` -- the meter: drain (E16), grace lifecycle (E30), recharge branch (the `else if !any_breach` arm — extend here); file header documents the contract — update it.
++- `core/types.odin:361` -- `Health_State`; add `no_drain_streak: u32` next to `prev_in_surge` (derived scratch — never serialized, not in the T1 hash, like prev_*).
++- `core/catalog.odin:372,1104,1125` -- `Health_Balance` struct + fail-fast parse/validate; add `meter_refill_per_tick` (>= 1) + `meter_refill_streak_ticks` (>= 1) mirroring the grace_refill pair.
++- `data/balance.json` -- `health` block: the two new knobs + `_comment` update (rationale: the #124 issue proposal, integer-grid adaptation).
++- `data/packet_types.json` -- both entries `health_grace_ticks` 400 → 900 + `_comment` update (rationale: the modernize-sprint window; fiber spool is era-3-gated).
++- `core/health_test.odin` -- the durable pins; grace-dependent exact-tick pins re-derive from measured runs; NEW test pins the streak refill (heals in-grace, blocked by active drain, streak reset).
++- `demos/health_win.dem`, `demos/health_lose.dem` -- the story-4.3 goldens: lose timings shift (grace 900), win is catalog-hash-only; refresh the lose captures to the measured ticks.
++- `demos/era3_surge_survivable.dem` (NEW) -- the #118 golden: era 2 start + `advance gate on` + `box on` + `health on` + `win surge 90`, gate fires era 3 @30 s, `modernize` the trunks wide at ~30.5 s, captures show the arrival ridden (meter 100) + the surge carried.
++- `demos/health_recover.dem` (NEW) -- the #124 golden: narrow-path saturation → Grace_Expired → meter mid-drain → demolish+wide-fan fix → breach exits → meter refills to 100; capture the trough and the full recovery.
++- `tools/harness.sh` -- `run | save | replay`; the rlsw re-bless entry point.
++- `harness/stats.odin` -- the stats stream (evidence for the tuning table); `--stats-out` per-tick CSVs.
++- `_pr_body_pace.md` -- the prior balance-change PR: the re-bless ritual + tuning-table format to mirror.
++
++## Tasks & Acceptance
++
++**Execution:**
++- [x] `data/packet_types.json` + `data/balance.json` -- the tuning move (both graces 900; two new health knobs) + comments -- the whole fix is these four numbers plus the refill mechanic.
++- [x] `core/types.odin` + `core/catalog.odin` -- the streak scratch field + the two validated knobs -- ODN-5/ODN-10 compliance.
++- [x] `core/health.odin` -- streak update in the drain/recharge branch + the in-grace refill arm + header docs -- the #124 mechanic.
++- [x] `core/health_test.odin` -- re-pin grace-shifted tests from measured runs + the new streak-refill test -- acceptance = durable tests, not PR prose.
++- [x] `demos/era3_surge_survivable.dem` + `demos/health_recover.dem` -- author, run, READ the stats, write the measured-number headers, bless -- the acceptance goldens.
++- [x] `demos/health_lose.dem` (+ any other shifted captures) -- re-time captures to measured ticks -- honest goldens.
++- [x] full corpus re-bless -- `tools/harness.sh save` + `harness input-parity save` + replay verify + `tools/ci-local.sh --mac` -- sanctioned rlsw pipeline.
++- [x] repro the death clock pre/post on a fun-run-shaped mesh with `--stats-out` -- the tuning table's before/after numbers.
++
++**Acceptance Criteria:**
++- Given the era-3 arrival on a prepared (promptly-modernized) mesh, when the gate fires era 3, then zero drain ticks occur and the run carries the surge with meter > 0 (the era3_surge_survivable golden).
++- Given a run whose meter has drained below 100, when the network stops actively draining for 200+ ticks, then the meter refills at 1%/tick and the health_recover golden shows trough → full recovery.
++- Given a never-converting player, when the grace expires with the breach live, then Run_Lost still fires on the unchanged drain (tension preserved; #115 not regressed).
++- Given the whole corpus re-blessed, when `tools/harness.sh run` + `odin test core` + `tools/ci-local.sh --mac` run, then all green.
++
++## Design Notes
++
++The evidence re-derivation that shaped the fix (carry to the PR): first dip 41.9–42.6 s with era 3 at 30.1 s means the latched class breached ~12 s BEFORE the flip — email, in era 2 (500‰ legacy decay on a grown standard mesh pushes the windowed avg latency over 2000 ms); 5.0 s of 1%/tick drain to death = email's severity, alone (streaming's grace ran to ~50.2 s, never reached). So a streaming-only grace extension (the issue's literal example) would NOT have saved the observed runs — both classes need the sprint window. Streaming keeps its own 900 for its era-3 clock (its breach latches at the flip; 45 s covers conversion + the 200-tick window slide).
++
++Streak semantics: `no_drain_streak` counts ticks where the E16 drain computed 0 (both in the breach-in-grace case and the all-clear case); ANY drain tick resets it to 0. The new refill arm fires only when `!any_breach` is false (the all-clear arm keeps the existing faster path) AND the streak >= `meter_refill_streak_ticks` AND meter < 100. The issue suggested 0.25%/tick; the integer grid (ODN-10 + the u8 Meter_Changed payload) admits 1%/tick — document the adaptation in the PR (recovery remains 4× slower than death's max drain, and only while no drain is active).
++
++Tension preservation (#115): the lose state's reach is UNCHANGED in structure — neglect through the (now 45 s) grace still ends in the unchanged 2–5 s terminal drain; refill requires zero active drain for 10 s, unreachable while dying; win condition untouched. The #115 complaint (lose unreachable in short/no-service play) lives in paths this job never touches.
++
++## Verification
++
++**Commands:**
++- `odin test core` -- expected: all green (298 + the new pins).
++- `tools/harness.sh run` -- expected: 52/52 green (50 + the two new demos).
++- `tools/ci-local.sh --mac` -- expected: green.
++- `./bin/harness run <demo> --stats-out /tmp/x.csv` -- expected: the measured tick numbers cited in demo headers + the PR tuning table.
++
++**Manual checks:**
++- The PR tuning table: before/after rows for both graces + the two new knobs, with measured first-drain/death ticks and the survivable golden's margin to the surge.
+diff --git a/_pr_body_funfix.md b/_pr_body_funfix.md
+new file mode 100644
+index 0000000..427f7a4
+--- /dev/null
++++ b/_pr_body_funfix.md
+@@ -0,0 +1,67 @@
++## Fix the two fun-killers: the era-3 death clock (#118) + the one-way meter (#124)
++
++Closes #118, closes #124.
++
++The 2026-08-31 playtest squad (fun/stress/neweyes, build `61ea014`) measured **8/8 strategy runs dead before the surge opened** — fun at 3.5/10 against a 7+ substrate. Both findings share one loop: era-3's arrival latches a breach the grace can't cover, and once a breach goes post-grace the meter is a 2.5–5 s countdown with no way back.
++
++## Which knob moved for #118
++
++**`health_grace_ticks` 400 → 900 (20 s → 45 s) for BOTH MVP classes** (packet_types.json) — the issue's option 2 ("extend grace to cover a realistic modernize sprint").
++
++The evidence re-derivation that picked the classes (carried from the spec): first dip 41.9–42.6 s with era 3 at 30.1 s means the fatal breach entered ~12 s BEFORE the flip — **email**, scarred in era 2 on a grown standard mesh (5.0 s of 1%/tick drain to death = email's severity alone; streaming's own grace ran to ~50.2 s, never reached). A streaming-only extension would NOT have saved the observed runs. Both classes get the sprint window: wide fiber only exists from era 3's Box grant (the pre-arrival conversion is economically impossible — the squad's diagnostic), and conversion + the 200-tick measurement-window slide needs ~45 s.
++
++## Which mechanic landed for #124
++
++**The meter's streak refill** — the issue's own proposal, two new balance.json knobs:
++
++- `meter_refill_streak_ticks: 200` — after this many ticks with **no active E16 drain**, the meter refills…
++- `meter_refill_per_tick: 1` — …+1%/tick toward 100, **even while classes remain breach-latched-in-grace**.
++
++The fight-back window: a scarred meter heals while the player fixes the cause inside the grace. An **actively draining meter never refills** (a drain tick resets the streak — the death spiral is byte-identical to before); the all-clear recharge branch (1%/tick) is unchanged. The issue suggested 0.25%/tick; the integer grid (ODN-10 + the u8 `Meter_Changed` payload) admits 1 whole-%/tick — refill only ever runs when drain is 0, so recovery can never outpace damage. New `Health_State.no_drain_streak` is derived scratch (never serialized, not in the T1 — replay re-steps it identically).
++
++## Tuning table (before/after, measured — never guessed)
++
++| number | before | after | measured effect (repro: era-2 gate mesh, seed 2026) |
++|---|---|---|---|
++| `health_grace_ticks` (email) | 400 (20 s) | **900 (45 s)** | era-2 scar no longer converts into a pre-surge death clock |
++| `health_grace_ticks` (streaming) | 400 (20 s) | **900 (45 s)** | the arrival shock's countdown covers the fiber sprint + window slide |
++| `meter_refill_per_tick` | — (no path) | **1** | scarred meter heals +1%/tick once no drain is active (health_recover: trough 40 → 100) |
++| `meter_refill_streak_ticks` | — (no path) | **200** | 10 s of no-active-drain before healing starts |
++| unprepared death tick (repro) | meter 0 @ 57.0 s (dip 52.5 s) | **meter 0 @ 82.0 s (dip 77.5 s)** | same unchanged E16/E17 drain — the window moved, the teeth didn't |
++| prepared build, era-3 arrival | dead pre-surge (squad: 8/8 runs) | **meter 100 throughout; surge carried at 100% uptime; Run_Won @ 150 s** | era3_surge_survivable.dem |
++| squad's observed runs (61ea014) | dip 41.9–42.6 s, dead 46.8–47.5 s | — | the before-column of record (hotter mesh than the repro) |
++
++## New goldens
++
++- **`era3_surge_survivable.dem`** — the acceptance golden: the advance gate fires era 3 at 30 s, the player spends era 3's Box grant on an immediate 13-leg wide sprint (30.6 s), the ×10 surge opens at 60 s and is carried whole (streaming lat ~320–460 ms vs the 1200 ms tolerance, 0 drops, 100% window uptime), **Run_Won at 150 s** — the win the squad could never reach.
++- **`health_recover.dem`** — the one-way meter could never tell this story: the unprepared shape drains from 49.2 s, the player fights back mid-drain, the meter troughs at **40**, and heals to **100 by 53.65 s** — one run, drain → fight → heal.
++- **`health_lose.dem`** re-timed to the measured ticks (breach ~84 — the D-2 first-delivery lag, expiry ~984, meter 0 @ ~1033); the lose frame is the same mechanism, honestly re-captured.
++- Full corpus re-blessed via the sanctioned rlsw pipeline (`harness save` + `harness input-parity save`): every shift is caused by (a) the catalog_hash fold (the new knob values + comments) and (b) the intentional grace-timing shift. Replay gate: every blessed log re-sims bit-for-bit. `tools/harness.sh run` 52/52 green; `harness input-parity` 27 green.
++
++## Lose-state tension is preserved (#115 does not regress)
++
++The lose state's structure is untouched, and this PR was scoped against #115 from the start:
++
++1. **The drain is byte-identical**: breach thresholds, hysteresis margins, per-class severities, the 2/tick cap, and E17's Run_Lost are unchanged. A never-converting player still dies on the unchanged 2–5 s drain — measured: the unprepared repro post-fix dies at 82 s (pre-fix: 57 s). The clock moved later; the teeth did not soften.
++2. **Refill cannot coexist with damage**: it requires 200 consecutive ticks with zero active drain. A dying network never qualifies (every drain tick resets the streak) — pinned by `test_health_meter_refill_blocked_by_drain`.
++3. **The win condition is untouched** (`win surge 90`), and the grace extension applies only to the recoverable countdown, not to any post-grace path.
++4. #115's shape (the meter never leaving 100 in short/no-demand play) lives in paths this change never touches — E24's no-demand neutrality is pinned and passing.
++
++Durable pins: `test_health_meter_refill_streak_in_grace`, `test_health_meter_refill_blocked_by_drain` (new), the #124 fail-fast catalog rows, plus the re-blessed goldens. `odin test core` 300/300; `tools/ci-local.sh --mac` 13/13 gates.
++
++## Decisions & rationale
++
++- **Both classes extended, not just streaming** — the observed killer was email's era-2 scar (see the re-derivation above); a streaming-only move would have shipped a fix that doesn't fix the measured deaths.
++- **Streak-refill over a repair action or Box coupling** — the issue's smallest-Change proposal; no new systems, no new event classes, no serialization changes (LOG_VERSION untouched). The u8 `Meter_Changed` payload is unchanged, so replay/serialization contracts hold as-is.
++- **1%/tick instead of the issue's 0.25%/tick** — the integer grid (ODN-10) has no 0.25; 1 whole-%/tick gated on 200 no-drain ticks keeps the issue's shape (slow, delayed, damage-blocked) without breaking ODN-10 or the event payload.
++- **Rejected: ramping era-3 credit rate (the issue's option 1)** — it touches demand volume/score/win economics for every system downstream; the grace window achieves survivability with one number per class. Revisit only if playtest shows the sprint alone can't save a hot mesh (the briefing's Ask-First tripwire — not needed: the golden rides with margin).
++- **Rejected: touching `drain_cap_pct_per_tick` or severities** — the 2.5–5 s post-grace death IS the tension; softening it risks the #115 overcorrection the briefing forbids.
++- **Scratch repro demos deliberately not committed** (the fun squad's sandbox rule — unblessed strategy demos would pollute the corpus); their measured numbers live in the tuning table and `/tmp` stats streams are regenerable from the demo descriptions.
++
++## Verification
++
++- `odin test core` — 300/300 (298 + 2 new #124 pins + 2 new fail-fast rows inside the catalog pin)
++- `tools/harness.sh run` — 52/52 (50 prior + 2 new goldens)
++- `harness input-parity` — 27 scenarios green
++- `tools/ci-local.sh --mac` — 13/13 gates green
++- Stats-stream evidence: `/tmp/funrepro_{before,after}.csv`, `/tmp/surv.csv`, `/tmp/recover2.csv` (regenerable via `--stats-out` from the committed demos)
+diff --git a/core/catalog.odin b/core/catalog.odin
+index 0bc3ad4..eade9eb 100644
+--- a/core/catalog.odin
++++ b/core/catalog.odin
+@@ -378,6 +378,11 @@ Warning_Balance :: struct {
+ // grace_refill_per_tick + grace_refill_streak_ticks are the never-lose guard
+ // (a recovered class's grace refills gradually, only after a sustained
+ // healthy streak — consecutive breach episodes burn the shared countdown).
++// meter_refill_per_tick + meter_refill_streak_ticks (pp-funfix-118-124, #124)
++// are the METER's own recovery path: after streak_ticks ticks with NO active
++// E16 drain, the meter refills +per_tick toward 100 even while classes sit
++// breach-latched-in-grace (the fight-back window); an actively draining
++// meter never refills (the death spiral stays a death spiral).
+ Health_Balance :: struct {
+ 	window_ticks:            i32, // rolling window in ticks (>= 1, <= 10000)
+ 	exit_margin_pct:         i32, // loss exit hysteresis: exit at <= max_loss_pct - this
+@@ -387,6 +392,8 @@ Health_Balance :: struct {
+ 	win_uptime_pct:          i32, // the surge-survival win threshold (1..100)
+ 	grace_refill_per_tick:   i32, // gradual grace re-arm per healthy tick past the streak gate (>= 1)
+ 	grace_refill_streak_ticks: i32, // healthy ticks before the refill starts (>= 1)
++	meter_refill_per_tick:   i32, // #124: meter refill per no-drain tick past the streak gate (>= 1)
++	meter_refill_streak_ticks: i32, // #124: no-active-drain ticks before the meter refill starts (>= 1)
+ }
+ 
+ // Advance_Balance — the 6.2 era-advance gate tunables (balance.json `advance`
+@@ -1106,6 +1113,8 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 			b.health.win_uptime_pct = jint(hobj, "win_uptime_pct", -1)
+ 			b.health.grace_refill_per_tick = jint(hobj, "grace_refill_per_tick", -1)
+ 			b.health.grace_refill_streak_ticks = jint(hobj, "grace_refill_streak_ticks", -1)
++			b.health.meter_refill_per_tick = jint(hobj, "meter_refill_per_tick", -1)
++			b.health.meter_refill_streak_ticks = jint(hobj, "meter_refill_streak_ticks", -1)
+ 		}
+ 		if b.health.window_ticks < 1 || b.health.window_ticks > 10000 {
+ 			return {"balance.json", "health.window_ticks", "must be 1..10000 with all keys present (the rolling window; the ring is classes x window)"}
+@@ -1125,6 +1134,9 @@ catalogs_load :: proc(cat: ^Catalogs, src: ^Catalog_Sources, allocator := contex
+ 		if b.health.grace_refill_per_tick < 1 || b.health.grace_refill_streak_ticks < 1 {
+ 			return {"balance.json", "health.grace_refill_per_tick/grace_refill_streak_ticks", "must be >= 1 (the gradual-refill never-lose guard)"}
+ 		}
++		if b.health.meter_refill_per_tick < 1 || b.health.meter_refill_streak_ticks < 1 {
++			return {"balance.json", "health.meter_refill_per_tick/meter_refill_streak_ticks", "must be >= 1 with all keys present (the #124 meter refill — a 0 rate or window would make the recovery path dead code)"}
++		}
+ 		// 6.2: the era-advance gate block (GDD M4 — the modernization gate's
+ 		// tunables). Fail-fast like its siblings: a MISSING key defaults to -1
+ 		// (a partial block is a load error, never a silent zero-window/silent
+diff --git a/core/catalog_test.odin b/core/catalog_test.odin
+index 5924705..32f48e8 100644
+--- a/core/catalog_test.odin
++++ b/core/catalog_test.odin
+@@ -79,7 +79,9 @@ BAL_VALID :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "packet_b
+     "recharge_pct_per_tick": 1,
+     "win_uptime_pct": 90,
+     "grace_refill_per_tick": 5,
+-    "grace_refill_streak_ticks": 50
++    "grace_refill_streak_ticks": 50,
++    "meter_refill_per_tick": 1,
++    "meter_refill_streak_ticks": 200
+   },
+   "box": {
+     "dot_interval_ticks": 2400,
+@@ -151,7 +153,9 @@ BAL_NO_PRESETS :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "pac
+     "recharge_pct_per_tick": 1,
+     "win_uptime_pct": 90,
+     "grace_refill_per_tick": 5,
+-    "grace_refill_streak_ticks": 50
++    "grace_refill_streak_ticks": 50,
++    "meter_refill_per_tick": 1,
++    "meter_refill_streak_ticks": 200
+   },
+   "box": {
+     "dot_interval_ticks": 2400,
+@@ -213,7 +217,9 @@ BAL_EMPTY_PRESETS :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "
+     "recharge_pct_per_tick": 1,
+     "win_uptime_pct": 90,
+     "grace_refill_per_tick": 5,
+-    "grace_refill_streak_ticks": 50
++    "grace_refill_streak_ticks": 50,
++    "meter_refill_per_tick": 1,
++    "meter_refill_streak_ticks": 200
+   },
+   "box": {
+     "dot_interval_ticks": 2400,
+@@ -276,7 +282,9 @@ BAL_BAD_PRESET_ID :: `{"logic_hz": 20, "max_ticks": 100000, "snap_radius": 36, "
+     "recharge_pct_per_tick": 1,
+     "win_uptime_pct": 90,
+     "grace_refill_per_tick": 5,
+-    "grace_refill_streak_ticks": 50
++    "grace_refill_streak_ticks": 50,
++    "meter_refill_per_tick": 1,
++    "meter_refill_streak_ticks": 200
+   },
+   "box": {
+     "dot_interval_ticks": 2400,
+@@ -715,6 +723,9 @@ test_catalogs_load_failfast :: proc(t: ^testing.T) {
+ 		{"win pct 101", replace1(BAL_VALID, `"win_uptime_pct": 90`, `"win_uptime_pct": 101`, 1), "must be 1..100 (the surge-survival win threshold)"},
+ 		{"refill zero", replace1(BAL_VALID, `"grace_refill_per_tick": 5`, `"grace_refill_per_tick": 0`, 1), "must be >= 1 (the gradual-refill never-lose guard)"},
+ 		{"streak missing", replace1(BAL_VALID, `"grace_refill_streak_ticks": 50`, `"x": 1`, 1), "must be >= 1 (the gradual-refill never-lose guard)"},
++		// pp-funfix-118-124 #124: the meter refill pair is fail-fast too
++		{"meter refill zero", replace1(BAL_VALID, `"meter_refill_per_tick": 1`, `"meter_refill_per_tick": 0`, 1), "must be >= 1 with all keys present (the #124 meter refill"},
++		{"meter streak missing", replace1(BAL_VALID, `"meter_refill_streak_ticks": 200`, `"x": 1`, 1), "must be >= 1 with all keys present (the #124 meter refill"},
+ 	}
+ 	for r in health_rows {
+ 		check_reject_bal(t, r.doc, r.rule)
+diff --git a/core/determinism_test.odin b/core/determinism_test.odin
+index 3b41d53..35ac736 100644
+--- a/core/determinism_test.odin
++++ b/core/determinism_test.odin
+@@ -128,11 +128,15 @@ test_catalog :: proc(cat: ^Catalogs, allocator := context.allocator) -> ^Catalog
+ 	}
+ 	// 4.3: the Network Health numbers (mirrors data/balance.json `health`) —
+ 	// the window must be non-zero or every tick's ring index divides by zero.
++	// pp-funfix-118-124 #124: the meter refill pair mirrors data/balance.json
++	// (the unit tests MUST carry the real values — a zeroed streak would make
++	// the meter's recovery path dead code under test).
+ 	cat.balance.health = Health_Balance{
+ 		window_ticks = 200, exit_margin_pct = 3, exit_margin_ms = 160,
+ 		drain_cap_pct_per_tick = 2, recharge_pct_per_tick = 1,
+ 		win_uptime_pct = 90, grace_refill_per_tick = 5,
+ 		grace_refill_streak_ticks = 50,
++		meter_refill_per_tick = 1, meter_refill_streak_ticks = 200,
+ 	}
+ 	// 6.2: the era-advance gate numbers (mirrors data/balance.json `advance`) —
+ 	// the milestone window must be non-zero (the gate ring divides by it) and
+diff --git a/core/health.odin b/core/health.odin
+index d8bf02e..3f3f29e 100644
+--- a/core/health.odin
++++ b/core/health.odin
+@@ -43,6 +43,16 @@ package core
+ // cannot empty faster than 100/cap ticks). Recharge: when NO class is
+ // breached, +recharge_pct_per_tick toward 100.
+ //
++// Meter refill (#124, pp-funfix-118-124): the meter's OWN recovery path for
++// the fight-back window — after meter_refill_streak_ticks ticks with NO
++// active drain (breach-in-grace episodes do NOT block it; only post-grace
++// draining does), the meter heals +meter_refill_per_tick per tick toward 100
++// EVEN while classes remain breach-latched-in-grace. An actively draining
++// meter NEVER refills (the death spiral is untouched — a drain tick resets
++// the streak), and the all-clear recharge branch above is unchanged (it
++// stays the faster full-health path). The no_drain_streak is derived scratch
++// (never serialized, not in the T1 — replay re-steps it identically).
++//
+ // Empty → Run_Lost (E17): on the drain tick that would empty the meter,
+ // health_update emits Run_Lost (tag 3), latches terminal/outcome, and emits
+ // NO Grace_Expired/Meter_Changed that tick (`run_lost` supersedes
+@@ -327,6 +337,7 @@ health_update :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 	}
+ 
+ 	if drain > 0 {
++		h.no_drain_streak = 0 // the streak counts NO-drain ticks — a drain tick resets it
+ 		if h.meter_pct <= drain {
+ 			// E17 — the meter emptied: Run_Lost supersedes everything this
+ 			// tick (no Grace_Expired, no Meter_Changed — `run_lost` supersedes
+@@ -343,15 +354,33 @@ health_update :: proc(state: ^Run_State, tick: u64, cat: ^Catalogs) {
+ 			}
+ 			event_emit_meter(state, tick, h.meter_pct)
+ 		}
+-	} else if !any_breach && h.meter_pct < 100 {
+-		// recharge: every class healthy
+-		recharge := u32(bal.recharge_pct_per_tick)
+-		if h.meter_pct + recharge > 100 {
+-			h.meter_pct = 100
+-		} else {
+-			h.meter_pct += recharge
++	} else {
++		h.no_drain_streak += 1
++		if !any_breach && h.meter_pct < 100 {
++			// recharge: every class healthy (the original fast path — unchanged)
++			recharge := u32(bal.recharge_pct_per_tick)
++			if h.meter_pct + recharge > 100 {
++				h.meter_pct = 100
++			} else {
++				h.meter_pct += recharge
++			}
++			event_emit_meter(state, tick, h.meter_pct)
++		} else if h.meter_pct < 100 &&
++		   h.no_drain_streak >= u32(bal.meter_refill_streak_ticks) {
++			// #124 — the meter refill: classes may still be breach-latched IN
++			// GRACE (no active drain — the recoverable window), and after the
++			// sustained no-drain streak the meter heals gradually. A player
++			// fixing the cause inside the grace watches the scar fade; if the
++			// grace expires anyway, the drain resumes and resets the streak
++			// (refill never coexists with drain — the E16 path is untouched).
++			refill := u32(bal.meter_refill_per_tick)
++			if h.meter_pct + refill > 100 {
++				h.meter_pct = 100
++			} else {
++				h.meter_pct += refill
++			}
++			event_emit_meter(state, tick, h.meter_pct)
+ 		}
+-		event_emit_meter(state, tick, h.meter_pct)
+ 	}
+ 
+ 	// surge-done edge: the window JUST ended — freeze the accumulators for
+diff --git a/core/health_test.odin b/core/health_test.odin
+index 91a3512..5a2d817 100644
+--- a/core/health_test.odin
++++ b/core/health_test.odin
+@@ -539,6 +539,116 @@ test_health_drain_cap_e16 :: proc(t: ^testing.T) {
+ 	testing.expectf(t, drain_ticks >= 50, "the cap means >= 100/2 = 50 drain ticks to empty, got %d", drain_ticks)
+ }
+ 
++// --- #124: the meter's streak refill (pp-funfix-118-124) ---------------------
++
++@(test)
++test_health_meter_refill_streak_in_grace :: proc(t: ^testing.T) {
++	// The #124 recovery path: with the meter SCARRED (a spent drain episode)
++	// and a class breach-latched IN GRACE (no active drain), the meter heals
++	// +meter_refill_per_tick (1)/tick after meter_refill_streak_ticks (200)
++	// no-drain ticks — the fight-back window the one-way meter never had.
++	// When the grace then expires under sustained breach, the drain resumes
++	// and the refill STOPS (a drain tick resets the streak — the paths never
++	// coexist). Crafted-state staging (the test_health_win_lose_same_tick
++	// precedent): the narrow fixture is genuinely saturated, so the crafted
++	// latch/grace/meter state is the LIVE state, stepped naturally.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 42, cat.hash, TEST_LOGIC_HZ)
++	s.era = 3
++	health_narrow_fixture(&s, cat)
++	s.health_enabled = true
++	step_n(&s, 100, cat) // the fixture's breach is live by ~85 (the D-2 re-pin) — the latch is hot
++	stream := u16(1)
++	testing.expectf(t, s.health.breach[stream], "the fixture must be breach-latched before the craft")
++	// craft the scar: mid-drain meter, a fresh 300-tick grace, latch on
++	s.health.meter_pct = 55
++	s.health.grace[stream].grace_left = 300
++	s.health.no_drain_streak = 0
++	// ticks 101..~420: in grace, no drain — the streak builds to 200 (refill
++	// starts ~301) and the meter climbs +1/tick to the cap; the grace then
++	// expires ~400 and the drain resumes — refill and drain never coexist.
++	meters: [dynamic]u32
++	defer delete(meters)
++	for i in 0..<320 {
++		prev := s.health.meter_pct
++		step_n(&s, 1, cat)
++		append(&meters, s.health.meter_pct)
++		if s.health.meter_pct == prev + 1 {
++			testing.expectf(t, s.health.breach[stream],
++				"the refill must run while breach-latched-in-grace (tick %d)", s.tick)
++		}
++	}
++	// find the first refill tick: it must be >= 200 no-drain ticks after the
++	// craft (the streak gate) and climb EXACTLY 1/tick to the 100 cap.
++	first := -1
++	for m, i in meters {
++		if first < 0 && m > 55 {
++			first = i
++			testing.expectf(t, i + 1 >= 200,
++				"the refill must not start before the 200-tick streak (first move at tick %d)", i + 1)
++			testing.expectf(t, m == 56, "the refill must climb +1/tick, got %d", m)
++		}
++	}
++	testing.expectf(t, first >= 0, "the meter must refill while in grace (no move in 320 ticks)")
++	peak: u32 = 0
++	for m in meters {
++		if m > peak {
++			peak = m
++		}
++	}
++	testing.expectf(t, peak == 100,
++		"the scar must heal fully to the 100 cap before the expiry, peak %d", peak)
++	testing.expectf(t, meters[len(meters) - 1] < 100,
++		"the drain must have resumed after the expiry (the refill never coexists), got %d", meters[len(meters) - 1])
++	// the grace then expires under the sustained breach (~330): the drain
++	// resumes and the meter FALLS — refill and drain never coexist.
++	meter_before_expiry := s.health.meter_pct
++	for i := 0; i < 260 && !s.terminal; i += 1 {
++		step_n(&s, 1, cat)
++	}
++	testing.expectf(t, health_count_tag(s.events[:], EVENT_TAG_GRACE_EXPIRED) >= 1,
++		"the crafted grace must expire under the sustained breach")
++	testing.expectf(t, s.health.meter_pct < meter_before_expiry,
++		"the meter must drain again after the expiry (got %d >= %d)", s.health.meter_pct, meter_before_expiry)
++	testing.expectf(t, s.terminal && s.outcome == .Lost,
++		"the un-fixed breach must still lose (the tension is preserved)")
++}
++
++@(test)
++test_health_meter_refill_blocked_by_drain :: proc(t: ^testing.T) {
++	// The streak gate's teeth: an ACTIVE drain tick resets no_drain_streak to
++	// 0 — a meter draining post-grace never refills (the death spiral stays
++	// a death spiral). Staged with the fast-grace variant: the breach at ~5,
++	// the (shortened) grace expires ~105, the drain runs — the streak must
++	// read 0 on every drain tick and the meter must never climb.
++	cat_storage: Catalogs
++	cat := test_catalog(&cat_storage)
++	defer catalogs_destroy(cat)
++	cat.packet_types[1].health_grace_ticks = 100 // the streaming grace: expiry ~185 (breach ~85)
++
++	s: Run_State
++	defer run_destroy(&s)
++	run_init(&s, 42, cat.hash, TEST_LOGIC_HZ)
++	s.era = 3
++	health_narrow_fixture(&s, cat)
++	s.health_enabled = true
++	step_n(&s, 200, cat) // breach ~85 + grace 100 -> draining from ~185
++	testing.expectf(t, s.health.breach[1] && s.health.grace[1].grace_left == 0,
++		"streaming must be post-grace and draining")
++	testing.expectf(t, s.health.meter_pct < 100, "the meter must be mid-drain, got %d", s.health.meter_pct)
++	for i := 0; i < 40 && !s.terminal; i += 1 {
++		step_n(&s, 1, cat)
++		testing.expectf(t, s.health.no_drain_streak == 0,
++			"an active drain tick must reset the streak (tick %d, streak %d)", s.tick, s.health.no_drain_streak)
++	}
++	testing.expectf(t, s.terminal, "the un-fixed drain must empty the meter (unchanged E16/E17)")
++}
++
+ // --- E17: empty meter -> Run_Lost, one terminal event per run ----------------
+ 
+ @(test)
+diff --git a/core/types.odin b/core/types.odin
+index 3d7fe59..52103e0 100644
+--- a/core/types.odin
++++ b/core/types.odin
+@@ -382,6 +382,14 @@ Health_State :: struct {
+ 	surge_dropped:   u64,
+ 	prev_in_surge:   bool, // derived — the deactivation-edge detector
+ 	surge_done:      bool, // the window ended; the accumulators are frozen
++	// derived scratch (pp-funfix-118-124 #124): ticks since the last ACTIVE
++	// E16 drain tick (a drain tick resets it to 0; in-grace breach ticks and
++	// all-clear ticks both count). Gates the meter's streak refill — the same
++	// shape as the per-class grace_refill healthy_streak. NEVER serialized and
++	// not in the T1 hash (replay re-steps health_update from run_init, so the
++	// streak rebuilds identically; a mid-run load restarts the streak at 0 —
++	// at worst a 10 s refill delay, never a state divergence).
++	no_drain_streak: u32,
+ }
+ 
+ // Sla_Accumulator — the per-class SLA counters (ODN-3 §5.2; 3.4). Fields of
+diff --git a/data/balance.json b/data/balance.json
+index ea544e8..a0213b2 100644
+--- a/data/balance.json
++++ b/data/balance.json
+@@ -44,7 +44,7 @@
+     "pipe_congestion_lead_ticks": 400
+   },
+   "health": {
+-    "_comment": "Story 4.3 Network Health numbers (arch §6.5; the proven-fun prototype's tuning scaled to 20 Hz). window_ticks = the rolling measurement window (the E30 seam — the prototype's 100 @ 10 Hz = 10 s -> 200 @ 20 Hz). exit_margin_pct/exit_margin_ms = the E30 hysteresis band (a class exits only meaningfully under its tolerance — the prototype's 93-exit vs 90-enter, per class; exit_margin_ms scaled 40→160 at the 2026-08-21 pace-tuning, 4× with packet_bandwidth, so the exit band keeps its ratio to the scaled latency tolerances). drain_cap_pct_per_tick = the E16 per-tick cap (never instant; >= 100/cap ticks to empty — the prototype's meter_drain_per_tick_max 2). recharge_pct_per_tick = healthy recovery (the prototype's 1). win_uptime_pct = the GDD MVP surge-survival win threshold (the prototype's 90). grace_refill_per_tick + grace_refill_streak_ticks = the never-lose guard (a recovered class's grace refills gradually, only after a sustained healthy streak — the prototype's 5/50; consecutive episodes burn the shared countdown). Per-class grace + severity live on packet_types.json entries (hard-SLA classes drain fast).",
++    "_comment": "Story 4.3 Network Health numbers (arch §6.5; the proven-fun prototype's tuning scaled to 20 Hz). window_ticks = the rolling measurement window (the E30 seam — the prototype's 100 @ 10 Hz = 10 s -> 200 @ 20 Hz). exit_margin_pct/exit_margin_ms = the E30 hysteresis band (a class exits only meaningfully under its tolerance — the prototype's 93-exit vs 90-enter, per class; exit_margin_ms scaled 40→160 at the 2026-08-21 pace-tuning, 4× with packet_bandwidth, so the exit band keeps its ratio to the scaled latency tolerances). drain_cap_pct_per_tick = the E16 per-tick cap (never instant; >= 100/cap ticks to empty — the prototype's meter_drain_per_tick_max 2). recharge_pct_per_tick = healthy recovery (the prototype's 1). win_uptime_pct = the GDD MVP surge-survival win threshold (the prototype's 90). grace_refill_per_tick + grace_refill_streak_ticks = the never-lose guard (a recovered class's grace refills gradually, only after a sustained healthy streak — the prototype's 5/50; consecutive episodes burn the shared countdown). Per-class grace + severity live on packet_types.json entries (hard-SLA classes drain fast). pp-funfix-118-124 (#124, 2026-09-01): meter_refill_streak_ticks + meter_refill_per_tick = the METER's recovery path (#124 — the issue's streak-refill proposal): after this many ticks with NO active E16 drain (breach-in-grace episodes do not block it — only post-grace draining does), the meter refills +meter_refill_per_tick per tick toward 100, EVEN while classes remain breach-latched-in-grace — the fight-back window: a scarred meter heals while the player fixes the cause inside the grace, and death still requires the grace to expire (the drain path is untouched; an actively draining meter never refills). The all-clear recharge branch is unchanged (faster, 1/tick — untouched). The issue suggested 0.25%/tick; the integer grid (ODN-10 + the u8 Meter_Changed payload) admits 1 whole-%/tick — 4× slower than the drain cap can never happen: refill only runs when drain is 0.",
+     "window_ticks": 200,
+     "exit_margin_pct": 3,
+     "exit_margin_ms": 160,
+@@ -52,7 +52,9 @@
+     "recharge_pct_per_tick": 1,
+     "win_uptime_pct": 90,
+     "grace_refill_per_tick": 5,
+-    "grace_refill_streak_ticks": 50
++    "grace_refill_streak_ticks": 50,
++    "meter_refill_per_tick": 1,
++    "meter_refill_streak_ticks": 200
+   },
+   "advance": {
+     "_comment": "Story 6.2 era-advance gate (GDD M4 / arch §6.6): the modernization gate's tunables. milestone_window_ticks = the era's milestone sustain window (the window the player must hold per-class SLA >= sla_uptime_pct to advance — prototype value 600 = 30s @ 20Hz; the GDD full-game assumption is ~8-12 min/era [ASSUMPTION: prototype tuning]); sla_uptime_pct = the era-advance per-class delivery bar (95 — GDD 'sustain SLA uptime >= 95%'). The gate evaluates every tick once the window has elapsed; an active crisis blocks [E15]; unmodernized legacy pipes block (the 6.3 seam predicate).",
+diff --git a/data/packet_types.json b/data/packet_types.json
+index 85e8191..683b584 100644
+--- a/data/packet_types.json
++++ b/data/packet_types.json
+@@ -1,5 +1,5 @@
+ {
+-  "_comment": "Packet-type catalog (GDD § M2, art-direction §5, ODN-5). Story 3.1 ships the MVP roster: email + streaming. The other 7 (web/gaming/banking/voice/multicast/IoT/AI) are full-game content that arrive with later eras. shape = the primary visual distinguisher (never colour alone, [UX-DR4]); color_rgba = the secondary cue (look-book render shades, cosmetic — RGBA quad). icon = the disambiguator glyph ([LATER] font render). All sim values are int (ODN-10): latency_tol_ms (SLA threshold, ms — scaled 4× at the 2026-08-21 pace-tuning (500→2000, 300→1200) with the balance packet_bandwidth knob so the time-axis stretch keeps the breach semantics: the tolerance is a wall-time deadline, and transit times stretch with the pace), max_loss_pct (SLA drop threshold, %), bandwidth_demand (units a packet of this class consumes crossing an edge, × the base packet_bandwidth), default_lane (0=Express/1=Standard/2=Best-effort; MVP = Standard), demand_weight (relative weight vs sibling classes — NOT the per-sink dst weight, which lives on node_types). 4.3: health_grace_ticks (the class's grace countdown in ticks — 400 @ 20 Hz = 20 s, the proven-fun prototype's grace scale; future hard-SLA classes (banking/voice) get a SHORT grace, GDD Win/Loss) + health_drain_pct_per_tick (the class's meter severity — the E16 max-over drain input, capped by balance health.drain_cap_pct_per_tick; streaming drains 2× faster than email — the MVP's hard class).",
++  "_comment": "Packet-type catalog (GDD § M2, art-direction §5, ODN-5). Story 3.1 ships the MVP roster: email + streaming. The other 7 (web/gaming/banking/voice/multicast/IoT/AI) are full-game content that arrive with later eras. shape = the primary visual distinguisher (never colour alone, [UX-DR4]); color_rgba = the secondary cue (look-book render shades, cosmetic — RGBA quad). icon = the disambiguator glyph ([LATER] font render). All sim values are int (ODN-10): latency_tol_ms (SLA threshold, ms — scaled 4× at the 2026-08-21 pace-tuning (500→2000, 300→1200) with the balance packet_bandwidth knob so the time-axis stretch keeps the breach semantics: the tolerance is a wall-time deadline, and transit times stretch with the pace), max_loss_pct (SLA drop threshold, %), bandwidth_demand (units a packet of this class consumes crossing an edge, × the base packet_bandwidth), default_lane (0=Express/1=Standard/2=Best-effort; MVP = Standard), demand_weight (relative weight vs sibling classes — NOT the per-sink dst weight, which lives on node_types). 4.3: health_grace_ticks (the class's grace countdown in ticks — 400 @ 20 Hz = 20 s, the proven-fun prototype's grace scale; future hard-SLA classes (banking/voice) get a SHORT grace, GDD Win/Loss) + health_drain_pct_per_tick (the class's meter severity — the E16 max-over drain input, capped by balance health.drain_cap_pct_per_tick; streaming drains 2× faster than email — the MVP's hard class). 2026-09-01 pp-funfix-118-124 (#118, #124): health_grace_ticks 400 → 900 (45 s) for BOTH MVP classes — the grace IS the counterplay window to era-3's arrival shock: wide fiber only exists from era 3's Box grant (the pre-arrival conversion is economically impossible — the fun squad's diagnostic), and a realistic modernize sprint (convert + the 200-tick measurement window slide) needs ~45 s. The 20 s grace was unplayable: the fun playtests measured every strategy run dead before the surge opened (era-3 arrival + 400-tick grace + the 2–5 s drain < 60 s). The DEATH itself is unchanged — an ignored breach still expires the grace and drains to Run_Lost on the unchanged E16 path; the window just fits the sprint now.",
+   "entries": [
+     {
+       "id": "email",
+@@ -14,7 +14,7 @@
+       "era_introduced": 1,
+       "sla_fail_effect": "queued mail bounces; users refresh",
+       "demand_weight": 1,
+-      "health_grace_ticks": 400,
++      "health_grace_ticks": 900,
+       "health_drain_pct_per_tick": 1
+     },
+     {
+@@ -30,7 +30,7 @@
+       "era_introduced": 3,
+       "sla_fail_effect": "buffers stall; viewers rage-quit",
+       "demand_weight": 1,
+-      "health_grace_ticks": 400,
++      "health_grace_ticks": 900,
+       "health_drain_pct_per_tick": 2
+     }
+   ]
+diff --git a/demos/era3_surge_survivable.dem b/demos/era3_surge_survivable.dem
+new file mode 100644
+index 0000000..09f0367
+--- /dev/null
++++ b/demos/era3_surge_survivable.dem
+@@ -0,0 +1,74 @@
++# era3_surge_survivable.dem — pp-funfix-118-124 (#118): THE ACCEPTANCE GOLDEN.
++# A prepared build RIDES the era-3 arrival: the advance gate fires era 3 at
++# tick 600 (30 s, the healthy-mesh fire), streaming demand joins the next
++# tick, and the player spends era 3's Box grant (the fiber spool exists ONLY
++# from this grant — the pre-arrival conversion is economically impossible,
++# the fun squad's diagnostic) on an immediate fiber sprint: all 13 legs
++# modernized wide at 30.6 s. Pre-fix (grace 400) this exact mesh DIED at
++# ~57 s with the meter never pausing (the squad's 8/8 runs died 16.7-28.4 s
++# after the flip, pre-surge); post-fix the windowed breach — if it latches —
++# exits long inside the 900-tick grace, the meter NEVER leaves 100, and the
++# x10 surge (opens 60 s) is carried whole: streaming lat ~310-460 ms against
++# the 1200 ms tolerance, 0 drops, deliveries flowing every tick (measured).
++# Run_Won fires at the window's deactivation tick 3000 (150 s) — the win the
++# squad could never reach. Captures:
++#   capture 25000ms — era-2 calm, pre-flip (standard mesh, meter 100)
++#   capture 32000ms — the sprint landed: the trunk gold with wides
++#   capture 60000ms — the surge OPENS: meter 100, no grace chip, no banner
++#   capture 75000ms — the surge carried (meter 100, deliveries flowing)
++#   capture 150500ms — the post-win frame (Run_Won at 3000, frozen)
++seed 2026
++run 152000ms
++era 2
++health on
++win surge 90
++box on
++advance gate on
++fixture off
++spawn_node residential 4 10
++spawn_node residential 4 22
++spawn_node residential 12 8
++spawn_node residential 14 24
++spawn_node residential 18 8
++spawn_node residential 20 24
++spawn_node residential 26 8
++spawn_node residential 30 24
++spawn_node small_biz 36 20
++spawn_node content_host 36 26
++spawn_node router_basic 8 16
++spawn_node router_basic 16 16
++spawn_node router_basic 24 16
++spawn_node router_basic 32 16
++at 100ms draw 0 10 standard
++at 100ms draw 1 10 standard
++at 100ms draw 2 10 standard
++at 100ms draw 3 11 standard
++at 100ms draw 4 11 standard
++at 100ms draw 10 11 standard
++at 100ms draw 5 12 standard
++at 100ms draw 6 12 standard
++at 100ms draw 11 12 standard
++at 100ms draw 7 13 standard
++at 100ms draw 8 13 standard
++at 100ms draw 9 13 standard
++at 100ms draw 12 13 standard
++# the fiber sprint — era 3's Box grant pays for the tier-up (logged Cmds)
++at 30600ms modernize 0 wide
++at 30600ms modernize 1 wide
++at 30600ms modernize 2 wide
++at 30600ms modernize 3 wide
++at 30600ms modernize 4 wide
++at 30600ms modernize 5 wide
++at 30600ms modernize 6 wide
++at 30600ms modernize 7 wide
++at 30600ms modernize 8 wide
++at 30600ms modernize 9 wide
++at 30600ms modernize 10 wide
++at 30600ms modernize 11 wide
++at 30600ms modernize 12 wide
++capture at 25000ms
++capture at 32000ms
++capture at 60000ms
++capture at 75000ms
++capture at 150500ms
++expect hash stable
+diff --git a/demos/health_lose.dem b/demos/health_lose.dem
+index 9765414..3f7e736 100644
+--- a/demos/health_lose.dem
++++ b/demos/health_lose.dem
+@@ -1,19 +1,24 @@
+ # health_lose.dem — Story 4.3: the LOSE frame (Error 404 — the Network Health
+-# meter). The unprepared standard path (the crisis shape): the era-3 base demand
+-# (2 streaming/tick x 60 u) saturates the 5 u/tick narrows within ticks — the
+-# E9 lane bound fills, sheds accrue, and the WINDOWED loss breaches at ~tick 5
+-# (0.25 s). The streaming grace (400 ticks = 20 s) counts down (Grace_Started
+-# at ~5, Grace_Expired at ~405), then the meter drains 2/tick -> empty at
+-# ~452 (22.6 s — READ from the run) -> Run_Lost (Error 404) -> the terminal
+-# barrier freezes the run (E17 — one terminal event). The death precedes the
+-# surge window (1200), so there is no crisis banner — the lose surface is the
+-# meter itself:
+-#   capture 5000ms  — in grace: the meter 100 + the streaming grace chip
+-#   capture 21000ms — draining: the meter ~68 (tick 420, mid-drain)
+-#   capture 23000ms — the terminal frame: the meter at 0 (tick 460, frozen)
+-# run 24000ms lets the post-terminal ticks exercise the barrier (frozen hashes).
++# meter). The unprepared standard path (the crisis shape): the era-3 base
++# demand (2 streaming/tick x 60 u) saturates the 5 u/tick narrows within
++# ticks — the E9 lane bound fills, sheds accrue, and the WINDOWED loss
++# breaches at ~tick 84 (0.25 s — the D-2 first-delivery lag). The streaming
++# grace (pp-funfix-118-124: 900 ticks = 45 s — the modernize-sprint window)
++# counts down (Grace_Started at ~84, Grace_Expired at ~984), then the meter
++# drains 2/tick -> empty at ~1033 (51.65 s — READ from the run) -> Run_Lost
++# (Error 404) -> the terminal barrier freezes the run (E17 — one terminal
++# event). The unprepared death moved from ~452 to ~1033 at the grace retune;
++# the LOSE itself is byte-for-byte the same mechanism — an ignored breach
++# still ends the run (the tension is preserved, #115 not regressed). The
++# death precedes the surge window's close (3000), so there is no crisis
++# banner — the lose surface is the meter itself:
++#   capture 40000ms  — in grace: the meter 100 + the streaming grace chip
++#   capture 50000ms  — draining: the meter ~66 (tick 1000, mid-drain)
++#   capture 52500ms  — the terminal frame: the meter at 0 (tick 1033, frozen)
++# run 60000ms lets the post-terminal ticks exercise the barrier (frozen
++# hashes).
+ seed 4243
+-run 24000ms
++run 60000ms
+ era 3
+ health on
+ win surge 90
+@@ -23,7 +28,7 @@ spawn_node router_basic 14 15
+ spawn_node content_host 20 15
+ at 100ms draw 0 1 standard
+ at 100ms draw 1 2 standard
+-capture at 5000ms
+-capture at 21000ms
+-capture at 23000ms
++capture at 40000ms
++capture at 50000ms
++capture at 52500ms
+ expect hash stable
+diff --git a/demos/health_recover.dem b/demos/health_recover.dem
+new file mode 100644
+index 0000000..0c9f394
+--- /dev/null
++++ b/demos/health_recover.dem
+@@ -0,0 +1,41 @@
++# health_recover.dem — pp-funfix-118-124 (#124): the meter's RECOVERY path.
++# The health_lose unprepared shape (res <- rt -> host on narrows, era 3), but
++# the player FIGHTS BACK inside the drain: the streaming breach enters at ~84
++# (the D-2 first-delivery lag); the grace (900) expires at ~984 and the meter
++# drains 2/tick. The fix — demolish the narrows, place a second router
++# (clears the 5.6 separation; every wide span <= 18), 2 wides per leg (the
++# health_apply_fix shape) — lands at 40 s; the 200-tick measurement window
++# keeps the latch hot until ~1013, so the meter SCARRS to 40 before the latch
++# exits; then the all-clear recharge (+1/tick) heals the scar to 100 by ~1073
++# (53.65 s) and the run rides into the surge open. The one-way meter could
++# never tell this story: drain -> fight back -> heal, all in one run.
++# Captures (ticks measured from the stats stream — never guessed):
++#   capture 40000ms — the sprint lands (in-grace, the meter still 100)
++#   capture 50500ms — the TROUGH: mid-drain at the latch's exit (meter ~40)
++#   capture 56000ms — HEALED: the meter back at 100, pre-surge calm
++seed 4243
++run 60000ms
++era 3
++health on
++win surge 90
++fixture off
++spawn_node residential 8 15
++spawn_node router_basic 14 15
++spawn_node content_host 20 15
++at 100ms draw 0 1 standard
++at 100ms draw 1 2 standard
++at 40000ms demolish pipe 0
++at 40000ms demolish pipe 1
++at 40100ms place router_basic 24 10
++at 40500ms draw 0 1 wide
++at 40500ms draw 0 1 wide
++at 40500ms draw 1 2 wide
++at 40500ms draw 1 2 wide
++at 40500ms draw 0 3 wide
++at 40500ms draw 0 3 wide
++at 40500ms draw 3 2 wide
++at 40500ms draw 3 2 wide
++capture at 40000ms
++capture at 50500ms
++capture at 56000ms
++expect hash stable
