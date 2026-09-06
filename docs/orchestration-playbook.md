@@ -85,13 +85,19 @@ His extension (`.pi/extensions/silas.ts`) injects his standing orders +
 startup checklist; nefario-watch is gated to `PI_SILAS=1`, so ALL sensors
 alert Silas — Gru's context stays clean.
 
-**Model:** Silas runs on **`zai-coding-cn/glm-5.3-flash`** (user ruling
-2026-08-27: new ZAI flash tier; deepseek flash retired from ops after the
-402 wall) — set
+**Model:** Silas ALWAYS runs on **`deepseek/deepseek-v4-flash`** (user
+ruling 2026-09-06: API billing = no session limits; the COO must be
+available to coordinate — availability is the point of the ruling;
+supersedes the 08-27 glm-5.3-flash COO pin, which stays the
+minion/mega-minion ops default, untouched) — set
 AUTOMATICALLY by `.pi/extensions/silas.ts` at launch (`session_start` ->
-`pi.setModel`), no manual `/model`; notifies if missing or unkeyed. The
-COO's work is execution-grade; the reasoning tier (Gru/Perkins/Bob) is
-k3-primary per 'Model policy'.
+`pi.setModel`), no manual `/model`; notifies if missing or unkeyed, and
+hardened at relaunch: `bin/night-watchman` clears `PI_MODEL`/`PI_PROVIDER`
+and pins `--model deepseek/deepseek-v4-flash` (the 11:47Z 2026-09-06
+relaunch leaked `PI_MODEL=k3` over the extension pin). Fallback if
+deepseek 402s (balance wall): glm-5.3-flash interim + escalate to the
+user for a top-up. The COO's work is execution-grade; the reasoning tier
+(Gru/Perkins/Bob) is k3-primary per 'Model policy'.
 
 **Silas owns (Gru never touches):** every nefario-watch alert (classify
 via transcript, act, ledger) · every ledger transition (`bin/ledger
@@ -310,12 +316,17 @@ self-reported ids. models.json entries MUST declare `"input": ["text",
 auto-delegation stays REMOVED (08-18). NO vision deferral: models with
 NO native vision MUST route through Kyle — never guess or hallucinate.
 
-**Execution — `zai-coding-cn/glm-5.3-flash`** (ops tier since
-2026-08-27; interim deepseek-v4-flash while ZAI errors): **Silas** (COO:
-ops,
-relay, coordination, dispatches), **ALL minions** (implementation), and
-**mega-minions** (well-specified sub-tasks). The fleet workhorse: fast,
-reliable, ZAI-always-live.
+**Execution tier — split 2026-09-06 (COO-only ruling):**
+- **Silas (COO)** — ops, relay, coordination, dispatches:
+  **`deepseek/deepseek-v4-flash` ALWAYS** (user ruling 2026-09-06: API
+  billing = no session limits — the COO must stay available to
+  coordinate). Supersedes the 08-27 glm-5.3-flash COO pin. Fallback if
+  deepseek 402s (balance wall): glm-5.3-flash interim + escalate to the
+  user for a top-up (availability is the point).
+- **ALL minions** (implementation) and **mega-minions**
+  (well-specified sub-tasks): **`zai-coding-cn/glm-5.3-flash`** (ops tier
+  since 2026-08-27). The fleet workhorse: fast, reliable,
+  ZAI-always-live. UNTOUCHED by the 2026-09-06 ruling.
 **The 402 CLASS (2026-08-19):** a deepseek **402 Insufficient Balance**
 is an ACCOUNT wall (billing — a user top-up fixes it; waiting does not).
 Per errored pane: `/model <ops fallback>` + continue, once; the fleet
@@ -842,3 +853,17 @@ truth; this appendix carries how we got here.
 - **2026-08-21** — playbook diet: core/annex split (relocation +
   tightening only, zero doctrine change — `docs/playbook-annex.md` holds
   the relocated history).
+- **2026-08-27** — reasoning dispatch model chain: k3 → glm-5.3 → HOLD
+  stands; ops default set to `zai-coding-cn/glm-5.3-flash` (COO +
+  minions + mega-minions).
+- **2026-09-06** — **COO model ruling: Silas ALWAYS runs on
+  `deepseek/deepseek-v4-flash`** (API billing = no session limits — the
+  COO must stay available to coordinate). Supersedes the 08-27
+  glm-5.3-flash COO pin. COO-only: reasoning tier (k3 → glm-5.3 → HOLD),
+  KYLE vision (glm-5.3-flash), and minion/mega-minion ops default
+  (glm-5.3-flash) are UNTOUCHED. Fallback if deepseek 402s (balance
+  wall): glm-5.3-flash interim + escalate to the user for a top-up.
+  Hardening in the same ruling: night-watchman's Silas relaunch clears
+  `PI_MODEL`/`PI_PROVIDER` and pins `--model deepseek/deepseek-v4-flash`
+  (the 11:47Z 2026-09-06 relaunch leaked `PI_MODEL=k3` over the
+  extension pin — the COO landed on the reasoning tier's model).
