@@ -12,7 +12,9 @@
 #
 # Targets are resolved BY TAB LABEL fresh every pass (pane ids churn
 # across restarts and workspace moves; nothing is cached between ticks):
-#   silas (tab label `silas`)  → relaunch `env -u PI_GRU PI_SILAS=1 pi`
+#   silas (tab label `silas`)  → relaunch `env -u PI_GRU -u PI_MODEL -u
+#                                PI_PROVIDER PI_SILAS=1 pi --model
+#                                deepseek/deepseek-v4-flash`
 #   gru   (tab label `Gru`)    → relaunch `env -u PI_SILAS PI_GRU=1 pi
 #                                --model <k3|glm-5.3 via probe gate> --thinking max`
 #
@@ -97,19 +99,26 @@ PROBE="${NIGHT_WATCHMAN_PROBE:-$ROOT/bin/quota-probe}"
 
 # reasoning tier for Gru relaunches (user rulings: k3 primary, glm-5.3
 # fallback; v4-pro banned on cost, flash banned for the reasoning tier).
+# COO ops model: deepseek/deepseek-v4-flash ALWAYS (user ruling 2026-09-06
+# — API billing, no session limits; availability is the point). The Silas
+# launch env CLEARS PI_MODEL + PI_PROVIDER (the 11:47Z 2026-09-06 relaunch
+# leaked PI_MODEL=k3 over the silas.ts extension pin) and build_launch pins
+# the model explicitly.
 REASONING_MODELS=(kimi-coding/k3 zai-coding-cn/glm-5.3)
 FORBIDDEN_REASONING="deepseek/deepseek-v4-pro deepseek/deepseek-v4-flash zai-coding-cn/glm-5.3-flash"
+SILAS_MODEL="deepseek/deepseek-v4-flash"
 
 # target records: tab-label|key|launch-env|handover|env-marker|tier
 # (launch-env = the ENV PREFIX of the relaunch command (no executable); the
-#  executable + model are appended at relaunch time: ` pi` for the ops tier
-#  (silas.ts auto-sets flash), ` pi --model <k3|glm-5.3> --thinking max` for
-#  the reasoning tier (Gru, via the probe gate).
+#  executable + model are appended at relaunch time: ` pi --model
+#  deepseek/deepseek-v4-flash` for the silas ops tier (pinned via
+#  build_launch, matching silas.ts), ` pi --model <k3|glm-5.3> --thinking
+#  max` for the reasoning tier (Gru, via the probe gate).
 #  env-marker = text the target's extension injects at session start,
 #  gated on the right PI_* env — proves env correctness, see silas.ts/gru.ts;
 #  tier = ops | reasoning)
 DEFAULT_TARGETS=(
-  "silas|silas|env -u PI_GRU PI_SILAS=1|Read the playbook section Silas (COO) standing orders and run your startup checklist|Silas startup checklist|ops"
+  "silas|silas|env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1|Read the playbook section Silas (COO) standing orders and run your startup checklist|Silas startup checklist|ops"
   "Gru|gru|env -u PI_SILAS PI_GRU=1|Read the playbook section Gru standing orders and run your startup checklist|Gru startup checklist|reasoning"
 )
 if [ -n "${NIGHT_WATCHMAN_TARGETS:-}" ]; then
@@ -345,7 +354,12 @@ probe_ok() { # $1=model → 0 if the provider/model probes OK through pi
 build_launch() { # $1=key $2=launch-env $3=tier
   local key="$1" env="$2" tier="$3" m
   if [ "$tier" != "reasoning" ]; then
-    echo "$env pi"
+    if [ "$key" = "silas" ]; then
+      # COO model ruling 2026-09-06: Silas ALWAYS runs on deepseek-v4-flash.
+      echo "$env pi --model $SILAS_MODEL"
+    else
+      echo "$env pi"
+    fi
     return 0
   fi
   for m in "${REASONING_MODELS[@]}"; do
@@ -510,7 +524,7 @@ handle_death() { # $1=label $2=key $3=pane $4=launch-env $5=handover $6=marker $
     if [ "$tier" = "reasoning" ]; then
       log "  dry-run: would relaunch ($launch_env pi --model <k3|glm-5.3 via probe gate> --thinking max) + handover"
     else
-      log "  dry-run: would relaunch ($launch_env pi) + handover"
+      log "  dry-run: would relaunch ($launch_env pi --model $SILAS_MODEL) + handover"
     fi
     return 0
   fi
@@ -704,10 +718,19 @@ self_test() {
     IFS='|' read -r label key launch_env handover marker tier <<<"$rec"
     printf '  %-6s %s (tier: %s)\n' "$key" "$launch_env" "$tier"
   done
-  [ "$(printf '%s' "${TARGETS[0]}" | cut -d'|' -f3)" = "env -u PI_GRU PI_SILAS=1" ] \
+  [ "$(printf '%s' "${TARGETS[0]}" | cut -d'|' -f3)" = "env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1" ] \
     || { echo "  FAIL: silas env mirror wrong"; rc=1; }
   [ "$(printf '%s' "${TARGETS[1]}" | cut -d'|' -f3)" = "env -u PI_SILAS PI_GRU=1" ] \
     || { echo "  FAIL: gru env mirror wrong"; rc=1; }
+
+  echo "--- silas launch pin (COO model ruling 2026-09-06)"
+  out="$(build_launch silas "env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1" ops)"
+  if [ "$(printf '%s' "$out" | grep -c 'pi --model deepseek/deepseek-v4-flash')" = "1" ]; then
+    echo "  PASS: silas launch pins deepseek/deepseek-v4-flash ($out)"
+  else
+    echo "  FAIL: silas build_launch wrong, got: $out"
+    rc=1
+  fi
 
   echo "--- NO KILL PATH assertion (kill allowed only as the 'kill -0' lock probe)"
   bad="$(grep -nE '\bkill\b' "$0" | grep -vE '\bkill[ ]+-0\b' || true)"

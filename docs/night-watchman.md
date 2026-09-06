@@ -21,8 +21,16 @@ across restarts and workspace moves):
 
 | Target | Tab label | Relaunch command |
 |---|---|---|
-| Silas (COO) | `silas` | `env -u PI_GRU PI_SILAS=1 pi` |
+| Silas (COO) | `silas` | `env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1 pi --model deepseek/deepseek-v4-flash` |
 | Gru (CEO) | `Gru` | `env -u PI_SILAS PI_GRU=1 pi --model <k3\|glm-5.3> --thinking max` |
+
+Silas's model is pinned (COO model ruling 2026-09-06 — deepseek API
+billing, no session limits; availability is the point). The launch env
+clears `PI_MODEL` + `PI_PROVIDER` so a leaked env cannot override the
+pin (the 2026-09-06 11:47Z relaunch leaked `PI_MODEL=k3` over the
+silas.ts extension pin — the COO landed on the reasoning tier's model).
+Fallback if deepseek 402s (balance wall): glm-5.3-flash interim + a
+user top-up (escalate) — never silently switch the COO tier.
 
 Gru's model is pinned at relaunch time through the **quota probe gate**
 (`bin/quota-probe`): `kimi-coding/k3` primary, `zai-coding-cn/glm-5.3`
@@ -97,7 +105,7 @@ launchd's stdout/stderr — the script writes timestamped lines):
 2026-08-21T06:14:08Z alive silas gru          ← heartbeat (quiet pass)
 2026-08-21T06:20:03Z DEATH silas pane=w1T:p1Y6
 2026-08-21T06:20:03Z   last-session=/Users/moses/.pi/agent/sessions/.../xxx.jsonl last-modified=missing
-2026-08-21T06:20:03Z   action: relaunch (env -u PI_GRU PI_SILAS=1 pi)
+2026-08-21T06:20:03Z   action: relaunch (env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1 pi --model deepseek/deepseek-v4-flash)
 2026-08-21T06:20:55Z   ready: idle (pi booted)
 2026-08-21T06:21:10Z   verified: session=... (env marker + handover landed)
 2026-08-21T10:25:36Z   classified BOOTING after grace — boot-race guard: no keystrokes   ← mid-boot, no action
@@ -213,7 +221,7 @@ NIGHT_WATCHMAN_TARGETS="$T" env $S bin/night-watchman --once
 NIGHT_WATCHMAN_TARGETS="$T" env $S bin/night-watchman --once
 
 # (d) identity tab missing → warn + notify + no pane created
-NIGHT_WATCHMAN_TARGETS='no-such-tab|ghost|env -u PI_GRU PI_SILAS=1|h|m|ops' \
+NIGHT_WATCHMAN_TARGETS='no-such-tab|ghost|env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1|h|m|ops' \
   env $S bin/night-watchman --once
 
 # (d2) stray split: herdr pane split <pane> → pass warns "holds 2 panes",

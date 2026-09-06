@@ -52,20 +52,20 @@ export default function silas(pi: ExtensionAPI) {
 		if (ctx.cwd !== GRU_DIR) return;
 		if (process.env.PI_SILAS !== "1") return;
 		if (event.reason === "startup" || event.reason === "new") {
-			// Silas runs on zai-coding-cn/glm-5.3-flash (user ruling 2026-08-27:
-			// new ZAI flash tier; deepseek flash retired from ops after the 402
-			// wall. Verified: authed probe OK + glm-5.3-flash confirmed in ZAI's
-			// served models list.
-			// the glm-5.3 ops interlude was the 402-incident fallback, now
-			// resolved; supersedes the 08-19 morning glm ruling). The COO's
-			// work (watcher triage, ledger, dispatches, close-outs) is
-			// execution-grade + well-specified. Reasoning tier stays kimi k3.
-			const model = ctx.modelRegistry.find("zai-coding-cn", "glm-5.3-flash");
+			// Silas ALWAYS runs on deepseek/deepseek-v4-flash (user ruling
+			// 2026-09-06: API billing = no session limits; the COO must be
+			// available to coordinate — availability is the point of the
+			// ruling). Supersedes the 08-27 glm-5.3-flash COO pin (which
+			// stays the minion/mega-minion ops default, untouched by this
+			// ruling — COO-only). Reasoning tier stays kimi k3 primary.
+			// Fallback if deepseek 402s (balance wall): glm-5.3-flash interim
+			// + escalate to the user for a top-up (per the policy doc).
+			const model = ctx.modelRegistry.find("deepseek", "deepseek-v4-flash");
 			if (model) {
 				const ok = await pi.setModel(model);
-				if (!ok) ctx.ui.notify("Silas: no API key for zai-coding-cn/glm-5.3-flash — staying on the current model", "error");
+				if (!ok) ctx.ui.notify("Silas: no API key for deepseek/deepseek-v4-flash — staying on the current model", "error");
 			} else {
-				ctx.ui.notify("Silas: zai-coding-cn/glm-5.3-flash not in the model registry — staying on the current model", "error");
+				ctx.ui.notify("Silas: deepseek/deepseek-v4-flash not in the model registry — staying on the current model", "error");
 			}
 			await pi.sendUserMessage(SILAS_STARTUP_CHECKLIST);
 		}
