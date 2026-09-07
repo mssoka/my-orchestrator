@@ -52,20 +52,28 @@ export default function silas(pi: ExtensionAPI) {
 		if (ctx.cwd !== GRU_DIR) return;
 		if (process.env.PI_SILAS !== "1") return;
 		if (event.reason === "startup" || event.reason === "new") {
-			// Silas ALWAYS runs on deepseek/deepseek-v4-flash (user ruling
-			// 2026-09-06: API billing = no session limits; the COO must be
-			// available to coordinate — availability is the point of the
-			// ruling). Supersedes the 08-27 glm-5.3-flash COO pin (which
-			// stays the minion/mega-minion ops default, untouched by this
-			// ruling — COO-only). Reasoning tier stays kimi k3 primary.
-			// Fallback if deepseek 402s (balance wall): glm-5.3-flash interim
-			// + escalate to the user for a top-up (per the policy doc).
-			const model = ctx.modelRegistry.find("deepseek", "deepseek-v4-flash");
+			// Silas ALWAYS runs on openai-codex/gpt-5.6-luna @ max thinking
+			// (user ruling 2026-09-07: GPT subscription — the COO tier is
+			// Luna, max). Supersedes the 09-06 deepseek-v4-flash COO pin
+			// (and before that the 08-27 glm-5.3-flash pin). Set at launch
+			// (`session_start` -> pi.setModel + pi.setThinkingLevel), no
+			// manual /model; notifies if missing or unkeyed, and hardened at
+			// relaunch: bin/night-watchman clears PI_MODEL/PI_PROVIDER and
+			// pins --model openai-codex/gpt-5.6-luna --thinking max. No
+			// silent legacy fallback — if Luna is unavailable the current
+			// model stays + an error notifies (availability escalates to the
+			// user). Reasoning tier (Gru/Bob/Perkins) = astra xhigh per
+			// 'Model policy'.
+			const model = ctx.modelRegistry.find("openai-codex", "gpt-5.6-luna");
 			if (model) {
 				const ok = await pi.setModel(model);
-				if (!ok) ctx.ui.notify("Silas: no API key for deepseek/deepseek-v4-flash — staying on the current model", "error");
+				if (!ok) {
+					ctx.ui.notify("Silas: no auth for openai-codex/gpt-5.6-luna — staying on the current model", "error");
+				} else {
+					await pi.setThinkingLevel("max");
+				}
 			} else {
-				ctx.ui.notify("Silas: deepseek/deepseek-v4-flash not in the model registry — staying on the current model", "error");
+				ctx.ui.notify("Silas: openai-codex/gpt-5.6-luna not in the model registry — staying on the current model", "error");
 			}
 			await pi.sendUserMessage(SILAS_STARTUP_CHECKLIST);
 		}

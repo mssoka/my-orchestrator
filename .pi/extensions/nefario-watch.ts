@@ -1029,7 +1029,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			const lastProbe = quotaProbeLast.get("t");
 			if (typeof lastProbe !== "number" || nowMs - lastProbe > 60 * 60 * 1000) {
 				quotaProbeLast.set("t", nowMs);
-				const probe = await pi.exec("bash", ["-c", "/Users/moses/code/bin/quota-probe kimi-coding/k3 >/dev/null 2>&1; echo $?"], { timeout: 75000 });
+				const probe = await pi.exec("bash", ["-c", "/Users/moses/code/bin/quota-probe openai-codex/gpt-6-astra >/dev/null 2>&1; echo $?"], { timeout: 75000 });
 				// Improvement #6 (user-approved 2026-08-18): probe the providers
 				// behind deferred:<tag> ledger rows too; when one flips BACK UP,
 				// surface the matching rows to Gru (ledger queue → deferred
@@ -1040,15 +1040,15 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 					if (regime.code === 0 && regime.stdout) {
 						try {
 							const rj = JSON.parse(regime.stdout);
-							const cur = rj?.["kimi-coding/k3"];
+							const cur = rj?.["openai-codex/gpt-6-astra"];
 							if (cur && quotaProbeLast.get("ok") !== undefined && cur.ok !== quotaProbeLast.get("ok")) {
 								pi.sendMessage(
 									{
 										customType: "nefario-watch",
 										content:
-											`[nefario-watch · ${stamp()}] QUOTA REGIME FLIP: kimi-coding/k3 ` +
+											`[nefario-watch · ${stamp()}] QUOTA REGIME FLIP: openai-codex/gpt-6-astra ` +
 											`${cur.ok ? "BACK UP" : "DOWN"} (${cur.error ?? ""} — ${cur.ts}). ` +
-											`${cur.ok ? "Probe before routing back; the unreliability guard applies." : "Reasoning chain: kimi k3 -> glm-5.3 -> HOLD (v4-pro BANNED from reasoning — zero duties; mid-work 403/1308 PARKS the round, resume via probe flip + continue)."}`, 
+											`${cur.ok ? "Probe before routing back; the unreliability guard applies." : "Reasoning chain: openai-codex/gpt-6-astra (Astra xhigh) — Gru/Bob/Perkins/3D ride it; a probe-DOWN row HOLDs new reasoning dispatches, resume via probe flip + continue. Legacy kimi/glm/deepseek chains superseded 2026-09-07."}`, 
 									display: true,
 								},
 								{ deliverAs: "followUp", triggerTurn: true },

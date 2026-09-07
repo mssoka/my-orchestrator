@@ -1,0 +1,79 @@
+#!/bin/bash
+# test-model-policy — asserts the 2026-09-07 GPT model-policy mapping is
+# actually wired into the ACTIVE config surfaces (extensions, watchman,
+# probe, skill) and that no legacy default (kimi/glm/deepseek) silently
+# overrides it. Read-only: greps files, exits 1 on any assertion failure.
+#
+# The policy (user ruling 2026-09-07; canon = playbook 'Model policy'):
+#   role → model → thinking
+#   Gru/Bob (reasoning)        → openai-codex/gpt-6-astra  → xhigh
+#   Perkins (round mains + lenses) → openai-codex/gpt-6-astra → xhigh
+#   3D/game/Blender agents + 3D mega-minions + 3D lenses → astra xhigh
+#       (the 3D OVERRIDE beats the generic Sol default)
+#   other minions / non-3D mega-minions → openai-codex/gpt-5.6-sol → xhigh
+#   Silas (COO)                → openai-codex/gpt-5.6-luna  → max
+# Legacy kimi/glm/deepseek chains are RETIRED from new dispatches.
+#
+# Usage: bin/test-model-policy   (run from the repo root or anywhere)
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 2
+
+rc=0
+fail() { echo "FAIL: $1"; rc=1; }
+pass() { echo "PASS: $1"; }
+
+ASTRA="openai-codex/gpt-6-astra"
+SOL="openai-codex/gpt-5.6-sol"
+LUNA="openai-codex/gpt-5.6-luna"
+ACTIVE=".pi/extensions/gru.ts .pi/extensions/silas.ts .pi/extensions/nefario-watch.ts bin/night-watchman bin/quota-probe .agents/skills/code-review/SKILL.md"
+
+echo "--- role → model + thinking mapping on the active surfaces ---"
+
+# 1. Identity extensions pin model + thinking at session_start.
+grep -q '"openai-codex", "gpt-6-astra"' .pi/extensions/gru.ts && grep -q 'setThinkingLevel("xhigh")' .pi/extensions/gru.ts \
+  && pass "gru.ts pins Astra + xhigh" || fail "gru.ts does not pin openai-codex/gpt-6-astra @ xhigh"
+grep -q '"openai-codex", "gpt-5.6-luna"' .pi/extensions/silas.ts && grep -q 'setThinkingLevel("max")' .pi/extensions/silas.ts \
+  && pass "silas.ts pins Luna + max" || fail "silas.ts does not pin openai-codex/gpt-5.6-luna @ max"
+
+# 2. Night-watchman relaunch pins (Gru reasoning + Silas ops) + the probe gate.
+grep -q "REASONING_MODELS=($ASTRA)" bin/night-watchman \
+  && pass "watchman reasoning gate = astra" || fail "watchman REASONING_MODELS != astra"
+grep -q "SILAS_MODEL=\"$LUNA\"" bin/night-watchman && grep -q 'SILAS_THINKING="max"' bin/night-watchman \
+  && pass "watchman silas pin = luna max" || fail "watchman SILAS_MODEL/THINKING != luna/max"
+grep -q 'REASONING_THINKING="xhigh"' bin/night-watchman \
+  && pass "watchman reasoning thinking = xhigh" || fail "watchman REASONING_THINKING != xhigh"
+
+# 3. Quota-probe default + deferred-tag map.
+grep -q 'MODELS=(openai-codex/gpt-6-astra)' bin/quota-probe \
+  && pass "quota-probe default = astra" || fail "quota-probe default is not astra"
+for m in astra sol luna; do
+  grep -q "\"$m\":" bin/quota-probe && pass "quota-probe deferred tag: $m" || fail "quota-probe deferred tag missing: $m"
+done
+
+# 4. nefario-watch probe + flip text.
+grep -q 'quota-probe openai-codex/gpt-6-astra' .pi/extensions/nefario-watch.ts \
+  && pass "nefario-watch probes astra" || fail "nefario-watch still probes a legacy model"
+
+# 5. 3D override: the playbook + skill name Astra for 3D/Blender work.
+grep -q '3D' docs/orchestration-playbook.md && grep -q "$ASTRA" docs/orchestration-playbook.md \
+  && pass "playbook Model policy names Astra + the 3D override" || fail "playbook Model policy missing Astra/3D override"
+
+# 6. No legacy model survives as an ACTIVE launch/assignment default in the code surfaces.
+#    (Comments, the FORBIDDEN_REASONING ban list, and the quota-probe deferred ALIAS map
+#    — which resolves historical deferred:<flash> rows — legitimately name legacy models.)
+STILL_ACTIVE=$(grep -nE '(SILAS_MODEL|MODELS|REASONING_MODELS)="?(deepseek|kimi|zai)|setModel\(find\("(deepseek|kimi|zai)|--model (deepseek|kimi|zai))' $ACTIVE 2>/dev/null \
+  | grep -v FORBIDDEN || true)
+if [ -z "$STILL_ACTIVE" ]; then
+  pass "no legacy model remains as an active launch/assignment default"
+else
+  fail "legacy model active assignment remains: $STILL_ACTIVE"
+fi
+
+# 7. code-review skill: no bare `--thinking max` universal pin left; per-model levels present.
+grep -q '<resolved-thinking>' .agents/skills/code-review/SKILL.md && ! grep -q -- '--thinking max"` in EACH grid pane' .agents/skills/code-review/SKILL.md \
+  && pass "code-review skill resolves per-model thinking" || fail "code-review skill thinking pin not per-model"
+
+echo "---"
+[ $rc -eq 0 ] && echo "model-policy test: ALL PASS" || echo "model-policy test: FAILURES"
+exit $rc

@@ -56,6 +56,27 @@ export default function gru(pi: ExtensionAPI) {
 		// "new" starts a fresh transcript, so re-kick. "resume"/"fork" keep
 		// their history — the per-turn standing orders are enough there.
 		if (event.reason === "startup" || event.reason === "new") {
+			// Gru ALWAYS runs on openai-codex/gpt-6-astra @ xhigh thinking
+			// (user ruling 2026-09-07: the reasoning tier is GPT — Gru, Bob,
+			// Perkins round mains + ALL 3D/game/Blender agents ride Astra
+			// xhigh). Set at launch (`session_start` -> pi.setModel +
+			// pi.setThinkingLevel), no manual /model; relaunch hardened by
+			// bin/night-watchman (clears PI_MODEL/PI_PROVIDER, pins the
+			// model + thinking). No silent legacy fallback — if Astra is
+			// unavailable the current model stays + an error notifies.
+			// Prior reasoning chain (kimi k3 / glm-5.3 / HOLD) superseded;
+			// see 'Model policy'.
+			const model = ctx.modelRegistry.find("openai-codex", "gpt-6-astra");
+			if (model) {
+				const ok = await pi.setModel(model);
+				if (!ok) {
+					ctx.ui.notify("Gru: no auth for openai-codex/gpt-6-astra — staying on the current model", "error");
+				} else {
+					await pi.setThinkingLevel("xhigh");
+				}
+			} else {
+				ctx.ui.notify("Gru: openai-codex/gpt-6-astra not in the model registry — staying on the current model", "error");
+			}
 			await pi.sendUserMessage(GRU_STARTUP_CHECKLIST);
 		}
 	});

@@ -190,13 +190,14 @@ the essentials.)
   ships); a g-wave COMPENSATION verdict (a subset of lenses delivering a
   valid verdict) counts as valid.
   Visual checks (goldens, sprites): verify MECHANICALLY first
-  (byte/hash/capture-diff); when a visual judgment is unavoidable, run
-  the `vision-read` skill on `lmstudio/qwen/qwen3.8-27b` — the
-  describe_image auto-delegation is retired (user ruling 2026-08-18),
-  never trust a text-only model's eye. On any non-k3 round, the
-  **vision caveat** applies verbatim: pixel verification MECHANICAL only
-  (byte/hash/capture-diff), aesthetic verdicts deferred for the k3
-  re-check, never faked.
+  (byte/hash/capture-diff). Perkins rides Astra (`openai-codex/gpt-6-astra`,
+  2026-09-07 GPT ruling) — natively multimodal, so inline image reads are
+  allowed, but mechanical-first stands and the USER remains the aesthetic
+  verdict (their look rulings supersede any model opinion); a visual claim
+  the user has not seen is flagged, never blessed. On a legacy blind-model
+  session the `vision-read` skill routes the read. The describe_image
+  auto-delegation stays retired (2026-08-18); never trust a text-only
+  model's eye.
   You MUST close every lens pane before finishing.
 - **Verdict → review event:**
   - 0 blockers → `--approve`

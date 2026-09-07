@@ -21,22 +21,22 @@ across restarts and workspace moves):
 
 | Target | Tab label | Relaunch command |
 |---|---|---|
-| Silas (COO) | `silas` | `env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1 pi --model deepseek/deepseek-v4-flash` |
-| Gru (CEO) | `Gru` | `env -u PI_SILAS PI_GRU=1 pi --model <k3\|glm-5.3> --thinking max` |
+| Silas (COO) | `silas` | `env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1 pi --model openai-codex/gpt-5.6-luna --thinking max` |
+| Gru (CEO) | `Gru` | `env -u PI_SILAS PI_GRU=1 pi --model openai-codex/gpt-6-astra --thinking xhigh` |
 
-Silas's model is pinned (COO model ruling 2026-09-06 — deepseek API
-billing, no session limits; availability is the point). The launch env
-clears `PI_MODEL` + `PI_PROVIDER` so a leaked env cannot override the
-pin (the 2026-09-06 11:47Z relaunch leaked `PI_MODEL=k3` over the
-silas.ts extension pin — the COO landed on the reasoning tier's model).
-Fallback if deepseek 402s (balance wall): glm-5.3-flash interim + a
-user top-up (escalate) — never silently switch the COO tier.
+Silas's model is pinned (COO model ruling 2026-09-07 —
+`openai-codex/gpt-5.6-luna` @ max). The launch env clears `PI_MODEL` +
+`PI_PROVIDER` so a leaked env cannot override the pin (the 2026-09-06
+11:47Z relaunch leaked `PI_MODEL=k3` over the silas.ts extension pin —
+the COO landed on the reasoning tier's model). No legacy fallback: if
+the openai-codex subscription is unavailable the current model stays +
+an error notifies (escalate) — never silently switch the COO tier.
 
 Gru's model is pinned at relaunch time through the **quota probe gate**
-(`bin/quota-probe`): `kimi-coding/k3` primary, `zai-coding-cn/glm-5.3`
-fallback. **Never** `deepseek-v4-pro` (cost-ban) and **never** flash
-(reasoning tier) — if both probe DOWN the watchman notifies and does NOT
-relaunch rather than boot a wrong-tier Gru.
+(`bin/quota-probe`): `openai-codex/gpt-6-astra` (user ruling 2026-09-07;
+the legacy kimi/glm/deepseek chains are retired). If Astra probes DOWN
+the watchman notifies and does NOT relaunch rather than boot a
+wrong-tier Gru.
 
 ## Safety invariants (hardened 2026-08-21 after the first live day)
 
@@ -230,9 +230,10 @@ NIGHT_WATCHMAN_TARGETS='no-such-tab|ghost|env -u PI_GRU -u PI_MODEL -u PI_PROVID
 
 For the model gate: `NIGHT_WATCHMAN_PROBE=<stub>` overrides the probe tool
 (`--self-test` uses an internal stub; a live run against the real
-`bin/quota-probe` shows today's pin decision, e.g. k3 403 → glm-5.3). A
+`bin/quota-probe` shows today's pin decision, e.g. astra probed →
+`openai-codex/gpt-6-astra --thinking xhigh`). A
 reasoning-tier test target (`...|reasoning`) + stub pin verifies the
-relaunch command carries `--model <k3|glm-5.3> --thinking max`.
+relaunch command carries `--model openai-codex/gpt-6-astra --thinking xhigh`.
 
 ## Disable
 
@@ -257,8 +258,8 @@ rm ~/Library/LaunchAgents/com.moses.code.night-watchman.plist
 - The **incident classes are simulated** (sandbox recipe above, 2026-08-21
   hardening job): boot-race grace, real-death relaunch into the correct
   pane (no tab split), live-agent no-op, missing tab + stray split STOPs.
-- The **model gate** is unit-tested (k3 → glm-5.3 → abort; never
-  v4-pro/flash) and exercised live (k3 403 → glm-5.3 pinned, 10:32Z
+- The **model gate** is unit-tested (astra → xhigh pin; astra-down → abort;
+  never a legacy model; silas ops → luna max) and exercised live (astra pinned after a probe recovery
   08-21).
 - **Kill tests remain human-run** — the watchman has no kill path by
   design (asserted in `--self-test`).
