@@ -97,7 +97,7 @@ and pins `--model deepseek/deepseek-v4-flash` (the 11:47Z 2026-09-06
 relaunch leaked `PI_MODEL=k3` over the extension pin). Fallback if
 deepseek 402s (balance wall): glm-5.3-flash interim + escalate to the
 user for a top-up. The COO's work is execution-grade; the reasoning tier
-(Gru/Perkins/Bob) is k3-primary per 'Model policy'.
+(Gru/Bob) is k3-primary per 'Model policy'; Perkins runs glm-5.3.
 
 **Silas owns (Gru never touches):** every nefario-watch alert (classify
 via transcript, act, ledger) · every ledger transition (`bin/ledger
@@ -262,9 +262,12 @@ a mid-work round PARKS (resume via probe flip + continue).
 **flash tiers (`deepseek-v4-flash`, `zai-coding-cn/glm-5.3-flash`) are
 ops/coding ONLY** — glm-5.3-flash joined the watchman's
 FORBIDDEN_REASONING list 2026-08-27. Reasoning roles:
-**Gru** (persona, relays, escalations, briefing authorship), **Perkins**
-(code review — the last line of defense), **Bob** (dream: consolidation +
-lesson curation). Low-volume, judgment-heavy roles. Belt rows stay
+**Gru** (persona, relays, escalations, briefing authorship) and **Bob**
+(dream: consolidation + lesson curation) ride the k3-primary chain.
+**Perkins (code review — the last line of defense) runs on
+`zai-coding-cn/glm-5.3`** (user ruling 2026-09-07 — effective for ALL NEW
+round dispatches, round mains AND lens fleets; PROBE-FIRST the round's
+model at every dispatch). Low-volume, judgment-heavy roles. Belt rows stay
 merge-gated (the user holds merges).
 
 **PROBE-FIRST at every reasoning dispatch** (`bin/quota-probe`; regime
@@ -336,8 +339,10 @@ The provider default is `settings.json` `defaultProvider` = `deepseek`
 (→ v4-flash), so **UNSET-model dispatches land on flash** — briefings
 ALWAYS name `deepseek/deepseek-v4-flash` explicitly (the dispatch
 `--model` carries it; the session modelId is verified after every
-launch). Gru / Perkins / Bob launches name `kimi-coding/k3` (fallback:
-`zai-coding-cn/glm-5.3`; HOLD if both down). Silas is pinned to
+launch). Gru / Bob launches name `kimi-coding/k3` (fallback:
+`zai-coding-cn/glm-5.3`; HOLD if both down). **Perkins launches name
+`zai-coding-cn/glm-5.3`** (user ruling 2026-09-07 — round mains AND lens
+fleets; probe-first at every dispatch). Silas is pinned to
 deepseek/deepseek-v4-flash by `.pi/extensions/silas.ts`.
 
 ## Durable state
@@ -662,7 +667,8 @@ Only an explicit waiver mutes a round.
 ### Silas dispatch sequence (on the Perkins sensor message)
 
 Full 7-step sequence (verify head · round N · detached worktree · briefing
-+ lens-guards + vision caveat · launch on `kimi-coding/k3` + verify
++ lens-guards + vision caveat · launch on `zai-coding-cn/glm-5.3`
+(Perkins model, user ruling 2026-09-07; probe-first) + verify
 modelId · `ledger add` round row · round close-out with blocked
 recovery): **`docs/playbook-annex.md` — 'Perkins — the lens run' and
 'Perkins — round-budget evidence & incidents'.** Essentials: use the
@@ -867,3 +873,11 @@ truth; this appendix carries how we got here.
   `PI_MODEL`/`PI_PROVIDER` and pins `--model deepseek/deepseek-v4-flash`
   (the 11:47Z 2026-09-06 relaunch leaked `PI_MODEL=k3` over the
   extension pin — the COO landed on the reasoning tier's model).
+- **2026-09-07** — **Perkins model ruling: code review runs on
+  `zai-coding-cn/glm-5.3`** — effective for ALL NEW round dispatches
+  (round mains AND lens fleets; update the code-review skill's model pin +
+  the dispatch chain). In-flight rounds complete on their launched model;
+  a mid-work 403 retry lands on glm-5.3. VISION CAVEAT now applies to
+  EVERY Perkins round (glm-5.3 is blind — pixel checks MECHANICAL only).
+  COO-only-scope NOT: Gru/Bob stay on the k3-primary chain. Supersedes
+  Perkins riding the k3-reasoning chain.
