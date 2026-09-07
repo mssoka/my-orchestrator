@@ -133,7 +133,12 @@ the user at the Gru session in `/Users/moses/code`.
   scope, design-audit blur-test columns, MM press-kit no-fetch
   supersede): relay + verify, never kill-and-redispatch — a briefing
   guardrail yields to a USER RULING via relayed amendment, never to
-  minion initiative.
+  minion initiative. 2026-09-07 addendum (dream-2026-09-07; ×3:
+  09-05 ×1, 09-06 ×2): the delivery grep races the session FLUSH —
+  a 0-hit grep seconds after the relay is a pre-flush miss, NOT a
+  delivery failure ("first grep 0 = flush race, second 2 hits"):
+  wait and re-grep before resending — a resend double-queues the
+  relay.
 - **A pi launched with cwd=`/Users/moses/code` IS Gru** — gru.ts guards on
   `ctx.cwd` alone, so the session gets the startup checklist as a user
   message + Gru standing orders every turn, and its session file lands in
@@ -312,7 +317,11 @@ the user at the Gru session in `/Users/moses/code`.
   resizes + layout reads → all even
   at 12 rows; surgery on a LIVE round is safe if no pane is closed or
   moved. Playbook + lens-skill-template amendments ride the next docs
-  pass.
+  pass. 2026-09-07 addendum (dream-2026-09-07; 09-06 startup ops,
+  the perkins-r2-lenses ladder 6/1/7/14/27/55/110): semantics
+  sharpened — `--amount` is a ratio DELTA on the boundary adjacent
+  to the addressed pane edge; a 7-pane split ladder evened to
+  7×31-32 cols in one pass (6 resizes), live round untouched.
 - **_local-refs/ is the intake lane for external reference assets
   (2026-08-21/22, ×3 drops).** IP-sensitive or user-generated
   references (MM press kit 9 JPGs, design-video DIRECTION.md, Suno
@@ -324,6 +333,19 @@ the user at the Gru session in `/Users/moses/code`.
   root 403s symlinks): serve via a loopback pane (`python3 -m
   http.server 4388 --bind 127.0.0.1` rooted at _local-refs) and
   reference `http://127.0.0.1:4388/...` in the HTML.**
+
+- **Silas self-edit lanes: user-ruled canon/config ships as Silas'
+  own micro-PRs (2026-09-07, dream-2026-09-07; ×3 same day —
+  orchestrator #17, PP3D #15, RTA #187).** The shape: pr_review=0,
+  no lavish, no minion — worktree @ origin/<base>, content VERBATIM
+  from the ruled source, heading levels adapted, a RECEIPT CONTRACT
+  verified in the diff (ERA-2/3/4/5/NIGHT all park = 5 matches;
+  LSTACK ONLY in Dropped), self-test extended for tooling changes.
+  Close-out notes the lane is sensor-blind (no minion pane) — sweep
+  worktree + branch, and on the LIVE main checkout use
+  `pull --ff-only` (fetch-into-checked-out-branch refuses). PR
+  bodies with backticks: write from a FILE, never a heredoc (the
+  08-13 backtick-eating class on a new surface).
 
 ### Provider incidents
 
@@ -583,6 +605,21 @@ the user at the Gru session in `/Users/moses/code`.
   reads INTERMITTENT same-day — strict-OK at one dispatch,
   chatty-OK an hour later) — reply CONTENT decides; the
   quota-probe matcher hardening remains OWED.
+  2026-09-07 addendum (dream-2026-09-07; alive-planet r4/r6 + the
+  glm-only window 09-05/06): the k3 5-HOUR wall lands BETWEEN the
+  dispatch probe and the wave (probe-at-dispatch is not a round-long
+  guarantee): a mid-round cap death = sweep all panes, preserve
+  attempt-1 artifacts (`<round>-attempt1-k3-403/`), RETRY THE SAME
+  ROW on glm-5.3 at the same sha (attempt-N, never rN+1; the VISION
+  CAVEAT rides). k3's freed windows RE-CAP ~90 min after each reset
+  — route long 2-wave rounds to glm proactively rather than
+  gambling a 90-min window. Same window's 1302 signature: under
+  glm-only load the burst is a ~1-per-spawn tax on the round MAIN
+  (dies on timeouts post-spawn while lenses survive and complete;
+  the 08-27 wave-spawn 0-JSON flavor) — pi auto-retry absorbs a
+  share, so classify by transcript first, then exactly ONE continue
+  per dead pane; ~1 continue/round across 5+ consecutive rounds,
+  never a re-dispatch, never a hold.
 - **Model dispatch & correction ops (2026-08-09).** Only a
   `provider/model` path naming an AUTHED provider works: bare
   `kimi-coding` fails (it's a PROVIDER with a key in auth.json, not a
@@ -639,7 +676,15 @@ the user at the Gru session in `/Users/moses/code`.
   typed to a WORKING (not errored) pane ends the current turn cleanly
   — ALWAYS pair with an explicit continue (6.2-r1 stalled
   09:25Z→12:49Z on a bare mid-flight /model; one continue recovered a
-  complete verdict).
+  complete verdict). 2026-09-07 addendum (dream-2026-09-07; the
+  PI_MODEL=k3 leak, gru-journal 09-06): env model vars beat an
+  extension's setModel pin at relaunch (silas.ts set flash
+  11:47:20, the leaked PI_MODEL=k3 overrode 11:47:27), AND a live
+  /model correction REVERTS to the env model on the next errored
+  turn (the 12:05Z flash correction reverted to k3 at 12:07Z).
+  Identity-pane relaunches clear PI_MODEL/PI_PROVIDER and pin
+  --model explicitly (hardened in the watchman same day; the COO
+  deepseek ruling lives in the playbook's Silas section).
 - **Serialize concurrent Perkins BURSTS (2026-08-11; models renamed 2026-08-12; SUPERSEDED 2026-08-16).**
   **2026-08-16 USER RULING: FULL THROTTLE on all providers — the serialize-on-quota
   doctrine below is LIFTED.** Dispatch rounds as needed, no holding behind
@@ -757,6 +802,15 @@ the user at the Gru session in `/Users/moses/code`.
   decision at close-out (skip if APPROVED per the #585 precedent;
   superseded by the fix push if CHANGES_REQUESTED — 7.2 08-17,
   executed as written across 3 doc-only commits).
+  2026-09-07 addendum (dream-2026-09-07; ×7 across 09-05/06): the
+  QUOTA-FLIP injector joins the echo family — probe flips (k3
+  UP/DOWN) re-fire on events the round rows already acted on (the
+  15:47Z DOWN flip re-fired the ~15:10Z cap death r4 attempt-1 had
+  already retried on glm; an UP flip = confirmation of already-
+  executed routing), and the review sensor raced the r2 pre-add by
+  seconds (tf-in-ci 15:50Z). Same answer as every echo: a
+  same-status note quoting the sha + the action already taken,
+  never a second action.
 - **Perkins can self-close its round row (2026-08-02).** Closing the
   Perkins pane writes `working -> done` before Silas' close-out
   `set done`, which then no-ops (same-status) and eats the verdict
@@ -1002,6 +1056,18 @@ the user at the Gru session in `/Users/moses/code`.
   hold gates on RED only; a fresh r1 dispatch is OK on 4/5 pass + 1
   pending ("UNSTABLE=pending, not red" — #36 r1 08-13, #28 08-12).
   Treating pending as red needlessly blocks fresh rounds.
+  2026-09-07 addendum (dream-2026-09-07; router-family r1 +
+  alive-planet r1 09-05, wif-durable r1 09-06): the CONFLICTING/
+  rebasing flavor — pre-create the HELD row with the pre-rebase sha
+  named DEAD verbatim ("never review it") + the release trigger
+  (rebase lands / PR mergeable); release re-resolves the fresh head
+  and updates the note (43516f3 DEAD → released at 859e2e1 →
+  APPROVED; fa21cf3 → d7edd8a). Sibling sweep rule: a mid-round head
+  move closes by FRESH CENSUS — list cwd-matched panes at sweep
+  time, NEVER from remembered ids (ids drift; orphaned lens
+  processes persist at dead cwds after the worktree is removed;
+  "3 incidents now") — then re-create the round main and verify
+  modelId.
 - **Perkins round ops: empty-lens standing trigger, push-hold
   discipline, vision caveat (2026-08-18/19, dream-2026-08-19).**
   (a) USER RULING (5.11-terminal-types arc): if acceptance/architecture
@@ -1091,6 +1157,26 @@ the user at the Gru session in `/Users/moses/code`.
   missed (an atomic-edit casualty), and the fix-audit mutation leg
   for harness gates is ABORT-MUST-FAIL (re-type the crash →
   suite RED).
+  2026-09-07 addendum (dream-2026-09-07; alive-planet r3-r6,
+  tf-in-ci r2, l1-refine-1 r2): the CLAIMED-BUT-DIDN'T-LAND class
+  is a first-class fix-audit hunt leg — fold commits claimed pins
+  that grep + mutation disprove (a river-width pin claimed 4
+  consecutive rounds, never written — "the pin must be IN THE
+  SUITE, not the commit message"; tf-in-ci's header + tripwire
+  both false on gcloud-verify). NEW mechanism: a constant
+  EXTRACTION can silently INVERT the value (ISLET_TOP_FRAC
+  0.38->0.62, suite green — no islet-geometry pin existed): every
+  extracted constant needs a value pin, and every fix claim gets
+  grep-verified against the tree AND mutation-proven before the
+  audit credits it. 2026-09-07 addendum-b (the user-play gate
+  hardens into round ops; l1-look-parity r1, alive-planet,
+  art-integration, l1-arpanet): (a) a USER PLAY/LOOK SESSION IN
+  PROGRESS gets a HOLD note on the row the moment it starts — NO
+  worktree sweeps, NO pane closes until the user reports done (the
+  Perkins round runs mechanical-only in parallel, unaffected);
+  (b) the user's MERGE CLICK ratifies a disclosed aesthetic
+  deviation (art-integration's KYLE-driven fresnel deviation,
+  ratified at merge) — the click IS the aesthetic verdict.
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
@@ -1455,7 +1541,10 @@ the user at the Gru session in `/Users/moses/code`.
   review: .' with the URL missing entirely (the done note read
   'review: posted-on-PR-125'). A placeholder is record-loss: FETCH
   the review id at close-out and write the full URL, or the
-  permanent ledger loses the anchor.
+  permanent ledger loses the anchor. Sibling 2026-09-07
+  (dream-2026-09-07; RTA verify 09-05): never guess PR NUMBERS
+  either — a guessed #9 vs the row's #180 sent the verify to the
+  wrong PR; read the row's `pr` field FIRST.
 
 - **`pr_review` is a LEDGER KEY, not a note string (2026-08-12, ~11h of sensor blindness).** The Perkins sensor's gate is `job.pr_review === 1` read from the COLUMN. Writing "pr_review 1" into the `ledger add` note leaves the column at its 0 default and the review-sensor silently skips the job — 5 jobs blind (~11h: 3.3/3.4/4.1/rc1-1/rc4-3/rc4-4/4.2, every Perkins round in that window was a manual/held dispatch; only 3.2 fired because its row was SQL-fixed at 12:16Z). ALWAYS pass `pr_review=<n>` as an add-key when the briefing mandates it. VERIFY the column after add (`sqlite3 ... SELECT pr_review`), don't trust the note. Sensor-down fallback: at every minion completion/settle, sweep in-review pr_review=1 jobs — no round row carrying the current head sha + head stable → dispatch manually, never wait on the sensor.
   2026-08-13 addendum (dream-2026-08-13): manual/held dispatch is what
@@ -1526,6 +1615,14 @@ the user at the Gru session in `/Users/moses/code`.
   byte/pixel gates decided). Craft: emit geometry.json anchors FROM the
   renderer, PIL-measure against them, let KYLE corroborate — the
   measurement decides, the vision screen ranks.
+  2026-09-07 addendum (dream-2026-09-07; alive-planet hard
+  correction 09-05, L1 look session 09-06): KYLE's second standing
+  job on look lanes — CORROBORATE USER SCREENSHOT CRITIQUES before
+  the amendment is relayed ("not sure the references were looked
+  at" → KYLE verified barren-water-world/clipping/desaturated; L1:
+  KYLE corroborated SRI slab float+tilt, tipped ring, 11px
+  captions). The user's eye reports, KYLE evidence-grades, the
+  amendment carries both.
 
 ### Video lane (standing rules, user-ruled 2026-08-29/30)
 
@@ -1636,6 +1733,15 @@ the user at the Gru session in `/Users/moses/code`.
   paneless held rows need a briefing-column backfill check (caught
   empty once); when a release authorization crosses an in-flight
   close-out escalation, verify SINGLE dispatch (one row/pane/worktree).
+  2026-09-07 addendum (dream-2026-09-07; model-single-source +
+  tf-in-ci 09-05, l1-look-parity 09-06): held rows are the
+  AMENDMENT SURFACE while they wait — fold user rulings +
+  Perkins-warning scope into the staged briefing DURING the hold
+  (the v2 LEAN-SWAP rewrite landed mid-hold), and the release step
+  RE-READS the amended briefing + re-resolves the fresh head. Each
+  predecessor row carries its successor's note so the close-out
+  can't miss the release (the 3-link RTA chain 38-sweep →
+  single-source → tf-in-ci ran end-to-end on this in one day).
 - **Sensor-doctrine sync (P2, standing rule):** ANY doctrine amendment
   task must grep the sensor/watcher configs (`.pi/extensions/*.ts`) for
   the retired doctrine being amended — the cap-3 echo class lived in

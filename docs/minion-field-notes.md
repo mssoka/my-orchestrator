@@ -744,6 +744,59 @@ findings that keep recurring. One line per entry, dated, with the job id.
   rolls back ALL edits in the call (a 4-edit apply lost 3 of 4;
   caught by re-grep). Re-grep after every multi-edit apply; keep
   oldText minimal so a miss is diagnosable.
+- 2026-09-07 (dream-2026-09-07; gdd-amend-alive-planet +
+  gdd-amend-cumulative, "×3 now"): `gh pr create --body "$(cat
+  <<'EOF' …)"` dies on quoting with apostrophe/backtick-rich
+  markdown even when carefully quoted — write the body to a temp
+  file and pass `--body-file` on the FIRST attempt, not the second.
+- 2026-09-07 (dream-2026-09-07; l1-topology-font + scene-refactor):
+  the godot MCP LSP is NOT ground truth — it serves the MAIN
+  checkout root (worktree files analyze as outsiders: phantom
+  "hides a global script class" / "not declared" for NEW classes)
+  and holds the PRE-MOVE class cache after refactors (140 phantom
+  diagnostics citing old paths; res:// existence checks lag new
+  files). Ground truth = the on-disk
+  `.godot/global_script_class_cache.cfg` + per-file `--check-only
+  --script`; `pkill -f "godot.*--lsp"` forces a fresh spawn (0
+  real diagnostics after).
+- 2026-09-07 (dream-2026-09-07; l1-topology-font + scene-refactor):
+  Godot editor-viewport captures — control the environment and pick
+  the right gate: macOS occlusion throttling freezes WINDOWED
+  captures (identical frames; fullscreen puts the window on an
+  active Space; CONTENT_SCALE_MODE_CANVAS_ITEMS+EXPAND keeps true
+  proportions), and PNG md5 is NOT a determinism gate (the editor
+  viewport drifts ±1px with window/dock layout — same-code renders
+  gave 3 md5s). Gate on a structural pixel diff (12× downscale +
+  blur, grayscale): noise floor max≈1, real composition change
+  reads max 110+.
+- 2026-09-07 (dream-2026-09-07; model-single-source + tf-in-ci):
+  bmad-build can't render where the repo-local `_bmad` lacks
+  `_bmad/scripts/render_skill.py` (older installs; bmad-quick-dev
+  is GONE from the canonical home) — the waiver path: read the
+  skill's step files / `review-prompts/*.md` directly from the
+  skill dir (template placeholders like `{workflow.review_layers}`
+  stay unresolved — improvise the named layer from the playbook's
+  lens list) + a waiver note in the PR body; a self-contained
+  briefing carries the rest.
+- 2026-09-07 (dream-2026-09-07; tf-in-ci r1/r2 + prod-deploy triage
+  09-05/06): GCP IAM claims are verified against the provider or
+  not made — predefined-role MEMORY is wrong in both directions
+  (bigquery.viewer and resourcemanager.projectIamViewer DON'T
+  exist; roles/aiplatform.viewer carries specialistPools.update =
+  WRITE), so gcloud-verify every roles/* string's existence AND
+  full permission list before it reaches tfvars, and read IAM
+  bindings via `gcloud ... get-iam-policy --format=json` parsed
+  programmatically (text output collapses compound principalSets —
+  a phantom missing grant sends the user on a wrong-fix chase). A
+  rerun failing AFTER a fix's timestamp means the fix was WRONG,
+  not absent.
+- 2026-09-07 (dream-2026-09-07; RTA #185 + wif-durable + #190,
+  09-05/06): a new-CI maiden-voyage RED is a bootstrap-ORDERING
+  issue until proven otherwise (user-owed applies/variables, not a
+  workflow code fix — check the bootstrap checklist FIRST), and
+  `gh pr checks` renders CANCELLED runs as fail lines — check the
+  run conclusion field before triaging (#190's 'failing' check = a
+  cancelled 3s concurrency-noise run).
 
 ## Conventions that saved time
 
@@ -1029,6 +1082,33 @@ findings that keep recurring. One line per entry, dated, with the job id.
   PP3D_NormalizedScale), never pick a winner between two claims
   (max_span 10-vs-14/16/18 resolved against data/pipe_tiers.json —
   10 was the DISABLED tier).
+- 2026-09-07 (dream-2026-09-07; gdd-amend-alive-planet +
+  gdd-amend-levels): column-aligned markdown (ASCII boxes, tables)
+  — build replacement lines in python and ASSERT display width
+  (east-asian-aware; emoji count 2) BEFORE issuing the edit, and
+  re-render the region after (an inserted clarifier paragraph
+  silently orphaned an M5 table split; pad math inner=65 vs real 64
+  made every line 70).
+- 2026-09-07 (dream-2026-09-07; gdd-amend-alive-planet +
+  gdd-amend-cumulative): a canon amendment greps the OLD phrasings
+  repo-wide BEFORE editing (caught the tutorial-seed +
+  L1-remediation stragglers the section-level plan missed) and
+  DATE-STAMPS the supersede note at EVERY site the old claim lives
+  (D5's retirement clause had propagated to 4 sites) — an undated
+  site reads as current canon.
+- 2026-09-07 (dream-2026-09-07; gdd-amend-cumulative / -era-planets
+  / -levels): scope-guard courtesy — touch ONLY the files the
+  briefing names; ADJACENT-surface finds get flagged for a ruling
+  (decision log + PR body, or an in-page lavish decision form),
+  never silently fixed (the README stale comment rode the PR by
+  user ruling, zero cross-lane conflict). A user ask satisfied from
+  the repo's own canon records does NOT break the guard.
+- 2026-09-07 (dream-2026-09-07; gdd-amend-levels + era-costume
+  ladder): lavish decision forms that parse — per-row radios + ONE
+  Queue button produce machine-parseable tagged rulings (D1-D5
+  arrived clean); pair every form with a pros/cons explainer when
+  the options aren't self-evident (the user asked "explain this,
+  pros and cons" on exactly the two forms that lacked one).
 
 ## Recurring review findings
 
