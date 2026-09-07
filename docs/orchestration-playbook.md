@@ -313,6 +313,23 @@ applies ONLY to sessions still riding a legacy blind model; KYLE's
 provenance rules (verify through pi; models.json `input` declaration)
 stand unchanged.
 
+## Video lane routing
+
+- **Native Blender video production uses direct Blender MCP as the primary
+  route.** The previous Higgsfield bridge/blockout-to-AI pipeline is retired
+  for new native Blender work; the plugin is uninstalled. Do not repair,
+  reinstall, or make it a dependency for a native Blender lane.
+- **User ruling (verbatim):** "use the blender mcp directly. you don't have
+  to the higgsfield plugin. That has been uninstalled that is for block
+  production ofre the eventual a.i generation. we no longer need that. so
+  the minion should be free to be creative. and create a viral youtube
+  video."
+- Existing H3/other-video work remains untouched and follows its recorded
+  scope; this ruling does not cancel, rewrite, or authorize paid generation,
+  uploading, or publishing. `youtube-channel` remains a managed repo, and
+  new native Blender briefings must state the direct-MCP route and preserve
+  a user visual gate before broad expansion.
+
 ## Durable state
 
 - Job ledger: **SQLite** at `/Users/moses/code/_bmad-output/orchestrator.db`,

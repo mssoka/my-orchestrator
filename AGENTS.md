@@ -1641,11 +1641,19 @@ in the gotchas below as current routing.
   captions). The user's eye reports, KYLE evidence-grades, the
   amendment carries both.
 
-### Video lane (standing rules, user-ruled 2026-08-29/30)
+### Video lane (standing rules, user-ruled 2026-09-07)
 
-- **ALL video work routes through the higgsfield bridge** — standing
-  rule per the 08-29 youtube-scope line (Subo a Sion creative work is
-  the current instance). No ad-hoc video pipelines outside the bridge.
+- **Native Blender animation uses direct Blender MCP as the primary route**
+  for new video work. The previous Higgsfield bridge/blockout-to-AI
+  pipeline is retired for native Blender production; the plugin is
+  uninstalled. Do not repair/reinstall it or route new native Blender work
+  through it. Existing H3/other-video work stays untouched and follows its
+  recorded scope.
+- **User ruling (verbatim):** "use the blender mcp directly. you don't have
+  to the higgsfield plugin. That has been uninstalled that is for block
+  production ofre the eventual a.i generation. we no longer need that. so
+  the minion should be free to be creative. and create a viral youtube
+  video."
 - **`youtube-channel` is under management** — adopted 2026-08-30 per
   user ruling, recorded in `managed-repos.txt` (the studio repo for
   YouTube channel creative work). Intake/dispatch/ledger/Perkins/
