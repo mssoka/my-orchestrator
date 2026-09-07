@@ -85,19 +85,21 @@ His extension (`.pi/extensions/silas.ts`) injects his standing orders +
 startup checklist; nefario-watch is gated to `PI_SILAS=1`, so ALL sensors
 alert Silas — Gru's context stays clean.
 
-**Model:** Silas ALWAYS runs on **`deepseek/deepseek-v4-flash`** (user
-ruling 2026-09-06: API billing = no session limits; the COO must be
-available to coordinate — availability is the point of the ruling;
-supersedes the 08-27 glm-5.3-flash COO pin, which stays the
-minion/mega-minion ops default, untouched) — set
+**Model:** Silas ALWAYS runs on **`openai-codex/gpt-5.6-luna` @ max thinking**
+(user ruling 2026-09-07: GPT subscription — the COO tier is Luna, max;
+supersedes the 09-06 deepseek-v4-flash pin, which superseded the 08-27
+glm-5.3-flash pin) — set
 AUTOMATICALLY by `.pi/extensions/silas.ts` at launch (`session_start` ->
-`pi.setModel`), no manual `/model`; notifies if missing or unkeyed, and
+`pi.setModel` + `pi.setThinkingLevel`), no manual `/model`; notifies if
+missing or unkeyed, and
 hardened at relaunch: `bin/night-watchman` clears `PI_MODEL`/`PI_PROVIDER`
-and pins `--model deepseek/deepseek-v4-flash` (the 11:47Z 2026-09-06
-relaunch leaked `PI_MODEL=k3` over the extension pin). Fallback if
-deepseek 402s (balance wall): glm-5.3-flash interim + escalate to the
-user for a top-up. The COO's work is execution-grade; the reasoning tier
-(Gru/Bob) is k3-primary per 'Model policy'; Perkins runs glm-5.3.
+and pins `--model openai-codex/gpt-5.6-luna --thinking max` (the 11:47Z
+2026-09-06 relaunch leaked `PI_MODEL=k3` over the extension pin). No
+silent legacy fallback — if Luna is unavailable the current model stays +
+an error notifies (availability escalates to the user). The COO's work is
+execution-grade; the reasoning tier
+(Gru/Bob) is astra xhigh per 'Model policy'; Perkins runs astra xhigh;
+3D agents ride astra xhigh.
 
 **Silas owns (Gru never touches):** every nefario-watch alert (classify
 via transcript, act, ledger) · every ledger transition (`bin/ledger
@@ -249,101 +251,67 @@ Silas startup checklist: read ${PLAYBOOK} sections 'Silas (COO)', 'Tracking (Sil
 
 ## Model policy
 
-Two allocations, by ROLE — the orchestrator's reasoning roles vs its
-execution roles. NOT by project. Superseded rulings: changelog appendix +
+Allocations by ROLE + a 3D OVERRIDE — not by project. Superseded rulings
+(kimi k3 / glm-5.3 / deepseek / v4-pro-ban chains): changelog appendix +
 `docs/playbook-annex.md`; the body below is the single current truth.
 
-**REASONING TIER — `kimi-coding/k3` PRIMARY → `zai-coding-cn/glm-5.3`
-fallback → HOLD:** reasoning dispatches probe `kimi-coding/k3` →
-`zai-coding-cn/glm-5.3` → **HOLD**. BOTH down → NO reasoning dispatches;
-a mid-work round PARKS (resume via probe flip + continue).
-**`deepseek/deepseek-v4-pro` is BANNED from the reasoning tier** (cost)
-— zero duties, not even mechanical fix-audits;
-**flash tiers (`deepseek-v4-flash`, `zai-coding-cn/glm-5.3-flash`) are
-ops/coding ONLY** — glm-5.3-flash joined the watchman's
-FORBIDDEN_REASONING list 2026-08-27. Reasoning roles:
-**Gru** (persona, relays, escalations, briefing authorship) and **Bob**
-(dream: consolidation + lesson curation) ride the k3-primary chain.
-**Perkins (code review — the last line of defense) runs on
-`zai-coding-cn/glm-5.3`** (user ruling 2026-09-07 — effective for ALL NEW
-round dispatches, round mains AND lens fleets; PROBE-FIRST the round's
-model at every dispatch). Low-volume, judgment-heavy roles. Belt rows stay
-merge-gated (the user holds merges).
+**GPT CHAIN (user ruling 2026-09-07 — ChatGPT subscription; exact IDs
+verified from the pi registry 2026-09-07: `openai-codex/gpt-6-astra` =
+Astra, `openai-codex/gpt-5.6-sol` = Sol, `openai-codex/gpt-5.6-luna` =
+Luna; all three natively multimodal + reasoning; thinking levels Astra/Sol
+= `xhigh`, Luna = `max` — verified through pi).**
+
+**REASONING TIER — `openai-codex/gpt-6-astra` (Astra) @ `xhigh`:**
+**Gru** (persona, relays, escalations, briefing authorship), **Bob**
+(dreams: consolidation + lesson curation), **Perkins** (code review —
+the last line of defense; round mains AND lens fleets), and **ALL 3D
+work**: every agent performing 3D/game/Blender animation work —
+including 3D mega-minions and 3D lens reviews — rides Astra xhigh
+(the 3D override beats the generic Sol default). Low-volume,
+judgment-heavy roles. Belt rows stay merge-gated (the user holds merges).
+
+**EXECUTION TIER:**
+- **Silas (COO)** — ops, relay, coordination, dispatches:
+  **`openai-codex/gpt-5.6-luna` (Luna) @ `max` thinking** (user ruling
+  2026-09-07). Supersedes the 09-06 deepseek-v4-flash COO pin. No silent
+  legacy fallback — if Luna is unavailable the current model stays + an
+  error notifies (availability escalates to the user).
+- **ALL other minions** (implementation) and **mega-minions**
+  (well-specified sub-tasks, NON-3D): **`openai-codex/gpt-5.6-sol`
+  (Sol) @ `xhigh`** — the fleet workhorse. Non-3D review lens
+  mega-minions follow Sol; 3D lenses follow Astra (the 3D override).
+- **Legacy models (kimi/glm/deepseek) are RETIRED from new dispatches**
+  — superseded 2026-09-07. Historical doctrine (the k3/glm HOLD chain,
+  v4-pro ban, 402 class, 1302 concentration, glm-5.3-flash ops tier)
+  is archived in the changelog + `docs/playbook-annex.md`.
 
 **PROBE-FIRST at every reasoning dispatch** (`bin/quota-probe`; regime
-file `_bmad-output/memory/quota-regime.json` is the record): probe before
-routing AND before any switch BACK to k3/glm. "X is back" is UNRELIABLE
-mid-cycle; a freed rolling window is NOT headroom; a cap message's stated
-reset time LIES — only the probe decides. A probe-DOWN row with an empty
-error can be a transient false read — re-probe once.
+file `_bmad-output/memory/quota-regime.json` is the record): probe
+`openai-codex/gpt-6-astra` before routing. With a subscription the
+failure mode is rate-limit / auth, not per-token balance — but the
+discipline stands: "X is back" is UNRELIABLE; only the probe decides. A
+probe-DOWN row with an empty error can be a transient false read —
+re-probe once. The chatty-OK false-DOWN matcher bug is a known read
+(reply CONTENT decides, never the strict match alone).
 
 **LAUNCHED-MODEL RULE — model flips apply to NEW dispatches only:** an
-in-flight job stays on its launched model. A provider WALL mid-round =
-`/model <the other of k3/glm>` + ONE continue (never continue-spam); if
-BOTH are down = PARK the round (resume at the probe flip; NEVER a v4-pro
-continue).
+in-flight job stays on its launched model. A provider wall mid-round =
+one continue; if Astra is down = HOLD new reasoning dispatches until the
+probe flips (never a legacy-model continue).
 
-**1302 CONCENTRATION:** with k3 cycle-capped, ALL reasoning rides glm and
-the account 1302-bursts EPISODICALLY (fleet-wide waves) — one continue per
-errored pane clears it, hold NEW glm fan-outs until the wave settles,
-escalate only if continues stop clearing.
+**Launch label = the FULL path always** — `openai-codex/gpt-6-astra`,
+`openai-codex/gpt-5.6-sol`, `openai-codex/gpt-5.6-luna` (provider/model
+prefixed; bare labels misroute). Thinking is pinned per launch too
+(`--thinking xhigh` / `--thinking max`) and at session_start by the
+identity extensions (gru.ts/silas.ts).
 
-**Launch label = the FULL path always** (bare labels misroute — the label
-is `kimi-coding/k3` / `zai-coding-cn/glm-5.3`, never a bare `kimi`/`glm`).
-
-**Capability axis — VISION:** superseded 2026-08-21 by the KYLE
-routing below (single voice). The 08-18 local-lmstudio doctrine it
-replaced is archived in `docs/playbook-annex.md` ('Vision
-provenance').
-
-**VISION ROUTING (user ruling 2026-08-21 — supersedes the 08-18 local
-lmstudio doctrine):** the vision mega-minion is named **KYLE**. (a)
-`kimi-coding/k3` sessions have NATIVE vision — attach the image, no
-spawn. (b) On any blind model (glm-5.3, deepseek flash — no image
-input), ALL agents route image reads through Kyle. Two spawn modes:
-- **Quick read** ("what does this screenshot show?") — headless one-shot:
-  `env $(env|grep '^PI_'|sed 's/=.*//;s/^/-u /'|tr '\n' ' ') pi --model
-  zai-coding-cn/glm-4.6v -p --no-session -nt @<image> "<question>"`.
-Batch 3–6 frames per summon, do not spam.
-- **Code-context verification / art-direction analysis** — spawn as a full
-  agent with `--cwd <relevant repo/worktree>` (tools armed): Kyle reads
-  the render code, goldens, and tests around the image, and answers WITH
-  file evidence (e.g. a golden-diff verdict naming the draw call and
-  file). The summon prompt ALWAYS carries why-it-was-summoned + pointers.
-Provenance rules: full path `zai-coding-cn/glm-4.6v` always pinned
-(glm-5v-turbo ruled 08-21 but NOT subscription-available — glm-4.6v is
-the standing vision model); verify through pi (reply must demonstrate it
-saw the image; session jsonl modelId is ground truth) — never trust
-self-reported ids. models.json entries MUST declare `"input": ["text",
-"image"]` or pi bounces the attachment. `describe_image`
-auto-delegation stays REMOVED (08-18). NO vision deferral: models with
-NO native vision MUST route through Kyle — never guess or hallucinate.
-
-**Execution tier — split 2026-09-06 (COO-only ruling):**
-- **Silas (COO)** — ops, relay, coordination, dispatches:
-  **`deepseek/deepseek-v4-flash` ALWAYS** (user ruling 2026-09-06: API
-  billing = no session limits — the COO must stay available to
-  coordinate). Supersedes the 08-27 glm-5.3-flash COO pin. Fallback if
-  deepseek 402s (balance wall): glm-5.3-flash interim + escalate to the
-  user for a top-up (availability is the point).
-- **ALL minions** (implementation) and **mega-minions**
-  (well-specified sub-tasks): **`zai-coding-cn/glm-5.3-flash`** (ops tier
-  since 2026-08-27). The fleet workhorse: fast, reliable,
-  ZAI-always-live. UNTOUCHED by the 2026-09-06 ruling.
-**The 402 CLASS (2026-08-19):** a deepseek **402 Insufficient Balance**
-is an ACCOUNT wall (billing — a user top-up fixes it; waiting does not).
-Per errored pane: `/model <ops fallback>` + continue, once; the fleet
-flips back when the balance returns (in-flight panes STAY).
-
-The provider default is `settings.json` `defaultProvider` = `deepseek`
-(→ v4-flash), so **UNSET-model dispatches land on flash** — briefings
-ALWAYS name `deepseek/deepseek-v4-flash` explicitly (the dispatch
-`--model` carries it; the session modelId is verified after every
-launch). Gru / Bob launches name `kimi-coding/k3` (fallback:
-`zai-coding-cn/glm-5.3`; HOLD if both down). **Perkins launches name
-`zai-coding-cn/glm-5.3`** (user ruling 2026-09-07 — round mains AND lens
-fleets; probe-first at every dispatch). Silas is pinned to
-deepseek/deepseek-v4-flash by `.pi/extensions/silas.ts`.
+**VISION ROUTING (superseded 2026-09-07):** the GPT-chain models
+(Astra/Sol/Luna) are ALL natively multimodal (`input: ["text",
+"image"]` — verified in the registry) — attach the image, no spawn. The
+KYLE vision-mega-minion routing (glm-4.6v / glm-5.3-flash spawns)
+applies ONLY to sessions still riding a legacy blind model; KYLE's
+provenance rules (verify through pi; models.json `input` declaration)
+stand unchanged.
 
 ## Durable state
 
@@ -533,9 +501,11 @@ older briefings use that name; this is the same section.)
   `bmad-review-adversarial-general` / `bmad-review-edge-case-hunter`);
   descriptive tabs `<job-slug>-<role>`. **Max 10 concurrent mega-minion
   panes.** You MUST close every pane you create before finishing.
-- **No native vision on flash/glm** (flash, glm-5.3, v4-pro are
-  text-only): route image analysis per 'Model policy' VISION ROUTING
-  (Kyle on `zai-coding-cn/glm-4.6v`; native on k3) and/or the
+- **No native vision on legacy blind models** (kimi k3 / glm-5.3 /
+  deepseek / glm-5.3-flash are text-only or legacy): route image
+  analysis per 'Model policy' VISION ROUTING — the GPT-chain models
+  (Astra/Sol/Luna) are natively multimodal, so attach the image on them;
+  legacy blind sessions route via the
   **`vision-read` skill** (`bin/vision-read <image> ["prompt"]`).
   REASONING-HEAVY — wait for the answer; an empty mid-reasoning reply is
   NOT failure. NEVER guess or hallucinate what an image shows;
@@ -667,10 +637,10 @@ Only an explicit waiver mutes a round.
 ### Silas dispatch sequence (on the Perkins sensor message)
 
 Full 7-step sequence (verify head · round N · detached worktree · briefing
-+ lens-guards + vision caveat · launch on `zai-coding-cn/glm-5.3`
-(Perkins model, user ruling 2026-09-07; probe-first) + verify
-modelId · `ledger add` round row · round close-out with blocked
-recovery): **`docs/playbook-annex.md` — 'Perkins — the lens run' and
++ lens-guards + vision caveat · launch on `openai-codex/gpt-6-astra`
+(Astra — Perkins model, user ruling 2026-09-07; xhigh thinking,
+probe-first) + verify modelId · `ledger add` round row · round close-out
+with blocked recovery): **`docs/playbook-annex.md` — 'Perkins — the lens run' and
 'Perkins — round-budget evidence & incidents'.** Essentials: use the
 freshest sha (`gh pr view <pr> --json state,headRefOid`); **hold on an
 UNSTABLE target** (head MOVING AND CI RED — CI PENDING is not red);
@@ -881,3 +851,19 @@ truth; this appendix carries how we got here.
   EVERY Perkins round (glm-5.3 is blind — pixel checks MECHANICAL only).
   COO-only-scope NOT: Gru/Bob stay on the k3-primary chain. Supersedes
   Perkins riding the k3-reasoning chain.
+- **2026-09-07 (later)** — **GPT chain ruling: the whole model policy
+  moves to the ChatGPT subscription.** Resolved + verified through pi
+  2026-09-07 (exact registry IDs): reasoning tier (Gru/Bob/Perkins round
+  mains + lens fleets) = `openai-codex/gpt-6-astra` @ xhigh; ALL 3D /
+  game / Blender agents incl. 3D mega-minions + 3D lenses = Astra xhigh
+  (the 3D override); other minions + non-3D mega-minions =
+  `openai-codex/gpt-5.6-sol` @ xhigh; Silas (COO) =
+  `openai-codex/gpt-5.6-luna` @ max. kimi/glm/deepseek chains RETIRED
+  from new dispatches (their HOLD/bans/402/1302 doctrine archived).
+  Identity extensions (gru.ts/silas.ts) pin model + thinking at
+  session_start; night-watchman relaunch pins + probe gate repointed;
+  quota-probe default = astra; code-review skill thinking pins go
+  per-model (xhigh/max). VISION: all three GPT models are natively
+  multimodal — native vision everywhere on the chain; KYLE routing only
+  for legacy blind sessions. Supersedes the 09-06 COO deepseek pin and
+  the 09-07 Perkins glm-5.3 pin (both above).

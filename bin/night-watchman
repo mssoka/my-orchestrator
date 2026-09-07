@@ -14,9 +14,9 @@
 # across restarts and workspace moves; nothing is cached between ticks):
 #   silas (tab label `silas`)  → relaunch `env -u PI_GRU -u PI_MODEL -u
 #                                PI_PROVIDER PI_SILAS=1 pi --model
-#                                deepseek/deepseek-v4-flash`
+#                                openai-codex/gpt-5.6-luna --thinking max`
 #   gru   (tab label `Gru`)    → relaunch `env -u PI_SILAS PI_GRU=1 pi
-#                                --model <k3|glm-5.3 via probe gate> --thinking max`
+#                                --model openai-codex/gpt-6-astra --thinking xhigh`
 #
 # ── SAFETY INVARIANTS (hardened 2026-08-21, incident-day fixes) ─────────
 # 1. NO KILL PATH. This script NEVER signals agent processes. The only
@@ -34,10 +34,11 @@
 #    grace window before any action, and the pane is re-polled
 #    immediately before the first keystroke (live-agent no-op guard).
 # 4. Gru relaunches pin the reasoning tier via the quota probe gate:
-#    kimi-coding/k3 primary, zai-coding-cn/glm-5.3 fallback. NEVER
-#    deepseek-v4-pro, NEVER flash (user rulings 08-12..08-19). If both
-#    reasoning providers probe DOWN, the watchman NOTIFIES and does NOT
-#    relaunch — a wrong-tier Gru is worse than a notified gap.
+#    openai-codex/gpt-6-astra (Astra) — user ruling 2026-09-07 (GPT
+#    subscription; supersedes the kimi k3 / glm-5.3 chain). Silas
+#    relaunches pin openai-codex/gpt-5.6-luna max. If the reasoning model
+#    probes DOWN, the watchman NOTIFIES and does NOT relaunch — a
+#    wrong-tier Gru is worse than a notified gap.
 # 5. Handover verification retries ACROSS TICKS (state file) before
 #    flagging — a pi mid-startup-checklist is not a failure.
 # 6. ABSOLUTE BINARY RESOLUTION (launchd PATH fix, hardening round 2):
@@ -97,23 +98,27 @@ TYPING=1
 PROBE="${NIGHT_WATCHMAN_PROBE:-$ROOT/bin/quota-probe}"
 [ -x "$PROBE" ] || PROBE=""
 
-# reasoning tier for Gru relaunches (user rulings: k3 primary, glm-5.3
-# fallback; v4-pro banned on cost, flash banned for the reasoning tier).
-# COO ops model: deepseek/deepseek-v4-flash ALWAYS (user ruling 2026-09-06
-# — API billing, no session limits; availability is the point). The Silas
-# launch env CLEARS PI_MODEL + PI_PROVIDER (the 11:47Z 2026-09-06 relaunch
-# leaked PI_MODEL=k3 over the silas.ts extension pin) and build_launch pins
-# the model explicitly.
-REASONING_MODELS=(kimi-coding/k3 zai-coding-cn/glm-5.3)
-FORBIDDEN_REASONING="deepseek/deepseek-v4-pro deepseek/deepseek-v4-flash zai-coding-cn/glm-5.3-flash"
-SILAS_MODEL="deepseek/deepseek-v4-flash"
+# reasoning tier for Gru relaunches (user ruling 2026-09-07: GPT
+# subscription — openai-codex/gpt-6-astra; supersedes the kimi k3 /
+# glm-5.3 chain and the v4-pro/flash bans — the old models are legacy).
+# COO ops model: openai-codex/gpt-5.6-luna max (user ruling 2026-09-07;
+# supersedes the 09-06 deepseek-v4-flash pin). The Silas launch env
+# CLEARS PI_MODEL + PI_PROVIDER (the 11:47Z 2026-09-06 relaunch leaked
+# PI_MODEL=k3 over the silas.ts extension pin) and build_launch pins
+# the model + thinking explicitly.
+REASONING_MODELS=(openai-codex/gpt-6-astra)
+FORBIDDEN_REASONING="kimi-coding/k3 zai-coding-cn/glm-5.3 deepseek/deepseek-v4-pro deepseek/deepseek-v4-flash zai-coding-cn/glm-5.3-flash"
+SILAS_MODEL="openai-codex/gpt-5.6-luna"
+SILAS_THINKING="max"
+REASONING_THINKING="xhigh"
 
 # target records: tab-label|key|launch-env|handover|env-marker|tier
 # (launch-env = the ENV PREFIX of the relaunch command (no executable); the
 #  executable + model are appended at relaunch time: ` pi --model
-#  deepseek/deepseek-v4-flash` for the silas ops tier (pinned via
-#  build_launch, matching silas.ts), ` pi --model <k3|glm-5.3> --thinking
-#  max` for the reasoning tier (Gru, via the probe gate).
+#  openai-codex/gpt-5.6-luna --thinking max` for the silas ops tier
+#  (pinned via build_launch, matching silas.ts), ` pi --model
+#  openai-codex/gpt-6-astra --thinking xhigh` for the reasoning tier
+#  (Gru, via the probe gate).
 #  env-marker = text the target's extension injects at session start,
 #  gated on the right PI_* env — proves env correctness, see silas.ts/gru.ts;
 #  tier = ops | reasoning)
@@ -355,8 +360,8 @@ build_launch() { # $1=key $2=launch-env $3=tier
   local key="$1" env="$2" tier="$3" m
   if [ "$tier" != "reasoning" ]; then
     if [ "$key" = "silas" ]; then
-      # COO model ruling 2026-09-06: Silas ALWAYS runs on deepseek-v4-flash.
-      echo "$env pi --model $SILAS_MODEL"
+      # COO model ruling 2026-09-07: Silas runs openai-codex/gpt-5.6-luna max.
+      echo "$env pi --model $SILAS_MODEL --thinking $SILAS_THINKING"
     else
       echo "$env pi"
     fi
@@ -365,13 +370,13 @@ build_launch() { # $1=key $2=launch-env $3=tier
   for m in "${REASONING_MODELS[@]}"; do
     if probe_ok "$m"; then
       log "  model gate: $m OK — pinning (never $FORBIDDEN_REASONING)"
-      echo "$env pi --model $m --thinking max"
+      echo "$env pi --model $m --thinking $REASONING_THINKING"
       return 0
     fi
   done
   log "  model gate: ALL reasoning models DOWN — NOT relaunching $key"
   if [ "$TYPING" -eq 1 ]; then
-    notify_once "both-reasoning-down-$key" "$key pi DEAD but both reasoning providers (k3, glm-5.3) probe DOWN — no relaunch; manual intervention needed"
+    notify_once "both-reasoning-down-$key" "$key pi DEAD but the reasoning model (openai-codex/gpt-6-astra) probes DOWN — no relaunch; manual intervention needed"
   fi
   return 1
 }
@@ -522,7 +527,7 @@ handle_death() { # $1=label $2=key $3=pane $4=launch-env $5=handover $6=marker $
 
   if [ "$TYPING" -eq 0 ]; then
     if [ "$tier" = "reasoning" ]; then
-      log "  dry-run: would relaunch ($launch_env pi --model <k3|glm-5.3 via probe gate> --thinking max) + handover"
+      log "  dry-run: would relaunch ($launch_env pi --model <astra via probe gate> --thinking xhigh) + handover"
     else
       log "  dry-run: would relaunch ($launch_env pi --model $SILAS_MODEL) + handover"
     fi
@@ -723,10 +728,10 @@ self_test() {
   [ "$(printf '%s' "${TARGETS[1]}" | cut -d'|' -f3)" = "env -u PI_SILAS PI_GRU=1" ] \
     || { echo "  FAIL: gru env mirror wrong"; rc=1; }
 
-  echo "--- silas launch pin (COO model ruling 2026-09-06)"
+  echo "--- silas launch pin (COO model ruling 2026-09-07: luna max)"
   out="$(build_launch silas "env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1" ops)"
-  if [ "$(printf '%s' "$out" | grep -c 'pi --model deepseek/deepseek-v4-flash')" = "1" ]; then
-    echo "  PASS: silas launch pins deepseek/deepseek-v4-flash ($out)"
+  if [ "$(printf '%s' "$out" | grep -c 'pi --model openai-codex/gpt-5.6-luna --thinking max')" = "1" ]; then
+    echo "  PASS: silas launch pins openai-codex/gpt-5.6-luna --thinking max ($out)"
   else
     echo "  FAIL: silas build_launch wrong, got: $out"
     rc=1
@@ -752,7 +757,7 @@ self_test() {
     echo "  PASS: no pane/tab/worktree creation or close calls"
   fi
 
-  echo "--- model gate (reasoning tier pin; NEVER v4-pro / flash)"
+  echo "--- model gate (reasoning tier pin; NEVER legacy models)"
   if [ "$(printf '%s' "${TARGETS[1]}" | cut -d'|' -f6)" != "reasoning" ]; then
     echo "  note: TARGETS[1] is not the reasoning tier (test override active) — gate test skipped"
   elif [ -z "$PROBE" ]; then
@@ -764,45 +769,46 @@ self_test() {
     cat >"$stub" <<'STUB'
 #!/bin/bash
 case "$1" in
-  kimi-coding/k3)        [ "${STUB_K3:-down}" = ok ] && echo "OK kimi-coding/k3" || echo "DOWN kimi-coding/k3 (403 test)" ;;
-  zai-coding-cn/glm-5.3) [ "${STUB_GLM:-down}" = ok ] && echo "OK zai-coding-cn/glm-5.3" || echo "DOWN zai-coding-cn/glm-5.3 (403 test)" ;;
+  openai-codex/gpt-6-astra) [ "${STUB_ASTRA:-down}" = ok ] && echo "OK openai-codex/gpt-6-astra" || echo "DOWN openai-codex/gpt-6-astra (auth test)" ;;
   *) echo "DOWN $1 (unknown test model)" ;;
 esac
 STUB
     chmod +x "$stub"
 
-    out="$(STUB_K3=ok STUB_GLM=down NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)"
-    if [ "$(printf '%s' "$out" | grep -c 'kimi-coding/k3 --thinking max')" = "1" ]; then
-      echo "  PASS: k3 up → pinned kimi-coding/k3"
+    out="$(STUB_ASTRA=ok NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)"
+    if [ "$(printf '%s' "$out" | grep -c 'openai-codex/gpt-6-astra --thinking xhigh')" = "1" ]; then
+      echo "  PASS: astra up → pinned openai-codex/gpt-6-astra --thinking xhigh"
     else
-      echo "  FAIL: expected k3 pin, got: $out"
+      echo "  FAIL: expected astra pin, got: $out"
       rc=1
     fi
 
-    out="$(STUB_K3=down STUB_GLM=ok NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)"
-    if [ "$(printf '%s' "$out" | grep -c 'zai-coding-cn/glm-5.3 --thinking max')" = "1" ]; then
-      echo "  PASS: k3 down, glm up → pinned zai-coding-cn/glm-5.3"
-    else
-      echo "  FAIL: expected glm-5.3 pin, got: $out"
-      rc=1
-    fi
-
-    out="$(STUB_K3=down STUB_GLM=down NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)"
+    out="$(STUB_ASTRA=down NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)"
     if [ -z "$out" ]; then
-      echo "  PASS: both down → no relaunch (abort)"
+      echo "  PASS: astra down → no relaunch (abort)"
     else
       echo "  FAIL: expected abort (empty), got: $out"
       rc=1
     fi
 
     for m in $FORBIDDEN_REASONING; do
-      if out="$(STUB_K3=ok STUB_GLM=ok NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)" \
+      if out="$(STUB_ASTRA=ok NIGHT_WATCHMAN_PROBE="$stub" "${BASH_SOURCE[0]}" --_launch-test 2>/dev/null | tail -1)" \
          && [ "$(printf '%s' "$out" | grep -c "$m")" = "1" ]; then
         echo "  FAIL: launch pins forbidden model $m"
         rc=1
       fi
     done
-    [ $rc -eq 0 ] && echo "  PASS: forbidden models (v4-pro/flash) never emitted"
+    [ $rc -eq 0 ] && echo "  PASS: forbidden legacy models never emitted"
+
+    # ops tier (Silas): build_launch pins openai-codex/gpt-5.6-luna max (no probe).
+    IFS='|' read -r slabel skey senv shandover smarker stier <<<"${TARGETS[0]}"
+    sout="$(build_launch "$skey" "$senv" "$stier")"
+    if [ "$(printf '%s' "$sout" | grep -c 'openai-codex/gpt-5.6-luna --thinking max')" = "1" ]; then
+      echo "  PASS: silas ops tier → openai-codex/gpt-5.6-luna --thinking max"
+    else
+      echo "  FAIL: expected luna max pin, got: $sout"
+      rc=1
+    fi
     rm -f "$stub"
   fi
 
