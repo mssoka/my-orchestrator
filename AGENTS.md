@@ -1585,29 +1585,26 @@ in the gotchas below as current routing.
   blinding both). (d) Typo'd round-row ids (tie-deconflect-perkins-r2
   vs parent -deconflict) silently break id-based dedup — treat the
   parent=/sha= NOTE fields as the durable dedup keys, not the row id.
-- **Vision = KYLE, the vision mega-minion (user ruling 2026-08-21;
-  SUPERSEDES the 08-18 local-lmstudio doctrine — qwen3.8-27b@4bit via
-  bin/vision-read is RETIRED; the 08-18 no-silent-auto-delegation lesson
-  stands).** When the active reasoning model is k3 (sees images
-  natively), or the session model is `zai-coding-cn/glm-5.3-flash`
-  (natively multimodal — first GLM-5-series flash with vision, verified
-  through pi 2026-08-27 with registered `input: ["text","image"]`; user
-  ruling: no vision skill/minion detour needed on it), vision is INLINE —
-  no spawn. Otherwise (glm-5.3 / deepseek
-  are blind) ANY agent (Gru, Silas, minions, Bob) spawns a KYLE
-  mega-minion on `zai-coding-cn/glm-5.3-flash` (the OPS pin — mega-minions
-  are ops tier and flash is natively multimodal, 2026-08-27 ruling;
-  fallback glm-4.6v when flash is down;
-  one-line flip to glm-5v-turbo when ZAI trial access
-  lands — 1311 subscription-gated as of 08-21). KYLE gets CODEBASE
-  ACCESS: spawn in the summoning repo/worktree cwd with tools
-  (read/grep/bash); the prompt carries summon-reason + pointers. Two
-  modes: quick-read (headless one-shot, image + question) vs
-  visual-verification (full agent in cwd — reads render code/goldens/
-  tests, answers with evidence). Named for Gru's guard dog — he
-  watches and barks. pi gates image attachment on the model's declared
-  `input` types — models.json registration for vision models needs
-  `input: ["text","image"]`. 2026-08-22/23 addendum (dream-2026-08-23):
+- **Vision = native GPT first; KYLE remains a role (user ruling 2026-09-07;
+  supersedes the old KYLE/GLM default).** All current GPT-chain models are
+  natively multimodal: **Astra** (`openai-codex/gpt-6-astra`, `xhigh`) is
+  the route for 3D/game/Blender work and 3D visual verification; **Sol**
+  (`openai-codex/gpt-5.6-sol`, `xhigh`) is the route for non-3D helpers;
+  **Luna** (`openai-codex/gpt-5.6-luna`, `max`) is Silas/COO's route.
+  Attach images inline on those sessions; do not spawn a vision detour.
+  Retain KYLE when a dedicated evidence-grade visual specialist is useful,
+  but select its provider from the current policy — never hard-code a
+  legacy GLM route. Legacy visual models are explicit, probe-verified
+  fallbacks only. KYLE gets CODEBASE ACCESS: spawn in the summoning
+  repo/worktree cwd with tools (read/grep/bash); the prompt carries
+  summon-reason + pointers. Two modes: quick-read (headless one-shot,
+  image + question) vs visual-verification (full agent in cwd — reads
+  render code/goldens/tests, answers with evidence). Named for Gru's guard
+  dog — he watches and barks. pi gates image attachment on the model's
+  declared `input` types — models.json registration for vision models needs
+  `input: ["text","image"]`. Historical KYLE/legacy-session addenda
+  below are retained for incident context and do not override this routing.
+  2026-08-22/23 addendum (dream-2026-08-23):
   routing grew a LOCAL fallback — remote glm-4.6v primary →
   `bin/vision-read --local` (lmstudio glm-4.6v-flash) → gemma coarse
   `--fast` last resort (wired + verified through pi 08-22). Vision

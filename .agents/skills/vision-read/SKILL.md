@@ -1,13 +1,26 @@
 ---
 name: vision-read
-description: Read an image with the KYLE vision model (zai-coding-cn/glm-5.3-flash — the ops tier's native multimodal, headless pi with an @file attachment, no mega-minion needed) for quick-reads, or spawn a KYLE visual-verification mega-minion for evidence-grade checks. Use when you need to know what an image shows (screenshots of panes, UI states, game screens, diagrams) and the current model has no vision, or for any image the user asks you to look at.
+description: Read an image with the native GPT vision route (Astra for 3D, Sol for non-3D helpers) through a headless pi with an @file attachment, or use KYLE as a visual-verification role for evidence-grade checks. Use when the current model cannot accept images, when a headless read is needed, or for any image the user asks you to inspect.
 ---
 
 # vision-read — KYLE vision (quick-read + visual-verification)
 
-KYLE doctrine (2026-08-21 user ruling; the AGENTS.md 'Vision = KYLE' block is
-canon): vision is EXPLICIT — never faked, never delegated to a blind text
-model. Two modes:
+KYLE doctrine (the 2026-09-07 GPT-chain ruling; the AGENTS.md vision block
+is canon): vision is EXPLICIT — never faked, never delegated to a blind text
+model. Current native-vision routing is:
+
+- **3D/game/Blender work and 3D visual verification** →
+  `openai-codex/gpt-6-astra` (Astra), `xhigh`.
+- **Non-3D helper reads** → `openai-codex/gpt-5.6-sol` (Sol), `xhigh`.
+- **Silas/COO** → `openai-codex/gpt-5.6-luna` (Luna), `max`.
+
+Attach images inline on those GPT sessions; no vision spawn is needed. KYLE
+remains a role for evidence-grade visual verification or a dedicated visual
+specialist when useful. KYLE's provider follows the current role policy; it
+is not a hard-coded legacy GLM route. Legacy visual models are explicit,
+probe-verified fallbacks only.
+
+Two modes:
 
 - **quick-read** — THIS skill's headless tool (`bin/vision-read`): one
   command, stdout answer. No pane, no mega-minion.
@@ -17,19 +30,12 @@ model. Two modes:
   visual claim is evidence-grade (golden diffs, render captures, layout or
   geometry truth) — a blind quick-read is not enough.
 
-When the active reasoning model is k3, or the session model is
-`zai-coding-cn/glm-5.3-flash` (natively multimodal, verified 2026-08-27
-through pi with a registered `input: ["text","image"]` entry — the first
-GLM-5-series flash with native vision, user ruling), vision is INLINE — no
-spawn, read the image directly with the read tool / @file attachment.
-Otherwise (glm-5.3 / deepseek are blind) route through this skill.
-
 ## When to use
 
 - The user asks what an image shows (screenshots, pane states, UI, diagrams,
-  game screens) and your model cannot see images (pi's read tool will say
-  "Current model does not support images" — that note means the ACTIVE model
-  lacks vision; use this skill instead).
+  game screens). If the active GPT-chain model supports images, attach the
+  image inline; if it does not, use this skill (pi's read tool will say
+  "Current model does not support images").
 - Any forensic image read where the content matters (verbatim text, layout,
   errors, unusual states).
 - Evidence-grade visual verification (goldens, captures, geometry) → Mode 2.
@@ -39,29 +45,34 @@ Otherwise (glm-5.3 / deepseek are blind) route through this skill.
 ## Mode 1 — quick-read (headless tool)
 
 ```bash
-# default (zai-coding-cn/glm-5.3-flash — KYLE, standing since the 2026-08-27
-# native-multimodal ruling; 4.6v demoted to fallback)
+# default: native GPT vision, Astra/xhigh (3D-safe default)
 /Users/moses/code/bin/vision-read "/absolute/path/to/image.png" "optional prompt"
 
-# explicit model for one call
-/Users/moses/code/bin/vision-read --model zai-coding-cn/glm-4.6v "/path.png"
+# non-3D helper read: select Sol/xhigh explicitly
+/Users/moses/code/bin/vision-read --model openai-codex/gpt-5.6-sol \
+  "/absolute/path/to/image.png" "optional prompt"
 
-# LOCAL last resort only (lmstudio/google/gemma-4-e2b — coarse, misreads verbatim text)
+# explicit 3D/KYLE-role read: select Astra/xhigh explicitly
+/Users/moses/code/bin/vision-read --model openai-codex/gpt-6-astra \
+  "/absolute/path/to/image.png" "optional prompt"
+
+# LOCAL last resort only (coarse; never the policy default)
 /Users/moses/code/bin/vision-read --fast "/absolute/path/to/image.png"
 
-# swap the model for a whole session without touching any file
-VISION_MODEL=zai-coding-cn/glm-5v-turbo /Users/moses/code/bin/vision-read "/path.png"
+# swap the model for one call/session without touching any file
+VISION_MODEL=openai-codex/gpt-6-astra /Users/moses/code/bin/vision-read "/path.png"
 ```
 
 ### Swapping the model
 
-Resolution order (first match wins): **`VISION_MODEL` env var → `--model` flag → `--fast` → default glm-5.3-flash**. To make a model the permanent default, edit the `MODEL="..."` default line in `bin/vision-read` (or export `VISION_MODEL` in the shell profile). **Fallback when flash is down: `--model zai-coding-cn/glm-4.6v`** (the pre-08-27 standing pin). **Any swap target must declare image input** — add `"input": ["text", "image"]` to its entry in the models registry (`~/.pi/agent/models.json` overrides / `models-store.json` catalog) or pi bounces the attachment (see Troubleshooting).
+Resolution order (first match wins): **`VISION_MODEL` env var → `--model` flag → `--fast`/`--local` → default `openai-codex/gpt-6-astra`**. The default is Astra/xhigh for 3D-safe routing; select `openai-codex/gpt-5.6-sol` @ xhigh explicitly for non-3D helpers. To make a model the permanent default, edit the `MODEL="..."` line in `bin/vision-read`. Any swap target must declare image input — `input: ["text", "image"]` in the models registry — or pi bounces the attachment (see Troubleshooting). Legacy visual models may be selected only explicitly after authorization and a successful probe.
 
 The wrapper runs (env-cleared, so no PI_* overrides):
 
 ```bash
+# Select Astra for 3D, or Sol for a non-3D helper before invoking.
 pi --print --no-session --no-tools \
-  --model zai-coding-cn/glm-4.6v \
+  --thinking xhigh --model openai-codex/gpt-6-astra \
   "@/absolute/path/to/image.png" "<prompt>"
 ```
 
@@ -76,8 +87,10 @@ Spawn KYLE as a full mega-minion when the visual claim needs evidence:
 
 - **Spawn cwd = the summoning repo/worktree** (codebase access: read/grep/
   bash on the real render code, goldens, tests). Never a bare cwd.
-- **Model pinned: `zai-coding-cn/glm-5.3-flash`** (the ops pin — probe first;
-  fallback `--model zai-coding-cn/glm-4.6v` if flash is down).
+- **Model pin follows the current GPT policy:** Astra/xhigh for 3D
+  verification, Sol/xhigh for non-3D verification. KYLE is the role, not a
+  hard-coded provider. Use a legacy visual model only as an explicitly
+  authorized, probe-verified fallback.
 - **Prompt carries summon-reason + pointers**: what to verify, which files
   render the artifact, where goldens/tests live, what evidence to produce
   (pixel scans, hashes, diff output) — never "look at this and tell me".
@@ -90,6 +103,7 @@ Prompt skeleton:
 ```
 You are KYLE, the vision mega-minion. Summon reason: <what must be proven>.
 Image: @<absolute path to capture/png>
+Model: <openai-codex/gpt-6-astra for 3D | openai-codex/gpt-5.6-sol for non-3D>
 Verify against the codebase in this cwd: <render path>, <golden paths>, <test
 paths>. Answer with EVIDENCE (pixel scans, byte/hash diffs, geometry checks),
 not vibes. Never describe what the image "probably" shows — if the pixels
@@ -98,48 +112,49 @@ don't prove it, say so.
 
 ## Probe-first rule
 
-Before ANY vision call on glm-4.6v (quick-read or KYLE spawn), probe the
-model with an env-cleared pi one-liner:
+Before a new headless vision route or KYLE spawn, probe the selected remote
+model with an env-cleared pi one-liner (Astra for 3D, Sol for non-3D):
 
 ```bash
 env $(env | grep '^PI_' | sed 's/=.*//;s/^/-u /' | tr '\n' ' ') \
-  pi --model zai-coding-cn/glm-4.6v -p --no-session -nt "Reply OK"
+  pi --model openai-codex/gpt-6-astra --thinking xhigh -p --no-session -nt "Reply OK"
 # expect: OK
 ```
 
-If 4.6v is DOWN: **stop and escalate** — never proceed on a blind model.
-A text model cannot substitute for vision; reporting a description you
-cannot verify is fabrication. (Same for the `--fast` local fallback: if
-both are down, report "vision unavailable".)
+If the selected model is DOWN: **stop and escalate** — never silently route
+to a legacy model. A text model cannot substitute for vision; reporting a
+description you cannot verify is fabrication. Local fallbacks are explicit
+and must be disclosed; if no authorized vision route is available, report
+"vision unavailable".
 
 ## Model + patience (doctrine 2026-08-21)
 
-- **Default: `zai-coding-cn/glm-5.3-flash`** — KYLE, the standing vision model
-  since the 2026-08-27 ruling (ops tier + native multimodal; fast, 1M
-  context, and registered with `input: ["text","image"]`). The
+- **Default: `openai-codex/gpt-6-astra` @ `xhigh`** — native multimodal
+  GPT, chosen as the safe default for 3D/Blender evidence. Use
+  `openai-codex/gpt-5.6-sol` @ `xhigh` explicitly for non-3D helpers. The
   evidence-grade bar is the METHOD (pixel scans, hashes, geometry — never
   vibes), not the model.
-- **`--fast`: `lmstudio/google/gemma-4-e2b`** — LOCAL last resort (~15s/
-  image but coarse and MISREADS verbatim text: missed overlays,
-  hallucinated percentages). Never default.
-- glm-4.6v is a **reasoning model**: expect **up to a few minutes per
-  image**. An empty or partial reply mid-reasoning is NOT a failure — the
-  answer lands when the reasoning block closes. Callers MUST use a generous
-  bash timeout (600s+).
-- **Thinking effort:** `VISION_THINKING` env passthrough (default low) —
-  routine forensic reads are perception, not reasoning.
+- **KYLE** is a visual-verification role that may use the policy-selected
+  GPT model; it is not a legacy GLM default. Legacy visual models and
+  `--fast`/`--local` fallbacks are explicit and disclosed only.
+- Astra/Sol are native multimodal GPT models. An empty or partial reply
+  mid-reasoning is NOT a failure — the final answer lands when the reasoning
+  block closes. Callers MUST use a generous bash timeout (600s+).
+- **Thinking effort:** `VISION_THINKING` env passthrough (default `xhigh`)
+  — the GPT policy pins Astra and Sol to xhigh.
 - If the read must be async, run it with nohup into a log and poll the log.
 
 ## Troubleshooting
 
 - **"Current model does not support images"** on the read tool — the ACTIVE
   model lacks vision; route through this skill's headless call instead.
-- **Image bounces even on glm-4.6v** — check the models registry
+- **Image bounces even on a GPT model** — check the models registry
   (`~/.pi/agent/models.json` override / `models-store.json` catalog): the
   model entry must declare `"input": ["text", "image"]` (pi gates image
   attachment on the model's declared input types).
-- **Empty stdout for minutes** — glm-4.6v is reasoning; wait. If it never
-  returns, re-probe (the model may have gone down mid-flight).
+- **Empty stdout for minutes** — the selected model may still be reasoning;
+  wait. If it never returns, re-probe the exact model (it may have gone
+  down mid-flight).
 - **Vision must never be faked** — model down or probe failing → report
   "vision unavailable" / escalate rather than describing the image from
   assumptions.

@@ -305,7 +305,7 @@ prefixed; bare labels misroute). Thinking is pinned per launch too
 (`--thinking xhigh` / `--thinking max`) and at session_start by the
 identity extensions (gru.ts/silas.ts).
 
-**VISION ROUTING (superseded 2026-09-07):** the GPT-chain models
+**VISION ROUTING (2026-09-07 GPT-chain ruling):** the GPT-chain models
 (Astra/Sol/Luna) are ALL natively multimodal (`input: ["text",
 "image"]` — verified in the registry) — attach the image, no spawn. The
 KYLE vision-mega-minion routing (glm-4.6v / glm-5.3-flash spawns)
