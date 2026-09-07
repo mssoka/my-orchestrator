@@ -349,6 +349,16 @@ the user at the Gru session in `/Users/moses/code`.
 
 ### Provider incidents
 
+**CURRENT MODEL POLICY (2026-09-07 user ruling — GPT chain):** the dated
+provider-incident doctrine below is HISTORICAL — the live chain is the
+playbook's 'Model policy' section: reasoning tier (Gru/Bob/Perkins round
+mains + lens fleets) = `openai-codex/gpt-6-astra` @ xhigh; ALL
+3D/game/Blender agents incl. 3D mega-minions + 3D lenses = Astra xhigh;
+other minions + non-3D mega-minions = `openai-codex/gpt-5.6-sol` @
+xhigh; Silas = `openai-codex/gpt-5.6-luna` @ max. kimi/glm/deepseek
+chains are RETIRED from new dispatches — do not act on old model names
+in the gotchas below as current routing.
+
 - **Provider incidents come in 3 classes with different recoveries
   (2026-08-02/03).** Transient stalls, mid-turn refusals, and
   connection-error waves all leave a LIVE pi with `stopReason:"error"` in
@@ -1559,10 +1569,17 @@ the user at the Gru session in `/Users/moses/code`.
   COMMENTED self-review, #98 caught 08-25): on catching one, register
   the row pr_review=1 + dispatch Perkins; spec = the PR body; the
   user's informal review is NEVER the verdict. (b) PRE-ADD round rows
-  AT DISPATCH with parent=/sha= keywords in the note (gauge r1 08-25,
-  egress r1/r2 08-26) — `ledger add` chokes on sha= (not a column), so
-  write it via `ledger note` after add; the keywords kill the stale
-  round-pending echo class. (c) When one pr_review=0 gap fires, sweep
+  AT DISPATCH with parent=/sha= in the parent + note COLUMNS (gauge r1
+  08-25, egress r1/r2 08-26) — the sensor's dedup query reads the JOBS
+  table (`WHERE parent='<job-id>'` + `note LIKE '%<full-sha>%'`), NOT
+  the event stream: `ledger add` chokes on sha= (not a column) and
+  `ledger note` writes EVENTS only — so set parent (sqlite3 UPDATE
+  post-add, same as the graph keys) and write the sha into the note
+  COLUMN, or the sensor sees zero rounds and re-fires the stale
+  round-pending echo every tick. (2026-09-07: the l1-refine-1 arc
+  r1-r5 rows all carried parent=/sha= in events only — empty parent
+  column — so every round dispatch on #17 re-triggered the alert;
+  backfilled parent + note(sha) on all 5 rows, echoes stopped.) (c) When one pr_review=0 gap fires, sweep
   the SIBLING rows of the same dispatch batch (gauge-telegraph 08-25:
   SQL-fixed itself AND crisis-duck, same latent gap, minutes from
   blinding both). (d) Typo'd round-row ids (tie-deconflect-perkins-r2
