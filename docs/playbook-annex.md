@@ -553,13 +553,15 @@ current state and the bmad-updates rules.)
   re-create the symlinks; then `git diff .agents/skills` — review what
   bmad changed, commit, push. Never hand-edit skill files (clobbered on
   the next update) — overrides go in `_bmad/custom/`.
-- **The bmad-build render failure (2026-08-21, still open):**
-  `render_skill.py` HALTs with `ambiguous config value
-  implementation_artifacts` (modules.bmm + modules.gds both define it).
-  Sanctioned path (Silas ruling 08-21 06:10Z): skill WAIVED —
-  self-contained briefing + the waiver carried as a canon note in the
-  PR body; avoid naming bmad-build in briefings until upstream dedupes
-  the token.
+- **The bmad-build mixed-module render patch (2026-09-07):**
+  The former waiver for `ambiguous config value implementation_artifacts`
+  is retired locally. The installer-owned v6.12.0 renderer now accepts a
+  duplicate short key only when every candidate resolves identically,
+  records every source path in the generation manifest, and still HALTs on
+  genuine conflicts or missing config. The tracked, hash-gated reapplication
+  path and regression receipt live in
+  `docs/bmad-renderer-short-config-patch.md`; run its `--check` after every
+  BMad update and never force it onto an unknown renderer hash.
 
 ## Changelog continuation
 
