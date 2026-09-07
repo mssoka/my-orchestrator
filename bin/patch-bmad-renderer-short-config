@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Apply the reviewed BMad 6.12.0 equivalent-short-config renderer patch.
+
+The installer owns _bmad/scripts/render_skill.py and may overwrite it. This
+patcher is the durable provenance and fail-closed reapplication path: it only
+modifies the exact upstream v6.12.0 bytes and is idempotent on the exact patched
+bytes. Any other renderer version or local modification HALTs for re-review.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import stat
+import tempfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TARGET = ROOT / "_bmad" / "scripts" / "render_skill.py"
+UPSTREAM_VERSION = "bmad-method v6.12.0"
+UPSTREAM_SHA256 = "8496d0d8b449d64c21b42a9aab3b13fc8a813a430c0695ffd84ad75bb1da7942"
+PATCHED_SHA256 = "6b8752a0a0552c4d24221912c2ef5cf0a37539e060b19425e7433574d589738d"
+
+OLD_RESOLVER = '''def _resolve_short_config(
+    central: dict[str, Any], key: str, project_root: Path
+) -> tuple[str, str]:
+    matches = _find_config_values(central, key)
+    if not matches:
+        raise RenderError(f"missing config value `{key}`")
+    if len(matches) > 1:
+        paths = ", ".join(path for path, _ in matches)
+        raise RenderError(f"ambiguous config value `{key}` found at: {paths}")
+    path, value = matches[0]
+    return path, _resolve_config_value(value, f"config.{path}", project_root)
+'''
+
+NEW_RESOLVER = '''def _resolve_short_config(
+    central: dict[str, Any], key: str, project_root: Path
+) -> tuple[list[str], str]:
+    matches = _find_config_values(central, key)
+    if not matches:
+        raise RenderError(f"missing config value `{key}`")
+
+    # Multiple installed modules may expose the same shared path contract.
+    # Accept shorthand only when every candidate resolves identically; unlike
+    # choosing the first match, this is order-independent and records every
+    # contributing config path in the generation manifest.
+    resolved_matches = [
+        (path, _resolve_config_value(value, f"config.{path}", project_root))
+        for path, value in matches
+    ]
+    if len({resolved for _, resolved in resolved_matches}) > 1:
+        paths = ", ".join(path for path, _ in resolved_matches)
+        raise RenderError(
+            f"ambiguous config value `{key}` has conflicting resolved values at: {paths}"
+        )
+    return [path for path, _ in resolved_matches], resolved_matches[0][1]
+'''
+
+OLD_CALLER = '''        for match in _SHORT_CONFIG_TOKEN.finditer(content):
+            token, key = match.group(0), match.group(1)
+            path, resolved = _resolve_short_config(central, key, project_root)
+            source = f"config.{path}"
+            replacements[token] = resolved
+            input_values[source] = resolved
+'''
+
+NEW_CALLER = '''        for match in _SHORT_CONFIG_TOKEN.finditer(content):
+            token, key = match.group(0), match.group(1)
+            paths, resolved = _resolve_short_config(central, key, project_root)
+            replacements[token] = resolved
+            for path in paths:
+                input_values[f"config.{path}"] = resolved
+'''
+
+
+def sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def patched_bytes(source: bytes) -> bytes:
+    text = source.decode("utf-8")
+    if text.count(OLD_RESOLVER) != 1 or text.count(OLD_CALLER) != 1:
+        raise ValueError("upstream patch anchors are not unique")
+    return text.replace(OLD_RESOLVER, NEW_RESOLVER).replace(OLD_CALLER, NEW_CALLER).encode("utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", type=Path, default=DEFAULT_TARGET)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="verify the exact patched bytes without modifying the target",
+    )
+    args = parser.parse_args()
+    target = args.target.resolve(strict=True)
+    original = target.read_bytes()
+    actual = sha256(original)
+
+    if actual == PATCHED_SHA256:
+        print(f"PASS: {target} already carries {UPSTREAM_VERSION} patch sha256={actual}")
+        return 0
+    if args.check:
+        if actual == UPSTREAM_SHA256:
+            print(f"HALT: {target} is exact {UPSTREAM_VERSION} upstream bytes; patch is not applied")
+        else:
+            print(f"HALT: {target} has unreviewed sha256={actual}")
+        return 1
+    if actual != UPSTREAM_SHA256:
+        print(
+            f"HALT: refusing to patch {target}; expected exact {UPSTREAM_VERSION} "
+            f"sha256={UPSTREAM_SHA256}, got {actual}"
+        )
+        return 1
+
+    try:
+        updated = patched_bytes(original)
+    except (UnicodeDecodeError, ValueError) as error:
+        print(f"HALT: cannot apply reviewed patch to {target}: {error}")
+        return 1
+    updated_hash = sha256(updated)
+    if updated_hash != PATCHED_SHA256:
+        print(
+            f"HALT: generated patch bytes do not match reviewed sha256={PATCHED_SHA256}; "
+            f"got {updated_hash}"
+        )
+        return 1
+
+    mode = stat.S_IMODE(target.stat().st_mode)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    installed_hash = sha256(target.read_bytes())
+    if installed_hash != PATCHED_SHA256:
+        print(f"HALT: post-install verification failed for {target}: sha256={installed_hash}")
+        return 1
+    print(
+        f"PATCHED: {target} from {UPSTREAM_VERSION} sha256={UPSTREAM_SHA256} "
+        f"to sha256={installed_hash}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
