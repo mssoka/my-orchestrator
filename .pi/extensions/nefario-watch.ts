@@ -103,6 +103,24 @@
  * Detection-only, same contract as above: the injected message tells
  * Silas to verify (row done + review posted) and sweep — this sensor
  * never closes panes and never removes directories.
+ *
+ * Stuck-pane sensor (same 5-min tick): a ledger-tracked pane whose
+ * session jsonl has stopped growing is either STUCK-WORKING
+ * (agent_status=working, zero growth ≥ STUCK_WORKING_MIN minutes — the
+ * frozen round-main class) or sitting on an ERRORED turn that no
+ * continue ever retried (session tail stopReason:"error" / "Retry
+ * failed after", zero growth ≥ ERROR_RETRIED_MIN minutes — the
+ * idle-on-error class repeatedly found by hand, e.g. the 2026-08-01
+ * 7.5h unnoticed terminated stream). Growth = size or mtime of the
+ * pane's own registry session file, baselined from the file's mtime so
+ * a cold Silas restart catches already-stuck panes on the following
+ * tick. A stale registry pointer (pi rolled to a newer session file in
+ * the same dir — the 2026-08-29 class) is ADOPTED silently instead of
+ * alerted. One alert per incident per classification until RESOLVED
+ * (growth resumes / pane stops working / pointer changes), then re-arm.
+ * Alerts carry pane id, tab label, cwd, classification, minutes-stuck.
+ * Detection-only, same contract: never continues, never closes, never
+ * writes the ledger — Silas classifies by transcript and acts.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -516,6 +534,256 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 					`left the pane behind. Close it: \`herdr pane close ${pid}\`. ` +
 					`(If this pane is a round MAIN whose row is still working, flag ` +
 					`it instead — never close an in-flight round.)`,
+			);
+		}
+		return alerts;
+	}
+
+	// ── Stuck-pane sensor ──────────────────────────────────────────────
+	/** Minutes a tracked pane may sit `working` with zero session-jsonl
+	 * growth before the stuck-working alert fires (configurable). */
+	const STUCK_WORKING_MIN = 15;
+	/** Minutes after an errored turn with zero session growth before the
+	 * error-never-retried alert fires (configurable). */
+	const ERROR_RETRIED_MIN = 10;
+	/** pane_id -> growth baseline: registry session path, size, mtime,
+	 * and last-growth time. Baselines from the FILE's own mtime (not tick
+	 * time), so a cold Silas restart detects an already-stuck pane on the
+	 * following tick instead of granting it a fresh window. */
+	const stuckState = new Map<
+		string,
+		{ path: string; size: number; mtime: number; lastGrowthMs: number }
+	>();
+	/** pane_id -> classification already alerted ("stuck-working" |
+	 * "error-never-retried"). One alert per incident until RESOLVED
+	 * (session growth resumes / pane leaves working / pointer changes);
+	 * re-arms after resolution. In-memory, like ciAlerted. */
+	const stuckAlerted = new Map<string, string>();
+
+	interface PaneInfo {
+		status: string | null;
+		cwd: string | null;
+		tabId: string | null;
+		session: string | null;
+	}
+
+	/** pane_id -> {status, cwd, tabId, session path}. Null when the pane
+	 * is gone, herdr blipped, or the pane has no agent session (bare
+	 * shell) — callers skip silently; a tooling failure must never
+	 * manufacture a stuck alert. */
+	async function paneInfoFor(paneId: string): Promise<PaneInfo | null> {
+		const r = await pi.exec("herdr", ["pane", "get", paneId], {
+			timeout: 8000,
+		});
+		if (r.code !== 0) return null;
+		try {
+			const p = JSON.parse(r.stdout)?.result?.pane;
+			if (!p) return null;
+			return {
+				status:
+					typeof p.agent_status === "string" ? p.agent_status : null,
+				cwd: typeof p.cwd === "string" ? p.cwd : null,
+				tabId: typeof p.tab_id === "string" ? p.tab_id : null,
+				session:
+					typeof p?.agent_session?.value === "string"
+						? p.agent_session.value
+						: null,
+			};
+		} catch {
+			return null;
+		}
+	}
+
+	/** Stuck-pane sensor: tracked panes (ledger, non-done) whose session
+	 * jsonl stopped growing — STUCK-WORKING (agent_status=working, no
+	 * growth ≥ STUCK_WORKING_MIN) or ERROR-NEVER-RETRIED (session tail
+	 * stopReason:"error" / "Retry failed after", no growth ≥
+	 * ERROR_RETRIED_MIN). Returns alert strings; empty when clean.
+	 * DETECTION-ONLY: never continues, never closes, never writes the
+	 * ledger. */
+	async function stuckCheck(): Promise<string[]> {
+		const alerts: string[] = [];
+		const jobs = await trackedJobs();
+		if (jobs.length === 0) return alerts;
+		const live = await liveStatuses();
+		const labels = new Map<string, string>();
+		const tabsR = await pi.exec("herdr", ["tab", "list"], { timeout: 8000 });
+		if (tabsR.code === 0) {
+			try {
+				for (const t of JSON.parse(tabsR.stdout)?.result?.tabs ?? []) {
+					if (typeof t?.tab_id === "string")
+						labels.set(
+							t.tab_id,
+							typeof t?.label === "string" ? t.label : "unknown",
+						);
+				}
+			} catch {
+				// herdr output changed shape — labels stay unknown this tick
+			}
+		}
+		interface Cand {
+			pane: string;
+			jobId: string;
+			status: string;
+			cwd: string;
+			tab: string;
+			path: string;
+		}
+		const cands: Cand[] = [];
+		for (const job of jobs) {
+			if (!job.pane_id) continue;
+			const info = await paneInfoFor(job.pane_id);
+			if (!info?.session) continue;
+			// Session paths never contain quotes or pipes; reject anything
+			// that does rather than risk breaking the batch script below.
+			if (/["'|]/.test(info.session)) continue;
+			cands.push({
+				pane: job.pane_id,
+				jobId: job.id,
+				status: live.get(job.pane_id) ?? info.status ?? "unknown",
+				cwd: info.cwd ?? "unknown",
+				tab: labels.get(info.tabId ?? "") ?? "unknown",
+				path: info.session,
+			});
+		}
+		if (cands.length === 0) return alerts;
+		// ONE batched bash call for every candidate: mtime+size, the dir's
+		// newest jsonl (stale-pointer guard), and the error-tail probe.
+		const script =
+			"for p in " +
+			cands.map((c) => "'" + c.path + "'").join(" ") +
+			"; do " +
+			'if [ -f "$p" ]; then ' +
+			'm=$(stat -f %m "$p"); s=$(stat -f %z "$p"); ' +
+			'n=$(ls -t "$(dirname "$p")"/*.jsonl 2>/dev/null | head -1); ' +
+			'nm=0; nb=""; ' +
+			'if [ -n "$n" ]; then nm=$(stat -f %m "$n"); nb=$(basename "$n"); fi; ' +
+			'e=$(tail -c 2000 "$p" 2>/dev/null | grep -cE \'stopReason":\"error|Retry failed after\'); ' +
+			'echo "P|$p|$m|$s|$nm|$nb|$e"; ' +
+			"else " +
+			'echo "P|$p||"; ' +
+			"fi; done";
+		const r = await pi.exec("bash", ["-c", script], { timeout: 15000 });
+		if (r.code !== 0 && !r.stdout.trim()) return alerts;
+		const stats = new Map<
+			string,
+			{ m: number; s: number; nm: number; nb: string; e: number }
+		>();
+		for (const line of r.stdout.split("\n")) {
+			const f = line.split("|");
+			if (f.length < 7 || f[0] !== "P" || !f[2]) continue;
+			stats.set(f[1], {
+				m: Number(f[2]),
+				s: Number(f[3]),
+				nm: Number(f[4]),
+				nb: f[5],
+				e: Number(f[6]) || 0,
+			});
+		}
+		const nowSec = Date.now() / 1000;
+		for (const c of cands) {
+			const raw = stats.get(c.path);
+			if (!raw || !raw.m) continue; // stat failed / file gone — skip tick
+			const prev = stuckState.get(c.pane);
+			if (
+				!prev ||
+				prev.path !== c.path ||
+				raw.s !== prev.size ||
+				raw.m !== prev.mtime
+			) {
+				// First sighting, a fresh session file, or GROWTH — (re)baseline
+				// and clear any active alert: growth means the incident resolved.
+				stuckAlerted.delete(c.pane);
+				stuckState.set(c.pane, {
+					path: c.path,
+					size: raw.s,
+					mtime: raw.m,
+					lastGrowthMs: raw.m * 1000,
+				});
+				continue;
+			}
+			const minutesStuck = Math.round((nowSec - raw.m) / 60);
+			// Stale-pointer guard (2026-08-29 class: herdr's registry
+			// agent_session pointer goes STALE while pi lives and writes a
+			// newer file in the same dir — a no-growth read would be a FALSE
+			// alert). If a DIFFERENT, newer jsonl exists in the session dir,
+			// adopt it as this pane's session and skip this tick. Caveat:
+			// mega-minions share a worktree's session dir, so adoption errs
+			// toward silence — acceptable for a detection-only sensor.
+			const baseName = c.path.slice(c.path.lastIndexOf("/") + 1);
+			if (
+				minutesStuck >= ERROR_RETRIED_MIN &&
+				raw.nb !== "" &&
+				raw.nb !== baseName &&
+				raw.nm > raw.m
+			) {
+				stuckAlerted.delete(c.pane);
+				stuckState.set(c.pane, {
+					path: c.path.slice(0, c.path.lastIndexOf("/") + 1) + raw.nb,
+					size: -1,
+					mtime: raw.nm,
+					lastGrowthMs: raw.nm * 1000,
+				});
+				continue;
+			}
+			let classification: string | null = null;
+			if (raw.e > 0 && minutesStuck >= ERROR_RETRIED_MIN) {
+				// Errored turn beats stuck-working — the more specific class.
+				classification = "error-never-retried";
+			} else if (
+				c.status === "working" &&
+				minutesStuck >= STUCK_WORKING_MIN
+			) {
+				classification = "stuck-working";
+			}
+			if (classification === null) {
+				// stuck-working clears as soon as the pane leaves working;
+				// error-never-retried clears only via growth/tail change above.
+				if (
+					stuckAlerted.get(c.pane) === "stuck-working" &&
+					c.status !== "working"
+				) {
+					stuckAlerted.delete(c.pane);
+				}
+				continue;
+			}
+			if (stuckAlerted.get(c.pane) === classification) continue;
+			stuckAlerted.set(c.pane, classification);
+			const guidance =
+				classification === "error-never-retried"
+					? "Errored turn at the session tail, never retried. Classify by " +
+						"transcript FIRST (`herdr pane read <pane> --source " +
+						'recent-unwrapped --lines 120`, or tail the session jsonl for ' +
+						'stopReason/errorMessage) — pi auto-retry sometimes ' +
+						'self-recovers; then at most ONE `herdr pane run <pane> ' +
+						'"continue"` — never loop continues. ' +
+						"(1302 burst: wait, then one more; 1308/402/weekly-cap: " +
+						"continue = waste — park per the quota regime.)"
+					: "agent_status=working with zero session growth. Verify real " +
+						"work vs stall BEFORE acting: compare toolUse entries in the " +
+						"session jsonl (a long single generation can legally exceed " +
+						"the window; an 18-20h pane was once REAL design work). If " +
+						"genuinely wedged: kill the pi pid, relaunch, full-context " +
+						"handover.";
+			alerts.push(
+				"- STUCK PANE (" +
+					classification +
+					") — " +
+					c.jobId +
+					" pane " +
+					c.pane +
+					' tab "' +
+					c.tab +
+					'" cwd ' +
+					c.cwd +
+					": no session-jsonl growth for ~" +
+					minutesStuck +
+					" min (last growth " +
+					new Date(raw.m * 1000).toISOString() +
+					"). " +
+					guidance +
+					" Detection-only: this sensor never continues, closes, or " +
+					"writes the ledger — Silas classifies and acts.",
 			);
 		}
 		return alerts;
@@ -979,12 +1247,16 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			// injected message carries the verify-then-sweep instruction.
 			const debris = await roundDebrisCheck();
 			if (debris.length) alerts.push(...debris);
+			// Stuck-pane sensor: tracked panes whose session stopped growing
+			// (stuck-working / error-never-retried). Detection-only.
+			const stuck = await stuckCheck();
+			if (stuck.length) alerts.push(...stuck);
 			if (alerts.length === 0) return;
 			pi.sendMessage(
 				{
 					customType: "nefario-watch",
 					content:
-						`[nefario-watch · ${stamp()}] PR/CI/conflict/review/Perkins/dream/round-debris alert(s):\n` +
+						`[nefario-watch · ${stamp()}] PR/CI/conflict/review/Perkins/dream/round-debris/stuck-pane alert(s):\n` +
 						alerts.join("\n") +
 						"\nDetection only: nefario-watch never writes the ledger or " +
 						"sends pane input — Silas owns every relay and ledger transition.",
