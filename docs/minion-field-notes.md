@@ -44,6 +44,16 @@ findings that keep recurring. One line per entry, dated, with the job id.
   per-row ruling arrived as a single tagged keep-leave prompt (R1
   restore-via-A1); a Send-&-End session delivers the final feedback
   once on the next poll (no extra polling rounds after it).
+  2026-09-09 addendum (dream-2026-09-09; Selva assets/rigs WIP +
+  full-song-storyboard, 09-08): technical completion is not the
+  viewing handoff. The finished movie was buried in technical chatter;
+  the storyboard browser opened before its poll existed. For a
+  requested visual handoff, verify the exact artifact and agreed
+  viewing/review path, then say READY TO WATCH/REVIEW conspicuously.
+  Browser-open alone does not prove active feedback monitoring; check
+  the owning poll or supported wake path. Open a player only when
+  requested/authorized; otherwise provide a clear usable link/path.
+  Opening, watching and artistic approval are three different claims.
 - 2026-07-31 (RightTenantry crew — form-funnel-w0, refcheck-rc1-1,
   refcheck-rc2-1): Squirrel triple-trap: `run_squirrel.sh` sources .env and
   points at STAGING (clobbers your override — run `gleam run -m squirrel`
@@ -526,7 +536,14 @@ findings that keep recurring. One line per entry, dated, with the job id.
   finish anyway; CHECK THE OUTPUT ARTIFACT before retrying or
   declaring failure (bridge-timeout Cycles renders landed
   server-side; pi lens turns that hit 500s still wrote findings to
-  disk).
+  disk). 2026-09-09 addendum (dream-2026-09-09; Selva assets/rigs
+  09-07 + blender-sculpt 08-23): existence is NOT completion — a
+  partial render or stale file can survive a failed producer. Bind
+  outputs to the attempt/source receipt, verify freshness, expected
+  completeness and producer result plus the job's semantic gates
+  before publishing. Preserve partials as diagnostics; never splice
+  timed-out attempts into a claimed complete proof. Check whether
+  the producer is still running before retrying.
 - 2026-08-20 (dream-2026-08-21; packet-plumber-ue-bootstrap + -slice-1 —
   the UE repo cluster): ue-mcp bridge ops — `ue-mcp init` is pty-only:
   deploy via the package's `dist/deploy-cli.js` then REBUILD (a stale
@@ -567,10 +584,10 @@ findings that keep recurring. One line per entry, dated, with the job id.
   what isn't.
 - 2026-08-21 (dream-2026-08-21; orchestrator-night-watchman +
   -hardening — 2 jobs): bmad-build (6.11.0, fresh from the 08-20
-  upstream update 585166c) render FAILS on this install — `ambiguous
+  upstream update 585166c) render FAILED on that install — `ambiguous
   config token implementation_artifacts` (modules.bmm + modules.gds
   both define it; the skill's step files consume
-  `{{.implementation_artifacts}}`). No in-repo fix exists (config.toml
+  `{{.implementation_artifacts}}`). No in-repo fix existed then (config.toml
   is installer-managed; a custom override still leaves 2 matches).
   Sanctioned path (Silas ruling 08-21 06:10Z): skill WAIVED —
   self-contained briefing + the waiver carried as a canon note in the
@@ -581,7 +598,20 @@ findings that keep recurring. One line per entry, dated, with the job id.
   (pace-tuning, motion-readability, camera-zoom, noc-player-toggle).
   estate-spawning proved it transiently FIXABLE in place (temp
   disambiguated the bmm/gds dup keys, config restored byte-equal) —
-  but the waiver stays the standing path until a real fix job lands.
+  the waiver remained the standing path at that time.
+  2026-09-09 supersede (dream-2026-09-09; Selva assets/rigs +
+  my-orchestrator-bmad-build-config-unblock-pp3d, 09-07): the local
+  equivalent-config ambiguity waiver is RETIRED by the installed
+  v6.12.0 repair (PR #23); Selva rendered successfully and PP3D
+  independently resumed the rendered workflow with 14/14 output
+  hashes verified. The patch accepts duplicate keys ONLY when all
+  resolve identically; conflicts/missing config still HALT. Follow
+  docs/playbook-annex.md's mixed-module patch entry and
+  docs/bmad-renderer-short-config-patch.md (hash-gated check after
+  updates). A missing renderer in another checkout is a DISTINCT
+  failure, not proof this repair applies there. Check the current
+  dispatched worktree under the skill's invocation contract; do not
+  inherit a historical waiver by assumption.
 - 2026-08-20 (dream-2026-08-21; righttenantry mobile-form-hunt +
   mobile-layout-1 — 2 jobs): front-end/env traps — (a) debug flex/CSS
   geometry by walking the ANCESTOR chain in the DOM, never by reading
@@ -1042,6 +1072,16 @@ findings that keep recurring. One line per entry, dated, with the job id.
   UNWIRED — never cite a catalog knob in a formula without grepping
   consumers; "documented in the loader comment" ≠ consumed). Anchor to
   capture-time state dumps, second derivations, consumer greps.
+  2026-09-09 addendum (dream-2026-09-09; PP3D typography study
+  09-08 + Selva assets/rigs 09-07): name the FINAL representation
+  being certified. Record decoded capture dimensions and source SHA
+  before cropping/normalization (1600x450 media is not 1600x900
+  font-pixel compliance evidence). Contact/scale checks observe
+  evaluated world-space geometry, the exact side/part and enabled
+  modifier order; saved/reopened or appended timeline behavior is
+  checked separately from manual sliders. Intermediate images,
+  comments and formulas remain useful diagnostics, not substitutes
+  for the final contract.
 - 2026-08-24/26 (dream-2026-08-27; dublin-map-beautify,
   look-node-legibility-diag — both exactly 7-round mock loops): the
   user iterates on MOCKS fast (~10min rounds) — keep the mock tool

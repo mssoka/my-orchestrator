@@ -695,6 +695,16 @@ in the gotchas below as current routing.
   Identity-pane relaunches clear PI_MODEL/PI_PROVIDER and pin
   --model explicitly (hardened in the watchman same day; the COO
   deepseek ruling lives in the playbook's Silas section).
+  2026-09-09 addendum (dream-2026-09-09; typography-study + the
+  storyboard/SOMA dispatch batch, 09-08): the historical blanket
+  `--thinking max` instruction above is superseded, NOT an alias
+  for the GPT policy. The installed registry persisted `max` and
+  `xhigh` distinctly. Verify BOTH `model_change.modelId` and the
+  latest `thinking_level_change.thinkingLevel` after every launch;
+  Astra/Sol require xhigh, Luna max. `/thinking xhigh` corrected all
+  three jobs in the SAME sessions without respawn. Verify progress
+  afterward; these corrections stayed working, so they did not need
+  a continue. Do not infer identical behavior for other slash commands.
 - **Serialize concurrent Perkins BURSTS (2026-08-11; models renamed 2026-08-12; SUPERSEDED 2026-08-16).**
   **2026-08-16 USER RULING: FULL THROTTLE on all providers — the serialize-on-quota
   doctrine below is LIFTED.** Dispatch rounds as needed, no holding behind
@@ -1482,6 +1492,20 @@ in the gotchas below as current routing.
   place with an explicit disregard note). Never leave placeholder
   pane-run commands in a && dispatch chain — one bad target types
   into a live agent.
+
+- **Shared Blender: a reservation or handshake is not live-state
+  clearance (2026-09-09, dream-2026-09-09; reliable-startup 09-07 +
+  Selva collision-resume 09-08).** Before a live restart, load/restore
+  or first mutation after handoff, freshly check owner, exact file/scene,
+  dirty state/frame, playback/jobs and workers. Startup found unsaved
+  frame83 despite idle workers; resume found dirty frame129 despite the
+  same PID, file hash and owner. Stop the live action on unexplained
+  drift; preserve and reconcile under the applicable authority, never
+  assume scrubbing is harmless or silently discard. A saved-copy hash
+  alone does not certify live cleanliness. Use observation timestamps:
+  newer explicit clearance can supersede an older dirty-state relay.
+  Read-only checks and isolated-copy CPU work need not touch or restart
+  the shared app; old PID/checkpoint receipts are not future authority.
 
 ### Extensions
 
