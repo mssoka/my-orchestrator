@@ -349,15 +349,16 @@ the user at the Gru session in `/Users/moses/code`.
 
 ### Provider incidents
 
-**CURRENT MODEL POLICY (2026-09-07 user ruling — GPT chain):** the dated
+**CURRENT MODEL POLICY (2026-09-09 user ruling — GPT chain):** the dated
 provider-incident doctrine below is HISTORICAL — the live chain is the
 playbook's 'Model policy' section: reasoning tier (Gru/Bob/Perkins round
 mains + lens fleets) = `openai-codex/gpt-6-astra` @ xhigh; ALL
 3D/game/Blender agents incl. 3D mega-minions + 3D lenses = Astra xhigh;
 other minions + non-3D mega-minions = `openai-codex/gpt-5.6-sol` @
-xhigh; Silas = `openai-codex/gpt-5.6-luna` @ max. kimi/glm/deepseek
-chains are RETIRED from new dispatches — do not act on old model names
-in the gotchas below as current routing.
+xhigh; Silas = `openai-codex/gpt-5.6-luna` @ xhigh. This supersedes
+the 2026-09-07 Luna/max current pin; historical max incidents remain
+historical. kimi/glm/deepseek chains are RETIRED from new dispatches —
+do not act on old model names in the gotchas below as current routing.
 
 - **Provider incidents come in 3 classes with different recoveries
   (2026-08-02/03).** Transient stalls, mid-turn refusals, and
@@ -1590,7 +1591,8 @@ in the gotchas below as current routing.
   natively multimodal: **Astra** (`openai-codex/gpt-6-astra`, `xhigh`) is
   the route for 3D/game/Blender work and 3D visual verification; **Sol**
   (`openai-codex/gpt-5.6-sol`, `xhigh`) is the route for non-3D helpers;
-  **Luna** (`openai-codex/gpt-5.6-luna`, `max`) is Silas/COO's route.
+  **Luna** (`openai-codex/gpt-5.6-luna`, `xhigh`) is Silas/COO's route
+  (user ruling 2026-09-09; supersedes the 09-07 Luna/max current pin).
   Attach images inline on those sessions; do not spawn a vision detour.
   Retain KYLE when a dedicated evidence-grade visual specialist is useful,
   but select its provider from the current policy — never hard-code a

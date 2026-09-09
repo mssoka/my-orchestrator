@@ -452,11 +452,12 @@ incidents.)
 - **Vision provenance:** the describe_image silent lmstudio fallback
   ran 15+ invisible delegations in one day under a lying log identity
   (deleted same day 08-18). The LEFOU→KYLE rename (08-21) is a cast
-  correction. **Current 2026-09-07 ruling:** GPT models are the native
+  correction. **Current 2026-09-09 ruling:** GPT models are the native
   vision route — Astra/xhigh for 3D and Blender, Sol/xhigh for non-3D
-  helpers, Luna/max for Silas; KYLE remains a role, not a hard-coded
-  legacy GLM provider. Verify new models THROUGH pi (probe + session
-  jsonl), never raw API curls or the reply's self-named id. Legacy visual
+  helpers, Luna/xhigh for Silas; this supersedes the 09-07 Luna/max
+  current pin. KYLE remains a role, not a hard-coded legacy GLM provider.
+  Verify new models THROUGH pi (probe + session jsonl), never raw API curls
+  or the reply's self-named id. Legacy visual
   models remain explicit, authorized fallbacks only (a "glm-4.7"
   self-report was model HALLUCINATION; a "ZAI balance 0" conclusion was a
   WRONG-ENDPOINT curl).
