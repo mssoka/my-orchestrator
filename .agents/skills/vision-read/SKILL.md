@@ -12,7 +12,7 @@ model. Current native-vision routing is:
 - **3D/game/Blender work and 3D visual verification** →
   `openai-codex/gpt-6-astra` (Astra), `xhigh`.
 - **Non-3D helper reads** → `openai-codex/gpt-5.6-sol` (Sol), `xhigh`.
-- **Silas/COO** → `openai-codex/gpt-5.6-luna` (Luna), `max`.
+- **Silas/COO** → `openai-codex/gpt-5.6-luna` (Luna), `xhigh`.
 
 Attach images inline on those GPT sessions; no vision spawn is needed. KYLE
 remains a role for evidence-grade visual verification or a dedicated visual
