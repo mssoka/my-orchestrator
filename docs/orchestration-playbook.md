@@ -333,6 +333,8 @@ stand unchanged.
   new native Blender briefings must state the direct-MCP route and preserve
   a user visual gate before broad expansion.
 
+**Blender access (user ruling2026-09-10):** Blender is provided for agents to use. Routine access, scene/file switching, checkpointing, in-scope imports/rendering and necessary application recovery require no new user-permission prompt. Silas coordinates ownership and fresh readiness internally; preserve unsaved work before replacement/restart and do not interrupt active workers. A changed PID or dirty scene triggers preservation/reconciliation under this standing authority, not another access question. Notify the user at meaningful output-review gates; escalate only genuine blockers or scope/cost/safety decisions not already covered. This changes access authority, not quality acceptance, resource/attempt limits or model routing.
+
 ## Durable state
 
 - Job ledger: **SQLite** at `/Users/moses/code/_bmad-output/orchestrator.db`,
