@@ -800,12 +800,17 @@ Two tiers, both policy (Herdr itself enforces no limit):
 
 ## Skills availability
 
-Canonical home: `/Users/moses/code/.agents/skills/` — **git-tracked since
-2026-08-01 (self-containment)**: the repo carries its whole skill set —
-`bmad-*`, `gds-*`, `lavish`, `code-review` + `review-plan` (Perkins'
-review skills, imported from `~/.claude/skills`), and `herdr`; everything
-symlinked into `~/.pi/agent/skills/`, visible from any cwd (incl.
-worktrees). User-general skills (adk-*, cadquery, sentry-*) stay outside.
+Canonical home: `/Users/moses/code/.agents/skills/` — **local-only
+canonical content (UNTRACKED 2026-09-10; git-tracked 2026-08-01–2026-09-10,
+see the annex 'Skills availability — self-containment history')**: the
+repo's skill set — `bmad-*`, `gds-*`, `lavish`, `code-review` +
+`review-plan` (Perkins' review skills, imported from `~/.claude/skills`),
+and `herdr` — lives as untracked files at the root, symlinked into
+`~/.pi/agent/skills/`, visible from any cwd; orchestrator WORKTREES
+bootstrap-symlink `.agents/skills` from the repo root (annex 'Dispatch —
+worktree bootstrap') — realpath-deduped against the globals, no
+collision warnings, no drift-prone copies. User-general skills (adk-*,
+cadquery, sentry-*) stay outside.
 The `gds-*` suite is wired the same way; the `_bmad/gds` module config
 lives per game project — ANY repo can become one: install BMGD into that
 repo's `_bmad`, propagate `_bmad/gds` + `config.toml` + `_config/` into
