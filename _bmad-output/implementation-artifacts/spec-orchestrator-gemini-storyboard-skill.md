@@ -2,7 +2,7 @@
 title: 'Reusable Gemini storyboard skill'
 type: 'feature'
 created: '2026-09-10'
-status: 'in-review'
+status: 'done'
 baseline_commit: '54164326422a736c41bff1429a83002401e378a8'
 route: 'dispatch'
 review_loop_iteration: 0
