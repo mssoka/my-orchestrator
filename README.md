@@ -386,7 +386,11 @@ cd <root>
 npx bmad-method@latest install   # reference: v6.10.0, modules core + bmm + tea + cis
 ```
 
-`_bmad/` and `.agents/skills/` are installer-managed and not tracked;
+`_bmad/` and `.agents/skills/` are installer-managed and not tracked
+(`.agents/skills/` is deliberately untracked since 2026-09-10 — the root
+keeps it as local-only canonical content, and orchestrator worktrees
+bootstrap-symlink it from the repo root; see
+`docs/playbook-annex.md` 'Dispatch — worktree bootstrap').
 `_bmad/custom/` overrides don't travel — re-answer installer prompts or copy
 `config.toml` / `config.user.toml` by hand. Create each repo's `.env` files
 by hand (never in git); dispatch symlinks them into worktrees, so jobs that
@@ -452,10 +456,14 @@ for s in code-review review-plan herdr; do ln -sfn <root>/.agents/skills/$s ~/.c
 ln -sfn <root>/.agents/skills/herdr ~/.agents/skills/herdr
 ```
 
-(The repo's `.agents/skills/` is git-tracked and self-contained: bmad-*,
-gds-*, lavish, code-review, review-plan, herdr. Skills your other projects
-use but orchestration doesn't — adk-*, sentry-*, etc. — stay in
-`~/.agents/skills` / `~/.claude/skills` untouched.)
+(The repo's `.agents/skills/` is local-only canonical content — NOT
+git-tracked since 2026-09-10 (untracked: git-tracked copies in worktrees
+collided with the global `~/.pi/agent/skills` symlinks pointing back at
+this root; worktrees symlink it instead — playbook-annex 'Dispatch —
+worktree bootstrap'): bmad-*, gds-*, lavish, code-review, review-plan,
+herdr. Skills your other projects use but orchestration doesn't —
+adk-*, sentry-*, etc. — stay in `~/.agents/skills` / `~/.claude/skills`
+untouched.)
 
 ### 6. Launch and smoke-test
 
