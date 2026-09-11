@@ -18,8 +18,10 @@ Config: ~/.config/perkins/config (0600, outside any repo), k=v lines:
 `--owner <login>` selects the installation for the repo's owner; it may be
 omitted when exactly one installation is configured. Tokens are cached per
 owner at ~/.config/perkins/token-cache-<owner> (0600) and reused while
->5 min remain; --refresh bypasses the cache. Any failure: one-line stderr
-reason, exit non-zero (callers map that to their fallback path).
+>5 min remain; --refresh bypasses the cache. Mint failures are retried a
+bounded number of times (loud per-attempt stderr logging, ~30s backoff)
+before the failure stands. Any failure: one-line stderr reason per attempt,
+exit non-zero (callers map that to their fallback path).
 """
 import argparse
 import base64
@@ -38,6 +40,14 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
 API = "https://api.github.com"
 # Installation tokens live 1h; reuse the cache while >5 min remain.
 REUSE_THRESHOLD_S = 300
+# Mint flake insurance (observed 2026-09-10, PR #22 r4 close): one
+# transient mint failure silently degraded the round to the plain-comment
+# fallback while a retry minutes later succeeded. Bounded retry: 1 try
+# + up to 2 automatic retries, ~30s apart (the proven manual-retry window,
+# compressed); after that the failure stands and the caller's last-resort
+# fallback fires as before.
+MINT_ATTEMPTS = 3
+MINT_RETRY_BACKOFF_S = 30
 
 
 def die(msg):
@@ -187,17 +197,43 @@ def write_cache(owner, token, expires_at):
         sys.stderr.write(f"perkins-token: warning: cache write failed ({e})\n")
 
 
-def mint(cfg, owner):
-    key_path = cfg["key_path"]
-    if not os.path.isfile(key_path):
-        die(f"missing private key: {key_path}")
-    jwt = mint_jwt(cfg["app_id"], key_path)
+def _mint_once(cfg, owner):
+    """One mint attempt; die()s (one-line stderr + exit 1) on failure."""
+    jwt = mint_jwt(cfg["app_id"], cfg["key_path"])
     resp = api("POST", f"/app/installations/{cfg['installations'][owner]}/access_tokens", jwt)
     token, expires_at = resp.get("token"), resp.get("expires_at")
     if not token or not expires_at:
         die("github returned an access-token response without token/expires_at")
     write_cache(owner, token, expires_at)
     return token
+
+
+def mint(cfg, owner):
+    """Bounded-retry wrapper around _mint_once.
+
+    Each failed attempt die()s (printing its reason) inside the try; this
+    wrapper adds a LOUD attempt-counter line on stderr and retries with
+    MINT_RETRY_BACKOFF_S between attempts, up to MINT_ATTEMPTS total. The
+    final attempt's SystemExit propagates unchanged, so the one-line-reason
+    + exit-non-zero contract — and callers' last-resort fallback path —
+    are exactly as before. The success path is untouched: first attempt
+    returns immediately, token to stdout only, no extra output.
+    """
+    if not os.path.isfile(cfg["key_path"]):
+        die(f"missing private key: {cfg['key_path']}")
+    for attempt in range(1, MINT_ATTEMPTS + 1):
+        if attempt > 1:
+            time.sleep(MINT_RETRY_BACKOFF_S)
+        try:
+            return _mint_once(cfg, owner)
+        except SystemExit:
+            if attempt < MINT_ATTEMPTS:
+                sys.stderr.write(f"perkins-token: mint attempt {attempt}/{MINT_ATTEMPTS} "
+                                 f"failed (reason above) — retrying in {MINT_RETRY_BACKOFF_S}s\n")
+            else:
+                sys.stderr.write(f"perkins-token: mint attempt {attempt}/{MINT_ATTEMPTS} "
+                                 f"failed (reason above) — all attempts exhausted, giving up\n")
+                raise
 
 
 def token_for(cfg, owner, refresh):
