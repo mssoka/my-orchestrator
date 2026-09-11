@@ -385,36 +385,31 @@ the user at the Gru session in `/Users/moses/code`.
   bodies with backticks: write from a FILE, never a heredoc (the
   08-13 backtick-eating class on a new surface).
 
+- **Separate an exact scope grant from expiring execution readiness
+  (2026-09-09, dream-2026-09-09; Selva dirty-state release + PP3D
+  native-smoke preflight, 09-08).** Record the grant's scope, owner,
+  attempt budget and superseding holds separately from immediate
+  dirty-state/resource/watchdog/preflight checks. Missing or expired
+  readiness blocks execution; it does not itself require another A/E
+  for an otherwise unchanged, explicit grant. Reconcile the condition,
+  re-check the latest authority and fresh readiness, then execute only
+  the still-unconsumed authorized scope without an idle turn that expires
+  the check. This is NOT permission to invent, broaden or revive a grant:
+  a later user stop, changed scope/ownership, exhausted attempt or
+  terminal failure/cancellation still controls. No retry is implied.
+
 ### Provider incidents
 
-**CURRENT MODEL POLICY (2026-09-07 user ruling — GPT chain):** the dated
+**CURRENT MODEL POLICY (2026-09-09 user ruling — GPT chain):** the dated
 provider-incident doctrine below is HISTORICAL — the live chain is the
 playbook's 'Model policy' section: reasoning tier (Gru/Bob/Perkins round
 mains + lens fleets) = `openai-codex/gpt-6-astra` @ xhigh; ALL
 3D/game/Blender agents incl. 3D mega-minions + 3D lenses = Astra xhigh;
 other minions + non-3D mega-minions = `openai-codex/gpt-5.6-sol` @
-xhigh; Silas = `openai-codex/gpt-5.6-luna` @ xhigh (2026-09-09 user
-ruling: "let's make silas model luna be on xhigh as well. rather than
-on max." — PR24 merged). kimi/glm/deepseek chains are RETIRED from
-new dispatches — do not act on old model names in the gotchas below as
-current routing.
-
-**HOLD INTERLUDE (2026-09-10 user ruling, DURATION-LIMITED — supersedes
-the GPT chain above for the hold's duration only):** the OpenAI account
-hit a windowed plan cap (~2026-09-15 per quota memory; 5th cap flavor —
-cap walls are provider-generic, same recovery shape as the kimi weekly
-cap: continue = waste, park with named resume trigger). Interim chain:
-`zai-coding-cn/glm-5.3` @ max for code + general work (glm-5.3-flash @
-high for Silas); image-gen exempt; Astra reserved for 3D craft when it
-returns. Identity panes flipped IN-PLACE (Gru glm-5.3 @ max; Silas died
-on the cap mid-turn and was revived same pane/session — /model +
-/thinking + continue) — watchman/relaunch pins are INVALID until lift
-(the silas.ts Luna-pin flap is a standing trap); mid-hold Silas model
-flips are user-sanctioned ad hoc. Under glm-only load ~3 concurrent
-Perkins round mains reliably launch-burst (1302) — one continue per
-pane after settle, serialize the rest of the day's glm fan-outs. Durable
-policy: `_bmad-output/memory/openai-quota-hold-glm-interim-2026-09-10.md`.
-The GPT-chain base resumes at lift.
+xhigh; Silas = `openai-codex/gpt-5.6-luna` @ xhigh. This supersedes
+the 2026-09-07 Luna/max current pin; historical max incidents remain
+historical. kimi/glm/deepseek chains are RETIRED from new dispatches —
+do not act on old model names in the gotchas below as current routing.
 
 - **Provider incidents come in 3 classes with different recoveries
   (2026-08-02/03).** Transient stalls, mid-turn refusals, and
@@ -1737,7 +1732,8 @@ The GPT-chain base resumes at lift.
   natively multimodal: **Astra** (`openai-codex/gpt-6-astra`, `xhigh`) is
   the route for 3D/game/Blender work and 3D visual verification; **Sol**
   (`openai-codex/gpt-5.6-sol`, `xhigh`) is the route for non-3D helpers;
-  **Luna** (`openai-codex/gpt-5.6-luna`, `max`) is Silas/COO's route.
+  **Luna** (`openai-codex/gpt-5.6-luna`, `xhigh`) is Silas/COO's route
+  (user ruling 2026-09-09; supersedes the 09-07 Luna/max current pin).
   Attach images inline on those sessions; do not spawn a vision detour.
   Retain KYLE when a dedicated evidence-grade visual specialist is useful,
   but select its provider from the current policy — never hard-code a

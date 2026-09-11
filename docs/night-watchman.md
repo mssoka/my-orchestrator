@@ -21,11 +21,12 @@ across restarts and workspace moves):
 
 | Target | Tab label | Relaunch command |
 |---|---|---|
-| Silas (COO) | `silas` | `env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1 pi --model openai-codex/gpt-5.6-luna --thinking max` |
+| Silas (COO) | `silas` | `env -u PI_GRU -u PI_MODEL -u PI_PROVIDER PI_SILAS=1 pi --model openai-codex/gpt-5.6-luna --thinking xhigh` |
 | Gru (CEO) | `Gru` | `env -u PI_SILAS PI_GRU=1 pi --model openai-codex/gpt-6-astra --thinking xhigh` |
 
-Silas's model is pinned (COO model ruling 2026-09-07 —
-`openai-codex/gpt-5.6-luna` @ max). The launch env clears `PI_MODEL` +
+Silas's model is pinned (COO model ruling 2026-09-09 —
+`openai-codex/gpt-5.6-luna` @ xhigh; this supersedes the 2026-09-07
+Luna/max current pin). The launch env clears `PI_MODEL` +
 `PI_PROVIDER` so a leaked env cannot override the pin (the 2026-09-06
 11:47Z relaunch leaked `PI_MODEL=k3` over the silas.ts extension pin —
 the COO landed on the reasoning tier's model). No legacy fallback: if
@@ -259,7 +260,7 @@ rm ~/Library/LaunchAgents/com.moses.code.night-watchman.plist
   hardening job): boot-race grace, real-death relaunch into the correct
   pane (no tab split), live-agent no-op, missing tab + stray split STOPs.
 - The **model gate** is unit-tested (astra → xhigh pin; astra-down → abort;
-  never a legacy model; silas ops → luna max) and exercised live (astra pinned after a probe recovery
+  never a legacy model; silas ops → luna xhigh) and exercised live (astra pinned after a probe recovery
   08-21).
 - **Kill tests remain human-run** — the watchman has no kill path by
   design (asserted in `--self-test`).

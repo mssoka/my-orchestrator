@@ -452,11 +452,12 @@ incidents.)
 - **Vision provenance:** the describe_image silent lmstudio fallback
   ran 15+ invisible delegations in one day under a lying log identity
   (deleted same day 08-18). The LEFOU→KYLE rename (08-21) is a cast
-  correction. **Current 2026-09-07 ruling:** GPT models are the native
+  correction. **Current 2026-09-09 ruling:** GPT models are the native
   vision route — Astra/xhigh for 3D and Blender, Sol/xhigh for non-3D
-  helpers, Luna/max for Silas; KYLE remains a role, not a hard-coded
-  legacy GLM provider. Verify new models THROUGH pi (probe + session
-  jsonl), never raw API curls or the reply's self-named id. Legacy visual
+  helpers, Luna/xhigh for Silas; this supersedes the 09-07 Luna/max
+  current pin. KYLE remains a role, not a hard-coded legacy GLM provider.
+  Verify new models THROUGH pi (probe + session jsonl), never raw API curls
+  or the reply's self-named id. Legacy visual
   models remain explicit, authorized fallbacks only (a "glm-4.7"
   self-report was model HALLUCINATION; a "ZAI balance 0" conclusion was a
   WRONG-ENDPOINT curl).
@@ -536,23 +537,50 @@ standing policy + a pointer here.)
 (Relocated from the playbook's Skills availability; the core keeps the
 current state and the bmad-updates rules.)
 
-- Skills became **git-tracked 2026-08-01 (self-containment)**: the repo
-  carries its whole skill set — `bmad-*`, `gds-*`, `lavish`, `code-review`
-  + `review-plan` (Perkins' review skills, imported from
+- Skills became **git-tracked 2026-08-01 (self-containment)** and were
+  **UNTRACKED again 2026-09-10** (local-only canonical content): the
+  2026-08-01 self-containment made every orchestrator worktree carry a
+  git-tracked `.agents/skills` copy, but pi dedupes skills by REALPATH —
+  `~/.pi/agent/skills/*` are symlinks into
+  `/Users/moses/code/.agents/skills/*`, so in worktrees the tracked copy
+  sat at a different realpath → pi reported `gds-*`/`bmad-*` collisions
+  on every worktree session (project copy silently shadows canonical;
+  byte-identical today, but drift would go unnoticed). Fix: `git rm -r
+  --cached .agents/skills` + `.gitignore` `/.agents/` — the root keeps
+  the files on disk as THE canonical source; worktrees bootstrap-symlink
+  `.agents/skills` from the repo root (see 'Dispatch — worktree
+  bootstrap' below), which realpath-dedupes clean against the global
+  symlinks. In-flight worktrees that predate the change keep their
+  tracked copies (do not force-touch); new worktrees get the clean shape.
+  The repo carries its whole skill set — `bmad-*`, `gds-*`, `lavish`,
+  `code-review` + `review-plan` (Perkins' review skills, imported from
   `~/.claude/skills`), and `herdr` (deduped from identical copies in
   `~/.agents/skills` and `~/.claude/skills`). Everything is symlinked
   into `~/.pi/agent/skills/` (and the three imports also into
   `~/.claude/skills/`, herdr also into `~/.agents/skills/`), so pi
   agents see them from any cwd (including worktrees).
+- **MERGE-TIME restore step (the untrack lands in the live root):**
+  when the main-branch pull/merge that carries the untrack reaches the
+  live root checkout, git DELETES the 1237 now-untracked skill files
+  from the root working tree (tracked→untracked removal). The global
+  symlinks would dangle. Before/at merge: copy `.agents/skills` aside,
+  pull, then if deleted restore with `git restore --source=<pre-untrack-
+  commit> --worktree -- .agents/skills` (worktree-only — never
+  `git checkout <commit> -- …`, which re-stages them into the index).
+  Files land back on disk untracked + gitignored; zero functional change.
 - **bmad updates flow detail:** run the bmad installer/update (writes
   fresh vanilla `bmad-*`/`gds-*` skill files); check where it wrote —
   `~/.pi/agent/skills/bmad-*` are symlinks INTO the repo: if the
   installer wrote through them, the update already landed in
   `/Users/moses/code/.agents/skills`; if it REPLACED the symlinks with
   real dirs, copy the new skill dirs into `.agents/skills/` and
-  re-create the symlinks; then `git diff .agents/skills` — review what
-  bmad changed, commit, push. Never hand-edit skill files (clobbered on
-  the next update) — overrides go in `_bmad/custom/`.
+  re-create the symlinks. Since the 2026-09-10 untrack there is NO git
+  review/commit step — the root files are untracked canonical content;
+  review changes by direct diff against a snapshot (e.g. `diff -r` an
+  aside copy) if needed, and NO commit/push of skills happens (the
+  canonical tree is machine-local; a fresh machine re-runs the BMad
+  install per README 'Setup'). Never hand-edit skill files (clobbered
+  on the next update) — overrides go in `_bmad/custom/`.
 - **The bmad-build mixed-module render patch (2026-09-07):**
   The former waiver for `ambiguous config value implementation_artifacts`
   is retired locally. The installer-owned v6.12.0 renderer now accepts a
@@ -579,10 +607,30 @@ folded here rather than deleted:
 ## Dispatch — worktree bootstrap (exact commands)
 
 (Relocated from the playbook core's Dispatch step 4 on 2026-08-21; the
-core keeps a one-line pointer. Worktrees only get git-tracked files.)
+core keeps a one-line pointer. Worktrees get git-tracked files plus the
+bootstrapped untracked pieces below.)
 
 - Missing `<worktree>/_bmad` + `<repo_root>/_bmad` exists →
   `cp -R <repo_root>/_bmad <worktree>/_bmad`
+- **Orchestrator repo — `.agents/skills` (since the 2026-09-10 untrack,
+  MANDATORY for my-orchestrator worktrees):** git no longer materializes
+  `.agents/skills` in fresh worktrees, and a real-dir COPY is the
+  collision we just fixed — bootstrap it as a SYMLINK so pi's realpath
+  dedup sees the same canonical target as the global
+  `~/.pi/agent/skills/*` symlinks (zero collision warnings):
+  ```bash
+  [ -d <repo_root>/.agents/skills ] && [ ! -e <worktree>/.agents/skills ] \
+    && mkdir -p <worktree>/.agents \
+    && ln -s <repo_root>/.agents/skills <worktree>/.agents/skills
+  ```
+  (Never `cp -R` skills into a worktree — a copy at a different realpath
+  is exactly the collision shape: project copy shadows canonical globals.)
+  The symlink is LOAD-BEARING, not just cosmetic: 8 skills (bmad-review,
+  bmad-walkthrough, bmad-deep-recon, bmad-project-context, comfy-run,
+  hf-generate, mlx-video, song-structure) have NO global
+  `~/.pi/agent/skills` symlink — a worktree without the bootstrap loses
+  them silently (verified 2026-09-10: 97 skills without vs 105 with the
+  symlink; both shapes collision-free).
 - **Env files** (gitignored, absent from the worktree): **symlink**
   from the main checkout — single source of truth:
   ```bash
