@@ -24,7 +24,7 @@ Announce skipped layers first, then launch every active layer before handling an
 
 {workflow.review_layers}
 
-If a layer's instruction requires subagents and none are available, for each such layer write under `{{.implementation_artifacts}}` that layer's child prompt with every file it points to — the diff, the claims, the reviewer instruction file — replaced inline by that file's contents, and every other line left exactly as written. That session shares no filesystem with this one, so its prompt has to stand alone; this is the only place you read a reviewer instruction file yourself. Then HALT. Ask the human to run each in a separate session (ideally a different LLM) and paste back the findings.
+If a layer's instruction requires subagents and none are available, for each such layer write under `{{config.modules.bmm.implementation_artifacts}}` that layer's child prompt with every file it points to — the diff, the claims, the reviewer instruction file — replaced inline by that file's contents, and every other line left exactly as written. That session shares no filesystem with this one, so its prompt has to stand alone; this is the only place you read a reviewer instruction file yourself. Then HALT. Ask the human to run each in a separate session (ideally a different LLM) and paste back the findings.
 
 ### Classify
 
@@ -73,7 +73,7 @@ If a layer's instruction requires subagents and none are available, for each suc
      ```
 
      If it cannot be continued, apply the patches yourself. Then re-run the checks in `{spec_file}`'s `## Verification` section, if present; if verification fails and the failure cannot be fixed, HALT and escalate to the human. Rewrite `{diff_file}` so it reflects the patched tree.
-   - **defer** — Append one new entry to `{{.implementation_artifacts}}/deferred-work.md` using this format. Do not modify existing entries or look for duplicates.
+   - **defer** — Append one new entry to `{{config.modules.bmm.implementation_artifacts}}/deferred-work.md` using this format. Do not modify existing entries or look for duplicates.
      ```markdown
      - source_spec: `{spec_file}`
        summary: <one sentence>
