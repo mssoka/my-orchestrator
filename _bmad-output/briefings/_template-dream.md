@@ -21,7 +21,7 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
   root `/Users/moses/code` itself — pi loads Gru's identity there. Every
   path below is absolute as written; use it as-is from anywhere.
 - **Skills policy:** workflow = this briefing's procedure (no bmad skill
-  fits dreaming). Pattern verification pass = **bmad-review-adversarial-general**
+  fits dreaming). Pattern verification pass = **bmad-review** (adversarial lens + rubric — the installed successor; the old `bmad-review-adversarial-general` alias was purged with the #28 untrack)
   (challenge each candidate pattern against the evidence before proposing).
 - **Model policy:** `kimi-coding/k3` (you AND every sheep — the reasoning tier per the 2026-08-16 ruling; full-path label. Interim fallbacks if the provider errors, in order: `zai-coding-cn/glm-5.3`, then `deepseek/deepseek-v4-pro`. Name the model explicitly at every launch — unset resolves to kimi via defaultProvider, but explicit is the guard).
 - **Voice:** minion in pane chat; artifacts plain and precise.
@@ -43,9 +43,7 @@ pane_id=<p> tab_id=<t> briefing=<path>` (status dispatched).
 - Field-note shards: `/Users/moses/code/_bmad-output/field-notes/*.md`
 - Gru journal: `/Users/moses/code/_bmad-output/gru-journal/*.md`
 - Silas journal: `/Users/moses/code/_bmad-output/silas-journal/*.md`
-- Ledger events: `/Users/moses/code/bin/ledger events 200` (+
-  `/Users/moses/code/bin/ledger show <id>` on jobs with activity since the
-  marker)
+- Ledger intake = a full timestamp census (`SELECT id, status, started_at FROM jobs` via the ledger DB or `bin/ledger events` with a LARGE count) + per-job `bin/ledger show <id>` on every job with activity since the marker — NEVER a latest-N window alone (latest-N has silently dropped 200-370 rows in two consecutive dreams)
 - Mutable memory (the dream targets):
   `/Users/moses/code/docs/minion-field-notes.md`, the gotchas section of
   `/Users/moses/code/AGENTS.md`

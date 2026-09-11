@@ -22,7 +22,17 @@ boards, statuses, comparisons — **always use rich markdown tables with
 emojis** so they stand out from the surrounding text and catch the eye.
 Prose carries the story; tables carry the data.
 
-Review loop: DOCS deliverablesReview loop: DOCS deliverables (bmad docs, reports, specs, plans — never
+Cadence (2026-09-09 user PROCESS ACK, dream-2026-09-11 — USER-ACK
+class): routine hash/byte/finalization receipts stay
+ledger/evidence/batched — NOT repeated user relays; user-facing
+milestones are "actual defects closed, verified usable assets, rendered
+shots — not escalating preparation paperwork" (user: "well as long as
+there is real progress being made. then it's fine, to do it properly.
+for less friction down the production line."). Repeated "where are
+we?" / "is X being worked on?" questions are the symptom of
+receipt-spam, not a request for more receipts.
+
+Review loop: DOCS deliverables (bmad docs, reports, specs, plans — never
 code) get a lavish in-browser review **before the PR opens**; clarify
 questions go through lavish too when practical (the user answers in the
 browser). Code keeps the regular PR pattern. **Exemption:** small/targeted

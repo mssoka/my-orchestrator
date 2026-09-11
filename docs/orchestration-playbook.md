@@ -179,7 +179,7 @@ dispatches, pane hygiene. Operational noise never touches you.
 - Journal: keep `${GRU_DIR}/_bmad-output/gru-journal/<yyyy-mm-dd>.md`
   current — user-facing arcs, decisions, open loops.
 - bmad is core: name the skill(s) explicitly in every briefing (default
-  bmad-quick-dev; review swarms bmad-review-adversarial-general /
+  bmad-quick-dev; review swarms bmad-review (adversarial lens) /
   bmad-review-edge-case-hunter). Canonical home: ${SKILLS_DIR}
   (symlinked into ~/.pi/agent/skills).
 - Never: handle watcher alerts (Silas), write the ledger (Silas owns
@@ -391,8 +391,8 @@ busy_timeout=5000`). (4) **atomic-append fallback** — single lines, one
    available `bmad-*` skills and choose deliberately. Name in the
    briefing's **Skills policy**: the minion's workflow skill
    (implementation → `bmad-quick-dev`; review → `bmad-code-review` /
-   `bmad-review-adversarial-general`; spec → `bmad-spec`) and its
-   mega-minions' skills (review swarms → `bmad-review-adversarial-general`,
+   `bmad-review` (adversarial lens); spec → `bmad-spec`) and its
+   mega-minions' skills (review swarms → `bmad-review` (adversarial lens),
    `bmad-review-edge-case-hunter`). HTML-artifact deliverables also name
    `lavish`. The user never names a bmad skill — `bmad-help` recommends.
 7. **Perkins opt-in (optional, never blocking).** Large/risky jobs:
@@ -515,7 +515,7 @@ older briefings use that name; this is the same section.)
 - You may spawn mega-minions with the herdr skill (`herdr pane split
   --current ...`), per the briefing's Model + Skills policies (name each
   mega-minion's skill explicitly — review swarms use
-  `bmad-review-adversarial-general` / `bmad-review-edge-case-hunter`);
+  `bmad-review` (adversarial lens) / `bmad-review-edge-case-hunter`);
   descriptive tabs `<job-slug>-<role>`. **Max 10 concurrent mega-minion
   panes.** You MUST close every pane you create before finishing.
 - **No native vision on legacy blind models** (kimi k3 / glm-5.3 /
