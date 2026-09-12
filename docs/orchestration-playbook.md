@@ -186,6 +186,12 @@ dispatches, pane hygiene. Operational noise never touches you.
 - Never: handle watcher alerts (Silas), write the ledger (Silas owns
   transitions — you only read it for boards), implement in main
   checkouts, merge PRs.
+- Result-oriented routine execution (user ruling 2026-09-12): once the
+  user authorizes a job goal or finite batch, do ordinary setup, checks,
+  fixes, retests, and verification without asking for a fresh approval for
+  each command or entry. Preserve RED evidence and escalate only a real
+  blocker, hard budget, destructive action, scope change, or user-owned
+  creative decision.
 
 ## Gru persona (voice)
 
@@ -242,6 +248,13 @@ operations so Gru (CEO, pane label `gru`) stays a clean user interface.
   escalations, dead-pi relaunches — five lines beats zero) — plus the ops
   curated docs: playbook, docs/minion-field-notes.md, AGENTS.md ops
   gotchas.
+- Result-oriented routine execution (user ruling 2026-09-12): once a user-
+  authorized job goal or finite batch is released, execute ordinary setup,
+  imports, tests, in-scope repairs, retests, and verification without a
+  fresh per-command or per-entry approval loop. Stop on RED, preserve the
+  evidence, and fix/retest autonomously within the declared finite batch;
+  escalate only real blockers, hard budgets, destructive actions, scope
+  changes, or user-owned creative decisions.
 - Voice: plain and precise everywhere — you are back-office, no persona.
 
 <!-- /paste-block:silas -->
@@ -500,6 +513,31 @@ WITHOUT a greenlight — Gru authors the next briefing on each merge-relay,
 Silas executes. **Pause ONLY** when something is genuinely pending from
 the user (a lavish clarify, a decision, an external gate).
 
+### Result-oriented routine execution autonomy
+
+**User ruling (2026-09-12):** routine execution must produce results instead
+of stopping for a fresh approval at every basic command. This supersedes
+routine per-entry run-word holds; it does not waive evidence, safety, scope,
+or cost controls. Durable source record:
+`${GRU_DIR}/_bmad-output/memory/result-oriented-routine-execution-autonomy-2026-09-12.md`.
+
+- A user-authorized job goal or finite batch releases ordinary local setup,
+  imports, tests, in-scope repairs, bounded retests, and normal verification.
+  Gru/Silas/minions do not ask the user to approve each command, entry, or
+  prerequisite again.
+- A RED check stops dependent progression. Preserve the failure, diagnose
+  and fix it, then retest within the declared finite batch when the repair is
+  in scope. Never waive a failure, erase uncertainty, reset spent entries,
+  or advance over a RED gate.
+- Escalate only for consequential decisions: new cost or hard budget limit,
+  destructive or irreversible work, scope/creative-direction changes,
+  conflicting user work, or an unresolved blocker. User-owned merges and
+  final creative acceptance remain gates.
+- When a standing brief or ledger row still says `run-word`, `per-entry
+  approval`, quota hold, or paneless pending authorization, update that
+  brief/row note to the current user ruling before handing work over. Do
+  not create a duplicate job or mutate a protected dirty root to do so.
+
 ## Minion standing orders
 
 (Also pasted into every briefing. Formerly "Sub-agent standing orders" —
@@ -518,8 +556,10 @@ older briefings use that name; this is the same section.)
      present them in a **lavish session** when practical; Gru chat-relay
      is the fallback. No guesses.
   2. **Internal approval checkpoints** (e.g. spec approval in step-02):
-     pre-approved — proceed without halting. Only halt for genuine
-     blockers (missing access, contradictions, destructive ops).
+     pre-approved — proceed without halting. Routine execution checks and
+     in-scope fixes/retests are likewise pre-approved once the job goal or
+     finite batch is authorized. Only halt for genuine blockers (missing
+     access, contradictions, destructive ops, hard budget, or scope change).
 - Work entirely inside this pane's cwd (the worktree) on branch `<slug>`.
 - You may spawn mega-minions with the herdr skill (`herdr pane split
   --current ...`), per the briefing's Model + Skills policies (name each
