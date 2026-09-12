@@ -1310,6 +1310,17 @@ do not act on old model names in the gotchas below as current routing.
   spent entries, erase failed evidence, silently exceed cost limits, or
   create duplicate rows. Durable source record:
   `_bmad-output/memory/result-oriented-routine-execution-autonomy-2026-09-12.md`.
+- **Factory completion contract (2026-09-12 user ruling).** Defined,
+  briefed, and assigned means ownership through verified completion of the
+  requested outcome, not merely the next phase. The owning minion carries
+  implementation, execution, integration, testing, fixes, retests, review
+  rework, and usable delivery required by the brief. User involvement is at
+  the beginning and end for goal/constraints, review, testing, and merge;
+  do not invent midpoint approvals, asset-shopping gates, or phase gates.
+  Escalate only genuinely critical cost/access/security/destructive,
+  conflicting-work, irreconcilable scope/creative, or hard-limit decisions.
+  Preserve real safety, scope, evidence, budgets, and explicit final
+  human-acceptance gates; a passing intermediate stage is not completion.
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
