@@ -4,191 +4,360 @@
 Reads the orchestrator job ledger for a job, inspects its PR on GitHub, and
 BLOCKS the close-out/merge unless:
   - the job is in `in-review` (or `done` with a verdict) and has a `pr`;
-  - the PR is OPEN, mergeable, not a draft;
-  - CI is green (no failed checks; `--allow-pending` tolerates in-flight);
-  - a REVIEW VERDICT is on record — no outstanding CHANGES_REQUESTED, and at
-    least one APPROVED review (prefer the `perkins-review[bot]`, but any
-    APPROVED review counts; `--require-perkins` makes the bot mandatory).
-  - `pr_review=1` if the job was flagged for Perkins review (warn-only when
-    0 — small changes may rely on the minion's built-in review).
+  - one validated host/owner/repo/PR identity resolves across the ledger
+    row, the repo_root origin remote and (when present) the PR URL —
+    conflicts are rejected, bare numbers never inherit an ambient repo;
+  - the PR is OPEN, mergeable, not a draft — strict schema: sparse/missing
+    evidence is never affirmative proof;
+  - CI is green: BOTH the CheckRun {status,conclusion} and StatusContext
+    {state} schemas are classified (pass/pending/fail/unknown); failing,
+    pending (without --allow-pending) and unknown outcomes cannot return
+    READY; the required-gate set is established from branch
+    protection/rulesets when readable (otherwise conservative UNKNOWN);
+  - a REVIEW VERDICT is on record, bound to the CURRENT head
+    (headRefOid): no outstanding CHANGES_REQUESTED, at least one APPROVED
+    review at the exact current head with a known actor. pr_review=1 (or
+    --require-perkins) requires the canonical `perkins-review[bot]` actor
+    EXACTLY — never a substring lookalike. The head is re-read before
+    READY so a moving target yields STALE/UNKNOWN, never READY.
 
 This is the control that turns "everyone remembers to review" into a check
-that blocks close-out. Exit 0 = ready; non-zero = a blocker or a failure.
+that blocks close-out. Decision logic lives in bin/pr_ready_core.py (pure,
+unit-tested); this file only collects evidence (bounded subprocesses,
+documented overrides) and prints.
+
+Exit codes:
+  0  READY (with --allow-pending: READY *qualified* — pending checks were
+     explicitly tolerated and CI green is NOT established)
+  1  NOT READY (blockers: reason codes CI_FAILED, CI_PENDING, REVIEW_*,
+     IDENTITY_MISMATCH, DRAFT, CONFLICTED, STATE_INVALID, JOB_INVALID, …)
+  2  UNKNOWN (evidence/tool gaps: TOOL_ERROR, EVIDENCE_MISSING, CI_UNKNOWN)
 
 Usage:
   check-pr-ready <job-id>
   check-pr-ready <job-id> --ledger <bin/ledger>     # default ~/code/bin/ledger
   check-pr-ready <job-id> --require-perkins --allow-pending
 
-Env overrides: LEDGER_BIN (absolute ledger CLI), GH (gh path).
+Env overrides (documented; flag > env > default): LEDGER_BIN (absolute
+ledger CLI), GH (gh path).
 """
-import argparse, json, os, shlex, subprocess, sys
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pr_ready_core as core  # noqa: E402
 
 DEFAULT_LEDGER = os.path.expanduser("~/code/bin/ledger")
 
-def run(cmd, cwd=None):
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+TIMEOUT_LEDGER_S = 30
+TIMEOUT_GH_S = 30
+TIMEOUT_GIT_S = 10
+
+
+class ToolError(Exception):
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+
+
+def run(cmd, cwd=None, timeout=None):
+    """Bounded subprocess run. Raises ToolError on timeout/missing binary —
+    never an uncaught traceback, never a false success."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ToolError("TOOL_ERROR", f"{cmd[0]} timed out after {timeout}s: {' '.join(cmd[:4])}…")
+    except FileNotFoundError:
+        raise ToolError("TOOL_ERROR", f"tool not found: {cmd[0]}")
+    except UnicodeDecodeError as e:
+        raise ToolError("TOOL_ERROR", f"{cmd[0]} output is not valid UTF-8 text: {e}")
+    except OSError as e:
+        raise ToolError("TOOL_ERROR", f"{cmd[0]} failed to run: {e}")
     return p.returncode, p.stdout.strip(), p.stderr.strip()
 
-def gh_json(args, cwd=None):
-    """gh <args> -> parsed JSON, or None on failure."""
-    rc, out, err = run(["gh", *args], cwd=cwd)
-    if rc != 0:
-        return None, f"gh {args[0]} failed: {err or out}"
-    try:
-        return json.loads(out), None
-    except json.JSONDecodeError as e:
-        return None, f"gh {args[0]} non-JSON: {e}"
 
-def git_owner_repo(repo_root):
-    """Derive owner/repo from the repo_root's origin remote."""
-    if not repo_root:
-        return None
-    rc, out, err = run(["git", "-C", repo_root, "remote", "get-url", "origin"])
-    if rc != 0 or not out:
-        return None
-    url = out
-    # git@github.com:owner/repo.git  |  https://github.com/owner/repo.git
-    url = url.rstrip("/")
-    if url.endswith(".git"):
-        url = url[:-4]
-    for sep in (":", "/"):
-        if sep in url:
-            url = url.rsplit(sep, 1)[1]
-    parts = url.split("/")
-    return "/".join(parts[-2:]) if len(parts) >= 2 else None
+class Collector:
+    def __init__(self, ledger_bin: str, gh_bin: str):
+        self.ledger_bin = ledger_bin
+        self.gh_bin = gh_bin
 
-def main():
-    ap = argparse.ArgumentParser()
+    def jobs(self):
+        rc, out, err = run([self.ledger_bin, "json", "all"], timeout=TIMEOUT_LEDGER_S)
+        if rc != 0:
+            raise ToolError("TOOL_ERROR", f"ledger 'json all' errored: {err or out}")
+        try:
+            parsed = json.loads(out)
+        except json.JSONDecodeError as e:
+            raise ToolError("TOOL_ERROR", f"ledger 'json all' returned non-JSON: {e}")
+        if not isinstance(parsed, list):
+            raise ToolError("TOOL_ERROR", "ledger 'json all' returned non-list JSON (schema)")
+        return parsed
+
+    def remote_url(self, repo_root):
+        if not repo_root:
+            return None
+        rc, out, _ = run(["git", "-C", repo_root, "remote", "get-url", "origin"],
+                         timeout=TIMEOUT_GIT_S)
+        return out if rc == 0 and out else None
+
+    def gh_json(self, args):
+        rc, out, err = run([self.gh_bin, *args], timeout=TIMEOUT_GH_S)
+        if rc != 0:
+            return None, f"gh {args[0]} failed: {err or out}"
+        try:
+            return json.loads(out), None
+        except json.JSONDecodeError as e:
+            return None, f"gh {args[0]} non-JSON: {e}"
+
+    def establish_required_checks(self, slug: str, base_ref: str | None):
+        """Required-gate names from branch protection + rulesets.
+
+        Returns [] (positively none configured), or None (cannot establish —
+        unreadable protection). 404 = none configured; 403/parse/network
+        failure on EVERY readable channel = cannot establish."""
+        if not base_ref:
+            return None
+        owner_repo = slug
+        channels = [
+            (f"repos/{owner_repo}/branches/{base_ref}/protection", "protection"),
+            (f"repos/{owner_repo}/rules/branches/{base_ref}", "rulesets"),
+        ]
+        any_readable = False
+        required: list[str] = []
+
+        def gh_api(path):
+            rc, out, err = run([self.gh_bin, "api", path], timeout=TIMEOUT_GH_S)
+            if rc != 0:
+                # gh prints "Not Found" (404) or "Forbidden" (403) on stderr
+                label = "not-found" if "Not Found" in (err or out) else (
+                    "forbidden" if ("Forbidden" in (err or out) or "403" in (err or out)) else "error"
+                )
+                return label, None, (err or out)
+            try:
+                return "ok", json.loads(out), None
+            except json.JSONDecodeError as e:
+                return "non-json", None, str(e)
+
+        status, doc, _err = gh_api(channels[0][0])
+        if status == "ok":
+            any_readable = True
+            rsc = doc.get("required_status_checks") if isinstance(doc, dict) else None
+            if isinstance(rsc, dict) and isinstance(rsc.get("contexts"), list):
+                required.extend(str(c) for c in rsc["contexts"] if c)
+        elif status == "not-found":
+            any_readable = True  # no classic protection configured on the branch
+        # forbidden/error/non-json on classic protection alone is not
+        # disqualifying — rulesets may still be readable
+
+        status, doc, _err = gh_api(channels[1][0])
+        if status == "ok":
+            any_readable = True
+            if isinstance(doc, list):
+                for rule in doc:
+                    if not isinstance(rule, dict):
+                        continue
+                    if rule.get("type") != "required_status_checks":
+                        continue
+                    params = rule.get("parameters") or {}
+                    for ctx in params.get("required_status_checks") or []:
+                        if isinstance(ctx, dict) and ctx.get("context"):
+                            required.append(str(ctx["context"]))
+        elif status == "not-found":
+            any_readable = True  # no branch ruleset configured
+
+        if not any_readable:
+            return None
+        # de-dup, preserve order
+        seen: set[str] = set()
+        return [c for c in required if not (c in seen or seen.add(c))]
+
+
+VIEW_FIELDS = "state,mergeable,isDraft,reviewDecision,headRefOid,baseRefName,statusCheckRollup"
+REREAD_FIELDS = "state,mergeable,headRefOid,statusCheckRollup"
+
+EXIT_EPILOG = """\
+exit codes:
+  0  READY (with --allow-pending: READY *qualified* — pending checks were
+     explicitly tolerated and CI green is NOT established)
+  1  NOT READY (blockers: CI_FAILED, CI_PENDING, REVIEW_*, IDENTITY_MISMATCH,
+     DRAFT, CONFLICTED, STATE_INVALID, JOB_INVALID, EVIDENCE_MISSING-as-blocker)
+  2  UNKNOWN (evidence/tool gaps: TOOL_ERROR, EVIDENCE_MISSING, CI_UNKNOWN)
+"""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="check-pr-ready",
+        description="Advisory merge-readiness gate",
+        epilog=EXIT_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("job_id")
     ap.add_argument("--ledger", default=os.environ.get("LEDGER_BIN", DEFAULT_LEDGER))
-    ap.add_argument("--require-perkins", action="store_true", help="the approval must come from perkins-review[bot]")
-    ap.add_argument("--allow-pending", action="store_true", help="tolerate a still-running CI check")
+    ap.add_argument("--require-perkins", action="store_true",
+                    help="the approval must come from perkins-review[bot] (exact canonical actor)")
+    ap.add_argument("--allow-pending", action="store_true",
+                    help="tolerate pending CI checks — READY becomes explicitly QUALIFIED, never 'CI green'")
     args = ap.parse_args()
 
-    fails, warns = [], []
-
-    # 1. the job from the ledger (JSON is machine-readable; use the same CLI).
-    rc, out, err = run([args.ledger, "json", "all"])
-    if rc != 0:
-        print(f"FAIL  ledger 'json all' errored: {err or out}")
+    ledger_bin = args.ledger
+    gh_bin = os.environ.get("GH", "gh")
+    if shutil.which(gh_bin) is None:
+        # GH env override or PATH gh — missing is a clean tool error (exit 2)
+        print(f"FAIL  gh tool not found: {gh_bin!r} (GH env / PATH)")
         return 2
+
+    col = Collector(ledger_bin, gh_bin)
+
+    # 1. job + remote (bounded, validated)
     try:
-        jobs = json.loads(out)
-    except json.JSONDecodeError:
-        print("FAIL  ledger 'json all' returned non-JSON")
+        jobs = col.jobs()
+    except ToolError as e:
+        print(f"FAIL  {e.message}")
         return 2
     job = next((j for j in jobs if j.get("id") == args.job_id), None)
 
     print(f"== check-pr-ready: {args.job_id} ==")
     if job is None:
-        print(f"  ✘ job '{args.job_id}' not found in ledger")
+        print(f"  ✘  job '{args.job_id}' not found in ledger")
         return 1
-    status = job.get("status")
-    pr = job.get("pr")
-    pr_review = int(job.get("pr_review") or 0)
     repo_root = job.get("repo_root") or job.get("worktree")
+    print(f"  job: status={job.get('status')}  pr={job.get('pr')}  "
+          f"pr_review={job.get('pr_review')}  repo_root={repo_root}")
+    try:
+        remote_url = col.remote_url(repo_root)
+    except ToolError as e:
+        remote_url = None
+        print(f"  !  origin remote lookup failed: {e.message}")
 
-    print(f"  job: status={status}  pr={pr}  pr_review={pr_review}  repo_root={repo_root}")
-    if status not in ("in-review", "done"):
-        fails.append(f"job status is '{status}', expected 'in-review' or 'done'")
-    if not pr:
-        fails.append("no 'pr' recorded for this job (was it dispatched with pr=PR-number?)")
+    # 2. identity (pure core) — only meaningful when a pr is recorded; a
+    #    missing pr is a job-row blocker, handled by the evaluator below
+    ref = None
+    if job.get("pr"):
+        ref, id_problems, id_info = core.resolve_identity(job, remote_url)
+        for line in id_info:
+            print(f"  ·  {line}")
+        if id_problems:
+            for _reason, msg in id_problems:
+                print(f"  ✘  {msg}")
+            print(f"\n== UNKNOWN — identity could not be validated ({len(id_problems)} problem(s)) ==")
+            return 2
+        print(f"  repo slug: {ref['slug']}   pr arg: {str(job.get('pr'))}")
 
-    # Resolve the PR arg + owner/repo. `pr` may be stored as a bare number OR a
-    # full GitHub URL. gh resolves a full URL itself; a bare number needs --repo.
-    pr_str = str(pr or "")
-    pr_is_url = pr_str.startswith("http")
-    oslug = None
-    if pr_is_url:
+    # 3. collect PR + reviews (bounded, validated)
+    view = reviews_payload = None
+    if ref is not None:
+        view_args = ["pr", "view", str(job.get("pr")), "--json", VIEW_FIELDS]
+        reviews_args = ["pr", "view", str(job.get("pr")), "--json", "reviews"]
+        if ref["kind"] == "number":
+            view_args += ["--repo", ref["slug"]]
+            reviews_args += ["--repo", ref["slug"]]
         try:
-            parts = pr_str.split("/")
-            i = parts.index("pull")
-            if i >= 2:
-                oslug = "/".join(parts[i - 2:i])
-        except ValueError:
-            oslug = None
-    if not oslug:
-        oslug = git_owner_repo(repo_root) or job.get("repo")
-    if not oslug and not pr_is_url:
-        fails.append("cannot derive owner/repo from repo_root's origin remote (and pr is a bare number)")
-    print(f"  repo slug: {oslug}   pr arg: {pr_str}")
+            view, err = col.gh_json(view_args)
+            reviews_payload, rerr = col.gh_json(reviews_args)
+        except ToolError as e:
+            print(f"  ✘  {e.message}")
+            print("\n== UNKNOWN — tool error ==")
+            return 2
+        if view is None:
+            print(f"  ✘  PR lookup: {err}")
+        if reviews_payload is None:
+            print(f"  ✘  reviews lookup: {rerr}")
 
-    # 2. the PR from GitHub.
-    if pr:
-        view = ["pr", "view", pr_str,
-                "--json", "state,mergeable,isDraft,reviewDecision,statusCheckRollup"]
-        if not pr_is_url and oslug:
-            view += ["--repo", oslug]
-        pr_json, err = gh_json(view)
-        if pr_json is None:
-            fails.append(f"PR lookup: {err}")
-        else:
-            if pr_json.get("state") != "OPEN":
-                fails.append(f"PR state is '{pr_json.get('state')}', not OPEN")
-            if pr_json.get("mergeable") not in (True, "MERGEABLE", None):
-                fails.append(f"PR mergeable='{pr_json.get('mergeable')}' — has conflicts")
-            if pr_json.get("isDraft"):
-                fails.append("PR is a draft")
-            rolls = pr_json.get("statusCheckRollup") or []
-            for c in rolls:
-                concl = (c.get("conclusion") or "").lower()
-                st = (c.get("status") or "").lower()
-                if concl in ("failure", "cancelled", "timed_out", "error") or st == "failure":
-                    fails.append(f"CI check '{c.get('name')}' is {concl or st}")
-                elif st in ("pending", "in_progress", "queued") and not args.allow_pending:
-                    warns.append(f"CI check '{c.get('name')}' is {st} (queued/in-progress)")
+    # 4. phase-1 evaluation (pure)
+    result = core.evaluate(
+        job, view, reviews_payload, remote_url, None,
+        allow_pending=args.allow_pending,
+        require_perkins=args.require_perkins,
+    )
 
-    # 3. the review verdict.
-    if pr:
-        view = ["pr", "view", pr_str, "--json", "reviews"]
-        if not pr_is_url and oslug:
-            view += ["--repo", oslug]
-        reviews, err = gh_json(view)
-        if reviews is None:
-            fails.append(f"reviews lookup: {err}")
-        else:
-            rs = reviews.get("reviews") or []
-            # Per-reviewer LATEST VERDICT (GitHub merge-gating semantics): a
-            # reviewer's newer review supersedes their older one — a stale
-            # CHANGES_REQUESTED from a superseded round must not block a newer
-            # APPROVED (and a stale APPROVED must not mask a newer CR).
-            # COMMENTED/PENDING carry no verdict: they neither set nor clear a
-            # stance; the reviewer's newest APPROVED/CHANGES_REQUESTED rules.
-            latest_verdict = {}
-            for r in sorted(rs, key=lambda r: r.get("submittedAt") or ""):
-                if r.get("state") in ("APPROVED", "CHANGES_REQUESTED"):
-                    who = (r.get("author") or {}).get("login") or "?"
-                    latest_verdict[who] = r.get("state")
-            approved = any(s == "APPROVED" for s in latest_verdict.values())
-            perkins_approved = any(s == "APPROVED" and "perkins" in w.lower()
-                                   for w, s in latest_verdict.items())
-            changes_req = any(s == "CHANGES_REQUESTED" for s in latest_verdict.values())
-            if changes_req:
-                stale = [w for w, s in latest_verdict.items() if s == "CHANGES_REQUESTED"]
-                fails.append(f"an outstanding CHANGES_REQUESTED review exists (latest verdict by: {', '.join(stale)})")
-            if args.require_perkins:
-                if not perkins_approved:
-                    fails.append("no perkins-review[bot] APPROVED verdict on record (--require-perkins)")
-            elif not approved:
-                fails.append("no APPROVED review verdict on record — the minion's step-04 review must have posted one, or run Perkins")
+    # 5. lazily establish required gates when they are the only CI gap
+    if (
+        result.needs_required_gates
+        and not result.blockers
+        and view is not None
+        and all(r == "CI_UNKNOWN" for r, _m in result.unknowns)
+    ):
+        try:
+            required = col.establish_required_checks(ref["slug"], view.get("baseRefName"))
+        except ToolError:
+            required = None
+        if required is not None:
+            result = core.evaluate(
+                job, view, reviews_payload, remote_url, required,
+                allow_pending=args.allow_pending,
+                require_perkins=args.require_perkins,
+            )
 
-    # 4. the pr_review flag (warn-only).
-    if pr_review == 0:
-        warns.append("pr_review=0 — this job wasn't flagged for Perkins; if it's a large/risky change it should be 1")
+    # 6. head re-read before READY (R02): a moving target is STALE, never READY
+    if result.status == core.READY:
+        try:
+            reread, err = col.gh_json(["pr", "view", str(job.get("pr")), "--json", REREAD_FIELDS]
+                                      + (["--repo", ref["slug"]] if ref and ref["kind"] == "number" else []))
+        except ToolError as e:
+            reread, err = None, e.message
+        if reread is None:
+            print(f"  ✘  head re-verification failed: {err}")
+            print("\n== UNKNOWN — could not re-verify PR head before READY ==")
+            return 2
+        head1 = view.get("headRefOid") if isinstance(view, dict) else None
+        head2 = reread.get("headRefOid") if isinstance(reread, dict) else None
+        # The re-read must be held to the SAME evidence standard as the
+        # read it verifies: a degraded/partial re-read payload (no rollup,
+        # null rollup, mergeability unestablished, or a check flipping to
+        # pending/failing at the same head) is STALE/UNKNOWN — never READY.
+        rr_rollup = reread.get("statusCheckRollup") if isinstance(reread, dict) else None
+        degraded = (
+            not isinstance(reread, dict)
+            or "statusCheckRollup" not in reread
+            or rr_rollup is None
+            or reread.get("mergeable") in (None, "UNKNOWN")
+        )
+        _p, reread_pend, reread_fails, reread_unknowns, _s = core.classify_rollup(rr_rollup)
+        pending_appeared = reread_pend and not args.allow_pending
+        if (
+            reread.get("state") != "OPEN"
+            or head2 != head1
+            or reread.get("mergeable") in (False, "CONFLICTING")
+        ):
+            print(f"  ✘  PR moved during evaluation (head {str(head1)[:7]} → {str(head2)[:7]}, "
+                  f"state {reread.get('state')}, mergeable {reread.get('mergeable')}) — STALE, never READY")
+            print("\n== UNKNOWN — PR head/state moved during evaluation ==")
+            return 2
+        if degraded or reread_fails or reread_unknowns or pending_appeared:
+            print("  ✘  evidence degraded or changed during evaluation (re-read rollup/mergeability "
+                  "incomplete, failing/unknown/pending check appeared at the same head) — STALE, never READY")
+            print("\n== UNKNOWN — CI evidence moved or degraded during evaluation ==")
+            return 2
 
-    # ---- verdict -----------------------------------------------------------
+    # 7. report
     print()
-    for w in warns:
+    for w in result.warns:
         print(f"  !  {w}")
-    for f in fails:
-        print(f"  ✘  {f}")
+    for i in result.info:
+        print(f"  ·  {i}")
+    for reason, msg in result.blockers:
+        print(f"  ✘  [{reason}] {msg}")
+    for reason, msg in result.unknowns:
+        print(f"  ?  [{reason}] {msg}")
     print()
-    if fails:
-        print(f"== NOT READY — {len(fails)} blocker(s) ==")
+    if result.status == core.NOT_READY:
+        print(f"== NOT READY — {len(result.blockers)} blocker(s): "
+              f"{', '.join(sorted({r for r, _ in result.blockers}))} ==")
         return 1
-    print(f"== READY to merge ({len(warns)} warning(s)) ==")
+    if result.status == core.UNKNOWN:
+        print(f"== UNKNOWN — evidence gap(s): "
+              f"{', '.join(sorted({r for r, _ in result.unknowns}))} ==")
+        return 2
+    suffix = " (QUALIFIED — pending tolerated via --allow-pending; CI green NOT established)" if result.qualified else ""
+    print(f"== READY to merge ({len(result.warns)} warning(s)){suffix} ==")
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

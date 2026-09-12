@@ -410,9 +410,13 @@ busy_timeout=5000`). (4) **atomic-append fallback** — single lines, one
    **Enforced from 2026-08-23 (never merge unreviewed):** the job MUST be
    registered at dispatch; the minion MUST run bmad-build **step 04** (spawn
    the review-layer subagents) before reporting `done`; and the Orchestrator
-   MUST run `bin/check-pr-ready <job-id>` (job in-review + PR open/mergeable +
-   CI green + an APPROVED verdict with no open CHANGES_REQUESTED) before
-   close-out/merge. `pr_review=1` jobs post the verdict as the `perkins-review`
+   MUST run `bin/check-pr-ready <job-id>` before close-out/merge (exit 0 =
+   READY — with `--allow-pending` an explicitly QUALIFIED ready; exit 1 =
+   NOT READY (CI failing/pending, stale-head or missing APPROVED verdict,
+   wrong reviewer actor, identity conflict); exit 2 = UNKNOWN/tool error —
+   see `--help`; strict CI schemas incl. legacy StatusContext, approvals
+   bound to the current head, exact `perkins-review[bot]` actor for
+   pr_review=1). `pr_review=1` jobs post the verdict as the `perkins-review`
    bot, not your own account.
 8. **Handoff (Silas).** End the briefing with a **Dispatch parameters**
    block (repo, repo_root, slug, base, model?, github_issue?). Gru hands
