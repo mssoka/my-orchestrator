@@ -123,6 +123,7 @@
  * writes the ledger — Silas classifies by transcript and acts.
  */
 
+import { statSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const GRU_DIR = "/Users/moses/code";
@@ -163,7 +164,10 @@ const REVIEW_ACTIONS: Record<string, string> = {
 		'(`herdr pane run <pane> "..."): "address or reply, your call"',
 	APPROVED:
 		'escalate one line to Gru (`herdr pane run` the pane labeled `gru`): ' +
-		'"PR approved — merge when ready". No minion action',
+		'"review APPROVED posted — an OBSERVED review event, not a merge-readiness verdict". ' +
+		'Before any merge relay, verify independently (CI green, head freshness, ' +
+		'mergeability — e.g. bin/check-pr-ready at the job id): a review can post ' +
+		'while CI fails, conflicts exist or the head has moved. No minion action',
 };
 
 /** UTC stamp for alert headers — same format as ledger event timestamps
@@ -183,6 +187,10 @@ interface ReviewJob {
 	pr: string | null;
 	pane_id: string | null;
 	pr_review: number;
+	/** ledger `repo` column — used ONLY to resolve bare-number PRs to an
+	 * explicit canonical owner/repo (R04: never inherit the ambient COO
+	 * repo from cwd). Full slug required; shortnames cannot identify. */
+	repo?: string | null;
 }
 
 export default function nefarioWatch(pi: ExtensionAPI) {
@@ -193,6 +201,23 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 	/** GitHub-status sensor + quota-probe state (P1c/P1a, user-approved 2026-08-18). */
 	const ghStatusKey = new Map<string, string>();
 	const quotaProbeLast = new Map<string, number | boolean | null>();
+	/** Rate-limited sensor-health notes (kind -> last emit ms; one per 30min). */
+	const healthLast = new Map<string, number>();
+
+	/** One rate-limited detection-only health note per failure kind (30min).
+	 * Returns the note text when it may fire now, else null. A tool failure
+	 * must NEVER be synthesized into pane-state or cleanup transitions
+	 * (N04/N08: unknown ≠ empty inventory ≠ no live owners). */
+	function sensorHealthNote(kind: string, reason: string, now = Date.now()): string | null {
+		const prev = healthLast.get(kind) ?? 0;
+		if (now < prev) healthLast.delete(kind); // clock stepped back — re-arm
+		else if (now - prev < 30 * 60 * 1000) return null;
+		healthLast.set(kind, now);
+		return (
+			`SENSOR HEALTH — ${kind}: ${reason}. No state changes were derived ` +
+			"from the failed read (detection-only; last-known pane/debris state untouched)."
+		);
+	}
 
 	async function trackedJobs(): Promise<TrackedJob[]> {
 		const r = await pi.exec(
@@ -212,20 +237,34 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		}
 	}
 
-	/** pane_id -> agent_status for every detected agent. */
-	async function liveStatuses(): Promise<Map<string, string>> {
+	/** pane_id -> agent_status for every detected agent. A FAILED or
+	 * unparseable inventory is a typed error, NEVER an empty map (N04: an
+	 * empty-success sample means real disappearance; a tool failure means
+	 * UNKNOWN — callers must skip the state diff, not mark panes gone). */
+	async function liveStatuses(): Promise<
+		{ ok: true; statuses: Map<string, string> } | { ok: false; reason: string }
+	> {
 		const r = await pi.exec("herdr", ["agent", "list"], { timeout: 8000 });
-		const m = new Map<string, string>();
-		if (r.code !== 0) return m;
+		if (r.code !== 0)
+			return { ok: false, reason: `herdr agent list exited ${r.code}` };
 		try {
 			const env = JSON.parse(r.stdout);
-			for (const a of env?.result?.agents ?? []) {
+			// N04: a parseable-but-malformed inventory (agents missing/not an
+			// array) is UNKNOWN too — an empty-success sample means real
+			// disappearance and must never be synthesized from bad shape.
+			if (!Array.isArray(env?.result?.agents))
+				return {
+					ok: false,
+					reason: "herdr agent list output changed shape (agents not an array)",
+				};
+			const m = new Map<string, string>();
+			for (const a of env.result.agents) {
 				if (a?.pane_id && a?.agent_status) m.set(a.pane_id, a.agent_status);
 			}
+			return { ok: true, statuses: m };
 		} catch {
-			// herdr output changed shape — skip this tick
+			return { ok: false, reason: "herdr agent list output changed shape (unparseable JSON)" };
 		}
-		return m;
 	}
 
 	async function tick(initial: boolean): Promise<void> {
@@ -235,10 +274,28 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			const [jobs, live] = await Promise.all([trackedJobs(), liveStatuses()]);
 			const alerts: string[] = [];
 
+			// N04: a failed/invalid inventory is UNKNOWN — skip the state diff
+			// entirely (no false gone/recovery transitions, last-known states
+			// preserved) and emit one rate-limited health note instead.
+			if (!live.ok) {
+				const note = sensorHealthNote("herdr-inventory", live.reason);
+				if (note)
+					pi.sendMessage(
+						{
+							customType: "nefario-watch",
+							content: `[nefario-watch · ${stamp()}] ${note}`,
+							display: true,
+						},
+						{ deliverAs: "followUp", triggerTurn: true },
+					);
+				return;
+			}
+			const statuses = live.statuses;
+
 			for (const job of jobs) {
 				const pane = job.pane_id;
 				if (!pane) continue;
-				const cur = live.get(pane);
+				const cur = statuses.get(pane);
 				const prev = last.get(job.id);
 
 				if (cur === undefined) {
@@ -412,7 +469,10 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			return alerts;
 		}
 		// Live round worktree paths — EXEMPT: an in-flight round's lenses are
-		// legitimately open and its worktree must not be touched.
+		// legitimately open and its worktree must not be touched. N08: a
+		// FAILED or unparseable live-ownership query means UNKNOWN owners —
+		// fail closed (no cleanup candidates this tick, one rate-limited
+		// health note), never an empty owner set manufacturing orphans.
 		const liveQ = await pi.exec(
 			"sqlite3",
 			[
@@ -423,20 +483,43 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			{ timeout: 5000 },
 		);
 		const livePaths = new Set<string>();
-		if (liveQ.code === 0 && liveQ.stdout.trim()) {
+		if (liveQ.code !== 0) {
+			const note = sensorHealthNote(
+				"debris-live-ownership",
+				`live-round query exited ${liveQ.code}`,
+			);
+			if (note) alerts.push(`[nefario-watch · ${stamp()}] ${note}`);
+			return alerts; // cannot establish owners — no cleanup candidates
+		}
+		if (liveQ.stdout.trim()) {
 			try {
 				for (const r of JSON.parse(liveQ.stdout) as { worktree: string }[]) {
 					livePaths.add(r.worktree);
 				}
 			} catch {
-				// unreadable — treat as no live rounds this tick
+				const note = sensorHealthNote(
+					"debris-live-ownership",
+					"live-round query returned unparseable JSON",
+				);
+				if (note) alerts.push(`[nefario-watch · ${stamp()}] ${note}`);
+				return alerts; // unknown owners — fail closed
 			}
 		}
-		// herdr agents: pane_id -> cwd (only panes under a perkins worktree
-		// path matter for this sensor).
+			// herdr agents: pane_id -> cwd (only panes under a perkins worktree
+			// path matter for this sensor).
 		const agents = await pi.exec("herdr", ["agent", "list"], { timeout: 8000 });
 		const perkinsPanes = new Map<string, string>();
-		if (agents.code === 0) {
+		let paneInventoryFailed = false;
+		if (agents.code !== 0) {
+			// N08: pane ownership unknown — the orphan branch derives no
+			// candidates from an empty map either way, but surface it.
+			paneInventoryFailed = true;
+			const note = sensorHealthNote(
+				"debris-pane-inventory",
+				`herdr agent list exited ${agents.code}`,
+			);
+			if (note) alerts.push(`[nefario-watch · ${stamp()}] ${note}`);
+		} else {
 			try {
 				for (const a of JSON.parse(agents.stdout)?.result?.agents ?? []) {
 					if (
@@ -447,36 +530,52 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 						perkinsPanes.set(a.pane_id, a.cwd);
 				}
 			} catch {
-				// herdr output changed shape — skip pane checks this tick
+				// herdr output changed shape — pane checks skipped this tick
+				paneInventoryFailed = true;
+				const note = sensorHealthNote(
+					"debris-pane-inventory",
+					"herdr agent list output changed shape (unparseable JSON)",
+				);
+				if (note) alerts.push(`[nefario-watch · ${stamp()}] ${note}`);
 			}
 		}
-		// Existence of every path of interest in ONE bash call.
+		// Existence of every path of interest — N07: pure fs.statSync, NO
+		// shell. Paths are literal data, never shell source (JSON.stringify
+		// is not bash quoting; $(…)/backticks/newlines stay filename bytes).
+		// Only meaningful absolute paths participate (unexpected/relative
+		// roots are skipped — never a cleanup instruction for them).
+		function meaningfulPath(p: string): boolean {
+			if (!p.startsWith("/") || p === "/" || p.includes("\0")) return false;
+			return p.split("/").filter(Boolean).length >= 2;
+		}
 		const allPaths = new Set<string>();
 		for (const r of rows) if (r.worktree) allPaths.add(r.worktree);
 		for (const c of perkinsPanes.values()) allPaths.add(c);
 		const exists = new Map<string, boolean>();
-		if (allPaths.size > 0) {
-			const script =
-				`for p in ${[...allPaths].map((p) => JSON.stringify(p)).join(" ")}; do ` +
-				`[ -d "$p" ] && echo "1 $p" || echo "0 $p"; done`;
-			const ex = await pi.exec("bash", ["-c", script], { timeout: 8000 });
-			for (const line of ex.stdout.split("\n")) {
-				const m = /^([01]) (.*)$/.exec(line.trim());
-				if (m) exists.set(m[2], m[1] === "1");
+		for (const p of allPaths) {
+			if (!meaningfulPath(p)) continue; // invalid root — not actionable
+			try {
+				exists.set(p, statSync(p).isDirectory());
+			} catch {
+				exists.set(p, false);
 			}
 		}
-		// Registered worktree paths per repo (cached for this tick).
-		const registries = new Map<string, Set<string>>();
-		async function registeredPaths(repoRoot: string): Promise<Set<string>> {
+		// Registered worktree paths per repo (cached for this tick). N08: a
+		// FAILED registry query returns null — the caller must skip the row
+		// (unknown ≠ unregistered; a failed read must not manufacture
+		// ORPHAN HUSK classifications).
+		const registries = new Map<string, Set<string> | null>();
+		async function registeredPaths(repoRoot: string): Promise<Set<string> | null> {
 			const hit = registries.get(repoRoot);
-			if (hit) return hit;
-			const s = new Set<string>();
+			if (hit !== undefined) return hit;
+			let s: Set<string> | null = null;
 			const g = await pi.exec(
 				"git",
 				["-C", repoRoot, "worktree", "list", "--porcelain"],
 				{ timeout: 8000 },
 			);
 			if (g.code === 0) {
+				s = new Set<string>();
 				for (const line of g.stdout.split("\n")) {
 					const m = /^worktree (\S+)/.exec(line.trim());
 					if (m) s.add(m[1]);
@@ -493,13 +592,31 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 				roundDebrisAlerted.delete(row.id); // resolved — re-arm
 				continue;
 			}
+			// N08: an ACTIVE round sharing this cwd exempts the row from
+			// cleanup candidacy — the live-owner exemption applies to EVERY
+			// branch (done rows too), not only the orphan-pane loop.
+			if (livePaths.has(wt)) continue;
 			if (roundDebrisAlerted.get(row.id)) continue; // one alert until resolved
 			const repoRoot = repoRootFor(wt, row.repo_root);
 			const registered = await registeredPaths(repoRoot);
+			if (registered === null) {
+				// registry unreadable — cannot establish husk vs registered;
+				// fail closed (skip this row, rate-limited health note)
+				const note = sensorHealthNote(
+					"debris-registry",
+					`git worktree list failed for ${repoRoot}`,
+				);
+				if (note) alerts.push(`[nefario-watch · ${stamp()}] ${note}`);
+				continue;
+			}
 			const isHusk = !registered.has(wt);
 			const panes = [...perkinsPanes.entries()]
 				.filter(([, c]) => c === wt)
 				.map(([p]) => p);
+			// N07 discipline for the RELAYED recipe too: paths are data — emit
+			// them shell-quoted (single-quote escaping) so a metacharacter-laden
+			// path can never execute when an operator pastes the line.
+			const sq = (s: string) => "'" + s.replace(/'/g, `'\\''`) + "'";
 			roundDebrisAlerted.set(row.id, true);
 			alerts.push(
 				`- PERKINS ROUND DEBRIS — ${row.id}: round is DONE but its worktree ` +
@@ -512,11 +629,14 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 						? `; ${panes.length} pane(s) still open with cwd == the round ` +
 							`worktree: ${panes.join(", ")}`
 						: "") +
+					(paneInventoryFailed
+						? "; pane inventory UNAVAILABLE this tick — resolve open panes manually before sweeping"
+						: "") +
 					`. Detection-only — do NOT auto-close (id-proximity / tab-label ` +
 					`matching burned us 08-17 ×2; match ONLY this cwd path): verify the ` +
 					`round row is done + the review posted (\`gh api repos/<owner>/` +
 					`<repo>/pulls/<n>/reviews --jq '.[-1]'\`), then sweep: close the ` +
-					`panes, \`git -C ${repoRoot} worktree remove --force ${wt}\` (or ` +
+					`panes, \`git -C ${sq(repoRoot)} worktree remove --force ${sq(wt)}\` (or ` +
 					`remove the husk dir), and NULL the row's worktree/pane_id via sqlite.`,
 			);
 		}
@@ -525,6 +645,9 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		// left the pane — the 2026-08-23 camera-zoom-r1 / font-r2 class).
 		for (const [pid, cwd] of perkinsPanes) {
 			if (livePaths.has(cwd)) continue; // in-flight round — legit
+			// N07/N08 doctrine: a path the existence check SKIPPED (relative /
+			// non-meaningful root) is UNKNOWN — never a cleanup instruction.
+			if (!meaningfulPath(cwd)) continue;
 			if (exists.get(cwd) ?? false) continue; // dir present → row check above
 			if (roundDebrisAlerted.get("pane:" + pid)) continue;
 			roundDebrisAlerted.set("pane:" + pid, true);
@@ -606,6 +729,13 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		const jobs = await trackedJobs();
 		if (jobs.length === 0) return alerts;
 		const live = await liveStatuses();
+		// N04: liveStatuses returns a typed union — a failed inventory is
+		// UNKNOWN (no statuses); fall back to pane_info's own evidence
+		// instead of crashing or inventing states.
+		const statusFor = (pane: string, infoStatus?: string): string =>
+			live.ok
+				? (live.statuses.get(pane) ?? infoStatus ?? "unknown")
+				: (infoStatus ?? "unknown");
 		const labels = new Map<string, string>();
 		const tabsR = await pi.exec("herdr", ["tab", "list"], { timeout: 8000 });
 		if (tabsR.code === 0) {
@@ -640,7 +770,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			cands.push({
 				pane: job.pane_id,
 				jobId: job.id,
-				status: live.get(job.pane_id) ?? info.status ?? "unknown",
+				status: statusFor(job.pane_id, info.status),
 				cwd: info.cwd ?? "unknown",
 				tab: labels.get(info.tabId ?? "") ?? "unknown",
 				path: info.session,
@@ -795,7 +925,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			[
 				"-json",
 				DB,
-				"SELECT id, pr, pane_id, pr_review FROM jobs WHERE status = 'in-review' AND pr IS NOT NULL",
+				"SELECT id, pr, pane_id, pr_review, repo FROM jobs WHERE status = 'in-review' AND pr IS NOT NULL",
 			],
 			{ timeout: 5000 },
 		);
@@ -808,7 +938,7 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 				[
 					"-json",
 					DB,
-					"SELECT id, pr, pane_id, 0 AS pr_review FROM jobs WHERE status = 'in-review' AND pr IS NOT NULL",
+					"SELECT id, pr, pane_id, 0 AS pr_review, NULL AS repo FROM jobs WHERE status = 'in-review' AND pr IS NOT NULL",
 				],
 				{ timeout: 5000 },
 			);
@@ -881,18 +1011,16 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 		"ACTION_REQUIRED",
 	]);
 
-	async function prInfo(url: string): Promise<PrInfo | null> {
-		const r = await pi.exec(
-			"gh",
-			[
-				"pr",
-				"view",
-				url,
-				"--json",
-				"state,headRefOid,statusCheckRollup,reviews,mergeable,mergeStateStatus,baseRefName",
-			],
-			{ timeout: 20_000 },
+	async function prInfo(url: string, repoSlug?: string | null): Promise<PrInfo | null> {
+		// R04: a bare-number PR needs an explicit canonical --repo (never the
+		// ambient COO cwd repo); a full URL resolves itself.
+		const args = ["pr", "view", url];
+		if (repoSlug) args.push("--repo", repoSlug);
+		args.push(
+			"--json",
+			"state,headRefOid,statusCheckRollup,reviews,mergeable,mergeStateStatus,baseRefName",
 		);
+		const r = await pi.exec("gh", args, { timeout: 20_000 });
 		if (r.code !== 0) return null; // gh missing/offline/rate-limited — skip
 		try {
 			const j = JSON.parse(r.stdout);
@@ -979,45 +1107,88 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			// by incident id); on clear inject a cleared line. Auto-classifies
 			// API/webhook flakes for Silas (note-only, retry beats alert;
 			// merges user-side via the CLI-merge recipe; git ops green).
-			const ghStatus = await pi.exec("curl", ["-s", "--max-time", "10", "https://www.githubstatus.com/api/v2/status.json"], { timeout: 12000 });
+			// N05: the documented /api/v2/status.json has NO incidents field —
+			// the old reader could never see a real incident. The summary.json
+			// endpoint carries status (rollup indicator) + components + active
+			// incidents. Invalid/unknown responses are skipped, never treated
+			// as recovery; "Git is green" is never claimed without evidence.
+			const ghStatus = await pi.exec("curl", ["-s", "--max-time", "10", "https://www.githubstatus.com/api/v2/summary.json"], { timeout: 12000 });
 			if (ghStatus.code === 0 && ghStatus.stdout) {
 				try {
 					const st = JSON.parse(ghStatus.stdout);
-					const incident = st?.incidents?.[0] ?? null;
-					const key = incident ? `incident:${incident.id}:${incident.status}` : "clear";
-					if (incident && ghStatusKey.get("s") !== key) {
+					// schema validation — anything else is UNKNOWN, not "clear"
+					const indicator =
+						typeof st?.status?.indicator === "string" ? st.status.indicator : null;
+					const incidentsRaw = Array.isArray(st?.incidents) ? st.incidents : null;
+					if (indicator === null || incidentsRaw === null)
+						throw new Error("summary.json schema invalid (status.indicator/incidents missing)");
+					const incidents = incidentsRaw.filter(
+						(i): i is { id: string; name: string; status: string; impact?: string } =>
+							typeof i?.id === "string" &&
+							typeof i?.name === "string" &&
+							typeof i?.status === "string",
+					);
+					// N05: a PARTIALLY-malformed incidents list is an invalid sample —
+					// filtering the bad entries out could fabricate "zero incidents"
+					// (a false clear). Skip the tick entirely instead.
+					if (incidents.length !== incidentsRaw.length)
+						throw new Error("summary.json incident entry schema invalid");
+					const nonOperational = (Array.isArray(st?.components) ? st.components : [])
+						.filter(
+							(c): c is { name: string; status: string } =>
+								typeof c?.name === "string" && typeof c?.status === "string",
+						)
+						.filter((c) => c.status !== "operational");
+					// dedup key: indicator + the FULL sorted incident set (id:status) —
+					// a second incident, or one resolving out of several, changes the
+					// key and re-advises (partial recovery is a new state, not silence)
+					const incPart = incidents
+						.map((i) => `${i.id}:${i.status}`)
+						.sort()
+						.join(",");
+					const clear = incidents.length === 0 && (indicator === "none" || indicator === "good");
+					const key = clear ? "clear" : `ind:${indicator}|inc:${incPart}`;
+					if (!clear && ghStatusKey.get("s") !== key) {
 						ghStatusKey.set("s", key);
+						const incList = incidents
+							.map((i) => `${i.name} (status: ${i.status}${i.impact ? `, impact: ${i.impact}` : ""})`)
+							.join("; ");
+						const compList = nonOperational.map((c) => `${c.name}=${c.status}`).join(", ");
 						pi.sendMessage(
 							{
 								customType: "nefario-watch",
 								content:
-									`[nefario-watch · ${stamp()}] GITHUB INCIDENT live — ${incident.name} ` +
-									`(status: ${incident.status}, impact: ${incident.impact}); status page: ` +
-									`https://www.githubstatus.com (${st.status?.description ?? ""}). ` +
+									`[nefario-watch · ${stamp()}] GITHUB STATUS non-clear — indicator: ${indicator}` +
+									(incidents.length ? `; active incident(s): ${incList}` : "; no unresolved incidents listed") +
+									(compList ? `; component(s): ${compList}` : "") +
+									`. Status page: https://www.githubstatus.com (${st.status?.description ?? ""}). ` +
 									`AUTO-CLASSIFICATION: API/PRs/Issues/Actions/webhook flakes and sensor ` +
 									`gaps during the window = incident noise — note-only, retry beats ` +
-									`alert, no reruns/relays/escalations on flakes; git ops GREEN; merges ` +
+									`alert, no reruns/relays/escalations on flakes. Do NOT assume Git ` +
+									`operations are green — check the component list above; merges ` +
 									`stay user-side with the CLI-merge recipe (local-merge + push) armed. ` +
-									`ONE FYI relay to Gru; then note-only per recurrence.`, 
+									`ONE FYI relay to Gru; then note-only per recurrence.`,
 								display: true,
 							},
 							{ deliverAs: "followUp", triggerTurn: true },
 						);
-					} else if (!incident && ghStatusKey.get("s") && ghStatusKey.get("s") !== "clear") {
+					} else if (clear && ghStatusKey.get("s") && ghStatusKey.get("s") !== "clear") {
 						ghStatusKey.set("s", "clear");
 						pi.sendMessage(
 							{
 								customType: "nefario-watch",
 								content:
-									`[nefario-watch · ${stamp()}] GitHub incident CLEARED — normal classification resumes.`,
+									`[nefario-watch · ${stamp()}] GitHub status page reports indicator '${indicator}' with no unresolved incidents — ` +
+									"normal classification resumes (evidence-based; verify component health before merge-critical operations).",
 								display: true,
 							},
 							{ deliverAs: "followUp", triggerTurn: true },
 						);
 					}
 				} catch {
-					// status.json parse failed — skip this tick (the 08-13 lesson:
-					// don't blame the provider on flaky telemetry)
+					// summary.json invalid/unparseable — skip this tick, NOT a
+					// recovery (the 08-13 lesson: don't blame the provider on
+					// flaky telemetry, and don't clear on unknown payloads)
 				}
 			}
 			// ── P1a: hourly quota probe (user-approved 2026-08-18) ──
@@ -1089,9 +1260,31 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 			}
 			const jobs = await inReviewJobs();
 			const alerts: string[] = [];
+			// R04/B6: collect EVERY job whose bare-number PR sensing was skipped
+			// so the single rate-limited health note names them all (per-kind
+			// rate limiting must not hide subjects 2..N).
+			const bareSkipped: string[] = [];
 			for (const job of jobs) {
 				if (!job.pr) continue;
-				const info = await prInfo(job.pr);
+				// R04: resolve the PR argument's identity up front. Bare numbers
+				// require a full owner/repo slug (ledger repo column); without one
+				// the job's PR sensing is SKIPPED (rate-limited health note) — a
+				// bare `gh pr view <n>` would silently query the AMBIENT repo.
+				const prRaw = job.pr.trim();
+				const bare = /^\d+$/.test(prRaw);
+				let slug: string | null = null;
+				let canonicalUrl: string | null = null;
+				if (bare) {
+					const repoCol = (job.repo ?? "").trim();
+					if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoCol)) {
+						slug = repoCol;
+						canonicalUrl = `https://github.com/${slug}/pull/${prRaw}`;
+					} else {
+						bareSkipped.push(`${job.id} (repo='${repoCol}')`);
+						continue;
+					}
+				}
+				const info = await prInfo(prRaw, slug);
 				if (info === null) continue;
 				prStates.set(job.id, info.state);
 				const terminal = info.state === "MERGED" || info.state === "CLOSED";
@@ -1159,11 +1352,15 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 						const actionable = novel.filter((rv) =>
 							Object.hasOwn(REVIEW_ACTIONS, rv.state),
 						);
-						const m = PR_URL.exec(job.pr.trim());
+						// R04: bare-number PRs use the resolved canonical URL (slug+num)
+						// instead of failing PR_URL and silently consuming review ids.
+						const m = canonicalUrl
+							? [canonicalUrl, "github.com", ...(slug ?? "").split("/"), prRaw]
+							: PR_URL.exec(job.pr.trim());
 						if (actionable.length > 0 && m) {
 							const urls = await reviewUrls(m[1], m[2], m[3], m[4]);
 							for (const rv of actionable) {
-								const url = urls.get(rv.id) ?? job.pr;
+								const url = urls.get(rv.id) ?? (canonicalUrl ?? job.pr);
 								const body = rv.body.trim();
 								const excerpt =
 									body.length === 0
@@ -1239,6 +1436,14 @@ export default function nefarioWatch(pi: ExtensionAPI) {
 							"abandon (close job + clean up) or reopen/fix?",
 					);
 				}
+			}
+			if (bareSkipped.length > 0) {
+				const note = sensorHealthNote(
+					"bare-pr-identity",
+					`bare-number PR sensing skipped for ${bareSkipped.length} job(s) — ledger repo is not a full owner/repo slug (ambient-repo lookup refused): ` +
+						bareSkipped.join("; "),
+				);
+				if (note) alerts.push(`[nefario-watch · ${stamp()}] ${note}`);
 			}
 			const dream = await dreamCheck();
 			if (dream) alerts.push(dream);
