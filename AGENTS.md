@@ -1295,6 +1295,21 @@ do not act on old model names in the gotchas below as current routing.
   fix-loop trigger; execution-found fixes on an APPROVED head are a
   legitimate NEW review delta (r5 after a skip-row, 09-11 01:26), not
   an echo.
+- **Result-oriented routine execution autonomy (2026-09-12 user ruling;
+  supersedes routine per-entry run-word holds).** The prior PP3D bounded-run
+  grant remains historical evidence and its headless limits, receipts,
+  quiescence checks, stop-on-RED behavior, and no-waiver rules remain in
+  force. What changes is the approval treadmill: once the user authorizes
+  a job goal or finite batch, Gru/Silas and the owning agent autonomously
+  execute ordinary local imports, tests, in-scope repairs, bounded retests,
+  and normal verification. A RED check stops dependent progression but does
+  not require a fresh approval to diagnose and retest a meaningful in-scope
+  fix inside the declared batch. Escalate only for a real blocker, hard
+  budget, destructive or irreversible action, conflicting user work, scope
+  or creative-direction change, or user-owned acceptance. Do not reset
+  spent entries, erase failed evidence, silently exceed cost limits, or
+  create duplicate rows. Durable source record:
+  `_bmad-output/memory/result-oriented-routine-execution-autonomy-2026-09-12.md`.
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
