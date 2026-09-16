@@ -56,16 +56,13 @@ Two modes:
 /Users/moses/code/bin/vision-read --model openai-codex/gpt-6-astra \
   "/absolute/path/to/image.png" "optional prompt"
 
-# LOCAL last resort only (coarse; never the policy default)
-/Users/moses/code/bin/vision-read --fast "/absolute/path/to/image.png"
-
 # swap the model for one call/session without touching any file
 VISION_MODEL=openai-codex/gpt-6-astra /Users/moses/code/bin/vision-read "/path.png"
 ```
 
 ### Swapping the model
 
-Resolution order (first match wins): **`VISION_MODEL` env var → `--model` flag → `--fast`/`--local` → default `openai-codex/gpt-6-astra`**. The default is Astra/xhigh for 3D-safe routing; select `openai-codex/gpt-5.6-sol` @ xhigh explicitly for non-3D helpers. To make a model the permanent default, edit the `MODEL="..."` line in `bin/vision-read`. Any swap target must declare image input — `input: ["text", "image"]` in the models registry — or pi bounces the attachment (see Troubleshooting). Legacy visual models may be selected only explicitly after authorization and a successful probe.
+Resolution order (first match wins): **`VISION_MODEL` env var → `--model` flag → default**. Interim multimodal route while the GPT chain is quota-capped: `--model zai-coding-cn/glm-5.3-flash` (probe-proven multimodal 2026-09-11). Native Astra/Sol defaults return at quota lift. The default is Astra/xhigh for 3D-safe routing; select `openai-codex/gpt-5.6-sol` @ xhigh explicitly for non-3D helpers. To make a model the permanent default, edit the `MODEL="..."` line in `bin/vision-read`. Any swap target must declare image input — `input: ["text", "image"]` in the models registry — or pi bounces the attachment (see Troubleshooting). Legacy visual models may be selected only explicitly after authorization and a successful probe.
 
 The wrapper runs (env-cleared, so no PI_* overrides):
 
@@ -135,8 +132,9 @@ and must be disclosed; if no authorized vision route is available, report
   evidence-grade bar is the METHOD (pixel scans, hashes, geometry — never
   vibes), not the model.
 - **KYLE** is a visual-verification role that may use the policy-selected
-  GPT model; it is not a legacy GLM default. Legacy visual models and
-  `--fast`/`--local` fallbacks are explicit and disclosed only.
+  GPT model; it is not a legacy GLM default. Legacy visual-model fallbacks were removed 2026-09-11 (provably dead:
+  LM Studio app gone, models absent); the interim multimodal route is
+  `zai-coding-cn/glm-5.3-flash` while the GPT chain is capped.
 - Astra/Sol are native multimodal GPT models. An empty or partial reply
   mid-reasoning is NOT a failure — the final answer lands when the reasoning
   block closes. Callers MUST use a generous bash timeout (600s+).

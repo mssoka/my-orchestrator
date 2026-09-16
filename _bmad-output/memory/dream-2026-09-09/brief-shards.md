@@ -1,0 +1,3 @@
+Read /Users/moses/code/_bmad-output/memory/dream-2026-09-09/sheep-common.md completely, then execute it as sheep-shards.
+Source: /Users/moses/code/_bmad-output/field-notes/*.md. Inventory: /Users/moses/code/_bmad-output/memory/dream-2026-09-09/inputs/field-notes-inventory.json. Read all newer-mtime shards in full, plus all older tails in inputs/field-notes-older-tails.md (277KB, paginate). Content dating selects genuinely new entries; older evidence may corroborate a novel pattern but cannot be counted as newly processed material. Expand any plausible backfill. Do not count the current dream's own notes.
+Output ONLY /Users/moses/code/_bmad-output/memory/dream-2026-09-09/sheep-shards.md.

@@ -1,1 +1,0 @@
-SHARED BLOCK PREAMBLE — this text is inlined into each non-blind lens prompt (edge, acceptance, security, architecture, codebase, tests). Kept here as the authoring record; the per-lens files are self-contained.

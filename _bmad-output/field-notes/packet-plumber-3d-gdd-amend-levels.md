@@ -1,0 +1,5 @@
+# Field notes — packet-plumber-3d-gdd-amend-levels
+
+- 2026-09-04: lavish decision forms work — per-row radios + one Queue button got clean machine-parseable rulings (D1–D5 all arrived as tagged prompts); pair every form with a pros/cons explainer block when the options aren't self-evident (the user asked "explain this, pros and cons" on the two forms that lacked one).
+- 2026-09-04: a user annotation can RESCUE a briefing's scope guard without breaking it — "look at the odin version" was satisfied from THIS repo's own verbatim inheritance records (M4/E10.2 carried the post-streaming era content); check what the repo's canon already records before reading across the guard.
+- 2026-09-04: box-art/ASCII blocks in markdown need exact column-count replacements — build replacement lines in python and assert interior width (64) BEFORE issuing the edit; and after table edits, re-render the region to catch rows orphaned by an inserted clarifier paragraph (my M5 table split silently on first attempt).

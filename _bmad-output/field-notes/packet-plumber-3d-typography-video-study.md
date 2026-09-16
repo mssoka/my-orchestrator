@@ -1,0 +1,3 @@
+- 2026-09-08 — PP3D L1 captures at 0818afc2 decode as1600×450 despite base1600×900: capture runner fullscreen Canvas Items+Expand normalizes width retaining aspect. Carry dimensions and last-change SHA; never use normalized crops as default font-pixel compliance proof.
+- 2026-09-08 — Named YouTube web_fetch returned complete transcript/chapters; public metadata worked but first frame seek got403. Transcript study still useful; stop at403 and never imply frame inspection.
+- 2026-09-08 — `hud.gd` calls560 a “cap” but assigns custom_minimum_size.x; distinguish comment intent from a proven max-width contract and credit existing1600×900 real-panel layout pins before proposing broader evidence.

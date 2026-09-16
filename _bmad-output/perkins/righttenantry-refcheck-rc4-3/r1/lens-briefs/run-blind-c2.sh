@@ -1,4 +1,0 @@
-#!/bin/bash
-export PI_NO_SESSION_HEADLESS=1
-pi -p --model deepseek/deepseek-v4-flash --no-session --name "mm-blind-c2-r1" "You are the 'blind' code-review lens (Perkins automated review round 1 of PR #606, righttenantry-refcheck-rc4-3). Read the lens brief at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-3/r1/lens-briefs/blind.md FIRST and follow it EXACTLY. Your ONLY input: the diff chunk at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-3/r1/diff.c2.patch (read ONLY that file's bytes - do not regenerate or expand). ISOLATION CONTRACT: do NOT read the worktree, the repo, any spec, or any other file - reading anything beyond the diff invalidates your lens. Write ONLY your JSON array to /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-3/r1/blind.c2.json and stop. Accuracy over volume; [] is an honest answer when nothing is wrong."
-echo "blind_c2_DONE_0"

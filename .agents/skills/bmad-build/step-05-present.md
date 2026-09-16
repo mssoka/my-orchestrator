@@ -14,7 +14,7 @@
 
 Change `{spec_file}` status to `done` in the frontmatter.
 
-If `{story_key}` is not empty and `{{.implementation_artifacts}}/sprint-status.yaml` exists, read `[[bmad-snapshot:sync-sprint-status.md]]` with `{target_status}` = `review`.
+If `{story_key}` is not empty and `{{config.modules.bmm.implementation_artifacts}}/sprint-status.yaml` exists, read `[[bmad-snapshot:sync-sprint-status.md]]` with `{target_status}` = `review`.
 
 ### Commit and Complete
 

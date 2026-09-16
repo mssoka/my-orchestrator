@@ -1,5 +1,0 @@
-#!/bin/bash
-cd /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-rc4-2-r2
-export PI_NO_SESSION_HEADLESS=1
-pi -p --model deepseek/deepseek-v4-flash --no-session --name "mm-blind-c3-r2" "You are the 'blind' code-review lens (Perkins automated review round 2 of PR #605, righttenantry-refcheck-rc4-2). Read the lens brief at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-2/r2/lens-briefs/_shared.md FIRST (SKIP the spec/worktree inputs \u2014 blind lenses do not read them), then /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-2/r2/lens-briefs/blind.md, and follow their instructions EXACTLY. Your diff chunk: /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-2/r2/diff.c3.patch \u2014 that file's bytes are ALL the context you have. Reading anything beyond that diff invalidates your lens. Write ONLY your JSON array to /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-2/r2/blind.c3.json and stop. Accuracy over volume; [] is an honest answer when nothing is wrong."
-echo "blind_c3_DONE_0"

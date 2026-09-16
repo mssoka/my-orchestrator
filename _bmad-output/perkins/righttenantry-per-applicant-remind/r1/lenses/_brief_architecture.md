@@ -1,7 +1,0 @@
-Architectural fit review. Given the diff and the surrounding codebase:
-- Does it follow existing patterns and conventions?
-- Does it introduce unnecessary coupling between modules?
-- Is there a simpler alternative with the same outcome?
-- Does it respect module boundaries and separation of concerns?
-- Will it create technical debt or make future changes harder?
-- Does complexity match the problem? Any premature abstraction?

@@ -1,4 +1,0 @@
-#!/bin/bash
-cd /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-rc3-4-r3
-pi -p --model zai-coding-cn/glm-5.2 --no-session --name "mm-codebase-r3" "You are the 'codebase' code-review lens (Perkins automated review round 3). Read the lens brief at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc3-4/r3/lens-briefs/_shared.md and then /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc3-4/r3/lens-briefs/codebase.md, and follow their instructions EXACTLY. Verify every claim by reading the actual files in the worktree at /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-rc3-4-r3 (read/grep/bash) — do not assume. Write ONLY your JSON array to /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc3-4/r3/codebase.json and stop. Accuracy over volume; an empty array is a valid, honest answer when nothing is wrong."
-echo "codebase_DONE_$?"

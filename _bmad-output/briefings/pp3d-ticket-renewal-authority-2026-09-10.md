@@ -1,0 +1,15 @@
+# PP3D — explicit standing ticket-renewal disposition for the remaining cases
+
+Gru authorizes Silas to issue a NEW truthful, source-bound scheduling ticket for the next UNRESERVED `mutation-dolphin-jump` case and refresh tickets as needed for the remaining already-authorized cases. **This supersedes the reported operational NO NEW TICKET constraint for this existing verification scope.** No further Gru/user approval is needed for ordinary readiness renewal within that scope.
+
+The old ticket `2110f02506b792c6feadab5759124ff61d7af29cb25d3ac446ce550e0742fa00` remains unchanged and expired for entry: `start_before=01:13:42Z` cannot be overridden by `safe_until=01:55:42Z`. Preserve its read-only rejection. Gru read the actual `scheduling_gate` and `verify_entry` in `verify_final_source_recovery_03.py`: the gate requires every entry `now<=start_before`, plus enough time until safe_until; the180s constraint applies to that ticket's FIRST use. First-use lookup is keyed by ticket SHA, so a legitimately NEW ticket is supported without editing an old entry or guard.
+
+Issue JIT only after real capacity/current controls are verified; immediately relay path/hash and verify first use within180s. Set the NEW ticket's latest-entry/safe-until timestamps according to an actually coordinated finite window, not by pretending the old window remains open. A subsequent expiry before an unreserved case permits another fresh ticket under these same rules; no tight polling/renewal loop and no guard bypass.
+
+Same pMY/session/Astra-xhigh, SAME recovery namespace and completed focused clearance. No new host proof/namespace/adapter/source/monitor changes are needed for a normal ticket refresh. Do not rerun focused or reset progress. Schema still describes the original12-case scope; actual remaining allowance is11, with cumulative18 starts/1064.9758850852959s. Original2700s total native/2GiB context/32GiB free/percase180s/full300s/stage512MiB and all source/ownership/diagnostic/serial-clearance rules remain. Full638 keeps --verbose. Actual failure or reservation still consumes its proper state and stops as specified—this does NOT authorize retries.
+
+If a genuine active-namespace hard STOP was written, do not delete/bypass it: show that exact artifact and state. A read-only pre-reservation ticket rejection by itself is not a native failure. Old historical STOPs stay preserved.
+
+The user's possible MANUAL historical621 reproduction remains unscheduled and separate; “no extra agent run/reservation” on that question never withdrew the eleven existing cases. This grant adds no case, user-play/editor/render/fix/PR/model change. Silas coordinates with Selva's actual native work; its current read-only diagnosis does not need the heavy queue.
+
+Canonical job `packet-plumber-3d-planet-life-router-legibility`; existing worktree; model `openai-codex/gpt-6-astra` / xhigh; skills existing bmad-build context, no bootstrap/fleet; existing pr_review1, no PR/Perkins now. Record this permission durably on the row and relay promptly. Report actual full-suite findings, not repeated ordinary ticket-expiry questions.

@@ -1,0 +1,6 @@
+- 2026-09-07: Live Herdr pane was w85:pMS while HERDR_PANE_ID retained pre-move w9G:p1; resolve by session path before reporting or controlling panes.
+- 2026-09-07: Higgsfield MCP returned 401 while direct Blender MCP read-only inspection worked; reservation does not itself authorize substituting the production route—halt and obtain a ruling before mutation.
+- 2026-09-07: bmad-build render_skill.py succeeded in this worktree; do not apply the older missing-renderer waiver by assumption.
+- 2026-09-07: Later user ruling superseded the initial route hold: direct Blender MCP is primary and Higgsfield is retired; the toy humanoid is rejected-study history, not premium acceptance, and the native moth gate still requires the user's actual visual verdict.
+- 2026-09-07: Contact tests must observe evaluated world-space support, not a copied formula; scale targets need exact side/part plus enabled modifier order, and saved/append timeline reveal must be tested separately from manual sliders.
+- 2026-09-07: Hybrid CPU+Metal produced long CPU path-tracing tails; process-local Metal-only finished the same 156-frame source in 537.52s without quality reduction or saved preferences. Keep UUID receipts/outputs and require complete exit-zero evidence before atomic gate publication; never splice a timed-out partial attempt.

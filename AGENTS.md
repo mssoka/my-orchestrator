@@ -56,6 +56,26 @@ the user at the Gru session in `/Users/moses/code`.
 
 ## Gru gotchas (field notes, learned the hard way)
 
+### Intake & planning — plan before heist (user ruling 2026-09-14)
+
+Do NOT rush to assign a minion when the user asks for a task. Gru (the
+highest-intelligence session) brainstorms WITH the user FIRST — the
+beginning/planning of every heist matters as much as the end (merge/
+review). Unclear intent = wasted tokens + wasted review rounds + a user
+playtest that surfaces what was never wanted. Consultation uses the
+problem-solving/brainstorming skills deliberately (bmad-brainstorming,
+bmad-cis-problem-solving, bmad-forge-idea, bmad-advanced-elicitation,
+grill-me), and the settled plan/design goes through a lavish review gate
+BEFORE the briefing is written. No heists on impulse: plan properly, THEN
+dispatch. (User: "when i ask for tasks do not just rush to assign minion.
+i have you with the most intelligence so we can brainstorm about it..
+before we assign task.. we don't just go on heists on impulse. we plan
+properly before assigning minions. it's also why we have lavish")
+Operational test: if the WHAT or HOW has open forks the user hasn't
+ruled on → consult first. A fix mandate with an already-locked spec
+(e.g. "fix these reviewed warnings") needs no fresh brainstorm — the
+spec IS the plan.
+
 ### Dispatch & handover
 
 - **`herdr agent send` does not submit.** It types text into the pane's
@@ -143,7 +163,16 @@ the user at the Gru session in `/Users/moses/code`.
   scope, design-audit blur-test columns, MM press-kit no-fetch
   supersede): relay + verify, never kill-and-redispatch — a briefing
   guardrail yields to a USER RULING via relayed amendment, never to
-  minion initiative. 2026-09-07 addendum (dream-2026-09-07; ×3:
+  minion initiative. 2026-09-13/14 addendum (dream-2026-09-15; Selva
+  lane, 3 same-owner extensions + ~6 direction pivots, ZERO
+  re-dispatches): same-ROW extension is the healthy follow-on shape
+  for creative lanes — a top-linked supersede amendment on the
+  controlling brief plus the SAME row/owner/tree (done→dispatched
+  re-open), and "deferred" means a NAMED owed deliverable ON the row
+  (the blender-music-video skill rode the MV row), never an orphan
+  "later" task. Write contradicting exceptions at the TOP of the
+  controlling brief — a stale blanket prohibition otherwise
+  quiet-parks the new mandate. 2026-09-07 addendum (dream-2026-09-07; ×3:
   09-05 ×1, 09-06 ×2): the delivery grep races the session FLUSH —
   a 0-hit grep seconds after the relay is a pre-flush miss, NOT a
   delivery failure ("first grep 0 = flush race, second 2 hits"):
@@ -254,7 +283,13 @@ the user at the Gru session in `/Users/moses/code`.
   <repo_root>/_bmad _bmad` from the worktree before any bmad-build
   step; render_skill.py lives at the ORCHESTRATOR root's
   `/Users/moses/code/_bmad/scripts/` (the PP main checkout's
-  `_bmad/scripts/` does NOT carry it).
+  `_bmad/scripts/` does NOT carry it). 2026-09-12 addendum
+  (dream-2026-09-13; constellation-view-v2): a Godot worktree carrying the
+  `_bmad` symlink INGESTS its CSVs as translations (bmad-help.csv + tooling
+  CSVs → locale-warning diagnostics in every import log — fail-closed
+  fodder under stop-on-surprise); sanctioned repair = a local facade dir
+  (own `.gdignore` + top-level forwards) leaving the shared target
+  byte-identical (non-following manifest verified unchanged).
 - **Godot fresh-worktree environment: import precondition FIRST;
   untracked `.import` sidecars are LOAD-BEARING (2026-09-10/11, PP3D ×3
   jobs; dream-2026-09-11).** A fresh Godot worktree has NO `.godot/`
@@ -270,7 +305,22 @@ the user at the Gru session in `/Users/moses/code`.
   over degraded worlds"); environment-sensitive pins must measure
   COMMITTED-tree state, not working-tree litter (#29 passes on pristine
   trees, bites used checkouts; the live user checkout carries MORE
-  sidecars than any worktree).
+  sidecars than any worktree). 2026-09-11 addendum (dream-2026-09-13;
+  lighthouse + l1-intro + inventory-dock): SILENT CAPTURE WEDGES have two
+  invocation root causes that masquerade as harness/engine defects —
+  (a) WRONG SCENE: the capture runner is attached to the project main
+  scene (l1_arpanet.tscn); a briefing-named scene (main.tscn) boots a
+  runnerless world that wedges for the full window (three 900s entries
+  burned; corrected invocation `godot --path . -- --capture-l1` = default
+  scene + one flag; 15 captures then landed in 19s — let a fast cheap
+  success FALSIFY the harness-defect diagnosis before routing rework);
+  (b) SLEEPING DISPLAY: macOS delivers zero frames while asleep, so
+  frame-gated waits AND frame-gated watchdogs (the fail-loud CAPTURE_FAIL
+  itself) never fire — silent wedge at any window size; standing wrapper =
+  `caffeinate -dimsu` + the one-line don't-close-the-pop-up warning,
+  daytime or wake-first. Captures need ~900s windows (boot+world-gen eats
+  300s); windowed-allowed capture entries are a blessed standing shape
+  (receipted, stop-on-surprise).
 - **my-orchestrator root pull past PR #28 deletes 1237 tracked skill
   files (2026-09-10, standing trap; dream-2026-09-11).** PR #28
   (skill-collision untrack) untracked `.agents/skills` — pulling the
@@ -283,6 +333,25 @@ the user at the Gru session in `/Users/moses/code`.
   mssoka/my-orchestrator#29). NEVER pull the live root past #28 without
   an aside copy of `.agents/skills`. Naming trap: my-orchestrator
   #26/#28/#29 ≠ PP3D #26/#28/#29 — always qualify by repo.
+- **youtube-channel drops worktrees (standing user ruling, 2026-09-14,
+  recorded at PR #4):** future youtube-channel dispatches default to the
+  main checkout `/Users/moses/code/youtube-channel`; worktrees only when
+  two lanes genuinely collide. Rationale from the same window: the repo's
+  media lanes run tree-rooted servers and untracked-by-design media that
+  worktree sweeps kill (see the close-out sweep-race gotcha).
+- **Playable exports build from the FINAL MERGED tree, with a
+  containment check before Start.command ships (2026-09-15, user-hit
+  b42 defect; process gap ruled by Gru).** An export staged from a
+  lane's working tree predates any merge that lands later on the same
+  branch (the #46 absorb): the shipped b42 carried PRE-#46 prop glbs
+  and booted the exact #31 fingerprint. Rule: build exports from a
+  clean checkout of the merged head (fresh .godot import to
+  quiescence — first passes can silently fail glb imports and a
+  re-run skips them; verify imported-entries for key assets), verify
+  export-tree == merged-head (byte-hash a named sentinel asset, e.g.
+  the glb the last fix regenerated), boot-receipt per the fix
+  contract (stderr EMPTY), THEN swap the central copy (defective
+  copy preserved aside with its distinguishing hash in the name).
 - **PP PRs always `--base v2` — the briefing names the base
   (2026-09-01, pp-funfix-118-124 / PR #125).** `gh pr create`
   silently targets the repo's DEFAULT branch: on the v2-lane repo
@@ -414,7 +483,18 @@ flips are user-sanctioned ad hoc. Under glm-only load ~3 concurrent
 Perkins round mains reliably launch-burst (1302) — one continue per
 pane after settle, serialize the rest of the day's glm fan-outs. Durable
 policy: `_bmad-output/memory/openai-quota-hold-glm-interim-2026-09-10.md`.
-The GPT-chain base resumes at lift.
+The GPT-chain base resumes at lift. **LIFTED 2026-09-12** (user,
+verbatim: "we have openai back in business" — explicit confirmation, never
+a probe-up): GPT-chain base resumed (Astra 3D / Luna COO / Sol workers, all
+xhigh); the GLM interim is retired EXCEPT explicit per-PR user overrides
+(2026-09-12: an orchestration-fix PR pinned glm-5.3@max for the round main
+AND every lens — "NO Astra fallback, no default GPT-chain round spawn" —
+and held through 1302 bursts). Identity relaunches under any hold
+reconcile the footer model against the DURABLE hold record — live model
+availability alone does not unfreeze production (09-12: a stale extension
+flipped a revived Silas to max; corrected via `/thinking xhigh`,
+event-verified). Strike this interlude block at the next docs pass per its
+own design; the cap-flavor taxonomy above stays.
 
 - **Provider incidents come in 3 classes with different recoveries
   (2026-08-02/03).** Transient stalls, mid-turn refusals, and
@@ -716,6 +796,11 @@ The GPT-chain base resumes at lift.
   retirement; the dispatch-time correction layer (Silas overrides +
   flags in the dispatch note) caught it, no wrong-model launch.
   Verify the model line at dispatch even on same-day briefs.
+  2026-09-14 addendum (dream-2026-09-15): TEMPLATE model lines rot on
+  the same clock — the DREAM template's kimi line was stale at BOTH
+  the dream-2026-09-13 and dream-2026-09-15 dispatches (hold-era glm
+  correction needed each time). Re-pin Bob/sheep model lines from the
+  current regime at every dream dispatch; session-verify after launch.
   2026-08-19 supersede (user ruling, wire-aesthetics r1 / PR #70):
   defaultProvider is now deepseek/deepseek-v4-flash — an UNSET or
   bare-`pi` Perkins ROUND launch now runs the WHOLE round on flash
@@ -752,6 +837,19 @@ The GPT-chain base resumes at lift.
   Identity-pane relaunches clear PI_MODEL/PI_PROVIDER and pin
   --model explicitly (hardened in the watchman same day; the COO
   deepseek ruling lives in the playbook's Silas section).
+  2026-09-13 addendum (dream-2026-09-15; PP3D constellation r3, USER-
+  CAUGHT): inherited env beats the pin on DIRECT LENS spawns too — 5
+  r3 lens panes came up glm-5.3/high despite the 17:06 launch
+  explicitly pinning Astra/xhigh (root cause: inherited
+  PI_MODEL/PI_PROVIDER plus `~/.pi/agent/settings.json` global glm
+  defaults; "GLM outputs are invalid for Astra approval" — the wave
+  was invalid for its tier). Lens panes inherit the round main's env:
+  clear PI_MODEL/PI_PROVIDER on EVERY spawn surface and verify each
+  lens session's modelId — session FILENAME timestamps are NOT header
+  ids (17:06 files, 17:09 ids). Caught pre-output = in-place /model
+  correction, no re-dispatch (constellation perkins-r2 02:33Z 09-13,
+  preparatory reads only); caught post-output = corrected relaunch on
+  the same panes with the frozen diff preserved, no blind revert.
   2026-09-09 addendum (dream-2026-09-09; typography-study + the
   storyboard/SOMA dispatch batch, 09-08): the historical blanket
   `--thinking max` instruction above is superseded, NOT an alias
@@ -889,7 +987,18 @@ The GPT-chain base resumes at lift.
   executed routing), and the review sensor raced the r2 pre-add by
   seconds (tf-in-ci 15:50Z). Same answer as every echo: a
   same-status note quoting the sha + the action already taken,
-  never a second action.
+  never a second action. 2026-09-12 addendum (dream-2026-09-13): probe
+  flips are RECORDS, not actions — an Astra DOWN flip mid-flight justified
+  verifying liveness by session growth (289+ toolUse entries) and NOTHING
+  else (no continue/kill/relaunch/fallback/model flip on a working pane;
+  the flip back UP 63 min later = availability confirmation only). Per-PR
+  INDEPENDENT-REVIEWER MODEL OVERRIDES are durable user rulings that pin
+  the round main AND every lens ("the Perkins round + every lens for THIS
+  PR runs zai-coding-cn/glm-5.3 at max — NO Astra fallback") and hold
+  THROUGH 1302 bursts (one continue after the wave settles, no model
+  change). Probe-interpretation hardening applied: the dispatch gate is a
+  raw env-cleared rc + nonempty reply, not strict `^OK$` (the chatty-OK
+  false-DOWN class).
 - **Perkins can self-close its round row (2026-08-02).** Closing the
   Perkins pane writes `working -> done` before Silas' close-out
   `set done`, which then no-ops (same-status) and eats the verdict
@@ -1033,6 +1142,13 @@ The GPT-chain base resumes at lift.
   Info), and the fix-now job's briefing is SCOPE-GUARDED against the
   batch items so it cannot eat them (M-1 shipped r1 APPROVED + merged
   as #627 same day). Generalizes to any audit/heist output.
+  2026-09-12 addendum (dream-2026-09-13; PP3D #34-#41): user-filed FUTURE
+  work receipts as BACKLOG-ONLY intake — GitHub issues (dedup-checked,
+  bodies preserved), recorded quietly on the active row with explicit
+  fences (no dispatch, no fold into active lanes, no resume of other
+  stops, no per-issue acknowledgement spam); ambiguous interrupted phrases
+  get clarified BEFORE publication; URLs listed to the user once. Intake
+  ≠ work — nothing moves without a dispatch.
   2026-08-27 addendum (dream-2026-08-27): two FOLD shapes complete the
   family — (a) prior-round advisories become ONE batch issue,
   EXECUTION-FOLDED onto the lane's next PR and closed when it ships
@@ -1058,6 +1174,15 @@ The GPT-chain base resumes at lift.
   override tables for the old value BEFORE any flip (PP palette
   mode tables 08-25 + RT test pins 09-04), and state "merge ≠ prod
   change" workflow facts in the PR body when paths are filtered.
+  2026-09-12 addendum (dream-2026-09-13; selected-safety-fixes r1): a
+  pre-verdict user merge recovers the commissioned round as an FYI
+  post-merge review on the EXACT pre-merge target/base with the preserved
+  canonical diff and its chunks ("FYI post-merge on exact pre-merge target
+  7b823c9d, original base d194d9f7, using preserved canonical 3585-line
+  diff") — NEVER regenerate the diff against merged main (it collapses to
+  the empty-diff trap); preserve-first existing lens arrays, run only the
+  missing chunk waves, post ONE FYI comment on the merged PR (no formal
+  review event, no fix loop); findings become user-decided follow-up debt.
   2026-08-22/23 addendum (dream-2026-08-23 — moot at scale, ×5):
   confirmation/delta rounds around an APPROVED substance are DISPOSABLE
   — sweep without re-dispatch and record the safe-merge qualifier each
@@ -1108,7 +1233,14 @@ The GPT-chain base resumes at lift.
   `_bmad-output/implementation-artifacts/` BEFORE the worktree sweep —
   the local-test precedent lost untracked artifacts to the sweep; the
   bughunt suite was swept twice and re-created a 3rd time before
-  preservation became standard (08-14/15, ×4 sightings).
+  preservation became standard (08-14/15, ×4 sightings). 2026-09-12
+  addendum (dream-2026-09-13; constellation-view-v2): halt/STOP evidence
+  now also preserves to the DEDICATED central archive
+  `_bmad-output/no-pr-evidence/<repo>/<lane>/<date>-<entry>/` as
+  hash-verified tarballs (SHA256 + cmp byte-identical to the worktree
+  archive; concurrent writers use parent-seal child dirs to avoid
+  overwriting each other); 3 archives in one lane (import-01,
+  import-recovery-02, parent-seal-01).
   2026-08-19 addendum (dream-2026-08-19; wire-aesthetics): a THIRD gap
   flavor — `herdr notification show` itself returns `shown:false` when
   the notification relay is busy (the ledger + watcher caught it).
@@ -1228,6 +1360,15 @@ The GPT-chain base resumes at lift.
   table's measured-effect citation was disproven (4-lens convergence
   + mutation) — bytes-not-claims extends to demo headers + tuning
   tables.
+  2026-09-13 addendum (dream-2026-09-15; PP3D constellation lane, ×2
+  same day): a tool CALL is not a RESULT, and a PREPARED brief is not
+  a received mandate — Gru's "confirmed mutations" mistook call text
+  for result (both GLM in-tree edits actually FAILED exact match),
+  and "lenses ignored instructions" mistook prepared wave briefs for
+  delivered ones (all 5 first prompts were implementation
+  amendments). Claims about what an agent DID rest on results
+  (diffs, session-jsonl results, gh state) — never on calls, prepared
+  prompts, or receipt-constructing pane output.
   2026-09-04 addendum (dream-2026-09-04; e1-r1, e2-r2/r3): the
   PHANTOM-CHECK flavor — a test file ABORTS mid-run (typed-Nil
   crash) and the harness still prints PASS over it: e2-r2 B1 "3/5
@@ -1264,7 +1405,19 @@ The GPT-chain base resumes at lift.
   Perkins round runs mechanical-only in parallel, unaffected);
   (b) the user's MERGE CLICK ratifies a disclosed aesthetic
   deviation (art-integration's KYLE-driven fresnel deviation,
-  ratified at merge) — the click IS the aesthetic verdict.
+  ratified at merge) — the click IS the aesthetic verdict. 2026-09-12
+  addendum (dream-2026-09-13; inventory-dock #33): USER PLAY finds
+  live-input defects scripted captures structurally miss — the dock
+  drag-drop NEVER installed (suite+captures green) because target
+  acquisition measured only the host ground-point projection while real
+  hands drop on building bodies at oblique angles (20-210px off) and empty
+  landing spots (~554px off), all silently cancelled. Fix standard: the
+  capture performs the FULL gesture (press->drag->drop->install)
+  end-to-end AND carries a discriminator pin labeled fails-pre-fix (the
+  landing-spot pin); acquisition via physics ray (the draw verb's rule) +
+  either-campus-point radius. Sibling: click-click placement + UI occlusion
+  (a pointer over the dock must never hover/install world targets — the
+  ray could install through the tray).
   2026-09-10 addendum (dream-2026-09-11; gemini-storyboard r1 +
   skill-collision r1 + router-legibility r4): on mssoka/my-orchestrator
   the fallback-comment is STRUCTURAL, not transient — perkins-token has
@@ -1276,7 +1429,13 @@ The GPT-chain base resumes at lift.
   manual retry is proven (router-legibility r4: formal 5168444639
   posted after a user-ordered manual retry). The owed fix is a paneless
   row `orchestrator-perkins-token-mint-retry-fix` (dispatched 14:34Z
-  09-10 — flagged possibly orphaned 09-11; verify it is alive).
+  09-10 — flagged possibly orphaned 09-11; verify it is alive). RESOLVED
+  2026-09-11: the orphaned paneless row sat ~34h (no watcher covers a
+  paneless pickup — verify pickup on every no-pane dispatch); re-dispatched
+  (the new row id carried a wrong packet-plumber-3d- prefix; the original
+  row left SUPERSEDED) and PR #31 MERGED — bounded mint retry (1-2 auto
+  retries + ~30s backoff + loud per-attempt stderr before the comment
+  fallback) is LIVE; the manual-retry workaround is retired.
 - **PP3D bounded-run grants & the execution-RED catch net (2026-09-10/11,
   user-ruled; dream-2026-09-11).** The user gated all Godot/native
   execution behind explicit run-word grants (grant doc
@@ -1299,7 +1458,16 @@ The GPT-chain base resumes at lift.
   owes a post-merge green-confirm entry — and that confirm is itself a
   fix-loop trigger; execution-found fixes on an APPROVED head are a
   legitimate NEW review delta (r5 after a skip-row, 09-11 01:26), not
-  an echo.
+  an echo. 2026-09-11 addendum (dream-2026-09-13; constellation lane-2,
+  events 00:41/00:43Z — surfaced a pass late): verification entries TEE
+  full logs (a piped `tail -30` lost the log head: test output +
+  first-error context; no rerun under stop-on-surprise — convert to static
+  analysis + an explicit instrumented-rerun request), and a suite that
+  exits 0 short with NEITHER per-script prints NOR the summary line is an
+  ABORTED COROUTINE, not a pass (a runtime error inside a test's run_all
+  kills the runner silently) — check for the 'SUITE RESULT:' line, not
+  just exit codes (the phantom-check counting discipline extended to the
+  runner level).
 - **Perkins-branch anomaly: `perkins-*` BRANCHES where only a DETACHED
   worktree should exist (2026-08-11, audit-flagged).** Perkins rounds use
   DETACHED worktrees (`git worktree add --detach <sha>`; dedup is
@@ -1434,6 +1602,19 @@ The GPT-chain base resumes at lift.
   the merge. Use `git merge-base --is-ancestor <commit> <branch>` AFTER
   `pull --ff-only` (or `git fetch origin <base>:<base>` when the tree is
   held). Commit-containment is immune to both traps.
+  2026-09-12 addendum (dream-2026-09-13; ×2 repos): MERGED ≠ DELIVERED ≠
+  ACTIVATED. A user "I don't see the merged change" report is FIRST a
+  local-checkout-sync question (read-only `git -C <checkout>` + containment
+  of mergeCommit AND head), never an editor-cache or implementation-bug
+  hunt — the PP3D user checkout sat at 19aae6a (behind 12) while origin/main
+  was 39d82d0; recovery = preserve-first fast-forward of the user's main
+  (incoming colliding docs/captures retained, containment proven).
+  Orchestrator twin: a tooling PR merged to main is deployment-pending while
+  the live root rides its dirty branch ("PR #33 is contained in merged
+  a59cf6d0, but live root remains vision-read-skill-cleanup at 0bdfcf8c")
+  — activation is its own user-gated sequence (aside-copy skills first per
+  the #28 landmine, reconcile hashes, reload between sensor cadences);
+  user-facing receipts state "merged, activation pending".
 - **Folding untracked artifacts into a PR leaves redundant originals —
   expect a base-sync collision at the NEXT merge (2026-08-27,
   dream-2026-08-27).** The sanctioned preserve-first fold structurally
@@ -1535,6 +1716,64 @@ The GPT-chain base resumes at lift.
   greps use the NEWEST-mtime files in the session dir that contain
   the relay text (excluding your OWN session — your bash args
   pollute it), never a single registry-pointed file.
+- **`role:user` in a pane is a TRANSPORT label, never human-origin proof
+  (2026-09-13 pYR incident; dream-2026-09-13).** An agent's ASSISTANT bash
+  toolcall relayed via `herdr pane run` lands in the recipient's session
+  as role:user — Silas read one as a "direct user reversal", killed the
+  Selva owner pane (pYR, 00:05Z 09-13) and wrote a durable stop note on a
+  claim the text never made (it was a PP3D closeout report). Provenance
+  is proven from the ORIGINATING session jsonl (assistant toolcall id +
+  routing + timestamps), not the receiving pane. Standing guards: a
+  job-scoped stop/deadline/RED never stops sibling jobs; label Gru-origin
+  directions `[GRU]` and agent reports `[MINION <job-id>]`; reserve
+  "HUMAN RULING" for verified human-origin instructions — a Gru
+  application of an existing ruling is recorded as a dated application,
+  not a new ruling (≥3 attribution corrections 09-12..13, superseded via
+  AUTHORITY-CORRECTION side files that preserve history); never kill an
+  unrelated minion from an ambiguous forwarded report — scoped
+  non-destructive pause + clarify first. Root text:
+  `memory/result-oriented-routine-execution-autonomy-2026-09-12.md`
+  (Provenance paragraph).
+  2026-09-13/14 addendum (dream-2026-09-15): the test cuts BOTH ways —
+  a direct typed `retry` (constellation pYQ, 16:54:15Z 09-13) WAS
+  genuine human input and overrode a stale BLOCKED disposition; and
+  an unbranded ACK (no [GRU]/[MINION] prefix) had its CLAIM
+  gh-verified before any ledger action. Origin-session forensics +
+  independent ground truth decide, in both directions — the label
+  (present or absent) never does.
+- **Close-out sweeps race tree-rooted daemons and user-facing paths
+  (2026-09-14, ×2 close-outs same day; dream-2026-09-15).**
+  `worktree remove` silently kills whatever is rooted in the tree: the
+  electric-loom close-out swept BEFORE re-rooting the gallery servers
+  — both (8794/8795) orphaned on the deleted cwd serving 404s (the
+  plan's order was re-root + verify 5 links THEN sweep), and 32
+  untracked mp4s died to the same sweep (recovered lossless from
+  central preserve, rsync --ignore-existing); the l1-spawn close-out
+  preserved 4.3G playable exports and re-anchored the b40
+  Start.command path BEFORE removal ("the worktree-relative playable
+  path in the ACK is DEAD"). Standing shape: before worktree removal,
+  enumerate NON-PANE daemons rooted in the tree (`lsof +D <worktree>`
+  / listening ports — pane sweeps cannot see them; the 08-27
+  orphan-process class, media-server flavor); order preserve-first
+  dependencies BEFORE the sweep (re-root servers, preserve untracked
+  user deliverables); re-anchor every user-facing path handed out
+  earlier ("ACK handover paths pointing INTO a worktree die at
+  close-out — either preserve-first + relay the new path, or hand
+  over from a stable root"); and include `git worktree list` in
+  censuses — husk worktrees with no row/pane escape ledger+pane
+  sweeps, and a failing `branch -D` usually means a worktree still
+  pins the branch (verify containment + clean, then remove).
+- **Row status and final prose are not activity (2026-09-12, ×3;
+  dream-2026-09-13).** A WORKING row sat behind an agent=done pane (Selva
+  pYR 22:25Z); a finished-turn pane went idle mid-heist (user: "I don't
+  see any minion running" — census confirmed zero working minions); an
+  ordinary adapter failure was quiet-parked BLOCKED with "no approval
+  requested" (violates the factory completion contract's
+  operational-verification rule). The check at any unfinished done/idle
+  transition: session-jsonl growth + owned child/async work + recent
+  files — then deliver the concrete next step in the existing session.
+  Do not classify an unfinished idle heist as harmless completion from
+  its own final prose; do not blindly nudge a genuine active async task.
 - **Killing a stuck / 403-dead pi: typed `exit` fails, C-c isn't uniform
   (2026-08-07).** `exit` typed into a dead pi does nothing; C-c sometimes
   leaves the TUI alive. Reliable path: `herdr pane process-info --pane <p>`
@@ -1754,7 +1993,14 @@ The GPT-chain base resumes at lift.
   2026-08-22/23 addendum (dream-2026-08-23):
   routing grew a LOCAL fallback — remote glm-4.6v primary →
   `bin/vision-read --local` (lmstudio glm-4.6v-flash) → gemma coarse
-  `--fast` last resort (wired + verified through pi 08-22). Vision
+  `--fast` last resort (wired + verified through pi 08-22). RETIRED
+  2026-09-11 (user-ordered strip; local lmstudio models off-disk, server
+  down — bin/vision-read micro-PR + SKILL.md edit landed): the local lane
+  is DEAD, do not route to it. Hold-era interim note: glm-5.3-flash is
+  natively multimodal (registry `input: ["text","image"]`, probe-proven
+  reading PNGs incl. UI text) and served as the vision route under the
+  OpenAI hold; post-lift the GPT-chain native routes (Astra/Sol) govern.
+  Vision
   capability is a property of the CURRENT pane model and flips
   intra-day with HOLDs (Gru flipped glm-5.3 blind mid-morning 08-23 →
   KYLE reads for him again). TWO craft laws from the wave: (a) a
@@ -1793,6 +2039,14 @@ The GPT-chain base resumes at lift.
   uninstalled. Do not repair/reinstall it or route new native Blender work
   through it. Existing H3/other-video work stays untouched and follows its
   recorded scope.
+- **Selva asset-first / look-flexibility (2026-09-12 user ruling).** Speed
+  and a coherent good-looking result over old-look parity; free
+  commercially-usable third-party assets (Sketchfab/PolyHaven) without an
+  asset-shopping approval gate; story/cast/scale retained; old validated
+  source/certs immutable (old GREEN does not certify changed assets).
+  Scope SELVA only — not permission to replace PP3D's living planet or
+  expand its backlog. Durable:
+  `_bmad-output/memory/selva-asset-first-look-flexibility-2026-09-12.md`.
 - **User ruling (verbatim):** "use the blender mcp directly. you don't have
   to the higgsfield plugin. That has been uninstalled that is for block
   production ofre the eventual a.i generation. we no longer need that. so
@@ -1926,6 +2180,14 @@ The GPT-chain base resumes at lift.
   self-report class.
 - **Playbook consolidation (P3):** rides the NEXT dream (Model policy +
   Perkins sections rewrite; supersede history → changelog appendix).
+- **Grid-at-creation extension (P3, user-flagged 2026-09-14):** the
+  grid-at-creation rule (397670b6) covers Perkins lens waves only —
+  minion-spawned helpers (bmad-build step 04 mega-minions) still LADDER
+  (pp3d-playtest-fixes-1: 4-pane split ladder, working minion squeezed to
+  22/230 cols, user-flagged; Silas resized even 57/58/57/58 live,
+  resize-only doctrine held). Extend the at-creation grid rule to ALL
+  multi-pane spawn surfaces (herdr skill template + role templates).
+  Rides the next docs pass.
   Recorded scope (user-approved 2026-08-19, U2): absorb the v4-pro ban
   chain (7e889ec), the 402-class + ops flip/revert (af06ff3/b2f51d9),
   probe hardening, 1302-concentration under a capped primary, and the

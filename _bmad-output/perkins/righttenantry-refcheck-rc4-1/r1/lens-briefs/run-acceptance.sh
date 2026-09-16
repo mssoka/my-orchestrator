@@ -1,4 +1,0 @@
-#!/bin/bash
-cd /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-rc4-1-r1
-pi -p --model deepseek/deepseek-v4-flash --no-session --name "mm-acceptance-r1" "You are the 'acceptance' code-review lens (Perkins automated review round 1 of PR #604). Read the lens brief at /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1/lens-briefs/_shared.md and then /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1/lens-briefs/acceptance.md, and follow their instructions EXACTLY. Verify every claim by reading the actual files in the worktree at /Users/moses/.herdr/worktrees/RightTenantry/perkins-refcheck-rc4-1-r1 (read/grep/bash) — do not assume. Write ONLY your JSON array to /Users/moses/code/_bmad-output/perkins/righttenantry-refcheck-rc4-1/r1/acceptance.json and stop. Accuracy over volume; [] is an honest answer when nothing is wrong."
-echo "acceptance_DONE_0"
