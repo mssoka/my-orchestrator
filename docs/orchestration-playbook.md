@@ -85,15 +85,16 @@ His extension (`.pi/extensions/silas.ts`) injects his standing orders +
 startup checklist; nefario-watch is gated to `PI_SILAS=1`, so ALL sensors
 alert Silas — Gru's context stays clean.
 
-**Model:** Silas ALWAYS runs on **`openai-codex/gpt-5.6-luna` @ max thinking**
-(user ruling 2026-09-07: GPT subscription — the COO tier is Luna, max;
+**Model:** Silas ALWAYS runs on **`openai-codex/gpt-5.6-luna` @ xhigh thinking**
+(user ruling 2026-09-09: Luna remains the COO model, and xhigh supersedes
+the 2026-09-07 Luna/max current pin; the older max state remains historical;
 supersedes the 09-06 deepseek-v4-flash pin, which superseded the 08-27
 glm-5.3-flash pin) — set
 AUTOMATICALLY by `.pi/extensions/silas.ts` at launch (`session_start` ->
 `pi.setModel` + `pi.setThinkingLevel`), no manual `/model`; notifies if
 missing or unkeyed, and
 hardened at relaunch: `bin/night-watchman` clears `PI_MODEL`/`PI_PROVIDER`
-and pins `--model openai-codex/gpt-5.6-luna --thinking max` (the 11:47Z
+and pins `--model openai-codex/gpt-5.6-luna --thinking xhigh` (the 11:47Z
 2026-09-06 relaunch leaked `PI_MODEL=k3` over the extension pin). No
 silent legacy fallback — if Luna is unavailable the current model stays +
 an error notifies (availability escalates to the user). The COO's work is
@@ -258,8 +259,8 @@ Allocations by ROLE + a 3D OVERRIDE — not by project. Superseded rulings
 **GPT CHAIN (user ruling 2026-09-07 — ChatGPT subscription; exact IDs
 verified from the pi registry 2026-09-07: `openai-codex/gpt-6-astra` =
 Astra, `openai-codex/gpt-5.6-sol` = Sol, `openai-codex/gpt-5.6-luna` =
-Luna; all three natively multimodal + reasoning; thinking levels Astra/Sol
-= `xhigh`, Luna = `max` — verified through pi).**
+Luna; all three natively multimodal + reasoning; thinking level is
+`xhigh` for Astra, Sol, and Luna — verified through pi).**
 
 **REASONING TIER — `openai-codex/gpt-6-astra` (Astra) @ `xhigh`:**
 **Gru** (persona, relays, escalations, briefing authorship), **Bob**
@@ -272,10 +273,11 @@ judgment-heavy roles. Belt rows stay merge-gated (the user holds merges).
 
 **EXECUTION TIER:**
 - **Silas (COO)** — ops, relay, coordination, dispatches:
-  **`openai-codex/gpt-5.6-luna` (Luna) @ `max` thinking** (user ruling
-  2026-09-07). Supersedes the 09-06 deepseek-v4-flash COO pin. No silent
-  legacy fallback — if Luna is unavailable the current model stays + an
-  error notifies (availability escalates to the user).
+  **`openai-codex/gpt-5.6-luna` (Luna) @ `xhigh` thinking** (user ruling
+  2026-09-09; supersedes the 2026-09-07 Luna/max current pin). Supersedes
+  the 09-06 deepseek-v4-flash COO pin. No silent legacy fallback — if Luna
+  is unavailable the current model stays + an error notifies (availability
+  escalates to the user).
 - **ALL other minions** (implementation) and **mega-minions**
   (well-specified sub-tasks, NON-3D): **`openai-codex/gpt-5.6-sol`
   (Sol) @ `xhigh`** — the fleet workhorse. Non-3D review lens
@@ -302,8 +304,9 @@ probe flips (never a legacy-model continue).
 **Launch label = the FULL path always** — `openai-codex/gpt-6-astra`,
 `openai-codex/gpt-5.6-sol`, `openai-codex/gpt-5.6-luna` (provider/model
 prefixed; bare labels misroute). Thinking is pinned per launch too
-(`--thinking xhigh` / `--thinking max`) and at session_start by the
-identity extensions (gru.ts/silas.ts).
+(`--thinking xhigh` for current GPT launches) and at session_start by the
+identity extensions (gru.ts/silas.ts);
+historical max pins remain historical evidence only.
 
 **VISION ROUTING (2026-09-07 GPT-chain ruling):** the GPT-chain models
 (Astra/Sol/Luna) are ALL natively multimodal (`input: ["text",
@@ -329,6 +332,8 @@ stand unchanged.
   uploading, or publishing. `youtube-channel` remains a managed repo, and
   new native Blender briefings must state the direct-MCP route and preserve
   a user visual gate before broad expansion.
+
+**Blender access (user ruling2026-09-10):** Blender is provided for agents to use. Routine access, scene/file switching, checkpointing, in-scope imports/rendering and necessary application recovery require no new user-permission prompt. Silas coordinates ownership and fresh readiness internally; preserve unsaved work before replacement/restart and do not interrupt active workers. A changed PID or dirty scene triggers preservation/reconciliation under this standing authority, not another access question. Notify the user at meaningful output-review gates; escalate only genuine blockers or scope/cost/safety decisions not already covered. This changes access authority, not quality acceptance, resource/attempt limits or model routing.
 
 ## Durable state
 
@@ -470,9 +475,9 @@ Slug = kebab-case from intent. Job id = `<repo>-<slug>`.
      briefing=<briefing-path> github_issue=<n>   # model=<m> if set
    ```
 6. Launch pi and hand over — append `--model <model>` when set, else
-   plain. **THINKING PIN — `--thinking max` on EVERY launch**:
+   plain. **THINKING PIN — `--thinking xhigh` on EVERY current GPT launch**:
    ```bash
-   herdr pane run <pane> "pi --model <model> --thinking max"   # or plain "pi --thinking max" when unset
+   herdr pane run <pane> "pi --model <model> --thinking xhigh"   # or plain "pi --thinking xhigh" when unset
    herdr agent wait <pane> --until idle --timeout 60000
    sleep 3
    herdr pane run <pane> "Read /Users/moses/code/docs/orchestration-playbook.md section 'Minion standing orders' and the briefing at <briefing-path>, then begin."
@@ -795,12 +800,17 @@ Two tiers, both policy (Herdr itself enforces no limit):
 
 ## Skills availability
 
-Canonical home: `/Users/moses/code/.agents/skills/` — **git-tracked since
-2026-08-01 (self-containment)**: the repo carries its whole skill set —
-`bmad-*`, `gds-*`, `lavish`, `code-review` + `review-plan` (Perkins'
-review skills, imported from `~/.claude/skills`), and `herdr`; everything
-symlinked into `~/.pi/agent/skills/`, visible from any cwd (incl.
-worktrees). User-general skills (adk-*, cadquery, sentry-*) stay outside.
+Canonical home: `/Users/moses/code/.agents/skills/` — **local-only
+canonical content (UNTRACKED 2026-09-10; git-tracked 2026-08-01–2026-09-10,
+see the annex 'Skills availability — self-containment history')**: the
+repo's skill set — `bmad-*`, `gds-*`, `lavish`, `code-review` +
+`review-plan` (Perkins' review skills, imported from `~/.claude/skills`),
+and `herdr` — lives as untracked files at the root, symlinked into
+`~/.pi/agent/skills/`, visible from any cwd; orchestrator WORKTREES
+bootstrap-symlink `.agents/skills` from the repo root (annex 'Dispatch —
+worktree bootstrap') — realpath-deduped against the globals, no
+collision warnings, no drift-prone copies. User-general skills (adk-*,
+cadquery, sentry-*) stay outside.
 The `gds-*` suite is wired the same way; the `_bmad/gds` module config
 lives per game project — ANY repo can become one: install BMGD into that
 repo's `_bmad`, propagate `_bmad/gds` + `config.toml` + `_config/` into
@@ -884,3 +894,8 @@ truth; this appendix carries how we got here.
   multimodal — native vision everywhere on the chain; KYLE routing only
   for legacy blind sessions. Supersedes the 09-06 COO deepseek pin and
   the 09-07 Perkins glm-5.3 pin (both above).
+- **2026-09-09** — User ruling supersedes the active Silas/Luna max pin:
+  Silas remains `openai-codex/gpt-5.6-luna`, now @ `xhigh`. Gru verified
+  the already-live Silas session at Luna/xhigh; no restart or reload was
+  needed. The extension, night-watchman relaunch path, tests, and active
+  policy docs must carry xhigh; historical max incidents remain unchanged.

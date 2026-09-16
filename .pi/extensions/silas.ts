@@ -52,25 +52,24 @@ export default function silas(pi: ExtensionAPI) {
 		if (ctx.cwd !== GRU_DIR) return;
 		if (process.env.PI_SILAS !== "1") return;
 		if (event.reason === "startup" || event.reason === "new") {
-			// Silas ALWAYS runs on openai-codex/gpt-5.6-luna @ max thinking
-			// (user ruling 2026-09-07: GPT subscription — the COO tier is
-			// Luna, max). Supersedes the 09-06 deepseek-v4-flash COO pin
-			// (and before that the 08-27 glm-5.3-flash pin). Set at launch
-			// (`session_start` -> pi.setModel + pi.setThinkingLevel), no
-			// manual /model; notifies if missing or unkeyed, and hardened at
-			// relaunch: bin/night-watchman clears PI_MODEL/PI_PROVIDER and
-			// pins --model openai-codex/gpt-5.6-luna --thinking max. No
-			// silent legacy fallback — if Luna is unavailable the current
-			// model stays + an error notifies (availability escalates to the
-			// user). Reasoning tier (Gru/Bob/Perkins) = astra xhigh per
-			// 'Model policy'.
+			// Silas ALWAYS runs on openai-codex/gpt-5.6-luna @ xhigh thinking.
+			// User ruling 2026-09-09 keeps Luna as the COO model and
+			// supersedes the 2026-09-07 Luna/max current pin. Historical max
+			// incidents remain historical. Set at launch (`session_start` ->
+			// pi.setModel + pi.setThinkingLevel), no manual /model; notifies if
+			// missing or unkeyed, and hardened at relaunch: bin/night-watchman
+			// clears PI_MODEL/PI_PROVIDER and pins --model
+			// openai-codex/gpt-5.6-luna --thinking xhigh. No silent legacy
+			// fallback — if Luna is unavailable the current model stays + an
+			// error notifies (availability escalates to the user). Reasoning
+			// tier (Gru/Bob/Perkins) = astra xhigh per 'Model policy'.
 			const model = ctx.modelRegistry.find("openai-codex", "gpt-5.6-luna");
 			if (model) {
 				const ok = await pi.setModel(model);
 				if (!ok) {
 					ctx.ui.notify("Silas: no auth for openai-codex/gpt-5.6-luna — staying on the current model", "error");
 				} else {
-					await pi.setThinkingLevel("max");
+					await pi.setThinkingLevel("xhigh");
 				}
 			} else {
 				ctx.ui.notify("Silas: openai-codex/gpt-5.6-luna not in the model registry — staying on the current model", "error");
